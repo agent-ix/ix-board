@@ -1,0 +1,10 @@
+target/
+*-target/
+.worktrees/
+node_modules/
+dist/
+Cargo.lock.bak
+*.swp
+.DS_Store
+.idea/
+.vscode/
