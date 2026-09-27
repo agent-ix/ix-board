@@ -3,6 +3,7 @@
 
 //! Typed records and command results for structured Linear reads.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fmt::{Display, Formatter};
@@ -11,17 +12,23 @@ use std::str::FromStr;
 use crate::Error;
 
 /// Stable Linear issue UUID used for relationships.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, JsonSchema,
+)]
 #[serde(transparent)]
 pub struct IssueId(pub String);
 
 /// Stable Linear project UUID used for lookup and relationships.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, JsonSchema,
+)]
 #[serde(transparent)]
 pub struct ProjectId(pub String);
 
 /// Linear team key used as a read scope.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, JsonSchema,
+)]
 #[serde(transparent)]
 pub struct TeamKey(pub String);
 
@@ -127,7 +134,7 @@ impl FromStr for ProjectPriority {
 }
 
 /// Stable structured project record fetched from Linear.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Project {
     /// Linear UUID.
@@ -153,7 +160,7 @@ pub struct Project {
 }
 
 /// A project milestone record.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Milestone {
     /// Linear UUID.
@@ -167,7 +174,7 @@ pub struct Milestone {
 }
 
 /// A structured Linear issue record and its prerequisite identifiers.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Issue {
     /// Linear UUID.
@@ -193,7 +200,7 @@ pub struct Issue {
 }
 
 /// A complete structured read snapshot used by all read commands.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceSnapshot {
     /// Projects in the Linear workspace.
@@ -203,7 +210,7 @@ pub struct WorkspaceSnapshot {
 }
 
 /// Next step inferred from a structured spec state.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum NextStep {
     /// The issue should be specified.
@@ -213,7 +220,7 @@ pub enum NextStep {
 }
 
 /// One eligible issue in a team's ready queue.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReadyItem {
     /// Project identifier or name.
@@ -229,7 +236,7 @@ pub struct ReadyItem {
 }
 
 /// All data returned by `project-chunk`.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectChunk {
     /// Project identifier, falling back to its Linear UUID.
@@ -247,7 +254,7 @@ pub struct ProjectChunk {
 }
 
 /// Issue summary included in a project chunk.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ChunkIssue {
     /// Issue identifier.
@@ -263,7 +270,9 @@ pub struct ChunkIssue {
 }
 
 /// Kind of record returned from structured search.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize, JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum SearchKind {
     /// Project record.
@@ -273,7 +282,7 @@ pub enum SearchKind {
 }
 
 /// One matching structured project or issue.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SearchResult {
     /// Record kind.

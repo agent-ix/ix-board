@@ -100,6 +100,23 @@ repository has no configured repository list or complete historical queue
 source. A collector must supply structured API records and pagination/history
 completeness; the evaluator fails closed when it reports missing evidence.
 
+## JSON Schema for downstream clients
+
+The public project, ready-queue, and drift wire types derive `schemars::JsonSchema`
+from their authoritative Rust definitions. Export a schema for a downstream
+contract build with:
+
+```bash
+cargo run --example export_schema -- Project > project.schema.json
+cargo run --example export_schema -- ProjectChunk > project-chunk.schema.json
+cargo run --example export_schema -- ReadyItem > ready-item.schema.json
+cargo run --example export_schema -- DriftReport > drift-report.schema.json
+```
+
+The schemas describe the serialized wire shape, including flattened signal
+availability fields and enum values. Downstream projects can generate
+TypeScript declarations from these schemas without copying the Rust models.
+
 ## License
 
 AGPL-3.0-or-later
