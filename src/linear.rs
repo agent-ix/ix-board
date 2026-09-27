@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
-const PAGE_SIZE: i32 = 50;
+// Linear's project query includes several nested connections; 50 exceeds its complexity cap.
+const PAGE_SIZE: i32 = 20;
 const RELATION_PAGE_SIZE: i32 = 50;
 const PAGE_LIMIT: usize = 1_000;
 // Invalidate cached snapshots that stored a display name instead of the semantic started state.
@@ -662,7 +663,10 @@ mod tests {
         RawProjectStatusOption, canonical_project_status, collect_blocked_by,
         resolve_project_status_id,
     };
-    use crate::{ProjectId, ProjectMutationSource, ProjectPriority, ProjectRunStatus, ReadService};
+    use crate::{
+        ProjectId, ProjectMutationSource, ProjectPriority, ProjectRunStatus, ReadService,
+        WorkspaceSource,
+    };
     use serde_json::Value;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -861,6 +865,27 @@ mod tests {
         let _ = std::fs::remove_file(cache_path);
 
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn workspace_transport_uses_linear_complexity_safe_page_size() {
+        let empty = connection(serde_json::json!([]));
+        let (endpoint, server) = mock_linear(vec![
+            serde_json::json!({"data": {"projects": empty.clone()}}),
+            serde_json::json!({"data": {"issues": empty}}),
+        ]);
+        let source = LinearGraphQlSource::with_endpoint("test-key", endpoint)
+            .expect("source with local endpoint");
+
+        source.fetch_workspace().expect("fetch empty workspace");
+
+        let requests = server.join().expect("mock server");
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request["variables"]["first"] == 20)
+        );
     }
 
     #[test]
