@@ -831,6 +831,39 @@ mod tests {
     }
 
     #[test]
+    fn decoded_paused_project_snapshot_is_excluded_from_next_queue() {
+        let project = serde_json::json!({
+            "id": "project-id", "identifier": "SWM-P1", "name": "Project", "description": "Goal",
+            "content": null, "priority": 2, "sortOrder": 1.0,
+            "status": {"name": "Paused", "type": "planned"},
+            "teams": connection(serde_json::json!([{"key": "SWM"}])),
+            "projectMilestones": connection(serde_json::json!([]))
+        });
+        let issue = serde_json::json!({
+            "id": "issue-id", "identifier": "SWM-3", "title": "Project ticket", "description": null,
+            "priority": 2.0, "sortOrder": 1.0, "state": {"name": "Specced"}, "team": {"key": "SWM"},
+            "project": {"id": "project-id"},
+            "relations": connection(serde_json::json!([]))
+        });
+        let (endpoint, server) = mock_linear(vec![
+            serde_json::json!({"data": {"projects": connection(serde_json::json!([project]))}}),
+            serde_json::json!({"data": {"issues": connection(serde_json::json!([issue]))}}),
+        ]);
+        let source = LinearGraphQlSource::with_endpoint("test-key", endpoint)
+            .expect("source with local endpoint");
+        let cache_path = std::env::temp_dir().join(format!(
+            "ix-board-linear-paused-transport-{}.sqlite",
+            std::process::id()
+        ));
+        let mut service = ReadService::open(source, &cache_path).expect("open read service");
+        let queue = service.next("SWM").expect("read next queue");
+        server.join().expect("mock server");
+        let _ = std::fs::remove_file(cache_path);
+
+        assert!(queue.is_empty());
+    }
+
+    #[test]
     fn typed_graphql_records_decode_selected_camel_case_fields() {
         let project: ProjectData = serde_json::from_value(serde_json::json!({
             "projects": {
