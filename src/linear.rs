@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
-// Linear's project query includes several nested connections; 50 exceeds its complexity cap.
+// Keep the project query below Linear's complexity limit while retaining nested page coverage.
 const PAGE_SIZE: i32 = 20;
+const PROJECT_NESTED_PAGE_SIZE: i32 = 50;
 const RELATION_PAGE_SIZE: i32 = 50;
 const PAGE_LIMIT: usize = 1_000;
 // Invalidate cached snapshots that stored a display name instead of the semantic started state.
@@ -21,13 +22,13 @@ const CACHE_MODEL_VERSION: &str = "v2";
 const ENDPOINT: &str = "https://api.linear.app/graphql";
 
 const PROJECT_QUERY: &str = r#"
-query WorkspaceProjects($first: Int!, $after: String) {
+query WorkspaceProjects($first: Int!, $nestedFirst: Int!, $after: String) {
   projects(first: $first, after: $after) {
     nodes {
       id identifier name description content priority sortOrder
       status { name }
-      teams(first: $first) { nodes { key } pageInfo { hasNextPage } }
-      projectMilestones(first: $first) {
+      teams(first: $nestedFirst) { nodes { key } pageInfo { hasNextPage } }
+      projectMilestones(first: $nestedFirst) {
         nodes { id name description sortOrder }
         pageInfo { hasNextPage }
       }
@@ -121,12 +122,14 @@ impl LinearGraphQlSource {
         query: &'static str,
         after: Option<&str>,
         relation_first: Option<i32>,
+        nested_first: Option<i32>,
     ) -> Result<T, Error> {
         self.request(
             query,
             Variables {
                 first: PAGE_SIZE,
                 relation_first,
+                nested_first,
                 after: after.map(str::to_owned),
             },
         )
@@ -167,7 +170,12 @@ impl WorkspaceSource for LinearGraphQlSource {
         let mut projects = Vec::new();
         let mut after = None;
         for page in 0..PAGE_LIMIT {
-            let result: ProjectData = self.query(PROJECT_QUERY, after.as_deref(), None)?;
+            let result: ProjectData = self.query(
+                PROJECT_QUERY,
+                after.as_deref(),
+                None,
+                Some(PROJECT_NESTED_PAGE_SIZE),
+            )?;
             let connection = result.projects;
             for raw in connection.nodes {
                 if raw.teams.page_info.has_next_page {
@@ -225,8 +233,12 @@ impl WorkspaceSource for LinearGraphQlSource {
         let mut raw_issues = Vec::new();
         let mut after = None;
         for page in 0..PAGE_LIMIT {
-            let result: IssueData =
-                self.query(ISSUE_QUERY, after.as_deref(), Some(RELATION_PAGE_SIZE))?;
+            let result: IssueData = self.query(
+                ISSUE_QUERY,
+                after.as_deref(),
+                Some(RELATION_PAGE_SIZE),
+                None,
+            )?;
             let connection = result.issues;
             for raw in connection.nodes {
                 if raw.relations.page_info.has_next_page {
@@ -328,7 +340,7 @@ impl LinearGraphQlSource {
         let mut after = None;
         for page in 0..PAGE_LIMIT {
             let result: ProjectStatusesData =
-                self.query(PROJECT_STATUSES_QUERY, after.as_deref(), None)?;
+                self.query(PROJECT_STATUSES_QUERY, after.as_deref(), None, None)?;
             let connection = result.project_statuses;
             statuses.extend(connection.nodes);
             if !connection.page_info.has_next_page {
@@ -434,6 +446,9 @@ struct Variables {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "relationFirst")]
     relation_first: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "nestedFirst")]
+    nested_first: Option<i32>,
     after: Option<String>,
 }
 
@@ -881,11 +896,10 @@ mod tests {
 
         let requests = server.join().expect("mock server");
         assert_eq!(requests.len(), 2);
-        assert!(
-            requests
-                .iter()
-                .all(|request| request["variables"]["first"] == 20)
-        );
+        assert_eq!(requests[0]["variables"]["first"], 20);
+        assert_eq!(requests[0]["variables"]["nestedFirst"], 50);
+        assert_eq!(requests[1]["variables"]["first"], 20);
+        assert!(requests[1]["variables"]["nestedFirst"].is_null());
     }
 
     #[test]
