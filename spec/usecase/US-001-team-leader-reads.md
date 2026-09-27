@@ -40,8 +40,10 @@ reads through a warm cache.
 
 - **Given** a running project with tickets at different dependency layers
 - **When** the team leader requests the next queue for that team
-- **Then** eligible work is ordered by its applicable spec step and each row
-  explains its readiness or position
+- **Then** eligible work is ordered by project priority and project manual
+  order, then by ticket priority and ticket manual order, with stable project
+  and ticket identifiers as final tie-breakers; each row includes its applicable
+  spec step and explains its readiness or position
 
 ### US-001-EX-2: Inspect a project
 
