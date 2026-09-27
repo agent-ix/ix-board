@@ -41,6 +41,65 @@ workspace snapshot in SQLite for five minutes. The default cache is the
 platform's application cache directory; `IX_BOARD_CACHE_PATH` can select a
 specific database path.
 
+## Drift report
+
+`drift` evaluates a versioned evidence file against an explicit lead and
+threshold configuration. It does not guess attribution from the shared GitHub
+account and does not call an LLM:
+
+```bash
+ix-board drift --config drift-config.json --evidence drift-evidence-v1.json
+ix-board drift --config drift-config.json --evidence drift-evidence-v1.json --json
+```
+
+The config JSON is a strict `DriftConfig` object with `report_time` (RFC 3339),
+`window_hours`, `stall_hours`, `spend_threshold`,
+`max_net_ticket_growth`, `min_merged_prs_for_churn`, and an ordered `leads`
+array of `{ "lead_id": "...", "team_key": "..." }` values. Time-window and
+stall hours must be positive; spend and churn thresholds must be nonnegative;
+each team can belong to only one configured lead.
+
+The evidence JSON envelope is strict and versioned:
+
+```json
+{
+  "schema_version": 1,
+  "evidence": {
+    "projects": [],
+    "tickets": [],
+    "transitions": [],
+    "pull_requests": [],
+    "commits": [],
+    "herdr_busy": { "lead-id": false },
+    "otel_spend": { "lead-id": 0.0 },
+    "missing": []
+  }
+}
+```
+
+Each record uses the corresponding strict, typed struct in the public Rust API.
+Project and issue snapshots must be complete for the configured leads.
+`transitions` carry a `queue_before` snapshot for each Coding transition,
+including the historical project/ticket ordering, spec and workflow states,
+and blocker edges. `queue_before.missing_inputs` names any historical field
+that could not be reconstructed. Pull request and commit records must cover
+all configured repositories and the whole reporting interval (plus PRs merged
+in the interval even if opened earlier); no pagination or partition may be
+silently omitted. Add `missing` entries such as
+`{"source":"github.prs","reason":"page 3 cursor unresolved"}` for every
+source page, partition, or history query that is incomplete. Applicable signals
+remain visible but become `unavailable`; their counts are `null` and the report
+cannot claim `on_track` from partial evidence. Omit a lead key from
+`herdr_busy` or `otel_spend` when that observation is unavailable. An explicit
+observed spend of zero is not activity, including when `spend_threshold` is
+zero.
+
+The evidence contract is the source boundary for drift v1. ix-board does not
+fetch GitHub or historical Linear data for this command because this
+repository has no configured repository list or complete historical queue
+source. A collector must supply structured API records and pagination/history
+completeness; the evaluator fails closed when it reports missing evidence.
+
 ## License
 
 AGPL-3.0-or-later
