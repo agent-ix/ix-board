@@ -5,7 +5,8 @@
 
 use clap::{Parser, Subcommand};
 use ix_board::{
-    Error, LinearGraphQlSource, NextStep, ProjectChunk, ReadService, ReadyItem, SearchResult,
+    Error, LinearGraphQlSource, NextStep, ProjectChunk, ProjectPriority, ProjectRunStatus,
+    ReadService, ReadyItem, SearchResult,
 };
 use ix_cli_kit::exit::Outcome;
 use ix_cli_kit::streams::{
@@ -18,7 +19,7 @@ use std::path::PathBuf;
 #[command(
     name = "ix-board",
     version,
-    about = "Deterministic, cached Linear reads for ready work, project context, and search."
+    about = "Deterministic Linear project controls and cached reads for ready work and project context."
 )]
 struct Cli {
     /// Emit machine-readable JSON on stdout instead of human-readable text.
@@ -55,6 +56,31 @@ enum Command {
         /// Case-insensitive substring query.
         query: String,
     },
+    /// Update one of the two supported Linear project fields.
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ProjectCommand {
+    /// Set the project run state to Started or Paused.
+    SetStatus {
+        /// Linear project identifier or UUID.
+        project: String,
+        /// One of: Started, Paused.
+        #[arg(value_parser = parse_project_status)]
+        status: ProjectRunStatus,
+    },
+    /// Set the project priority to a Linear priority value.
+    SetPriority {
+        /// Linear project identifier or UUID.
+        project: String,
+        /// 0=No priority, 1=Urgent, 2=High, 3=Medium, 4=Low.
+        #[arg(value_parser = parse_project_priority)]
+        priority: ProjectPriority,
+    },
 }
 
 #[derive(Serialize)]
@@ -63,6 +89,23 @@ enum Output {
     Queue(Vec<ReadyItem>),
     Chunk(ProjectChunk),
     Search(Vec<SearchResult>),
+    ProjectStatusUpdated {
+        project: String,
+        status: String,
+    },
+    ProjectPriorityUpdated {
+        project: String,
+        priority: i32,
+        label: String,
+    },
+}
+
+fn parse_project_status(value: &str) -> Result<ProjectRunStatus, String> {
+    value.parse().map_err(|error: Error| error.to_string())
+}
+
+fn parse_project_priority(value: &str) -> Result<ProjectPriority, String> {
+    value.parse().map_err(|error: Error| error.to_string())
 }
 
 fn main() -> std::process::ExitCode {
@@ -97,9 +140,11 @@ fn main() -> std::process::ExitCode {
         Err(error) => {
             emit_diagnostic(diagnostics, "error", &error.to_string());
             std::process::ExitCode::from(match error {
-                Error::InvalidTeam | Error::InvalidQuery | Error::ProjectNotFound { .. } => {
-                    Outcome::Invalid
-                }
+                Error::InvalidTeam
+                | Error::InvalidQuery
+                | Error::ProjectNotFound { .. }
+                | Error::InvalidProjectStatus { .. }
+                | Error::InvalidProjectPriority { .. } => Outcome::Invalid,
                 _ => Outcome::Internal,
             })
         }
@@ -115,6 +160,12 @@ fn validate_command(command: &Command) -> Result<(), Error> {
                 identifier: project.clone(),
             })
         }
+        Command::Project {
+            command:
+                ProjectCommand::SetStatus { project, .. } | ProjectCommand::SetPriority { project, .. },
+        } if project.trim().is_empty() => Err(Error::ProjectNotFound {
+            identifier: project.clone(),
+        }),
         _ => Ok(()),
     }
 }
@@ -127,6 +178,23 @@ fn run(command: Command) -> Result<Output, Error> {
         Command::Next { team } => service.next(&team).map(Output::Queue),
         Command::ProjectChunk { project } => service.project_chunk(&project).map(Output::Chunk),
         Command::Search { query } => service.search(&query).map(Output::Search),
+        Command::Project {
+            command: ProjectCommand::SetStatus { project, status },
+        } => service
+            .set_project_status(&project, status)
+            .map(|()| Output::ProjectStatusUpdated {
+                project,
+                status: status.as_str().to_owned(),
+            }),
+        Command::Project {
+            command: ProjectCommand::SetPriority { project, priority },
+        } => service.set_project_priority(&project, priority).map(|()| {
+            Output::ProjectPriorityUpdated {
+                project,
+                priority: priority.linear_value(),
+                label: priority.label().to_owned(),
+            }
+        }),
     }
 }
 
@@ -150,6 +218,16 @@ fn render_human(output: &Output) -> String {
             .map(|record| format!("{:?} {} — {}", record.kind, record.identifier, record.name))
             .collect::<Vec<_>>()
             .join("\n"),
+        Output::ProjectStatusUpdated { project, status } => {
+            format!("Project {project} status set to {status}")
+        }
+        Output::ProjectPriorityUpdated {
+            project,
+            priority,
+            label,
+        } => {
+            format!("Project {project} priority set to {priority} ({label})")
+        }
     }
 }
 
