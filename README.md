@@ -41,6 +41,11 @@ workspace snapshot in SQLite for five minutes. The default cache is the
 platform's application cache directory; `IX_BOARD_CACHE_PATH` can select a
 specific database path.
 
+Library consumers can call `ReadService::workspace_snapshot` for the cached
+workspace, `force_refresh_workspace` to fetch through the five-minute cache,
+and `invalidate_cache` to discard a snapshot before a write. A failed forced
+refresh leaves no cached snapshot for subsequent reads.
+
 ## Drift report
 
 `drift` evaluates a versioned evidence file against an explicit lead and
@@ -99,6 +104,23 @@ fetch GitHub or historical Linear data for this command because this
 repository has no configured repository list or complete historical queue
 source. A collector must supply structured API records and pagination/history
 completeness; the evaluator fails closed when it reports missing evidence.
+
+## JSON Schema for downstream clients
+
+The public project, ready-queue, and drift wire types derive `schemars::JsonSchema`
+from their authoritative Rust definitions. Export a schema for a downstream
+contract build with:
+
+```bash
+cargo run --example export_schema -- Project > project.schema.json
+cargo run --example export_schema -- ProjectChunk > project-chunk.schema.json
+cargo run --example export_schema -- ReadyItem > ready-item.schema.json
+cargo run --example export_schema -- DriftReport > drift-report.schema.json
+```
+
+The schemas describe the serialized wire shape, including flattened signal
+availability fields and enum values. Downstream projects can generate
+TypeScript declarations from these schemas without copying the Rust models.
 
 ## License
 

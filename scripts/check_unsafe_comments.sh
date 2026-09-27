@@ -41,16 +41,18 @@ fi
 audited=${#unsafe_lines[@]}
 
 missing_lines=()
-for entry in "${unsafe_lines[@]}"; do
-  file=${entry%%:*}
-  rest=${entry#*:}
-  line=${rest%%:*}
+if [[ "$audited" -gt 0 ]]; then
+  for entry in "${unsafe_lines[@]}"; do
+    file=${entry%%:*}
+    rest=${entry#*:}
+    line=${rest%%:*}
 
-  start=$(( line > 3 ? line - 3 : 1 ))
-  if ! sed -n "${start},${line}p" "$file" | grep -q '// SAFETY:'; then
-    missing_lines+=("${file}:${line}")
-  fi
-done
+    start=$(( line > 3 ? line - 3 : 1 ))
+    if ! sed -n "${start},${line}p" "$file" | grep -q '// SAFETY:'; then
+      missing_lines+=("${file}:${line}")
+    fi
+  done
+fi
 
 if [[ "$update_baseline" == true ]]; then
   if [[ ${#missing_lines[@]} -eq 0 ]]; then

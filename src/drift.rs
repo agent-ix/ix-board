@@ -3,12 +3,13 @@
 
 //! Typed evidence and deterministic alert classification for `drift` reports.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use thiserror::Error as ThisError;
 
 /// A configured team leader and the Linear team they own.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DriftLead {
     /// Stable lead identifier.
@@ -18,7 +19,7 @@ pub struct DriftLead {
 }
 
 /// Thresholds and reporting interval for a drift read.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DriftConfig {
     /// End of the half-open reporting interval, as RFC 3339.
@@ -38,7 +39,7 @@ pub struct DriftConfig {
 }
 
 /// A project state used to reconstruct a queue at a Coding transition.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HistoricalProject {
     /// Stable project ID.
@@ -56,7 +57,7 @@ pub struct HistoricalProject {
 }
 
 /// A ticket state used to reconstruct the queue at a Coding transition.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HistoricalTicket {
     /// Stable Linear issue ID.
@@ -80,7 +81,7 @@ pub struct HistoricalTicket {
 }
 
 /// Full contemporaneous state immediately before a Coding transition.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct QueueEvidence {
     /// Projects available in the historical read.
@@ -92,7 +93,7 @@ pub struct QueueEvidence {
 }
 
 /// A ticket and project at report time.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DriftTicket {
     /// Stable Linear issue ID.
@@ -122,7 +123,7 @@ pub struct DriftTicket {
 }
 
 /// A Linear issue state transition event.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct IssueTransition {
     /// Stable event ID used for de-duplication.
@@ -140,7 +141,7 @@ pub struct IssueTransition {
 }
 
 /// A GitHub pull request with structured metadata.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DriftPullRequest {
     /// Repository in `owner/name` form.
@@ -162,7 +163,7 @@ pub struct DriftPullRequest {
 }
 
 /// A commit associated with ticket identifiers in its structured branch or message.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DriftCommit {
     /// Stable Git commit SHA.
@@ -176,7 +177,7 @@ pub struct DriftCommit {
 }
 
 /// A signal source and a page or partition that could not be fully read.
-#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MissingEvidence {
     /// Source name, such as `github.prs` or `linear.history`.
@@ -186,7 +187,7 @@ pub struct MissingEvidence {
 }
 
 /// Complete structured records and explicit completeness for a drift read.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DriftEvidence {
     /// Current Linear projects.
@@ -208,7 +209,7 @@ pub struct DriftEvidence {
 }
 
 /// Versioned file envelope accepted by `ix-board drift --evidence`.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DriftEvidenceFile {
     /// Evidence contract version; currently `1`.
@@ -221,7 +222,7 @@ pub struct DriftEvidenceFile {
 pub const DRIFT_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 
 /// Shared availability fields for one signal group.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SignalAvailability {
     /// Whether all required source records were enumerated.
@@ -231,7 +232,7 @@ pub struct SignalAvailability {
 }
 
 /// Whether a signal has complete source evidence.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Availability {
     /// Required source pages and partitions are complete.
@@ -241,7 +242,7 @@ pub enum Availability {
 }
 
 /// The PR-to-ticket scope signal.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PrScopeSignal {
     /// Source completeness.
@@ -252,7 +253,7 @@ pub struct PrScopeSignal {
 }
 
 /// One attributed PR's scope classification.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ScopedPullRequest {
     /// Repository in `owner/name` form.
@@ -270,7 +271,7 @@ pub struct ScopedPullRequest {
 }
 
 /// Whether an attributed new PR belongs to a lead's running project scope.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ScopeClassification {
     /// Ticket belongs to a running project of this lead.
@@ -280,7 +281,7 @@ pub enum ScopeClassification {
 }
 
 /// A Coding transition that was outside the ready queue or jumped its order.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct VeeringTicket {
     /// Human-readable ticket identifier.
@@ -294,7 +295,7 @@ pub struct VeeringTicket {
 }
 
 /// Queue-veering reason.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum VeeringReason {
     /// Ticket was outside the lead's running project scope.
@@ -304,7 +305,7 @@ pub enum VeeringReason {
 }
 
 /// Coding-state queue veering signal.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct VeeringSignal {
     /// Source completeness.
@@ -315,7 +316,7 @@ pub struct VeeringSignal {
 }
 
 /// A Coding ticket that has been idle longer than the configured stall interval.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StalledTicket {
     /// Human-readable ticket identifier.
@@ -329,7 +330,7 @@ pub struct StalledTicket {
 }
 
 /// Coding stall signal.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StallSignal {
     /// Source completeness.
@@ -340,7 +341,7 @@ pub struct StallSignal {
 }
 
 /// Busy or spending without an attributed new PR.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BusyWithoutPrSignal {
     /// Source completeness.
@@ -357,7 +358,7 @@ pub struct BusyWithoutPrSignal {
 }
 
 /// Ticket and merged-PR counts for a lead's running scope.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TicketChurnSignal {
     /// Source completeness.
@@ -374,7 +375,7 @@ pub struct TicketChurnSignal {
 }
 
 /// Five evidence-bearing signal groups for a configured lead.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LeadSignals {
     /// New attributed PRs and scope.
@@ -390,7 +391,7 @@ pub struct LeadSignals {
 }
 
 /// One of the two configured alerts.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DriftAlert {
     /// Alert kind.
@@ -400,7 +401,9 @@ pub struct DriftAlert {
 }
 
 /// The two alert kinds derived from the five signal groups.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, PartialEq, Ord, PartialOrd, Serialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum AlertKind {
     /// Out-of-scope attributed PR or queue-veering transition.
@@ -410,7 +413,7 @@ pub enum AlertKind {
 }
 
 /// A configured lead's ordered projects, status, alerts, reasons, and signals.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LeadDriftReport {
     /// Configured stable lead ID.
@@ -430,7 +433,7 @@ pub struct LeadDriftReport {
 }
 
 /// One running project in queue order.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RunningProject {
     /// Stable project ID.
@@ -440,7 +443,7 @@ pub struct RunningProject {
 }
 
 /// Lead status after evaluating both alerts and required signal completeness.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum LeadStatus {
     /// Both alert conditions were false with complete evidence.
@@ -452,7 +455,7 @@ pub enum LeadStatus {
 }
 
 /// A PR that could not be attributed to a configured lead.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UnassignedPullRequest {
     /// Repository in `owner/name` form.
@@ -476,7 +479,7 @@ pub struct UnassignedPullRequest {
 }
 
 /// Why an observed PR lacks lead attribution.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum UnassignedReason {
     /// No ticket ID was found in branch or title.
@@ -490,7 +493,7 @@ pub enum UnassignedReason {
 }
 
 /// Stable typed output of one `drift` read.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DriftReport {
     /// RFC 3339 UTC report time.

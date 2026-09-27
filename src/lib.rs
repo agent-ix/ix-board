@@ -216,15 +216,32 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
         Ok(search_snapshot(&snapshot, query))
     }
 
+    /// Returns the cached workspace snapshot, fetching it when the cache has expired.
+    pub fn workspace_snapshot(&mut self) -> Result<WorkspaceSnapshot, Error> {
+        self.snapshot()
+    }
+
+    /// Fetches a new workspace snapshot even when the cache is still fresh.
+    /// A failed fetch leaves the cache empty so later reads cannot use stale data.
+    pub fn force_refresh_workspace(&mut self) -> Result<WorkspaceSnapshot, Error> {
+        self.cache.invalidate()?;
+        let snapshot = self.source.fetch_workspace()?;
+        self.cache
+            .replace(self.clock.now_epoch_seconds(), &snapshot)?;
+        Ok(snapshot)
+    }
+
+    /// Removes this source's cached snapshot before a write or uncertain source state.
+    pub fn invalidate_cache(&mut self) -> Result<(), Error> {
+        self.cache.invalidate()
+    }
+
     fn snapshot(&mut self) -> Result<WorkspaceSnapshot, Error> {
         let now = self.clock.now_epoch_seconds();
         if let Some(snapshot) = self.cache.fresh(now)? {
             return Ok(snapshot);
         }
-        let snapshot = self.source.fetch_workspace()?;
-        self.cache
-            .replace(self.clock.now_epoch_seconds(), &snapshot)?;
-        Ok(snapshot)
+        self.force_refresh_workspace()
     }
 }
 
