@@ -50,6 +50,7 @@ account and does not call an LLM:
 ```bash
 ix-board drift --config drift-config.json --evidence drift-evidence-v1.json
 ix-board drift --config drift-config.json --evidence drift-evidence-v1.json --json
+ix-board drift --config drift-config.json --evidence drift-evidence-v1.json --github-org agent-ix --json
 ```
 
 The config JSON is a strict `DriftConfig` object with `report_time` (RFC 3339),
@@ -95,9 +96,14 @@ observed spend of zero is not activity, including when `spend_threshold` is
 zero.
 
 The evidence contract is the source boundary for drift v1. ix-board does not
-fetch GitHub or historical Linear data for this command because this
-repository has no configured repository list or complete historical queue
-source. A collector must supply structured API records and pagination/history
+fetch historical Linear data for this command because a complete historical
+queue source is not configured. With `--github-org`, it fetches authenticated
+GitHub PR creation and merge events across the named organization through
+`gh api graphql`, replaces the evidence file's empty `pull_requests` array,
+and records search failures, null results, missing cursors, and the GitHub
+1,000-result search limit as `github.prs` gaps. The evidence file must not
+contain PRs or an existing `github.prs` missing marker when this option is used.
+Other collectors must supply structured API records and pagination/history
 completeness; the evaluator fails closed when it reports missing evidence.
 
 ## License

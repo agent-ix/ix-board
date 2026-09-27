@@ -4,6 +4,7 @@
 //! Command-line interface for deterministic cached Linear reads.
 
 use clap::{Parser, Subcommand};
+use ix_board::drift_github::collect_prs;
 use ix_board::{
     DriftConfig, DriftError, DriftEvidenceFile, DriftReport, Error, LinearGraphQlSource, NextStep,
     ProjectChunk, ProjectPriority, ProjectRunStatus, ReadService, ReadyItem, SearchResult,
@@ -65,6 +66,9 @@ enum Command {
         /// JSON file containing source records and completeness attestations.
         #[arg(long)]
         evidence: PathBuf,
+        /// Fetch complete GitHub PR event pages for this organization.
+        #[arg(long)]
+        github_org: Option<String>,
     },
     /// Update one of the two supported Linear project fields.
     Project {
@@ -186,7 +190,11 @@ fn validate_command(command: &Command) -> Result<(), Error> {
 
 fn run(command: Command) -> Result<Output, Error> {
     match command {
-        Command::Drift { config, evidence } => run_drift(&config, &evidence).map(Output::Drift),
+        Command::Drift {
+            config,
+            evidence,
+            github_org,
+        } => run_drift(&config, &evidence, github_org.as_deref()).map(Output::Drift),
         other => run_linear(other),
     }
 }
@@ -222,7 +230,11 @@ fn run_linear(command: Command) -> Result<Output, Error> {
     }
 }
 
-fn run_drift(config_path: &PathBuf, evidence_path: &PathBuf) -> Result<DriftReport, Error> {
+fn run_drift(
+    config_path: &PathBuf,
+    evidence_path: &PathBuf,
+    github_org: Option<&str>,
+) -> Result<DriftReport, Error> {
     let config_text =
         std::fs::read_to_string(config_path).map_err(|source| Error::DriftInputRead {
             path: config_path.display().to_string(),
@@ -238,11 +250,30 @@ fn run_drift(config_path: &PathBuf, evidence_path: &PathBuf) -> Result<DriftRepo
             path: evidence_path.display().to_string(),
             source,
         })?;
-    let evidence: DriftEvidenceFile =
+    let mut evidence: DriftEvidenceFile =
         serde_json::from_str(&evidence_text).map_err(|source| Error::DriftInputDecode {
             path: evidence_path.display().to_string(),
             source,
         })?;
+    if let Some(organization) = github_org {
+        if organization.is_empty()
+            || organization.len() > 39
+            || !organization
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+            || !evidence.evidence.pull_requests.is_empty()
+            || evidence
+                .evidence
+                .missing
+                .iter()
+                .any(|gap| gap.source == "github.prs")
+        {
+            return Err(Error::Drift(DriftError::InvalidConfig {reason:"--github-org requires a nonempty organization and evidence with no GitHub PR records or missing markers".into()}));
+        }
+        let (prs, missing) = collect_prs(organization, &config);
+        evidence.evidence.pull_requests = prs;
+        evidence.evidence.missing.extend(missing);
+    }
     Ok(evaluate_drift_file(&config, &evidence)?)
 }
 

@@ -5,6 +5,7 @@
 
 mod cache;
 mod drift;
+pub mod drift_github;
 mod linear;
 mod model;
 
