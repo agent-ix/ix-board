@@ -9,6 +9,7 @@ use crate::{
 };
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 const PAGE_SIZE: i32 = 50;
@@ -53,6 +54,7 @@ query WorkspaceIssues($first: Int!, $relationFirst: Int!, $after: String) {
 pub struct LinearGraphQlSource {
     client: Client,
     api_key: String,
+    cache_namespace: String,
 }
 
 impl LinearGraphQlSource {
@@ -62,11 +64,13 @@ impl LinearGraphQlSource {
         if api_key.trim().is_empty() {
             return Err(Error::MissingApiKey);
         }
+        let cache_namespace = format!("linear:sha256:{:x}", Sha256::digest(api_key.as_bytes()));
         Ok(Self {
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()?,
             api_key,
+            cache_namespace,
         })
     }
 
@@ -111,6 +115,10 @@ impl LinearGraphQlSource {
 }
 
 impl WorkspaceSource for LinearGraphQlSource {
+    fn cache_namespace(&self) -> String {
+        self.cache_namespace.clone()
+    }
+
     fn fetch_workspace(&self) -> Result<WorkspaceSnapshot, Error> {
         let mut projects = Vec::new();
         let mut after = None;

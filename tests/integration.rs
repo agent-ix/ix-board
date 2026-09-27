@@ -17,6 +17,7 @@ struct FixtureSource {
     snapshot: Arc<Mutex<WorkspaceSnapshot>>,
     reads: Arc<AtomicUsize>,
     fail: Arc<AtomicBool>,
+    namespace: String,
 }
 
 impl FixtureSource {
@@ -25,7 +26,13 @@ impl FixtureSource {
             snapshot: Arc::new(Mutex::new(snapshot)),
             reads: Arc::new(AtomicUsize::new(0)),
             fail: Arc::new(AtomicBool::new(false)),
+            namespace: "fixture-default".to_owned(),
         }
+    }
+
+    fn with_namespace(mut self, namespace: &str) -> Self {
+        self.namespace = namespace.to_owned();
+        self
     }
 
     fn replace(&self, snapshot: WorkspaceSnapshot) {
@@ -34,6 +41,10 @@ impl FixtureSource {
 }
 
 impl WorkspaceSource for FixtureSource {
+    fn cache_namespace(&self) -> String {
+        self.namespace.clone()
+    }
+
     fn fetch_workspace(&self) -> Result<WorkspaceSnapshot, Error> {
         self.reads.fetch_add(1, Ordering::SeqCst);
         if self.fail.load(Ordering::SeqCst) {
@@ -491,6 +502,65 @@ fn cache_reuses_fresh_snapshot_and_refreshes_after_five_minutes() {
     assert_eq!(refreshed.len(), 1);
     assert_ne!(initial, refreshed);
     assert_eq!(source.reads.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn cache_snapshot_isolated_between_source_namespaces() {
+    let directory = TempDir::new().expect("temporary directory");
+    let cache_path = directory.path().join("shared-cache.sqlite");
+    let clock = ManualClock::new(30_000);
+    let mut first_snapshot = queue_fixture();
+    first_snapshot.projects[0].name = "First namespace project".to_owned();
+    let first_source = FixtureSource::new(first_snapshot).with_namespace("namespace-one");
+    let mut first = ReadService::with_clock(first_source, &cache_path, clock.clone())
+        .expect("open first namespace cache");
+    assert_eq!(
+        first
+            .search("First namespace")
+            .expect("first snapshot")
+            .len(),
+        1
+    );
+
+    let mut second_snapshot = queue_fixture();
+    second_snapshot.projects[0].name = "Second namespace project".to_owned();
+    let second_source = FixtureSource::new(second_snapshot).with_namespace("namespace-two");
+    let reads = second_source.reads.clone();
+    let mut second = ReadService::with_clock(second_source, &cache_path, clock)
+        .expect("open second namespace cache");
+    assert_eq!(
+        second
+            .search("Second namespace")
+            .expect("second snapshot")
+            .len(),
+        1
+    );
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn cache_database_permissions_are_restricted_for_existing_files() {
+    use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+
+    let directory = TempDir::new().expect("temporary directory");
+    let cache_path = directory.path().join("existing-cache.sqlite");
+    std::fs::write(&cache_path, []).expect("create existing cache file");
+    std::fs::set_permissions(&cache_path, Permissions::from_mode(0o644))
+        .expect("make existing cache readable by group");
+
+    let _service = ReadService::with_clock(
+        FixtureSource::new(queue_fixture()),
+        &cache_path,
+        ManualClock::new(40_000),
+    )
+    .expect("open cache");
+    let mode = std::fs::metadata(cache_path)
+        .expect("cache metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
 }
 
 #[test]

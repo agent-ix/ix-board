@@ -57,6 +57,9 @@ pub enum Error {
     /// SQLite could not read or write the cache.
     #[error("SQLite cache error: {0}")]
     Cache(#[source] rusqlite::Error),
+    /// The cache database permissions could not be restricted.
+    #[error("could not restrict cache database permissions: {0}")]
+    CachePermissions(#[source] std::io::Error),
     /// A cached timestamp could not be represented safely.
     #[error("cached timestamp overflow")]
     CacheTimestamp,
@@ -87,6 +90,11 @@ pub enum Error {
 pub trait WorkspaceSource: Send + Sync {
     /// Fetches all projects and issues needed for cross-team dependency resolution.
     fn fetch_workspace(&self) -> Result<WorkspaceSnapshot, Error>;
+
+    /// Identifies the source data for cache isolation. Fixture sources share a stable default.
+    fn cache_namespace(&self) -> String {
+        "fixture-default".to_owned()
+    }
 }
 
 /// Cached read service shared by the CLI and library consumers.
@@ -106,9 +114,10 @@ impl<S: WorkspaceSource> ReadService<S, SystemClock> {
 impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
     /// Opens a service with an injected clock, primarily useful for deterministic cache tests.
     pub fn with_clock(source: S, cache_path: &Path, clock: C) -> Result<Self, Error> {
+        let cache_namespace = source.cache_namespace();
         Ok(Self {
             source,
-            cache: SnapshotCache::open(cache_path)?,
+            cache: SnapshotCache::open(cache_path, &cache_namespace)?,
             clock,
         })
     }

@@ -33,11 +33,13 @@ impl Clock for SystemClock {
 /// SQLite-backed cache for a single workspace snapshot.
 pub(crate) struct SnapshotCache {
     connection: Connection,
+    cache_key: String,
 }
 
 impl SnapshotCache {
     /// Opens or creates the cache database at `path`.
-    pub(crate) fn open(path: &Path) -> Result<Self, Error> {
+    pub(crate) fn open(path: &Path, cache_key: &str) -> Result<Self, Error> {
+        restrict_permissions(path)?;
         let connection = Connection::open(path).map_err(Error::Cache)?;
         connection
             .execute_batch(
@@ -48,15 +50,18 @@ impl SnapshotCache {
                 );",
             )
             .map_err(Error::Cache)?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            cache_key: cache_key.to_owned(),
+        })
     }
 
     pub(crate) fn fresh(&self, now: i64) -> Result<Option<WorkspaceSnapshot>, Error> {
         let row = self
             .connection
             .query_row(
-                "SELECT fetched_at, payload FROM workspace_snapshot WHERE cache_key = 'workspace'",
-                [],
+                "SELECT fetched_at, payload FROM workspace_snapshot WHERE cache_key = ?1",
+                params![self.cache_key],
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
             )
             .optional()
@@ -80,12 +85,34 @@ impl SnapshotCache {
         self.connection
             .execute(
                 "INSERT INTO workspace_snapshot(cache_key, fetched_at, payload)
-                 VALUES ('workspace', ?1, ?2)
+                 VALUES (?1, ?2, ?3)
                  ON CONFLICT(cache_key) DO UPDATE SET fetched_at = excluded.fetched_at,
                    payload = excluded.payload",
-                params![now, payload],
+                params![self.cache_key, now, payload],
             )
             .map_err(Error::Cache)?;
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn restrict_permissions(path: &Path) -> Result<(), Error> {
+    use std::{
+        fs::OpenOptions,
+        os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    };
+
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(Error::CachePermissions)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(Error::CachePermissions)
+}
+
+#[cfg(not(unix))]
+fn restrict_permissions(_path: &Path) -> Result<(), Error> {
+    Ok(())
 }
