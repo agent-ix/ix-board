@@ -77,12 +77,20 @@ mutation ProjectUpdate($id: String!, $input: ProjectUpdateInput!) {
 pub struct LinearGraphQlSource {
     client: Client,
     api_key: String,
+    endpoint: String,
     cache_namespace: String,
 }
 
 impl LinearGraphQlSource {
     /// Creates a source using the supplied Linear API key.
     pub fn new(api_key: impl Into<String>) -> Result<Self, Error> {
+        Self::with_endpoint(api_key, ENDPOINT)
+    }
+
+    fn with_endpoint(
+        api_key: impl Into<String>,
+        endpoint: impl Into<String>,
+    ) -> Result<Self, Error> {
         let api_key = api_key.into();
         if api_key.trim().is_empty() {
             return Err(Error::MissingApiKey);
@@ -96,6 +104,7 @@ impl LinearGraphQlSource {
                 .timeout(std::time::Duration::from_secs(30))
                 .build()?,
             api_key,
+            endpoint: endpoint.into(),
             cache_namespace,
         })
     }
@@ -129,7 +138,7 @@ impl LinearGraphQlSource {
     ) -> Result<T, Error> {
         let response = self
             .client
-            .post(ENDPOINT)
+            .post(&self.endpoint)
             .header(reqwest::header::AUTHORIZATION, &self.api_key)
             .json(&GraphQlRequest { query, variables })
             .send()?
@@ -496,6 +505,8 @@ struct ProjectStatusScopeData {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawProjectStatusScope {
+    #[serde(rename = "id")]
+    _id: String,
     status: RawProjectStatusScopeStatus,
 }
 
@@ -647,11 +658,177 @@ struct RawRelationIssue {
 #[cfg(test)]
 mod tests {
     use super::{
-        IssueData, LinearProjectStatusType, ProjectData, ProjectUpdateInput,
+        IssueData, LinearGraphQlSource, LinearProjectStatusType, ProjectData, ProjectUpdateInput,
         RawProjectStatusOption, canonical_project_status, collect_blocked_by,
         resolve_project_status_id,
     };
-    use crate::{ProjectPriority, ProjectRunStatus};
+    use crate::{ProjectId, ProjectMutationSource, ProjectPriority, ProjectRunStatus, ReadService};
+    use serde_json::Value;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread::JoinHandle;
+
+    fn mock_linear(responses: Vec<Value>) -> (String, JoinHandle<Vec<Value>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Linear endpoint");
+        let endpoint = format!(
+            "http://{}/graphql",
+            listener.local_addr().expect("local addr")
+        );
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("accept GraphQL request");
+                requests.push(read_request(&mut stream));
+                let body = serde_json::to_vec(&response).expect("encode GraphQL response");
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .expect("write response headers");
+                stream.write_all(&body).expect("write response body");
+            }
+            requests
+        });
+        (endpoint, server)
+    }
+
+    fn read_request(stream: &mut TcpStream) -> Value {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        let (header_end, content_length) = loop {
+            let count = stream.read(&mut buffer).expect("read request");
+            assert_ne!(count, 0, "request ended before headers completed");
+            bytes.extend_from_slice(&buffer[..count]);
+            if let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                let header_text = String::from_utf8_lossy(&bytes[..header_end]);
+                let content_length = header_text
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().expect("content length"))
+                    })
+                    .expect("Content-Length header");
+                break (header_end + 4, content_length);
+            }
+        };
+        while bytes.len() < header_end + content_length {
+            let count = stream.read(&mut buffer).expect("read request body");
+            assert_ne!(count, 0, "request ended before body completed");
+            bytes.extend_from_slice(&buffer[..count]);
+        }
+        serde_json::from_slice(&bytes[header_end..header_end + content_length])
+            .expect("decode GraphQL request")
+    }
+
+    fn connection(nodes: Value) -> Value {
+        serde_json::json!({
+            "nodes": nodes,
+            "pageInfo": {"hasNextPage": false, "endCursor": null}
+        })
+    }
+
+    fn project_status_response() -> Value {
+        serde_json::json!({"data": {"project": {"id": "project-id", "status": {"team": null}}}})
+    }
+
+    fn project_statuses_response() -> Value {
+        serde_json::json!({"data": {"projectStatuses": connection(serde_json::json!([
+            {"id": "823c10d9-99c0-44ab-bb7a-26a453d3412f", "name": "In Progress", "type": "started", "team": null},
+            {"id": "aa78afd2-2630-412e-82af-45e504471946", "name": "Paused", "type": "planned", "team": null},
+            {"id": "planned-id", "name": "Planned", "type": "planned", "team": null}
+        ]))}})
+    }
+
+    fn update_response() -> Value {
+        serde_json::json!({"data": {"projectUpdate": {"success": true, "project": {"id": "project-id"}}}})
+    }
+
+    #[test]
+    fn status_mutations_discover_live_status_ids_and_write_only_status_id() {
+        let (endpoint, server) = mock_linear(vec![
+            project_status_response(),
+            project_statuses_response(),
+            update_response(),
+            project_status_response(),
+            project_statuses_response(),
+            update_response(),
+        ]);
+        let source = LinearGraphQlSource::with_endpoint("test-key", endpoint)
+            .expect("source with local endpoint");
+
+        source
+            .set_project_status(
+                &ProjectId("project-id".to_owned()),
+                ProjectRunStatus::Started,
+            )
+            .expect("set Started");
+        source
+            .set_project_status(
+                &ProjectId("project-id".to_owned()),
+                ProjectRunStatus::Paused,
+            )
+            .expect("set Paused");
+
+        let requests = server.join().expect("mock server");
+        let updates = requests
+            .iter()
+            .filter(|request| {
+                request["query"]
+                    .as_str()
+                    .is_some_and(|query| query.contains("mutation ProjectUpdate"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(
+            updates[0]["variables"]["input"],
+            serde_json::json!({
+                "statusId": "823c10d9-99c0-44ab-bb7a-26a453d3412f"
+            })
+        );
+        assert_eq!(
+            updates[1]["variables"]["input"],
+            serde_json::json!({
+                "statusId": "aa78afd2-2630-412e-82af-45e504471946"
+            })
+        );
+    }
+
+    #[test]
+    fn decoded_started_project_snapshot_remains_in_next_queue() {
+        let project = serde_json::json!({
+            "id": "project-id", "identifier": "SWM-P1", "name": "Project", "description": "Goal",
+            "content": null, "priority": 2, "sortOrder": 1.0,
+            "status": {"name": "In Progress", "type": "started"},
+            "teams": connection(serde_json::json!([{"key": "SWM"}])),
+            "projectMilestones": connection(serde_json::json!([]))
+        });
+        let issue = serde_json::json!({
+            "id": "issue-id", "identifier": "SWM-3", "title": "Project ticket", "description": null,
+            "priority": 2.0, "sortOrder": 1.0, "state": {"name": "Specced"}, "team": {"key": "SWM"},
+            "project": {"id": "project-id"},
+            "relations": connection(serde_json::json!([]))
+        });
+        let (endpoint, server) = mock_linear(vec![
+            serde_json::json!({"data": {"projects": connection(serde_json::json!([project]))}}),
+            serde_json::json!({"data": {"issues": connection(serde_json::json!([issue]))}}),
+        ]);
+        let source = LinearGraphQlSource::with_endpoint("test-key", endpoint)
+            .expect("source with local endpoint");
+        let cache_path = std::env::temp_dir().join(format!(
+            "ix-board-linear-transport-{}.sqlite",
+            std::process::id()
+        ));
+        let mut service = ReadService::open(source, &cache_path).expect("open read service");
+        let queue = service.next("SWM").expect("read next queue");
+        server.join().expect("mock server");
+        let _ = std::fs::remove_file(cache_path);
+
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].identifier, "SWM-3");
+        assert_eq!(queue[0].project, "SWM-P1");
+    }
 
     #[test]
     fn typed_graphql_records_decode_selected_camel_case_fields() {
