@@ -19,6 +19,8 @@ security_critical: false
 SWM-2 gives team leaders deterministic Linear reads for ready work, project
 context, and search through the ix-board CLI and library. SWM-3 adds explicit
 project status and priority writes so team leaders can control the run queue.
+SWM-4 reports evidence of work outside that queue and work that is active but
+not landing.
 
 ## Scope
 
@@ -32,10 +34,12 @@ project status and priority writes so team leaders can control the run queue.
 - The warm-cache latency target and team-leader skill handoff.
 - `project set-status` for `Started`/`Paused` and `project set-priority` for
   supported Linear project priority values; these are ix-board's only writes.
+- `drift` reports per-lead scope and churn signals from structured Linear,
+  GitHub, herdr, and OpenTelemetry records, with configurable thresholds,
+  JSON output, and one text line per lead.
 
 ### Out of Scope
 
-- Drift detection and reporting, which is a later feature.
 - Webhook-based cache refresh; SWM-2 uses polling.
 - LLM-based interpretation or actions based on ticket or comment prose.
 - Mutating Linear fields other than project status and priority, or mutating
@@ -51,8 +55,9 @@ ix-board is a deterministic Linear/GitHub CLI and library. SWM-2 adds fast,
 cached Linear reads for a team leader: a reasoned ready queue, a project summary,
 and search across tickets and projects. SWM-3 adds narrow project controls:
 `Started` runs a project and `Paused` holds it; project priority participates in
-the queue order defined by FR-001. The library obtains structured source
-records through Linear GraphQL and caches read results locally.
+the queue order defined by FR-001. SWM-4 adds a read-only drift report for the
+configured leads. The library obtains structured source records through Linear
+GraphQL and caches read results locally.
 
 ### Intended Users
 
@@ -61,11 +66,14 @@ records through Linear GraphQL and caches read results locally.
 
 ## Requirements Architecture
 
-The use case US-001 traces to FR-001 through FR-007 and NFR-001. Functional
-acceptance criteria include fixture checks for queue rules and cache behavior;
-NFR-001 specifies a lightweight warm-cache fixture benchmark.
+The use case US-001 traces to FR-001 through FR-007 and NFR-001. US-002 traces
+to FR-008 and FR-009, which depend on the queue and structured-data boundary.
+Functional acceptance criteria include fixture checks for each drift signal,
+queue rules, and cache behavior; NFR-001 specifies a lightweight warm-cache
+fixture benchmark.
 
 ## References
 
 - SWM-2, “ix-board: next, project-chunk and search with cache” (Linear).
+- SWM-4, “ix-board drift: out-of-scope and churn alerts” (Linear).
 - The ix-board README and source repository.
