@@ -36,7 +36,9 @@ not landing.
   supported Linear project priority values; these are ix-board's only writes.
 - `drift` reports per-lead scope and churn signals from structured Linear,
   GitHub, herdr, and OpenTelemetry records, with configurable thresholds,
-  JSON output, and one text line per lead.
+  a stable JSON field contract, and one text line per lead. Its time-based
+  decisions require complete event enumeration and contemporaneous queue
+  evidence; incomplete reads produce unavailable signal results.
 
 ### Out of Scope
 

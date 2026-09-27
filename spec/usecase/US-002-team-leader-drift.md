@@ -46,6 +46,19 @@ guessing a lead.
 - **Then** both forms state the same lead status and reasons, while the text
   form uses one line per lead
 
+### US-002-EX-4: Keep historical delivery visible
+
+- **Given** a PR opened before the reporting window and merged inside it
+- **When** the report counts landed work
+- **Then** the PR contributes to delivery without being treated as a new PR
+
+### US-002-EX-5: Recognize incomplete evidence
+
+- **Given** a missing source page or historical queue state for a Coding move
+- **When** the report is requested
+- **Then** the affected signal explains that its evidence is incomplete,
+  without presenting a clean status based on the partial view
+
 ## Notes (Informative)
 
 The shared GitHub account cannot establish which lead owns a PR without a
