@@ -336,6 +336,7 @@ fn next_applies_project_ticket_order_and_recursive_cross_team_blockers() {
             .iter()
             .all(|item| item.reason.contains("all recursive blockers are Completed"))
     );
+    assert_eq!(reads.next("swm").expect("repeated queue"), result);
 }
 
 #[test]
@@ -405,6 +406,14 @@ fn project_chunk_returns_goal_milestones_open_tickets_and_dependency_layers() {
     );
     assert_eq!(chunk.blocker_layers[1], ["OPS-5", "OPS-8"]);
     assert_eq!(chunk.blocker_layers[2], ["SWM-4", "SWM-7"]);
+
+    let sparse = reads.project_chunk("SWM-P4").expect("sparse project chunk");
+    assert!(sparse.milestones.is_empty());
+    assert_eq!(sparse.open_tickets.len(), 1);
+    assert!(matches!(
+        reads.project_chunk("missing-project"),
+        Err(Error::ProjectNotFound { .. })
+    ));
 }
 
 #[test]

@@ -8,7 +8,9 @@ use ix_board::{
     Error, LinearGraphQlSource, NextStep, ProjectChunk, ReadService, ReadyItem, SearchResult,
 };
 use ix_cli_kit::exit::Outcome;
-use ix_cli_kit::streams::{ColorChoice, Diagnostics, DiagnosticsFormat};
+use ix_cli_kit::streams::{
+    ColorChoice, Diagnostics, DiagnosticsFormat, emit_diagnostic, emit_result,
+};
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -65,31 +67,35 @@ enum Output {
 
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
-    let _diagnostics = Diagnostics::resolved(cli.diagnostics_format, cli.color);
+    let diagnostics = Diagnostics::resolved(cli.diagnostics_format, cli.color);
     if let Err(error) = validate_command(&cli.command) {
-        eprintln!("{error}");
+        emit_diagnostic(diagnostics, "error", &error.to_string());
         return std::process::ExitCode::from(Outcome::Invalid);
     }
     match run(cli.command) {
         Ok(output) => {
             let rendered = if cli.json {
-                serde_json::to_string_pretty(&output).map_err(|error| error.to_string())
+                ix_cli_kit::json::encode_canonical(&output, true).map_err(|error| error.to_string())
             } else {
                 Ok(render_human(&output))
             };
             match rendered {
                 Ok(text) => {
-                    println!("{text}");
+                    emit_result(&text);
                     std::process::ExitCode::from(Outcome::Ok)
                 }
                 Err(error) => {
-                    eprintln!("could not encode result: {error}");
+                    emit_diagnostic(
+                        diagnostics,
+                        "error",
+                        &format!("could not encode result: {error}"),
+                    );
                     std::process::ExitCode::from(Outcome::Internal)
                 }
             }
         }
         Err(error) => {
-            eprintln!("{error}");
+            emit_diagnostic(diagnostics, "error", &error.to_string());
             std::process::ExitCode::from(match error {
                 Error::InvalidTeam | Error::InvalidQuery | Error::ProjectNotFound { .. } => {
                     Outcome::Invalid

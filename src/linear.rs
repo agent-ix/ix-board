@@ -198,17 +198,7 @@ impl WorkspaceSource for LinearGraphQlSource {
             }
         }
 
-        let mut blocked_by = BTreeMap::<String, BTreeSet<String>>::new();
-        for issue in &raw_issues {
-            for relation in &issue.relations.nodes {
-                if relation.relation_type == "blocks" {
-                    blocked_by
-                        .entry(relation.issue.id.clone())
-                        .or_default()
-                        .insert(relation.related_issue.id.clone());
-                }
-            }
-        }
+        let blocked_by = collect_blocked_by(&raw_issues);
         let issues = raw_issues
             .into_iter()
             .map(|raw| {
@@ -234,6 +224,21 @@ impl WorkspaceSource for LinearGraphQlSource {
             .collect();
         Ok(WorkspaceSnapshot { projects, issues })
     }
+}
+
+fn collect_blocked_by(raw_issues: &[RawIssue]) -> BTreeMap<String, BTreeSet<String>> {
+    let mut blocked_by = BTreeMap::<String, BTreeSet<String>>::new();
+    for issue in raw_issues {
+        for relation in &issue.relations.nodes {
+            if relation.relation_type == "blocks" {
+                blocked_by
+                    .entry(relation.related_issue.id.clone())
+                    .or_default()
+                    .insert(relation.issue.id.clone());
+            }
+        }
+    }
+    blocked_by
 }
 
 #[derive(Serialize)]
@@ -375,7 +380,7 @@ struct RawRelationIssue {
 
 #[cfg(test)]
 mod tests {
-    use super::{IssueData, ProjectData};
+    use super::{IssueData, ProjectData, collect_blocked_by};
 
     #[test]
     fn typed_graphql_records_decode_selected_camel_case_fields() {
@@ -446,6 +451,11 @@ mod tests {
         assert_eq!(
             issues.issues.nodes[0].relations.nodes[0].issue.id,
             "blocker-uuid"
+        );
+        assert!(
+            collect_blocked_by(&issues.issues.nodes)
+                .get("issue-uuid")
+                .is_some_and(|ids| ids.contains("blocker-uuid"))
         );
     }
 }

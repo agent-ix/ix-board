@@ -37,7 +37,7 @@ pub struct Project {
     pub content: Option<String>,
     /// Structured lifecycle status name.
     pub status: String,
-    /// Lower values have higher priority in Linear.
+    /// Linear project priority; zero means unprioritized, while lower nonzero values rank higher.
     pub priority: i32,
     /// Linear manual project order.
     pub sort_order: f64,
@@ -79,7 +79,7 @@ pub struct Issue {
     pub team_key: TeamKey,
     /// Associated project UUID.
     pub project_id: Option<ProjectId>,
-    /// Linear numeric priority (0 is unprioritized).
+    /// Linear numeric priority; zero means unprioritized, while lower nonzero values rank higher.
     pub priority: f64,
     /// Linear manual issue order.
     pub sort_order: f64,
@@ -137,7 +137,7 @@ pub struct ProjectChunk {
     pub milestones: Vec<Milestone>,
     /// Open project issues in identifier order.
     pub open_tickets: Vec<ChunkIssue>,
-    /// Dependency layers, with prerequisites before dependent issues.
+    /// Dependency layers reachable from open project tickets, prerequisites before dependents.
     pub blocker_layers: Vec<Vec<String>>,
 }
 
@@ -153,7 +153,7 @@ pub struct ChunkIssue {
     pub description: Option<String>,
     /// Workflow state name.
     pub state: String,
-    /// Open prerequisite identifiers in this project.
+    /// Direct prerequisite identifiers, including completed and cross-team issues.
     pub blocked_by: Vec<String>,
 }
 
