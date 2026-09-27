@@ -41,6 +41,11 @@ workspace snapshot in SQLite for five minutes. The default cache is the
 platform's application cache directory; `IX_BOARD_CACHE_PATH` can select a
 specific database path.
 
+Library consumers can call `ReadService::workspace_snapshot` for the cached
+workspace, `force_refresh_workspace` to fetch through the five-minute cache,
+and `invalidate_cache` to discard a snapshot before a write. A failed forced
+refresh leaves no cached snapshot for subsequent reads.
+
 ## Drift report
 
 `drift` evaluates a versioned evidence file against an explicit lead and

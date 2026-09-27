@@ -93,6 +93,16 @@ impl SnapshotCache {
             .map_err(Error::Cache)?;
         Ok(())
     }
+
+    pub(crate) fn invalidate(&mut self) -> Result<(), Error> {
+        self.connection
+            .execute(
+                "DELETE FROM workspace_snapshot WHERE cache_key = ?1",
+                params![self.cache_key],
+            )
+            .map_err(Error::Cache)?;
+        Ok(())
+    }
 }
 
 #[cfg(unix)]

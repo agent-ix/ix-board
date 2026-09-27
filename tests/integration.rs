@@ -649,6 +649,85 @@ fn cache_reuses_fresh_snapshot_and_refreshes_after_five_minutes() {
 }
 
 #[test]
+fn forced_refresh_bypasses_fresh_cache_and_replaces_it() {
+    let directory = TempDir::new().expect("temporary directory");
+    let source = FixtureSource::new(queue_fixture());
+    let mut reads = service(source.clone(), ManualClock::new(10_000), &directory);
+
+    assert_eq!(
+        reads
+            .workspace_snapshot()
+            .expect("initial snapshot")
+            .projects[0]
+            .name,
+        "Project SWM-P1"
+    );
+    let mut changed = queue_fixture();
+    changed.projects[0].name = "Updated project".to_owned();
+    source.replace(changed);
+
+    assert_eq!(
+        reads.workspace_snapshot().expect("warm cache").projects[0].name,
+        "Project SWM-P1"
+    );
+    assert_eq!(source.reads.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        reads
+            .force_refresh_workspace()
+            .expect("forced refresh")
+            .projects[0]
+            .name,
+        "Updated project"
+    );
+    assert_eq!(source.reads.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        reads.workspace_snapshot().expect("replaced cache").projects[0].name,
+        "Updated project"
+    );
+    assert_eq!(source.reads.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn invalidation_removes_only_the_current_source_snapshot() {
+    let directory = TempDir::new().expect("temporary directory");
+    let cache_path = directory.path().join("shared-cache.sqlite");
+    let clock = ManualClock::new(10_000);
+    let first_source = FixtureSource::new(queue_fixture()).with_namespace("first");
+    let second_source = FixtureSource::new(queue_fixture()).with_namespace("second");
+    let mut first = ReadService::with_clock(first_source.clone(), &cache_path, clock.clone())
+        .expect("first service");
+    let mut second =
+        ReadService::with_clock(second_source.clone(), &cache_path, clock).expect("second service");
+    first.workspace_snapshot().expect("first cache fill");
+    second.workspace_snapshot().expect("second cache fill");
+
+    first.invalidate_cache().expect("invalidate first cache");
+    first.workspace_snapshot().expect("first refetch");
+    second.workspace_snapshot().expect("second cache reuse");
+    assert_eq!(first_source.reads.load(Ordering::SeqCst), 2);
+    assert_eq!(second_source.reads.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn failed_forced_refresh_does_not_leave_a_fresh_stale_snapshot() {
+    let directory = TempDir::new().expect("temporary directory");
+    let source = FixtureSource::new(queue_fixture());
+    let mut reads = service(source.clone(), ManualClock::new(10_000), &directory);
+    reads.workspace_snapshot().expect("initial cache fill");
+    source.fail.store(true, Ordering::SeqCst);
+
+    assert!(matches!(
+        reads.force_refresh_workspace(),
+        Err(Error::GraphQl { .. })
+    ));
+    assert!(matches!(
+        reads.workspace_snapshot(),
+        Err(Error::GraphQl { .. })
+    ));
+    assert_eq!(source.reads.load(Ordering::SeqCst), 3);
+}
+
+#[test]
 fn cache_snapshot_isolated_between_source_namespaces() {
     let directory = TempDir::new().expect("temporary directory");
     let cache_path = directory.path().join("shared-cache.sqlite");
