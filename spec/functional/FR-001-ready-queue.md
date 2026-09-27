@@ -50,7 +50,7 @@ its inclusion and position.
 | ID | Criteria | Verification |
 |----|----------|--------------|
 | FR-001-AC-1 | Given fixture projects in `Started` and `Paused`, `next` includes eligible tickets only from `Started` projects. | Test |
-| FR-001-AC-2 | Given fixture issues in `Completed`, `Canceled`, and other states, only issues in other states are open; tickets in Coding or Review and tickets with unmapped spec states are excluded from the ready queue. | Test |
+| FR-001-AC-2 | Given Linear workflow states with display names `Done`/type `completed` and `Canceled`/type `canceled`, plus other issue states, the first two map to closed `Completed` and `Canceled` while other names are preserved; tickets in Coding or Review and tickets with unmapped spec states are excluded from the ready queue. | Test |
 | FR-001-AC-3 | Given fixture tickets in `Backlog`, `Specify`, and `Specced`, their next steps are Specify, Specify, and Coding respectively. | Test |
 | FR-001-AC-4 | A ticket remains excluded while any prerequisite in any recursive `blocked-by` layer, including a cross-team prerequisite, is not `Completed`; a canceled prerequisite does not resolve the block. | Test |
 | FR-001-AC-5 | Eligible tickets are ordered by project priority/manual order, then ticket priority/manual order, with identifiers as final tie-breakers; each row explains its project, step, and readiness. | Test |

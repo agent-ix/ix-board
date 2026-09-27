@@ -17,8 +17,8 @@ const PAGE_SIZE: i32 = 20;
 const PROJECT_NESTED_PAGE_SIZE: i32 = 50;
 const RELATION_PAGE_SIZE: i32 = 50;
 const PAGE_LIMIT: usize = 1_000;
-// Invalidate cached snapshots that stored a display name instead of the semantic started state.
-const CACHE_MODEL_VERSION: &str = "v2";
+// Invalidate cached snapshots predating canonical Linear project/issue state handling.
+const CACHE_MODEL_VERSION: &str = "v3";
 const ENDPOINT: &str = "https://api.linear.app/graphql";
 
 const PROJECT_QUERY: &str = r#"
@@ -689,13 +689,29 @@ mod tests {
         resolve_project_status_id,
     };
     use crate::{
-        ProjectId, ProjectMutationSource, ProjectPriority, ProjectRunStatus, ReadService,
-        WorkspaceSource,
+        Issue, IssueId, Project, ProjectId, ProjectMutationSource, ProjectPriority,
+        ProjectRunStatus, ReadService, TeamKey, WorkspaceSnapshot, WorkspaceSource,
     };
     use serde_json::Value;
+    use sha2::{Digest, Sha256};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::thread::JoinHandle;
+
+    struct CachedSnapshotSource {
+        namespace: String,
+        snapshot: WorkspaceSnapshot,
+    }
+
+    impl WorkspaceSource for CachedSnapshotSource {
+        fn fetch_workspace(&self) -> Result<WorkspaceSnapshot, crate::Error> {
+            Ok(self.snapshot.clone())
+        }
+
+        fn cache_namespace(&self) -> String {
+            self.namespace.clone()
+        }
+    }
 
     fn mock_linear(responses: Vec<Value>) -> (String, JoinHandle<Vec<Value>>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Linear endpoint");
@@ -749,6 +765,24 @@ mod tests {
         }
         serde_json::from_slice(&bytes[header_end..header_end + content_length])
             .expect("decode GraphQL request")
+    }
+
+    fn satisfy_unused_mock_requests(endpoint: &str, count: usize) {
+        let authority = endpoint
+            .strip_prefix("http://")
+            .and_then(|value| value.strip_suffix("/graphql"))
+            .expect("mock endpoint authority");
+        let body = br#"{"query":"mock shutdown","variables":{}}"#;
+        for _ in 0..count {
+            if let Ok(mut stream) = TcpStream::connect(authority) {
+                let _ = write!(
+                    stream,
+                    "POST /graphql HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(body);
+            }
+        }
     }
 
     fn connection(nodes: Value) -> Value {
@@ -893,7 +927,8 @@ mod tests {
     }
 
     #[test]
-    fn completed_display_name_unblocks_queue_but_canceled_does_not() {
+    /// FR-001-AC-2, FR-001-AC-4: verify Linear workflow type mapping and blocker completion.
+    fn completed_type_unblocks_and_canceled_type_remains_unresolved() {
         let project = serde_json::json!({
             "id": "project-id", "identifier": "SWM-P1", "name": "Project", "description": "Goal",
             "content": null, "priority": 2, "sortOrder": 1.0,
@@ -960,6 +995,130 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["SWM-6"]
         );
+    }
+
+    #[test]
+    fn pre_canonicalization_cache_with_done_blocker_is_refetched() {
+        let cache_path = std::env::temp_dir().join(format!(
+            "ix-board-linear-cache-version-{}.sqlite",
+            std::process::id()
+        ));
+        let old_namespace = format!(
+            "linear:v2:sha256:{:x}",
+            Sha256::digest("test-key".as_bytes())
+        );
+        let stale_snapshot = WorkspaceSnapshot {
+            projects: vec![Project {
+                id: ProjectId("project-id".to_owned()),
+                identifier: Some("SWM-P1".to_owned()),
+                name: "Project".to_owned(),
+                description: "Goal".to_owned(),
+                content: None,
+                status: "Started".to_owned(),
+                priority: 2,
+                sort_order: 1.0,
+                team_keys: vec![TeamKey("SWM".to_owned())],
+                milestones: Vec::new(),
+            }],
+            issues: vec![
+                Issue {
+                    id: IssueId("blocker-id".to_owned()),
+                    identifier: "SWM-2".to_owned(),
+                    title: "Done blocker cached before canonicalization".to_owned(),
+                    description: None,
+                    state: "Done".to_owned(),
+                    team_key: TeamKey("SWM".to_owned()),
+                    project_id: None,
+                    priority: 2.0,
+                    sort_order: 1.0,
+                    blocked_by: Vec::new(),
+                },
+                Issue {
+                    id: IssueId("ready-ticket".to_owned()),
+                    identifier: "SWM-6".to_owned(),
+                    title: "Ready after refresh".to_owned(),
+                    description: None,
+                    state: "Specced".to_owned(),
+                    team_key: TeamKey("SWM".to_owned()),
+                    project_id: Some(ProjectId("project-id".to_owned())),
+                    priority: 2.0,
+                    sort_order: 2.0,
+                    blocked_by: vec![IssueId("blocker-id".to_owned())],
+                },
+            ],
+        };
+        {
+            let mut old_service = ReadService::open(
+                CachedSnapshotSource {
+                    namespace: old_namespace.clone(),
+                    snapshot: stale_snapshot,
+                },
+                &cache_path,
+            )
+            .expect("open v2 cache seed service");
+            assert!(
+                old_service
+                    .next("SWM")
+                    .expect("read v2 cached queue")
+                    .is_empty()
+            );
+        }
+
+        let project = serde_json::json!({
+            "id": "project-id", "identifier": "SWM-P1", "name": "Project", "description": "Goal",
+            "content": null, "priority": 2, "sortOrder": 1.0,
+            "status": {"name": "In Progress", "type": "started"},
+            "teams": connection(serde_json::json!([{"key": "SWM"}])),
+            "projectMilestones": connection(serde_json::json!([]))
+        });
+        let blocker = serde_json::json!({
+            "id": "blocker-id", "identifier": "SWM-2", "title": "Done blocker",
+            "description": null, "priority": 2.0, "sortOrder": 1.0,
+            "state": {"name": "Done", "type": "completed"}, "team": {"key": "SWM"},
+            "project": null,
+            "relations": connection(serde_json::json!([{
+                "type": "blocks", "issue": {"id": "blocker-id"},
+                "relatedIssue": {"id": "ready-ticket"}
+            }]))
+        });
+        let ready_ticket = serde_json::json!({
+            "id": "ready-ticket", "identifier": "SWM-6", "title": "Ready after refresh",
+            "description": null, "priority": 2.0, "sortOrder": 2.0,
+            "state": {"name": "Specced", "type": "started"}, "team": {"key": "SWM"},
+            "project": {"id": "project-id"}, "relations": connection(serde_json::json!([]))
+        });
+        let (endpoint, server) = mock_linear(vec![
+            serde_json::json!({"data": {"projects": connection(serde_json::json!([project]))}}),
+            serde_json::json!({"data": {"issues": connection(serde_json::json!([
+                blocker,
+                ready_ticket
+            ]))}}),
+        ]);
+        let source = LinearGraphQlSource::with_endpoint("test-key", endpoint.clone())
+            .expect("source with local endpoint");
+        assert_ne!(source.cache_namespace(), old_namespace);
+        let mut service =
+            ReadService::open(source, &cache_path).expect("open current cache service");
+        let queue = service
+            .next("SWM")
+            .expect("refresh old cache and read next");
+        drop(service);
+        satisfy_unused_mock_requests(&endpoint, 2);
+        let requests = server.join().expect("mock server");
+        let _ = std::fs::remove_file(cache_path);
+
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].identifier, "SWM-6");
+        assert!(requests.iter().any(|request| {
+            request["query"]
+                .as_str()
+                .is_some_and(|query| query.contains("query WorkspaceProjects"))
+        }));
+        assert!(requests.iter().any(|request| {
+            request["query"]
+                .as_str()
+                .is_some_and(|query| query.contains("query WorkspaceIssues"))
+        }));
     }
 
     #[test]
