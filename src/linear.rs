@@ -26,7 +26,7 @@ query WorkspaceProjects($first: Int!, $nestedFirst: Int!, $after: String) {
   projects(first: $first, after: $after) {
     nodes {
       id identifier name description content priority sortOrder
-      status { name }
+      status { name type }
       teams(first: $nestedFirst) { nodes { key } pageInfo { hasNextPage } }
       projectMilestones(first: $nestedFirst) {
         nodes { id name description sortOrder }
@@ -896,6 +896,11 @@ mod tests {
 
         let requests = server.join().expect("mock server");
         assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0]["query"]
+                .as_str()
+                .is_some_and(|query| query.contains("status { name type }"))
+        );
         assert_eq!(requests[0]["variables"]["first"], 20);
         assert_eq!(requests[0]["variables"]["nestedFirst"], 50);
         assert_eq!(requests[1]["variables"]["first"], 20);
