@@ -99,6 +99,20 @@ impl ProjectMutationSource for FixtureSource {
         project.priority = priority.linear_value();
         Ok(())
     }
+
+    fn set_project_sort_order(&self, project_id: &ProjectId, sort_order: f64) -> Result<(), Error> {
+        self.mutations.fetch_add(1, Ordering::SeqCst);
+        let mut snapshot = self.snapshot.lock().expect("fixture mutex");
+        let project = snapshot
+            .projects
+            .iter_mut()
+            .find(|project| &project.id == project_id)
+            .ok_or_else(|| Error::ProjectNotFound {
+                identifier: project_id.0.clone(),
+            })?;
+        project.sort_order = sort_order;
+        Ok(())
+    }
 }
 
 #[derive(Clone)]

@@ -117,6 +117,9 @@ pub enum Error {
     /// A project priority token was not one of the exact Linear priority values.
     #[error("invalid project priority '{value}'; expected one of 0, 1, 2, 3, or 4")]
     InvalidProjectPriority { value: String },
+    /// A manual project order value must be finite.
+    #[error("project sort order must be finite")]
+    InvalidProjectSortOrder,
     /// No supported status is configured in the current Linear workspace.
     #[error("Linear project status '{status}' is unavailable in this workspace")]
     ProjectStatusUnavailable { status: String },
@@ -145,7 +148,7 @@ pub trait WorkspaceSource: Send + Sync {
     }
 }
 
-/// Source capable of updating the two Linear project fields ix-board owns.
+/// Source capable of updating the Linear project fields ix-board owns.
 pub trait ProjectMutationSource: WorkspaceSource {
     /// Sets one project's status to Started or Paused.
     fn set_project_status(
@@ -160,6 +163,9 @@ pub trait ProjectMutationSource: WorkspaceSource {
         project_id: &ProjectId,
         priority: ProjectPriority,
     ) -> Result<(), Error>;
+
+    /// Sets one project's manual order within its priority group.
+    fn set_project_sort_order(&self, project_id: &ProjectId, sort_order: f64) -> Result<(), Error>;
 }
 
 /// Cached read service shared by the CLI and library consumers.
