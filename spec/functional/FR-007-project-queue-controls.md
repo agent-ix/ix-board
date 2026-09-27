@@ -19,8 +19,10 @@ The ix-board CLI SHALL expose two explicit project mutations:
 
 - `project set-status <project> <Started|Paused>` sets the requested project's
   Linear status to `Started` (run) or `Paused` (hold).
-- `project set-priority <project> <priority>` sets its Linear project priority
-  to a supported Linear priority value.
+- `project set-priority <project> <0|1|2|3|4>` accepts one decimal integer
+  token and sets the matching Linear project priority: `0` = No priority,
+  `1` = Urgent, `2` = High, `3` = Medium, and `4` = Low. Other tokens are
+  invalid.
 
 These are the only Linear mutations ix-board may perform. In particular,
 ix-board does not write project manual order, issue state, issue priority,
@@ -33,7 +35,8 @@ as an error and does not update another field or project.
 
 - A Linear project identifier.
 - Either one of the allowed run statuses (`Started` or `Paused`) or a priority
-  value supported by Linear.
+  token exactly equal to `0`, `1`, `2`, `3`, or `4`, with the mapping defined
+  above.
 
 ## Outputs
 
@@ -50,6 +53,7 @@ as an error and does not update another field or project.
 | FR-007-AC-3 | Given projects with different priorities, changing one project's priority changes queue ordering according to FR-001 while preserving its manual order and all ticket fields. | Test |
 | FR-007-AC-4 | Given an unknown project, unsupported status, or unsupported priority, the command reports an error and no project field is changed. | Test |
 | FR-007-AC-5 | Given any ix-board project mutation, only the requested project's status or priority field is written; no other Linear field is changed. | Inspection |
+| FR-007-AC-6 | Given `project set-priority` values outside the exact tokens `0`, `1`, `2`, `3`, and `4` (including negative, greater-than-four, decimal, or named values), the command reports an error and performs no mutation. | Test |
 
 ## Dependencies
 

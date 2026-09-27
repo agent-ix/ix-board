@@ -15,8 +15,10 @@ Linear project status and priority; it does not write manual order or any other
 Linear fields.
 
 The project mutation commands are `project set-status <project> <Started|Paused>`
-and `project set-priority <project> <priority>`. These make an explicit update
-to the requested project's corresponding Linear field.
+and `project set-priority <project> <0|1|2|3|4>`. The priority values map to
+Linear as `0` = No priority, `1` = Urgent, `2` = High, `3` = Medium, and `4` =
+Low. These make an explicit update to the requested project's corresponding
+Linear field.
 
 ## Build
 
