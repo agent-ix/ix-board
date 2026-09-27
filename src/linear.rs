@@ -315,6 +315,7 @@ impl ProjectMutationSource for LinearGraphQlSource {
             ProjectUpdateInput {
                 status_id: Some(status_id),
                 priority: None,
+                sort_order: None,
             },
         )
     }
@@ -329,6 +330,21 @@ impl ProjectMutationSource for LinearGraphQlSource {
             ProjectUpdateInput {
                 status_id: None,
                 priority: Some(priority.linear_value()),
+                sort_order: None,
+            },
+        )
+    }
+
+    fn set_project_sort_order(&self, project_id: &ProjectId, sort_order: f64) -> Result<(), Error> {
+        if !sort_order.is_finite() {
+            return Err(Error::InvalidProjectSortOrder);
+        }
+        self.update_project(
+            project_id,
+            ProjectUpdateInput {
+                status_id: None,
+                priority: None,
+                sort_order: Some(sort_order),
             },
         )
     }
@@ -470,6 +486,8 @@ struct ProjectUpdateInput {
     status_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     priority: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sort_order: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -1313,6 +1331,7 @@ mod tests {
         let status = serde_json::to_value(ProjectUpdateInput {
             status_id: Some("status-id".to_owned()),
             priority: None,
+            sort_order: None,
         })
         .expect("serialize status update");
         assert_eq!(status, serde_json::json!({"statusId": "status-id"}));
@@ -1320,8 +1339,17 @@ mod tests {
         let priority = serde_json::to_value(ProjectUpdateInput {
             status_id: None,
             priority: Some(ProjectPriority::Urgent.linear_value()),
+            sort_order: None,
         })
         .expect("serialize priority update");
         assert_eq!(priority, serde_json::json!({"priority": 1}));
+
+        let order = serde_json::to_value(ProjectUpdateInput {
+            status_id: None,
+            priority: None,
+            sort_order: Some(3.5),
+        })
+        .expect("serialize order update");
+        assert_eq!(order, serde_json::json!({"sortOrder": 3.5}));
     }
 }
