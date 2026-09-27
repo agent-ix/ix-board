@@ -4,7 +4,8 @@
 use assert_cmd::Command;
 use ix_board::{
     Clock, Error, Issue, IssueId, Milestone, NextStep, Project, ProjectChunk, ProjectId,
-    ReadService, SearchKind, TeamKey, WorkspaceSnapshot, WorkspaceSource,
+    ProjectMutationSource, ProjectPriority, ProjectRunStatus, ReadService, SearchKind, TeamKey,
+    WorkspaceSnapshot, WorkspaceSource,
 };
 use std::sync::{
     Arc, Mutex,
@@ -17,6 +18,7 @@ struct FixtureSource {
     snapshot: Arc<Mutex<WorkspaceSnapshot>>,
     reads: Arc<AtomicUsize>,
     fail: Arc<AtomicBool>,
+    mutations: Arc<AtomicUsize>,
     namespace: String,
 }
 
@@ -26,6 +28,7 @@ impl FixtureSource {
             snapshot: Arc::new(Mutex::new(snapshot)),
             reads: Arc::new(AtomicUsize::new(0)),
             fail: Arc::new(AtomicBool::new(false)),
+            mutations: Arc::new(AtomicUsize::new(0)),
             namespace: "fixture-default".to_owned(),
         }
     }
@@ -53,6 +56,48 @@ impl WorkspaceSource for FixtureSource {
             });
         }
         Ok(self.snapshot.lock().expect("fixture mutex").clone())
+    }
+}
+
+impl ProjectMutationSource for FixtureSource {
+    fn set_project_status(
+        &self,
+        project_id: &ProjectId,
+        status: ProjectRunStatus,
+    ) -> Result<(), Error> {
+        self.mutations.fetch_add(1, Ordering::SeqCst);
+        let mut snapshot = self.snapshot.lock().expect("fixture mutex");
+        let Some(project) = snapshot
+            .projects
+            .iter_mut()
+            .find(|project| &project.id == project_id)
+        else {
+            return Err(Error::ProjectNotFound {
+                identifier: project_id.0.clone(),
+            });
+        };
+        project.status = status.as_str().to_owned();
+        Ok(())
+    }
+
+    fn set_project_priority(
+        &self,
+        project_id: &ProjectId,
+        priority: ProjectPriority,
+    ) -> Result<(), Error> {
+        self.mutations.fetch_add(1, Ordering::SeqCst);
+        let mut snapshot = self.snapshot.lock().expect("fixture mutex");
+        let Some(project) = snapshot
+            .projects
+            .iter_mut()
+            .find(|project| &project.id == project_id)
+        else {
+            return Err(Error::ProjectNotFound {
+                identifier: project_id.0.clone(),
+            });
+        };
+        project.priority = priority.linear_value();
+        Ok(())
     }
 }
 
@@ -351,6 +396,105 @@ fn next_applies_project_ticket_order_and_recursive_cross_team_blockers() {
 }
 
 #[test]
+fn pausing_and_resuming_a_project_updates_the_cached_ready_queue() {
+    let directory = TempDir::new().expect("temporary directory");
+    let source = FixtureSource::new(queue_fixture());
+    let mut reads = service(source.clone(), ManualClock::new(1_500), &directory);
+
+    assert!(
+        reads
+            .next("SWM")
+            .expect("initial queue")
+            .iter()
+            .any(|item| item.project == "SWM-P1")
+    );
+    reads
+        .set_project_status("SWM-P1", ProjectRunStatus::Paused)
+        .expect("pause project");
+    assert!(
+        reads
+            .next("SWM")
+            .expect("queue after pause")
+            .iter()
+            .all(|item| item.project != "SWM-P1")
+    );
+    reads
+        .set_project_status("SWM-P1", ProjectRunStatus::Started)
+        .expect("resume project");
+    assert!(
+        reads
+            .next("SWM")
+            .expect("queue after resume")
+            .iter()
+            .any(|item| item.project == "SWM-P1")
+    );
+    assert_eq!(source.mutations.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn changing_project_priority_changes_queue_order_without_changing_manual_order() {
+    let directory = TempDir::new().expect("temporary directory");
+    let source = FixtureSource::new(queue_fixture());
+    let mut reads = service(source.clone(), ManualClock::new(1_600), &directory);
+
+    let initial = reads.next("SWM").expect("initial queue");
+    let initial_p2 = initial
+        .iter()
+        .position(|item| item.identifier == "SWM-14")
+        .expect("priority 1 project ticket");
+    let initial_p1 = initial
+        .iter()
+        .position(|item| item.identifier == "SWM-05")
+        .expect("priority 2 project ticket");
+    assert!(initial_p2 < initial_p1);
+
+    reads
+        .set_project_priority("SWM-P2", ProjectPriority::Low)
+        .expect("lower project priority");
+    let changed = reads.next("SWM").expect("queue after priority update");
+    let changed_p2 = changed
+        .iter()
+        .position(|item| item.identifier == "SWM-14")
+        .expect("updated project ticket");
+    let changed_p1 = changed
+        .iter()
+        .position(|item| item.identifier == "SWM-05")
+        .expect("comparison project ticket");
+    assert!(
+        changed_p1 < changed_p2,
+        "changed queue order: {:?}",
+        changed
+            .iter()
+            .map(|item| item.identifier.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    let snapshot = source.snapshot.lock().expect("fixture mutex");
+    let p2 = snapshot
+        .projects
+        .iter()
+        .find(|project| project.id.0 == "p2")
+        .expect("updated project");
+    assert_eq!(p2.priority, 4);
+    assert_eq!(p2.sort_order, 1.0);
+    assert_eq!(snapshot.issues, queue_fixture().issues);
+    assert_eq!(source.mutations.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn unknown_project_mutation_is_rejected_before_the_source_write() {
+    let directory = TempDir::new().expect("temporary directory");
+    let source = FixtureSource::new(queue_fixture());
+    let mut reads = service(source.clone(), ManualClock::new(1_700), &directory);
+
+    assert!(matches!(
+        reads.set_project_priority("missing-project", ProjectPriority::Urgent),
+        Err(Error::ProjectNotFound { .. })
+    ));
+    assert_eq!(source.mutations.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn project_chunk_returns_goal_milestones_open_tickets_and_dependency_layers() {
     let directory = TempDir::new().expect("temporary directory");
     let mut snapshot = queue_fixture();
@@ -589,6 +733,7 @@ fn cli_exposes_all_three_reads_and_rejects_empty_search_before_api_setup() {
     assert!(help_text.contains("next"));
     assert!(help_text.contains("project-chunk"));
     assert!(help_text.contains("search"));
+    assert!(help_text.contains("project"));
 
     let invalid = Command::cargo_bin("ix-board")
         .expect("built binary")
@@ -597,6 +742,27 @@ fn cli_exposes_all_three_reads_and_rejects_empty_search_before_api_setup() {
         .expect("empty search");
     assert_eq!(invalid.status.code(), Some(3));
     assert!(String::from_utf8_lossy(&invalid.stderr).contains("search query must not be empty"));
+
+    let invalid_priority = Command::cargo_bin("ix-board")
+        .expect("built binary")
+        .args(["project", "set-priority", "SWM-P1", "5"])
+        .env_remove("LINEAR_API_KEY")
+        .output()
+        .expect("invalid project priority");
+    assert_eq!(invalid_priority.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&invalid_priority.stderr)
+            .contains("expected one of 0, 1, 2, 3, or 4")
+    );
+
+    let invalid_status = Command::cargo_bin("ix-board")
+        .expect("built binary")
+        .args(["project", "set-status", "SWM-P1", "Completed"])
+        .env_remove("LINEAR_API_KEY")
+        .output()
+        .expect("invalid project status");
+    assert_eq!(invalid_status.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&invalid_status.stderr).contains("expected Started or Paused"));
 }
 
 #[test]

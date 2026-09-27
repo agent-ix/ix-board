@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Agent-IX
 
-//! Deterministic, cached Linear reads for ready work, project context, and search.
+//! Deterministic Linear project controls and cached reads for ready work, context, and search.
 
 mod cache;
 mod linear;
@@ -11,8 +11,9 @@ use cache::SnapshotCache;
 pub use cache::{CACHE_TTL_SECONDS, Clock, SystemClock};
 pub use linear::LinearGraphQlSource;
 pub use model::{
-    ChunkIssue, Issue, IssueId, Milestone, NextStep, Project, ProjectChunk, ProjectId, ReadyItem,
-    SearchKind, SearchResult, TeamKey, WorkspaceSnapshot,
+    ChunkIssue, Issue, IssueId, Milestone, NextStep, Project, ProjectChunk, ProjectId,
+    ProjectPriority, ProjectRunStatus, ReadyItem, SearchKind, SearchResult, TeamKey,
+    WorkspaceSnapshot,
 };
 
 use model::{compare_f64, issue_is_open};
@@ -78,6 +79,21 @@ pub enum Error {
     /// The requested project was not present in the source snapshot.
     #[error("project not found: {identifier}")]
     ProjectNotFound { identifier: String },
+    /// A project status token was not one of the supported values.
+    #[error("invalid project status '{value}'; expected Started or Paused")]
+    InvalidProjectStatus { value: String },
+    /// A project priority token was not one of the exact Linear priority values.
+    #[error("invalid project priority '{value}'; expected one of 0, 1, 2, 3, or 4")]
+    InvalidProjectPriority { value: String },
+    /// No supported status is configured in the current Linear workspace.
+    #[error("Linear project status '{status}' is unavailable in this workspace")]
+    ProjectStatusUnavailable { status: String },
+    /// Multiple supported statuses match the requested status and scope.
+    #[error("Linear project status '{status}' is ambiguous in this workspace")]
+    ProjectStatusAmbiguous { status: String },
+    /// Linear rejected a project update or returned no updated project.
+    #[error("Linear rejected the project update for {identifier}")]
+    ProjectUpdateRejected { identifier: String },
     /// A referenced issue was absent from the complete snapshot.
     #[error("dependency issue {issue} is missing from the Linear snapshot")]
     MissingDependency { issue: String },
@@ -95,6 +111,23 @@ pub trait WorkspaceSource: Send + Sync {
     fn cache_namespace(&self) -> String {
         "fixture-default".to_owned()
     }
+}
+
+/// Source capable of updating the two Linear project fields ix-board owns.
+pub trait ProjectMutationSource: WorkspaceSource {
+    /// Sets one project's status to Started or Paused.
+    fn set_project_status(
+        &self,
+        project_id: &ProjectId,
+        status: ProjectRunStatus,
+    ) -> Result<(), Error>;
+
+    /// Sets one project's priority to a supported Linear priority.
+    fn set_project_priority(
+        &self,
+        project_id: &ProjectId,
+        priority: ProjectPriority,
+    ) -> Result<(), Error>;
 }
 
 /// Cached read service shared by the CLI and library consumers.
@@ -161,6 +194,67 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
             .replace(self.clock.now_epoch_seconds(), &snapshot)?;
         Ok(snapshot)
     }
+}
+
+impl<S: ProjectMutationSource, C: Clock> ReadService<S, C> {
+    /// Sets a project's status and refreshes the cached queue snapshot.
+    pub fn set_project_status(
+        &mut self,
+        identifier: &str,
+        status: ProjectRunStatus,
+    ) -> Result<(), Error> {
+        let mut snapshot = self.snapshot()?;
+        let project_id = project_id(&snapshot, identifier)?;
+        self.source.set_project_status(&project_id, status)?;
+        let project = snapshot
+            .projects
+            .iter_mut()
+            .find(|project| project.id == project_id)
+            .ok_or_else(|| Error::ProjectNotFound {
+                identifier: identifier.to_owned(),
+            })?;
+        project.status = status.as_str().to_owned();
+        self.cache
+            .replace(self.clock.now_epoch_seconds(), &snapshot)
+    }
+
+    /// Sets a project's priority and refreshes the cached queue snapshot.
+    pub fn set_project_priority(
+        &mut self,
+        identifier: &str,
+        priority: ProjectPriority,
+    ) -> Result<(), Error> {
+        let mut snapshot = self.snapshot()?;
+        let project_id = project_id(&snapshot, identifier)?;
+        self.source.set_project_priority(&project_id, priority)?;
+        let project = snapshot
+            .projects
+            .iter_mut()
+            .find(|project| project.id == project_id)
+            .ok_or_else(|| Error::ProjectNotFound {
+                identifier: identifier.to_owned(),
+            })?;
+        project.priority = priority.linear_value();
+        self.cache
+            .replace(self.clock.now_epoch_seconds(), &snapshot)
+    }
+}
+
+fn project_id(snapshot: &WorkspaceSnapshot, identifier: &str) -> Result<ProjectId, Error> {
+    snapshot
+        .projects
+        .iter()
+        .find(|project| {
+            project.id.0.eq_ignore_ascii_case(identifier)
+                || project
+                    .identifier
+                    .as_deref()
+                    .is_some_and(|id| id.eq_ignore_ascii_case(identifier))
+        })
+        .map(|project| project.id.clone())
+        .ok_or_else(|| Error::ProjectNotFound {
+            identifier: identifier.to_owned(),
+        })
 }
 
 fn ready_queue(snapshot: &WorkspaceSnapshot, team: &str) -> Result<Vec<ReadyItem>, Error> {

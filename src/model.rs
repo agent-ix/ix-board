@@ -5,6 +5,10 @@
 
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+use std::fmt::{Display, Formatter};
+use std::str::FromStr;
+
+use crate::Error;
 
 /// Stable Linear issue UUID used for relationships.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -21,6 +25,107 @@ pub struct ProjectId(pub String);
 #[serde(transparent)]
 pub struct TeamKey(pub String);
 
+/// Project lifecycle command accepted by the project status mutation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProjectRunStatus {
+    /// Run the project and include its otherwise-ready tickets in `next`.
+    Started,
+    /// Hold the project and exclude its tickets from `next`.
+    Paused,
+}
+
+impl ProjectRunStatus {
+    /// Canonical CLI token for this run status.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Started => "Started",
+            Self::Paused => "Paused",
+        }
+    }
+}
+
+impl Display for ProjectRunStatus {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ProjectRunStatus {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "Started" => Ok(Self::Started),
+            "Paused" => Ok(Self::Paused),
+            _ => Err(Error::InvalidProjectStatus {
+                value: value.to_owned(),
+            }),
+        }
+    }
+}
+
+/// Linear project priority accepted by the project priority mutation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProjectPriority {
+    /// Linear priority value 0.
+    None,
+    /// Linear priority value 1.
+    Urgent,
+    /// Linear priority value 2.
+    High,
+    /// Linear priority value 3.
+    Medium,
+    /// Linear priority value 4.
+    Low,
+}
+
+impl ProjectPriority {
+    /// Numeric Linear API value for this priority.
+    pub fn linear_value(self) -> i32 {
+        match self {
+            Self::None => 0,
+            Self::Urgent => 1,
+            Self::High => 2,
+            Self::Medium => 3,
+            Self::Low => 4,
+        }
+    }
+
+    /// Human-readable Linear priority label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "No priority",
+            Self::Urgent => "Urgent",
+            Self::High => "High",
+            Self::Medium => "Medium",
+            Self::Low => "Low",
+        }
+    }
+}
+
+impl Display for ProjectPriority {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} ({})", self.linear_value(), self.label())
+    }
+}
+
+impl FromStr for ProjectPriority {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "0" => Ok(Self::None),
+            "1" => Ok(Self::Urgent),
+            "2" => Ok(Self::High),
+            "3" => Ok(Self::Medium),
+            "4" => Ok(Self::Low),
+            _ => Err(Error::InvalidProjectPriority {
+                value: value.to_owned(),
+            }),
+        }
+    }
+}
+
 /// Stable structured project record fetched from Linear.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -35,7 +140,7 @@ pub struct Project {
     pub description: String,
     /// Project content in markdown.
     pub content: Option<String>,
-    /// Structured lifecycle status name.
+    /// Canonical run state (`Started`) or the Linear display name for other statuses.
     pub status: String,
     /// Linear project priority; zero means unprioritized, while lower nonzero values rank higher.
     pub priority: i32,
@@ -185,4 +290,52 @@ pub(crate) fn issue_is_open(issue: &Issue) -> bool {
 
 pub(crate) fn compare_f64(left: f64, right: f64) -> Ordering {
     left.total_cmp(&right)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProjectPriority, ProjectRunStatus};
+    use std::str::FromStr;
+
+    #[test]
+    fn project_priority_tokens_map_exactly_to_linear_values() {
+        let priorities = [
+            ("0", ProjectPriority::None, "No priority"),
+            ("1", ProjectPriority::Urgent, "Urgent"),
+            ("2", ProjectPriority::High, "High"),
+            ("3", ProjectPriority::Medium, "Medium"),
+            ("4", ProjectPriority::Low, "Low"),
+        ];
+        for (token, priority, label) in priorities {
+            let parsed = ProjectPriority::from_str(token).expect("supported priority");
+            assert_eq!(parsed, priority);
+            assert_eq!(
+                parsed.linear_value(),
+                i32::from_str(token).expect("integer token")
+            );
+            assert_eq!(parsed.label(), label);
+        }
+        for token in ["-1", "5", "1.0", "Urgent", "01"] {
+            assert!(matches!(
+                ProjectPriority::from_str(token),
+                Err(crate::Error::InvalidProjectPriority { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn project_status_tokens_are_exact_and_closed() {
+        assert_eq!(
+            ProjectRunStatus::from_str("Started").expect("Started token"),
+            ProjectRunStatus::Started
+        );
+        assert_eq!(
+            ProjectRunStatus::from_str("Paused").expect("Paused token"),
+            ProjectRunStatus::Paused
+        );
+        assert!(matches!(
+            ProjectRunStatus::from_str("Completed"),
+            Err(crate::Error::InvalidProjectStatus { .. })
+        ));
+    }
 }
