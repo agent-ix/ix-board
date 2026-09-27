@@ -4,11 +4,22 @@
 //! Deterministic Linear project controls and cached reads for ready work, context, and search.
 
 mod cache;
+mod drift;
 mod linear;
 mod model;
 
 use cache::SnapshotCache;
 pub use cache::{CACHE_TTL_SECONDS, Clock, SystemClock};
+pub use drift::{
+    AlertKind, Availability, BusyWithoutPrSignal, DRIFT_EVIDENCE_SCHEMA_VERSION, DriftAlert,
+    DriftCommit, DriftConfig, DriftError, DriftEvidence, DriftEvidenceFile, DriftLead,
+    DriftPullRequest, DriftReport, DriftTicket, HistoricalProject, HistoricalTicket,
+    IssueTransition, LeadDriftReport, LeadSignals, LeadStatus, MissingEvidence, PrScopeSignal,
+    QueueEvidence, RunningProject, ScopeClassification, ScopedPullRequest, SignalAvailability,
+    StallSignal, StalledTicket, TicketChurnSignal, UnassignedPullRequest, UnassignedReason,
+    VeeringReason, VeeringSignal, VeeringTicket, evaluate_drift, evaluate_drift_file,
+    render_drift_text,
+};
 pub use linear::LinearGraphQlSource;
 pub use model::{
     ChunkIssue, Issue, IssueId, Milestone, NextStep, Project, ProjectChunk, ProjectId,
@@ -76,6 +87,27 @@ pub enum Error {
     /// The requested search query was empty.
     #[error("search query must not be empty")]
     InvalidQuery,
+    /// Drift config/evidence input failed to read.
+    #[error("could not read drift input {path}: {source}")]
+    DriftInputRead {
+        /// Input path.
+        path: String,
+        /// Underlying filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// Drift config/evidence input failed its strict JSON contract.
+    #[error("invalid drift JSON in {path}: {source}")]
+    DriftInputDecode {
+        /// Input path.
+        path: String,
+        /// Underlying JSON failure.
+        #[source]
+        source: serde_json::Error,
+    },
+    /// Drift configuration or evaluation failed.
+    #[error(transparent)]
+    Drift(#[from] drift::DriftError),
     /// The requested project was not present in the source snapshot.
     #[error("project not found: {identifier}")]
     ProjectNotFound { identifier: String },

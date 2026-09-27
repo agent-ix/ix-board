@@ -5,8 +5,9 @@
 
 use clap::{Parser, Subcommand};
 use ix_board::{
-    Error, LinearGraphQlSource, NextStep, ProjectChunk, ProjectPriority, ProjectRunStatus,
-    ReadService, ReadyItem, SearchResult,
+    DriftConfig, DriftError, DriftEvidenceFile, DriftReport, Error, LinearGraphQlSource, NextStep,
+    ProjectChunk, ProjectPriority, ProjectRunStatus, ReadService, ReadyItem, SearchResult,
+    evaluate_drift_file, render_drift_text,
 };
 use ix_cli_kit::exit::Outcome;
 use ix_cli_kit::streams::{
@@ -56,6 +57,15 @@ enum Command {
         /// Case-insensitive substring query.
         query: String,
     },
+    /// Render a deterministic drift report from versioned structured evidence.
+    Drift {
+        /// JSON file containing thresholds and configured leads.
+        #[arg(long)]
+        config: PathBuf,
+        /// JSON file containing source records and completeness attestations.
+        #[arg(long)]
+        evidence: PathBuf,
+    },
     /// Update one of the two supported Linear project fields.
     Project {
         #[command(subcommand)]
@@ -89,6 +99,7 @@ enum Output {
     Queue(Vec<ReadyItem>),
     Chunk(ProjectChunk),
     Search(Vec<SearchResult>),
+    Drift(DriftReport),
     ProjectStatusUpdated {
         project: String,
         status: String,
@@ -144,7 +155,10 @@ fn main() -> std::process::ExitCode {
                 | Error::InvalidQuery
                 | Error::ProjectNotFound { .. }
                 | Error::InvalidProjectStatus { .. }
-                | Error::InvalidProjectPriority { .. } => Outcome::Invalid,
+                | Error::InvalidProjectPriority { .. }
+                | Error::DriftInputRead { .. }
+                | Error::DriftInputDecode { .. }
+                | Error::Drift(_) => Outcome::Invalid,
                 _ => Outcome::Internal,
             })
         }
@@ -171,6 +185,13 @@ fn validate_command(command: &Command) -> Result<(), Error> {
 }
 
 fn run(command: Command) -> Result<Output, Error> {
+    match command {
+        Command::Drift { config, evidence } => run_drift(&config, &evidence).map(Output::Drift),
+        other => run_linear(other),
+    }
+}
+
+fn run_linear(command: Command) -> Result<Output, Error> {
     let source = LinearGraphQlSource::from_env()?;
     let cache_path = cache_path()?;
     let mut service = ReadService::open(source, &cache_path)?;
@@ -178,6 +199,9 @@ fn run(command: Command) -> Result<Output, Error> {
         Command::Next { team } => service.next(&team).map(Output::Queue),
         Command::ProjectChunk { project } => service.project_chunk(&project).map(Output::Chunk),
         Command::Search { query } => service.search(&query).map(Output::Search),
+        Command::Drift { .. } => Err(Error::Drift(DriftError::InvalidConfig {
+            reason: "drift command must use its evidence input".to_owned(),
+        })),
         Command::Project {
             command: ProjectCommand::SetStatus { project, status },
         } => service
@@ -196,6 +220,30 @@ fn run(command: Command) -> Result<Output, Error> {
             }
         }),
     }
+}
+
+fn run_drift(config_path: &PathBuf, evidence_path: &PathBuf) -> Result<DriftReport, Error> {
+    let config_text =
+        std::fs::read_to_string(config_path).map_err(|source| Error::DriftInputRead {
+            path: config_path.display().to_string(),
+            source,
+        })?;
+    let config: DriftConfig =
+        serde_json::from_str(&config_text).map_err(|source| Error::DriftInputDecode {
+            path: config_path.display().to_string(),
+            source,
+        })?;
+    let evidence_text =
+        std::fs::read_to_string(evidence_path).map_err(|source| Error::DriftInputRead {
+            path: evidence_path.display().to_string(),
+            source,
+        })?;
+    let evidence: DriftEvidenceFile =
+        serde_json::from_str(&evidence_text).map_err(|source| Error::DriftInputDecode {
+            path: evidence_path.display().to_string(),
+            source,
+        })?;
+    Ok(evaluate_drift_file(&config, &evidence)?)
 }
 
 fn cache_path() -> Result<PathBuf, Error> {
@@ -218,6 +266,7 @@ fn render_human(output: &Output) -> String {
             .map(|record| format!("{:?} {} — {}", record.kind, record.identifier, record.name))
             .collect::<Vec<_>>()
             .join("\n"),
+        Output::Drift(report) => render_drift_text(report),
         Output::ProjectStatusUpdated { project, status } => {
             format!("Project {project} status set to {status}")
         }

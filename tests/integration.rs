@@ -3,9 +3,9 @@
 
 use assert_cmd::Command;
 use ix_board::{
-    Clock, Error, Issue, IssueId, Milestone, NextStep, Project, ProjectChunk, ProjectId,
-    ProjectMutationSource, ProjectPriority, ProjectRunStatus, ReadService, SearchKind, TeamKey,
-    WorkspaceSnapshot, WorkspaceSource,
+    Clock, DriftConfig, DriftEvidence, DriftEvidenceFile, DriftLead, Error, Issue, IssueId,
+    Milestone, NextStep, Project, ProjectChunk, ProjectId, ProjectMutationSource, ProjectPriority,
+    ProjectRunStatus, ReadService, SearchKind, TeamKey, WorkspaceSnapshot, WorkspaceSource,
 };
 use std::sync::{
     Arc, Mutex,
@@ -798,4 +798,122 @@ fn warm_cache_next_cli_runs_under_one_second() {
             "run {run} took {elapsed:?}"
         );
     }
+}
+
+#[test]
+fn drift_cli_emits_stable_typed_json_and_one_line_per_lead() {
+    let directory = TempDir::new().expect("temporary directory");
+    let config_path = directory.path().join("drift-config.json");
+    let evidence_path = directory.path().join("drift-evidence.json");
+    let config = DriftConfig {
+        report_time: "2026-09-27T12:00:00Z".to_owned(),
+        window_hours: 24.0,
+        stall_hours: 12.0,
+        spend_threshold: 0.0,
+        max_net_ticket_growth: 0,
+        min_merged_prs_for_churn: 1,
+        leads: vec![DriftLead {
+            lead_id: "lead-a".to_owned(),
+            team_key: "SWM".to_owned(),
+        }],
+    };
+    let evidence = DriftEvidenceFile {
+        schema_version: 1,
+        evidence: DriftEvidence {
+            projects: Vec::new(),
+            tickets: Vec::new(),
+            transitions: Vec::new(),
+            pull_requests: Vec::new(),
+            commits: Vec::new(),
+            herdr_busy: std::collections::BTreeMap::from([("lead-a".to_owned(), false)]),
+            otel_spend: std::collections::BTreeMap::from([("lead-a".to_owned(), 0.0)]),
+            missing: Vec::new(),
+        },
+    };
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec(&config).expect("serialize drift config"),
+    )
+    .expect("write config");
+    std::fs::write(
+        &evidence_path,
+        serde_json::to_vec(&evidence).expect("serialize drift evidence"),
+    )
+    .expect("write evidence");
+    let run = || {
+        Command::cargo_bin("ix-board")
+            .expect("built binary")
+            .args([
+                "drift",
+                "--config",
+                config_path.to_str().expect("config path utf8"),
+                "--evidence",
+                evidence_path.to_str().expect("evidence path utf8"),
+                "--json",
+            ])
+            .env_remove("LINEAR_API_KEY")
+            .output()
+            .expect("drift command")
+    };
+    let result = run();
+    assert!(
+        result.status.success(),
+        "CLI stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&result.stdout).expect("valid JSON report");
+    assert_eq!(value["report_time"], "2026-09-27T12:00:00Z");
+    assert_eq!(value["window_start"], "2026-09-26T12:00:00Z");
+    assert_eq!(value["window_end"], value["report_time"]);
+    assert_eq!(value["unassigned_prs"].as_array().map(Vec::len), Some(0));
+    let lead = &value["leads"][0];
+    assert_eq!(lead["lead_id"], "lead-a");
+    assert_eq!(lead["team_key"], "SWM");
+    assert_eq!(lead["status"], "on_track");
+    assert_eq!(lead["running_projects"].as_array().map(Vec::len), Some(0));
+    assert_eq!(lead["alerts"].as_array().map(Vec::len), Some(0));
+    assert_eq!(lead["reasons"].as_array().map(Vec::len), Some(0));
+    let signals = &lead["signals"];
+    for signal in [
+        "pr_scope",
+        "veering",
+        "stall",
+        "busy_without_pr",
+        "ticket_churn",
+    ] {
+        assert_eq!(signals[signal]["availability"], "available");
+        assert_eq!(
+            signals[signal]["missing_sources"].as_array().map(Vec::len),
+            Some(0)
+        );
+    }
+    assert!(signals["pr_scope"]["prs"].is_array());
+    assert!(signals["veering"]["tickets"].is_array());
+    assert!(signals["stall"]["tickets"].is_array());
+    assert_eq!(signals["busy_without_pr"]["finding"], false);
+    assert_eq!(signals["busy_without_pr"]["herdr_busy"], false);
+    assert_eq!(signals["busy_without_pr"]["otel_spend"], 0.0);
+    assert_eq!(signals["busy_without_pr"]["new_pr_count"], 0);
+    assert_eq!(signals["ticket_churn"]["created"], 0);
+    assert_eq!(signals["ticket_churn"]["completed"], 0);
+    assert_eq!(signals["ticket_churn"]["merged_prs"], 0);
+    assert_eq!(signals["ticket_churn"]["net_growth"], 0);
+    assert_eq!(run().stdout, result.stdout);
+
+    let text = Command::cargo_bin("ix-board")
+        .expect("built binary")
+        .args([
+            "drift",
+            "--config",
+            config_path.to_str().expect("config path utf8"),
+            "--evidence",
+            evidence_path.to_str().expect("evidence path utf8"),
+        ])
+        .env_remove("LINEAR_API_KEY")
+        .output()
+        .expect("drift text command");
+    assert!(text.status.success());
+    assert_eq!(String::from_utf8_lossy(&text.stdout).lines().count(), 1);
+    assert!(String::from_utf8_lossy(&text.stdout).contains("lead-a on_track"));
 }
