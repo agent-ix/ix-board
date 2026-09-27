@@ -14,41 +14,33 @@ dependencies: []
 
 ## Description
 
-The ix-board read library SHALL use SQLite to cache structured Linear read data
-and SHALL poll Linear at five-minute intervals for changes. After a successful
-poll observes a changed source record, the library SHALL invalidate or replace
-the corresponding cached value before a subsequent command returns that value.
-The cache SHALL NOT cause a command to return a value older than five minutes
-when polling succeeds.
+The ix-board read library SHALL use SQLite to cache structured Linear read data.
+Each cache entry expires five minutes after it is fetched. A read of an expired
+entry SHALL refresh it from Linear before returning. A refresh failure SHALL
+return an error. Stale cache data SHALL NOT be returned after a failed refresh.
+A successful refresh SHALL replace the expired value.
 
 ## Inputs
 
 - Structured Linear records obtained through the read client.
 - Cached records and their refresh metadata.
-- The configured five-minute polling interval.
+- The five-minute cache-entry lifetime.
 
 ## Outputs
 
 - Cached records for reads that do not require a refresh.
 - Refreshed records after a successful poll observes source changes.
+- An error when an expired entry cannot be refreshed.
 
 ## Acceptance Criteria
 
 | ID | Criteria | Verification |
 |----|----------|--------------|
-| FR-004-AC-1 | Given an unchanged fixture read within the five-minute interval, a repeated read returns the cached value without changing the observable result. | Test (IT-001) |
-| FR-004-AC-2 | Given a changed source fixture at the next successful poll, the prior cached value is invalidated and the subsequent command returns the changed value. | Test (IT-001) |
-| FR-004-AC-3 | Given a successful poll and a cache entry older than five minutes, a command does not return that stale entry. | Test (IT-001) |
-| FR-004-AC-4 | Given identical cache state and source fixture, repeated reads return identical results. | Test (IT-001) |
+| FR-004-AC-1 | Given an unexpired cache entry, repeated fixture reads use the cached value and return identical results without another source read. | Test |
+| FR-004-AC-2 | Given an expired entry and a changed fixture source, the next read refreshes and returns the changed value. | Test |
+| FR-004-AC-3 | Given an expired entry and a failed fixture refresh, the read returns an error and does not return the stale value. | Test |
+| FR-004-AC-4 | Given identical cache state and fixture source, repeated reads return identical results. | Test |
 
 ## Dependencies
 
 - **Upstream**: [US-001](../usecase/US-001-team-leader-reads.md)
-- **Downstream**: [IT-001](../integration/IT-001-linear-read-fixtures.md)
-
-## Open Questions
-
-Decide whether five minutes is a periodic process interval or a maximum age per
-cache entry, whether polling is per team/project or global, how concurrent
-processes coordinate refresh, and what commands return when a poll fails. These
-choices affect freshness and cache invalidation semantics.

@@ -57,6 +57,5 @@ reads through a warm cache.
 
 ## Notes (Informative)
 
-Policy details not stated by the request remain open in the master specification:
-status-to-step mapping, tie ordering, search fields and ranking, cache scope and
-poll-failure behavior, and the latency measurement population.
+The MVP uses the Linear status, queue, search, and cache defaults stated in
+FR-001 through FR-004. Reads use structured fields and do not interpret prose.

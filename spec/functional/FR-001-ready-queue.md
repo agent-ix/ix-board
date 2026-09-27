@@ -14,12 +14,21 @@ dependencies: []
 
 ## Description
 
-The ix-board `next --team <T>` command SHALL return the ready tickets for the
-requested team. A ticket is eligible only when its project is running and no
-ticket in its `blocked-by` dependency layers remains unresolved. The applicable
-spec state SHALL determine the ticket's next step. Each returned row SHALL
-include a reason that states the readiness and step facts used to include and
-position it.
+The ix-board `next --team <T>` command SHALL return eligible, not-yet-active
+tickets for the requested team. A project is running only when its Linear state
+is `Started`; `Paused` projects and their tickets are excluded. Issue states
+`Completed` and `Canceled` are closed; all other issue states are open. The
+`Specced` spec state maps to Coding, while `Specify` and `Backlog` map to Specify.
+Tickets already in Coding or Review, and tickets with any other spec state, are
+not in the ready queue.
+
+A ticket is blocked until every prerequisite in its recursive `blocked-by`
+dependency graph is `Completed`; this includes prerequisites outside the
+requested team. A canceled prerequisite remains unresolved. Order results by
+project priority, then project manual order, then ticket priority, then ticket
+manual order; use project and ticket identifiers as stable final tie-breakers.
+Each row SHALL state the project, next step, and readiness facts that explain
+its inclusion and position.
 
 ## Inputs
 
@@ -36,20 +45,13 @@ position it.
 
 | ID | Criteria | Verification |
 |----|----------|--------------|
-| FR-001-AC-1 | Given a fixture graph with a running project and an eligible ticket, `next` includes that ticket and a reason identifying its project and spec step. | Test (IT-001) |
-| FR-001-AC-2 | Given a ticket whose project is not running, `next` omits that ticket from the ready queue. | Test (IT-001) |
-| FR-001-AC-3 | Given a fixture with multiple `blocked-by` layers, `next` omits a ticket while any prerequisite in its dependency layers is unresolved and includes it when all prerequisites are resolved. | Test (IT-001) |
-| FR-001-AC-4 | Given identical structured inputs, repeated calls return the same ticket order and reasons. | Test (IT-001) |
-| FR-001-AC-5 | Given multiple eligible tickets, the output order follows the configured spec-state step order and states a reason for each row. | Test (IT-001) |
+| FR-001-AC-1 | Given fixture projects in `Started` and `Paused`, `next` includes eligible tickets only from `Started` projects. | Test |
+| FR-001-AC-2 | Given fixture issues in `Completed`, `Canceled`, and other states, only issues in other states are open; tickets in Coding or Review and tickets with unmapped spec states are excluded from the ready queue. | Test |
+| FR-001-AC-3 | Given fixture tickets in `Backlog`, `Specify`, and `Specced`, their next steps are Specify, Specify, and Coding respectively. | Test |
+| FR-001-AC-4 | A ticket remains excluded while any prerequisite in any recursive `blocked-by` layer, including a cross-team prerequisite, is not `Completed`; a canceled prerequisite does not resolve the block. | Test |
+| FR-001-AC-5 | Eligible tickets are ordered by project priority/manual order, then ticket priority/manual order, with identifiers as final tie-breakers; each row explains its project, step, and readiness. | Test |
+| FR-001-AC-6 | Given identical structured fixture data, repeated calls return the same rows, order, and reasons. | Test |
 
 ## Dependencies
 
 - **Upstream**: [US-001](../usecase/US-001-team-leader-reads.md)
-- **Downstream**: [IT-001](../integration/IT-001-linear-read-fixtures.md)
-
-## Open Questions
-
-The exact Linear value for a running project, spec-state-to-step mapping, tie
-ordering, and behavior for blockers outside the requested team remain undecided.
-The implementation must not invent these policies; resolve them before treating
-the corresponding acceptance criteria as fully specified.
