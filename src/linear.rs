@@ -42,7 +42,7 @@ query WorkspaceIssues($first: Int!, $relationFirst: Int!, $after: String) {
   issues(first: $first, after: $after) {
     nodes {
       id identifier title description priority sortOrder
-      state { name }
+      state { name type }
       team { key }
       project { id }
       relations(first: $relationFirst) {
@@ -266,7 +266,7 @@ impl WorkspaceSource for LinearGraphQlSource {
         let issues = raw_issues
             .into_iter()
             .map(|raw| {
-                let state = raw.state.name;
+                let state = canonical_issue_state(raw.state.name, raw.state.status_type);
                 Issue {
                     id: IssueId(raw.id.clone()),
                     identifier: raw.identifier,
@@ -646,6 +646,16 @@ struct RawIssue {
 #[serde(deny_unknown_fields)]
 struct RawState {
     name: String,
+    #[serde(rename = "type")]
+    status_type: String,
+}
+
+fn canonical_issue_state(name: String, status_type: String) -> String {
+    match status_type.as_str() {
+        "completed" => "Completed".to_owned(),
+        "canceled" => "Canceled".to_owned(),
+        _ => name,
+    }
 }
 
 #[derive(Deserialize)]
@@ -825,7 +835,7 @@ mod tests {
         });
         let issue = serde_json::json!({
             "id": "issue-id", "identifier": "SWM-3", "title": "Project ticket", "description": null,
-            "priority": 2.0, "sortOrder": 1.0, "state": {"name": "Specced"}, "team": {"key": "SWM"},
+            "priority": 2.0, "sortOrder": 1.0, "state": {"name": "Specced", "type": "started"}, "team": {"key": "SWM"},
             "project": {"id": "project-id"},
             "relations": connection(serde_json::json!([]))
         });
@@ -860,7 +870,7 @@ mod tests {
         });
         let issue = serde_json::json!({
             "id": "issue-id", "identifier": "SWM-3", "title": "Project ticket", "description": null,
-            "priority": 2.0, "sortOrder": 1.0, "state": {"name": "Specced"}, "team": {"key": "SWM"},
+            "priority": 2.0, "sortOrder": 1.0, "state": {"name": "Specced", "type": "started"}, "team": {"key": "SWM"},
             "project": {"id": "project-id"},
             "relations": connection(serde_json::json!([]))
         });
@@ -880,6 +890,76 @@ mod tests {
         let _ = std::fs::remove_file(cache_path);
 
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn completed_display_name_unblocks_queue_but_canceled_does_not() {
+        let project = serde_json::json!({
+            "id": "project-id", "identifier": "SWM-P1", "name": "Project", "description": "Goal",
+            "content": null, "priority": 2, "sortOrder": 1.0,
+            "status": {"name": "In Progress", "type": "started"},
+            "teams": connection(serde_json::json!([{"key": "SWM"}])),
+            "projectMilestones": connection(serde_json::json!([]))
+        });
+        let completed_blocker = serde_json::json!({
+            "id": "completed-blocker", "identifier": "SWM-2", "title": "Done prerequisite",
+            "description": null, "priority": 2.0, "sortOrder": 1.0,
+            "state": {"name": "Done", "type": "completed"}, "team": {"key": "SWM"},
+            "project": null,
+            "relations": connection(serde_json::json!([{
+                "type": "blocks", "issue": {"id": "completed-blocker"},
+                "relatedIssue": {"id": "ready-ticket"}
+            }]))
+        });
+        let canceled_blocker = serde_json::json!({
+            "id": "canceled-blocker", "identifier": "SWM-5", "title": "Canceled prerequisite",
+            "description": null, "priority": 2.0, "sortOrder": 2.0,
+            "state": {"name": "Canceled", "type": "canceled"}, "team": {"key": "SWM"},
+            "project": null,
+            "relations": connection(serde_json::json!([{
+                "type": "blocks", "issue": {"id": "canceled-blocker"},
+                "relatedIssue": {"id": "canceled-dependent"}
+            }]))
+        });
+        let ready_ticket = serde_json::json!({
+            "id": "ready-ticket", "identifier": "SWM-6", "title": "Now unblocked",
+            "description": null, "priority": 2.0, "sortOrder": 3.0,
+            "state": {"name": "Specced", "type": "started"}, "team": {"key": "SWM"},
+            "project": {"id": "project-id"}, "relations": connection(serde_json::json!([]))
+        });
+        let canceled_dependent = serde_json::json!({
+            "id": "canceled-dependent", "identifier": "SWM-7", "title": "Still blocked",
+            "description": null, "priority": 2.0, "sortOrder": 4.0,
+            "state": {"name": "Specced", "type": "started"}, "team": {"key": "SWM"},
+            "project": {"id": "project-id"}, "relations": connection(serde_json::json!([]))
+        });
+        let (endpoint, server) = mock_linear(vec![
+            serde_json::json!({"data": {"projects": connection(serde_json::json!([project]))}}),
+            serde_json::json!({"data": {"issues": connection(serde_json::json!([
+                completed_blocker,
+                canceled_blocker,
+                ready_ticket,
+                canceled_dependent
+            ]))}}),
+        ]);
+        let source = LinearGraphQlSource::with_endpoint("test-key", endpoint)
+            .expect("source with local endpoint");
+        let cache_path = std::env::temp_dir().join(format!(
+            "ix-board-linear-completed-transport-{}.sqlite",
+            std::process::id()
+        ));
+        let mut service = ReadService::open(source, &cache_path).expect("open read service");
+        let queue = service.next("SWM").expect("read next queue");
+        server.join().expect("mock server");
+        let _ = std::fs::remove_file(cache_path);
+
+        assert_eq!(
+            queue
+                .iter()
+                .map(|item| item.identifier.as_str())
+                .collect::<Vec<_>>(),
+            ["SWM-6"]
+        );
     }
 
     #[test]
@@ -903,6 +983,11 @@ mod tests {
         );
         assert_eq!(requests[0]["variables"]["first"], 20);
         assert_eq!(requests[0]["variables"]["nestedFirst"], 50);
+        assert!(
+            requests[1]["query"]
+                .as_str()
+                .is_some_and(|query| query.contains("state { name type }"))
+        );
         assert_eq!(requests[1]["variables"]["first"], 20);
         assert!(requests[1]["variables"]["nestedFirst"].is_null());
     }
@@ -957,7 +1042,7 @@ mod tests {
                     "description": null,
                     "priority": 2.0,
                     "sortOrder": 3.0,
-                    "state": {"name": "Specced"},
+                    "state": {"name": "Specced", "type": "started"},
                     "team": {"key": "SWM"},
                     "project": {"id": "project-uuid"},
                     "relations": {

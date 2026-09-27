@@ -17,7 +17,11 @@ dependencies: []
 The ix-board `next --team <T>` command SHALL return eligible, not-yet-active
 tickets for the requested team. A project is running only when its Linear state
 is `Started`; `Paused` projects and their tickets are excluded. Issue states
-`Completed` and `Canceled` are closed; all other issue states are open. The
+`Completed` and `Canceled` are closed; all other issue states are open. For
+Linear workflow states, `type=completed` maps to `Completed` and
+`type=canceled` maps to `Canceled`, regardless of display name; other workflow
+types retain their display name. Thus a `Done` state with `type=completed` is
+closed, while a canceled prerequisite remains unresolved. The
 `Specced` spec state maps to Coding, while `Specify` and `Backlog` map to Specify.
 Tickets already in Coding or Review, and tickets with any other spec state, are
 not in the ready queue.
