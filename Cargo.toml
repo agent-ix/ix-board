@@ -3,7 +3,7 @@ name = "ix-board"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.98.1"
-description = "Keeps the Linear dependency graph honest: resolves dependencies written in ticket prose, reports every reference it cannot resolve, and never silently drops one."
+description = "Deterministic, cached Linear project and ready-work reads."
 authors = ["Peter Krenesky <kreneskyp@gmail.com>"]
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/agent-ix/ix-board"
@@ -28,9 +28,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.20"
 directories = "5"
-regex = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "time"] }
-futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
 assert_cmd = "2"
