@@ -30,7 +30,7 @@ pub use model::{
 use model::{compare_f64, issue_is_open};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use thiserror::Error as ThisError;
 
 /// Errors returned by the library's read and cache boundaries.
@@ -176,9 +176,108 @@ pub struct ReadService<S, C = SystemClock> {
 }
 
 impl<S: WorkspaceSource> ReadService<S, SystemClock> {
+    /// Opens a service using ix-board's platform cache location, honoring
+    /// `IX_BOARD_CACHE_PATH` when it is set.
+    pub fn open_default(source: S) -> Result<Self, Error> {
+        Self::open(source, &default_cache_path()?)
+    }
+
     /// Opens a service with the system clock and a SQLite cache at cache_path.
     pub fn open(source: S, cache_path: &Path) -> Result<Self, Error> {
         Self::with_clock(source, cache_path, SystemClock)
+    }
+}
+
+/// Returns ix-board's SQLite cache path, creating the parent directory for the
+/// platform default.
+///
+/// `IX_BOARD_CACHE_PATH` overrides the platform location. Without that override,
+/// Linux uses `$XDG_CACHE_HOME/ix-board` or `$HOME/.cache/ix-board`, macOS uses
+/// `$HOME/Library/Caches/com.agent-ix.ix-board`, and Windows uses
+/// `%LOCALAPPDATA%/agent-ix/ix-board/cache` (falling back to the conventional
+/// path under `%USERPROFILE%`). On Unix, an absolute `XDG_CACHE_HOME` is enough
+/// even when `HOME` is unset; otherwise `HOME` must be available. This function
+/// returns [`Error::CacheDirectoryUnavailable`] rather than guessing a home path
+/// when neither standard environment variable is available. The standard library
+/// has no portable API for resolving the operating system account database, so
+/// callers in stripped environments can provide `XDG_CACHE_HOME` explicitly.
+pub fn default_cache_path() -> Result<PathBuf, Error> {
+    if let Some(path) = std::env::var_os("IX_BOARD_CACHE_PATH") {
+        return Ok(PathBuf::from(path));
+    }
+    let cache_dir = platform_cache_dir()?;
+    std::fs::create_dir_all(&cache_dir).map_err(Error::CacheDirectory)?;
+    Ok(cache_dir.join("linear.sqlite3"))
+}
+
+#[cfg(target_os = "windows")]
+fn platform_cache_dir() -> Result<PathBuf, Error> {
+    let local_data = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join("AppData").join("Local")))
+        .ok_or(Error::CacheDirectoryUnavailable)?;
+    Ok(local_data.join("agent-ix").join("ix-board").join("cache"))
+}
+
+#[cfg(target_os = "macos")]
+fn platform_cache_dir() -> Result<PathBuf, Error> {
+    Ok(home_dir()
+        .ok_or(Error::CacheDirectoryUnavailable)?
+        .join("Library")
+        .join("Caches")
+        .join("com.agent-ix.ix-board"))
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn platform_cache_dir() -> Result<PathBuf, Error> {
+    let xdg_cache_home = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from);
+    unix_cache_dir(home_dir().as_deref(), xdg_cache_home.as_deref())
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn unix_cache_dir(home: Option<&Path>, xdg_cache_home: Option<&Path>) -> Result<PathBuf, Error> {
+    if let Some(cache_home) = xdg_cache_home.filter(|path| path.is_absolute()) {
+        return Ok(cache_home.join("ix-board"));
+    }
+    home.map(|path| path.join(".cache").join("ix-board"))
+        .ok_or(Error::CacheDirectoryUnavailable)
+}
+
+#[cfg(all(test, not(any(target_os = "windows", target_os = "macos"))))]
+mod cache_path_tests {
+    use super::unix_cache_dir;
+    use std::path::Path;
+
+    /// Tracing: TC-004-05
+    /// ACs: FR-004-AC-5
+    #[test]
+    fn tc_004_05_absolute_xdg_cache_home_does_not_require_home() {
+        assert_eq!(
+            unix_cache_dir(None, Some(Path::new("/tmp/cache"))).expect("absolute XDG path"),
+            Path::new("/tmp/cache/ix-board")
+        );
+    }
+
+    /// Tracing: TC-004-06
+    /// ACs: FR-004-AC-6
+    #[test]
+    fn tc_004_06_invalid_xdg_uses_home_and_missing_home_is_unavailable() {
+        assert_eq!(
+            unix_cache_dir(Some(Path::new("/home/agent")), Some(Path::new("relative")))
+                .expect("home fallback"),
+            Path::new("/home/agent/.cache/ix-board")
+        );
+        assert!(matches!(
+            unix_cache_dir(None, None),
+            Err(super::Error::CacheDirectoryUnavailable)
+        ));
     }
 }
 

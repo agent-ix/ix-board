@@ -193,8 +193,7 @@ fn run(command: Command) -> Result<Output, Error> {
 
 fn run_linear(command: Command) -> Result<Output, Error> {
     let source = LinearGraphQlSource::from_env()?;
-    let cache_path = cache_path()?;
-    let mut service = ReadService::open(source, &cache_path)?;
+    let mut service = ReadService::open_default(source)?;
     match command {
         Command::Next { team } => service.next(&team).map(Output::Queue),
         Command::ProjectChunk { project } => service.project_chunk(&project).map(Output::Chunk),
@@ -244,17 +243,6 @@ fn run_drift(config_path: &PathBuf, evidence_path: &PathBuf) -> Result<DriftRepo
             source,
         })?;
     Ok(evaluate_drift_file(&config, &evidence)?)
-}
-
-fn cache_path() -> Result<PathBuf, Error> {
-    if let Some(path) = std::env::var_os("IX_BOARD_CACHE_PATH") {
-        return Ok(PathBuf::from(path));
-    }
-    let Some(project_dirs) = directories::ProjectDirs::from("com", "agent-ix", "ix-board") else {
-        return Err(Error::CacheDirectoryUnavailable);
-    };
-    std::fs::create_dir_all(project_dirs.cache_dir()).map_err(Error::CacheDirectory)?;
-    Ok(project_dirs.cache_dir().join("linear.sqlite3"))
 }
 
 fn render_human(output: &Output) -> String {

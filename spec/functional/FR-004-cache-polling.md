@@ -40,6 +40,8 @@ A successful refresh SHALL replace the expired value.
 | FR-004-AC-2 | Given an expired entry and a changed fixture source, the next read refreshes and returns the changed value. | Test |
 | FR-004-AC-3 | Given an expired entry and a failed fixture refresh, the read returns an error and does not return the stale value. | Test |
 | FR-004-AC-4 | Given identical cache state and fixture source, repeated reads return identical results. | Test |
+| FR-004-AC-5 | The CLI and library `ReadService::open_default` SHALL use the same platform cache location, and `IX_BOARD_CACHE_PATH` SHALL override that location. On Unix, an absolute `XDG_CACHE_HOME` SHALL select `<XDG_CACHE_HOME>/ix-board/linear.sqlite3` even when `HOME` is unset; otherwise `HOME` SHALL select `<HOME>/.cache/ix-board/linear.sqlite3`. | Test |
+| FR-004-AC-6 | Given a non-absolute or absent `XDG_CACHE_HOME`, ix-board SHALL fall back to the available home directory; if neither an absolute XDG cache directory nor a home directory is available, the library SHALL return `CacheDirectoryUnavailable` rather than inventing a path. | Test |
 
 ## Dependencies
 
