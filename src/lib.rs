@@ -30,7 +30,7 @@ pub use model::{
 use model::{compare_f64, issue_is_open};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use thiserror::Error as ThisError;
 
 /// Errors returned by the library's read and cache boundaries.
@@ -176,10 +176,68 @@ pub struct ReadService<S, C = SystemClock> {
 }
 
 impl<S: WorkspaceSource> ReadService<S, SystemClock> {
+    /// Opens a service using ix-board's platform cache location, honoring
+    /// `IX_BOARD_CACHE_PATH` when it is set.
+    pub fn open_default(source: S) -> Result<Self, Error> {
+        Self::open(source, &default_cache_path()?)
+    }
+
     /// Opens a service with the system clock and a SQLite cache at cache_path.
     pub fn open(source: S, cache_path: &Path) -> Result<Self, Error> {
         Self::with_clock(source, cache_path, SystemClock)
     }
+}
+
+/// Returns ix-board's SQLite cache path, creating the parent directory for the
+/// platform default.
+///
+/// `IX_BOARD_CACHE_PATH` overrides the platform location. Without that override,
+/// Linux uses `$XDG_CACHE_HOME/ix-board` or `$HOME/.cache/ix-board`, macOS uses
+/// `$HOME/Library/Caches/com.agent-ix.ix-board`, and Windows uses
+/// `%LOCALAPPDATA%/agent-ix/ix-board/cache` (falling back to the conventional
+/// path under `%USERPROFILE%`).
+pub fn default_cache_path() -> Result<PathBuf, Error> {
+    if let Some(path) = std::env::var_os("IX_BOARD_CACHE_PATH") {
+        return Ok(PathBuf::from(path));
+    }
+    let cache_dir = platform_cache_dir().ok_or(Error::CacheDirectoryUnavailable)?;
+    std::fs::create_dir_all(&cache_dir).map_err(Error::CacheDirectory)?;
+    Ok(cache_dir.join("linear.sqlite3"))
+}
+
+#[cfg(target_os = "windows")]
+fn platform_cache_dir() -> Option<PathBuf> {
+    let local_data = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join("AppData").join("Local")))?;
+    Some(local_data.join("agent-ix").join("ix-board").join("cache"))
+}
+
+#[cfg(target_os = "macos")]
+fn platform_cache_dir() -> Option<PathBuf> {
+    Some(
+        home_dir()?
+            .join("Library")
+            .join("Caches")
+            .join("com.agent-ix.ix-board"),
+    )
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn platform_cache_dir() -> Option<PathBuf> {
+    let home = home_dir()?;
+    let cache_home = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| home.join(".cache"));
+    Some(cache_home.join("ix-board"))
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
 }
 
 impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
