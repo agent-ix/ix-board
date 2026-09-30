@@ -157,6 +157,8 @@ pub struct Project {
     pub team_keys: Vec<TeamKey>,
     /// Project milestones in Linear order.
     pub milestones: Vec<Milestone>,
+    /// Initiatives containing this project.
+    pub initiatives: Vec<Initiative>,
 }
 
 /// A project milestone record.
@@ -187,6 +189,10 @@ pub struct Issue {
     pub description: Option<String>,
     /// Workflow state name.
     pub state: String,
+    /// Linear workflow category, independent of its display name.
+    pub state_type: WorkflowStateType,
+    /// Parent ticket UUID, distinct from prerequisite dependencies.
+    pub parent_id: Option<IssueId>,
     /// Team identifier.
     pub team_key: TeamKey,
     /// Associated project UUID.
@@ -207,6 +213,8 @@ pub struct WorkspaceSnapshot {
     pub projects: Vec<Project>,
     /// Issues in the Linear workspace, including cross-team prerequisites.
     pub issues: Vec<Issue>,
+    /// Unix seconds of the actual source fetch, preserved by cached reads.
+    pub fetched_at: i64,
 }
 
 /// Next step inferred from a structured spec state.
@@ -294,7 +302,10 @@ pub struct SearchResult {
 }
 
 pub(crate) fn issue_is_open(issue: &Issue) -> bool {
-    !matches!(issue.state.as_str(), "Completed" | "Canceled")
+    !matches!(
+        issue.state_type,
+        WorkflowStateType::Completed | WorkflowStateType::Canceled | WorkflowStateType::Duplicate
+    )
 }
 
 pub(crate) fn compare_f64(left: f64, right: f64) -> Ordering {
@@ -347,4 +358,34 @@ mod tests {
             Err(crate::Error::InvalidProjectStatus { .. })
         ));
     }
+}
+
+/// Initiative identity and name attached to a project.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Initiative {
+    /// Linear UUID.
+    pub id: String,
+    /// Initiative name.
+    pub name: String,
+}
+
+/// Linear workflow category catalog.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkflowStateType {
+    /// Requires triage.
+    Triage,
+    /// Deferred work.
+    Backlog,
+    /// Work not yet started.
+    Unstarted,
+    /// Work in progress.
+    Started,
+    /// Completed work.
+    Completed,
+    /// Canceled work.
+    Canceled,
+    /// Duplicate work.
+    Duplicate,
 }

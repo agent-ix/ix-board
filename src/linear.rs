@@ -4,8 +4,9 @@
 //! Linear GraphQL transport for selected reads and project status/priority writes.
 
 use crate::{
-    Error, Issue, IssueId, Milestone, Project, ProjectId, ProjectMutationSource, ProjectPriority,
-    ProjectRunStatus, TeamKey, WorkspaceSnapshot, WorkspaceSource,
+    Clock, Error, Initiative, Issue, IssueId, Milestone, Project, ProjectId, ProjectMutationSource,
+    ProjectPriority, ProjectRunStatus, SystemClock, TeamKey, WorkflowStateType, WorkspaceSnapshot,
+    WorkspaceSource,
 };
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -18,7 +19,7 @@ const PROJECT_NESTED_PAGE_SIZE: i32 = 50;
 const RELATION_PAGE_SIZE: i32 = 50;
 const PAGE_LIMIT: usize = 1_000;
 // Invalidate cached snapshots predating canonical Linear project/issue state handling.
-const CACHE_MODEL_VERSION: &str = "v3";
+const CACHE_MODEL_VERSION: &str = "v4";
 const ENDPOINT: &str = "https://api.linear.app/graphql";
 
 const PROJECT_QUERY: &str = r#"
@@ -27,6 +28,7 @@ query WorkspaceProjects($first: Int!, $nestedFirst: Int!, $after: String) {
     nodes {
       id identifier name description content priority sortOrder
       status { name type }
+      initiatives(first: 10) { nodes { id name } pageInfo { hasNextPage } }
       teams(first: $nestedFirst) { nodes { key } pageInfo { hasNextPage } }
       projectMilestones(first: $nestedFirst) {
         nodes { id name description sortOrder }
@@ -45,6 +47,7 @@ query WorkspaceIssues($first: Int!, $relationFirst: Int!, $after: String) {
       state { name type }
       team { key }
       project { id }
+      parent { id }
       relations(first: $relationFirst) {
         nodes { type issue { id } relatedIssue { id } }
         pageInfo { hasNextPage }
@@ -188,7 +191,13 @@ impl WorkspaceSource for LinearGraphQlSource {
                         resource: format!("project {} milestones", raw.id),
                     });
                 }
+                if raw.initiatives.page_info.has_next_page {
+                    return Err(Error::NestedPaginationLimit {
+                        resource: format!("project {} initiatives", raw.id),
+                    });
+                }
                 projects.push(Project {
+                    initiatives: raw.initiatives.nodes,
                     id: ProjectId(raw.id),
                     identifier: raw.identifier,
                     name: raw.name,
@@ -266,13 +275,16 @@ impl WorkspaceSource for LinearGraphQlSource {
         let issues = raw_issues
             .into_iter()
             .map(|raw| {
-                let state = canonical_issue_state(raw.state.name, raw.state.status_type);
+                let state_type = raw.state.status_type;
+                let state = canonical_issue_state(raw.state.name, state_type);
                 Issue {
                     id: IssueId(raw.id.clone()),
                     identifier: raw.identifier,
                     title: raw.title,
                     description: raw.description,
                     state,
+                    state_type,
+                    parent_id: raw.parent.map(|p| IssueId(p.id)),
                     team_key: TeamKey(raw.team.key),
                     project_id: raw.project.map(|project| ProjectId(project.id)),
                     priority: raw.priority,
@@ -286,7 +298,11 @@ impl WorkspaceSource for LinearGraphQlSource {
                 }
             })
             .collect();
-        Ok(WorkspaceSnapshot { projects, issues })
+        Ok(WorkspaceSnapshot {
+            projects,
+            issues,
+            fetched_at: SystemClock.now_epoch_seconds(),
+        })
     }
 }
 
@@ -590,6 +606,7 @@ struct RawProject {
     status: RawProjectStatus,
     teams: Connection<RawTeam>,
     project_milestones: Connection<RawMilestone>,
+    initiatives: Connection<Initiative>,
 }
 
 #[derive(Deserialize)]
@@ -657,6 +674,7 @@ struct RawIssue {
     state: RawState,
     team: RawTeam,
     project: Option<RawIssueProject>,
+    parent: Option<RawIssueProject>,
     relations: Connection<RawRelation>,
 }
 
@@ -665,14 +683,18 @@ struct RawIssue {
 struct RawState {
     name: String,
     #[serde(rename = "type")]
-    status_type: String,
+    status_type: WorkflowStateType,
 }
 
-fn canonical_issue_state(name: String, status_type: String) -> String {
-    match status_type.as_str() {
-        "completed" => "Completed".to_owned(),
-        "canceled" => "Canceled".to_owned(),
-        _ => name,
+fn canonical_issue_state(name: String, status_type: WorkflowStateType) -> String {
+    match status_type {
+        WorkflowStateType::Completed => "Completed".to_owned(),
+        WorkflowStateType::Canceled => "Canceled".to_owned(),
+        WorkflowStateType::Duplicate => "Duplicate".to_owned(),
+        WorkflowStateType::Triage
+        | WorkflowStateType::Backlog
+        | WorkflowStateType::Unstarted
+        | WorkflowStateType::Started => name,
     }
 }
 
@@ -883,6 +905,7 @@ mod tests {
             "content": null, "priority": 2, "sortOrder": 1.0,
             "status": {"name": "In Progress", "type": "started"},
             "teams": connection(serde_json::json!([{"key": "SWM"}])),
+            "initiatives": connection(serde_json::json!([])),
             "projectMilestones": connection(serde_json::json!([]))
         });
         let issue = serde_json::json!({
@@ -918,6 +941,7 @@ mod tests {
             "content": null, "priority": 2, "sortOrder": 1.0,
             "status": {"name": "Paused", "type": "planned"},
             "teams": connection(serde_json::json!([{"key": "SWM"}])),
+            "initiatives": connection(serde_json::json!([])),
             "projectMilestones": connection(serde_json::json!([]))
         });
         let issue = serde_json::json!({
@@ -952,6 +976,7 @@ mod tests {
             "content": null, "priority": 2, "sortOrder": 1.0,
             "status": {"name": "In Progress", "type": "started"},
             "teams": connection(serde_json::json!([{"key": "SWM"}])),
+            "initiatives": connection(serde_json::json!([{ "id": "init", "name": "Delivery" }])),
             "projectMilestones": connection(serde_json::json!([]))
         });
         let completed_blocker = serde_json::json!({
@@ -975,7 +1000,7 @@ mod tests {
             }]))
         });
         let ready_ticket = serde_json::json!({
-            "id": "ready-ticket", "identifier": "SWM-6", "title": "Now unblocked",
+            "parent": {"id": "completed-blocker"}, "id": "ready-ticket", "identifier": "SWM-6", "title": "Now unblocked",
             "description": null, "priority": 2.0, "sortOrder": 3.0,
             "state": {"name": "Specced", "type": "started"}, "team": {"key": "SWM"},
             "project": {"id": "project-id"}, "relations": connection(serde_json::json!([]))
@@ -1003,6 +1028,16 @@ mod tests {
         ));
         let mut service = ReadService::open(source, &cache_path).expect("open read service");
         let queue = service.next("SWM").expect("read next queue");
+        let snapshot = service.workspace_snapshot().unwrap();
+        assert_eq!(snapshot.projects[0].initiatives[0].id, "init");
+        let child = snapshot
+            .issues
+            .iter()
+            .find(|i| i.identifier == "SWM-6")
+            .unwrap();
+        assert_eq!(child.parent_id, Some(IssueId("completed-blocker".into())));
+        assert_eq!(child.state_type, crate::WorkflowStateType::Started);
+        assert!(snapshot.fetched_at > 0);
         server.join().expect("mock server");
         let _ = std::fs::remove_file(cache_path);
 
@@ -1026,7 +1061,11 @@ mod tests {
             Sha256::digest("test-key".as_bytes())
         );
         let stale_snapshot = WorkspaceSnapshot {
+            fetched_at: 0,
+
             projects: vec![Project {
+                initiatives: Vec::new(),
+
                 id: ProjectId("project-id".to_owned()),
                 identifier: Some("SWM-P1".to_owned()),
                 name: "Project".to_owned(),
@@ -1040,6 +1079,9 @@ mod tests {
             }],
             issues: vec![
                 Issue {
+                    parent_id: None,
+                    state_type: crate::WorkflowStateType::Unstarted,
+
                     id: IssueId("blocker-id".to_owned()),
                     identifier: "SWM-2".to_owned(),
                     title: "Done blocker cached before canonicalization".to_owned(),
@@ -1052,6 +1094,9 @@ mod tests {
                     blocked_by: Vec::new(),
                 },
                 Issue {
+                    parent_id: None,
+                    state_type: crate::WorkflowStateType::Unstarted,
+
                     id: IssueId("ready-ticket".to_owned()),
                     identifier: "SWM-6".to_owned(),
                     title: "Ready after refresh".to_owned(),
@@ -1087,6 +1132,7 @@ mod tests {
             "content": null, "priority": 2, "sortOrder": 1.0,
             "status": {"name": "In Progress", "type": "started"},
             "teams": connection(serde_json::json!([{"key": "SWM"}])),
+            "initiatives": connection(serde_json::json!([])),
             "projectMilestones": connection(serde_json::json!([]))
         });
         let blocker = serde_json::json!({
@@ -1186,7 +1232,8 @@ mod tests {
                         "nodes": [{"key": "SWM"}],
                         "pageInfo": {"hasNextPage": false}
                     },
-                    "projectMilestones": {
+                    "initiatives": connection(serde_json::json!([])),
+            "projectMilestones": {
                         "nodes": [{
                             "id": "milestone-uuid",
                             "name": "Milestone",

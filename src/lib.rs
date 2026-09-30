@@ -7,6 +7,8 @@ mod cache;
 mod drift;
 mod linear;
 mod model;
+mod scope;
+pub use scope::{ScopeSelection, ScopeSummary, select_scope};
 
 use cache::SnapshotCache;
 pub use cache::{CACHE_TTL_SECONDS, Clock, SystemClock};
@@ -22,9 +24,9 @@ pub use drift::{
 };
 pub use linear::LinearGraphQlSource;
 pub use model::{
-    ChunkIssue, Issue, IssueId, Milestone, NextStep, Project, ProjectChunk, ProjectId,
+    ChunkIssue, Initiative, Issue, IssueId, Milestone, NextStep, Project, ProjectChunk, ProjectId,
     ProjectPriority, ProjectRunStatus, ReadyItem, SearchKind, SearchResult, TeamKey,
-    WorkspaceSnapshot,
+    WorkflowStateType, WorkspaceSnapshot,
 };
 
 use model::{compare_f64, issue_is_open};
@@ -36,6 +38,30 @@ use thiserror::Error as ThisError;
 /// Errors returned by the library's read and cache boundaries.
 #[derive(Debug, ThisError)]
 pub enum Error {
+    /// A referenced ancestor was absent from the complete snapshot.
+    #[error("ticket {identifier} has an unavailable parent {parent:?}")]
+    MissingParent {
+        /// Descendant whose ancestry was incomplete.
+        identifier: String,
+        /// Missing parent identity.
+        parent: IssueId,
+    },
+    /// A scope selector did not resolve to one authoritative record.
+    #[error("scope {kind} {identifier:?} resolved to {matches} records")]
+    ScopeSelection {
+        /// Selected record kind.
+        kind: &'static str,
+        /// User supplied identifier.
+        identifier: String,
+        /// Number of distinct matches.
+        matches: usize,
+    },
+    /// The parent graph contains a cycle and cannot define leaf tasks.
+    #[error("issue parent graph contains a cycle at {identifier}")]
+    ParentCycle {
+        /// Ticket where the cycle was detected.
+        identifier: String,
+    },
     /// A Linear HTTP request failed.
     #[error("Linear request failed: {0}")]
     Http(#[from] reqwest::Error),
@@ -330,9 +356,9 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
     /// A failed fetch leaves the cache empty so later reads cannot use stale data.
     pub fn force_refresh_workspace(&mut self) -> Result<WorkspaceSnapshot, Error> {
         self.cache.invalidate()?;
-        let snapshot = self.source.fetch_workspace()?;
-        self.cache
-            .replace(self.clock.now_epoch_seconds(), &snapshot)?;
+        let mut snapshot = self.source.fetch_workspace()?;
+        snapshot.fetched_at = self.clock.now_epoch_seconds();
+        self.cache.replace(snapshot.fetched_at, &snapshot)?;
         Ok(snapshot)
     }
 
@@ -720,4 +746,12 @@ fn search_snapshot(snapshot: &WorkspaceSnapshot, query: &str) -> Vec<SearchResul
             .then_with(|| left.identifier.cmp(&right.identifier))
     });
     results
+}
+
+/// Computes the ordered queue from exactly the supplied complete snapshot.
+pub fn ready_from_snapshot(
+    snapshot: &WorkspaceSnapshot,
+    team: &str,
+) -> Result<Vec<ReadyItem>, Error> {
+    ready_queue(snapshot, team)
 }
