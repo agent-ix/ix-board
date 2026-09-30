@@ -136,6 +136,7 @@ impl Clock for ManualClock {
 
 fn project(id: &str, identifier: &str, status: &str, priority: i32, sort_order: f64) -> Project {
     Project {
+        initiatives: Vec::new(),
         id: ProjectId(id.to_owned()),
         identifier: Some(identifier.to_owned()),
         name: format!("Project {identifier}"),
@@ -160,6 +161,14 @@ fn issue(
     blocked_by: &[&str],
 ) -> Issue {
     Issue {
+        parent_id: None,
+        state_type: match state {
+            "Completed" => ix_board::WorkflowStateType::Completed,
+            "Canceled" => ix_board::WorkflowStateType::Canceled,
+            "Duplicate" => ix_board::WorkflowStateType::Duplicate,
+            "Specced" | "Backlog" => ix_board::WorkflowStateType::Unstarted,
+            _ => ix_board::WorkflowStateType::Started,
+        },
         id: IssueId(id.to_owned()),
         identifier: identifier.to_owned(),
         title: format!("Title {identifier}"),
@@ -188,6 +197,8 @@ fn with_description(mut value: Issue, description: &str) -> Issue {
 
 fn queue_fixture() -> WorkspaceSnapshot {
     WorkspaceSnapshot {
+        fetched_at: 0,
+
         projects: vec![
             project("p1", "SWM-P1", "Started", 2, 2.0),
             project("p2", "SWM-P2", "Started", 1, 1.0),
@@ -628,6 +639,7 @@ fn search_is_case_insensitive_structured_and_ordered_by_kind_then_identifier() {
     );
 }
 
+/// Trace: FR-010-AC-4
 #[test]
 fn cache_reuses_fresh_snapshot_and_refreshes_after_five_minutes() {
     let directory = TempDir::new().expect("temporary directory");
@@ -637,9 +649,15 @@ fn cache_reuses_fresh_snapshot_and_refreshes_after_five_minutes() {
 
     let initial = reads.search("Title SWM-1").expect("initial read");
     assert_eq!(source.reads.load(Ordering::SeqCst), 1);
+    assert_eq!(reads.workspace_snapshot().unwrap().fetched_at, 10_000);
     source.replace(WorkspaceSnapshot {
+        fetched_at: 0,
+
         projects: queue_fixture().projects,
         issues: vec![Issue {
+            parent_id: None,
+            state_type: ix_board::WorkflowStateType::Started,
+
             title: "Changed title".to_owned(),
             ..issue(
                 "changed",
@@ -655,18 +673,26 @@ fn cache_reuses_fresh_snapshot_and_refreshes_after_five_minutes() {
     });
     assert_eq!(reads.search("changed").expect("warm cache").len(), 0);
     assert_eq!(source.reads.load(Ordering::SeqCst), 1);
+    clock.set(10_001);
+    assert_eq!(reads.workspace_snapshot().unwrap().fetched_at, 10_000);
     clock.set(10_000 + ix_board::CACHE_TTL_SECONDS);
     let refreshed = reads.search("changed").expect("expired cache refresh");
     assert_eq!(refreshed.len(), 1);
+    assert_eq!(
+        reads.workspace_snapshot().unwrap().fetched_at,
+        10_000 + ix_board::CACHE_TTL_SECONDS
+    );
     assert_ne!(initial, refreshed);
     assert_eq!(source.reads.load(Ordering::SeqCst), 2);
 }
 
+/// Trace: FR-010-AC-4
 #[test]
 fn forced_refresh_bypasses_fresh_cache_and_replaces_it() {
     let directory = TempDir::new().expect("temporary directory");
     let source = FixtureSource::new(queue_fixture());
-    let mut reads = service(source.clone(), ManualClock::new(10_000), &directory);
+    let clock = ManualClock::new(10_000);
+    let mut reads = service(source.clone(), clock.clone(), &directory);
 
     assert_eq!(
         reads
@@ -679,6 +705,7 @@ fn forced_refresh_bypasses_fresh_cache_and_replaces_it() {
     let mut changed = queue_fixture();
     changed.projects[0].name = "Updated project".to_owned();
     source.replace(changed);
+    clock.set(10_001);
 
     assert_eq!(
         reads.workspace_snapshot().expect("warm cache").projects[0].name,
@@ -694,11 +721,13 @@ fn forced_refresh_bypasses_fresh_cache_and_replaces_it() {
         "Updated project"
     );
     assert_eq!(source.reads.load(Ordering::SeqCst), 2);
+    assert_eq!(reads.workspace_snapshot().unwrap().fetched_at, 10_001);
     assert_eq!(
         reads.workspace_snapshot().expect("replaced cache").projects[0].name,
         "Updated project"
     );
     assert_eq!(source.reads.load(Ordering::SeqCst), 2);
+    assert_eq!(reads.workspace_snapshot().unwrap().fetched_at, 10_001);
 }
 
 #[test]
