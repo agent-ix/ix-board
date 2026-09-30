@@ -12,7 +12,7 @@ Reviewed the full diff using repository conventions and the Rust review checklis
 
 ## Verdict
 
-**PASS** — no findings. Local HTTP transport tests exercise real requests, HTTP 400 GraphQL rate limits, unrelated metadata and non-rate failures. Fixed-time header tests exercise request, endpoint and complexity reset selection and malformed/past metadata. The existing transport test measures the emitted project and issue page limits. Full make ci passes (50 tests, two existing ignored lanes). Requirement validation passes. The installed quire CLI has no matrix command; no strict matrix success is claimed.
+**PASS** — no findings. Local HTTP transport tests exercise real requests, HTTP 400 GraphQL rate limits, unrelated metadata and non-rate failures. Fixed-time header tests exercise request, endpoint and complexity reset selection and malformed/past metadata. The existing transport test measures the emitted project and issue page limits. Full make ci passes (50 tests, two existing ignored lanes). The new acceptance criteria have no grammar findings. FR-004 validation still reports pre-existing bundled obligations in AC-5 and AC-6; those unchanged criteria are outside this diff. The installed quire CLI has no matrix command; no strict matrix success is claimed.
 
 ## Findings
 
