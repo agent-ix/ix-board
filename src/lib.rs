@@ -65,6 +65,12 @@ pub enum Error {
     /// A Linear HTTP request failed.
     #[error("Linear request failed: {0}")]
     Http(#[from] reqwest::Error),
+    /// Linear exhausted a request or complexity quota.
+    #[error("Linear rate limited; retry in {retry_after:?}")]
+    LinearRateLimited {
+        /// Minimum cooldown before attempting another source request.
+        retry_after: std::time::Duration,
+    },
     /// LINEAR_API_KEY is missing or empty.
     #[error("LINEAR_API_KEY is required for Linear reads")]
     MissingApiKey,

@@ -14,7 +14,9 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 // Keep the project query below Linear's complexity limit while retaining nested page coverage.
-const PAGE_SIZE: i32 = 20;
+const PROJECT_PAGE_SIZE: i32 = 20;
+// 50 issues including up to 50 relations each remain below the 10,000-point query limit.
+const ISSUE_PAGE_SIZE: i32 = 50;
 const PROJECT_NESTED_PAGE_SIZE: i32 = 50;
 const RELATION_PAGE_SIZE: i32 = 50;
 const PAGE_LIMIT: usize = 1_000;
@@ -123,6 +125,7 @@ impl LinearGraphQlSource {
     fn query<T: DeserializeOwned>(
         &self,
         query: &'static str,
+        first: i32,
         after: Option<&str>,
         relation_first: Option<i32>,
         nested_first: Option<i32>,
@@ -130,7 +133,7 @@ impl LinearGraphQlSource {
         self.request(
             query,
             Variables {
-                first: PAGE_SIZE,
+                first,
                 relation_first,
                 nested_first,
                 after: after.map(str::to_owned),
@@ -148,10 +151,25 @@ impl LinearGraphQlSource {
             .post(&self.endpoint)
             .header(reqwest::header::AUTHORIZATION, &self.api_key)
             .json(&GraphQlRequest { query, variables })
-            .send()?
-            .error_for_status()?
-            .json::<GraphQlResponse<T>>()?;
+            .send()?;
+        let status_error = response.error_for_status_ref().err();
+        let retry_after = rate_limit_delay(response.headers(), std::time::SystemTime::now());
+        // Linear deliberately uses HTTP 400 for GraphQL RATELIMITED responses.
+        // Inspect its structured errors before returning the HTTP status error.
+        let response = match response.json::<GraphQlResponse<T>>() {
+            Ok(response) => response,
+            Err(error) => return Err(Error::Http(status_error.unwrap_or(error))),
+        };
         if let Some(errors) = response.errors.filter(|errors| !errors.is_empty()) {
+            if errors.iter().any(|error| {
+                error
+                    .extensions
+                    .as_ref()
+                    .and_then(|ext| ext.code.as_deref())
+                    == Some("RATELIMITED")
+            }) {
+                return Err(Error::LinearRateLimited { retry_after });
+            }
             return Err(Error::GraphQl {
                 messages: errors
                     .into_iter()
@@ -159,6 +177,9 @@ impl LinearGraphQlSource {
                     .collect::<Vec<_>>()
                     .join("; "),
             });
+        }
+        if let Some(error) = status_error {
+            return Err(Error::Http(error));
         }
         response.data.ok_or(Error::MissingWorkspaceData)
     }
@@ -175,6 +196,7 @@ impl WorkspaceSource for LinearGraphQlSource {
         for page in 0..PAGE_LIMIT {
             let result: ProjectData = self.query(
                 PROJECT_QUERY,
+                PROJECT_PAGE_SIZE,
                 after.as_deref(),
                 None,
                 Some(PROJECT_NESTED_PAGE_SIZE),
@@ -244,6 +266,7 @@ impl WorkspaceSource for LinearGraphQlSource {
         for page in 0..PAGE_LIMIT {
             let result: IssueData = self.query(
                 ISSUE_QUERY,
+                ISSUE_PAGE_SIZE,
                 after.as_deref(),
                 Some(RELATION_PAGE_SIZE),
                 None,
@@ -371,8 +394,13 @@ impl LinearGraphQlSource {
         let mut statuses = Vec::new();
         let mut after = None;
         for page in 0..PAGE_LIMIT {
-            let result: ProjectStatusesData =
-                self.query(PROJECT_STATUSES_QUERY, after.as_deref(), None, None)?;
+            let result: ProjectStatusesData = self.query(
+                PROJECT_STATUSES_QUERY,
+                PROJECT_PAGE_SIZE,
+                after.as_deref(),
+                None,
+                None,
+            )?;
             let connection = result.project_statuses;
             statuses.extend(connection.nodes);
             if !connection.page_info.has_next_page {
@@ -515,6 +543,49 @@ struct GraphQlResponse<T> {
 #[derive(Deserialize)]
 struct GraphQlError {
     message: String,
+    extensions: Option<GraphQlErrorExtensions>,
+}
+
+// GraphQL error extensions are an open metadata map. Consume the selected
+// discriminant while allowing Linear's unrelated error metadata.
+#[derive(Deserialize)]
+struct GraphQlErrorExtensions {
+    code: Option<String>,
+}
+
+fn rate_limit_delay(
+    headers: &reqwest::header::HeaderMap,
+    now: std::time::SystemTime,
+) -> std::time::Duration {
+    let now_ms = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    // Multiple quotas can be exhausted at once; wait until all indicated
+    // request/endpoint/complexity reset times have elapsed.
+    let reset_ms = ["requests", "endpoint-requests", "complexity"]
+        .into_iter()
+        .filter_map(|quota| {
+            let remaining = headers
+                .get(format!("x-ratelimit-{quota}-remaining"))?
+                .to_str()
+                .ok()?;
+            if remaining.parse::<u64>().ok()? != 0 {
+                return None;
+            }
+            headers
+                .get(format!("x-ratelimit-{quota}-reset"))?
+                .to_str()
+                .ok()?
+                .parse::<u64>()
+                .ok()
+        })
+        .max();
+    reset_ms
+        .and_then(|reset| u64::try_from(u128::from(reset).saturating_sub(now_ms)).ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(std::time::Duration::from_secs(60))
+        .max(std::time::Duration::from_secs(60))
 }
 
 #[derive(Deserialize)]
@@ -754,6 +825,17 @@ mod tests {
     }
 
     fn mock_linear(responses: Vec<Value>) -> (String, JoinHandle<Vec<Value>>) {
+        mock_linear_http(
+            responses
+                .into_iter()
+                .map(|body| (200, Vec::new(), body))
+                .collect(),
+        )
+    }
+
+    type MockResponse = (u16, Vec<(&'static str, String)>, Value);
+
+    fn mock_linear_http(responses: Vec<MockResponse>) -> (String, JoinHandle<Vec<Value>>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Linear endpoint");
         let endpoint = format!(
             "http://{}/graphql",
@@ -761,16 +843,20 @@ mod tests {
         );
         let server = std::thread::spawn(move || {
             let mut requests = Vec::new();
-            for response in responses {
+            for (status, headers, response) in responses {
                 let (mut stream, _) = listener.accept().expect("accept GraphQL request");
                 requests.push(read_request(&mut stream));
                 let body = serde_json::to_vec(&response).expect("encode GraphQL response");
                 write!(
                     stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 {status} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
                     body.len()
                 )
                 .expect("write response headers");
+                for (name, value) in headers {
+                    write!(stream, "{name}: {value}\r\n").expect("write quota header");
+                }
+                stream.write_all(b"\r\n").expect("end headers");
                 stream.write_all(&body).expect("write response body");
             }
             requests
@@ -1185,6 +1271,99 @@ mod tests {
         }));
     }
 
+    /// Trace: FR-004-AC-9, FR-004-AC-10
+    #[test]
+    fn http_400_rate_limit_is_typed_and_keeps_quota_reset_delay() {
+        let (endpoint, server) = mock_linear_http(vec![(
+            400,
+            vec![
+                ("X-RateLimit-Requests-Remaining", "0".into()),
+                ("X-RateLimit-Requests-Reset", "1".into()),
+            ],
+            serde_json::json!({"errors": [{"message": "quota exceeded", "extensions": {"code": "RATELIMITED", "type": "extra server metadata"}}]}),
+        )]);
+        let source = LinearGraphQlSource::with_endpoint("test-key", endpoint).unwrap();
+        let error = source.fetch_workspace().unwrap_err();
+        let crate::Error::LinearRateLimited { retry_after } = error else {
+            panic!("wrong error: {error:?}")
+        };
+        assert_eq!(retry_after, std::time::Duration::from_secs(60));
+        assert!(
+            crate::Error::LinearRateLimited { retry_after }
+                .to_string()
+                .contains("rate limited")
+        );
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    /// Trace: FR-004-AC-9, FR-004-AC-10
+    #[test]
+    fn rate_limit_delay_uses_exhausted_quotas_and_rejects_invalid_metadata() {
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(100);
+        let mut headers = reqwest::header::HeaderMap::new();
+        for (name, value) in [
+            ("x-ratelimit-requests-remaining", "0"),
+            ("x-ratelimit-requests-reset", "200000"),
+            ("x-ratelimit-endpoint-requests-remaining", "0"),
+            ("x-ratelimit-endpoint-requests-reset", "400000"),
+            ("x-ratelimit-complexity-remaining", "1"),
+            ("x-ratelimit-complexity-reset", "999999"),
+        ] {
+            headers.insert(name, value.parse().unwrap());
+        }
+        assert_eq!(
+            super::rate_limit_delay(&headers, now),
+            std::time::Duration::from_secs(300)
+        );
+        headers.insert("x-ratelimit-complexity-remaining", "0".parse().unwrap());
+        assert_eq!(
+            super::rate_limit_delay(&headers, now),
+            std::time::Duration::from_millis(899999)
+        );
+        headers.clear();
+        headers.insert("x-ratelimit-requests-remaining", "bad".parse().unwrap());
+        headers.insert("x-ratelimit-requests-reset", "bad".parse().unwrap());
+        assert_eq!(
+            super::rate_limit_delay(&headers, now),
+            std::time::Duration::from_secs(60)
+        );
+        headers.insert("x-ratelimit-requests-remaining", "0".parse().unwrap());
+        headers.insert("x-ratelimit-requests-reset", "1".parse().unwrap());
+        assert_eq!(
+            super::rate_limit_delay(&headers, now),
+            std::time::Duration::from_secs(60)
+        );
+    }
+
+    /// Trace: FR-004-AC-9, FR-004-AC-10
+    #[test]
+    fn non_rate_graphql_and_http_failures_remain_distinct() {
+        for (body, graphql) in [
+            (
+                serde_json::json!({"errors": [{"message": "invalid query", "extensions": {"code": "OTHER"}}]}),
+                true,
+            ),
+            (serde_json::json!({"proxy": "unavailable"}), false),
+        ] {
+            let (endpoint, server) = mock_linear_http(vec![(400, vec![], body)]);
+            let source = LinearGraphQlSource::with_endpoint("test-key", endpoint).unwrap();
+            let error = source.fetch_workspace().unwrap_err();
+            match error {
+                crate::Error::GraphQl { messages } => {
+                    assert!(graphql);
+                    assert_eq!(messages, "invalid query");
+                }
+                crate::Error::Http(error) => {
+                    assert!(!graphql);
+                    assert_eq!(error.status(), Some(reqwest::StatusCode::BAD_REQUEST));
+                }
+                other => panic!("wrong error: {other:?}"),
+            }
+            assert_eq!(server.join().unwrap().len(), 1);
+        }
+    }
+
+    /// Trace: FR-004-AC-7, FR-004-AC-8
     #[test]
     fn workspace_transport_uses_linear_complexity_safe_page_size() {
         let empty = connection(serde_json::json!([]));
@@ -1211,7 +1390,7 @@ mod tests {
                 .as_str()
                 .is_some_and(|query| query.contains("state { name type }"))
         );
-        assert_eq!(requests[1]["variables"]["first"], 20);
+        assert_eq!(requests[1]["variables"]["first"], 50);
         assert!(requests[1]["variables"]["nestedFirst"].is_null());
     }
 
