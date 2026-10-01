@@ -91,8 +91,10 @@ and dependency cycles SHALL produce explicit errors and no partial chunk.
 ## Outputs
 
 - A deterministic sequence of at most N open focus issue rows (or every open
-  focus issue when N is omitted), ordered by dependency layer, milestone
-  sequence, and stable issue identifier.
+  focus issue when N is omitted), ordered by dependency layer; FR-001 project
+  priority, project manual order, and stable project identifier; milestone
+  `sortOrder` and identifier within each project with unmilestoned issues last;
+  then stable issue identifier.
 - Each row's identifier, title, milestone, FR-001 readiness result and reasons,
   sorted `unblocks` focus identifiers, and bounded acceptance-criteria excerpt.
 - The actual source snapshot fetch timestamp, preserving cache age under
