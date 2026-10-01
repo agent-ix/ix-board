@@ -131,6 +131,7 @@ pub fn select_scope(
             })
             .map(|i| i.id.clone()),
     );
+    let mut pending = VecDeque::new();
     for value in &selection.tickets {
         let issue = unique(
             "ticket",
@@ -142,6 +143,7 @@ pub fn select_scope(
                 .collect(),
         )?;
         result.issue_ids.insert(issue.id.clone());
+        pending.push_back(issue.id.clone());
     }
     let mut children: BTreeMap<_, Vec<_>> = BTreeMap::new();
     for issue in &snapshot.issues {
@@ -149,12 +151,14 @@ pub fn select_scope(
             children.entry(parent).or_default().push(&issue.id);
         }
     }
-    let mut pending: VecDeque<_> = result.issue_ids.iter().cloned().collect();
+    let mut visited = BTreeSet::new();
     while let Some(id) = pending.pop_front() {
+        if !visited.insert(id.clone()) {
+            continue;
+        }
         for child in children.get(&id).into_iter().flatten() {
-            if result.issue_ids.insert((*child).clone()) {
-                pending.push_back((*child).clone());
-            }
+            result.issue_ids.insert((*child).clone());
+            pending.push_back((*child).clone());
         }
     }
     let by_id: BTreeMap<_, _> = snapshot.issues.iter().map(|i| (&i.id, i)).collect();

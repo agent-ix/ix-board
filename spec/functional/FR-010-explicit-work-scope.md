@@ -31,6 +31,8 @@ leaves do not count as work. Source fetch timestamps survive cached reads.
 
 | FR-010-AC-5 | A team boundary selects only tickets owned by that team, including unprojected tickets when no narrower selectors exist; project, initiative and ticket selectors intersect that boundary, while leaf classification retains full snapshot ancestry. Unknown teams are refused. | Test |
 
+| FR-010-AC-6 | Project and initiative membership follows assigned project IDs without expanding into descendants in other projects. Explicit ticket selection includes descendants across projects within the team boundary; global ancestry still prevents counting parents as leaves. | Test |
+
 ## Dependencies
 
 - Linear project initiatives, ticket parent relationships and workflow categories.
