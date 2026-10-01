@@ -948,42 +948,70 @@ fn duplicate_groups(issues: &[&Issue]) -> Result<Vec<DuplicateTitleFinding>, Hyg
 }
 
 fn timestamp_epoch(timestamp: &str) -> Option<i64> {
-    let date = timestamp.get(..10)?;
-    if date.get(4..5)? != "-" || date.get(7..8)? != "-" {
-        return None;
-    }
-    let year = date.get(..4)?.parse::<i64>().ok()?;
-    let month = date.get(5..7)?.parse::<i64>().ok()?;
-    let day = date.get(8..10)?.parse::<i64>().ok()?;
-    let rest = timestamp.get(11..)?;
-    if rest.get(2..3)? != ":" || rest.get(5..6)? != ":" {
-        return None;
-    }
-    let hour = rest.get(..2)?.parse::<i64>().ok()?;
-    let minute = rest.get(3..5)?.parse::<i64>().ok()?;
-    let second = rest.get(6..8)?.parse::<i64>().ok()?;
-    let offset_at = rest
-        .get(8..)?
-        .find(['+', '-'])
-        .map_or(rest.len(), |position| position + 8);
-    let offset = rest
-        .get(offset_at..)
-        .filter(|s| !s.is_empty())
-        .and_then(|s| {
-            let sign = if s.starts_with('-') { -1 } else { 1 };
-            let h = s.get(1..3)?.parse::<i64>().ok()?;
-            let m = s.get(4..6)?.parse::<i64>().ok()?;
-            Some(sign * (h * 3600 + m * 60))
-        })
-        .unwrap_or(0);
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 60
+    if !timestamp.is_ascii()
+        || timestamp.len() < 20
+        || timestamp.as_bytes().get(4) != Some(&b'-')
+        || timestamp.as_bytes().get(7) != Some(&b'-')
+        || timestamp.as_bytes().get(10) != Some(&b'T')
+        || timestamp.as_bytes().get(13) != Some(&b':')
+        || timestamp.as_bytes().get(16) != Some(&b':')
     {
         return None;
     }
+    let year = timestamp.get(0..4)?.parse::<i64>().ok()?;
+    let month = timestamp.get(5..7)?.parse::<i64>().ok()?;
+    let day = timestamp.get(8..10)?.parse::<i64>().ok()?;
+    let hour = timestamp.get(11..13)?.parse::<i64>().ok()?;
+    let minute = timestamp.get(14..16)?.parse::<i64>().ok()?;
+    let second = timestamp.get(17..19)?.parse::<i64>().ok()?;
+    if year == 0 || !(1..=12).contains(&month) || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if day == 0 || day > days_in_month {
+        return None;
+    }
+
+    let bytes = timestamp.as_bytes();
+    let mut position = 19;
+    if bytes.get(position) == Some(&b'.') {
+        position += 1;
+        let fraction_start = position;
+        while position < bytes.len() && bytes[position].is_ascii_digit() {
+            position += 1;
+        }
+        if position == fraction_start {
+            return None;
+        }
+    }
+    let offset = match bytes.get(position) {
+        Some(b'Z') if position + 1 == bytes.len() => 0,
+        Some(b'+' | b'-')
+            if position + 6 == bytes.len() && bytes.get(position + 3) == Some(&b':') =>
+        {
+            let hours = timestamp
+                .get(position + 1..position + 3)?
+                .parse::<i64>()
+                .ok()?;
+            let minutes = timestamp
+                .get(position + 4..position + 6)?
+                .parse::<i64>()
+                .ok()?;
+            if hours > 23 || minutes > 59 {
+                return None;
+            }
+            let sign = if bytes[position] == b'+' { 1 } else { -1 };
+            sign * (hours * 3_600 + minutes * 60)
+        }
+        _ => return None,
+    };
+
     let adjusted_year = year - i64::from(month <= 2);
     let era = adjusted_year.div_euclid(400);
     let year_of_era = adjusted_year - era * 400;
@@ -991,7 +1019,7 @@ fn timestamp_epoch(timestamp: &str) -> Option<i64> {
     let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
     let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
     let days = era * 146097 + day_of_era - 719468;
-    Some(days * 86400 + hour * 3600 + minute * 60 + second - offset)
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second - offset)
 }
 
 #[cfg(test)]
@@ -1558,6 +1586,10 @@ mod tests {
     /// Trace: FR-013-AC-7, FR-013-AC-8
     #[test]
     fn tc_013_08_missing_activity_timestamp_makes_group_unavailable_and_preserves_baseline() {
+        assert!(timestamp_epoch("2026-09-27T14:00:00+02:00").is_some());
+        assert!(timestamp_epoch("2026-02-30T00:00:00Z").is_none());
+        assert!(timestamp_epoch("2026-09-27T14:00:00+25:00").is_none());
+        assert!(timestamp_epoch("2026-09-27T14:00:00").is_none());
         let mut current = issue("IR-1", "missing timestamp", WorkflowStateType::Started);
         current.updated_at = None;
         let snapshot = workspace_snapshot(vec![current.clone()]);
