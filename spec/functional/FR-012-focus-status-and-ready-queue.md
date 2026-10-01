@@ -5,12 +5,15 @@ type: FR
 relationships:
   - target: "ix://agent-ix/ix-board/US-004"
     type: implements
+  - target: "ix://agent-ix/ix-board/FR-005"
+    type: depends_on
 provenance:
   source: SWM-34
 description: The ix-board CLI and library SHALL report project and milestone status, blocker states, and eligible ready work for an inline focus.
 dependencies:
   - FR-001
   - FR-002
+  - FR-005
   - FR-010
   - FR-011
 ---
@@ -32,6 +35,11 @@ when its Linear workflow-state type is `started`. Open-state groups and issue
 lists SHALL be ordered deterministically by state display name and stable
 Linear issue identifier, respectively.
 
+Open-state counts and in-progress rows SHALL include only resolved focus
+member issues assigned to the corresponding project or milestone. Blocker-only
+issues SHALL NOT contribute to these counts or rows unless they are also
+resolved focus members.
+
 Progress SHALL reuse FR-010's leaf-work classification: completed leaves
 count as done; canceled and duplicate leaves do not count as work; parents do
 not count as leaves. Project progress SHALL count classified leaf issues in
@@ -50,8 +58,11 @@ For every focus issue, the result SHALL expose its complete transitive
 title, workflow-state display name, and FR-001 state classification
 (`Completed`, `Canceled`, or open). The result SHALL preserve the blocker-layer
 ordering and include blockers from every project and team, including completed
-and canceled blockers. Missing blocker records and dependency cycles SHALL
-produce the FR-002 errors.
+and canceled blockers. The result SHALL report the aggregate FR-011 blocker
+layers, with each blocker included once in its layer and a `focus_root_ids`
+list sorted by stable Linear issue identifier, naming every resolved focus
+issue whose transitive `blocked_by` closure contains that blocker. Missing
+blocker records and dependency cycles SHALL produce the FR-002 errors.
 
 The ready queue SHALL contain focus issues that satisfy FR-001's full ready
 eligibility rules, including project-running state, issue and spec state, and
@@ -77,9 +88,9 @@ produce an explicit error and no partial status result.
 
 - A deterministic status result containing project and milestone target dates,
   open issue counts by state, in-progress issue rows, and leaf progress counts
-  and percentage.
-- Per-focus-issue blocker layers with each blocker’s current workflow state and
-  classification.
+  and percentage, restricted to resolved focus members.
+- Aggregate blocker layers with each blocker’s current workflow state and
+  classification, plus the sorted `focus_root_ids` attribution list.
 - The FR-001 eligible ready queue for focus issues, with deterministic order
   and reasons.
 - The actual snapshot fetch timestamp, preserving cache age under FR-010.
@@ -88,9 +99,9 @@ produce an explicit error and no partial status result.
 
 | ID | Criteria | Verification |
 |----|----------|--------------|
-| FR-012-AC-1 | Given a focus with selected projects and milestones, `focus status` reports each project's and milestone's target date, open issue counts grouped by workflow-state display name, and in-progress issues (`type=started`) in stable order. `Completed` and `Canceled` issues are not counted as open. | Test |
+| FR-012-AC-1 | Given selected projects and milestones, `focus status` reports each group's target date, open issue counts grouped by workflow-state display name, and in-progress issues (`type=started`) in stable order, considering only resolved focus members assigned to the group. `Completed` and `Canceled` issues are not counted as open; blocker-only issues do not contribute unless they are also focus members. | Test |
 | FR-012-AC-2 | Given project and milestone issue trees with completed, open, canceled, duplicate, and parent issues, progress uses FR-010 leaf classification, reports done/total and percentage, and returns zero counts with a null percentage for an empty countable set. | Test |
-| FR-012-AC-3 | Given focus issues with transitive blockers across projects and teams in open, completed, and canceled states, each focus issue's blocker layers include the full FR-002 closure and report each blocker's identifier, title, state, and FR-001 classification. | Test |
+| FR-012-AC-3 | Given two focus issues with a shared transitive blocker and other blockers across projects and teams in open, completed, and canceled states, aggregate layers include the full FR-002 closure, each blocker appears once in its layer, and each blocker row reports its identifier, title, state, FR-001 classification, and sorted `focus_root_ids`. The shared blocker row lists both focus issues in identifier order; other blockers list only the focus issue whose closure contains them. | Test |
 | FR-012-AC-4 | Given focus issues with different project, spec, and blocker eligibility, the ready queue includes exactly the focus issues eligible under FR-001, applies FR-001 ordering, and includes its readiness reasons; blocker-only issues are excluded. | Test |
 | FR-012-AC-5 | Given identical complete Linear records, repeated `focus status` calls return identical project and milestone groups, issue lists, blocker layers, ready queue order, and reasons; the result reports the source snapshot's actual fetch timestamp. | Test |
 | FR-012-AC-6 | An empty focus, incomplete source snapshot, missing blocker record, or dependency cycle returns an explicit error and no partial status result. | Test |
@@ -99,6 +110,7 @@ produce an explicit error and no partial status result.
 
 - **Upstream**: [FR-001](FR-001-ready-queue.md),
   [FR-002](FR-002-project-chunk.md),
+  [FR-005](FR-005-structured-data-boundary.md),
   [FR-010](FR-010-explicit-work-scope.md),
   [FR-011](FR-011-inline-planner-focus.md)
 - Structured Linear project, milestone, issue, workflow-state, target-date,
