@@ -879,7 +879,7 @@ fn focus_status_scopes_progress_blockers_and_ready_work_to_focus_members() {
     );
 }
 
-/// Trace: FR-012-AC-2, FR-012-AC-5
+/// Trace: FR-012-AC-2
 #[test]
 fn focus_status_reports_null_percent_for_groups_without_countable_leaves() {
     let directory = TempDir::new().expect("temporary directory");
