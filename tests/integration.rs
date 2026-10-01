@@ -918,6 +918,236 @@ fn focus_status_reports_null_percent_for_groups_without_countable_leaves() {
     assert_eq!(status.projects[0].target_date, None);
 }
 
+/// Trace: FR-014-AC-1, FR-014-AC-2, FR-014-AC-3, FR-014-AC-4, FR-014-AC-5, FR-014-AC-6, FR-014-AC-8, FR-014-AC-9
+#[test]
+fn focus_plan_chunk_orders_full_closure_and_returns_handoff_facts() {
+    let directory = TempDir::new().expect("temporary directory");
+    let mut root_project = project("p1", "IR-P1", "Started", 1, 2.0);
+    root_project.milestones = vec![
+        Milestone {
+            id: "m0".to_owned(),
+            name: "M0".to_owned(),
+            description: None,
+            sort_order: 0.0,
+            target_date: None,
+        },
+        Milestone {
+            id: "m1".to_owned(),
+            name: "M1".to_owned(),
+            description: None,
+            sort_order: 1.0,
+            target_date: None,
+        },
+        Milestone {
+            id: "m2".to_owned(),
+            name: "M2".to_owned(),
+            description: None,
+            sort_order: 2.0,
+            target_date: None,
+        },
+    ];
+    let mut root = with_description(
+        issue("i317", "IR-317", Some("p1"), "Specced", 1.0, 1.0, None, &[]),
+        "Intro\n## acceptance criteria \n  First criterion.\n## Notes\nignored",
+    );
+    root.project_milestone_id = Some("m0".to_owned());
+    let mut first_dependent = issue(
+        "i318",
+        "IR-318",
+        Some("p1"),
+        "Specced",
+        1.0,
+        2.0,
+        None,
+        &["i317"],
+    );
+    first_dependent.project_milestone_id = Some("m1".to_owned());
+    let mut same_layer_m1 = issue("i315", "IR-315", Some("p1"), "Specced", 1.0, 0.0, None, &[]);
+    same_layer_m1.project_milestone_id = Some("m1".to_owned());
+    let mut deep_dependent = with_description(
+        issue(
+            "i319",
+            "IR-319",
+            Some("p1"),
+            "Specced",
+            1.0,
+            3.0,
+            None,
+            &["i320"],
+        ),
+        &format!("## Acceptance Criteria\n{}", "🧪".repeat(281)),
+    );
+    deep_dependent.project_milestone_id = Some("m2".to_owned());
+    let mut later_project = project("p2", "IR-P2", "Started", 2, 1.0);
+    later_project.milestones = vec![Milestone {
+        id: "m0p2".to_owned(),
+        name: "M0".to_owned(),
+        description: None,
+        sort_order: 0.0,
+        target_date: None,
+    }];
+    let project_order_tie = issue("i321", "IR-321", Some("p1"), "Specced", 1.0, 4.0, None, &[]);
+    let mut other_project = issue("i316", "IR-316", Some("p2"), "Specced", 1.0, 1.0, None, &[]);
+    other_project.project_milestone_id = Some("m0p2".to_owned());
+    let paused_project = project("p3", "IR-P3", "Paused", 0, 0.0);
+    let paused_issue = issue("i322", "IR-322", Some("p3"), "Specced", 1.0, 1.0, None, &[]);
+    let completed_middle = issue(
+        "i320",
+        "OPS-320",
+        None,
+        "Completed",
+        1.0,
+        4.0,
+        None,
+        &["i318"],
+    );
+    let snapshot = WorkspaceSnapshot {
+        fetched_at: 1234,
+        projects: vec![root_project, later_project, paused_project],
+        issues: vec![
+            root,
+            first_dependent,
+            same_layer_m1,
+            deep_dependent,
+            project_order_tie,
+            other_project,
+            paused_issue,
+            completed_middle,
+        ],
+    };
+    let mut reads = service(
+        FixtureSource::new(snapshot),
+        ManualClock::new(9_000),
+        &directory,
+    );
+    let selection = ix_board::FocusSelection {
+        projects: vec!["IR-P1".to_owned(), "IR-P2".to_owned(), "IR-P3".to_owned()],
+        ..Default::default()
+    };
+    let chunk = reads
+        .focus_plan_chunk(&selection, None)
+        .expect("plan chunk");
+    assert_eq!(chunk.fetched_at, 9_000);
+    assert_eq!(
+        chunk
+            .issues
+            .iter()
+            .map(|row| row.identifier.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "IR-317", "IR-315", "IR-321", "IR-316", "IR-322", "IR-318", "IR-319"
+        ]
+    );
+    assert_eq!(chunk.issues[0].dependency_layer, 0);
+    assert_eq!(chunk.issues[5].dependency_layer, 1);
+    assert_eq!(chunk.issues[6].dependency_layer, 3);
+    assert!(chunk.issues[0].ready);
+    assert!(!chunk.issues[5].ready);
+    assert!(!chunk.issues[4].ready);
+    assert!(
+        chunk.issues[4]
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("Paused"))
+    );
+    assert!(
+        chunk.issues[5]
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("IR-317"))
+    );
+    assert_eq!(chunk.issues[5].milestone.as_deref(), Some("M1"));
+    assert_eq!(chunk.issues[0].unblocks, ["IR-318", "IR-319"]);
+    assert_eq!(
+        chunk.issues[0].acceptance_criteria.as_deref(),
+        Some("First criterion.")
+    );
+    let unicode_excerpt = chunk.issues[6]
+        .acceptance_criteria
+        .as_deref()
+        .expect("unicode acceptance excerpt");
+    assert_eq!(unicode_excerpt.chars().count(), 281);
+    assert!(unicode_excerpt.ends_with('…'));
+    assert_eq!(
+        reads
+            .focus_plan_chunk(&selection, std::num::NonZeroUsize::new(2))
+            .expect("sized plan chunk")
+            .issues
+            .iter()
+            .map(|row| row.identifier.as_str())
+            .collect::<Vec<_>>(),
+        ["IR-317", "IR-315"]
+    );
+    assert_eq!(
+        reads
+            .focus_plan_chunk(&selection, None)
+            .expect("repeat plan chunk"),
+        chunk
+    );
+}
+
+/// Trace: FR-014-AC-6
+#[test]
+fn focus_plan_chunk_refuses_empty_missing_and_cyclic_input_without_partial_rows() {
+    let directory = TempDir::new().expect("temporary directory");
+    let incomplete = WorkspaceSnapshot {
+        fetched_at: 100,
+        projects: vec![project("p1", "IR-P1", "Started", 1, 1.0)],
+        issues: vec![issue(
+            "i1",
+            "IR-1",
+            Some("p1"),
+            "Specced",
+            1.0,
+            1.0,
+            None,
+            &["missing"],
+        )],
+    };
+    let mut missing_reads = service(
+        FixtureSource::new(incomplete),
+        ManualClock::new(1_000),
+        &directory,
+    );
+    assert!(matches!(
+        missing_reads.focus_plan_chunk(&ix_board::FocusSelection::default(), None),
+        Err(Error::EmptyFocus)
+    ));
+    assert!(matches!(
+        missing_reads.focus_plan_chunk(
+            &ix_board::FocusSelection {
+                projects: vec!["IR-P1".to_owned()],
+                ..Default::default()
+            },
+            None
+        ),
+        Err(Error::MissingDependency { issue }) if issue == "missing"
+    ));
+
+    let mut cycle_issue = issue("i2", "IR-2", Some("p2"), "Specced", 1.0, 1.0, None, &[]);
+    cycle_issue.blocked_by.push(IssueId("i2".to_owned()));
+    let cyclic = WorkspaceSnapshot {
+        fetched_at: 200,
+        projects: vec![project("p2", "IR-P2", "Started", 1, 1.0)],
+        issues: vec![cycle_issue],
+    };
+    let mut cycle_reads = service(
+        FixtureSource::new(cyclic).with_namespace("plan-cycle"),
+        ManualClock::new(2_000),
+        &directory,
+    );
+    assert!(matches!(
+        cycle_reads.focus_plan_chunk(
+            &ix_board::FocusSelection {
+                projects: vec!["IR-P2".to_owned()],
+                ..Default::default()
+            },
+            None
+        ),
+        Err(Error::DependencyCycle { .. })
+    ));
+}
+
 /// Trace: FR-011-AC-4, FR-012-AC-6
 #[test]
 fn focus_expansion_rejects_empty_or_unresolved_selectors_without_partial_data() {
