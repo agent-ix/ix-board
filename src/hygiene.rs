@@ -377,7 +377,7 @@ pub fn build_report(
         .map(|error| vec![format!("{error:?}")])
         .unwrap_or_default();
     let diff = diff_result.unwrap_or_default();
-    let created_time_missing = current_baseline
+    let created_time_unavailable = current_baseline
         .iter()
         .filter(|current| {
             prior.is_none_or(|(_, records)| !records.iter().any(|old| old.id == current.id))
@@ -385,14 +385,16 @@ pub fn build_report(
         .any(|current| {
             issues
                 .get(&current.id)
-                .is_some_and(|issue| issue.created_at.is_none())
+                .and_then(|issue| issue.created_at.as_deref())
+                .and_then(timestamp_epoch)
+                .is_none()
         });
     let mut diff_reasons = prior_unavailable
         .into_iter()
         .chain(diff_reasons)
         .collect::<Vec<_>>();
-    if created_time_missing {
-        diff_reasons.push("createdAt unavailable for a newly focused issue".to_owned());
+    if created_time_unavailable {
+        diff_reasons.push("createdAt unavailable or invalid for a newly focused issue".to_owned());
     }
     let baseline_advance = stale_reasons.is_empty() && diff_reasons.is_empty();
     Ok(FocusHygieneReport {
@@ -433,6 +435,50 @@ fn group_with_reasons<T>(findings: Vec<T>, reasons: Vec<String>) -> HygieneGroup
 }
 
 fn pull_request_group(issues: &[&Issue]) -> HygieneGroup<PullRequestFinding> {
+    let (linked, reasons) = linked_pull_requests(issues);
+    if linked.is_empty() {
+        return pull_request_group_result(Vec::new(), reasons, |_, _| Ok(None));
+    }
+    let token = std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN"));
+    let Some(token) = token.ok().filter(|token| !token.trim().is_empty()) else {
+        return pull_request_group_result(linked, reasons, |_, _| {
+            Err("GITHUB_TOKEN or GH_TOKEN is required for linked pull request metadata".to_owned())
+        });
+    };
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            return pull_request_group_result(linked, reasons, |_, _| {
+                Err(format!("GitHub client unavailable: {error}"))
+            });
+        }
+    };
+    pull_request_group_with(issues, |repository, number| {
+        let (owner, name) = repository
+            .split_once('/')
+            .ok_or_else(|| "invalid repository in pull request URL".to_owned())?;
+        fetch_github_pull_request(
+            &client,
+            "https://api.github.com/graphql",
+            &token,
+            owner,
+            name,
+            number,
+        )
+    })
+}
+
+struct LinkedPullRequest<'a> {
+    issue: &'a Issue,
+    repository: String,
+    number: u64,
+    url: String,
+}
+
+fn linked_pull_requests<'a>(issues: &[&'a Issue]) -> (Vec<LinkedPullRequest<'a>>, Vec<String>) {
     let mut linked = Vec::new();
     let mut reasons = Vec::new();
     for issue in issues {
@@ -441,7 +487,12 @@ fn pull_request_group(issues: &[&Issue]) -> HygieneGroup<PullRequestFinding> {
         }
         for url in &issue.attachment_urls {
             match parse_pull_url(url) {
-                Some((repository, number)) => linked.push((issue, repository, number, url.clone())),
+                Some((repository, number)) => linked.push(LinkedPullRequest {
+                    issue,
+                    repository,
+                    number,
+                    url: url.clone(),
+                }),
                 None => reasons.push(format!(
                     "unrecognized pull request URL on {}: {url}",
                     issue.identifier
@@ -449,58 +500,30 @@ fn pull_request_group(issues: &[&Issue]) -> HygieneGroup<PullRequestFinding> {
             }
         }
     }
-    if linked.is_empty() {
-        return HygieneGroup {
-            availability: if reasons.is_empty() {
-                GroupStatus::Available
-            } else {
-                GroupStatus::Unavailable
-            },
-            reasons,
-            findings: Vec::new(),
-        };
-    }
-    let token = std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN"));
-    let Some(token) = token.ok().filter(|token| !token.trim().is_empty()) else {
-        reasons.push(
-            "GITHUB_TOKEN or GH_TOKEN is required for linked pull request metadata".to_owned(),
-        );
-        return HygieneGroup {
-            availability: GroupStatus::Unavailable,
-            reasons,
-            findings: Vec::new(),
-        };
-    };
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .build()
-    {
-        Ok(client) => client,
-        Err(error) => {
-            return HygieneGroup {
-                availability: GroupStatus::Unavailable,
-                reasons: vec![format!("GitHub client unavailable: {error}")],
-                findings: Vec::new(),
-            };
-        }
-    };
+    (linked, reasons)
+}
+
+fn pull_request_group_with(
+    issues: &[&Issue],
+    lookup: impl FnMut(&str, u64) -> Result<Option<GithubPullRequest>, String>,
+) -> HygieneGroup<PullRequestFinding> {
+    let (linked, reasons) = linked_pull_requests(issues);
+    pull_request_group_result(linked, reasons, lookup)
+}
+
+fn pull_request_group_result(
+    linked: Vec<LinkedPullRequest<'_>>,
+    mut reasons: Vec<String>,
+    mut lookup: impl FnMut(&str, u64) -> Result<Option<GithubPullRequest>, String>,
+) -> HygieneGroup<PullRequestFinding> {
     let mut findings = Vec::new();
-    for (issue, repository, number, url) in linked {
-        let Some((owner, name)) = repository.split_once('/') else {
-            continue;
-        };
-        let record = match fetch_github_pull_request(
-            &client,
-            "https://api.github.com/graphql",
-            &token,
-            owner,
-            name,
-            number,
-        ) {
+    for link in linked {
+        let record = match lookup(&link.repository, link.number) {
             Ok(record) => record,
             Err(reason) => {
                 reasons.push(format!(
-                    "GitHub lookup failed for {repository}#{number}: {reason}"
+                    "GitHub lookup failed for {}#{}: {reason}",
+                    link.repository, link.number
                 ));
                 None
             }
@@ -508,20 +531,22 @@ fn pull_request_group(issues: &[&Issue]) -> HygieneGroup<PullRequestFinding> {
         let Some(record) = record else {
             if !reasons
                 .iter()
-                .any(|reason| reason.contains(&format!("{repository}#{number}")))
+                .any(|reason| reason.contains(&format!("{}#{}", link.repository, link.number)))
             {
                 reasons.push(format!(
-                    "GitHub pull request unavailable: {repository}#{number}"
+                    "GitHub pull request unavailable: {}#{}",
+                    link.repository, link.number
                 ));
             }
             continue;
         };
-        if let Some(kind) = pr_mismatch_kind(issue, &record.state, record.merged_at.as_deref()) {
+        if let Some(kind) = pr_mismatch_kind(link.issue, &record.state, record.merged_at.as_deref())
+        {
             findings.push(PullRequestFinding {
-                issue_id: issue.id.clone(),
-                repository: repository.clone(),
-                number,
-                url,
+                issue_id: link.issue.id.clone(),
+                repository: link.repository,
+                number: link.number,
+                url: link.url,
                 kind,
                 state: record.state,
                 merged_at: record.merged_at,
@@ -570,6 +595,12 @@ fn fetch_github_pull_request(
         .and_then(reqwest::blocking::Response::error_for_status)
         .and_then(|response| response.json::<GithubGraphQlResponse>())
         .map_err(|error| error.to_string())?;
+    decode_github_pull_request(response)
+}
+
+fn decode_github_pull_request(
+    response: GithubGraphQlResponse,
+) -> Result<Option<GithubPullRequest>, String> {
     if let Some(errors) = response.errors.filter(|errors| !errors.is_empty()) {
         return Err(errors
             .into_iter()
@@ -1374,6 +1405,59 @@ mod tests {
         let _ = server.join().unwrap();
     }
 
+    /// Trace: FR-013-AC-3
+    #[test]
+    fn tc_013_12_report_pr_group_attributes_each_link_and_keeps_proven_findings() {
+        let mut done = issue("IR-1", "done", WorkflowStateType::Completed);
+        done.attachment_urls = vec!["https://github.com/agent-ix/ix-board/pull/17".to_owned()];
+        let mut open = issue("IR-2", "open", WorkflowStateType::Started);
+        open.attachment_urls = vec!["https://github.com/agent-ix/ix-board/pull/18".to_owned()];
+        let mut missing = issue("IR-3", "missing PR record", WorkflowStateType::Completed);
+        missing.attachment_urls = vec!["https://github.com/agent-ix/ix-board/pull/19".to_owned()];
+        let issues = [&done, &open, &missing];
+        let fixtures = BTreeMap::from([
+            (
+                ("agent-ix/ix-board".to_owned(), 17),
+                r#"{"data":{"repository":{"pullRequest":{"state":"OPEN","mergedAt":null}}}}"#,
+            ),
+            (
+                ("agent-ix/ix-board".to_owned(), 18),
+                r#"{"data":{"repository":{"pullRequest":{"state":"CLOSED","mergedAt":"2026-02-01T00:00:00Z"}}}}"#,
+            ),
+            (
+                ("agent-ix/ix-board".to_owned(), 19),
+                r#"{"data":{"repository":{"pullRequest":null}}}"#,
+            ),
+        ]);
+        let report = pull_request_group_with(&issues, |repository, number| {
+            let key = (repository.to_owned(), number);
+            let fixture = fixtures
+                .get(&key)
+                .ok_or_else(|| format!("missing fixture for {repository}#{number}"))?;
+            let response = serde_json::from_str::<GithubGraphQlResponse>(fixture)
+                .map_err(|error| error.to_string())?;
+            decode_github_pull_request(response)
+        });
+        assert_eq!(report.availability, GroupStatus::Unavailable);
+        assert!(
+            report
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("agent-ix/ix-board#19"))
+        );
+        assert_eq!(report.findings.len(), 2);
+        assert!(report.findings.iter().any(|finding| {
+            finding.issue_id == done.id
+                && finding.number == 17
+                && finding.kind == PullRequestMismatchKind::DoneWithOpenPr
+        }));
+        assert!(report.findings.iter().any(|finding| {
+            finding.issue_id == open.id
+                && finding.number == 18
+                && finding.kind == PullRequestMismatchKind::OpenWithMergedPr
+        }));
+    }
+
     /// Trace: FR-013-AC-3, FR-013-AC-7, FR-013-AC-8
     #[test]
     fn tc_013_10_attachment_incompleteness_is_limited_to_the_pr_group() {
@@ -1581,6 +1665,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(first_copy, second_copy);
+    }
+
+    /// Trace: FR-013-AC-7, FR-013-AC-8
+    #[test]
+    fn tc_013_11_invalid_created_at_for_new_focus_blocks_diff_and_baseline() {
+        let mut current = issue(
+            "IR-3",
+            "new with invalid timestamp",
+            WorkflowStateType::Started,
+        );
+        current.created_at = Some("2026-02-30T00:00:00Z".to_owned());
+        current.updated_at = Some("2026-02-02T00:00:00Z".to_owned());
+        let snapshot = workspace_snapshot(vec![current.clone()]);
+        let report = build_report(
+            &snapshot,
+            &[current.id.clone()].into(),
+            vec!["issue:IR-3".to_owned()],
+            "2026-02-02T00:00:00Z",
+            30,
+            Some(("2026-02-01T00:00:00Z", &[])),
+            None,
+        )
+        .unwrap();
+        assert_eq!(report.diff.availability, GroupStatus::Unavailable);
+        assert!(
+            report
+                .diff
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("createdAt"))
+        );
+        assert!(!report.baseline_advance);
     }
 
     /// Trace: FR-013-AC-7, FR-013-AC-8
