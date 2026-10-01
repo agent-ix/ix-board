@@ -38,18 +38,24 @@ readiness using the issue's owning project/team and full transitive blocker
 rules from FR-001; FR-001 queue ordering SHALL not replace this requirement's
 ordering.
 
-The command SHALL derive each focus issue's dependency layer from the full
-transitive `blocked_by` closure and topological layer semantics in FR-002.
-Every node in that closure, including blocker-only, completed, and canceled
-issues, SHALL participate in the layer calculation. ix-board SHALL emit only
-open focus issues as rows. Rows SHALL be ordered by ascending dependency layer,
-then by their project's milestone sequence, then by stable Linear issue
-identifier. Within a project, milestone sequence SHALL use Linear milestone
-`sortOrder` ascending, with milestone identifier as a tie-breaker. Issues with
-no milestone SHALL follow milestone-assigned issues in the same project. If
-milestone positions from different projects tie, project identifier SHALL
-break that tie. The stable issue identifier SHALL be the final tie-breaker.
-Missing blocker records and dependency cycles SHALL retain FR-002's errors.
+The command SHALL derive each focus issue's dependency layer from the complete
+transitive `blocked_by` closure defined by FR-002. Every node in that closure,
+including blocker-only, completed, and canceled issues, SHALL participate in
+the layer calculation. The layer of a node with no blocker prerequisites in the
+closure SHALL be 0. The layer of every other node SHALL be one plus the maximum
+layer of its blocker prerequisites in the closure; this is the longest-path
+depth from a node without prerequisites. ix-board SHALL emit only open focus
+issues as rows.
+
+The command SHALL order rows by this complete tuple, in ascending order:
+(dependency layer; FR-001 project order; milestone order within that project,
+with unmilestoned issues after milestone-assigned issues; stable Linear issue
+identifier). FR-001 project order SHALL use project priority, project manual
+order, then stable project identifier. Within a project, milestone order SHALL
+use Linear milestone `sortOrder` ascending, then milestone identifier. This
+command's row order SHALL not use FR-001 ticket priority or ticket manual
+order. The stable issue identifier SHALL be the final tie-breaker. Missing
+blocker records and dependency cycles SHALL retain FR-002's errors.
 
 For each emitted issue, the output SHALL include its stable identifier, title,
 milestone name or `null`, readiness boolean and reasons, the stable identifiers
@@ -98,13 +104,15 @@ and dependency cycles SHALL produce explicit errors and no partial chunk.
 
 | ID | Criteria | Verification |
 |----|----------|--------------|
-| FR-014-AC-1 | The returned chunk includes only open focus issues and orders them by prerequisite-first dependency layer, milestone sequence, and stable issue identifier; completed, canceled, and blocker-only nodes affect layer calculation but are not emitted. | Test |
+| FR-014-AC-1 | The returned chunk includes only open focus issues and orders them by the complete tuple of dependency layer, FR-001 project order, milestone order within the project with unmilestoned issues last, and stable issue identifier; completed, canceled, and blocker-only nodes affect layer calculation but are not emitted. | Test |
 | FR-014-AC-2 | The handoff candidate set includes every open focus issue, including issues that are ready, blocked, in a paused project, in Coding or Review, or have an unmapped spec state; each row's readiness result and reasons match FR-001 eligibility for its owning project/team and complete blocker closure. | Test |
 | FR-014-AC-3 | Given `--size N`, exactly the first min(N, candidate-count) issue rows appear after deterministic ordering; blocker-only nodes and completed/canceled focus issues do not count toward N. Omitted size returns all open focus issues; zero, negative, non-integer, and malformed values return an error with no partial chunk. | Test |
 | FR-014-AC-4 | Given a focus prerequisite with multiple transitive open focus dependents, its `unblocks` lists each dependent once in stable identifier order; unrelated and blocker-only issues are absent. | Test |
 | FR-014-AC-5 | Given descriptions with a matching Acceptance Criteria Markdown heading, the excerpt is the trimmed section body through the next heading, limited to 280 Unicode scalar values with `…` only when truncated; absent headings or empty bodies yield null, and description text does not change focus membership or readiness. | Test |
 | FR-014-AC-6 | Given identical complete Linear records and size, repeated calls return identical rows, readiness reasons, unblocks, excerpts, ordering, and source fetch timestamp; missing blocker data, a dependency cycle, incomplete input, or empty focus returns an explicit error without partial rows. | Test |
 | FR-014-AC-7 | The operation uses only structured Linear reads and makes no GitHub Issues request or mutation. | Inspection |
+| FR-014-AC-8 | Given one focus issue with prerequisite paths of unequal lengths in its complete blocker closure and another focus issue on a shorter path, each node receives layer zero when it has no blocker prerequisites and otherwise one plus its deepest prerequisite layer; the longer path's focus issue sorts after the shorter-path issue regardless of milestone order. | Test |
+| FR-014-AC-9 | Given unmilestoned and milestone-assigned open focus issues across projects, dependency layer sorts first, FR-001 project priority/manual order/project identifier sorts next, and within each project milestone-assigned rows follow Linear milestone order before its unmilestoned rows; stable issue identifier resolves remaining ties. | Test |
 
 ## Dependencies
 
