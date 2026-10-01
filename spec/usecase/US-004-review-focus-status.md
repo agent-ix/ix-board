@@ -32,14 +32,15 @@ relationships:
 
 ### US-004-EX-2: Verify the live IR focus against Linear
 
-- **Given** the current live IR focus and a separate expected result obtained
-  from an independent `linear api` read
+- **Given** the initiative selector `Contract IR: build layers → V1 Kani MVP`
+  together with the explicit issue selector QSL-20, and a separate expected
+  result obtained from an independent `linear api` read
 - **When** the delivery acceptance check compares that expected result with
   `focus status`
-- **Then** the check confirms that IR-320, IR-321, and IR-322 appear in the
-  ready queue and that QSL-20's blockers are listed, and records the query,
-  comparison result, verification time, and reviewed commit in the SWM-34
-  Linear ticket
+- **Then** the check confirms that the currently eligible issue IR-453 appears
+  in the ready queue and that QSL-20's incoming `blocked-by` relations are
+  listed, and records the query, comparison result, verification time, and
+  reviewed commit in the SWM-34 Linear ticket
 - **And** these identifiers denote the ticket's example data at verification
   time; they are neither product-contract identifiers nor permanent fixture
   identifiers
