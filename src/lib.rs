@@ -24,7 +24,8 @@ pub use drift::{
 };
 pub use linear::LinearGraphQlSource;
 pub use model::{
-    ChunkIssue, Initiative, Issue, IssueId, Milestone, NextStep, Project, ProjectChunk, ProjectId,
+    ChunkIssue, FocusExpansion, FocusIssue, FocusMilestone, FocusProject, FocusSelection,
+    Initiative, Issue, IssueId, Milestone, NextStep, Project, ProjectChunk, ProjectId,
     ProjectPriority, ProjectRunStatus, ReadyItem, SearchKind, SearchResult, TeamKey,
     WorkflowStateType, WorkspaceSnapshot,
 };
@@ -167,6 +168,19 @@ pub enum Error {
     /// The blocker graph contains a cycle that cannot be layered.
     #[error("dependency graph contains a cycle involving: {issues}")]
     DependencyCycle { issues: String },
+    /// No inline initiative, project, or issue selector was supplied.
+    #[error("focus requires at least one --initiative, --project, or --issue selector")]
+    EmptyFocus,
+    /// An issue references a milestone absent from its selected project's records.
+    #[error("issue {issue} references unavailable milestone {milestone} in project {project}")]
+    MissingProjectMilestone {
+        /// Human-readable issue identifier.
+        issue: String,
+        /// Missing milestone UUID.
+        milestone: String,
+        /// Project UUID.
+        project: String,
+    },
 }
 
 /// Injectable source of complete structured workspace snapshots.
@@ -342,6 +356,18 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
         }
         let snapshot = self.snapshot()?;
         make_project_chunk(&snapshot, identifier)
+    }
+
+    /// Resolves inline initiative, project, and issue selectors into a focus expansion.
+    pub fn focus_expand(&mut self, selection: &FocusSelection) -> Result<FocusExpansion, Error> {
+        if selection.initiatives.is_empty()
+            && selection.projects.is_empty()
+            && selection.issues.is_empty()
+        {
+            return Err(Error::EmptyFocus);
+        }
+        let snapshot = self.snapshot()?;
+        make_focus_expansion(&snapshot, selection)
     }
 
     /// Searches structured project and issue IDs, names, titles, and descriptions.
@@ -615,6 +641,152 @@ fn make_project_chunk(
         open_tickets,
         blocker_layers: layers,
     })
+}
+
+fn make_focus_expansion(
+    snapshot: &WorkspaceSnapshot,
+    selection: &FocusSelection,
+) -> Result<FocusExpansion, Error> {
+    if selection.initiatives.is_empty()
+        && selection.projects.is_empty()
+        && selection.issues.is_empty()
+    {
+        return Err(Error::EmptyFocus);
+    }
+
+    let scope_selection = ScopeSelection {
+        team: None,
+        initiatives: selection.initiatives.clone(),
+        projects: selection.projects.clone(),
+        tickets: selection.issues.clone(),
+    };
+    let scope = select_scope(snapshot, &scope_selection)?;
+    let issue_selector_scope = if selection.issues.is_empty() {
+        ScopeSummary::default()
+    } else {
+        select_scope(
+            snapshot,
+            &ScopeSelection {
+                team: None,
+                initiatives: Vec::new(),
+                projects: Vec::new(),
+                tickets: selection.issues.clone(),
+            },
+        )?
+    };
+    let issues_by_id: BTreeMap<_, _> = snapshot
+        .issues
+        .iter()
+        .map(|issue| (issue.id.clone(), issue))
+        .collect();
+    let focus_issues = summarize_issues(&scope.issue_ids, &issues_by_id)?;
+    let issue_selector_issues = summarize_issues(&issue_selector_scope.issue_ids, &issues_by_id)?;
+    let focus_roots = scope
+        .issue_ids
+        .iter()
+        .filter_map(|id| issues_by_id.get(id).copied())
+        .collect::<Vec<_>>();
+    let blocker_layers = dependency_layers(snapshot, &focus_roots)?;
+
+    let mut projects = Vec::new();
+    for project in snapshot
+        .projects
+        .iter()
+        .filter(|project| scope.project_ids.contains(&project.id))
+    {
+        let mut milestone_records = project.milestones.iter().collect::<Vec<_>>();
+        milestone_records.sort_by(|left, right| {
+            compare_f64(left.sort_order, right.sort_order).then_with(|| left.id.cmp(&right.id))
+        });
+        let mut milestones = milestone_records
+            .into_iter()
+            .map(|milestone| FocusMilestone {
+                id: milestone.id.clone(),
+                name: milestone.name.clone(),
+                description: milestone.description.clone(),
+                issues: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let mut project_level_issues = Vec::new();
+        for issue in snapshot.issues.iter().filter(|issue| {
+            scope.issue_ids.contains(&issue.id) && issue.project_id.as_ref() == Some(&project.id)
+        }) {
+            let summary = focus_issue(issue);
+            if let Some(milestone_id) = &issue.project_milestone_id {
+                let Some(milestone) = milestones.iter_mut().find(|m| &m.id == milestone_id) else {
+                    return Err(Error::MissingProjectMilestone {
+                        issue: issue.identifier.clone(),
+                        milestone: milestone_id.clone(),
+                        project: project.id.0.clone(),
+                    });
+                };
+                milestone.issues.push(summary);
+            } else {
+                project_level_issues.push(summary);
+            }
+        }
+        for milestone in &mut milestones {
+            milestone
+                .issues
+                .sort_by(|left, right| left.identifier.cmp(&right.identifier));
+        }
+        project_level_issues.sort_by(|left, right| left.identifier.cmp(&right.identifier));
+        projects.push(FocusProject {
+            id: project.id.clone(),
+            identifier: project
+                .identifier
+                .clone()
+                .unwrap_or_else(|| project.id.0.clone()),
+            name: project.name.clone(),
+            milestones,
+            project_level_issues,
+        });
+    }
+    projects.sort_by(|left, right| {
+        left.identifier
+            .cmp(&right.identifier)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(FocusExpansion {
+        fetched_at: snapshot.fetched_at,
+        projects,
+        focus_issues,
+        issue_selector_issues,
+        blocker_layers,
+    })
+}
+
+fn summarize_issues(
+    ids: &BTreeSet<IssueId>,
+    issues: &BTreeMap<IssueId, &Issue>,
+) -> Result<Vec<FocusIssue>, Error> {
+    let mut summaries = ids
+        .iter()
+        .map(|id| {
+            issues
+                .get(id)
+                .copied()
+                .map(focus_issue)
+                .ok_or_else(|| Error::MissingDependency {
+                    issue: id.0.clone(),
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    summaries.sort_by(|left, right| {
+        left.identifier
+            .cmp(&right.identifier)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(summaries)
+}
+
+fn focus_issue(issue: &Issue) -> FocusIssue {
+    FocusIssue {
+        id: issue.id.clone(),
+        identifier: issue.identifier.clone(),
+        title: issue.title.clone(),
+        state: issue.state.clone(),
+    }
 }
 
 fn dependency_layers(

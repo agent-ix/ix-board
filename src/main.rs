@@ -5,9 +5,9 @@
 
 use clap::{Parser, Subcommand};
 use ix_board::{
-    DriftConfig, DriftError, DriftEvidenceFile, DriftReport, Error, LinearGraphQlSource, NextStep,
-    ProjectChunk, ProjectPriority, ProjectRunStatus, ReadService, ReadyItem, SearchResult,
-    evaluate_drift_file, render_drift_text,
+    DriftConfig, DriftError, DriftEvidenceFile, DriftReport, Error, FocusExpansion, FocusSelection,
+    LinearGraphQlSource, NextStep, ProjectChunk, ProjectPriority, ProjectRunStatus, ReadService,
+    ReadyItem, SearchResult, evaluate_drift_file, render_drift_text,
 };
 use ix_cli_kit::exit::Outcome;
 use ix_cli_kit::streams::{
@@ -66,10 +66,31 @@ enum Command {
         #[arg(long)]
         evidence: PathBuf,
     },
+    /// Resolve an inline Linear initiative/project/issue focus.
+    Focus {
+        #[command(subcommand)]
+        command: FocusCommand,
+    },
     /// Update one of the two supported Linear project fields.
     Project {
         #[command(subcommand)]
         command: ProjectCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum FocusCommand {
+    /// Expand selectors into focus issues and prerequisite layers.
+    Expand {
+        /// Linear initiative UUID or exact name; may be repeated.
+        #[arg(long = "initiative", action = clap::ArgAction::Append)]
+        initiatives: Vec<String>,
+        /// Linear project UUID, identifier, or exact name; may be repeated.
+        #[arg(long = "project", action = clap::ArgAction::Append)]
+        projects: Vec<String>,
+        /// Linear issue UUID or identifier; may be repeated.
+        #[arg(long = "issue", action = clap::ArgAction::Append)]
+        issues: Vec<String>,
     },
 }
 
@@ -98,6 +119,7 @@ enum ProjectCommand {
 enum Output {
     Queue(Vec<ReadyItem>),
     Chunk(ProjectChunk),
+    Focus(FocusExpansion),
     Search(Vec<SearchResult>),
     Drift(DriftReport),
     ProjectStatusUpdated {
@@ -156,6 +178,8 @@ fn main() -> std::process::ExitCode {
                 | Error::ProjectNotFound { .. }
                 | Error::InvalidProjectStatus { .. }
                 | Error::InvalidProjectPriority { .. }
+                | Error::EmptyFocus
+                | Error::ScopeSelection { .. }
                 | Error::DriftInputRead { .. }
                 | Error::DriftInputDecode { .. }
                 | Error::Drift(_) => Outcome::Invalid,
@@ -169,6 +193,16 @@ fn validate_command(command: &Command) -> Result<(), Error> {
     match command {
         Command::Next { team } if team.trim().is_empty() => Err(Error::InvalidTeam),
         Command::Search { query } if query.trim().is_empty() => Err(Error::InvalidQuery),
+        Command::Focus {
+            command:
+                FocusCommand::Expand {
+                    initiatives,
+                    projects,
+                    issues,
+                },
+        } if initiatives.is_empty() && projects.is_empty() && issues.is_empty() => {
+            Err(Error::EmptyFocus)
+        }
         Command::ProjectChunk { project } if project.trim().is_empty() => {
             Err(Error::ProjectNotFound {
                 identifier: project.clone(),
@@ -198,6 +232,20 @@ fn run_linear(command: Command) -> Result<Output, Error> {
         Command::Next { team } => service.next(&team).map(Output::Queue),
         Command::ProjectChunk { project } => service.project_chunk(&project).map(Output::Chunk),
         Command::Search { query } => service.search(&query).map(Output::Search),
+        Command::Focus {
+            command:
+                FocusCommand::Expand {
+                    initiatives,
+                    projects,
+                    issues,
+                },
+        } => service
+            .focus_expand(&FocusSelection {
+                initiatives,
+                projects,
+                issues,
+            })
+            .map(Output::Focus),
         Command::Drift { .. } => Err(Error::Drift(DriftError::InvalidConfig {
             reason: "drift command must use its evidence input".to_owned(),
         })),
@@ -249,6 +297,7 @@ fn render_human(output: &Output) -> String {
     match output {
         Output::Queue(items) => render_queue(items),
         Output::Chunk(chunk) => render_chunk(chunk),
+        Output::Focus(expansion) => render_focus(expansion),
         Output::Search(results) => results
             .iter()
             .map(|record| format!("{:?} {} — {}", record.kind, record.identifier, record.name))
@@ -266,6 +315,66 @@ fn render_human(output: &Output) -> String {
             format!("Project {project} priority set to {priority} ({label})")
         }
     }
+}
+
+fn render_focus(expansion: &FocusExpansion) -> String {
+    let mut lines = vec![format!(
+        "Focus snapshot fetched at {}",
+        expansion.fetched_at
+    )];
+    lines.push("Selected projects:".to_owned());
+    if expansion.projects.is_empty() {
+        lines.push("  (none)".to_owned());
+    }
+    for project in &expansion.projects {
+        lines.push(format!("  {} — {}", project.identifier, project.name));
+        for milestone in &project.milestones {
+            lines.push(format!(
+                "    Milestone {} — {}",
+                milestone.name, milestone.id
+            ));
+            lines.extend(milestone.issues.iter().map(|issue| {
+                format!(
+                    "      {} [{}] {}",
+                    issue.identifier, issue.state, issue.title
+                )
+            }));
+        }
+        lines.push("    Project-level issues:".to_owned());
+        lines.extend(project.project_level_issues.iter().map(|issue| {
+            format!(
+                "      {} [{}] {}",
+                issue.identifier, issue.state, issue.title
+            )
+        }));
+    }
+    lines.push("Focus issues:".to_owned());
+    lines.extend(
+        expansion
+            .focus_issues
+            .iter()
+            .map(|issue| format!("  {} [{}] {}", issue.identifier, issue.state, issue.title)),
+    );
+    lines.push("Issue selector issues and descendants:".to_owned());
+    lines.extend(
+        expansion
+            .issue_selector_issues
+            .iter()
+            .map(|issue| format!("  {} [{}] {}", issue.identifier, issue.state, issue.title)),
+    );
+    lines.push("Blocker layers:".to_owned());
+    if expansion.blocker_layers.is_empty() {
+        lines.push("  (none)".to_owned());
+    } else {
+        lines.extend(
+            expansion
+                .blocker_layers
+                .iter()
+                .enumerate()
+                .map(|(index, layer)| format!("  {}: {}", index, layer.join(", "))),
+        );
+    }
+    lines.join("\n")
 }
 
 fn render_queue(items: &[ReadyItem]) -> String {
@@ -325,4 +434,43 @@ fn render_chunk(chunk: &ProjectChunk) -> String {
         );
     }
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Command, FocusCommand};
+    use clap::Parser;
+
+    /// Trace: FR-011-AC-1
+    #[test]
+    fn focus_expand_accepts_repeated_combined_selectors() {
+        let cli = Cli::try_parse_from([
+            "ix-board",
+            "focus",
+            "expand",
+            "--initiative",
+            "Delivery",
+            "--project",
+            "SWM-P1",
+            "--project",
+            "SWM-P2",
+            "--issue",
+            "SWM-1",
+            "--issue",
+            "SWM-2",
+        ])
+        .expect("parse repeated selectors");
+        assert!(matches!(
+            cli.command,
+            Command::Focus {
+                command: FocusCommand::Expand {
+                    initiatives,
+                    projects,
+                    issues,
+                }
+            } if initiatives == ["Delivery"]
+                && projects == ["SWM-P1", "SWM-P2"]
+                && issues == ["SWM-1", "SWM-2"]
+        ));
+    }
 }

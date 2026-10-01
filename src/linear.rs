@@ -20,8 +20,8 @@ const ISSUE_PAGE_SIZE: i32 = 50;
 const PROJECT_NESTED_PAGE_SIZE: i32 = 50;
 const RELATION_PAGE_SIZE: i32 = 50;
 const PAGE_LIMIT: usize = 1_000;
-// Invalidate cached snapshots predating canonical Linear project/issue state handling.
-const CACHE_MODEL_VERSION: &str = "v4";
+// Invalidate cached snapshots predating issue-to-project-milestone associations.
+const CACHE_MODEL_VERSION: &str = "v5";
 const ENDPOINT: &str = "https://api.linear.app/graphql";
 
 const PROJECT_QUERY: &str = r#"
@@ -49,6 +49,7 @@ query WorkspaceIssues($first: Int!, $relationFirst: Int!, $after: String) {
       state { name type }
       team { key }
       project { id }
+      projectMilestone { id }
       parent { id }
       relations(first: $relationFirst) {
         nodes { type issue { id } relatedIssue { id } }
@@ -310,6 +311,7 @@ impl WorkspaceSource for LinearGraphQlSource {
                     parent_id: raw.parent.map(|p| IssueId(p.id)),
                     team_key: TeamKey(raw.team.key),
                     project_id: raw.project.map(|project| ProjectId(project.id)),
+                    project_milestone_id: raw.project_milestone.map(|milestone| milestone.id),
                     priority: raw.priority,
                     sort_order: raw.sort_order,
                     blocked_by: blocked_by
@@ -745,6 +747,7 @@ struct RawIssue {
     state: RawState,
     team: RawTeam,
     project: Option<RawIssueProject>,
+    project_milestone: Option<RawIssueProject>,
     parent: Option<RawIssueProject>,
     relations: Connection<RawRelation>,
 }
@@ -795,9 +798,9 @@ struct RawRelationIssue {
 #[cfg(test)]
 mod tests {
     use super::{
-        IssueData, LinearGraphQlSource, LinearProjectStatusType, ProjectData, ProjectUpdateInput,
-        RawProjectStatusOption, canonical_project_status, collect_blocked_by,
-        resolve_project_status_id,
+        ISSUE_PAGE_SIZE, IssueData, LinearGraphQlSource, LinearProjectStatusType,
+        PROJECT_PAGE_SIZE, ProjectData, ProjectUpdateInput, RawProjectStatusOption,
+        canonical_project_status, collect_blocked_by, resolve_project_status_id,
     };
     use crate::{
         Issue, IssueId, Project, ProjectId, ProjectMutationSource, ProjectPriority,
@@ -984,6 +987,7 @@ mod tests {
         );
     }
 
+    /// Trace: FR-011-AC-6
     #[test]
     fn decoded_started_project_snapshot_remains_in_next_queue() {
         let project = serde_json::json!({
@@ -992,12 +996,15 @@ mod tests {
             "status": {"name": "In Progress", "type": "started"},
             "teams": connection(serde_json::json!([{"key": "SWM"}])),
             "initiatives": connection(serde_json::json!([])),
-            "projectMilestones": connection(serde_json::json!([]))
+            "projectMilestones": connection(serde_json::json!([{
+                "id": "milestone-id", "name": "M1", "description": null, "sortOrder": 1.0
+            }]))
         });
         let issue = serde_json::json!({
             "id": "issue-id", "identifier": "SWM-3", "title": "Project ticket", "description": null,
             "priority": 2.0, "sortOrder": 1.0, "state": {"name": "Specced", "type": "started"}, "team": {"key": "SWM"},
             "project": {"id": "project-id"},
+            "projectMilestone": {"id": "milestone-id"},
             "relations": connection(serde_json::json!([]))
         });
         let (endpoint, server) = mock_linear(vec![
@@ -1012,12 +1019,43 @@ mod tests {
         ));
         let mut service = ReadService::open(source, &cache_path).expect("open read service");
         let queue = service.next("SWM").expect("read next queue");
-        server.join().expect("mock server");
+        let snapshot = service.workspace_snapshot().expect("workspace snapshot");
+        let requests = server.join().expect("mock server");
         let _ = std::fs::remove_file(cache_path);
 
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].identifier, "SWM-3");
         assert_eq!(queue[0].project, "SWM-P1");
+        assert_eq!(
+            snapshot.issues[0].project_milestone_id.as_deref(),
+            Some("milestone-id")
+        );
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0]["query"]
+                .as_str()
+                .unwrap()
+                .contains("projects(first:")
+        );
+        assert!(
+            requests[1]["query"]
+                .as_str()
+                .unwrap()
+                .contains("issues(first:")
+        );
+        assert!(
+            requests[1]["query"]
+                .as_str()
+                .unwrap()
+                .contains("projectMilestone { id }")
+        );
+        assert_eq!(requests[0]["variables"]["first"], PROJECT_PAGE_SIZE);
+        assert_eq!(requests[1]["variables"]["first"], ISSUE_PAGE_SIZE);
+        assert!(requests.iter().all(|request| {
+            !request["query"]
+                .as_str()
+                .is_some_and(|query| query.contains("github"))
+        }));
     }
 
     #[test]
@@ -1175,6 +1213,7 @@ mod tests {
                     state: "Done".to_owned(),
                     team_key: TeamKey("SWM".to_owned()),
                     project_id: None,
+                    project_milestone_id: None,
                     priority: 2.0,
                     sort_order: 1.0,
                     blocked_by: Vec::new(),
@@ -1190,6 +1229,7 @@ mod tests {
                     state: "Specced".to_owned(),
                     team_key: TeamKey("SWM".to_owned()),
                     project_id: Some(ProjectId("project-id".to_owned())),
+                    project_milestone_id: None,
                     priority: 2.0,
                     sort_order: 2.0,
                     blocked_by: vec![IssueId("blocker-id".to_owned())],
