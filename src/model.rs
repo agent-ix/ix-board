@@ -153,6 +153,8 @@ pub struct Project {
     pub priority: i32,
     /// Linear manual project order.
     pub sort_order: f64,
+    /// Linear project target date, when configured.
+    pub target_date: Option<String>,
     /// Teams associated with this project.
     pub team_keys: Vec<TeamKey>,
     /// Project milestones in Linear order.
@@ -173,6 +175,8 @@ pub struct Milestone {
     pub description: Option<String>,
     /// Linear manual order.
     pub sort_order: f64,
+    /// Linear milestone target date, when configured.
+    pub target_date: Option<String>,
 }
 
 /// A structured Linear issue record and its prerequisite identifiers.
@@ -189,6 +193,8 @@ pub struct Issue {
     pub description: Option<String>,
     /// Workflow state name.
     pub state: String,
+    /// Linear workflow-state display name before terminal-state canonicalization.
+    pub state_name: String,
     /// Linear workflow category, independent of its display name.
     pub state_type: WorkflowStateType,
     /// Parent ticket UUID, distinct from prerequisite dependencies.
@@ -288,6 +294,110 @@ pub struct FocusExpansion {
     pub issue_selector_issues: Vec<FocusIssue>,
     /// Complete blocker closures, prerequisites before dependents.
     pub blocker_layers: Vec<Vec<String>>,
+}
+
+/// Combined focus status, blocker attribution, and eligible ready work.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FocusStatus {
+    /// Unix seconds when the source snapshot was fetched.
+    pub fetched_at: i64,
+    /// Selected projects and milestone status, in deterministic order.
+    pub projects: Vec<FocusProjectStatus>,
+    /// Complete prerequisite closure in FR-002 layer order.
+    pub blocker_layers: Vec<Vec<FocusBlocker>>,
+    /// Focus issues eligible under FR-001, in its deterministic order.
+    pub ready_queue: Vec<ReadyItem>,
+}
+
+/// Status summary for one selected Linear project.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FocusProjectStatus {
+    /// Linear project UUID.
+    pub id: ProjectId,
+    /// Human-readable project identifier, falling back to its UUID.
+    pub identifier: String,
+    /// Project name.
+    pub name: String,
+    /// Linear project target date, when configured.
+    pub target_date: Option<String>,
+    /// Open focus issue counts by Linear workflow-state display name.
+    pub open_by_state: Vec<FocusStateCount>,
+    /// Started focus issues assigned to this project.
+    pub in_progress: Vec<FocusIssue>,
+    /// Progress over countable focus leaf issues assigned to this project.
+    pub progress: FocusProgress,
+    /// Selected milestone status, in Linear milestone order.
+    pub milestones: Vec<FocusMilestoneStatus>,
+}
+
+/// Status summary for one selected Linear project milestone.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FocusMilestoneStatus {
+    /// Linear milestone UUID.
+    pub id: String,
+    /// Milestone name.
+    pub name: String,
+    /// Linear milestone target date, when configured.
+    pub target_date: Option<String>,
+    /// Open focus issue counts by Linear workflow-state display name.
+    pub open_by_state: Vec<FocusStateCount>,
+    /// Started focus issues assigned to this milestone.
+    pub in_progress: Vec<FocusIssue>,
+    /// Progress over countable focus leaf issues assigned to this milestone.
+    pub progress: FocusProgress,
+}
+
+/// Open issue count for one workflow-state display name.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FocusStateCount {
+    /// Linear workflow-state display name.
+    pub state: String,
+    /// Number of open resolved focus issues in this state and group.
+    pub count: usize,
+}
+
+/// Leaf progress counts and completion percentage for one focus group.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FocusProgress {
+    /// Completed countable leaf issues.
+    pub done: usize,
+    /// All countable leaf issues, excluding canceled and duplicate leaves.
+    pub total: usize,
+    /// Completion percentage from zero through 100, or null for no countable leaves.
+    pub completed_percent: Option<f64>,
+}
+
+/// One issue in the complete prerequisite closure with its focus roots.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FocusBlocker {
+    /// Stable Linear issue identifier.
+    pub identifier: String,
+    /// Issue title.
+    pub title: String,
+    /// Linear workflow-state display name.
+    pub state: String,
+    /// FR-001 classification of the issue state.
+    pub classification: FocusIssueClassification,
+    /// Sorted stable identifiers of focus issues whose blocker closure contains this issue.
+    pub focus_root_ids: Vec<String>,
+}
+
+/// FR-001 open and terminal workflow-state classes.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "PascalCase")]
+pub enum FocusIssueClassification {
+    /// Issue is completed.
+    Completed,
+    /// Issue is canceled.
+    Canceled,
+    /// Issue remains open under FR-001.
+    Open,
 }
 
 /// One selected project with issues grouped by their milestone association.

@@ -21,19 +21,19 @@ const PROJECT_NESTED_PAGE_SIZE: i32 = 50;
 const RELATION_PAGE_SIZE: i32 = 50;
 const PAGE_LIMIT: usize = 1_000;
 // Invalidate cached snapshots predating issue-to-project-milestone associations.
-const CACHE_MODEL_VERSION: &str = "v5";
+const CACHE_MODEL_VERSION: &str = "v6";
 const ENDPOINT: &str = "https://api.linear.app/graphql";
 
 const PROJECT_QUERY: &str = r#"
 query WorkspaceProjects($first: Int!, $nestedFirst: Int!, $after: String) {
   projects(first: $first, after: $after) {
     nodes {
-      id identifier name description content priority sortOrder
+      id identifier name description content priority sortOrder targetDate
       status { name type }
       initiatives(first: 10) { nodes { id name } pageInfo { hasNextPage } }
       teams(first: $nestedFirst) { nodes { key } pageInfo { hasNextPage } }
       projectMilestones(first: $nestedFirst) {
-        nodes { id name description sortOrder }
+        nodes { id name description sortOrder targetDate }
         pageInfo { hasNextPage }
       }
     }
@@ -229,6 +229,7 @@ impl WorkspaceSource for LinearGraphQlSource {
                     status: canonical_project_status(raw.status.name, raw.status.status_type),
                     priority: raw.priority,
                     sort_order: raw.sort_order,
+                    target_date: raw.target_date,
                     team_keys: raw
                         .teams
                         .nodes
@@ -244,6 +245,7 @@ impl WorkspaceSource for LinearGraphQlSource {
                             name: milestone.name,
                             description: milestone.description,
                             sort_order: milestone.sort_order,
+                            target_date: milestone.target_date,
                         })
                         .collect(),
                 });
@@ -300,13 +302,15 @@ impl WorkspaceSource for LinearGraphQlSource {
             .into_iter()
             .map(|raw| {
                 let state_type = raw.state.status_type;
-                let state = canonical_issue_state(raw.state.name, state_type);
+                let state_name = raw.state.name;
+                let state = canonical_issue_state(state_name.clone(), state_type);
                 Issue {
                     id: IssueId(raw.id.clone()),
                     identifier: raw.identifier,
                     title: raw.title,
                     description: raw.description,
                     state,
+                    state_name,
                     state_type,
                     parent_id: raw.parent.map(|p| IssueId(p.id)),
                     team_key: TeamKey(raw.team.key),
@@ -676,6 +680,7 @@ struct RawProject {
     content: Option<String>,
     priority: i32,
     sort_order: f64,
+    target_date: Option<String>,
     status: RawProjectStatus,
     teams: Connection<RawTeam>,
     project_milestones: Connection<RawMilestone>,
@@ -726,6 +731,7 @@ struct RawMilestone {
     name: String,
     description: Option<String>,
     sort_order: f64,
+    target_date: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -987,17 +993,18 @@ mod tests {
         );
     }
 
-    /// Trace: FR-011-AC-6
+    /// Trace: FR-011-AC-6, FR-012-AC-1
     #[test]
     fn decoded_started_project_snapshot_remains_in_next_queue() {
         let project = serde_json::json!({
             "id": "project-id", "identifier": "SWM-P1", "name": "Project", "description": "Goal",
-            "content": null, "priority": 2, "sortOrder": 1.0,
+            "content": null, "priority": 2, "sortOrder": 1.0, "targetDate": "2026-12-01",
             "status": {"name": "In Progress", "type": "started"},
             "teams": connection(serde_json::json!([{"key": "SWM"}])),
             "initiatives": connection(serde_json::json!([])),
             "projectMilestones": connection(serde_json::json!([{
-                "id": "milestone-id", "name": "M1", "description": null, "sortOrder": 1.0
+                "id": "milestone-id", "name": "M1", "description": null, "sortOrder": 1.0,
+                "targetDate": "2026-11-20"
             }]))
         });
         let issue = serde_json::json!({
@@ -1030,12 +1037,27 @@ mod tests {
             snapshot.issues[0].project_milestone_id.as_deref(),
             Some("milestone-id")
         );
+        assert_eq!(
+            snapshot.projects[0].target_date.as_deref(),
+            Some("2026-12-01")
+        );
+        assert_eq!(
+            snapshot.projects[0].milestones[0].target_date.as_deref(),
+            Some("2026-11-20")
+        );
+        assert_eq!(snapshot.issues[0].state_name, "Specced");
         assert_eq!(requests.len(), 2);
         assert!(
             requests[0]["query"]
                 .as_str()
                 .unwrap()
                 .contains("projects(first:")
+        );
+        assert!(
+            requests[0]["query"]
+                .as_str()
+                .unwrap()
+                .contains("targetDate")
         );
         assert!(
             requests[1]["query"]
@@ -1198,6 +1220,7 @@ mod tests {
                 status: "Started".to_owned(),
                 priority: 2,
                 sort_order: 1.0,
+                target_date: None,
                 team_keys: vec![TeamKey("SWM".to_owned())],
                 milestones: Vec::new(),
             }],
@@ -1211,6 +1234,7 @@ mod tests {
                     title: "Done blocker cached before canonicalization".to_owned(),
                     description: None,
                     state: "Done".to_owned(),
+                    state_name: "Done".to_owned(),
                     team_key: TeamKey("SWM".to_owned()),
                     project_id: None,
                     project_milestone_id: None,
@@ -1227,6 +1251,7 @@ mod tests {
                     title: "Ready after refresh".to_owned(),
                     description: None,
                     state: "Specced".to_owned(),
+                    state_name: "Specced".to_owned(),
                     team_key: TeamKey("SWM".to_owned()),
                     project_id: Some(ProjectId("project-id".to_owned())),
                     project_milestone_id: None,
