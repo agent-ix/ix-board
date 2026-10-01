@@ -21,7 +21,8 @@ context, and search through the ix-board CLI and library. SWM-3 adds explicit
 project status and priority writes so team leaders can control the run queue.
 SWM-4 reports evidence of work outside that queue and work that is active but
 not landing. SWM-33 adds inline planner focus inputs that expand initiatives,
-projects, and issues into Linear issue sets and blocker layers.
+projects, and issues into Linear issue sets and blocker layers. SWM-34 adds
+focus status, blocker-state, and ready-queue reporting.
 
 ## Scope
 
@@ -37,6 +38,8 @@ projects, and issues into Linear issue sets and blocker layers.
   supported Linear project priority values; these are ix-board's only writes.
 - Inline planner focus inputs that expand selected Linear initiatives,
   projects, and issues into a deduplicated issue set and blocker layers (FR-011).
+- Focus status by project and milestone, blocker-state details, and the ready
+  queue restricted to focus issues (FR-012).
 - `drift` reports per-lead scope and churn signals from structured Linear,
   GitHub, herdr, and OpenTelemetry records, with configurable thresholds,
   a stable JSON field contract, and one text line per lead. Its time-based
@@ -63,14 +66,17 @@ and search across tickets and projects. SWM-3 adds narrow project controls:
 `Started` runs a project and `Paused` holds it; project priority participates in
 the queue order defined by FR-001. SWM-4 adds a read-only drift report for the
 configured leads. SWM-33 adds inline focus expansion from structured Linear
-records. The library obtains structured source records through Linear GraphQL
-and caches read results locally.
+records; SWM-34 composes that focus with project and milestone status, blocker
+states, and the FR-001 ready queue. The library obtains structured source
+records through Linear GraphQL and caches read results locally.
 
 ### Intended Users
 
 - Team leaders use the CLI and team-leader skill to inspect team and project work.
 - Team planners use inline focus selectors to resolve their planned
   initiatives, projects, issues, and blockers.
+- Team leads use `focus status` to inspect progress, blockers, and ready work
+  within the selected focus.
 - Library consumers rely on the same deterministic read results and queue rules.
 
 ## Requirements Architecture
@@ -78,6 +84,8 @@ and caches read results locally.
 The use case US-001 traces to FR-001 through FR-007 and NFR-001. US-002 traces
 to FR-008 and FR-009, which depend on the queue and structured-data boundary.
 US-003 traces to FR-010 and FR-011, reusing FR-001/FR-002 blocker semantics.
+US-004 traces to FR-010 through FR-012, composing the existing focus expansion
+and queue rules into a status result.
 Functional acceptance criteria include fixture checks for each drift signal,
 queue rules, and cache behavior; NFR-001 specifies a lightweight warm-cache
 fixture benchmark.
