@@ -40,7 +40,7 @@ pub use model::{
 
 use model::{compare_f64, issue_is_open};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use thiserror::Error as ThisError;
 
@@ -685,8 +685,16 @@ fn spec_step(spec_state: &str) -> Option<NextStep> {
 }
 
 fn blockers_completed(issue: &Issue, issues: &HashMap<&IssueId, &Issue>) -> Result<bool, Error> {
+    Ok(unresolved_blockers(issue, issues)?.is_empty())
+}
+
+fn unresolved_blockers(
+    issue: &Issue,
+    issues: &HashMap<&IssueId, &Issue>,
+) -> Result<BTreeSet<String>, Error> {
     let mut pending = issue.blocked_by.to_vec();
-    let mut visited = HashSet::new();
+    let mut visited = BTreeSet::new();
+    let mut unresolved = BTreeSet::new();
     while let Some(blocker_id) = pending.pop() {
         if !visited.insert(blocker_id.clone()) {
             continue;
@@ -696,12 +704,12 @@ fn blockers_completed(issue: &Issue, issues: &HashMap<&IssueId, &Issue>) -> Resu
                 issue: blocker_id.0,
             });
         };
-        if blocker.state != "Completed" {
-            return Ok(false);
+        if blocker.state_type != WorkflowStateType::Completed {
+            unresolved.insert(blocker.identifier.clone());
         }
         pending.extend(blocker.blocked_by.iter().cloned());
     }
-    Ok(true)
+    Ok(unresolved)
 }
 
 fn canonical_selectors(
@@ -1298,23 +1306,7 @@ fn plan_readiness(
         Some(step) => format!("spec state {} maps to {:?}", issue.state, step),
         None => format!("spec state {} has no FR-001 next step", issue.state),
     });
-    let mut unresolved = BTreeSet::new();
-    let mut pending = issue.blocked_by.clone();
-    let mut visited = BTreeSet::new();
-    while let Some(blocker_id) = pending.pop() {
-        if !visited.insert(blocker_id.clone()) {
-            continue;
-        }
-        let Some(blocker) = issues.get(&blocker_id).copied() else {
-            return Err(Error::MissingDependency {
-                issue: blocker_id.0,
-            });
-        };
-        if blocker.state_type != WorkflowStateType::Completed {
-            unresolved.insert(blocker.identifier.clone());
-        }
-        pending.extend(blocker.blocked_by.iter().cloned());
-    }
+    let unresolved = unresolved_blockers(issue, issues)?;
     let blockers_ready = unresolved.is_empty();
     reasons.push(if blockers_ready {
         "all recursive blockers are Completed".to_owned()

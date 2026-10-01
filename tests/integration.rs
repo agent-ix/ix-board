@@ -1148,6 +1148,112 @@ fn focus_plan_chunk_refuses_empty_missing_and_cyclic_input_without_partial_rows(
     ));
 }
 
+/// Trace: FR-014-AC-2
+#[test]
+fn focus_plan_chunk_keeps_open_coding_review_and_unmapped_spec_candidates() {
+    let directory = TempDir::new().expect("temporary directory");
+    let mut completed_blocker = issue("d1", "OPS-1", None, "Done", 1.0, 1.0, None, &[]);
+    completed_blocker.state_type = ix_board::WorkflowStateType::Completed;
+    completed_blocker.state_name = "Done".to_owned();
+    let coding = issue(
+        "i1",
+        "IR-CODING",
+        Some("p1"),
+        "Started",
+        1.0,
+        1.0,
+        Some("Coding"),
+        &[],
+    );
+    let review = issue(
+        "i2",
+        "IR-REVIEW",
+        Some("p1"),
+        "Started",
+        1.0,
+        2.0,
+        Some("Review"),
+        &[],
+    );
+    let unmapped = issue(
+        "i3",
+        "IR-UNKNOWN",
+        Some("p1"),
+        "Started",
+        1.0,
+        3.0,
+        Some("Needs Design"),
+        &[],
+    );
+    let ready = issue(
+        "i4",
+        "IR-READY",
+        Some("p1"),
+        "Specced",
+        1.0,
+        4.0,
+        None,
+        &["d1"],
+    );
+    let snapshot = WorkspaceSnapshot {
+        fetched_at: 50,
+        projects: vec![project("p1", "IR-P1", "Started", 1, 1.0)],
+        issues: vec![coding, review, unmapped, ready, completed_blocker],
+    };
+    let queue = ix_board::ready_from_snapshot(&snapshot, "IR").expect("FR-001 ready queue");
+    assert_eq!(
+        queue
+            .iter()
+            .map(|row| row.identifier.as_str())
+            .collect::<Vec<_>>(),
+        ["IR-READY"]
+    );
+    let mut reads = service(
+        FixtureSource::new(snapshot),
+        ManualClock::new(9_000),
+        &directory,
+    );
+    let chunk = reads
+        .focus_plan_chunk(
+            &ix_board::FocusSelection {
+                projects: vec!["IR-P1".to_owned()],
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("plan chunk retains every open focus candidate");
+    assert_eq!(
+        chunk
+            .issues
+            .iter()
+            .map(|row| row.identifier.as_str())
+            .collect::<Vec<_>>(),
+        ["IR-CODING", "IR-REVIEW", "IR-UNKNOWN", "IR-READY"]
+    );
+    assert_eq!(
+        chunk.issues.iter().map(|row| row.ready).collect::<Vec<_>>(),
+        [false, false, false, true]
+    );
+    assert!(
+        chunk.issues[0]
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("no FR-001 next step"))
+    );
+    assert!(
+        chunk.issues[1]
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("no FR-001 next step"))
+    );
+    assert!(
+        chunk.issues[2]
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("no FR-001 next step"))
+    );
+}
+
 /// Trace: FR-011-AC-4, FR-012-AC-6
 #[test]
 fn focus_expansion_rejects_empty_or_unresolved_selectors_without_partial_data() {
