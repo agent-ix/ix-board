@@ -4,11 +4,13 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use crate::{Error, IssueId, ProjectId, WorkflowStateType, WorkspaceSnapshot};
+use crate::{Error, IssueId, ProjectId, TeamKey, WorkflowStateType, WorkspaceSnapshot};
 
-/// Explicit assignment selectors, combined as a union.
+/// Explicit assignment selectors, combined as a union within an optional team boundary.
 #[derive(Clone, Debug, Default)]
 pub struct ScopeSelection {
+    /// Restrict membership to this team; alone selects the whole team.
+    pub team: Option<TeamKey>,
     /// Initiative UUIDs or exact names.
     pub initiatives: Vec<String>,
     /// Project UUIDs, identifiers, or exact names.
@@ -53,6 +55,36 @@ pub fn select_scope(
     selection: &ScopeSelection,
 ) -> Result<ScopeSummary, Error> {
     let mut result = ScopeSummary::default();
+    if let Some(team) = &selection.team {
+        let known = snapshot.issues.iter().any(|i| i.team_key == *team)
+            || snapshot.projects.iter().any(|p| p.team_keys.contains(team));
+        if !known {
+            return Err(Error::ScopeSelection {
+                kind: "team",
+                identifier: team.0.clone(),
+                matches: 0,
+            });
+        }
+        if selection.initiatives.is_empty()
+            && selection.projects.is_empty()
+            && selection.tickets.is_empty()
+        {
+            result.project_ids.extend(
+                snapshot
+                    .projects
+                    .iter()
+                    .filter(|p| p.team_keys.contains(team))
+                    .map(|p| p.id.clone()),
+            );
+            result.issue_ids.extend(
+                snapshot
+                    .issues
+                    .iter()
+                    .filter(|i| i.team_key == *team)
+                    .map(|i| i.id.clone()),
+            );
+        }
+    }
     for value in &selection.projects {
         let project = unique(
             "project",
@@ -126,6 +158,21 @@ pub fn select_scope(
         }
     }
     let by_id: BTreeMap<_, _> = snapshot.issues.iter().map(|i| (&i.id, i)).collect();
+    if let Some(team) = &selection.team {
+        result
+            .issue_ids
+            .retain(|id| by_id.get(id).is_some_and(|i| i.team_key == *team));
+        result.project_ids.retain(|id| {
+            snapshot
+                .projects
+                .iter()
+                .any(|p| p.id == *id && p.team_keys.contains(team))
+                || snapshot
+                    .issues
+                    .iter()
+                    .any(|i| result.issue_ids.contains(&i.id) && i.project_id.as_ref() == Some(id))
+        });
+    }
     let mut checked = BTreeSet::new();
     for issue in snapshot
         .issues

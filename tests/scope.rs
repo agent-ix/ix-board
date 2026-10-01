@@ -61,6 +61,7 @@ fn tc_010_01_overlapping_selectors_count_leaves_once_and_exclude_terminal_nonwor
         projects: vec!["Product".into()],
         initiatives: vec!["Delivery".into()],
         tickets: vec!["SWM-1".into()],
+        ..ScopeSelection::default()
     };
     let scope = select_scope(&snapshot, &selection).unwrap();
     assert_eq!(scope.issue_ids.len(), 5);
@@ -125,5 +126,63 @@ fn tc_010_02_unknown_ambiguous_and_cyclic_scope_is_refused() {
             }
         ),
         Err(ix_board::Error::MissingParent { .. })
+    ));
+}
+
+/// Trace: FR-010-AC-5
+#[test]
+fn team_boundary_includes_unprojected_work_and_intersects_project_focus() {
+    let mut foreign = issue("AGE-1", Some("SWM-1"), WorkflowStateType::Started);
+    foreign.team_key = TeamKey("AGE".into());
+    let mut unprojected = issue("SWM-3", None, WorkflowStateType::Started);
+    unprojected.project_id = None;
+    let mut unrelated = project("q", "Other team");
+    unrelated.team_keys = vec![TeamKey("AGE".into())];
+    let snapshot = WorkspaceSnapshot {
+        projects: vec![project("p", "Product"), unrelated],
+        issues: vec![
+            issue("SWM-1", None, WorkflowStateType::Completed),
+            issue("SWM-2", None, WorkflowStateType::Completed),
+            foreign,
+            unprojected,
+        ],
+        fetched_at: 0,
+    };
+    let mut selection = ScopeSelection {
+        team: Some(TeamKey("SWM".into())),
+        ..ScopeSelection::default()
+    };
+    let all = select_scope(&snapshot, &selection).unwrap();
+    assert_eq!(all.issue_ids.len(), 3);
+    assert_eq!(all.project_ids, [ProjectId("p".into())].into());
+    // Global ancestry prevents a parent with a foreign child becoming a leaf.
+    assert_eq!(
+        all.leaf_ids,
+        [IssueId("SWM-2".into()), IssueId("SWM-3".into())].into()
+    );
+    assert_eq!(all.done, 1);
+    selection.projects = vec!["Product".into()];
+    let focused = select_scope(&snapshot, &selection).unwrap();
+    assert_eq!(focused.issue_ids.len(), 2);
+    assert_eq!(focused.leaf_ids, [IssueId("SWM-2".into())].into());
+    selection.projects.clear();
+    selection.initiatives = vec!["Delivery".into()];
+    assert_eq!(
+        select_scope(&snapshot, &selection).unwrap().issue_ids,
+        focused.issue_ids
+    );
+    selection.initiatives.clear();
+    selection.tickets = vec!["SWM-1".into()];
+    let subtree = select_scope(&snapshot, &selection).unwrap();
+    assert_eq!(subtree.issue_ids, [IssueId("SWM-1".into())].into());
+    assert!(subtree.leaf_ids.is_empty());
+    selection.team = Some(TeamKey("MISSING".into()));
+    assert!(matches!(
+        select_scope(&snapshot, &selection),
+        Err(ix_board::Error::ScopeSelection {
+            kind: "team",
+            matches: 0,
+            ..
+        })
     ));
 }
