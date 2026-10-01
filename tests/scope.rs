@@ -43,6 +43,10 @@ fn issue(id: &str, parent: Option<&str>, category: WorkflowStateType) -> Issue {
         priority: 2.0,
         sort_order: 0.0,
         blocked_by: vec![],
+        created_at: None,
+        updated_at: None,
+        attachment_urls: vec![],
+        attachments_complete: true,
     }
 }
 

@@ -3,7 +3,7 @@
 
 //! SQLite persistence for the five-minute structured workspace snapshot.
 
-use crate::{Error, WorkspaceSnapshot};
+use crate::{Error, WorkspaceSnapshot, hygiene::FocusBaseline};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 
@@ -47,6 +47,13 @@ impl SnapshotCache {
                     cache_key TEXT PRIMARY KEY,
                     fetched_at INTEGER NOT NULL,
                     payload BLOB NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS focus_hygiene_baseline (
+                    workspace_key TEXT NOT NULL,
+                    focus_key TEXT NOT NULL,
+                    report_time TEXT NOT NULL,
+                    payload BLOB NOT NULL,
+                    PRIMARY KEY (workspace_key, focus_key)
                 );",
             )
             .map_err(Error::Cache)?;
@@ -103,6 +110,36 @@ impl SnapshotCache {
             .map_err(Error::Cache)?;
         Ok(())
     }
+
+    pub(crate) fn hygiene_baseline(&self, focus_key: &str) -> Result<Option<FocusBaseline>, Error> {
+        let payload = self.connection.query_row(
+            "SELECT payload FROM focus_hygiene_baseline WHERE workspace_key = ?1 AND focus_key = ?2",
+            params![self.cache_key, focus_key],
+            |row| row.get::<_, Vec<u8>>(0),
+        ).optional().map_err(Error::Cache)?;
+        payload
+            .map(|bytes| serde_json::from_slice(&bytes).map_err(Error::CacheDecode))
+            .transpose()
+    }
+
+    pub(crate) fn replace_hygiene_baseline(
+        &mut self,
+        focus_key: &str,
+        baseline: &FocusBaseline,
+    ) -> Result<(), Error> {
+        let payload = serde_json::to_vec(baseline).map_err(Error::CacheEncode)?;
+        let transaction = self.connection.transaction().map_err(Error::Cache)?;
+        transaction
+            .execute(
+                "INSERT INTO focus_hygiene_baseline(workspace_key, focus_key, report_time, payload)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(workspace_key, focus_key) DO UPDATE SET
+               report_time = excluded.report_time, payload = excluded.payload",
+                params![self.cache_key, focus_key, baseline.report_time, payload],
+            )
+            .map_err(Error::Cache)?;
+        transaction.commit().map_err(Error::Cache)
+    }
 }
 
 #[cfg(unix)]
@@ -125,4 +162,70 @@ fn restrict_permissions(path: &Path) -> Result<(), Error> {
 #[cfg(not(unix))]
 fn restrict_permissions(_path: &Path) -> Result<(), Error> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{FocusBaseline, FocusBaselineIssue, IssueId, WorkflowStateType};
+
+    /// Trace: FR-013-AC-7
+    #[test]
+    fn tc_013_07_baseline_upsert_is_per_workspace_and_canonical_focus() {
+        let directory = tempfile::tempdir().expect("cache dir");
+        let path = directory.path().join("linear.sqlite3");
+        let mut cache = SnapshotCache::open(&path, "workspace-one").expect("open cache");
+        let saved = FocusBaseline {
+            report_time: "2026-02-01T00:00:00Z".to_owned(),
+            issues: vec![FocusBaselineIssue {
+                id: IssueId("IR-1".to_owned()),
+                in_focus: true,
+                state: "Todo".to_owned(),
+                state_type: WorkflowStateType::Started,
+                project_id: None,
+                milestone_id: None,
+                blocked_by: vec![],
+            }],
+        };
+        cache
+            .replace_hygiene_baseline("[\"project:p1\"]", &saved)
+            .expect("atomic baseline upsert");
+        assert_eq!(
+            cache
+                .hygiene_baseline("[\"project:p1\"]")
+                .expect("read baseline"),
+            Some(saved.clone())
+        );
+        assert_eq!(
+            cache
+                .hygiene_baseline("[\"project:p2\"]")
+                .expect("other focus"),
+            None
+        );
+        cache
+            .replace_hygiene_baseline(
+                "[\"project:p1\"]",
+                &FocusBaseline {
+                    report_time: "2026-02-02T00:00:00Z".to_owned(),
+                    issues: vec![],
+                },
+            )
+            .expect("replace baseline");
+        assert_eq!(
+            cache
+                .hygiene_baseline("[\"project:p1\"]")
+                .expect("read replaced"),
+            Some(FocusBaseline {
+                report_time: "2026-02-02T00:00:00Z".to_owned(),
+                issues: vec![]
+            })
+        );
+        let other_workspace = SnapshotCache::open(&path, "workspace-two").expect("other workspace");
+        assert_eq!(
+            other_workspace
+                .hygiene_baseline("[\"project:p1\"]")
+                .expect("workspace isolation"),
+            None
+        );
+    }
 }

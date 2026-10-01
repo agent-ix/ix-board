@@ -190,6 +190,10 @@ fn issue(
             .iter()
             .map(|id| IssueId((*id).to_owned()))
             .collect(),
+        created_at: None,
+        updated_at: None,
+        attachment_urls: vec![],
+        attachments_complete: true,
     }
 }
 

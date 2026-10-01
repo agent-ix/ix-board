@@ -15,13 +15,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 // Keep the project query below Linear's complexity limit while retaining nested page coverage.
 const PROJECT_PAGE_SIZE: i32 = 20;
-// 50 issues including up to 50 relations each remain below the 10,000-point query limit.
+// 50 issues with up to 50 relations and 50 attachments each remain below the query complexity limit.
 const ISSUE_PAGE_SIZE: i32 = 50;
 const PROJECT_NESTED_PAGE_SIZE: i32 = 50;
 const RELATION_PAGE_SIZE: i32 = 50;
 const PAGE_LIMIT: usize = 1_000;
 // Invalidate cached snapshots predating issue-to-project-milestone associations.
-const CACHE_MODEL_VERSION: &str = "v6";
+const CACHE_MODEL_VERSION: &str = "v7";
 const ENDPOINT: &str = "https://api.linear.app/graphql";
 
 const PROJECT_QUERY: &str = r#"
@@ -45,7 +45,7 @@ const ISSUE_QUERY: &str = r#"
 query WorkspaceIssues($first: Int!, $relationFirst: Int!, $after: String) {
   issues(first: $first, after: $after) {
     nodes {
-      id identifier title description priority sortOrder
+      id identifier title description priority sortOrder createdAt updatedAt
       state { name type }
       team { key }
       project { id }
@@ -53,6 +53,10 @@ query WorkspaceIssues($first: Int!, $relationFirst: Int!, $after: String) {
       parent { id }
       relations(first: $relationFirst) {
         nodes { type issue { id } relatedIssue { id } }
+        pageInfo { hasNextPage }
+      }
+      attachments(first: 50) {
+        nodes { url }
         pageInfo { hasNextPage }
       }
     }
@@ -323,6 +327,18 @@ impl WorkspaceSource for LinearGraphQlSource {
                         .into_iter()
                         .flat_map(|ids| ids.iter().cloned())
                         .map(IssueId)
+                        .collect(),
+                    created_at: raw.created_at,
+                    updated_at: raw.updated_at,
+                    attachments_complete: raw
+                        .attachments
+                        .as_ref()
+                        .is_some_and(|attachments| !attachments.page_info.has_next_page),
+                    attachment_urls: raw
+                        .attachments
+                        .into_iter()
+                        .flat_map(|attachments| attachments.nodes)
+                        .map(|item| item.url)
                         .collect(),
                 }
             })
@@ -750,12 +766,22 @@ struct RawIssue {
     description: Option<String>,
     priority: f64,
     sort_order: f64,
+    created_at: Option<String>,
+    updated_at: Option<String>,
     state: RawState,
     team: RawTeam,
     project: Option<RawIssueProject>,
     project_milestone: Option<RawIssueProject>,
     parent: Option<RawIssueProject>,
     relations: Connection<RawRelation>,
+    attachments: Option<Connection<RawAttachment>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct RawAttachment {
+    url: String,
 }
 
 #[derive(Deserialize)]
@@ -1241,6 +1267,10 @@ mod tests {
                     priority: 2.0,
                     sort_order: 1.0,
                     blocked_by: Vec::new(),
+                    created_at: None,
+                    updated_at: None,
+                    attachment_urls: Vec::new(),
+                    attachments_complete: true,
                 },
                 Issue {
                     parent_id: None,
@@ -1258,6 +1288,10 @@ mod tests {
                     priority: 2.0,
                     sort_order: 2.0,
                     blocked_by: vec![IssueId("blocker-id".to_owned())],
+                    created_at: None,
+                    updated_at: None,
+                    attachment_urls: Vec::new(),
+                    attachments_complete: true,
                 },
             ],
         };

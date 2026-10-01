@@ -5,9 +5,10 @@
 
 use clap::{Parser, Subcommand};
 use ix_board::{
-    DriftConfig, DriftError, DriftEvidenceFile, DriftReport, Error, FocusExpansion, FocusSelection,
-    FocusStatus, LinearGraphQlSource, NextStep, ProjectChunk, ProjectPriority, ProjectRunStatus,
-    ReadService, ReadyItem, SearchResult, evaluate_drift_file, render_drift_text,
+    DriftConfig, DriftError, DriftEvidenceFile, DriftReport, Error, FocusExpansion,
+    FocusHygieneReport, FocusSelection, FocusStatus, LinearGraphQlSource, NextStep, ProjectChunk,
+    ProjectPriority, ProjectRunStatus, ReadService, ReadyItem, SearchResult, evaluate_drift_file,
+    render_drift_text,
 };
 use ix_cli_kit::exit::Outcome;
 use ix_cli_kit::streams::{
@@ -104,6 +105,18 @@ enum FocusCommand {
         #[arg(long = "issue", action = clap::ArgAction::Append)]
         issues: Vec<String>,
     },
+    /// Report hygiene findings and changes for a focus.
+    Hygiene {
+        #[arg(long = "initiative", action = clap::ArgAction::Append)]
+        initiatives: Vec<String>,
+        #[arg(long = "project", action = clap::ArgAction::Append)]
+        projects: Vec<String>,
+        #[arg(long = "issue", action = clap::ArgAction::Append)]
+        issues: Vec<String>,
+        /// Stale threshold in positive whole days.
+        #[arg(long, default_value_t = 30, value_parser = parse_positive_days)]
+        stale_days: u32,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -133,6 +146,7 @@ enum Output {
     Chunk(ProjectChunk),
     Focus(FocusExpansion),
     FocusStatus(FocusStatus),
+    FocusHygiene(FocusHygieneReport),
     Search(Vec<SearchResult>),
     Drift(DriftReport),
     ProjectStatusUpdated {
@@ -152,6 +166,14 @@ fn parse_project_status(value: &str) -> Result<ProjectRunStatus, String> {
 
 fn parse_project_priority(value: &str) -> Result<ProjectPriority, String> {
     value.parse().map_err(|error: Error| error.to_string())
+}
+
+fn parse_positive_days(value: &str) -> Result<u32, String> {
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|days| *days > 0)
+        .ok_or_else(|| "stale days must be a positive whole number".to_owned())
 }
 
 fn main() -> std::process::ExitCode {
@@ -212,6 +234,17 @@ fn validate_command(command: &Command) -> Result<(), Error> {
                     initiatives,
                     projects,
                     issues,
+                },
+        } if initiatives.is_empty() && projects.is_empty() && issues.is_empty() => {
+            Err(Error::EmptyFocus)
+        }
+        Command::Focus {
+            command:
+                FocusCommand::Hygiene {
+                    initiatives,
+                    projects,
+                    issues,
+                    ..
                 },
         } if initiatives.is_empty() && projects.is_empty() && issues.is_empty() => {
             Err(Error::EmptyFocus)
@@ -283,6 +316,32 @@ fn run_linear(command: Command) -> Result<Output, Error> {
                 issues,
             })
             .map(Output::FocusStatus),
+        Command::Focus {
+            command:
+                FocusCommand::Hygiene {
+                    initiatives,
+                    projects,
+                    issues,
+                    stale_days,
+                },
+        } => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| {
+                    i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+                });
+            service
+                .focus_hygiene(
+                    &FocusSelection {
+                        initiatives,
+                        projects,
+                        issues,
+                    },
+                    &format_utc(now),
+                    stale_days,
+                )
+                .map(Output::FocusHygiene)
+        }
         Command::Drift { .. } => Err(Error::Drift(DriftError::InvalidConfig {
             reason: "drift command must use its evidence input".to_owned(),
         })),
@@ -336,6 +395,7 @@ fn render_human(output: &Output) -> String {
         Output::Chunk(chunk) => render_chunk(chunk),
         Output::Focus(expansion) => render_focus(expansion),
         Output::FocusStatus(status) => render_focus_status(status),
+        Output::FocusHygiene(report) => render_focus_hygiene(report),
         Output::Search(results) => results
             .iter()
             .map(|record| format!("{:?} {} — {}", record.kind, record.identifier, record.name))
@@ -467,6 +527,99 @@ fn render_focus_status(status: &FocusStatus) -> String {
             .map(|item| format!("  {} — {} ({})", item.identifier, item.title, item.reason)),
     );
     lines.join("\n")
+}
+
+fn render_focus_hygiene(report: &FocusHygieneReport) -> String {
+    let mut lines = vec![format!(
+        "Focus hygiene report at {} (stale > {} days)",
+        report.report_time, report.stale_days
+    )];
+    macro_rules! group_header {
+        ($name:literal, $group:expr) => {
+            lines.push(format!("{}: {:?}", $name, $group.availability));
+            for reason in &$group.reasons {
+                lines.push(format!("  unavailable: {reason}"));
+            }
+        };
+    }
+    group_header!("Missing scope", report.missing_scope);
+    for finding in &report.missing_scope.findings {
+        lines.push(format!(
+            "  {} missing {}",
+            finding.issue_id.0,
+            finding.missing_fields.join(", ")
+        ));
+    }
+    group_header!("Overdue milestones", report.overdue_milestones);
+    for finding in &report.overdue_milestones.findings {
+        lines.push(format!(
+            "  {} {} due {}: {}",
+            finding.project_id.0,
+            finding.name,
+            finding.target_date,
+            finding
+                .open_issue_ids
+                .iter()
+                .map(|id| id.0.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    group_header!("Pull requests", report.pull_requests);
+    for finding in &report.pull_requests.findings {
+        lines.push(format!(
+            "  {} {}#{} {}",
+            finding.issue_id.0,
+            finding.repository,
+            finding.number,
+            finding.kind.as_str()
+        ));
+    }
+    group_header!("Stale issues", report.stale_issues);
+    for finding in &report.stale_issues.findings {
+        lines.push(format!(
+            "  {} last updated {} ({} days)",
+            finding.issue_id.0, finding.updated_at, finding.elapsed_days
+        ));
+    }
+    group_header!("Near-duplicate titles", report.near_duplicate_titles);
+    for finding in &report.near_duplicate_titles.findings {
+        lines.push(format!(
+            "  {}",
+            finding
+                .issue_ids
+                .iter()
+                .map(|id| id.0.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    group_header!("Diff", report.diff);
+    for finding in &report.diff.findings {
+        lines.push(format!("  {finding:?}"));
+    }
+    lines.join("\n")
+}
+
+fn format_utc(epoch: i64) -> String {
+    let days = epoch.div_euclid(86_400);
+    let seconds = epoch.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        seconds / 3600,
+        (seconds % 3600) / 60,
+        seconds % 60
+    )
 }
 
 fn render_status_group(
@@ -623,5 +776,35 @@ mod tests {
                 && projects == ["SWM-P1"]
                 && issues == ["SWM-1"]
         ));
+    }
+
+    /// Trace: FR-013-AC-4
+    #[test]
+    fn focus_hygiene_accepts_positive_stale_days_and_rejects_zero() {
+        let cli = Cli::try_parse_from([
+            "ix-board",
+            "focus",
+            "hygiene",
+            "--project",
+            "IR-P1",
+            "--stale-days",
+            "45",
+        ])
+        .expect("positive stale days");
+        assert!(
+            matches!(cli.command, Command::Focus { command: FocusCommand::Hygiene { stale_days: 45, projects, .. } } if projects == ["IR-P1"])
+        );
+        assert!(
+            Cli::try_parse_from([
+                "ix-board",
+                "focus",
+                "hygiene",
+                "--project",
+                "IR-P1",
+                "--stale-days",
+                "0",
+            ])
+            .is_err()
+        );
     }
 }
