@@ -186,3 +186,50 @@ fn team_boundary_includes_unprojected_work_and_intersects_project_focus() {
         })
     ));
 }
+
+/// Trace: FR-010-AC-6
+#[test]
+fn project_focus_does_not_expand_into_descendants_in_other_projects() {
+    let mut moved_child = issue("SWM-2", Some("SWM-3"), WorkflowStateType::Started);
+    moved_child.project_id = Some(ProjectId("q".into()));
+    let mut other = project("q", "Other");
+    other.initiatives.clear();
+    let snapshot = WorkspaceSnapshot {
+        projects: vec![project("p", "Product"), other],
+        issues: vec![
+            issue("SWM-1", None, WorkflowStateType::Started),
+            issue("SWM-3", Some("SWM-1"), WorkflowStateType::Started),
+            moved_child,
+        ],
+        fetched_at: 0,
+    };
+    let mut selection = ScopeSelection {
+        projects: vec!["Product".into()],
+        team: Some(TeamKey("SWM".into())),
+        ..Default::default()
+    };
+    let focused = select_scope(&snapshot, &selection).unwrap();
+    assert_eq!(
+        focused.issue_ids,
+        [IssueId("SWM-1".into()), IssueId("SWM-3".into())].into()
+    );
+    assert_eq!(focused.project_ids, [ProjectId("p".into())].into());
+    assert!(focused.leaf_ids.is_empty());
+    selection.projects.clear();
+    selection.initiatives = vec!["Delivery".into()];
+    assert_eq!(
+        select_scope(&snapshot, &selection).unwrap().issue_ids,
+        focused.issue_ids
+    );
+    selection.initiatives.clear();
+    selection.projects = vec!["Product".into()];
+    selection.tickets = vec!["SWM-1".into()];
+    let subtree = select_scope(&snapshot, &selection).unwrap();
+    assert_eq!(subtree.issue_ids.len(), 3);
+    assert_eq!(subtree.leaf_ids, [IssueId("SWM-2".into())].into());
+    selection.tickets.clear();
+    selection.projects.clear();
+    let whole_team = select_scope(&snapshot, &selection).unwrap();
+    assert_eq!(whole_team.issue_ids.len(), 3);
+    assert_eq!(whole_team.leaf_ids, subtree.leaf_ids);
+}
