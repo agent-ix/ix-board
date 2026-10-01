@@ -24,10 +24,11 @@ pub use drift::{
 };
 pub use linear::LinearGraphQlSource;
 pub use model::{
-    ChunkIssue, FocusExpansion, FocusIssue, FocusMilestone, FocusProject, FocusSelection,
-    Initiative, Issue, IssueId, Milestone, NextStep, Project, ProjectChunk, ProjectId,
-    ProjectPriority, ProjectRunStatus, ReadyItem, SearchKind, SearchResult, TeamKey,
-    WorkflowStateType, WorkspaceSnapshot,
+    ChunkIssue, FocusBlocker, FocusExpansion, FocusIssue, FocusIssueClassification, FocusMilestone,
+    FocusMilestoneStatus, FocusProgress, FocusProject, FocusProjectStatus, FocusSelection,
+    FocusStateCount, FocusStatus, Initiative, Issue, IssueId, Milestone, NextStep, Project,
+    ProjectChunk, ProjectId, ProjectPriority, ProjectRunStatus, ReadyItem, SearchKind,
+    SearchResult, TeamKey, WorkflowStateType, WorkspaceSnapshot,
 };
 
 use model::{compare_f64, issue_is_open};
@@ -370,6 +371,18 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
         make_focus_expansion(&snapshot, selection)
     }
 
+    /// Returns focus status, complete blocker attribution, and eligible ready work.
+    pub fn focus_status(&mut self, selection: &FocusSelection) -> Result<FocusStatus, Error> {
+        if selection.initiatives.is_empty()
+            && selection.projects.is_empty()
+            && selection.issues.is_empty()
+        {
+            return Err(Error::EmptyFocus);
+        }
+        let snapshot = self.snapshot()?;
+        make_focus_status(&snapshot, selection)
+    }
+
     /// Searches structured project and issue IDs, names, titles, and descriptions.
     pub fn search(&mut self, query: &str) -> Result<Vec<SearchResult>, Error> {
         if query.trim().is_empty() {
@@ -470,6 +483,15 @@ fn project_id(snapshot: &WorkspaceSnapshot, identifier: &str) -> Result<ProjectI
 }
 
 fn ready_queue(snapshot: &WorkspaceSnapshot, team: &str) -> Result<Vec<ReadyItem>, Error> {
+    ready_queue_for(snapshot, |issue| {
+        issue.team_key.0.eq_ignore_ascii_case(team)
+    })
+}
+
+fn ready_queue_for(
+    snapshot: &WorkspaceSnapshot,
+    is_member: impl Fn(&Issue) -> bool,
+) -> Result<Vec<ReadyItem>, Error> {
     let projects: HashMap<_, _> = snapshot
         .projects
         .iter()
@@ -482,7 +504,7 @@ fn ready_queue(snapshot: &WorkspaceSnapshot, team: &str) -> Result<Vec<ReadyItem
         .collect();
     let mut candidates = Vec::new();
     for issue in &snapshot.issues {
-        if !issue.team_key.0.eq_ignore_ascii_case(team) || !issue_is_open(issue) {
+        if !is_member(issue) || !issue_is_open(issue) {
             continue;
         }
         let Some(step) = spec_step(&issue.state) else {
@@ -756,6 +778,237 @@ fn make_focus_expansion(
     })
 }
 
+fn make_focus_status(
+    snapshot: &WorkspaceSnapshot,
+    selection: &FocusSelection,
+) -> Result<FocusStatus, Error> {
+    let expansion = make_focus_expansion(snapshot, selection)?;
+    let scope = select_scope(
+        snapshot,
+        &ScopeSelection {
+            team: None,
+            initiatives: selection.initiatives.clone(),
+            projects: selection.projects.clone(),
+            tickets: selection.issues.clone(),
+        },
+    )?;
+    if expansion.focus_issues.is_empty() {
+        return Err(Error::EmptyFocus);
+    }
+    let issues_by_id: BTreeMap<_, _> = snapshot
+        .issues
+        .iter()
+        .map(|issue| (issue.id.clone(), issue))
+        .collect();
+    let leaf_ids = scope.leaf_ids;
+    let mut projects = snapshot
+        .projects
+        .iter()
+        .filter(|project| scope.project_ids.contains(&project.id))
+        .map(|project| {
+            let member_issues = snapshot
+                .issues
+                .iter()
+                .filter(|issue| {
+                    scope.issue_ids.contains(&issue.id)
+                        && issue.project_id.as_ref() == Some(&project.id)
+                })
+                .collect::<Vec<_>>();
+            let mut milestones = project.milestones.iter().collect::<Vec<_>>();
+            milestones.sort_by(|left, right| {
+                compare_f64(left.sort_order, right.sort_order).then_with(|| left.id.cmp(&right.id))
+            });
+            let milestone_status = milestones
+                .into_iter()
+                .map(|milestone| {
+                    let assigned = member_issues
+                        .iter()
+                        .copied()
+                        .filter(|issue| {
+                            issue.project_milestone_id.as_deref() == Some(&milestone.id)
+                        })
+                        .collect::<Vec<_>>();
+                    FocusMilestoneStatus {
+                        id: milestone.id.clone(),
+                        name: milestone.name.clone(),
+                        target_date: milestone.target_date.clone(),
+                        open_by_state: open_state_counts(&assigned),
+                        in_progress: started_issues(&assigned),
+                        progress: leaf_progress(&assigned, &leaf_ids),
+                    }
+                })
+                .collect();
+            FocusProjectStatus {
+                id: project.id.clone(),
+                identifier: project
+                    .identifier
+                    .clone()
+                    .unwrap_or_else(|| project.id.0.clone()),
+                name: project.name.clone(),
+                target_date: project.target_date.clone(),
+                open_by_state: open_state_counts(&member_issues),
+                in_progress: started_issues(&member_issues),
+                progress: leaf_progress(&member_issues, &leaf_ids),
+                milestones: milestone_status,
+            }
+        })
+        .collect::<Vec<_>>();
+    projects.sort_by(|left, right| {
+        left.identifier
+            .cmp(&right.identifier)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    let focus_roots = scope
+        .issue_ids
+        .iter()
+        .map(|id| {
+            issues_by_id
+                .get(id)
+                .copied()
+                .ok_or_else(|| Error::MissingDependency {
+                    issue: id.0.clone(),
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let blocker_layers = focus_blocker_layers(snapshot, &focus_roots)?;
+    let focus_ids = scope.issue_ids;
+    let ready_queue = ready_queue_for(snapshot, |issue| focus_ids.contains(&issue.id))?;
+    Ok(FocusStatus {
+        fetched_at: snapshot.fetched_at,
+        projects,
+        blocker_layers,
+        ready_queue,
+    })
+}
+
+fn open_state_counts(issues: &[&Issue]) -> Vec<FocusStateCount> {
+    let mut counts = BTreeMap::<&str, usize>::new();
+    for issue in issues.iter().copied().filter(|issue| {
+        !matches!(
+            issue.state_type,
+            WorkflowStateType::Completed | WorkflowStateType::Canceled
+        )
+    }) {
+        *counts.entry(&issue.state_name).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(state, count)| FocusStateCount {
+            state: state.to_owned(),
+            count,
+        })
+        .collect()
+}
+
+fn started_issues(issues: &[&Issue]) -> Vec<FocusIssue> {
+    let mut rows = issues
+        .iter()
+        .copied()
+        .filter(|issue| issue.state_type == WorkflowStateType::Started)
+        .map(|issue| FocusIssue {
+            id: issue.id.clone(),
+            identifier: issue.identifier.clone(),
+            title: issue.title.clone(),
+            state: issue.state_name.clone(),
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        left.identifier
+            .cmp(&right.identifier)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    rows
+}
+
+fn leaf_progress(issues: &[&Issue], leaf_ids: &BTreeSet<IssueId>) -> FocusProgress {
+    let leaves = issues
+        .iter()
+        .copied()
+        .filter(|issue| leaf_ids.contains(&issue.id))
+        .collect::<Vec<_>>();
+    let done = leaves
+        .iter()
+        .filter(|issue| issue.state_type == WorkflowStateType::Completed)
+        .count();
+    let total = leaves.len();
+    FocusProgress {
+        done,
+        total,
+        completed_percent: (total != 0).then(|| (done as f64 / total as f64) * 100.0),
+    }
+}
+
+fn focus_blocker_layers(
+    snapshot: &WorkspaceSnapshot,
+    focus_roots: &[&Issue],
+) -> Result<Vec<Vec<FocusBlocker>>, Error> {
+    let layers = dependency_layer_ids(snapshot, focus_roots)?;
+    let issues: HashMap<_, _> = snapshot
+        .issues
+        .iter()
+        .map(|issue| (&issue.id, issue))
+        .collect();
+    let mut roots_by_blocker = BTreeMap::<IssueId, BTreeSet<String>>::new();
+    for root in focus_roots {
+        let mut pending = root.blocked_by.clone();
+        let mut visited = BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if !visited.insert(id.clone()) {
+                continue;
+            }
+            let blocker = issues
+                .get(&id)
+                .copied()
+                .ok_or_else(|| Error::MissingDependency {
+                    issue: id.0.clone(),
+                })?;
+            roots_by_blocker
+                .entry(id)
+                .or_default()
+                .insert(root.identifier.clone());
+            pending.extend(blocker.blocked_by.iter().cloned());
+        }
+    }
+    layers
+        .into_iter()
+        .map(|layer| {
+            layer
+                .into_iter()
+                .map(|id| {
+                    let issue =
+                        issues
+                            .get(&id)
+                            .copied()
+                            .ok_or_else(|| Error::MissingDependency {
+                                issue: id.0.clone(),
+                            })?;
+                    let classification = match issue.state_type {
+                        WorkflowStateType::Completed => FocusIssueClassification::Completed,
+                        WorkflowStateType::Canceled => FocusIssueClassification::Canceled,
+                        WorkflowStateType::Triage
+                        | WorkflowStateType::Backlog
+                        | WorkflowStateType::Unstarted
+                        | WorkflowStateType::Started
+                        | WorkflowStateType::Duplicate => FocusIssueClassification::Open,
+                    };
+                    Ok(FocusBlocker {
+                        identifier: issue.identifier.clone(),
+                        title: issue.title.clone(),
+                        state: issue.state_name.clone(),
+                        classification,
+                        focus_root_ids: roots_by_blocker
+                            .get(&id)
+                            .into_iter()
+                            .flat_map(|roots| roots.iter().cloned())
+                            .collect(),
+                    })
+                })
+                .collect::<Result<Vec<_>, Error>>()
+        })
+        .collect()
+}
+
 fn summarize_issues(
     ids: &BTreeSet<IssueId>,
     issues: &BTreeMap<IssueId, &Issue>,
@@ -793,6 +1046,32 @@ fn dependency_layers(
     snapshot: &WorkspaceSnapshot,
     project_issues: &[&Issue],
 ) -> Result<Vec<Vec<String>>, Error> {
+    let layers = dependency_layer_ids(snapshot, project_issues)?;
+    let issues: HashMap<_, _> = snapshot
+        .issues
+        .iter()
+        .map(|issue| (&issue.id, issue))
+        .collect();
+    layers
+        .into_iter()
+        .map(|layer| {
+            layer
+                .into_iter()
+                .map(|id| {
+                    issues
+                        .get(&id)
+                        .map(|issue| issue.identifier.clone())
+                        .ok_or_else(|| Error::MissingDependency { issue: id.0 })
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn dependency_layer_ids(
+    snapshot: &WorkspaceSnapshot,
+    project_issues: &[&Issue],
+) -> Result<Vec<Vec<IssueId>>, Error> {
     let issues: HashMap<_, _> = snapshot
         .issues
         .iter()
@@ -840,12 +1119,12 @@ fn dependency_layers(
     let mut emitted = 0usize;
     while !ready.is_empty() {
         let current = std::mem::take(&mut ready);
-        let mut names = Vec::with_capacity(current.len());
+        let mut ordered_layer = Vec::with_capacity(current.len());
         for id in &current {
-            let issue = issues.get(id).ok_or_else(|| Error::MissingDependency {
+            let _issue = issues.get(id).ok_or_else(|| Error::MissingDependency {
                 issue: id.0.clone(),
             })?;
-            names.push(issue.identifier.clone());
+            ordered_layer.push(id.clone());
             emitted += 1;
             if let Some(children) = dependents.get(id) {
                 for child in children {
@@ -858,8 +1137,14 @@ fn dependency_layers(
                 }
             }
         }
-        names.sort();
-        layers.push(names);
+        ordered_layer.sort_by(|left, right| {
+            let left_identifier = issues.get(left).map(|issue| issue.identifier.as_str());
+            let right_identifier = issues.get(right).map(|issue| issue.identifier.as_str());
+            left_identifier
+                .cmp(&right_identifier)
+                .then_with(|| left.cmp(right))
+        });
+        layers.push(ordered_layer);
     }
     if emitted != closure.len() {
         let cycle = indegree

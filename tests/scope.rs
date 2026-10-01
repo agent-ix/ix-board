@@ -17,6 +17,7 @@ fn project(id: &str, name: &str) -> Project {
         status: "Started".into(),
         priority: 2,
         sort_order: 0.0,
+        target_date: None,
         team_keys: vec![TeamKey("SWM".into())],
         milestones: vec![],
         initiatives: vec![Initiative {
@@ -33,6 +34,7 @@ fn issue(id: &str, parent: Option<&str>, category: WorkflowStateType) -> Issue {
         title: id.into(),
         description: None,
         state: "Review".into(),
+        state_name: "Review".into(),
         state_type: category,
         parent_id: parent.map(|id| IssueId(id.into())),
         team_key: TeamKey("SWM".into()),

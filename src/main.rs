@@ -6,8 +6,8 @@
 use clap::{Parser, Subcommand};
 use ix_board::{
     DriftConfig, DriftError, DriftEvidenceFile, DriftReport, Error, FocusExpansion, FocusSelection,
-    LinearGraphQlSource, NextStep, ProjectChunk, ProjectPriority, ProjectRunStatus, ReadService,
-    ReadyItem, SearchResult, evaluate_drift_file, render_drift_text,
+    FocusStatus, LinearGraphQlSource, NextStep, ProjectChunk, ProjectPriority, ProjectRunStatus,
+    ReadService, ReadyItem, SearchResult, evaluate_drift_file, render_drift_text,
 };
 use ix_cli_kit::exit::Outcome;
 use ix_cli_kit::streams::{
@@ -92,6 +92,18 @@ enum FocusCommand {
         #[arg(long = "issue", action = clap::ArgAction::Append)]
         issues: Vec<String>,
     },
+    /// Report project and milestone status, blockers, and ready focus issues.
+    Status {
+        /// Linear initiative UUID or exact name; may be repeated.
+        #[arg(long = "initiative", action = clap::ArgAction::Append)]
+        initiatives: Vec<String>,
+        /// Linear project UUID, identifier, or exact name; may be repeated.
+        #[arg(long = "project", action = clap::ArgAction::Append)]
+        projects: Vec<String>,
+        /// Linear issue UUID or identifier; may be repeated.
+        #[arg(long = "issue", action = clap::ArgAction::Append)]
+        issues: Vec<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -120,6 +132,7 @@ enum Output {
     Queue(Vec<ReadyItem>),
     Chunk(ProjectChunk),
     Focus(FocusExpansion),
+    FocusStatus(FocusStatus),
     Search(Vec<SearchResult>),
     Drift(DriftReport),
     ProjectStatusUpdated {
@@ -203,6 +216,16 @@ fn validate_command(command: &Command) -> Result<(), Error> {
         } if initiatives.is_empty() && projects.is_empty() && issues.is_empty() => {
             Err(Error::EmptyFocus)
         }
+        Command::Focus {
+            command:
+                FocusCommand::Status {
+                    initiatives,
+                    projects,
+                    issues,
+                },
+        } if initiatives.is_empty() && projects.is_empty() && issues.is_empty() => {
+            Err(Error::EmptyFocus)
+        }
         Command::ProjectChunk { project } if project.trim().is_empty() => {
             Err(Error::ProjectNotFound {
                 identifier: project.clone(),
@@ -246,6 +269,20 @@ fn run_linear(command: Command) -> Result<Output, Error> {
                 issues,
             })
             .map(Output::Focus),
+        Command::Focus {
+            command:
+                FocusCommand::Status {
+                    initiatives,
+                    projects,
+                    issues,
+                },
+        } => service
+            .focus_status(&FocusSelection {
+                initiatives,
+                projects,
+                issues,
+            })
+            .map(Output::FocusStatus),
         Command::Drift { .. } => Err(Error::Drift(DriftError::InvalidConfig {
             reason: "drift command must use its evidence input".to_owned(),
         })),
@@ -298,6 +335,7 @@ fn render_human(output: &Output) -> String {
         Output::Queue(items) => render_queue(items),
         Output::Chunk(chunk) => render_chunk(chunk),
         Output::Focus(expansion) => render_focus(expansion),
+        Output::FocusStatus(status) => render_focus_status(status),
         Output::Search(results) => results
             .iter()
             .map(|record| format!("{:?} {} — {}", record.kind, record.identifier, record.name))
@@ -375,6 +413,90 @@ fn render_focus(expansion: &FocusExpansion) -> String {
         );
     }
     lines.join("\n")
+}
+
+fn render_focus_status(status: &FocusStatus) -> String {
+    let mut lines = vec![format!("Focus snapshot fetched at {}", status.fetched_at)];
+    for project in &status.projects {
+        lines.push(format!("Project {} — {}", project.identifier, project.name));
+        lines.push(format!(
+            "  Target date: {}",
+            project.target_date.as_deref().unwrap_or("none")
+        ));
+        render_status_group(
+            &mut lines,
+            "  ",
+            &project.open_by_state,
+            &project.in_progress,
+            project.progress,
+        );
+        for milestone in &project.milestones {
+            lines.push(format!("  Milestone {} — {}", milestone.name, milestone.id));
+            lines.push(format!(
+                "    Target date: {}",
+                milestone.target_date.as_deref().unwrap_or("none")
+            ));
+            render_status_group(
+                &mut lines,
+                "    ",
+                &milestone.open_by_state,
+                &milestone.in_progress,
+                milestone.progress,
+            );
+        }
+    }
+    lines.push("Blocker layers:".to_owned());
+    for (index, layer) in status.blocker_layers.iter().enumerate() {
+        lines.push(format!("  {index}:"));
+        lines.extend(layer.iter().map(|blocker| {
+            format!(
+                "    {} [{} / {:?}] roots: {} — {}",
+                blocker.identifier,
+                blocker.state,
+                blocker.classification,
+                blocker.focus_root_ids.join(", "),
+                blocker.title
+            )
+        }));
+    }
+    lines.push("Ready focus issues:".to_owned());
+    lines.extend(
+        status
+            .ready_queue
+            .iter()
+            .map(|item| format!("  {} — {} ({})", item.identifier, item.title, item.reason)),
+    );
+    lines.join("\n")
+}
+
+fn render_status_group(
+    lines: &mut Vec<String>,
+    indent: &str,
+    open_by_state: &[ix_board::FocusStateCount],
+    in_progress: &[ix_board::FocusIssue],
+    progress: ix_board::FocusProgress,
+) {
+    lines.push(format!(
+        "{indent}Progress: {}/{} leaves ({})",
+        progress.done,
+        progress.total,
+        progress
+            .completed_percent
+            .map_or_else(|| "n/a".to_owned(), |percent| format!("{percent:.1}%"))
+    ));
+    lines.push(format!("{indent}Open by state:"));
+    lines.extend(
+        open_by_state
+            .iter()
+            .map(|count| format!("{indent}  {}: {}", count.state, count.count)),
+    );
+    lines.push(format!("{indent}In progress:"));
+    lines.extend(in_progress.iter().map(|issue| {
+        format!(
+            "{indent}  {} [{}] {}",
+            issue.identifier, issue.state, issue.title
+        )
+    }));
 }
 
 fn render_queue(items: &[ReadyItem]) -> String {
@@ -471,6 +593,35 @@ mod tests {
             } if initiatives == ["Delivery"]
                 && projects == ["SWM-P1", "SWM-P2"]
                 && issues == ["SWM-1", "SWM-2"]
+        ));
+    }
+
+    /// Trace: FR-012-AC-1
+    #[test]
+    fn focus_status_accepts_repeated_combined_selectors() {
+        let cli = Cli::try_parse_from([
+            "ix-board",
+            "focus",
+            "status",
+            "--initiative",
+            "Delivery",
+            "--project",
+            "SWM-P1",
+            "--issue",
+            "SWM-1",
+        ])
+        .expect("parse focus status selectors");
+        assert!(matches!(
+            cli.command,
+            Command::Focus {
+                command: FocusCommand::Status {
+                    initiatives,
+                    projects,
+                    issues,
+                }
+            } if initiatives == ["Delivery"]
+                && projects == ["SWM-P1"]
+                && issues == ["SWM-1"]
         ));
     }
 }

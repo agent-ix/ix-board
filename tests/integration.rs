@@ -145,6 +145,7 @@ fn project(id: &str, identifier: &str, status: &str, priority: i32, sort_order: 
         status: status.to_owned(),
         priority,
         sort_order,
+        target_date: None,
         team_keys: vec![TeamKey("SWM".to_owned())],
         milestones: Vec::new(),
     }
@@ -174,6 +175,7 @@ fn issue(
         title: format!("Title {identifier}"),
         description: Some(format!("Description {identifier}")),
         state: spec_state.unwrap_or(state).to_owned(),
+        state_name: state.to_owned(),
         team_key: TeamKey(
             identifier
                 .split_once('-')
@@ -530,12 +532,14 @@ fn project_chunk_returns_goal_milestones_open_tickets_and_dependency_layers() {
             name: "Later".to_owned(),
             description: None,
             sort_order: 2.0,
+            target_date: None,
         },
         Milestone {
             id: "m1".to_owned(),
             name: "First".to_owned(),
             description: Some("Milestone description".to_owned()),
             sort_order: 1.0,
+            target_date: None,
         },
     ];
     let mut reads = service(
@@ -612,12 +616,14 @@ fn focus_expansion_unions_selectors_groups_milestones_and_layers_blockers() {
             name: "Later".to_owned(),
             description: None,
             sort_order: 2.0,
+            target_date: None,
         },
         Milestone {
             id: "m1".to_owned(),
             name: "First".to_owned(),
             description: Some("First milestone".to_owned()),
             sort_order: 1.0,
+            target_date: None,
         },
     ];
     let mut second = project("p2", "SWM-P2", "Started", 2, 2.0);
@@ -697,7 +703,204 @@ fn focus_expansion_unions_selectors_groups_milestones_and_layers_blockers() {
     assert_eq!(first_result.blocker_layers[2], ["SWM-10"]);
 }
 
-/// Trace: FR-011-AC-4
+/// Trace: FR-012-AC-1, FR-012-AC-2, FR-012-AC-3, FR-012-AC-4, FR-012-AC-5
+#[test]
+fn focus_status_scopes_progress_blockers_and_ready_work_to_focus_members() {
+    let directory = TempDir::new().expect("temporary directory");
+    let mut selected_project = project("p1", "SWM-P1", "Started", 2, 1.0);
+    selected_project.target_date = Some("2026-10-30".to_owned());
+    selected_project.milestones = vec![Milestone {
+        id: "m1".to_owned(),
+        name: "First".to_owned(),
+        description: None,
+        sort_order: 1.0,
+        target_date: Some("2026-10-15".to_owned()),
+    }];
+    let mut swm1 = issue(
+        "i1",
+        "SWM-1",
+        Some("p1"),
+        "Specced",
+        1.0,
+        1.0,
+        None,
+        &["i10"],
+    );
+    swm1.project_milestone_id = Some("m1".to_owned());
+    let mut swm2 = issue(
+        "i2",
+        "SWM-2",
+        Some("p1"),
+        "Specced",
+        2.0,
+        2.0,
+        None,
+        &["i10"],
+    );
+    swm2.project_milestone_id = Some("m1".to_owned());
+    let mut swm4 = issue("i4", "SWM-4", Some("p1"), "Completed", 1.0, 4.0, None, &[]);
+    swm4.project_milestone_id = Some("m1".to_owned());
+    let mut swm5 = issue("i5", "SWM-5", Some("p1"), "Canceled", 1.0, 5.0, None, &[]);
+    swm5.project_milestone_id = Some("m1".to_owned());
+    let swm3 = issue("i3", "SWM-3", Some("p1"), "Todo", 1.0, 3.0, None, &[]);
+    let swm6 = issue("i6", "SWM-6", Some("p1"), "Duplicate", 1.0, 6.0, None, &[]);
+    let swm7 = issue(
+        "i7",
+        "SWM-7",
+        Some("p1"),
+        "Specced",
+        1.0,
+        7.0,
+        None,
+        &["i11"],
+    );
+    let mut swm8 = issue("i8", "SWM-8", Some("p1"), "Todo", 1.0, 8.0, None, &[]);
+    swm8.parent_id = None;
+    let mut swm9 = issue("i9", "SWM-9", Some("p1"), "Todo", 1.0, 9.0, None, &[]);
+    swm9.parent_id = Some(IssueId("i8".to_owned()));
+    let blocker_done = issue("i10", "OPS-10", None, "Completed", 1.0, 1.0, None, &[]);
+    let blocker_canceled = issue("i11", "OPS-11", None, "Canceled", 1.0, 1.0, None, &[]);
+    let snapshot = WorkspaceSnapshot {
+        fetched_at: 1234,
+        projects: vec![selected_project],
+        issues: vec![
+            swm1,
+            swm2,
+            swm3,
+            swm4,
+            swm5,
+            swm6,
+            swm7,
+            swm8,
+            swm9,
+            blocker_done,
+            blocker_canceled,
+        ],
+    };
+    let mut reads = service(
+        FixtureSource::new(snapshot),
+        ManualClock::new(9_000),
+        &directory,
+    );
+
+    let status = reads
+        .focus_status(&ix_board::FocusSelection {
+            projects: vec!["SWM-P1".to_owned()],
+            ..Default::default()
+        })
+        .expect("focus status");
+    assert_eq!(status.fetched_at, 9_000);
+    let project = &status.projects[0];
+    assert_eq!(project.target_date.as_deref(), Some("2026-10-30"));
+    assert_eq!(project.progress.done, 1);
+    assert_eq!(project.progress.total, 6);
+    assert!(
+        (project.progress.completed_percent.expect("leaf percentage") - 100.0 / 6.0).abs() < 0.0001
+    );
+    assert!(
+        project
+            .open_by_state
+            .iter()
+            .any(|state| { state.state == "Duplicate" && state.count == 1 })
+    );
+    assert_eq!(
+        project.milestones[0].target_date.as_deref(),
+        Some("2026-10-15")
+    );
+    assert_eq!(project.milestones[0].progress.done, 1);
+    assert_eq!(project.milestones[0].progress.total, 3);
+    assert_eq!(
+        project
+            .in_progress
+            .iter()
+            .map(|issue| issue.identifier.as_str())
+            .collect::<Vec<_>>(),
+        ["SWM-3", "SWM-8", "SWM-9"]
+    );
+    assert_eq!(
+        status
+            .ready_queue
+            .iter()
+            .map(|issue| issue.identifier.as_str())
+            .collect::<Vec<_>>(),
+        ["SWM-1", "SWM-2"]
+    );
+    assert!(
+        status
+            .ready_queue
+            .iter()
+            .all(|issue| !issue.identifier.starts_with("OPS-"))
+    );
+    let shared = status
+        .blocker_layers
+        .iter()
+        .flatten()
+        .find(|blocker| blocker.identifier == "OPS-10")
+        .expect("shared blocker");
+    assert_eq!(shared.state, "Completed");
+    assert_eq!(
+        shared.classification,
+        ix_board::FocusIssueClassification::Completed
+    );
+    assert_eq!(shared.focus_root_ids, ["SWM-1", "SWM-2"]);
+    let canceled = status
+        .blocker_layers
+        .iter()
+        .flatten()
+        .find(|blocker| blocker.identifier == "OPS-11")
+        .expect("canceled blocker");
+    assert_eq!(
+        canceled.classification,
+        ix_board::FocusIssueClassification::Canceled
+    );
+    assert_eq!(canceled.focus_root_ids, ["SWM-7"]);
+    assert_eq!(
+        reads
+            .focus_status(&ix_board::FocusSelection {
+                projects: vec!["SWM-P1".to_owned()],
+                ..Default::default()
+            })
+            .expect("repeat focus status"),
+        status
+    );
+}
+
+/// Trace: FR-012-AC-2, FR-012-AC-5, FR-012-AC-6
+#[test]
+fn focus_status_reports_null_percent_for_groups_without_countable_leaves() {
+    let directory = TempDir::new().expect("temporary directory");
+    let snapshot = WorkspaceSnapshot {
+        fetched_at: 0,
+        projects: vec![project("p1", "SWM-P1", "Started", 2, 1.0)],
+        issues: vec![issue(
+            "i1",
+            "SWM-1",
+            Some("p1"),
+            "Canceled",
+            1.0,
+            1.0,
+            None,
+            &[],
+        )],
+    };
+    let mut reads = service(
+        FixtureSource::new(snapshot),
+        ManualClock::new(9_000),
+        &directory,
+    );
+    let status = reads
+        .focus_status(&ix_board::FocusSelection {
+            projects: vec!["SWM-P1".to_owned()],
+            ..Default::default()
+        })
+        .expect("focus status with no countable leaves");
+    assert_eq!(status.projects[0].progress.done, 0);
+    assert_eq!(status.projects[0].progress.total, 0);
+    assert_eq!(status.projects[0].progress.completed_percent, None);
+    assert_eq!(status.projects[0].target_date, None);
+}
+
+/// Trace: FR-011-AC-4, FR-012-AC-6
 #[test]
 fn focus_expansion_rejects_empty_or_unresolved_selectors_without_partial_data() {
     let directory = TempDir::new().expect("temporary directory");
@@ -705,6 +908,10 @@ fn focus_expansion_rejects_empty_or_unresolved_selectors_without_partial_data() 
     let mut reads = service(source.clone(), ManualClock::new(1_000), &directory);
     assert!(matches!(
         reads.focus_expand(&ix_board::FocusSelection::default()),
+        Err(Error::EmptyFocus)
+    ));
+    assert!(matches!(
+        reads.focus_status(&ix_board::FocusSelection::default()),
         Err(Error::EmptyFocus)
     ));
     assert_eq!(source.reads.load(Ordering::SeqCst), 0);
@@ -719,9 +926,20 @@ fn focus_expansion_rejects_empty_or_unresolved_selectors_without_partial_data() 
             ..
         })
     ));
+    assert!(matches!(
+        reads.focus_status(&ix_board::FocusSelection {
+            projects: vec!["missing".to_owned()],
+            ..ix_board::FocusSelection::default()
+        }),
+        Err(Error::ScopeSelection {
+            kind: "project",
+            matches: 0,
+            ..
+        })
+    ));
 }
 
-/// Trace: FR-011-AC-5
+/// Trace: FR-011-AC-5, FR-012-AC-6
 #[test]
 fn focus_expansion_refuses_missing_blockers_cycles_and_unknown_milestones() {
     let directory = TempDir::new().expect("temporary directory");
@@ -734,6 +952,13 @@ fn focus_expansion_refuses_missing_blockers_cycles_and_unknown_milestones() {
     );
     assert!(matches!(
         reads.focus_expand(&ix_board::FocusSelection {
+            issues: vec!["SWM-1".to_owned()],
+            ..ix_board::FocusSelection::default()
+        }),
+        Err(Error::MissingDependency { .. })
+    ));
+    assert!(matches!(
+        reads.focus_status(&ix_board::FocusSelection {
             issues: vec!["SWM-1".to_owned()],
             ..ix_board::FocusSelection::default()
         }),
@@ -759,6 +984,13 @@ fn focus_expansion_refuses_missing_blockers_cycles_and_unknown_milestones() {
         }),
         Err(Error::DependencyCycle { .. })
     ));
+    assert!(matches!(
+        reads.focus_status(&ix_board::FocusSelection {
+            issues: vec!["SWM-1".to_owned()],
+            ..ix_board::FocusSelection::default()
+        }),
+        Err(Error::DependencyCycle { .. })
+    ));
 
     let directory = TempDir::new().expect("temporary directory");
     let mut bad_milestone = queue_fixture();
@@ -770,6 +1002,13 @@ fn focus_expansion_refuses_missing_blockers_cycles_and_unknown_milestones() {
     );
     assert!(matches!(
         reads.focus_expand(&ix_board::FocusSelection {
+            projects: vec!["SWM-P1".to_owned()],
+            ..ix_board::FocusSelection::default()
+        }),
+        Err(Error::MissingProjectMilestone { .. })
+    ));
+    assert!(matches!(
+        reads.focus_status(&ix_board::FocusSelection {
             projects: vec!["SWM-P1".to_owned()],
             ..ix_board::FocusSelection::default()
         }),
@@ -839,6 +1078,7 @@ fn cache_reuses_fresh_snapshot_and_refreshes_after_five_minutes() {
             parent_id: None,
             state_type: ix_board::WorkflowStateType::Started,
             project_milestone_id: None,
+            state_name: "Todo".to_owned(),
 
             title: "Changed title".to_owned(),
             ..issue(
