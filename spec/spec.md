@@ -101,9 +101,8 @@ US-004 traces to FR-010 through FR-012, composing the existing focus expansion
 and queue rules into a status result.
 US-005 traces to FR-013, which uses the canonical focus from FR-011 and the
 structured-source boundary in FR-005.
-and queue rules into a status result. US-006 traces to FR-010, FR-011, FR-012,
-and FR-014, composing focus membership, blocker layers, and readiness into an
-ordered handoff slice.
+US-006 traces to FR-010, FR-011, FR-012, and FR-014, composing focus
+membership, blocker layers, and readiness into an ordered handoff slice.
 Functional acceptance criteria include fixture checks for each drift signal,
 queue rules, and cache behavior; NFR-001 specifies a lightweight warm-cache
 fixture benchmark.
