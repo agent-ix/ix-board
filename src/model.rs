@@ -211,6 +211,14 @@ pub struct Issue {
     pub sort_order: f64,
     /// UUIDs of issues this issue is blocked by.
     pub blocked_by: Vec<IssueId>,
+    /// UTC creation timestamp from Linear.
+    pub created_at: Option<String>,
+    /// UTC last-update timestamp from Linear.
+    pub updated_at: Option<String>,
+    /// Structured attachment URLs returned by Linear.
+    pub attachment_urls: Vec<String>,
+    /// Whether Linear returned every attachment record for this issue.
+    pub attachments_complete: bool,
 }
 
 /// A complete structured read snapshot used by all read commands.

@@ -5,6 +5,7 @@
 
 mod cache;
 mod drift;
+mod hygiene;
 mod linear;
 mod model;
 mod scope;
@@ -21,6 +22,12 @@ pub use drift::{
     StallSignal, StalledTicket, TicketChurnSignal, UnassignedPullRequest, UnassignedReason,
     VeeringReason, VeeringSignal, VeeringTicket, evaluate_drift, evaluate_drift_file,
     render_drift_text,
+};
+pub use hygiene::{
+    DuplicateTitleFinding, FocusBaseline, FocusBaselineIssue, FocusChange, FocusHygieneReport,
+    FocusMembershipChange, GroupStatus, HygieneError, HygieneGroup, MissingScopeFinding,
+    OverdueMilestoneFinding, PullRequestFinding, PullRequestMismatchKind, StaleIssueFinding,
+    TITLE_PAIR_LIMIT,
 };
 pub use linear::LinearGraphQlSource;
 pub use model::{
@@ -172,6 +179,15 @@ pub enum Error {
     /// No inline initiative, project, or issue selector was supplied.
     #[error("focus requires at least one --initiative, --project, or --issue selector")]
     EmptyFocus,
+    /// A focus hygiene report exceeded a deterministic resource bound.
+    #[error("focus hygiene title candidates exceeded resource limit {limit}")]
+    FocusHygieneResourceLimit { limit: usize },
+    /// A required source record for the hygiene report was incomplete.
+    #[error("focus hygiene record is unavailable: {issue}")]
+    FocusHygieneIncomplete { issue: String },
+    /// The report timestamp or stale threshold is invalid.
+    #[error("focus hygiene requires an RFC 3339 report timestamp and positive stale threshold")]
+    InvalidFocusHygieneTime,
     /// An issue references a milestone absent from its selected project's records.
     #[error("issue {issue} references unavailable milestone {milestone} in project {project}")]
     MissingProjectMilestone {
@@ -381,6 +397,70 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
         }
         let snapshot = self.snapshot()?;
         make_focus_status(&snapshot, selection)
+    }
+
+    /// Returns a deterministic focus hygiene report from the current snapshot.
+    pub fn focus_hygiene(
+        &mut self,
+        selection: &FocusSelection,
+        report_time: &str,
+        stale_days: u32,
+    ) -> Result<FocusHygieneReport, Error> {
+        if selection.initiatives.is_empty()
+            && selection.projects.is_empty()
+            && selection.issues.is_empty()
+        {
+            return Err(Error::EmptyFocus);
+        }
+        let snapshot = self.snapshot()?;
+        let scope = select_scope(
+            &snapshot,
+            &ScopeSelection {
+                team: None,
+                initiatives: selection.initiatives.clone(),
+                projects: selection.projects.clone(),
+                tickets: selection.issues.clone(),
+            },
+        )?;
+        if scope.issue_ids.is_empty() {
+            return Err(Error::EmptyFocus);
+        }
+        let canonical_focus = canonical_selectors(&snapshot, selection)?;
+        let focus_key = serde_json::to_string(&canonical_focus).map_err(Error::CacheEncode)?;
+        let (prior, prior_unavailable) = match self.cache.hygiene_baseline(&focus_key) {
+            Ok(prior) => (prior, None),
+            Err(Error::CacheDecode(_)) => (None, Some("prior baseline is unreadable".to_owned())),
+            Err(error) => return Err(error),
+        };
+        let mut report = hygiene::build_report(
+            &snapshot,
+            &scope.issue_ids,
+            canonical_focus,
+            report_time,
+            stale_days,
+            prior
+                .as_ref()
+                .map(|baseline| (baseline.report_time.as_str(), baseline.issues.as_slice())),
+            prior_unavailable,
+        )
+        .map_err(|error| match error {
+            hygiene::HygieneError::ResourceLimit { limit } => {
+                Error::FocusHygieneResourceLimit { limit }
+            }
+            hygiene::HygieneError::IncompleteSnapshot { issue } => {
+                Error::FocusHygieneIncomplete { issue }
+            }
+            hygiene::HygieneError::InvalidTime => Error::InvalidFocusHygieneTime,
+        })?;
+        let baseline = FocusBaseline {
+            report_time: report.report_time.clone(),
+            issues: std::mem::take(&mut report.baseline),
+        };
+        if report.baseline_advance {
+            self.cache.replace_hygiene_baseline(&focus_key, &baseline)?;
+        }
+        report.baseline = baseline.issues;
+        Ok(report)
     }
 
     /// Searches structured project and issue IDs, names, titles, and descriptions.
@@ -598,6 +678,78 @@ fn blockers_completed(issue: &Issue, issues: &HashMap<&IssueId, &Issue>) -> Resu
         pending.extend(blocker.blocked_by.iter().cloned());
     }
     Ok(true)
+}
+
+fn canonical_selectors(
+    snapshot: &WorkspaceSnapshot,
+    selection: &FocusSelection,
+) -> Result<Vec<String>, Error> {
+    let mut selectors = BTreeSet::new();
+    for value in &selection.initiatives {
+        let matches = snapshot
+            .projects
+            .iter()
+            .flat_map(|project| &project.initiatives)
+            .filter(|initiative| {
+                initiative.id == *value || initiative.name.eq_ignore_ascii_case(value)
+            })
+            .map(|initiative| initiative.id.clone())
+            .collect::<BTreeSet<_>>();
+        if matches.len() != 1 {
+            return Err(Error::ScopeSelection {
+                kind: "initiative",
+                identifier: value.clone(),
+                matches: matches.len(),
+            });
+        }
+        if let Some(id) = matches.first() {
+            selectors.insert(format!("initiative:{id}"));
+        }
+    }
+    for value in &selection.projects {
+        let matches = snapshot
+            .projects
+            .iter()
+            .filter(|project| {
+                project.id.0 == *value
+                    || project.name.eq_ignore_ascii_case(value)
+                    || project
+                        .identifier
+                        .as_ref()
+                        .is_some_and(|id| id.eq_ignore_ascii_case(value))
+            })
+            .map(|project| project.id.0.clone())
+            .collect::<BTreeSet<_>>();
+        if matches.len() != 1 {
+            return Err(Error::ScopeSelection {
+                kind: "project",
+                identifier: value.clone(),
+                matches: matches.len(),
+            });
+        }
+        if let Some(id) = matches.first() {
+            selectors.insert(format!("project:{id}"));
+        }
+    }
+    for value in &selection.issues {
+        let matches = snapshot
+            .issues
+            .iter()
+            .filter(|issue| issue.id.0 == *value || issue.identifier.eq_ignore_ascii_case(value))
+            .map(|issue| issue.id.0.clone())
+            .collect::<BTreeSet<_>>();
+        if matches.len() != 1 {
+            return Err(Error::ScopeSelection {
+                kind: "issue",
+                identifier: value.clone(),
+                matches: matches.len(),
+            });
+        }
+        if let Some(id) = matches.first() {
+            selectors.insert(format!("issue:{id}"));
+        }
+    }
+    Ok(selectors.into_iter().collect())
 }
 
 fn make_project_chunk(
