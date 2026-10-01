@@ -758,8 +758,9 @@ fn focus_status_scopes_progress_blockers_and_ready_work_to_focus_members() {
     swm8.parent_id = None;
     let mut swm9 = issue("i9", "SWM-9", Some("p1"), "Todo", 1.0, 9.0, None, &[]);
     swm9.parent_id = Some(IssueId("i8".to_owned()));
-    let blocker_done = issue("i10", "OPS-10", None, "Completed", 1.0, 1.0, None, &[]);
+    let blocker_done = issue("i10", "OPS-10", None, "Completed", 1.0, 1.0, None, &["i12"]);
     let blocker_canceled = issue("i11", "OPS-11", None, "Canceled", 1.0, 1.0, None, &[]);
+    let blocker_transitive_done = issue("i12", "OPS-12", None, "Completed", 1.0, 1.0, None, &[]);
     let snapshot = WorkspaceSnapshot {
         fetched_at: 1234,
         projects: vec![selected_project],
@@ -775,6 +776,7 @@ fn focus_status_scopes_progress_blockers_and_ready_work_to_focus_members() {
             swm9,
             blocker_done,
             blocker_canceled,
+            blocker_transitive_done,
         ],
     };
     let mut reads = service(
@@ -843,6 +845,18 @@ fn focus_status_scopes_progress_blockers_and_ready_work_to_focus_members() {
         ix_board::FocusIssueClassification::Completed
     );
     assert_eq!(shared.focus_root_ids, ["SWM-1", "SWM-2"]);
+    let transitive = status
+        .blocker_layers
+        .iter()
+        .flatten()
+        .find(|blocker| blocker.identifier == "OPS-12")
+        .expect("transitive blocker");
+    assert_eq!(transitive.state, "Completed");
+    assert_eq!(
+        transitive.classification,
+        ix_board::FocusIssueClassification::Completed
+    );
+    assert_eq!(transitive.focus_root_ids, ["SWM-1", "SWM-2"]);
     let canceled = status
         .blocker_layers
         .iter()
@@ -865,7 +879,7 @@ fn focus_status_scopes_progress_blockers_and_ready_work_to_focus_members() {
     );
 }
 
-/// Trace: FR-012-AC-2, FR-012-AC-5, FR-012-AC-6
+/// Trace: FR-012-AC-2, FR-012-AC-5
 #[test]
 fn focus_status_reports_null_percent_for_groups_without_countable_leaves() {
     let directory = TempDir::new().expect("temporary directory");
