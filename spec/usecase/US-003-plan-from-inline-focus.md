@@ -33,3 +33,14 @@ am responsible for.
 FR-010 owns selector membership and ticket-descendant behavior. FR-001 and
 FR-002 own blocker evaluation and blocker-layer traversal semantics. FR-011
 combines those existing behaviors into the inline focus-expansion result.
+
+## Delivery Verification
+
+Before SWM-33 is accepted, verify the delivered binary on luna:
+
+- `command -v ix-board` returns the path to the installed executable.
+- `ix-board --version` exits successfully.
+- `ix-board focus expand --help` exits successfully.
+
+This verifies the binary is installed on PATH and runnable; the installation
+method is outside this use case.
