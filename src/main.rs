@@ -146,7 +146,7 @@ enum Output {
     Chunk(ProjectChunk),
     Focus(FocusExpansion),
     FocusStatus(FocusStatus),
-    FocusHygiene(FocusHygieneReport),
+    FocusHygiene(Box<FocusHygieneReport>),
     Search(Vec<SearchResult>),
     Drift(DriftReport),
     ProjectStatusUpdated {
@@ -340,7 +340,7 @@ fn run_linear(command: Command) -> Result<Output, Error> {
                     &format_utc(now),
                     stale_days,
                 )
-                .map(Output::FocusHygiene)
+                .map(|report| Output::FocusHygiene(Box::new(report)))
         }
         Command::Drift { .. } => Err(Error::Drift(DriftError::InvalidConfig {
             reason: "drift command must use its evidence input".to_owned(),

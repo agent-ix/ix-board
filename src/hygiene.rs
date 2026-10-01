@@ -278,7 +278,7 @@ pub fn build_report(
 
     let missing_scope = focused
         .iter()
-        .map(|issue| {
+        .filter_map(|issue| {
             let mut missing_fields = Vec::new();
             if issue.project_id.is_none() {
                 missing_fields.push("project".to_owned());
@@ -291,7 +291,6 @@ pub fn build_report(
                 missing_fields,
             })
         })
-        .flatten()
         .collect();
 
     let mut overdue = Vec::new();
@@ -970,13 +969,12 @@ fn timestamp_epoch(timestamp: &str) -> Option<i64> {
     let offset = rest
         .get(offset_at..)
         .filter(|s| !s.is_empty())
-        .map(|s| {
+        .and_then(|s| {
             let sign = if s.starts_with('-') { -1 } else { 1 };
             let h = s.get(1..3)?.parse::<i64>().ok()?;
             let m = s.get(4..6)?.parse::<i64>().ok()?;
             Some(sign * (h * 3600 + m * 60))
         })
-        .flatten()
         .unwrap_or(0);
     if !(1..=12).contains(&month)
         || !(1..=31).contains(&day)
@@ -1164,7 +1162,7 @@ mod tests {
     /// Trace: FR-013-AC-5, FR-013-AC-10, FR-013-AC-11
     #[test]
     fn tc_013_03_duplicate_component_threshold_and_pair_cap_are_deterministic() {
-        let related = vec![
+        let related = [
             issue(
                 "IR-1",
                 "Mark hash/digest/pin antipattern as slated for removal",
