@@ -22,7 +22,9 @@ project status and priority writes so team leaders can control the run queue.
 SWM-4 reports evidence of work outside that queue and work that is active but
 not landing. SWM-33 adds inline planner focus inputs that expand initiatives,
 projects, and issues into Linear issue sets and blocker layers. SWM-34 adds
-focus status, blocker-state, and ready-queue reporting.
+focus status, blocker-state, and ready-queue reporting. SWM-35 adds a
+focus hygiene report and a comparison with the last successful report for
+that focus.
 
 ## Scope
 
@@ -40,6 +42,9 @@ focus status, blocker-state, and ready-queue reporting.
   projects, and issues into a deduplicated issue set and blocker layers (FR-011).
 - Focus status by project and milestone, blocker-state details, and the ready
   queue restricted to focus issues (FR-012).
+- Focus hygiene findings for missing project/milestone assignment, overdue
+  milestones, linked GitHub pull request status, stale issues, and duplicate
+  title groups, plus a diff from the most recent successful report (FR-013).
 - `drift` reports per-lead scope and churn signals from structured Linear,
   GitHub, herdr, and OpenTelemetry records, with configurable thresholds,
   a stable JSON field contract, and one text line per lead. Its time-based
@@ -53,6 +58,8 @@ focus status, blocker-state, and ready-queue reporting.
 - Mutating Linear fields other than project status and priority, or mutating
   GitHub data.
 - Reading or writing GitHub Issues as part of planner focus resolution.
+- Reading or writing GitHub Issues as part of focus hygiene; GitHub is queried
+  only for pull requests linked by structured Linear attachments.
 - Compatibility layers, legacy readers, or migration shims.
 - Copying or vendoring artifacts from another repository.
 
@@ -77,6 +84,8 @@ records through Linear GraphQL and caches read results locally.
   initiatives, projects, issues, and blockers.
 - Team leads use `focus status` to inspect progress, blockers, and ready work
   within the selected focus.
+- Team planners use inline focus selectors and hygiene reports to inspect
+  planned work, correct tracking gaps, and see changes since a prior report.
 - Library consumers rely on the same deterministic read results and queue rules.
 
 ## Requirements Architecture
@@ -86,6 +95,8 @@ to FR-008 and FR-009, which depend on the queue and structured-data boundary.
 US-003 traces to FR-010 and FR-011, reusing FR-001/FR-002 blocker semantics.
 US-004 traces to FR-010 through FR-012, composing the existing focus expansion
 and queue rules into a status result.
+US-005 traces to FR-013, which uses the canonical focus from FR-011 and the
+structured-source boundary in FR-005.
 Functional acceptance criteria include fixture checks for each drift signal,
 queue rules, and cache behavior; NFR-001 specifies a lightweight warm-cache
 fixture benchmark.
