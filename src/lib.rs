@@ -32,15 +32,15 @@ pub use hygiene::{
 pub use linear::LinearGraphQlSource;
 pub use model::{
     ChunkIssue, FocusBlocker, FocusExpansion, FocusIssue, FocusIssueClassification, FocusMilestone,
-    FocusMilestoneStatus, FocusProgress, FocusProject, FocusProjectStatus, FocusSelection,
-    FocusStateCount, FocusStatus, Initiative, Issue, IssueId, Milestone, NextStep, Project,
-    ProjectChunk, ProjectId, ProjectPriority, ProjectRunStatus, ReadyItem, SearchKind,
-    SearchResult, TeamKey, WorkflowStateType, WorkspaceSnapshot,
+    FocusMilestoneStatus, FocusPlanChunk, FocusPlanIssue, FocusProgress, FocusProject,
+    FocusProjectStatus, FocusSelection, FocusStateCount, FocusStatus, Initiative, Issue, IssueId,
+    Milestone, NextStep, Project, ProjectChunk, ProjectId, ProjectPriority, ProjectRunStatus,
+    ReadyItem, SearchKind, SearchResult, TeamKey, WorkflowStateType, WorkspaceSnapshot,
 };
 
 use model::{compare_f64, issue_is_open};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use thiserror::Error as ThisError;
 
@@ -179,6 +179,14 @@ pub enum Error {
     /// No inline initiative, project, or issue selector was supplied.
     #[error("focus requires at least one --initiative, --project, or --issue selector")]
     EmptyFocus,
+    /// An issue's required structured focus data was unavailable.
+    #[error("focus plan data is incomplete for {issue}: missing {field}")]
+    FocusPlanIncomplete {
+        /// Issue whose source record was incomplete.
+        issue: String,
+        /// Missing structured field or related record.
+        field: &'static str,
+    },
     /// A focus hygiene report exceeded a deterministic resource bound.
     #[error("focus hygiene title candidates exceeded resource limit {limit}")]
     FocusHygieneResourceLimit { limit: usize },
@@ -397,6 +405,22 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
         }
         let snapshot = self.snapshot()?;
         make_focus_status(&snapshot, selection)
+    }
+
+    /// Returns a dependency-ordered handoff of open focus issues, optionally bounded by size.
+    pub fn focus_plan_chunk(
+        &mut self,
+        selection: &FocusSelection,
+        size: Option<std::num::NonZeroUsize>,
+    ) -> Result<FocusPlanChunk, Error> {
+        if selection.initiatives.is_empty()
+            && selection.projects.is_empty()
+            && selection.issues.is_empty()
+        {
+            return Err(Error::EmptyFocus);
+        }
+        let snapshot = self.snapshot()?;
+        make_focus_plan_chunk(&snapshot, selection, size)
     }
 
     /// Returns a deterministic focus hygiene report from the current snapshot.
@@ -661,8 +685,16 @@ fn spec_step(spec_state: &str) -> Option<NextStep> {
 }
 
 fn blockers_completed(issue: &Issue, issues: &HashMap<&IssueId, &Issue>) -> Result<bool, Error> {
+    Ok(unresolved_blockers(issue, issues)?.is_empty())
+}
+
+fn unresolved_blockers(
+    issue: &Issue,
+    issues: &HashMap<&IssueId, &Issue>,
+) -> Result<BTreeSet<String>, Error> {
     let mut pending = issue.blocked_by.to_vec();
-    let mut visited = HashSet::new();
+    let mut visited = BTreeSet::new();
+    let mut unresolved = BTreeSet::new();
     while let Some(blocker_id) = pending.pop() {
         if !visited.insert(blocker_id.clone()) {
             continue;
@@ -672,12 +704,12 @@ fn blockers_completed(issue: &Issue, issues: &HashMap<&IssueId, &Issue>) -> Resu
                 issue: blocker_id.0,
             });
         };
-        if blocker.state != "Completed" {
-            return Ok(false);
+        if blocker.state_type != WorkflowStateType::Completed {
+            unresolved.insert(blocker.identifier.clone());
         }
         pending.extend(blocker.blocked_by.iter().cloned());
     }
-    Ok(true)
+    Ok(unresolved)
 }
 
 fn canonical_selectors(
@@ -1034,6 +1066,419 @@ fn make_focus_status(
     })
 }
 
+fn make_focus_plan_chunk(
+    snapshot: &WorkspaceSnapshot,
+    selection: &FocusSelection,
+    size: Option<std::num::NonZeroUsize>,
+) -> Result<FocusPlanChunk, Error> {
+    let scope = select_scope(
+        snapshot,
+        &ScopeSelection {
+            team: None,
+            initiatives: selection.initiatives.clone(),
+            projects: selection.projects.clone(),
+            tickets: selection.issues.clone(),
+        },
+    )?;
+    if scope.issue_ids.is_empty() {
+        return Err(Error::EmptyFocus);
+    }
+
+    let issues: HashMap<_, _> = snapshot
+        .issues
+        .iter()
+        .map(|issue| (&issue.id, issue))
+        .collect();
+    let roots = scope
+        .issue_ids
+        .iter()
+        .map(|id| {
+            issues
+                .get(id)
+                .copied()
+                .ok_or_else(|| Error::MissingDependency {
+                    issue: id.0.clone(),
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let layers = dependency_layer_ids(snapshot, &roots)?;
+    let layer_by_id: BTreeMap<_, _> = layers
+        .iter()
+        .enumerate()
+        .flat_map(|(layer, ids)| ids.iter().map(move |id| (id.clone(), layer)))
+        .collect();
+    let projects: HashMap<_, _> = snapshot
+        .projects
+        .iter()
+        .map(|project| (&project.id, project))
+        .collect();
+    let mut candidates = scope
+        .issue_ids
+        .iter()
+        .filter_map(|id| issues.get(id).copied())
+        .filter(|issue| {
+            !matches!(
+                issue.state_type,
+                WorkflowStateType::Completed | WorkflowStateType::Canceled
+            )
+        })
+        .collect::<Vec<_>>();
+
+    candidates.sort_by(|left, right| {
+        let left_layer = layer_by_id.get(&left.id).copied().unwrap_or(usize::MAX);
+        let right_layer = layer_by_id.get(&right.id).copied().unwrap_or(usize::MAX);
+        left_layer
+            .cmp(&right_layer)
+            .then_with(|| compare_plan_project_order(left, right, &projects))
+            .then_with(|| compare_plan_milestone_order(left, right, &projects))
+            .then_with(|| left.identifier.cmp(&right.identifier))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let unblocks_by_id = focus_unblocks(&candidates, &issues)?;
+
+    let rows =
+        candidates
+            .iter()
+            .map(|issue| {
+                let layer = layer_by_id.get(&issue.id).copied().ok_or_else(|| {
+                    Error::FocusPlanIncomplete {
+                        issue: issue.identifier.clone(),
+                        field: "dependency layer",
+                    }
+                })?;
+                let milestone = plan_milestone(issue, &projects)?;
+                let (ready, reasons) = plan_readiness(issue, &projects, &issues)?;
+                Ok(FocusPlanIssue {
+                    identifier: issue.identifier.clone(),
+                    title: issue.title.clone(),
+                    milestone,
+                    dependency_layer: layer,
+                    ready,
+                    reasons,
+                    unblocks: unblocks_by_id
+                        .get(&issue.id)
+                        .map(|values| values.iter().cloned().collect())
+                        .unwrap_or_default(),
+                    acceptance_criteria: acceptance_criteria_excerpt(issue.description.as_deref()),
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+    let issues = match size {
+        Some(size) => rows.into_iter().take(size.get()).collect(),
+        None => rows,
+    };
+    Ok(FocusPlanChunk {
+        fetched_at: snapshot.fetched_at,
+        issues,
+    })
+}
+
+fn compare_plan_project_order(
+    left: &Issue,
+    right: &Issue,
+    projects: &HashMap<&ProjectId, &Project>,
+) -> Ordering {
+    let left_project = left
+        .project_id
+        .as_ref()
+        .and_then(|id| projects.get(id).copied());
+    let right_project = right
+        .project_id
+        .as_ref()
+        .and_then(|id| projects.get(id).copied());
+    match (left_project, right_project) {
+        (Some(left_project), Some(right_project)) => {
+            compare_project_priority(left_project.priority, right_project.priority)
+                .then_with(|| compare_f64(left_project.sort_order, right_project.sort_order))
+                .then_with(|| {
+                    left_project
+                        .identifier
+                        .as_deref()
+                        .unwrap_or(&left_project.id.0)
+                        .cmp(
+                            right_project
+                                .identifier
+                                .as_deref()
+                                .unwrap_or(&right_project.id.0),
+                        )
+                })
+                .then_with(|| left_project.id.cmp(&right_project.id))
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn compare_plan_milestone_order(
+    left: &Issue,
+    right: &Issue,
+    projects: &HashMap<&ProjectId, &Project>,
+) -> Ordering {
+    let milestone = |issue: &Issue| {
+        issue
+            .project_id
+            .as_ref()
+            .and_then(|project_id| projects.get(project_id).copied())
+            .and_then(|project| {
+                issue.project_milestone_id.as_deref().and_then(|id| {
+                    project
+                        .milestones
+                        .iter()
+                        .find(|milestone| milestone.id == id)
+                })
+            })
+    };
+    match (milestone(left), milestone(right)) {
+        (Some(left), Some(right)) => {
+            compare_f64(left.sort_order, right.sort_order).then_with(|| left.id.cmp(&right.id))
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn plan_milestone(
+    issue: &Issue,
+    projects: &HashMap<&ProjectId, &Project>,
+) -> Result<Option<String>, Error> {
+    let Some(milestone_id) = &issue.project_milestone_id else {
+        return Ok(None);
+    };
+    let Some(project_id) = &issue.project_id else {
+        return Err(Error::FocusPlanIncomplete {
+            issue: issue.identifier.clone(),
+            field: "project for milestone",
+        });
+    };
+    let Some(project) = projects.get(project_id).copied() else {
+        return Err(Error::FocusPlanIncomplete {
+            issue: issue.identifier.clone(),
+            field: "project record",
+        });
+    };
+    let Some(milestone) = project.milestones.iter().find(|m| m.id == *milestone_id) else {
+        return Err(Error::MissingProjectMilestone {
+            issue: issue.identifier.clone(),
+            milestone: milestone_id.clone(),
+            project: project_id.0.clone(),
+        });
+    };
+    Ok(Some(milestone.name.clone()))
+}
+
+fn plan_readiness(
+    issue: &Issue,
+    projects: &HashMap<&ProjectId, &Project>,
+    issues: &HashMap<&IssueId, &Issue>,
+) -> Result<(bool, Vec<String>), Error> {
+    let mut reasons = Vec::new();
+    let state_is_ready = issue_is_open(issue);
+    reasons.push(if state_is_ready {
+        format!("workflow state {} is eligible", issue.state_name)
+    } else {
+        format!("workflow state {} is not eligible", issue.state_name)
+    });
+    let project_running = match &issue.project_id {
+        Some(project_id) => {
+            let Some(project) = projects.get(project_id).copied() else {
+                return Err(Error::FocusPlanIncomplete {
+                    issue: issue.identifier.clone(),
+                    field: "project record",
+                });
+            };
+            let started = project.status == "Started";
+            reasons.push(format!(
+                "owning project {} is {}",
+                project.identifier.as_deref().unwrap_or(&project.name),
+                project.status
+            ));
+            started
+        }
+        None => {
+            reasons.push("issue has no owning project".to_owned());
+            false
+        }
+    };
+    let step = spec_step(&issue.state);
+    reasons.push(match step {
+        Some(step) => format!("spec state {} maps to {:?}", issue.state, step),
+        None => format!("spec state {} has no FR-001 next step", issue.state),
+    });
+    let unresolved = unresolved_blockers(issue, issues)?;
+    let blockers_ready = unresolved.is_empty();
+    reasons.push(if blockers_ready {
+        "all recursive blockers are Completed".to_owned()
+    } else {
+        format!(
+            "recursive blockers are not Completed: {}",
+            unresolved.into_iter().collect::<Vec<_>>().join(", ")
+        )
+    });
+    let ready = state_is_ready && project_running && step.is_some() && blockers_ready;
+    Ok((ready, reasons))
+}
+
+fn focus_unblocks(
+    candidates: &[&Issue],
+    issues: &HashMap<&IssueId, &Issue>,
+) -> Result<BTreeMap<IssueId, BTreeSet<String>>, Error> {
+    let focus_ids = candidates
+        .iter()
+        .map(|issue| issue.id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut unblocks = BTreeMap::<IssueId, BTreeSet<String>>::new();
+    for dependent in candidates {
+        let mut pending = dependent.blocked_by.clone();
+        let mut visited = BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if !visited.insert(id.clone()) {
+                continue;
+            }
+            let Some(blocker) = issues.get(&id).copied() else {
+                return Err(Error::MissingDependency { issue: id.0 });
+            };
+            if focus_ids.contains(&id) && id != dependent.id {
+                unblocks
+                    .entry(id.clone())
+                    .or_default()
+                    .insert(dependent.identifier.clone());
+            }
+            pending.extend(blocker.blocked_by.iter().cloned());
+        }
+    }
+    Ok(unblocks)
+}
+
+fn acceptance_criteria_excerpt(description: Option<&str>) -> Option<String> {
+    let lines = description?.lines().collect::<Vec<_>>();
+    let headings = markdown_headings(&lines);
+    for (heading_index, (_, body_start, title)) in headings.iter().enumerate() {
+        if !title.trim().eq_ignore_ascii_case("Acceptance Criteria") {
+            continue;
+        }
+        let body_end = headings
+            .get(heading_index + 1)
+            .map_or(lines.len(), |(next_heading_line, _, _)| *next_heading_line);
+        let body = lines[*body_start..body_end].to_vec().join("\n");
+        let body = body.trim();
+        if body.is_empty() {
+            return None;
+        }
+        let mut chars = body.chars();
+        let excerpt = chars.by_ref().take(280).collect::<String>();
+        return Some(if chars.next().is_some() {
+            format!("{excerpt}…")
+        } else {
+            excerpt
+        });
+    }
+    None
+}
+
+fn markdown_headings(lines: &[&str]) -> Vec<(usize, usize, String)> {
+    let mut headings = Vec::new();
+    let mut fence: Option<(u8, usize)> = None;
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+        if let Some((marker, minimum)) = fence {
+            if closing_fence(line, marker, minimum) {
+                fence = None;
+            }
+            index += 1;
+            continue;
+        }
+        if let Some(opening) = opening_fence(line) {
+            fence = Some(opening);
+            index += 1;
+            continue;
+        }
+        if let Some(title) = atx_heading_title(line) {
+            headings.push((index, index + 1, title.to_owned()));
+            index += 1;
+            continue;
+        }
+        if index > 0 && is_setext_underline(line) {
+            let title_line = lines[index - 1];
+            if !title_line.trim().is_empty()
+                && headings
+                    .last()
+                    .is_none_or(|(last_heading_line, _, _)| *last_heading_line != index - 1)
+            {
+                headings.push((index - 1, index + 1, title_line.trim().to_owned()));
+            }
+        }
+        index += 1;
+    }
+    headings.sort_by_key(|(heading_line, _, _)| *heading_line);
+    headings
+}
+
+fn opening_fence(line: &str) -> Option<(u8, usize)> {
+    let indentation = line.len() - line.trim_start_matches(' ').len();
+    if indentation > 3 {
+        return None;
+    }
+    let content = &line[indentation..];
+    let marker = *content.as_bytes().first()?;
+    if marker != b'`' && marker != b'~' {
+        return None;
+    }
+    let length = content.bytes().take_while(|byte| *byte == marker).count();
+    (length >= 3).then_some((marker, length))
+}
+
+fn closing_fence(line: &str, marker: u8, minimum: usize) -> bool {
+    let indentation = line.len() - line.trim_start_matches(' ').len();
+    if indentation > 3 {
+        return false;
+    }
+    let content = &line[indentation..];
+    let length = content.bytes().take_while(|byte| *byte == marker).count();
+    length >= minimum && content[length..].trim().is_empty()
+}
+
+fn is_setext_underline(line: &str) -> bool {
+    let indentation = line.len() - line.trim_start_matches(' ').len();
+    if indentation > 3 {
+        return false;
+    }
+    let underline = line.trim();
+    (underline.bytes().all(|byte| byte == b'=') || underline.bytes().all(|byte| byte == b'-'))
+        && !underline.is_empty()
+}
+
+fn atx_heading_title(line: &str) -> Option<&str> {
+    let indentation = line.len() - line.trim_start_matches(' ').len();
+    if indentation > 3 {
+        return None;
+    }
+    let line = &line[indentation..];
+    let hashes = line.bytes().take_while(|byte| *byte == b'#').count();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    let remainder = &line[hashes..];
+    if remainder
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| !byte.is_ascii_whitespace())
+    {
+        return None;
+    }
+    let title = remainder.trim();
+    let closing_hashes = title.bytes().rev().take_while(|byte| *byte == b'#').count();
+    if closing_hashes > 0 {
+        let closing_start = title.len() - closing_hashes;
+        if closing_start == 0 || title.as_bytes()[closing_start - 1].is_ascii_whitespace() {
+            return Some(title[..closing_start].trim_end());
+        }
+    }
+    Some(title)
+}
+
 fn open_state_counts(issues: &[&Issue]) -> Vec<FocusStateCount> {
     let mut counts = BTreeMap::<&str, usize>::new();
     for issue in issues.iter().copied().filter(|issue| {
@@ -1369,4 +1814,27 @@ pub fn ready_from_snapshot(
     team: &str,
 ) -> Result<Vec<ReadyItem>, Error> {
     ready_queue(snapshot, team)
+}
+
+#[cfg(test)]
+mod plan_chunk_tests {
+    use super::acceptance_criteria_excerpt;
+
+    /// Trace: FR-014-AC-5
+    #[test]
+    fn acceptance_excerpt_uses_markdown_heading_boundaries() {
+        let description = "````md\n# Acceptance Criteria\ncode sample\n````\nOther heading\n===\nwrong section\n## acceptance criteria ###\nfirst body\n### Next\nignored";
+        assert_eq!(
+            acceptance_criteria_excerpt(Some(description)).as_deref(),
+            Some("first body")
+        );
+        assert_eq!(
+            acceptance_criteria_excerpt(Some("# Acceptance Criteria\n  \n## Next")),
+            None
+        );
+        assert_eq!(
+            acceptance_criteria_excerpt(Some("## Acceptance Criteria-ish\nbody")),
+            None
+        );
+    }
 }

@@ -6,15 +6,16 @@
 use clap::{Parser, Subcommand};
 use ix_board::{
     DriftConfig, DriftError, DriftEvidenceFile, DriftReport, Error, FocusExpansion,
-    FocusHygieneReport, FocusSelection, FocusStatus, LinearGraphQlSource, NextStep, ProjectChunk,
-    ProjectPriority, ProjectRunStatus, ReadService, ReadyItem, SearchResult, evaluate_drift_file,
-    render_drift_text,
+    FocusHygieneReport, FocusPlanChunk, FocusSelection, FocusStatus, LinearGraphQlSource, NextStep,
+    ProjectChunk, ProjectPriority, ProjectRunStatus, ReadService, ReadyItem, SearchResult,
+    evaluate_drift_file, render_drift_text,
 };
 use ix_cli_kit::exit::Outcome;
 use ix_cli_kit::streams::{
     ColorChoice, Diagnostics, DiagnosticsFormat, emit_diagnostic, emit_result,
 };
 use serde::Serialize;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -105,6 +106,21 @@ enum FocusCommand {
         #[arg(long = "issue", action = clap::ArgAction::Append)]
         issues: Vec<String>,
     },
+    /// Prepare a bounded dependency-ordered handoff chunk for a focus.
+    PlanChunk {
+        /// Linear initiative UUID or exact name; may be repeated.
+        #[arg(long = "initiative", action = clap::ArgAction::Append)]
+        initiatives: Vec<String>,
+        /// Linear project UUID, identifier, or exact name; may be repeated.
+        #[arg(long = "project", action = clap::ArgAction::Append)]
+        projects: Vec<String>,
+        /// Linear issue UUID or identifier; may be repeated.
+        #[arg(long = "issue", action = clap::ArgAction::Append)]
+        issues: Vec<String>,
+        /// Maximum number of open focus issues to emit.
+        #[arg(long, value_parser = parse_positive_size)]
+        size: Option<NonZeroUsize>,
+    },
     /// Report hygiene findings and changes for a focus.
     Hygiene {
         #[arg(long = "initiative", action = clap::ArgAction::Append)]
@@ -146,6 +162,7 @@ enum Output {
     Chunk(ProjectChunk),
     Focus(FocusExpansion),
     FocusStatus(FocusStatus),
+    FocusPlanChunk(FocusPlanChunk),
     FocusHygiene(Box<FocusHygieneReport>),
     Search(Vec<SearchResult>),
     Drift(DriftReport),
@@ -174,6 +191,12 @@ fn parse_positive_days(value: &str) -> Result<u32, String> {
         .ok()
         .filter(|days| *days > 0)
         .ok_or_else(|| "stale days must be a positive whole number".to_owned())
+}
+
+fn parse_positive_size(value: &str) -> Result<NonZeroUsize, String> {
+    value
+        .parse::<NonZeroUsize>()
+        .map_err(|_| "size must be a positive whole number".to_owned())
 }
 
 fn main() -> std::process::ExitCode {
@@ -318,6 +341,24 @@ fn run_linear(command: Command) -> Result<Output, Error> {
             .map(Output::FocusStatus),
         Command::Focus {
             command:
+                FocusCommand::PlanChunk {
+                    initiatives,
+                    projects,
+                    issues,
+                    size,
+                },
+        } => service
+            .focus_plan_chunk(
+                &FocusSelection {
+                    initiatives,
+                    projects,
+                    issues,
+                },
+                size,
+            )
+            .map(Output::FocusPlanChunk),
+        Command::Focus {
+            command:
                 FocusCommand::Hygiene {
                     initiatives,
                     projects,
@@ -395,6 +436,7 @@ fn render_human(output: &Output) -> String {
         Output::Chunk(chunk) => render_chunk(chunk),
         Output::Focus(expansion) => render_focus(expansion),
         Output::FocusStatus(status) => render_focus_status(status),
+        Output::FocusPlanChunk(chunk) => render_focus_plan_chunk(chunk),
         Output::FocusHygiene(report) => render_focus_hygiene(report),
         Output::Search(results) => results
             .iter()
@@ -526,6 +568,27 @@ fn render_focus_status(status: &FocusStatus) -> String {
             .iter()
             .map(|item| format!("  {} — {} ({})", item.identifier, item.title, item.reason)),
     );
+    lines.join("\n")
+}
+
+fn render_focus_plan_chunk(chunk: &FocusPlanChunk) -> String {
+    let mut lines = vec![format!("Focus snapshot fetched at {}", chunk.fetched_at)];
+    lines.push("Plan chunk:".to_owned());
+    if chunk.issues.is_empty() {
+        lines.push("  (no open focus issues)".to_owned());
+    }
+    for issue in &chunk.issues {
+        let milestone = issue.milestone.as_deref().unwrap_or("unmilestoned");
+        lines.push(format!(
+            "  {} [layer {}] — {} ({milestone}; ready: {})",
+            issue.identifier, issue.dependency_layer, issue.title, issue.ready
+        ));
+        lines.push(format!("    reasons: {}", issue.reasons.join("; ")));
+        lines.push(format!("    unblocks: {}", issue.unblocks.join(", ")));
+        if let Some(excerpt) = &issue.acceptance_criteria {
+            lines.push(format!("    acceptance criteria: {excerpt}"));
+        }
+    }
     lines.join("\n")
 }
 
@@ -776,6 +839,53 @@ mod tests {
                 && projects == ["SWM-P1"]
                 && issues == ["SWM-1"]
         ));
+    }
+
+    /// Trace: FR-014-AC-3
+    #[test]
+    fn focus_plan_chunk_accepts_repeated_selectors_and_positive_size_only() {
+        let cli = Cli::try_parse_from([
+            "ix-board",
+            "focus",
+            "plan-chunk",
+            "--initiative",
+            "Delivery",
+            "--project",
+            "IR-P1",
+            "--issue",
+            "IR-317",
+            "--size",
+            "4",
+        ])
+        .expect("parse plan chunk");
+        assert!(matches!(
+            cli.command,
+            Command::Focus {
+                command: FocusCommand::PlanChunk {
+                    initiatives,
+                    projects,
+                    issues,
+                    size: Some(size),
+                }
+            } if initiatives == ["Delivery"]
+                && projects == ["IR-P1"]
+                && issues == ["IR-317"]
+                && size.get() == 4
+        ));
+        for value in ["0", "-1", "abc"] {
+            assert!(
+                Cli::try_parse_from([
+                    "ix-board",
+                    "focus",
+                    "plan-chunk",
+                    "--project",
+                    "IR-P1",
+                    "--size",
+                    value,
+                ])
+                .is_err()
+            );
+        }
     }
 
     /// Trace: FR-013-AC-4

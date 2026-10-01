@@ -318,6 +318,38 @@ pub struct FocusStatus {
     pub ready_queue: Vec<ReadyItem>,
 }
 
+/// A bounded dependency-ordered handoff for an inline focus.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FocusPlanChunk {
+    /// Unix seconds when the source snapshot was fetched.
+    pub fetched_at: i64,
+    /// Ordered open focus issues included in the handoff.
+    pub issues: Vec<FocusPlanIssue>,
+}
+
+/// One open focus issue in a dependency-ordered handoff.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FocusPlanIssue {
+    /// Stable Linear issue identifier.
+    pub identifier: String,
+    /// Issue title.
+    pub title: String,
+    /// Milestone name, or null for project-level and unprojected issues.
+    pub milestone: Option<String>,
+    /// Longest-path dependency layer from an issue without prerequisites.
+    pub dependency_layer: usize,
+    /// Whether this issue satisfies FR-001 ready-queue eligibility.
+    pub ready: bool,
+    /// Structured facts explaining its FR-001 readiness result.
+    pub reasons: Vec<String>,
+    /// Sorted identifiers of other open focus issues transitively blocked by this issue.
+    pub unblocks: Vec<String>,
+    /// Bounded Acceptance Criteria section excerpt from the structured description.
+    pub acceptance_criteria: Option<String>,
+}
+
 /// Status summary for one selected Linear project.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
