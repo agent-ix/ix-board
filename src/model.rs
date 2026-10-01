@@ -197,6 +197,8 @@ pub struct Issue {
     pub team_key: TeamKey,
     /// Associated project UUID.
     pub project_id: Option<ProjectId>,
+    /// Associated project milestone UUID, when the issue belongs to a milestone.
+    pub project_milestone_id: Option<String>,
     /// Linear numeric priority; zero means unprioritized, while lower nonzero values rank higher.
     pub priority: f64,
     /// Linear manual issue order.
@@ -259,6 +261,77 @@ pub struct ProjectChunk {
     pub open_tickets: Vec<ChunkIssue>,
     /// Dependency layers reachable from open project tickets, prerequisites before dependents.
     pub blocker_layers: Vec<Vec<String>>,
+}
+
+/// Inline selectors resolved into a deterministic Linear workspace focus.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FocusSelection {
+    /// Initiative UUIDs or exact names.
+    pub initiatives: Vec<String>,
+    /// Project UUIDs, identifiers, or exact names.
+    pub projects: Vec<String>,
+    /// Issue UUIDs or identifiers, including descendants.
+    pub issues: Vec<String>,
+}
+
+/// Focus expansion for a single current workspace snapshot.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FocusExpansion {
+    /// Unix seconds when the source snapshot was fetched.
+    pub fetched_at: i64,
+    /// Selected projects and their milestone/project-level issues.
+    pub projects: Vec<FocusProject>,
+    /// Deduplicated union of all focus issues.
+    pub focus_issues: Vec<FocusIssue>,
+    /// Issues selected by explicit issue selectors and their descendants.
+    pub issue_selector_issues: Vec<FocusIssue>,
+    /// Complete blocker closures, prerequisites before dependents.
+    pub blocker_layers: Vec<Vec<String>>,
+}
+
+/// One selected project with issues grouped by their milestone association.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FocusProject {
+    /// Linear project UUID.
+    pub id: ProjectId,
+    /// Human-readable project identifier, falling back to UUID.
+    pub identifier: String,
+    /// Project name.
+    pub name: String,
+    /// Project milestones in deterministic Linear order.
+    pub milestones: Vec<FocusMilestone>,
+    /// Issues assigned to this project without a milestone.
+    pub project_level_issues: Vec<FocusIssue>,
+}
+
+/// Milestone metadata and its selected issues.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FocusMilestone {
+    /// Linear milestone UUID.
+    pub id: String,
+    /// Milestone name.
+    pub name: String,
+    /// Optional milestone description.
+    pub description: Option<String>,
+    /// Issues assigned to this milestone.
+    pub issues: Vec<FocusIssue>,
+}
+
+/// Stable summary of a Linear issue included in focus.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FocusIssue {
+    /// Linear issue UUID.
+    pub id: IssueId,
+    /// Human-readable issue identifier.
+    pub identifier: String,
+    /// Issue title.
+    pub title: String,
+    /// Workflow state name.
+    pub state: String,
 }
 
 /// Issue summary included in a project chunk.

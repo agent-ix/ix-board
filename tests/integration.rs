@@ -181,6 +181,7 @@ fn issue(
                 .to_owned(),
         ),
         project_id: project_id.map(|id| ProjectId(id.to_owned())),
+        project_milestone_id: None,
         priority,
         sort_order,
         blocked_by: blocked_by
@@ -596,6 +597,186 @@ fn project_chunk_returns_goal_milestones_open_tickets_and_dependency_layers() {
     ));
 }
 
+/// Trace: FR-011-AC-1, FR-011-AC-2, FR-011-AC-3, FR-011-AC-6
+#[test]
+fn focus_expansion_unions_selectors_groups_milestones_and_layers_blockers() {
+    let directory = TempDir::new().expect("temporary directory");
+    let mut first = project("p1", "SWM-P1", "Started", 2, 1.0);
+    first.initiatives = vec![ix_board::Initiative {
+        id: "init-1".to_owned(),
+        name: "Delivery".to_owned(),
+    }];
+    first.milestones = vec![
+        Milestone {
+            id: "m2".to_owned(),
+            name: "Later".to_owned(),
+            description: None,
+            sort_order: 2.0,
+        },
+        Milestone {
+            id: "m1".to_owned(),
+            name: "First".to_owned(),
+            description: Some("First milestone".to_owned()),
+            sort_order: 1.0,
+        },
+    ];
+    let mut second = project("p2", "SWM-P2", "Started", 2, 2.0);
+    second.initiatives = first.initiatives.clone();
+    let mut milestone_issue = issue(
+        "i10",
+        "SWM-10",
+        Some("p1"),
+        "Todo",
+        1.0,
+        1.0,
+        None,
+        &["i20"],
+    );
+    milestone_issue.project_milestone_id = Some("m1".to_owned());
+    let mut child = issue("i11", "SWM-11", Some("p2"), "Todo", 1.0, 1.0, None, &[]);
+    child.parent_id = Some(IssueId("i10".to_owned()));
+    let project_level = issue("i12", "SWM-12", Some("p1"), "Todo", 1.0, 2.0, None, &[]);
+    let completed_blocker = issue("i21", "OPS-2", None, "Completed", 1.0, 1.0, None, &[]);
+    let canceled_blocker = issue("i20", "OPS-1", None, "Canceled", 1.0, 1.0, None, &["i21"]);
+    let snapshot = WorkspaceSnapshot {
+        projects: vec![second, first],
+        issues: vec![
+            project_level,
+            child,
+            canceled_blocker,
+            milestone_issue,
+            completed_blocker,
+        ],
+        fetched_at: 42,
+    };
+    let mut reads = service(
+        FixtureSource::new(snapshot),
+        ManualClock::new(100),
+        &directory,
+    );
+    let selection = ix_board::FocusSelection {
+        initiatives: vec!["Delivery".to_owned()],
+        projects: vec!["SWM-P1".to_owned()],
+        issues: vec!["SWM-10".to_owned()],
+    };
+    let first_result = reads.focus_expand(&selection).expect("focus expansion");
+    let repeated = reads.focus_expand(&selection).expect("repeat expansion");
+
+    assert_eq!(first_result, repeated);
+    assert_eq!(first_result.fetched_at, 100);
+    assert_eq!(
+        first_result
+            .focus_issues
+            .iter()
+            .map(|issue| issue.identifier.as_str())
+            .collect::<Vec<_>>(),
+        ["SWM-10", "SWM-11", "SWM-12"]
+    );
+    assert_eq!(
+        first_result
+            .issue_selector_issues
+            .iter()
+            .map(|issue| issue.identifier.as_str())
+            .collect::<Vec<_>>(),
+        ["SWM-10", "SWM-11"]
+    );
+    assert_eq!(first_result.projects.len(), 2);
+    let project_one = first_result
+        .projects
+        .iter()
+        .find(|project| project.identifier == "SWM-P1")
+        .expect("selected project");
+    assert_eq!(project_one.milestones[0].name, "First");
+    assert_eq!(project_one.milestones[0].issues[0].identifier, "SWM-10");
+    assert_eq!(project_one.project_level_issues[0].identifier, "SWM-12");
+    assert_eq!(
+        first_result.blocker_layers[0],
+        ["OPS-2", "SWM-11", "SWM-12"]
+    );
+    assert_eq!(first_result.blocker_layers[1], ["OPS-1"]);
+    assert_eq!(first_result.blocker_layers[2], ["SWM-10"]);
+}
+
+/// Trace: FR-011-AC-4
+#[test]
+fn focus_expansion_rejects_empty_or_unresolved_selectors_without_partial_data() {
+    let directory = TempDir::new().expect("temporary directory");
+    let source = FixtureSource::new(queue_fixture());
+    let mut reads = service(source.clone(), ManualClock::new(1_000), &directory);
+    assert!(matches!(
+        reads.focus_expand(&ix_board::FocusSelection::default()),
+        Err(Error::EmptyFocus)
+    ));
+    assert_eq!(source.reads.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        reads.focus_expand(&ix_board::FocusSelection {
+            projects: vec!["missing".to_owned()],
+            ..ix_board::FocusSelection::default()
+        }),
+        Err(Error::ScopeSelection {
+            kind: "project",
+            matches: 0,
+            ..
+        })
+    ));
+}
+
+/// Trace: FR-011-AC-5
+#[test]
+fn focus_expansion_refuses_missing_blockers_cycles_and_unknown_milestones() {
+    let directory = TempDir::new().expect("temporary directory");
+    let mut missing = queue_fixture();
+    missing.issues[0].blocked_by = vec![IssueId("absent".to_owned())];
+    let mut reads = service(
+        FixtureSource::new(missing),
+        ManualClock::new(2_000),
+        &directory,
+    );
+    assert!(matches!(
+        reads.focus_expand(&ix_board::FocusSelection {
+            issues: vec!["SWM-1".to_owned()],
+            ..ix_board::FocusSelection::default()
+        }),
+        Err(Error::MissingDependency { .. })
+    ));
+
+    let directory = TempDir::new().expect("temporary directory");
+    let mut cycle = queue_fixture();
+    let focus_id = cycle.issues[0].id.clone();
+    cycle.issues[0].blocked_by = vec![IssueId("cycle".to_owned())];
+    let mut cycle_issue = issue("cycle", "OPS-9", None, "Todo", 1.0, 1.0, None, &[]);
+    cycle_issue.blocked_by = vec![focus_id];
+    cycle.issues.push(cycle_issue);
+    let mut reads = service(
+        FixtureSource::new(cycle),
+        ManualClock::new(2_000),
+        &directory,
+    );
+    assert!(matches!(
+        reads.focus_expand(&ix_board::FocusSelection {
+            issues: vec!["SWM-1".to_owned()],
+            ..ix_board::FocusSelection::default()
+        }),
+        Err(Error::DependencyCycle { .. })
+    ));
+
+    let directory = TempDir::new().expect("temporary directory");
+    let mut bad_milestone = queue_fixture();
+    bad_milestone.issues[0].project_milestone_id = Some("absent-milestone".to_owned());
+    let mut reads = service(
+        FixtureSource::new(bad_milestone),
+        ManualClock::new(2_000),
+        &directory,
+    );
+    assert!(matches!(
+        reads.focus_expand(&ix_board::FocusSelection {
+            projects: vec!["SWM-P1".to_owned()],
+            ..ix_board::FocusSelection::default()
+        }),
+        Err(Error::MissingProjectMilestone { .. })
+    ));
+}
+
 #[test]
 fn search_is_case_insensitive_structured_and_ordered_by_kind_then_identifier() {
     let directory = TempDir::new().expect("temporary directory");
@@ -657,6 +838,7 @@ fn cache_reuses_fresh_snapshot_and_refreshes_after_five_minutes() {
         issues: vec![Issue {
             parent_id: None,
             state_type: ix_board::WorkflowStateType::Started,
+            project_milestone_id: None,
 
             title: "Changed title".to_owned(),
             ..issue(

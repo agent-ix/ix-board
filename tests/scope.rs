@@ -37,6 +37,7 @@ fn issue(id: &str, parent: Option<&str>, category: WorkflowStateType) -> Issue {
         parent_id: parent.map(|id| IssueId(id.into())),
         team_key: TeamKey("SWM".into()),
         project_id: Some(ProjectId("p".into())),
+        project_milestone_id: None,
         priority: 2.0,
         sort_order: 0.0,
         blocked_by: vec![],
