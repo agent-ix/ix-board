@@ -22,7 +22,7 @@ path = "src/main.rs"
 # version provenance, config precedence. Consumed by git-rev pin — one rev
 # string, no vendoring and no tag pin (see agent-ix/ix-cli-kit README,
 # "Consuming this crate").
-ix-cli-kit = { git = "https://github.com/agent-ix/ix-cli-kit", rev = "911666e4e316faa77e6e23d4f9f95f1ecb0f0def" }
+ix-cli-kit = { git = "https://github.com/agent-ix/ix-cli-kit", rev = "cc69a934f887966f955440bff8c356e3da449bee", features = ["secrets"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
