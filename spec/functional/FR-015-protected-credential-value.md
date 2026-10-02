@@ -30,8 +30,13 @@ which has no serialization or Display implementation.
 
 ## Acceptance Criteria
 
-| ID | Criterion | Verification |
+| ID | Criteria | Verification |
 | --- | --- | --- |
 | FR-015-AC-1 | A synthetic credential is retained as SecretValue; its Debug representation is redacted and does not contain the fixture text. | Test |
 | FR-015-AC-2 | The existing injected HTTP request receives the unchanged fixture Authorization header and the existing cache namespace remains stable. | Test |
 | FR-015-AC-3 | Empty and whitespace-only constructor inputs still return MissingApiKey. | Test |
+
+## Dependencies
+
+- The authoritative ix-cli-kit secrets value type.
+- The existing Linear transport and injected HTTP test seam.
