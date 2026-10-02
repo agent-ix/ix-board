@@ -3,6 +3,8 @@
 
 //! Linear GraphQL transport for selected reads and project status/priority writes.
 
+use ix_cli_kit::secrets::SecretValue;
+
 use crate::{
     Clock, Error, Initiative, Issue, IssueId, Milestone, Project, ProjectId, ProjectMutationSource,
     ProjectPriority, ProjectRunStatus, SystemClock, TeamKey, WorkflowStateType, WorkspaceSnapshot,
@@ -88,7 +90,7 @@ mutation ProjectUpdate($id: String!, $input: ProjectUpdateInput!) {
 /// Linear GraphQL client for structured project/issue reads and scoped project updates.
 pub struct LinearGraphQlSource {
     client: Client,
-    api_key: String,
+    api_key: SecretValue,
     endpoint: String,
     cache_namespace: String,
 }
@@ -115,7 +117,7 @@ impl LinearGraphQlSource {
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()?,
-            api_key,
+            api_key: SecretValue::new(api_key),
             endpoint: endpoint.into(),
             cache_namespace,
         })
@@ -154,7 +156,7 @@ impl LinearGraphQlSource {
         let response = self
             .client
             .post(&self.endpoint)
-            .header(reqwest::header::AUTHORIZATION, &self.api_key)
+            .header(reqwest::header::AUTHORIZATION, self.api_key.expose_secret())
             .json(&GraphQlRequest { query, variables })
             .send()?;
         let status_error = response.error_for_status_ref().err();
@@ -830,10 +832,12 @@ struct RawRelationIssue {
 #[cfg(test)]
 mod tests {
     use super::{
-        ISSUE_PAGE_SIZE, IssueData, LinearGraphQlSource, LinearProjectStatusType,
-        PROJECT_PAGE_SIZE, ProjectData, ProjectUpdateInput, RawProjectStatusOption,
-        canonical_project_status, collect_blocked_by, resolve_project_status_id,
+        CACHE_MODEL_VERSION, ISSUE_PAGE_SIZE, IssueData, LinearGraphQlSource,
+        LinearProjectStatusType, PROJECT_PAGE_SIZE, PROJECT_UPDATE_MUTATION, ProjectData,
+        ProjectUpdateInput, RawProjectStatusOption, canonical_project_status, collect_blocked_by,
+        resolve_project_status_id,
     };
+    use crate::Error;
     use crate::{
         Issue, IssueId, Project, ProjectId, ProjectMutationSource, ProjectPriority,
         ProjectRunStatus, ReadService, TeamKey, WorkspaceSnapshot, WorkspaceSource,
@@ -880,7 +884,7 @@ mod tests {
             let mut requests = Vec::new();
             for (status, headers, response) in responses {
                 let (mut stream, _) = listener.accept().expect("accept GraphQL request");
-                requests.push(read_request(&mut stream));
+                requests.push(read_request(&mut stream).0);
                 let body = serde_json::to_vec(&response).expect("encode GraphQL response");
                 write!(
                     stream,
@@ -899,7 +903,7 @@ mod tests {
         (endpoint, server)
     }
 
-    fn read_request(stream: &mut TcpStream) -> Value {
+    fn read_request(stream: &mut TcpStream) -> (Value, String) {
         let mut bytes = Vec::new();
         let mut buffer = [0_u8; 4096];
         let (header_end, content_length) = loop {
@@ -924,8 +928,10 @@ mod tests {
             assert_ne!(count, 0, "request ended before body completed");
             bytes.extend_from_slice(&buffer[..count]);
         }
-        serde_json::from_slice(&bytes[header_end..header_end + content_length])
-            .expect("decode GraphQL request")
+        let headers = String::from_utf8_lossy(&bytes[..header_end]).into_owned();
+        let body = serde_json::from_slice(&bytes[header_end..header_end + content_length])
+            .expect("decode GraphQL request");
+        (body, headers)
     }
 
     fn satisfy_unused_mock_requests(endpoint: &str, count: usize) {
@@ -1676,5 +1682,52 @@ mod tests {
         })
         .expect("serialize order update");
         assert_eq!(order, serde_json::json!({"sortOrder": 3.5}));
+    }
+
+    /// Trace: FR-015-AC-1, FR-015-AC-2
+    #[test]
+    fn protected_credential_preserves_authentication_and_cache_identity() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/graphql", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (_, headers) = read_request(&mut stream);
+            let body =
+                br#"{"data":{"projectUpdate":{"success":true,"project":{"id":"project-id"}}}}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+            stream.write_all(body).unwrap();
+            headers
+        });
+        let source = LinearGraphQlSource::with_endpoint("fictional-test-token", endpoint).unwrap();
+        let debug = format!("{:?}", source.api_key);
+        assert_eq!(debug, "SecretValue([REDACTED])");
+        assert!(!debug.contains("fictional-test-token"));
+        assert_eq!(
+            source.cache_namespace,
+            format!(
+                "linear:{CACHE_MODEL_VERSION}:sha256:{:x}",
+                Sha256::digest(b"fictional-test-token")
+            )
+        );
+        source
+            .request::<Value, _>(PROJECT_UPDATE_MUTATION, serde_json::json!({}))
+            .unwrap();
+        let headers = server.join().unwrap();
+        assert!(
+            headers
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("authorization: fictional-test-token"))
+        );
+    }
+
+    /// Trace: FR-015-AC-3
+    #[test]
+    fn empty_credential_inputs_remain_missing() {
+        for value in ["", "  ", "\t\n"] {
+            assert!(matches!(
+                LinearGraphQlSource::new(value),
+                Err(Error::MissingApiKey)
+            ));
+        }
     }
 }
