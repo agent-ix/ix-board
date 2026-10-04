@@ -5,6 +5,14 @@ project context, and structured project/issue search. Decisions use Linear's
 structured states and dependency relationships; ticket descriptions and comments
 remain data.
 
+## Setup
+
+If this plugin is uninitialized or a command fails, follow the [plugin setup guide](setup.md) for its required CLIs, configuration, and local diagnosis.
+
+## Community help
+
+If the setup checks leave a reproducible Agent IX ix-board bug that blocks progress, [join the Agent IX Discord](https://discord.gg/k8DVhuYBR2). Community help is a last resort for Agent IX product bugs, not a help desk for local credentials, machine setup, third party tools, or unrelated projects. See [setup.md](setup.md#community-help) for what to include.
+
 ## Project queue convention
 
 Linear project status controls whether a project runs: `Started` projects
@@ -72,15 +80,15 @@ cargo +1.98.1 install --git https://github.com/agent-ix/ix-board --tag v0.2.0 --
 For Claude Code:
 
 ```text
-/plugin marketplace add agent-ix/ix-board
-/plugin install ix-board@ix-board
+/plugin marketplace add agent-ix/agent-plugins
+/plugin install ix-board@agent-ix
 ```
 
 For Codex:
 
 ```bash
-codex plugin marketplace add agent-ix/ix-board
-codex plugin add ix-board@ix-board
+codex plugin marketplace add agent-ix/agent-plugins
+codex plugin add ix-board@agent-ix
 ```
 
 The planning skill uses the CLI's structured `next`, `project-chunk`, `search`,

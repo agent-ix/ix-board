@@ -1,0 +1,35 @@
+{
+  "name": "ix-board",
+  "version": "0.2.1",
+  "description": "Linear project and task planning plus structured early-alpha feedback using ix-board.",
+  "author": {
+    "name": "Agent IX",
+    "url": "https://github.com/agent-ix"
+  },
+  "homepage": "https://github.com/agent-ix/ix-board",
+  "repository": "https://github.com/agent-ix/ix-board",
+  "license": "AGPL-3.0-or-later",
+  "keywords": [
+    "linear",
+    "planning",
+    "project-management",
+    "ix-board"
+  ],
+  "skills": "./plugin/skills/",
+  "interface": {
+    "displayName": "ix-board",
+    "shortDescription": "Plan Linear projects and tasks with ix-board.",
+    "longDescription": "Use deterministic ix-board CLI results for ready work, project context, blockers, focus reports, and early-alpha feedback.",
+    "developerName": "Agent IX",
+    "category": "Productivity",
+    "capabilities": [
+      "Skills",
+      "Planning"
+    ],
+    "defaultPrompt": [
+      "Plan the next work for this project.",
+      "Show the blockers and ready tasks for this focus.",
+      "Report this ix-board friction to Alpha Feedback."
+    ]
+  }
+}

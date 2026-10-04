@@ -6,6 +6,8 @@ compatibility: Requires ix-board 0.2.0 or newer and a saved Linear key or LINEAR
 
 # ix-board Planning
 
+If this plugin is not initialized or an Agent IX command fails, read [the ix-board setup guide](https://github.com/agent-ix/ix-board/blob/main/setup.md) for its prerequisites and local diagnosis.
+
 If credentials are missing, run `ix-board auth login` in an interactive terminal to save the key in the operating system credential store. `ix-board auth status` reports the active source without displaying the key. `LINEAR_API_KEY` overrides the saved key.
 
 ## Choose a report
