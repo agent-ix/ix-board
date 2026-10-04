@@ -3,7 +3,7 @@
 
 //! Linear GraphQL transport for selected reads and project status/priority writes.
 
-use ix_cli_kit::secrets::SecretValue;
+use ix_cli_kit::secrets::{AppScope, SecretKey, SecretStore, SecretValue};
 
 use crate::{
     Clock, Error, Initiative, Issue, IssueId, Milestone, Project, ProjectId, ProjectMutationSource,
@@ -123,10 +123,14 @@ impl LinearGraphQlSource {
         })
     }
 
-    /// Reads the API key from LINEAR_API_KEY for Linear reads and project updates.
+    /// Resolves LINEAR_API_KEY first, then the saved OS credential.
     pub fn from_env() -> Result<Self, Error> {
-        let api_key = std::env::var("LINEAR_API_KEY").map_err(|_| Error::MissingApiKey)?;
-        Self::new(api_key)
+        let scope = AppScope::try_from("ix-board")?;
+        let key = SecretKey::try_from("linear-api-key")?;
+        let resolved = SecretStore::system()
+            .resolve(None, Some("LINEAR_API_KEY"), &scope, &key)?
+            .ok_or(Error::MissingApiKey)?;
+        Self::new(resolved.value.expose_secret())
     }
 
     fn query<T: DeserializeOwned>(

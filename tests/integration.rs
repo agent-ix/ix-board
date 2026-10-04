@@ -1699,6 +1699,33 @@ fn warm_cache_next_cli_runs_under_one_second() {
 }
 
 #[test]
+fn auth_status_reports_environment_source_without_exposing_key() {
+    let output = Command::cargo_bin("ix-board")
+        .expect("built binary")
+        .args(["auth", "status", "--json"])
+        .env("LINEAR_API_KEY", "fictional-secret-token")
+        .output()
+        .expect("auth status");
+    assert!(output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    assert_eq!(result["status"], "ready");
+    assert_eq!(result["source"], "env");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("fictional-secret-token"));
+}
+
+#[test]
+fn auth_login_rejects_empty_stdin_without_touching_store() {
+    let output = Command::cargo_bin("ix-board")
+        .expect("built binary")
+        .args(["auth", "login", "--stdin"])
+        .write_stdin("\n")
+        .output()
+        .expect("auth login");
+    assert_eq!(output.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("must not be empty"));
+}
+
+#[test]
 fn drift_cli_emits_stable_typed_json_and_one_line_per_lead() {
     let directory = TempDir::new().expect("temporary directory");
     let config_path = directory.path().join("drift-config.json");

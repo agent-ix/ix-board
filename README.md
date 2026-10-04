@@ -28,7 +28,21 @@ make test
 
 ## Read commands
 
-Set `LINEAR_API_KEY` to a Linear API key, then run:
+Save a Linear API key in the operating system credential store, then run:
+
+```bash
+ix-board auth login
+ix-board auth status
+```
+
+The prompt hides the key. For scripts, pipe the key to `ix-board auth login --stdin`.
+`LINEAR_API_KEY` overrides the saved key without changing it. `ix-board auth
+logout` removes the saved key. `auth status` only reports whether a key is
+available and which source is active; it never displays the value. If the OS
+credential store is locked or unavailable, the CLI reports that failure and
+does not create a plaintext fallback file.
+
+Run reads with:
 
 ```bash
 ix-board next --team SWM
@@ -45,6 +59,33 @@ Library consumers can call `ReadService::workspace_snapshot` for the cached
 workspace, `force_refresh_workspace` to fetch through the five-minute cache,
 and `invalidate_cache` to discard a snapshot before a write. A failed forced
 refresh leaves no cached snapshot for subsequent reads.
+
+## Agent plugin
+
+The standalone ix-board plugin provides planning and early-alpha feedback
+skills for Claude Code and Codex. Install the CLI separately:
+
+```bash
+cargo +1.98.1 install --git https://github.com/agent-ix/ix-board --tag v0.2.0 --locked
+```
+
+For Claude Code:
+
+```text
+/plugin marketplace add agent-ix/ix-board
+/plugin install ix-board@ix-board
+```
+
+For Codex:
+
+```bash
+codex plugin marketplace add agent-ix/ix-board
+codex plugin add ix-board@ix-board
+```
+
+The planning skill uses the CLI's structured `next`, `project-chunk`, `search`,
+and `focus` reports. Live reads require a Linear key saved with `ix-board auth
+login` or supplied through `LINEAR_API_KEY`.
 
 ## Drift report
 
