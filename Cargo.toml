@@ -1,6 +1,6 @@
 [package]
 name = "ix-board"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.98.1"
 description = "Deterministic, cached Linear project and ready-work reads."
@@ -31,6 +31,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
 schemars = "1.2"
+rpassword = "7"
 
 [dev-dependencies]
 assert_cmd = "2"

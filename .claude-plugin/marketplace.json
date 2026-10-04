@@ -1,0 +1,16 @@
+{
+  "name": "ix-board",
+  "owner": {
+    "name": "Agent IX"
+  },
+  "metadata": {
+    "description": "Project and task planning with ix-board."
+  },
+  "plugins": [
+    {
+      "name": "ix-board",
+      "source": "./plugin",
+      "description": "Linear project planning and early-alpha feedback powered by the ix-board CLI."
+    }
+  ]
+}

@@ -11,10 +11,12 @@ use ix_board::{
     evaluate_drift_file, render_drift_text,
 };
 use ix_cli_kit::exit::Outcome;
+use ix_cli_kit::secrets::{AppScope, SecretKey, SecretStore, SecretValue};
 use ix_cli_kit::streams::{
     ColorChoice, Diagnostics, DiagnosticsFormat, emit_diagnostic, emit_result,
 };
 use serde::Serialize;
+use std::io::Read;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
@@ -43,6 +45,11 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Manage the Linear API key in the operating system credential store.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
     /// Show the deterministic ready queue for one Linear team.
     Next {
         /// Linear team key.
@@ -78,6 +85,20 @@ enum Command {
         #[command(subcommand)]
         command: ProjectCommand,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum AuthCommand {
+    /// Save a Linear API key; prompt without echoing by default.
+    Login {
+        /// Read the key from stdin for scripts instead of prompting.
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// Report the active key source without displaying the key.
+    Status,
+    /// Remove the saved key from the OS credential store.
+    Logout,
 }
 
 #[derive(Subcommand, Debug)]
@@ -158,6 +179,10 @@ enum ProjectCommand {
 #[derive(Serialize)]
 #[serde(untagged)]
 enum Output {
+    Auth {
+        status: String,
+        source: Option<String>,
+    },
     Queue(Vec<ReadyItem>),
     Chunk(ProjectChunk),
     Focus(FocusExpansion),
@@ -241,6 +266,7 @@ fn main() -> std::process::ExitCode {
                 | Error::DriftInputRead { .. }
                 | Error::DriftInputDecode { .. }
                 | Error::Drift(_) => Outcome::Invalid,
+                Error::EmptyCredentialInput => Outcome::Invalid,
                 _ => Outcome::Internal,
             })
         }
@@ -299,8 +325,52 @@ fn validate_command(command: &Command) -> Result<(), Error> {
 
 fn run(command: Command) -> Result<Output, Error> {
     match command {
+        Command::Auth { command } => run_auth(command),
         Command::Drift { config, evidence } => run_drift(&config, &evidence).map(Output::Drift),
         other => run_linear(other),
+    }
+}
+
+fn run_auth(command: AuthCommand) -> Result<Output, Error> {
+    let store = SecretStore::system();
+    let scope = AppScope::try_from("ix-board")?;
+    let key = SecretKey::try_from("linear-api-key")?;
+    match command {
+        AuthCommand::Login { stdin } => {
+            let value = if stdin {
+                let mut value = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut value)
+                    .map_err(Error::CredentialInput)?;
+                value.trim_end_matches(['\r', '\n']).to_owned()
+            } else {
+                rpassword::prompt_password("Linear API key: ").map_err(Error::CredentialInput)?
+            };
+            if value.trim().is_empty() {
+                return Err(Error::EmptyCredentialInput);
+            }
+            store.set(&scope, &key, &SecretValue::new(value))?;
+            Ok(Output::Auth {
+                status: "saved".to_owned(),
+                source: Some("credential_store".to_owned()),
+            })
+        }
+        AuthCommand::Status => {
+            let source = store
+                .resolve(None, Some("LINEAR_API_KEY"), &scope, &key)?
+                .map(|resolved| resolved.source.as_str().to_owned());
+            Ok(Output::Auth {
+                status: if source.is_some() { "ready" } else { "missing" }.to_owned(),
+                source,
+            })
+        }
+        AuthCommand::Logout => {
+            store.delete(&scope, &key)?;
+            Ok(Output::Auth {
+                status: "removed".to_owned(),
+                source: None,
+            })
+        }
     }
 }
 
@@ -308,6 +378,7 @@ fn run_linear(command: Command) -> Result<Output, Error> {
     let source = LinearGraphQlSource::from_env()?;
     let mut service = ReadService::open_default(source)?;
     match command {
+        Command::Auth { .. } => unreachable!("auth commands are handled before Linear dispatch"),
         Command::Next { team } => service.next(&team).map(Output::Queue),
         Command::ProjectChunk { project } => service.project_chunk(&project).map(Output::Chunk),
         Command::Search { query } => service.search(&query).map(Output::Search),
@@ -432,6 +503,10 @@ fn run_drift(config_path: &PathBuf, evidence_path: &PathBuf) -> Result<DriftRepo
 
 fn render_human(output: &Output) -> String {
     match output {
+        Output::Auth { status, source } => match source {
+            Some(source) => format!("Linear credential {status} ({source})"),
+            None => format!("Linear credential {status}"),
+        },
         Output::Queue(items) => render_queue(items),
         Output::Chunk(chunk) => render_chunk(chunk),
         Output::Focus(expansion) => render_focus(expansion),

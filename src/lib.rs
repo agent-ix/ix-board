@@ -80,9 +80,18 @@ pub enum Error {
         /// Minimum cooldown before attempting another source request.
         retry_after: std::time::Duration,
     },
-    /// LINEAR_API_KEY is missing or empty.
-    #[error("LINEAR_API_KEY is required for Linear reads")]
+    /// Neither an environment override nor a saved Linear credential exists.
+    #[error("Linear API key is missing; run `ix-board auth login` or set LINEAR_API_KEY")]
     MissingApiKey,
+    /// The shared credential store could not resolve the Linear key.
+    #[error("Linear credential error: {0}")]
+    Credential(#[from] ix_cli_kit::secrets::SecretError),
+    /// Interactive or stdin credential input failed.
+    #[error("could not read Linear API key: {0}")]
+    CredentialInput(#[source] std::io::Error),
+    /// The entered credential contains no non-whitespace characters.
+    #[error("Linear API key must not be empty")]
+    EmptyCredentialInput,
     /// The platform did not provide an application cache directory.
     #[error("could not determine the ix-board cache directory")]
     CacheDirectoryUnavailable,

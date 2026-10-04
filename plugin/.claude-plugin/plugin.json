@@ -1,0 +1,19 @@
+{
+  "name": "ix-board",
+  "version": "0.2.0",
+  "description": "Linear project and task planning plus structured early-alpha feedback using ix-board.",
+  "author": {
+    "name": "Agent IX",
+    "url": "https://github.com/agent-ix"
+  },
+  "homepage": "https://github.com/agent-ix/ix-board",
+  "repository": "https://github.com/agent-ix/ix-board",
+  "license": "AGPL-3.0-or-later",
+  "keywords": [
+    "linear",
+    "planning",
+    "project-management",
+    "ix-board"
+  ],
+  "skills": "./skills/"
+}
