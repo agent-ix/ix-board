@@ -992,6 +992,7 @@ fn focus_status_work_milestones_limit_ready_and_blocker_roots_without_hiding_pro
         .focus_status_for_milestones(&focus, &["M1".to_owned()])
         .expect("M1 status");
     assert_eq!(active.work_milestones, ["M1"]);
+    assert_eq!(active.excluded_ready_count, 1);
     assert_eq!(
         active
             .ready_queue
@@ -1055,7 +1056,7 @@ fn focus_status_reports_null_percent_for_groups_without_countable_leaves() {
     assert_eq!(status.projects[0].target_date, None);
 }
 
-/// Trace: FR-014-AC-1, FR-014-AC-2, FR-014-AC-3, FR-014-AC-4, FR-014-AC-5, FR-014-AC-6, FR-014-AC-8, FR-014-AC-9
+/// Trace: FR-014-AC-1, FR-014-AC-2, FR-014-AC-3, FR-014-AC-4, FR-014-AC-5, FR-014-AC-6, FR-014-AC-8, FR-014-AC-9, FR-014-AC-10
 #[test]
 fn focus_plan_chunk_orders_full_closure_and_returns_handoff_facts() {
     let directory = TempDir::new().expect("temporary directory");
@@ -1195,6 +1196,22 @@ fn focus_plan_chunk_orders_full_closure_and_returns_handoff_facts() {
     );
     assert_eq!(chunk.issues[5].milestone.as_deref(), Some("M1"));
     assert_eq!(chunk.issues[0].unblocks, ["IR-318", "IR-319"]);
+    let m1_chunk = reads
+        .focus_plan_chunk_for_milestones(&selection, None, &["M1".to_owned()])
+        .expect("M1 handoff");
+    assert_eq!(m1_chunk.work_milestones, ["M1"]);
+    assert_eq!(
+        m1_chunk
+            .issues
+            .iter()
+            .map(|row| row.identifier.as_str())
+            .collect::<Vec<_>>(),
+        ["IR-317", "IR-315", "IR-318"]
+    );
+    assert!(matches!(
+        reads.focus_plan_chunk_for_milestones(&selection, None, &["M9".to_owned()]),
+        Err(Error::WorkMilestoneNotFound { .. })
+    ));
     assert_eq!(
         chunk.issues[0].acceptance_criteria.as_deref(),
         Some("First criterion.")

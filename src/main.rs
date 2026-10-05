@@ -147,6 +147,9 @@ enum FocusCommand {
         /// Linear issue UUID or identifier; may be repeated.
         #[arg(long = "issue", action = clap::ArgAction::Append)]
         issues: Vec<String>,
+        /// Limit handoff roots to these exact milestone IDs or names; repeatable.
+        #[arg(long = "work-milestone", action = clap::ArgAction::Append)]
+        work_milestones: Vec<String>,
         /// Maximum number of open focus issues to emit.
         #[arg(long, value_parser = parse_positive_size)]
         size: Option<NonZeroUsize>,
@@ -451,16 +454,18 @@ fn run_linear(command: Command) -> Result<Output, Error> {
                     initiatives,
                     projects,
                     issues,
+                    work_milestones,
                     size,
                 },
         } => service
-            .focus_plan_chunk(
+            .focus_plan_chunk_for_milestones(
                 &FocusSelection {
                     initiatives,
                     projects,
                     issues,
                 },
                 size,
+                &work_milestones,
             )
             .map(Output::FocusPlanChunk),
         Command::Focus {
@@ -699,6 +704,17 @@ fn render_focus_status(status: &FocusStatus) -> String {
         }));
     }
     lines.push("Ready focus issues:".to_owned());
+    if status.ready_queue.is_empty() {
+        lines.push(if status.work_milestones.is_empty() {
+            "  (none)".to_owned()
+        } else {
+            format!(
+                "  (none in {}; {} ready in other milestones excluded)",
+                status.work_milestones.join(", "),
+                status.excluded_ready_count
+            )
+        });
+    }
     lines.extend(
         status
             .ready_queue
@@ -713,6 +729,12 @@ fn render_focus_plan_chunk(chunk: &FocusPlanChunk) -> String {
         "Focus snapshot fetched at {}",
         format_snapshot_time(chunk.fetched_at)
     )];
+    if !chunk.work_milestones.is_empty() {
+        lines.push(format!(
+            "Work milestones: {}",
+            chunk.work_milestones.join(", ")
+        ));
+    }
     lines.push("Plan chunk:".to_owned());
     if chunk.issues.is_empty() {
         lines.push("  (no open focus issues)".to_owned());
@@ -964,9 +986,29 @@ fn render_chunk(chunk: &ProjectChunk) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, FocusCommand, format_issue_ref, format_snapshot_time_at};
+    use super::{
+        Cli, Command, FocusCommand, format_issue_ref, format_snapshot_time_at, render_focus_status,
+    };
     use clap::Parser;
-    use ix_board::{IssueId, IssueReference};
+    use ix_board::{FocusStatus, IssueId, IssueReference};
+
+    /// Trace: FR-012-AC-9
+    #[test]
+    fn empty_filtered_ready_queue_explains_excluded_work() {
+        let status = FocusStatus {
+            fetched_at: 1_791_232_484,
+            work_milestones: vec!["M1 Spec".to_owned(), "M2 Core on Qwen".to_owned()],
+            excluded_ready_count: 15,
+            projects: Vec::new(),
+            blocker_layers: Vec::new(),
+            ready_queue: Vec::new(),
+        };
+        assert!(
+            render_focus_status(&status).contains(
+                "(none in M1 Spec, M2 Core on Qwen; 15 ready in other milestones excluded)"
+            )
+        );
+    }
     use std::collections::BTreeMap;
 
     /// Trace: FR-012-AC-7
@@ -1079,6 +1121,8 @@ mod tests {
             "IR-P1",
             "--issue",
             "IR-317",
+            "--work-milestone",
+            "M1",
             "--size",
             "4",
         ])
@@ -1090,11 +1134,13 @@ mod tests {
                     initiatives,
                     projects,
                     issues,
+                    work_milestones,
                     size: Some(size),
                 }
             } if initiatives == ["Delivery"]
                 && projects == ["IR-P1"]
                 && issues == ["IR-317"]
+                && work_milestones == ["M1"]
                 && size.get() == 4
         ));
         for value in ["0", "-1", "abc"] {

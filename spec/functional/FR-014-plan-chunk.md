@@ -27,7 +27,13 @@ optional positive `--size N`. If `--size` is omitted, the command SHALL emit all
 open focus issues. `--size N` SHALL limit the result to at most N emitted issue
 rows; blocker-only issues and terminal focus issues SHALL not count toward N.
 
-The command SHALL select every resolved focus issue that FR-001 classifies as
+The optional repeatable `--work-milestone` SHALL resolve exact IDs or names in
+the selected projects. When supplied, the handoff SHALL include open issues in
+those milestones and open focus-member prerequisites in their complete blocker
+closure, excluding unrelated later-milestone work. Unknown selectors SHALL
+fail explicitly. The JSON result SHALL identify the selected work milestones.
+
+Without a work-milestone filter, the command SHALL select every resolved focus issue that FR-001 classifies as
 open (neither `Completed` nor `Canceled`) before applying the size limit. When
 a resolved focus issue is open, ix-board SHALL include it in the candidate set
 regardless of blocker state, project run state, workflow state, or spec state.
@@ -117,6 +123,7 @@ and dependency cycles SHALL produce explicit errors and no partial chunk.
 | FR-014-AC-7 | The operation uses only structured Linear reads and makes no GitHub Issues request or mutation. | Inspection |
 | FR-014-AC-8 | Given one focus issue with prerequisite paths of unequal lengths in its complete blocker closure and another focus issue on a shorter path, each node receives layer zero when it has no blocker prerequisites and otherwise one plus its deepest prerequisite layer; the longer path's focus issue sorts after the shorter-path issue regardless of milestone order. | Test |
 | FR-014-AC-9 | Given unmilestoned and milestone-assigned open focus issues across projects, dependency layer sorts first, FR-001 project priority/manual order/project identifier sorts next, and within each project milestone-assigned rows follow Linear milestone order before its unmilestoned rows; stable issue identifier resolves remaining ties. | Test |
+| FR-014-AC-10 | Given a work-milestone filter, the chunk includes selected open work and open focus-member prerequisites from its blocker closure, excludes unrelated later work, preserves dependency order, and rejects unknown milestones. | Test |
 
 ## Dependencies
 
