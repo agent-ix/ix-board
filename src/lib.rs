@@ -33,10 +33,10 @@ pub use linear::LinearGraphQlSource;
 pub use model::{
     ChunkIssue, FocusBlocker, FocusExpansion, FocusIssue, FocusIssueClassification, FocusMilestone,
     FocusMilestoneStatus, FocusPlanChunk, FocusPlanIssue, FocusProgress, FocusProject,
-    FocusProjectStatus, FocusSelection, FocusStateCount, FocusStatus, FocusUnmilestonedStatus,
-    Initiative, Issue, IssueBatch, IssueId, Milestone, NextStep, Project, ProjectChunk, ProjectId,
-    ProjectPriority, ProjectRunStatus, ReadyItem, SearchKind, SearchResult, TeamKey,
-    WorkflowStateType, WorkspaceSnapshot,
+    FocusProjectStatus, FocusRecord, FocusSelection, FocusStateCount, FocusStatus,
+    FocusUnmilestonedStatus, Initiative, Issue, IssueBatch, IssueId, Milestone, NextStep, Project,
+    ProjectChunk, ProjectId, ProjectPriority, ProjectRunStatus, ReadyItem, SearchKind, SearchResult,
+    TeamKey, WorkflowStateType, WorkspaceSnapshot,
 };
 
 use model::{compare_f64, issue_is_open};
@@ -44,6 +44,9 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use thiserror::Error as ThisError;
+
+/// Current ix-board focus record JSON contract.
+pub const FOCUS_RECORD_SCHEMA_VERSION: u32 = 1;
 
 /// Errors returned by the library's read and cache boundaries.
 #[derive(Debug, ThisError)]
@@ -477,6 +480,23 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
         }
         let snapshot = self.snapshot()?;
         make_focus_status(&snapshot, selection, work_milestones)
+    }
+
+    /// Produces one versioned record with canonical selectors and focus status.
+    pub fn focus_record(&mut self, selection: &FocusSelection) -> Result<FocusRecord, Error> {
+        if selection.initiatives.is_empty()
+            && selection.projects.is_empty()
+            && selection.issues.is_empty()
+        {
+            return Err(Error::EmptyFocus);
+        }
+        let snapshot = self.snapshot()?;
+        Ok(FocusRecord {
+            schema_version: FOCUS_RECORD_SCHEMA_VERSION,
+            selection: canonical_selectors(&snapshot, selection)?,
+            reported_at: self.clock.now_epoch_seconds(),
+            status: make_focus_status(&snapshot, selection)?,
+        })
     }
 
     /// Returns a dependency-ordered handoff of open focus issues, optionally bounded by size.

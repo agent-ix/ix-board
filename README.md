@@ -81,6 +81,11 @@ ix-board search "dependency graph"
 ix-board issues SWM-12 SWM-13 SWM-14
 ```
 
+For a versioned focus record that another client can validate and store as
+JSON, run `ix-board --json focus report --initiative "Initiative name"`.
+The record includes canonical Linear IDs, the report time, and ix-board's
+status report. This command does not publish to ix-relay.
+
 Add `--json` to any command for machine-readable output. The CLI stores one
 workspace snapshot in SQLite for five minutes. The default cache is the
 platform's application cache directory; `IX_BOARD_CACHE_PATH` can select a
@@ -192,6 +197,7 @@ cargo run --example export_schema -- ProjectChunk > project-chunk.schema.json
 cargo run --example export_schema -- ReadyItem > ready-item.schema.json
 cargo run --example export_schema -- DriftReport > drift-report.schema.json
 cargo run --example export_schema -- FocusStatus > focus-status.schema.json
+cargo run --example export_schema -- FocusRecord > focus-record.schema.json
 cargo run --example export_schema -- FocusHygieneReport > focus-hygiene.schema.json
 cargo run --example export_schema -- FocusPlanChunk > focus-plan-chunk.schema.json
 ```

@@ -6,7 +6,7 @@
 use clap::{Parser, Subcommand};
 use ix_board::{
     DriftConfig, DriftError, DriftEvidenceFile, DriftReport, Error, FocusExpansion,
-    FocusHygieneReport, FocusPlanChunk, FocusSelection, FocusStatus, IssueBatch,
+    FocusHygieneReport, FocusPlanChunk, FocusRecord, FocusSelection, FocusStatus, IssueBatch,
     LinearGraphQlSource, NextStep, ProjectChunk, ProjectPriority, ProjectRunStatus, ReadService,
     ReadyItem, SearchResult, evaluate_drift_file, render_drift_text,
 };
@@ -109,6 +109,15 @@ enum AuthCommand {
 
 #[derive(Subcommand, Debug)]
 enum FocusCommand {
+    /// Emit a versioned focus record suitable for shared storage and dashboards.
+    Report {
+        #[arg(long = "initiative", action = clap::ArgAction::Append)]
+        initiatives: Vec<String>,
+        #[arg(long = "project", action = clap::ArgAction::Append)]
+        projects: Vec<String>,
+        #[arg(long = "issue", action = clap::ArgAction::Append)]
+        issues: Vec<String>,
+    },
     /// Expand selectors into focus issues and prerequisite layers.
     Expand {
         /// Linear initiative UUID, identifier (for example I-10), or exact name; may be repeated.
@@ -200,6 +209,7 @@ enum Output {
     Chunk(ProjectChunk),
     Focus(FocusExpansion),
     FocusStatus(FocusStatus),
+    FocusRecord(FocusRecord),
     FocusPlanChunk(FocusPlanChunk),
     FocusHygiene(Box<FocusHygieneReport>),
     Search(Vec<SearchResult>),
@@ -321,6 +331,16 @@ fn validate_command(command: &Command) -> Result<(), Error> {
         }
         Command::Focus {
             command:
+                FocusCommand::Report {
+                    initiatives,
+                    projects,
+                    issues,
+                },
+        } if initiatives.is_empty() && projects.is_empty() && issues.is_empty() => {
+            Err(Error::EmptyFocus)
+        }
+        Command::Focus {
+            command:
                 FocusCommand::Expand {
                     initiatives,
                     projects,
@@ -426,6 +446,20 @@ fn run_linear(command: Command) -> Result<Output, Error> {
         Command::ProjectChunk { project } => service.project_chunk(&project).map(Output::Chunk),
         Command::Search { query } => service.search(&query).map(Output::Search),
         Command::Issues { identifiers } => service.issues(&identifiers).map(Output::Issues),
+        Command::Focus {
+            command:
+                FocusCommand::Report {
+                    initiatives,
+                    projects,
+                    issues,
+                },
+        } => service
+            .focus_record(&FocusSelection {
+                initiatives,
+                projects,
+                issues,
+            })
+            .map(Output::FocusRecord),
         Command::Focus {
             command:
                 FocusCommand::Expand {
@@ -561,6 +595,13 @@ fn render_human(output: &Output) -> String {
         Output::Chunk(chunk) => render_chunk(chunk),
         Output::Focus(expansion) => render_focus(expansion),
         Output::FocusStatus(status) => render_focus_status(status),
+        Output::FocusRecord(record) => format!(
+            "Focus record v{} at {}\nSelection: {}\n{}",
+            record.schema_version,
+            format_utc(record.reported_at),
+            record.selection.join(", "),
+            render_focus_status(&record.status)
+        ),
         Output::FocusPlanChunk(chunk) => render_focus_plan_chunk(chunk),
         Output::FocusHygiene(report) => render_focus_hygiene(report),
         Output::Search(results) => results

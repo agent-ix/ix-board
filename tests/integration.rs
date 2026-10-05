@@ -850,6 +850,16 @@ fn focus_status_scopes_progress_blockers_and_ready_work_to_focus_members() {
             ..Default::default()
         })
         .expect("focus status");
+    let record = reads
+        .focus_record(&ix_board::FocusSelection {
+            projects: vec!["SWM-P1".to_owned()],
+            ..Default::default()
+        })
+        .expect("focus record");
+    assert_eq!(record.schema_version, ix_board::FOCUS_RECORD_SCHEMA_VERSION);
+    assert_eq!(record.selection, ["project:p1"]);
+    assert_eq!(record.reported_at, 9_000);
+    assert_eq!(record.status, status);
     assert_eq!(status.fetched_at, 9_000);
     let project = &status.projects[0];
     assert_eq!(project.target_date.as_deref(), Some("2026-10-30"));
