@@ -292,7 +292,7 @@ pub struct ProjectChunk {
 /// Inline selectors resolved into a deterministic Linear workspace focus.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FocusSelection {
-    /// Initiative UUIDs or exact names.
+    /// Initiative UUIDs, identifiers, or exact names.
     pub initiatives: Vec<String>,
     /// Project UUIDs, identifiers, or exact names.
     pub projects: Vec<String>,
@@ -621,6 +621,8 @@ mod tests {
 pub struct Initiative {
     /// Linear UUID.
     pub id: String,
+    /// Human-readable Linear initiative identifier, such as I-10.
+    pub identifier: String,
     /// Initiative name.
     pub name: String,
 }

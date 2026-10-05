@@ -11,7 +11,7 @@ use crate::{Error, IssueId, ProjectId, TeamKey, WorkflowStateType, WorkspaceSnap
 pub struct ScopeSelection {
     /// Restrict membership to this team; alone selects the whole team.
     pub team: Option<TeamKey>,
-    /// Initiative UUIDs or exact names.
+    /// Initiative UUIDs, identifiers, or exact names.
     pub initiatives: Vec<String>,
     /// Project UUIDs, identifiers, or exact names.
     pub projects: Vec<String>,
@@ -108,7 +108,11 @@ pub fn select_scope(
             .projects
             .iter()
             .flat_map(|p| &p.initiatives)
-            .filter(|i| i.id == *value || i.name.eq_ignore_ascii_case(value))
+            .filter(|i| {
+                i.id == *value
+                    || i.identifier.eq_ignore_ascii_case(value)
+                    || i.name.eq_ignore_ascii_case(value)
+            })
             .map(|i| &i.id)
             .collect();
         let id = unique("initiative", value, ids.into_iter().collect())?;

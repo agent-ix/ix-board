@@ -111,7 +111,7 @@ enum AuthCommand {
 enum FocusCommand {
     /// Expand selectors into focus issues and prerequisite layers.
     Expand {
-        /// Linear initiative UUID or exact name; may be repeated.
+        /// Linear initiative UUID, identifier (for example I-10), or exact name; may be repeated.
         #[arg(long = "initiative", action = clap::ArgAction::Append)]
         initiatives: Vec<String>,
         /// Linear project UUID, identifier, or exact name; may be repeated.
@@ -123,7 +123,7 @@ enum FocusCommand {
     },
     /// Report project and milestone status, blockers, and ready focus issues.
     Status {
-        /// Linear initiative UUID or exact name; may be repeated.
+        /// Linear initiative UUID, identifier (for example I-10), or exact name; may be repeated.
         #[arg(long = "initiative", action = clap::ArgAction::Append)]
         initiatives: Vec<String>,
         /// Linear project UUID, identifier, or exact name; may be repeated.
@@ -138,7 +138,7 @@ enum FocusCommand {
     },
     /// Prepare a bounded dependency-ordered handoff chunk for a focus.
     PlanChunk {
-        /// Linear initiative UUID or exact name; may be repeated.
+        /// Linear initiative UUID, identifier (for example I-10), or exact name; may be repeated.
         #[arg(long = "initiative", action = clap::ArgAction::Append)]
         initiatives: Vec<String>,
         /// Linear project UUID, identifier, or exact name; may be repeated.
@@ -156,6 +156,7 @@ enum FocusCommand {
     },
     /// Report hygiene findings and changes for a focus.
     Hygiene {
+        /// Linear initiative UUID, identifier (for example I-10), or exact name; may be repeated.
         #[arg(long = "initiative", action = clap::ArgAction::Append)]
         initiatives: Vec<String>,
         #[arg(long = "project", action = clap::ArgAction::Append)]
@@ -254,7 +255,7 @@ fn main() -> std::process::ExitCode {
             match rendered {
                 Ok(text) => {
                     emit_result(&text);
-                    std::process::ExitCode::from(Outcome::Ok)
+                    std::process::ExitCode::from(output_outcome(&output))
                 }
                 Err(error) => {
                     emit_diagnostic(
@@ -284,6 +285,15 @@ fn main() -> std::process::ExitCode {
                 _ => Outcome::Internal,
             })
         }
+    }
+}
+
+fn output_outcome(output: &Output) -> Outcome {
+    match output {
+        Output::Issues(batch) if batch.issues.is_empty() && !batch.missing.is_empty() => {
+            Outcome::Invalid
+        }
+        _ => Outcome::Ok,
     }
 }
 
@@ -1002,10 +1012,25 @@ fn render_chunk(chunk: &ProjectChunk) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, FocusCommand, format_issue_ref, format_snapshot_time_at, render_focus_status,
+        Cli, Command, FocusCommand, Output, format_issue_ref, format_snapshot_time_at,
+        output_outcome, render_focus_status,
     };
     use clap::Parser;
-    use ix_board::{FocusStatus, IssueId, IssueReference};
+    use ix_board::{FocusStatus, IssueBatch, IssueId, IssueReference};
+    use ix_cli_kit::exit::Outcome;
+
+    /// Trace: FR-015-AC-4
+    #[test]
+    fn all_missing_issue_batch_exits_nonzero_after_rendering() {
+        assert_eq!(
+            output_outcome(&Output::Issues(IssueBatch {
+                issues: Vec::new(),
+                missing: vec!["SAPHO-9999".to_owned()],
+                complete: false,
+            })) as u8,
+            Outcome::Invalid as u8
+        );
+    }
 
     /// Trace: FR-012-AC-9
     #[test]

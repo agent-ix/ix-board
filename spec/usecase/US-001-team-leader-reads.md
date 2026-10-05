@@ -68,6 +68,12 @@ reads through a warm cache.
 - **Then** the found tickets retain their exact Linear states and the missing
   identifier is called out without hiding the found records
 
+### US-001-EX-5: Detect an entirely stale ticket list in a script
+
+- **Given** every requested issue identifier is unknown to the current snapshot
+- **When** a script reads them together
+- **Then** ix-board prints the missing identifiers and exits non-zero
+
 ## Notes (Informative)
 
 The MVP uses the Linear status, queue, search, and cache defaults stated in
