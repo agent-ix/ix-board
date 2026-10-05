@@ -39,6 +39,14 @@ and understand which items are ready now.
 - **Then** the command returns at most N issue rows from the deterministic
   dependency and milestone ordering
 
+### US-006-EX-3: Hand off active milestones with prerequisites
+
+- **Given** a campaign with active M1/M2 work, later backlog, and an open
+  prerequisite in another milestone
+- **When** the lead requests a plan chunk for M1/M2
+- **Then** the chunk includes selected work and the required open focus-member
+  prerequisite in dependency order, while excluding unrelated later work
+
 ## Notes (Informative)
 
 FR-010 and FR-011 own inline focus selection and expansion. FR-001 owns ready

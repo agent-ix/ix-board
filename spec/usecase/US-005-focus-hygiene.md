@@ -33,6 +33,13 @@ since I last reviewed it.
   relations change
 - **Then** ix-board reports those changes against the stored prior snapshot
 
+### US-005-EX-3: Distinguish unavailable PR checks from clean results
+
+- **Given** repeated links to the same PR and no available GitHub token
+- **When** the planner runs focus hygiene
+- **Then** the PR check reports one unavailable reason and marks
+  the section incomplete instead of listing duplicate reasons or zero findings
+
 ## Notes (Informative)
 
 PR state is looked up from a GitHub pull request URL attached to a Linear
