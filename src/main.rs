@@ -535,7 +535,7 @@ fn render_human(output: &Output) -> String {
 fn render_focus(expansion: &FocusExpansion) -> String {
     let mut lines = vec![format!(
         "Focus snapshot fetched at {}",
-        expansion.fetched_at
+        format_snapshot_time(expansion.fetched_at)
     )];
     lines.push("Selected projects:".to_owned());
     if expansion.projects.is_empty() {
@@ -593,7 +593,10 @@ fn render_focus(expansion: &FocusExpansion) -> String {
 }
 
 fn render_focus_status(status: &FocusStatus) -> String {
-    let mut lines = vec![format!("Focus snapshot fetched at {}", status.fetched_at)];
+    let mut lines = vec![format!(
+        "Focus snapshot fetched at {}",
+        format_snapshot_time(status.fetched_at)
+    )];
     for project in &status.projects {
         lines.push(format!("Project {} — {}", project.identifier, project.name));
         lines.push(format!(
@@ -621,6 +624,14 @@ fn render_focus_status(status: &FocusStatus) -> String {
                 milestone.progress,
             );
         }
+        lines.push("  No milestone:".to_owned());
+        render_status_group(
+            &mut lines,
+            "    ",
+            &project.unmilestoned.open_by_state,
+            &project.unmilestoned.in_progress,
+            project.unmilestoned.progress,
+        );
     }
     lines.push("Blocker layers:".to_owned());
     for (index, layer) in status.blocker_layers.iter().enumerate() {
@@ -647,7 +658,10 @@ fn render_focus_status(status: &FocusStatus) -> String {
 }
 
 fn render_focus_plan_chunk(chunk: &FocusPlanChunk) -> String {
-    let mut lines = vec![format!("Focus snapshot fetched at {}", chunk.fetched_at)];
+    let mut lines = vec![format!(
+        "Focus snapshot fetched at {}",
+        format_snapshot_time(chunk.fetched_at)
+    )];
     lines.push("Plan chunk:".to_owned());
     if chunk.issues.is_empty() {
         lines.push("  (no open focus issues)".to_owned());
@@ -683,8 +697,8 @@ fn render_focus_hygiene(report: &FocusHygieneReport) -> String {
     group_header!("Missing scope", report.missing_scope);
     for finding in &report.missing_scope.findings {
         lines.push(format!(
-            "  {} missing {}",
-            finding.issue_id.0,
+            "  {}: missing {}",
+            issue_label(report, &finding.issue_id),
             finding.missing_fields.join(", ")
         ));
     }
@@ -698,16 +712,16 @@ fn render_focus_hygiene(report: &FocusHygieneReport) -> String {
             finding
                 .open_issue_ids
                 .iter()
-                .map(|id| id.0.as_str())
+                .map(|id| issue_label(report, id))
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join("; ")
         ));
     }
     group_header!("Pull requests", report.pull_requests);
     for finding in &report.pull_requests.findings {
         lines.push(format!(
             "  {} {}#{} {}",
-            finding.issue_id.0,
+            issue_label(report, &finding.issue_id),
             finding.repository,
             finding.number,
             finding.kind.as_str()
@@ -717,7 +731,9 @@ fn render_focus_hygiene(report: &FocusHygieneReport) -> String {
     for finding in &report.stale_issues.findings {
         lines.push(format!(
             "  {} last updated {} ({} days)",
-            finding.issue_id.0, finding.updated_at, finding.elapsed_days
+            issue_label(report, &finding.issue_id),
+            finding.updated_at,
+            finding.elapsed_days
         ));
     }
     group_header!("Near-duplicate titles", report.near_duplicate_titles);
@@ -727,14 +743,17 @@ fn render_focus_hygiene(report: &FocusHygieneReport) -> String {
             finding
                 .issue_ids
                 .iter()
-                .map(|id| id.0.as_str())
+                .map(|id| issue_label(report, id))
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join("; ")
         ));
     }
     group_header!("Diff", report.diff);
     for finding in &report.diff.findings {
-        lines.push(format!("  {finding:?}"));
+        lines.push(format!(
+            "  {}: {finding:?}",
+            issue_label(report, change_issue_id(finding))
+        ));
     }
     lines.join("\n")
 }
@@ -760,6 +779,49 @@ fn format_utc(epoch: i64) -> String {
     )
 }
 
+fn format_snapshot_time(epoch: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok());
+    format_snapshot_time_at(epoch, now)
+}
+
+fn format_snapshot_time_at(epoch: i64, now: Option<i64>) -> String {
+    match now.and_then(|now| now.checked_sub(epoch)) {
+        Some(age) if age >= 0 => format!("{} ({}s old)", format_utc(epoch), age),
+        Some(_) => format!("{} (clock ahead of local time)", format_utc(epoch)),
+        None => format!("{} (age unavailable)", format_utc(epoch)),
+    }
+}
+
+fn issue_label(report: &FocusHygieneReport, id: &ix_board::IssueId) -> String {
+    format_issue_ref(&report.issue_refs, id)
+}
+
+fn format_issue_ref(
+    refs: &std::collections::BTreeMap<ix_board::IssueId, ix_board::IssueReference>,
+    id: &ix_board::IssueId,
+) -> String {
+    refs.get(id).map_or_else(
+        || id.0.clone(),
+        |reference| format!("{} — {}", reference.identifier, reference.title),
+    )
+}
+
+fn change_issue_id(change: &ix_board::FocusChange) -> &ix_board::IssueId {
+    use ix_board::FocusChange;
+    match change {
+        FocusChange::Membership { issue_id, .. }
+        | FocusChange::State { issue_id, .. }
+        | FocusChange::Project { issue_id, .. }
+        | FocusChange::Milestone { issue_id, .. }
+        | FocusChange::Blockers { issue_id, .. }
+        | FocusChange::Created { issue_id }
+        | FocusChange::Closed { issue_id } => issue_id,
+    }
+}
+
 fn render_status_group(
     lines: &mut Vec<String>,
     indent: &str,
@@ -768,14 +830,14 @@ fn render_status_group(
     progress: ix_board::FocusProgress,
 ) {
     lines.push(format!(
-        "{indent}Progress: {}/{} leaves ({})",
+        "{indent}Progress: {}/{} leaf tasks, excluding parents ({})",
         progress.done,
         progress.total,
         progress
             .completed_percent
             .map_or_else(|| "n/a".to_owned(), |percent| format!("{percent:.1}%"))
     ));
-    lines.push(format!("{indent}Open by state:"));
+    lines.push(format!("{indent}Open by state, including parents:"));
     lines.extend(
         open_by_state
             .iter()
@@ -851,8 +913,41 @@ fn render_chunk(chunk: &ProjectChunk) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, FocusCommand};
+    use super::{Cli, Command, FocusCommand, format_issue_ref, format_snapshot_time_at};
     use clap::Parser;
+    use ix_board::{IssueId, IssueReference};
+    use std::collections::BTreeMap;
+
+    /// Trace: FR-012-AC-7
+    #[test]
+    fn snapshot_time_is_readable_and_reports_age() {
+        assert_eq!(
+            format_snapshot_time_at(1_791_232_484, Some(1_791_232_514)),
+            "2026-10-05T20:34:44Z (30s old)"
+        );
+        assert!(format_snapshot_time_at(10, Some(9)).contains("clock ahead"));
+    }
+
+    /// Trace: FR-013-AC-12
+    #[test]
+    fn hygiene_issue_label_uses_identifier_and_title_with_uuid_fallback() {
+        let id = IssueId("issue-uuid".to_owned());
+        let refs = BTreeMap::from([(
+            id.clone(),
+            IssueReference {
+                identifier: "SAPHO-57".to_owned(),
+                title: "Add Extractor port".to_owned(),
+            },
+        )]);
+        assert_eq!(
+            format_issue_ref(&refs, &id),
+            "SAPHO-57 — Add Extractor port"
+        );
+        assert_eq!(
+            format_issue_ref(&refs, &IssueId("missing-uuid".to_owned())),
+            "missing-uuid"
+        );
+    }
 
     /// Trace: FR-011-AC-1
     #[test]

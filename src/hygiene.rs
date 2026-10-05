@@ -101,6 +101,16 @@ pub struct PullRequestFinding {
     pub merged_at: Option<String>,
 }
 
+/// Human-readable Linear identity for an issue referenced by a hygiene finding.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IssueReference {
+    /// Stable Linear issue identifier.
+    pub identifier: String,
+    /// Current issue title.
+    pub title: String,
+}
+
 /// PR and issue state mismatch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -212,6 +222,8 @@ pub struct FocusHygieneReport {
     pub canonical_focus: Vec<String>,
     /// Stale threshold in days.
     pub stale_days: u32,
+    /// Human-readable identities keyed by the UUIDs referenced in findings.
+    pub issue_refs: BTreeMap<IssueId, IssueReference>,
     /// Issues missing project or milestone assignment.
     pub missing_scope: HygieneGroup<MissingScopeFinding>,
     /// Overdue milestones with open focus issues.
@@ -397,10 +409,11 @@ pub fn build_report(
         diff_reasons.push("createdAt unavailable or invalid for a newly focused issue".to_owned());
     }
     let baseline_advance = stale_reasons.is_empty() && diff_reasons.is_empty();
-    Ok(FocusHygieneReport {
+    let mut report = FocusHygieneReport {
         report_time: report_time.to_owned(),
         canonical_focus,
         stale_days,
+        issue_refs: BTreeMap::new(),
         missing_scope: available(missing_scope),
         overdue_milestones: available(overdue),
         pull_requests: pull_request_group(&focused),
@@ -419,7 +432,65 @@ pub fn build_report(
         },
         baseline: current_baseline,
         baseline_advance,
-    })
+    };
+    let mut referenced = BTreeSet::new();
+    referenced.extend(
+        report
+            .missing_scope
+            .findings
+            .iter()
+            .map(|finding| finding.issue_id.clone()),
+    );
+    referenced.extend(
+        report
+            .overdue_milestones
+            .findings
+            .iter()
+            .flat_map(|finding| finding.open_issue_ids.iter().cloned()),
+    );
+    referenced.extend(
+        report
+            .pull_requests
+            .findings
+            .iter()
+            .map(|finding| finding.issue_id.clone()),
+    );
+    referenced.extend(
+        report
+            .stale_issues
+            .findings
+            .iter()
+            .map(|finding| finding.issue_id.clone()),
+    );
+    referenced.extend(
+        report
+            .near_duplicate_titles
+            .findings
+            .iter()
+            .flat_map(|finding| finding.issue_ids.iter().cloned()),
+    );
+    referenced.extend(
+        report
+            .diff
+            .findings
+            .iter()
+            .map(|finding| change_issue_id(finding).clone()),
+    );
+    report.issue_refs = referenced
+        .into_iter()
+        .filter_map(|id| {
+            issues.get(&id).map(|issue| {
+                (
+                    id,
+                    IssueReference {
+                        identifier: issue.identifier.clone(),
+                        title: issue.title.clone(),
+                    },
+                )
+            })
+        })
+        .collect();
+    Ok(report)
 }
 
 fn group_with_reasons<T>(findings: Vec<T>, reasons: Vec<String>) -> HygieneGroup<T> {
@@ -1115,7 +1186,7 @@ mod tests {
         baseline_issue(issue, in_focus)
     }
 
-    /// Trace: FR-013-AC-1, FR-013-AC-2
+    /// Trace: FR-013-AC-1, FR-013-AC-2, FR-013-AC-12
     #[test]
     fn tc_013_01_missing_scope_is_independent_and_overdue_needs_open_work() {
         let mut no_project = issue("IR-1", "one", WorkflowStateType::Completed);
@@ -1142,6 +1213,22 @@ mod tests {
             report.overdue_milestones.findings[0].open_issue_ids,
             vec![open.id.clone()]
         );
+        assert_eq!(
+            report.issue_refs.get(&no_project.id),
+            Some(&IssueReference {
+                identifier: "IR-1".to_owned(),
+                title: "one".to_owned(),
+            })
+        );
+        assert_eq!(
+            report.issue_refs.get(&open.id),
+            Some(&IssueReference {
+                identifier: "IR-2".to_owned(),
+                title: "two".to_owned(),
+            })
+        );
+        let json = serde_json::to_value(&report).expect("serialize hygiene report");
+        assert_eq!(json["issue_refs"]["IR-2"]["title"], "two");
         snapshot.projects[0].milestones[0].target_date = Some("2026-02-01".to_owned());
         let due_today = build_report(
             &snapshot,
@@ -1216,9 +1303,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![old.id]
         );
+        assert!(report.issue_refs.contains_key(&IssueId("IR-2".to_owned())));
     }
 
-    /// Trace: FR-013-AC-5, FR-013-AC-10, FR-013-AC-11
+    /// Trace: FR-013-AC-5, FR-013-AC-10, FR-013-AC-11, FR-013-AC-12
     #[test]
     fn tc_013_03_duplicate_component_threshold_and_pair_cap_are_deterministic() {
         let related = [
@@ -1270,6 +1358,9 @@ mod tests {
                 .len(),
             2
         );
+        assert!(focused_report.issue_refs.contains_key(&related[0].id));
+        assert!(focused_report.issue_refs.contains_key(&related[1].id));
+        assert!(!focused_report.issue_refs.contains_key(&related[2].id));
         let below = issue("IR-4", "hash digest token", WorkflowStateType::Started);
         assert!(duplicate_groups(&[&related[0], &below]).unwrap().is_empty());
         let five_tokens = issue(
@@ -1613,7 +1704,7 @@ mod tests {
         );
     }
 
-    /// Trace: FR-013-AC-7, FR-013-AC-8, FR-013-AC-9
+    /// Trace: FR-013-AC-7, FR-013-AC-8, FR-013-AC-9, FR-013-AC-12
     #[test]
     fn tc_013_07_incomplete_diff_preserves_baseline_and_complete_output_is_stable() {
         let current = issue("IR-2", "current", WorkflowStateType::Started);
@@ -1650,6 +1741,27 @@ mod tests {
             GroupStatus::Unavailable
         ));
         assert!(!incomplete.baseline_advance);
+        let complete_snapshot = workspace_snapshot(vec![current.clone(), prior_only.clone()]);
+        let complete = build_report(
+            &complete_snapshot,
+            &ids,
+            vec!["project:p1".into()],
+            "2026-02-02T00:00:00Z",
+            30,
+            Some(("2026-02-01T00:00:00Z", &[baseline(&prior_only, true)])),
+            None,
+        )
+        .unwrap();
+        assert!(complete.diff.findings.iter().any(|finding| {
+            matches!(finding, FocusChange::Membership { issue_id, change: FocusMembershipChange::LeftFocus } if issue_id == &prior_only.id)
+        }));
+        assert_eq!(
+            complete
+                .issue_refs
+                .get(&prior_only.id)
+                .map(|reference| reference.title.as_str()),
+            Some("moved out")
+        );
         let first_copy = serde_json::to_vec(&initial).unwrap();
         let second_copy = serde_json::to_vec(
             &build_report(

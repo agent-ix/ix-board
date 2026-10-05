@@ -370,6 +370,8 @@ pub struct FocusProjectStatus {
     pub progress: FocusProgress,
     /// Selected milestone status, in Linear milestone order.
     pub milestones: Vec<FocusMilestoneStatus>,
+    /// Status of focus issues assigned to the project without a milestone.
+    pub unmilestoned: FocusUnmilestonedStatus,
 }
 
 /// Status summary for one selected Linear project milestone.
@@ -387,6 +389,18 @@ pub struct FocusMilestoneStatus {
     /// Started focus issues assigned to this milestone.
     pub in_progress: Vec<FocusIssue>,
     /// Progress over countable focus leaf issues assigned to this milestone.
+    pub progress: FocusProgress,
+}
+
+/// Status of project focus issues without a milestone assignment.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FocusUnmilestonedStatus {
+    /// Open focus issue counts by Linear workflow-state display name.
+    pub open_by_state: Vec<FocusStateCount>,
+    /// Started focus issues without a milestone.
+    pub in_progress: Vec<FocusIssue>,
+    /// Progress over countable focus leaf issues without a milestone.
     pub progress: FocusProgress,
 }
 

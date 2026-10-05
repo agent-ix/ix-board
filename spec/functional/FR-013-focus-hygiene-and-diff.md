@@ -150,6 +150,11 @@ GitHub.
   `stale_days` threshold, five hygiene groups (`missing_scope`,
   `overdue_milestone`, PR-status mismatch, `stale_issue`, and
   `near_duplicate_titles`), and a diff group.
+- An `issue_refs` map keyed by the stable UUIDs referenced in findings. Each
+  available entry SHALL contain the current Linear identifier and title.
+  Finding IDs remain unchanged. Terminal output SHALL print the identifier and
+  title for each referenced issue, falling back to the UUID when no current
+  issue record is available.
 - Each group SHALL expose `available` or `unavailable`, a list of missing
   source reasons, and any findings proven by available records.
 - The diff SHALL expose focus-membership changes (`entered_focus` and
@@ -177,6 +182,7 @@ GitHub.
 | FR-013-AC-9 | When a previously focused issue moves to a project outside the current focus, the diff still reports its `left_focus` membership change and old/current project IDs from the union of prior focus IDs and current focus IDs. A changed issue whose current record cannot be fetched makes the diff unavailable and does not advance the baseline. | Test |
 | FR-013-AC-10 | The inverted index generates each unique issue pair within the resolved focus that shares at least one normalized content token, counts shared tokens, excludes out-of-focus issues, and applies the three-token and title-overlap thresholds only after candidate enumeration; candidate pairs, connected-component groups, and group members use the specified stable ordering. | Test |
 | FR-013-AC-11 | A fixture of 448 focused titles each normalizing to the same single content token generates 100,128 all-candidate pairs and returns `resource_limit` before title-match filtering, with no partial report and no baseline update; 447 such titles yield 99,681 candidates and no duplicate group because the match threshold is not met. | Test |
+| FR-013-AC-12 | JSON `issue_refs` contains identifier and title for available issues referenced by scope, overdue, PR, stale, duplicate, and diff findings while retaining their stable UUID fields. Terminal findings use those references and fall back to UUIDs when a current record is unavailable. | Test |
 
 ## Dependencies
 

@@ -71,10 +71,13 @@ refresh leaves no cached snapshot for subsequent reads.
 ## Agent plugin
 
 The standalone ix-board plugin provides planning and early-alpha feedback
-skills for Claude Code and Codex. Install the CLI separately:
+skills for Claude Code and Codex. The `focus-status`, `focus-hygiene`, and
+`plan-chunk` skills live here with the commands and report schema they use;
+team lead and planner role skills consume their results. Install the CLI
+separately:
 
 ```bash
-cargo +1.98.1 install --git https://github.com/agent-ix/ix-board --tag v0.2.0 --locked
+cargo +1.98.1 install --git https://github.com/agent-ix/ix-board --tag v0.2.1 --locked
 ```
 
 For Claude Code:
@@ -156,7 +159,7 @@ completeness; the evaluator fails closed when it reports missing evidence.
 
 ## JSON Schema for downstream clients
 
-The public project, ready-queue, and drift wire types derive `schemars::JsonSchema`
+The public project, ready-queue, focus-report, and drift wire types derive `schemars::JsonSchema`
 from their authoritative Rust definitions. Export a schema for a downstream
 contract build with:
 
@@ -165,6 +168,9 @@ cargo run --example export_schema -- Project > project.schema.json
 cargo run --example export_schema -- ProjectChunk > project-chunk.schema.json
 cargo run --example export_schema -- ReadyItem > ready-item.schema.json
 cargo run --example export_schema -- DriftReport > drift-report.schema.json
+cargo run --example export_schema -- FocusStatus > focus-status.schema.json
+cargo run --example export_schema -- FocusHygieneReport > focus-hygiene.schema.json
+cargo run --example export_schema -- FocusPlanChunk > focus-plan-chunk.schema.json
 ```
 
 The schemas describe the serialized wire shape, including flattened signal
