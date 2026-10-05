@@ -1578,20 +1578,27 @@ fn issue_batch_returns_exact_states_in_request_order_with_one_snapshot() {
         .expect("issue batch");
     assert_eq!(
         batch
+            .issues
             .iter()
             .map(|issue| issue.identifier.as_str())
             .collect::<Vec<_>>(),
         ["SWM-2", "SWM-1"]
     );
+    assert!(batch.complete);
+    assert!(batch.missing.is_empty());
     assert_eq!(source.reads.load(Ordering::SeqCst), 1);
-    assert!(matches!(
-        reads.issues(&["SWM-404".to_owned()]),
-        Err(Error::ScopeSelection {
-            kind: "issue",
-            matches: 0,
-            ..
-        })
-    ));
+    let partial = reads
+        .issues(&[
+            "SWM-1".to_owned(),
+            "SWM-404".to_owned(),
+            "swm-404".to_owned(),
+        ])
+        .expect("partial issue batch");
+    assert_eq!(partial.issues.len(), 1);
+    assert_eq!(partial.issues[0].identifier, "SWM-1");
+    assert_eq!(partial.missing, ["SWM-404"]);
+    assert!(!partial.complete);
+    assert_eq!(source.reads.load(Ordering::SeqCst), 1);
 }
 
 /// Trace: FR-010-AC-4
