@@ -32,7 +32,7 @@ source data, and a dependency-cycle error if the closure contains a cycle.
 
 ## Inputs
 
-- A project identifier accepted by `project-chunk <project>`.
+- A project identifier, UUID, or exact case-insensitive name accepted by `project-chunk <project>`; ambiguous names fail explicitly.
 
 ## Outputs
 
@@ -53,6 +53,7 @@ source data, and a dependency-cycle error if the closure contains a cycle.
 | FR-002-AC-6 | Given a dependency graph for the closure, layers place prerequisites before dependents and order entries within each layer by stable Linear issue identifier. | Test |
 | FR-002-AC-7 | Given a `blocked_by` reference in the closure to an issue absent from the structured source data, `project-chunk` reports a missing-dependency error. | Test |
 | FR-002-AC-8 | Given a cycle in the dependency closure, `project-chunk` reports a dependency-cycle error. | Test |
+| FR-002-AC-9 | An exact project name resolves case-insensitively to the same chunk as its identifier; duplicate matching names fail explicitly rather than choosing one. | Test |
 
 ## Dependencies
 

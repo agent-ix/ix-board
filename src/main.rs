@@ -58,7 +58,7 @@ enum Command {
     },
     /// Return a project's goal, milestones, open tickets, and blocker layers.
     ProjectChunk {
-        /// Linear project identifier or UUID.
+        /// Linear project identifier, UUID, or exact name.
         project: String,
     },
     /// Search structured project and issue fields.

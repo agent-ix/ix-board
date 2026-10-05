@@ -798,16 +798,40 @@ fn make_project_chunk(
     snapshot: &WorkspaceSnapshot,
     identifier: &str,
 ) -> Result<ProjectChunk, Error> {
-    let Some(project) = snapshot.projects.iter().find(|project| {
-        project.id.0.eq_ignore_ascii_case(identifier)
-            || project
-                .identifier
-                .as_deref()
-                .is_some_and(|id| id.eq_ignore_ascii_case(identifier))
-    }) else {
-        return Err(Error::ProjectNotFound {
-            identifier: identifier.to_owned(),
-        });
+    let exact = snapshot
+        .projects
+        .iter()
+        .filter(|project| {
+            project.id.0.eq_ignore_ascii_case(identifier)
+                || project
+                    .identifier
+                    .as_deref()
+                    .is_some_and(|id| id.eq_ignore_ascii_case(identifier))
+        })
+        .collect::<Vec<_>>();
+    let matches = if exact.is_empty() {
+        snapshot
+            .projects
+            .iter()
+            .filter(|project| project.name.eq_ignore_ascii_case(identifier))
+            .collect::<Vec<_>>()
+    } else {
+        exact
+    };
+    let project = match matches.as_slice() {
+        [project] => *project,
+        [] => {
+            return Err(Error::ProjectNotFound {
+                identifier: identifier.to_owned(),
+            });
+        }
+        _ => {
+            return Err(Error::ScopeSelection {
+                kind: "project",
+                identifier: identifier.to_owned(),
+                matches: matches.len(),
+            });
+        }
     };
     let issues: HashMap<_, _> = snapshot
         .issues
