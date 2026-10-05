@@ -1550,6 +1550,33 @@ fn search_is_case_insensitive_structured_and_ordered_by_kind_then_identifier() {
     );
 }
 
+/// Trace: FR-015-AC-1, FR-015-AC-2
+#[test]
+fn issue_batch_returns_exact_states_in_request_order_with_one_snapshot() {
+    let directory = TempDir::new().expect("temporary directory");
+    let source = FixtureSource::new(queue_fixture());
+    let mut reads = service(source.clone(), ManualClock::new(3_000), &directory);
+    let batch = reads
+        .issues(&["SWM-2".to_owned(), "swm-1".to_owned(), "SWM-2".to_owned()])
+        .expect("issue batch");
+    assert_eq!(
+        batch
+            .iter()
+            .map(|issue| issue.identifier.as_str())
+            .collect::<Vec<_>>(),
+        ["SWM-2", "SWM-1"]
+    );
+    assert_eq!(source.reads.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        reads.issues(&["SWM-404".to_owned()]),
+        Err(Error::ScopeSelection {
+            kind: "issue",
+            matches: 0,
+            ..
+        })
+    ));
+}
+
 /// Trace: FR-010-AC-4
 #[test]
 fn cache_reuses_fresh_snapshot_and_refreshes_after_five_minutes() {
