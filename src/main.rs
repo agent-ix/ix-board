@@ -6,9 +6,9 @@
 use clap::{Parser, Subcommand};
 use ix_board::{
     DriftConfig, DriftError, DriftEvidenceFile, DriftReport, Error, FocusExpansion,
-    FocusHygieneReport, FocusPlanChunk, FocusSelection, FocusStatus, Issue, LinearGraphQlSource,
-    NextStep, ProjectChunk, ProjectPriority, ProjectRunStatus, ReadService, ReadyItem,
-    SearchResult, evaluate_drift_file, render_drift_text,
+    FocusHygieneReport, FocusPlanChunk, FocusSelection, FocusStatus, IssueBatch,
+    LinearGraphQlSource, NextStep, ProjectChunk, ProjectPriority, ProjectRunStatus, ReadService,
+    ReadyItem, SearchResult, evaluate_drift_file, render_drift_text,
 };
 use ix_cli_kit::exit::Outcome;
 use ix_cli_kit::secrets::{AppScope, SecretKey, SecretStore, SecretValue};
@@ -202,7 +202,7 @@ enum Output {
     FocusPlanChunk(FocusPlanChunk),
     FocusHygiene(Box<FocusHygieneReport>),
     Search(Vec<SearchResult>),
-    Issues(Vec<Issue>),
+    Issues(IssueBatch),
     Drift(DriftReport),
     ProjectStatusUpdated {
         project: String,
@@ -558,16 +558,22 @@ fn render_human(output: &Output) -> String {
             .map(|record| format!("{:?} {} — {}", record.kind, record.identifier, record.name))
             .collect::<Vec<_>>()
             .join("\n"),
-        Output::Issues(issues) => issues
-            .iter()
-            .map(|issue| {
-                format!(
-                    "{} [{}] {}",
-                    issue.identifier, issue.state_name, issue.title
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
+        Output::Issues(batch) => {
+            let mut lines = batch
+                .issues
+                .iter()
+                .map(|issue| {
+                    format!(
+                        "{} [{}] {}",
+                        issue.identifier, issue.state_name, issue.title
+                    )
+                })
+                .collect::<Vec<_>>();
+            if !batch.missing.is_empty() {
+                lines.push(format!("Missing: {}", batch.missing.join(", ")));
+            }
+            lines.join("\n")
+        }
         Output::Drift(report) => render_drift_text(report),
         Output::ProjectStatusUpdated { project, status } => {
             format!("Project {project} status set to {status}")

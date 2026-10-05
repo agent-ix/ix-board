@@ -43,9 +43,9 @@ If credentials are missing, run `ix-board auth login` in an interactive terminal
    ix-board search "<QUERY>"
    ```
 
-   If a project name is ambiguous, use its identifier from `search`. Use `focus status --project <EXACT-NAME>` for a progress report. Select focus only from an explicit request or structured Linear context. Run `ix-board focus <COMMAND> --help` when selector syntax is unclear.
+   Names match exactly without case sensitivity. If a name is ambiguous, use its identifier from `search`. Use `focus status --project <EXACT-NAME>` for a progress report. Select focus only from an explicit request or structured Linear context. Run `ix-board focus <COMMAND> --help` when selector syntax is unclear.
 
-5. To check several exact issue states in one read, pass their identifiers to `issues`. Preserve the returned order and exact Linear state names:
+5. To check several exact issue states in one read, pass their identifiers to `issues`. Preserve the returned order and exact Linear state names; call out any `missing` selectors without hiding found records:
 
    ```bash
    ix-board issues SWM-12 SWM-13 SWM-14

@@ -17,6 +17,8 @@ relationships:
     type: traces_to
   - target: "ix://agent-ix/ix-board/FR-007"
     type: traces_to
+  - target: "ix://agent-ix/ix-board/FR-015"
+    type: traces_to
   - target: "ix://agent-ix/ix-board/NFR-001"
     type: traces_to
 ---
@@ -58,6 +60,13 @@ reads through a warm cache.
 - **Given** matching ticket and project records
 - **When** the team leader searches for a query
 - **Then** matching tickets and projects are returned from structured data
+
+### US-001-EX-4: Check a handoff's ticket states in one read
+
+- **Given** a lead has a list of ticket identifiers and one identifier is stale
+- **When** the lead reads those issues together
+- **Then** the found tickets retain their exact Linear states and the missing
+  identifier is called out without hiding the found records
 
 ## Notes (Informative)
 
