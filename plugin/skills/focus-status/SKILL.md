@@ -19,6 +19,7 @@ If this plugin is not initialized or an Agent IX command fails, read [the ix-boa
    ```
 
    Combine selectors when the focus requires them. Add `--json` when structured output makes it easier to preserve every returned field.
+   When the user names active milestones, repeat `--work-milestone <ID-OR-EXACT-NAME>` for each one. This narrows blocker roots and the ready queue; project and milestone progress still cover the full selected focus. An unknown milestone is an error. Do not infer an active milestone from ticket prose.
 3. Use the command result as the authority. Preserve project and milestone status, each returned milestone's `done` and `total` leaf counts, blocker layers and `focus_root_ids`, the ready queue, and the source fetch timestamp. Do not recalculate focus membership, blockers, readiness, or ordering. If counts are absent or incomplete, preserve that absence; the team-planner must report `undetermined` when required counts are missing or have `total` equal to zero.
 4. Report the source fetch timestamp and its elapsed age at report time, using
    the current UTC time. If the timestamp is absent, malformed, or unavailable,

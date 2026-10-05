@@ -84,6 +84,9 @@ pub enum Error {
     /// Neither an environment override nor a saved Linear credential exists.
     #[error("Linear API key is missing; run `ix-board auth login` or set LINEAR_API_KEY")]
     MissingApiKey,
+    /// A requested work milestone did not match a milestone in the selected projects.
+    #[error("work milestone {selector:?} not found in the selected focus projects")]
+    WorkMilestoneNotFound { selector: String },
     /// The shared credential store could not resolve the Linear key.
     #[error("Linear credential error: {0}")]
     Credential(#[from] ix_cli_kit::secrets::SecretError),
@@ -407,6 +410,15 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
 
     /// Returns focus status, complete blocker attribution, and eligible ready work.
     pub fn focus_status(&mut self, selection: &FocusSelection) -> Result<FocusStatus, Error> {
+        self.focus_status_for_milestones(selection, &[])
+    }
+
+    /// Returns full project progress, limiting blocker roots and ready work to named milestones.
+    pub fn focus_status_for_milestones(
+        &mut self,
+        selection: &FocusSelection,
+        work_milestones: &[String],
+    ) -> Result<FocusStatus, Error> {
         if selection.initiatives.is_empty()
             && selection.projects.is_empty()
             && selection.issues.is_empty()
@@ -414,7 +426,7 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
             return Err(Error::EmptyFocus);
         }
         let snapshot = self.snapshot()?;
-        make_focus_status(&snapshot, selection)
+        make_focus_status(&snapshot, selection, work_milestones)
     }
 
     /// Returns a dependency-ordered handoff of open focus issues, optionally bounded by size.
@@ -975,6 +987,7 @@ fn make_focus_expansion(
 fn make_focus_status(
     snapshot: &WorkspaceSnapshot,
     selection: &FocusSelection,
+    work_milestones: &[String],
 ) -> Result<FocusStatus, Error> {
     let expansion = make_focus_expansion(snapshot, selection)?;
     let scope = select_scope(
@@ -994,6 +1007,23 @@ fn make_focus_status(
         .iter()
         .map(|issue| (issue.id.clone(), issue))
         .collect();
+    let mut work_milestone_ids = BTreeSet::new();
+    for selector in work_milestones {
+        let matches = snapshot
+            .projects
+            .iter()
+            .filter(|project| scope.project_ids.contains(&project.id))
+            .flat_map(|project| project.milestones.iter())
+            .filter(|milestone| milestone.id == *selector || milestone.name == *selector)
+            .map(|milestone| milestone.id.clone())
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            return Err(Error::WorkMilestoneNotFound {
+                selector: selector.clone(),
+            });
+        }
+        work_milestone_ids.extend(matches);
+    }
     let leaf_ids = scope.leaf_ids;
     let mut projects = snapshot
         .projects
@@ -1063,8 +1093,19 @@ fn make_focus_status(
             .then_with(|| left.id.cmp(&right.id))
     });
 
-    let focus_roots = scope
+    let work_ids = scope
         .issue_ids
+        .iter()
+        .filter(|id| {
+            work_milestones.is_empty()
+                || issues_by_id
+                    .get(*id)
+                    .and_then(|issue| issue.project_milestone_id.as_ref())
+                    .is_some_and(|milestone| work_milestone_ids.contains(milestone))
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let focus_roots = work_ids
         .iter()
         .map(|id| {
             issues_by_id
@@ -1076,10 +1117,13 @@ fn make_focus_status(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let blocker_layers = focus_blocker_layers(snapshot, &focus_roots)?;
-    let focus_ids = scope.issue_ids;
-    let ready_queue = ready_queue_for(snapshot, |issue| focus_ids.contains(&issue.id))?;
+    let ready_queue = ready_queue_for(snapshot, |issue| work_ids.contains(&issue.id))?;
+    let mut work_milestones = work_milestones.to_vec();
+    work_milestones.sort();
+    work_milestones.dedup();
     Ok(FocusStatus {
         fetched_at: snapshot.fetched_at,
+        work_milestones,
         projects,
         blocker_layers,
         ready_queue,

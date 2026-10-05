@@ -310,6 +310,8 @@ pub struct FocusExpansion {
 pub struct FocusStatus {
     /// Unix seconds when the source snapshot was fetched.
     pub fetched_at: i64,
+    /// Exact milestone IDs or names limiting blocker roots and ready work; empty means all focus work.
+    pub work_milestones: Vec<String>,
     /// Selected projects and milestone status, in deterministic order.
     pub projects: Vec<FocusProjectStatus>,
     /// Complete prerequisite closure in FR-002 layer order.

@@ -19,6 +19,8 @@ If credentials are missing, run `ix-board auth login` in an interactive terminal
    ix-board focus status --project <PROJECT>
    ```
 
+   To report only current work from named milestones, add repeatable `--work-milestone <ID-OR-EXACT-NAME>` as described in `focus-status`. The status report retains full project and milestone progress.
+
 2. For "hand this work off" or "what should the next lead take?", use the `plan-chunk` skill. For "is Linear out of date?" or "what changed?", use the `focus-hygiene` skill:
 
    ```bash

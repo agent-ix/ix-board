@@ -126,6 +126,9 @@ enum FocusCommand {
         /// Linear issue UUID or identifier; may be repeated.
         #[arg(long = "issue", action = clap::ArgAction::Append)]
         issues: Vec<String>,
+        /// Limit blocker roots and ready issues to these exact milestone IDs or names; repeatable.
+        #[arg(long = "work-milestone", action = clap::ArgAction::Append)]
+        work_milestones: Vec<String>,
     },
     /// Prepare a bounded dependency-ordered handoff chunk for a focus.
     PlanChunk {
@@ -262,6 +265,7 @@ fn main() -> std::process::ExitCode {
                 | Error::InvalidProjectStatus { .. }
                 | Error::InvalidProjectPriority { .. }
                 | Error::EmptyFocus
+                | Error::WorkMilestoneNotFound { .. }
                 | Error::ScopeSelection { .. }
                 | Error::DriftInputRead { .. }
                 | Error::DriftInputDecode { .. }
@@ -315,6 +319,7 @@ fn validate_command(command: &Command) -> Result<(), Error> {
                     initiatives,
                     projects,
                     issues,
+                    ..
                 },
         } if initiatives.is_empty() && projects.is_empty() && issues.is_empty() => {
             Err(Error::EmptyFocus)
@@ -413,13 +418,17 @@ fn run_linear(command: Command) -> Result<Output, Error> {
                     initiatives,
                     projects,
                     issues,
+                    work_milestones,
                 },
         } => service
-            .focus_status(&FocusSelection {
-                initiatives,
-                projects,
-                issues,
-            })
+            .focus_status_for_milestones(
+                &FocusSelection {
+                    initiatives,
+                    projects,
+                    issues,
+                },
+                &work_milestones,
+            )
             .map(Output::FocusStatus),
         Command::Focus {
             command:
@@ -608,6 +617,12 @@ fn render_focus_status(status: &FocusStatus) -> String {
         "Focus snapshot fetched at {}",
         format_snapshot_time(status.fetched_at)
     )];
+    if !status.work_milestones.is_empty() {
+        lines.push(format!(
+            "Work milestones (ready queue and blocker roots): {}",
+            status.work_milestones.join(", ")
+        ));
+    }
     for project in &status.projects {
         lines.push(format!("Project {} — {}", project.identifier, project.name));
         lines.push(format!(
@@ -1006,6 +1021,8 @@ mod tests {
             "SWM-P1",
             "--issue",
             "SWM-1",
+            "--work-milestone",
+            "M1",
         ])
         .expect("parse focus status selectors");
         assert!(matches!(
@@ -1015,10 +1032,12 @@ mod tests {
                     initiatives,
                     projects,
                     issues,
+                    work_milestones,
                 }
             } if initiatives == ["Delivery"]
                 && projects == ["SWM-P1"]
                 && issues == ["SWM-1"]
+                && work_milestones == ["M1"]
         ));
     }
 

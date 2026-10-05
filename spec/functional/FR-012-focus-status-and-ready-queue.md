@@ -78,6 +78,17 @@ The output SHALL preserve the distinction between focus issues and blocker-only
 issues; blocker-only issues SHALL NOT enter the ready queue unless they are
 also members of the resolved focus issue set.
 
+The optional repeatable `--work-milestone` selector SHALL accept an exact
+milestone name or ID among the selected projects. If supplied, blocker roots
+and ready issues SHALL be limited to focus issues assigned to matching
+milestones. The complete prerequisite closure of those roots SHALL remain
+visible even when a prerequisite belongs to another milestone or project.
+Project and milestone progress SHALL remain for the full selected focus, so
+the report retains its denominator. A selector matching no selected project
+milestone SHALL fail before emitting a partial report. The JSON result SHALL
+include the effective work-milestone selectors; no selector means all focus
+issues are considered for blockers and ready work.
+
 ## Inputs
 
 - One or more inline initiative, project, or issue selectors accepted by
@@ -114,6 +125,7 @@ produce an explicit error and no partial status result.
 | FR-012-AC-5 | Given identical complete Linear records, repeated `focus status` calls return identical project and milestone groups, issue lists, blocker layers, ready queue order, and reasons; the result reports the source snapshot's actual fetch timestamp. | Test |
 | FR-012-AC-6 | An empty focus, incomplete source snapshot, missing blocker record, or dependency cycle returns an explicit error and no partial status result. | Test |
 | FR-012-AC-7 | Project focus issues without a milestone appear in `unmilestoned` with open-state, in-progress, and leaf-progress facts; parent issues contribute to open-state counts but not leaf progress, and terminal output explains the difference. The terminal fetch time is readable UTC with age while JSON retains `fetched_at`. | Test |
+| FR-012-AC-8 | A work-milestone selector keeps full project and milestone progress but restricts blocker roots and ready issues to matching milestones, preserving cross-milestone prerequisites; an unknown selector fails explicitly. | Test |
 
 ## Dependencies
 
