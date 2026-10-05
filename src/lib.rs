@@ -435,6 +435,16 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
         selection: &FocusSelection,
         size: Option<std::num::NonZeroUsize>,
     ) -> Result<FocusPlanChunk, Error> {
+        self.focus_plan_chunk_for_milestones(selection, size, &[])
+    }
+
+    /// Returns a handoff for selected milestones and any focus-member prerequisites.
+    pub fn focus_plan_chunk_for_milestones(
+        &mut self,
+        selection: &FocusSelection,
+        size: Option<std::num::NonZeroUsize>,
+        work_milestones: &[String],
+    ) -> Result<FocusPlanChunk, Error> {
         if selection.initiatives.is_empty()
             && selection.projects.is_empty()
             && selection.issues.is_empty()
@@ -442,7 +452,7 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
             return Err(Error::EmptyFocus);
         }
         let snapshot = self.snapshot()?;
-        make_focus_plan_chunk(&snapshot, selection, size)
+        make_focus_plan_chunk(&snapshot, selection, size, work_milestones)
     }
 
     /// Returns a deterministic focus hygiene report from the current snapshot.
@@ -1007,23 +1017,8 @@ fn make_focus_status(
         .iter()
         .map(|issue| (issue.id.clone(), issue))
         .collect();
-    let mut work_milestone_ids = BTreeSet::new();
-    for selector in work_milestones {
-        let matches = snapshot
-            .projects
-            .iter()
-            .filter(|project| scope.project_ids.contains(&project.id))
-            .flat_map(|project| project.milestones.iter())
-            .filter(|milestone| milestone.id == *selector || milestone.name == *selector)
-            .map(|milestone| milestone.id.clone())
-            .collect::<Vec<_>>();
-        if matches.is_empty() {
-            return Err(Error::WorkMilestoneNotFound {
-                selector: selector.clone(),
-            });
-        }
-        work_milestone_ids.extend(matches);
-    }
+    let work_milestone_ids =
+        resolve_work_milestones(snapshot, &scope.project_ids, work_milestones)?;
     let leaf_ids = scope.leaf_ids;
     let mut projects = snapshot
         .projects
@@ -1118,22 +1113,56 @@ fn make_focus_status(
         .collect::<Result<Vec<_>, _>>()?;
     let blocker_layers = focus_blocker_layers(snapshot, &focus_roots)?;
     let ready_queue = ready_queue_for(snapshot, |issue| work_ids.contains(&issue.id))?;
+    let excluded_ready_count = if work_milestones.is_empty() {
+        0
+    } else {
+        ready_queue_for(snapshot, |issue| scope.issue_ids.contains(&issue.id))?
+            .len()
+            .saturating_sub(ready_queue.len())
+    };
     let mut work_milestones = work_milestones.to_vec();
     work_milestones.sort();
     work_milestones.dedup();
     Ok(FocusStatus {
         fetched_at: snapshot.fetched_at,
         work_milestones,
+        excluded_ready_count,
         projects,
         blocker_layers,
         ready_queue,
     })
 }
 
+fn resolve_work_milestones(
+    snapshot: &WorkspaceSnapshot,
+    project_ids: &BTreeSet<ProjectId>,
+    selectors: &[String],
+) -> Result<BTreeSet<String>, Error> {
+    let mut ids = BTreeSet::new();
+    for selector in selectors {
+        let matches = snapshot
+            .projects
+            .iter()
+            .filter(|project| project_ids.contains(&project.id))
+            .flat_map(|project| project.milestones.iter())
+            .filter(|milestone| milestone.id == *selector || milestone.name == *selector)
+            .map(|milestone| milestone.id.clone())
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            return Err(Error::WorkMilestoneNotFound {
+                selector: selector.clone(),
+            });
+        }
+        ids.extend(matches);
+    }
+    Ok(ids)
+}
+
 fn make_focus_plan_chunk(
     snapshot: &WorkspaceSnapshot,
     selection: &FocusSelection,
     size: Option<std::num::NonZeroUsize>,
+    work_milestones: &[String],
 ) -> Result<FocusPlanChunk, Error> {
     let scope = select_scope(
         snapshot,
@@ -1153,9 +1182,17 @@ fn make_focus_plan_chunk(
         .iter()
         .map(|issue| (&issue.id, issue))
         .collect();
+    let milestone_ids = resolve_work_milestones(snapshot, &scope.project_ids, work_milestones)?;
     let roots = scope
         .issue_ids
         .iter()
+        .filter(|id| {
+            work_milestones.is_empty()
+                || issues
+                    .get(*id)
+                    .and_then(|issue| issue.project_milestone_id.as_ref())
+                    .is_some_and(|milestone| milestone_ids.contains(milestone))
+        })
         .map(|id| {
             issues
                 .get(id)
@@ -1179,6 +1216,7 @@ fn make_focus_plan_chunk(
     let mut candidates = scope
         .issue_ids
         .iter()
+        .filter(|id| work_milestones.is_empty() || layer_by_id.contains_key(*id))
         .filter_map(|id| issues.get(id).copied())
         .filter(|issue| {
             !matches!(
@@ -1233,6 +1271,12 @@ fn make_focus_plan_chunk(
     };
     Ok(FocusPlanChunk {
         fetched_at: snapshot.fetched_at,
+        work_milestones: {
+            let mut selectors = work_milestones.to_vec();
+            selectors.sort();
+            selectors.dedup();
+            selectors
+        },
         issues,
     })
 }
