@@ -56,6 +56,7 @@ Run reads with:
 ix-board next --team SWM
 ix-board project-chunk SWM-P1
 ix-board search "dependency graph"
+ix-board issues SWM-12 SWM-13 SWM-14
 ```
 
 Add `--json` to any command for machine-readable output. The CLI stores one

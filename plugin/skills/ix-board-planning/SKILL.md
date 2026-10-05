@@ -43,6 +43,12 @@ If credentials are missing, run `ix-board auth login` in an interactive terminal
 
    `project-chunk` does not accept project names. Use `focus status --project <EXACT-NAME>` for a name-based progress report. Select focus only from an explicit request or structured Linear context. Run `ix-board focus <COMMAND> --help` when selector syntax is unclear.
 
+5. To check several exact issue states in one read, pass their identifiers to `issues`. Preserve the returned order and exact Linear state names:
+
+   ```bash
+   ix-board issues SWM-12 SWM-13 SWM-14
+   ```
+
 ## Preserve the result
 
 - Treat ix-board output as authoritative for readiness, ordering, project status, dependencies, focus membership, and blockers. Do not reconstruct those facts from issue descriptions or comments.

@@ -393,6 +393,44 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
         make_project_chunk(&snapshot, identifier)
     }
 
+    /// Returns exact issues for requested UUIDs or identifiers, in request order.
+    pub fn issues(&mut self, identifiers: &[String]) -> Result<Vec<Issue>, Error> {
+        if identifiers.is_empty() || identifiers.iter().any(|value| value.trim().is_empty()) {
+            return Err(Error::ScopeSelection {
+                kind: "issue",
+                identifier: String::new(),
+                matches: 0,
+            });
+        }
+        let snapshot = self.snapshot()?;
+        let mut result = Vec::new();
+        let mut seen = BTreeSet::new();
+        for identifier in identifiers {
+            let matches = snapshot
+                .issues
+                .iter()
+                .filter(|issue| {
+                    issue.id.0.eq_ignore_ascii_case(identifier)
+                        || issue.identifier.eq_ignore_ascii_case(identifier)
+                })
+                .collect::<Vec<_>>();
+            let issue = match matches.as_slice() {
+                [issue] => *issue,
+                _ => {
+                    return Err(Error::ScopeSelection {
+                        kind: "issue",
+                        identifier: identifier.clone(),
+                        matches: matches.len(),
+                    });
+                }
+            };
+            if seen.insert(issue.id.clone()) {
+                result.push(issue.clone());
+            }
+        }
+        Ok(result)
+    }
+
     /// Resolves inline initiative, project, and issue selectors into a focus expansion.
     pub fn focus_expand(&mut self, selection: &FocusSelection) -> Result<FocusExpansion, Error> {
         if selection.initiatives.is_empty()
