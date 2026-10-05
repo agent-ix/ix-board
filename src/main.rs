@@ -761,7 +761,16 @@ fn render_focus_hygiene(report: &FocusHygieneReport) -> String {
     )];
     macro_rules! group_header {
         ($name:literal, $group:expr) => {
-            lines.push(format!("{}: {:?}", $name, $group.availability));
+            lines.push(format!(
+                "{}: {} ({} findings)",
+                $name,
+                if matches!($group.availability, ix_board::GroupStatus::Available) {
+                    "checked"
+                } else {
+                    "incomplete"
+                },
+                $group.findings.len()
+            ));
             for reason in &$group.reasons {
                 lines.push(format!("  unavailable: {reason}"));
             }
