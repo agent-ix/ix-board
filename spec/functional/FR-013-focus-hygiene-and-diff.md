@@ -183,6 +183,7 @@ GitHub.
 | FR-013-AC-10 | The inverted index generates each unique issue pair within the resolved focus that shares at least one normalized content token, counts shared tokens, excludes out-of-focus issues, and applies the three-token and title-overlap thresholds only after candidate enumeration; candidate pairs, connected-component groups, and group members use the specified stable ordering. | Test |
 | FR-013-AC-11 | A fixture of 448 focused titles each normalizing to the same single content token generates 100,128 all-candidate pairs and returns `resource_limit` before title-match filtering, with no partial report and no baseline update; 447 such titles yield 99,681 candidates and no duplicate group because the match threshold is not met. | Test |
 | FR-013-AC-12 | JSON `issue_refs` contains identifier and title for available issues referenced by scope, overdue, PR, stale, duplicate, and diff findings while retaining their stable UUID fields. Terminal findings use those references and fall back to UUIDs when a current record is unavailable. | Test |
+| FR-013-AC-13 | Repeated links to one pull request share one lookup and one unavailable reason; terminal headings state whether each check was complete and how many findings it produced. | Test |
 
 ## Dependencies
 

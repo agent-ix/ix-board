@@ -512,9 +512,16 @@ fn pull_request_group(issues: &[&Issue]) -> HygieneGroup<PullRequestFinding> {
     }
     let token = std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN"));
     let Some(token) = token.ok().filter(|token| !token.trim().is_empty()) else {
-        return pull_request_group_result(linked, reasons, |_, _| {
-            Err("GITHUB_TOKEN or GH_TOKEN is required for linked pull request metadata".to_owned())
-        });
+        let unique = linked
+            .iter()
+            .map(|link| (&link.repository, link.number))
+            .collect::<BTreeSet<_>>()
+            .len();
+        let mut reasons = reasons;
+        reasons.push(format!(
+            "GITHUB_TOKEN or GH_TOKEN is required to check {unique} linked pull requests"
+        ));
+        return group_with_reasons(Vec::new(), reasons);
     };
     let client = match reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
@@ -588,8 +595,13 @@ fn pull_request_group_result(
     mut lookup: impl FnMut(&str, u64) -> Result<Option<GithubPullRequest>, String>,
 ) -> HygieneGroup<PullRequestFinding> {
     let mut findings = Vec::new();
+    let mut lookup_cache = BTreeMap::new();
     for link in linked {
-        let record = match lookup(&link.repository, link.number) {
+        let record = match lookup_cache
+            .entry((link.repository.clone(), link.number))
+            .or_insert_with(|| lookup(&link.repository, link.number))
+            .clone()
+        {
             Ok(record) => record,
             Err(reason) => {
                 reasons.push(format!(
@@ -630,6 +642,8 @@ fn pull_request_group_result(
             .then(left.number.cmp(&right.number))
             .then(left.issue_id.cmp(&right.issue_id))
     });
+    let mut seen_reasons = BTreeSet::new();
+    reasons.retain(|reason| seen_reasons.insert(reason.clone()));
     HygieneGroup {
         availability: if reasons.is_empty() {
             GroupStatus::Available
@@ -746,7 +760,7 @@ struct GithubRepository {
     pull_request: Option<GithubPullRequest>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GithubPullRequest {
     state: String,
@@ -1547,6 +1561,24 @@ mod tests {
                 && finding.number == 18
                 && finding.kind == PullRequestMismatchKind::OpenWithMergedPr
         }));
+    }
+
+    /// Trace: FR-013-AC-13
+    #[test]
+    fn repeated_pr_links_share_one_lookup_and_one_unavailable_reason() {
+        let mut first = issue("IR-1", "first", WorkflowStateType::Started);
+        let mut second = issue("IR-2", "second", WorkflowStateType::Started);
+        let url = "https://github.com/agent-ix/ix-board/pull/20".to_owned();
+        first.attachment_urls = vec![url.clone()];
+        second.attachment_urls = vec![url];
+        let mut calls = 0;
+        let group = pull_request_group_with(&[&first, &second], |_, _| {
+            calls += 1;
+            Err("unavailable".to_owned())
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(group.reasons.len(), 1);
+        assert_eq!(group.availability, GroupStatus::Unavailable);
     }
 
     /// Trace: FR-013-AC-3, FR-013-AC-7, FR-013-AC-8
