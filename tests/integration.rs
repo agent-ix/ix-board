@@ -526,6 +526,7 @@ fn unknown_project_mutation_is_rejected_before_the_source_write() {
     assert_eq!(source.mutations.load(Ordering::SeqCst), 0);
 }
 
+/// Trace: FR-002-AC-1, FR-002-AC-9
 #[test]
 fn project_chunk_returns_goal_milestones_open_tickets_and_dependency_layers() {
     let directory = TempDir::new().expect("temporary directory");
@@ -553,6 +554,13 @@ fn project_chunk_returns_goal_milestones_open_tickets_and_dependency_layers() {
     );
 
     let chunk: ProjectChunk = reads.project_chunk("swm-p1").expect("project chunk");
+    assert_eq!(
+        reads
+            .project_chunk("project swm-p1")
+            .expect("project name lookup")
+            .identifier,
+        chunk.identifier
+    );
     assert_eq!(chunk.goal, "Goal SWM-P1");
     assert_eq!(
         chunk
@@ -602,6 +610,23 @@ fn project_chunk_returns_goal_milestones_open_tickets_and_dependency_layers() {
     assert!(matches!(
         reads.project_chunk("missing-project"),
         Err(Error::ProjectNotFound { .. })
+    ));
+
+    let duplicate_directory = TempDir::new().expect("temporary directory");
+    let mut duplicate_names = queue_fixture();
+    duplicate_names.projects[1].name = duplicate_names.projects[0].name.clone();
+    let mut duplicate_reads = service(
+        FixtureSource::new(duplicate_names),
+        ManualClock::new(2_000),
+        &duplicate_directory,
+    );
+    assert!(matches!(
+        duplicate_reads.project_chunk("Project SWM-P1"),
+        Err(Error::ScopeSelection {
+            kind: "project",
+            matches: 2,
+            ..
+        })
     ));
 }
 

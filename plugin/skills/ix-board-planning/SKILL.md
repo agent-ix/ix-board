@@ -36,14 +36,14 @@ If credentials are missing, run `ix-board auth login` in an interactive terminal
    ix-board next --team <TEAM>
    ```
 
-4. For a project's goal, open issues, and dependency layers, use its Linear project identifier or UUID with `project-chunk`. For structured discovery, use `search`:
+4. For a project's goal, open issues, and dependency layers, use its Linear project identifier, UUID, or exact name with `project-chunk`. For structured discovery, use `search`:
 
    ```bash
-   ix-board project-chunk <PROJECT-ID>
+   ix-board project-chunk <PROJECT-ID-OR-EXACT-NAME>
    ix-board search "<QUERY>"
    ```
 
-   `project-chunk` does not accept project names. Use `focus status --project <EXACT-NAME>` for a name-based progress report. Select focus only from an explicit request or structured Linear context. Run `ix-board focus <COMMAND> --help` when selector syntax is unclear.
+   If a project name is ambiguous, use its identifier from `search`. Use `focus status --project <EXACT-NAME>` for a progress report. Select focus only from an explicit request or structured Linear context. Run `ix-board focus <COMMAND> --help` when selector syntax is unclear.
 
 ## Preserve the result
 
