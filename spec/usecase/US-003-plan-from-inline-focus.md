@@ -28,6 +28,13 @@ am responsible for.
 - **Then** ix-board returns the deduplicated Linear issue set and complete
   blocker layers in deterministic order
 
+### US-003-EX-2: Reuse the initiative's visible identifier
+
+- **Given** Linear shows a campaign initiative as `I-10`
+- **When** the planner selects `--initiative I-10`
+- **Then** ix-board resolves the same project and issue set as the initiative's
+  UUID or exact name
+
 ## Notes (Informative)
 
 FR-010 owns selector membership and ticket-descendant behavior. FR-001 and

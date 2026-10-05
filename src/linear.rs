@@ -23,7 +23,7 @@ const PROJECT_NESTED_PAGE_SIZE: i32 = 50;
 const RELATION_PAGE_SIZE: i32 = 50;
 const PAGE_LIMIT: usize = 1_000;
 // Invalidate cached snapshots predating issue-to-project-milestone associations.
-const CACHE_MODEL_VERSION: &str = "v7";
+const CACHE_MODEL_VERSION: &str = "v8";
 const ENDPOINT: &str = "https://api.linear.app/graphql";
 
 const PROJECT_QUERY: &str = r#"
@@ -32,7 +32,7 @@ query WorkspaceProjects($first: Int!, $nestedFirst: Int!, $after: String) {
     nodes {
       id identifier name description content priority sortOrder targetDate
       status { name type }
-      initiatives(first: 10) { nodes { id name } pageInfo { hasNextPage } }
+      initiatives(first: 10) { nodes { id identifier name } pageInfo { hasNextPage } }
       teams(first: $nestedFirst) { nodes { key } pageInfo { hasNextPage } }
       projectMilestones(first: $nestedFirst) {
         nodes { id name description sortOrder targetDate }
@@ -1158,7 +1158,7 @@ mod tests {
             "content": null, "priority": 2, "sortOrder": 1.0,
             "status": {"name": "In Progress", "type": "started"},
             "teams": connection(serde_json::json!([{"key": "SWM"}])),
-            "initiatives": connection(serde_json::json!([{ "id": "init", "name": "Delivery" }])),
+            "initiatives": connection(serde_json::json!([{ "id": "init", "identifier": "I-10", "name": "Delivery" }])),
             "projectMilestones": connection(serde_json::json!([]))
         });
         let completed_blocker = serde_json::json!({
