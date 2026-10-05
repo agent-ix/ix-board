@@ -254,7 +254,7 @@ fn main() -> std::process::ExitCode {
             }
         }
         Err(error) => {
-            emit_diagnostic(diagnostics, "error", &error.to_string());
+            emit_diagnostic(diagnostics, "error", &format_cli_error(&error));
             std::process::ExitCode::from(match error {
                 Error::InvalidTeam
                 | Error::InvalidQuery
@@ -271,6 +271,17 @@ fn main() -> std::process::ExitCode {
             })
         }
     }
+}
+
+fn format_cli_error(error: &Error) -> String {
+    #[cfg(target_os = "macos")]
+    if matches!(
+        error,
+        Error::Credential(ix_cli_kit::secrets::SecretError::Unavailable)
+    ) {
+        return "Linear credential store unavailable or access denied for this binary; if another ix-board build works, grant this build access to the saved ix-board item in Keychain Access (see setup.md)".to_owned();
+    }
+    error.to_string()
 }
 
 fn validate_command(command: &Command) -> Result<(), Error> {
