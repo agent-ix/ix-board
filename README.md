@@ -136,11 +136,13 @@ login` or supplied through `LINEAR_API_KEY`.
 
 `drift` evaluates a versioned evidence file against an explicit lead and
 threshold configuration. It does not guess attribution from the shared GitHub
-account and does not call an LLM:
+account and does not call an LLM. Use `--live` to collect Linear issues and
+state history directly; use `--evidence` for a deterministic replay:
 
 ```bash
 ix-board drift --config drift-config.json --evidence drift-evidence-v1.json
 ix-board drift --config drift-config.json --evidence drift-evidence-v1.json --json
+ix-board drift --config drift-config.json --live --json
 ```
 
 The config JSON is a strict `DriftConfig` object with `report_time` (RFC 3339),
@@ -149,6 +151,27 @@ The config JSON is a strict `DriftConfig` object with `report_time` (RFC 3339),
 array of `{ "lead_id": "...", "team_key": "..." }` values. Time-window and
 stall hours must be positive; spend and churn thresholds must be nonnegative;
 each team can belong to only one configured lead.
+
+Optional `priority_goals` entries reserve a minimum worker count and report
+stalled goals alongside the existing lead signals. A goal matches a Linear
+project or milestone by exact identifier/name, or matches explicit issue IDs
+when the goal has no structured project or milestone membership:
+
+```json
+{
+  "goal": "QSL L2 plan v2",
+  "ticket_ids": ["QSL-485", "QSL-486", "QSL-487"],
+  "minimum_workers": 1,
+  "no_progress_hours": 12.0
+}
+```
+
+The report includes last completion and transition times, hours since linked
+progress, claimed active issues versus recently worked active issues, the
+configured minimum, and other projects with transitions in the no-progress
+interval. The live collector reconstructs ticket state at `report_time` from
+Linear's issue history. Live mode currently has only Linear issue/history
+evidence; unavailable GitHub, Herdr, and OTel sources remain explicit.
 
 The evidence JSON envelope is strict and versioned:
 
@@ -185,11 +208,11 @@ cannot claim `on_track` from partial evidence. Omit a lead key from
 observed spend of zero is not activity, including when `spend_threshold` is
 zero.
 
-The evidence contract is the source boundary for drift v1. ix-board does not
-fetch GitHub or historical Linear data for this command because this
-repository has no configured repository list or complete historical queue
-source. A collector must supply structured API records and pagination/history
-completeness; the evaluator fails closed when it reports missing evidence.
+The evidence contract is the source boundary for deterministic replay. Live
+mode reads Linear history; a supplied evidence file can additionally contain
+GitHub, Herdr, and OTel records. Every collector must report pagination and
+history completeness; the evaluator fails closed when required evidence is
+missing.
 
 ## JSON Schema for downstream clients
 
