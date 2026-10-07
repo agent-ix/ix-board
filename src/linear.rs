@@ -24,8 +24,8 @@ const ISSUE_PAGE_SIZE: i32 = 50;
 const PROJECT_NESTED_PAGE_SIZE: i32 = 50;
 const RELATION_PAGE_SIZE: i32 = 50;
 const PAGE_LIMIT: usize = 1_000;
-// Invalidate cached snapshots predating issue-to-project-milestone associations.
-const CACHE_MODEL_VERSION: &str = "v8";
+// Invalidate cached snapshots predating assignee identity support.
+const CACHE_MODEL_VERSION: &str = "v9";
 const ENDPOINT: &str = "https://api.linear.app/graphql";
 
 const PROJECT_QUERY: &str = r#"
@@ -52,6 +52,7 @@ query WorkspaceIssues($first: Int!, $relationFirst: Int!, $after: String) {
       id identifier title description priority sortOrder createdAt updatedAt
       state { name type }
       team { key }
+      assignee { id }
       project { id }
       projectMilestone { id }
       parent { id }
@@ -203,6 +204,8 @@ impl LinearGraphQlSource {
         };
 
         let mut history_issue_ids = HashSet::new();
+        let mut priority_goal_team_keys = HashSet::new();
+        let mut priority_goal_assignees = HashSet::new();
         for goal in &config.priority_goals {
             let project_exists = snapshot.projects.iter().any(|project| {
                 project.identifier.as_deref() == Some(goal.goal.as_str())
@@ -238,6 +241,68 @@ impl LinearGraphQlSource {
             }
         }
 
+        let issue_matches_goal = |issue: &Issue| {
+            let project_identifier = issue
+                .project_id
+                .as_ref()
+                .and_then(|id| projects_by_id.get(id.0.as_str()))
+                .map(|project| {
+                    project
+                        .identifier
+                        .clone()
+                        .unwrap_or_else(|| project.name.clone())
+                });
+            let milestone_identifier = issue
+                .project_milestone_id
+                .as_deref()
+                .and_then(|id| milestones_by_id.get(id))
+                .map(|name| (*name).to_owned());
+            config.priority_goals.iter().any(|goal| {
+                project_identifier.as_deref() == Some(goal.goal.as_str())
+                    || milestone_identifier.as_deref() == Some(goal.goal.as_str())
+                    || goal
+                        .ticket_ids
+                        .iter()
+                        .any(|id| id.eq_ignore_ascii_case(&issue.identifier))
+            })
+        };
+        let issues_by_id: HashMap<_, _> = snapshot
+            .issues
+            .iter()
+            .map(|issue| (issue.id.0.as_str(), issue))
+            .collect();
+        let mut pending_blockers = Vec::new();
+        for issue in snapshot
+            .issues
+            .iter()
+            .filter(|issue| issue_matches_goal(issue))
+        {
+            priority_goal_team_keys.insert(issue.team_key.0.clone());
+            if let Some(assignee) = issue.assignee_id.as_deref() {
+                priority_goal_assignees.insert(assignee.to_owned());
+            }
+            pending_blockers.extend(issue.blocked_by.iter().map(|id| id.0.clone()));
+        }
+        let mut visited_blockers = HashSet::new();
+        while let Some(blocker_id) = pending_blockers.pop() {
+            if !visited_blockers.insert(blocker_id.clone()) {
+                continue;
+            }
+            history_issue_ids.insert(blocker_id.clone());
+            if let Some(blocker) = issues_by_id.get(blocker_id.as_str()) {
+                if let Some(assignee) = blocker.assignee_id.as_deref() {
+                    priority_goal_assignees.insert(assignee.to_owned());
+                }
+                pending_blockers.extend(blocker.blocked_by.iter().map(|id| id.0.clone()));
+            }
+        }
+        if !priority_goal_team_keys.is_empty() && priority_goal_assignees.is_empty() {
+            evidence.missing.push(crate::MissingEvidence {
+                source: "linear.issues".to_owned(),
+                reason: "priority goal issues and their blockers have no assignee identities; cross-team activity cannot be attributed".to_owned(),
+            });
+        }
+
         for issue in &snapshot.issues {
             let project = issue
                 .project_id
@@ -268,7 +333,12 @@ impl LinearGraphQlSource {
                 .map(crate::drift::timestamp_epoch)
                 .transpose()?
                 .is_some_and(|updated| updated >= window_start);
-            if belongs_to_goal || recently_updated {
+            let relevant_to_goal_capacity = priority_goal_team_keys.contains(&issue.team_key.0)
+                || issue
+                    .assignee_id
+                    .as_ref()
+                    .is_some_and(|assignee| priority_goal_assignees.contains(assignee));
+            if belongs_to_goal || (recently_updated && relevant_to_goal_capacity) {
                 history_issue_ids.insert(issue.id.0.clone());
             }
             let Some(created_at) = issue.created_at.clone() else {
@@ -282,6 +352,7 @@ impl LinearGraphQlSource {
                 id: issue.id.0.clone(),
                 identifier: issue.identifier.clone(),
                 team_key: issue.team_key.0.clone(),
+                assignee_id: issue.assignee_id.clone(),
                 project_id: issue.project_id.as_ref().map(|id| id.0.clone()),
                 project_identifier,
                 milestone_identifier,
@@ -297,9 +368,13 @@ impl LinearGraphQlSource {
                 sort_order: issue.sort_order,
                 blocked_by: issue.blocked_by.iter().map(|id| id.0.clone()).collect(),
                 created_at,
+                updated_at: issue.updated_at.clone(),
                 state_entered_at: None,
             });
         }
+
+        // Goal progress depends on the whole transitive blocker chain, even when
+        // a blocker itself has not recently changed state.
 
         let mut history_ids: Vec<_> = history_issue_ids.into_iter().collect();
         history_ids.sort();
@@ -636,6 +711,7 @@ impl WorkspaceSource for LinearGraphQlSource {
                     state_type,
                     parent_id: raw.parent.map(|p| IssueId(p.id)),
                     team_key: TeamKey(raw.team.key),
+                    assignee_id: raw.assignee.map(|assignee| assignee.id),
                     project_id: raw.project.map(|project| ProjectId(project.id)),
                     project_milestone_id: raw.project_milestone.map(|milestone| milestone.id),
                     priority: raw.priority,
@@ -1067,6 +1143,12 @@ struct RawTeam {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawUser {
+    id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
 struct RawMilestone {
     id: String,
@@ -1121,6 +1203,7 @@ struct RawIssue {
     updated_at: Option<String>,
     state: RawState,
     team: RawTeam,
+    assignee: Option<RawUser>,
     project: Option<RawIssueProject>,
     project_milestone: Option<RawIssueProject>,
     parent: Option<RawIssueProject>,
@@ -1630,6 +1713,7 @@ mod tests {
                     state: "Done".to_owned(),
                     state_name: "Done".to_owned(),
                     team_key: TeamKey("SWM".to_owned()),
+                    assignee_id: None,
                     project_id: None,
                     project_milestone_id: None,
                     priority: 2.0,
@@ -1651,6 +1735,7 @@ mod tests {
                     state: "Specced".to_owned(),
                     state_name: "Specced".to_owned(),
                     team_key: TeamKey("SWM".to_owned()),
+                    assignee_id: None,
                     project_id: Some(ProjectId("project-id".to_owned())),
                     project_milestone_id: None,
                     priority: 2.0,
@@ -1852,11 +1937,9 @@ mod tests {
         );
         assert_eq!(requests[0]["variables"]["first"], 20);
         assert_eq!(requests[0]["variables"]["nestedFirst"], 50);
-        assert!(
-            requests[1]["query"]
-                .as_str()
-                .is_some_and(|query| query.contains("state { name type }"))
-        );
+        assert!(requests[1]["query"].as_str().is_some_and(|query| {
+            query.contains("state { name type }") && query.contains("assignee { id }")
+        }));
         assert_eq!(requests[1]["variables"]["first"], 50);
         assert!(requests[1]["variables"]["nestedFirst"].is_null());
     }
@@ -1914,6 +1997,7 @@ mod tests {
                     "sortOrder": 3.0,
                     "state": {"name": "Specced", "type": "started"},
                     "team": {"key": "SWM"},
+                    "assignee": {"id": "worker-uuid"},
                     "project": {"id": "project-uuid"},
                     "relations": {
                         "nodes": [{
@@ -1935,6 +2019,13 @@ mod tests {
         assert_eq!(
             issues.issues.nodes[0].relations.nodes[0].issue.id,
             "blocker-uuid"
+        );
+        assert_eq!(
+            issues.issues.nodes[0]
+                .assignee
+                .as_ref()
+                .map(|assignee| assignee.id.as_str()),
+            Some("worker-uuid")
         );
         assert!(
             collect_blocked_by(&issues.issues.nodes)
