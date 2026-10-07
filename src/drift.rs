@@ -3,6 +3,7 @@
 
 //! Typed evidence and deterministic alert classification for `drift` reports.
 
+use crate::WorkflowStateType;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -135,6 +136,9 @@ pub struct DriftTicket {
     pub linked_pr_urls: Vec<String>,
     /// Current workflow state.
     pub state: String,
+    /// Linear workflow category for custom state names.
+    #[serde(default = "default_unstarted_state")]
+    pub state_type: WorkflowStateType,
     /// Current spec state.
     pub spec_state: String,
     /// Current ticket priority.
@@ -150,6 +154,10 @@ pub struct DriftTicket {
     pub updated_at: Option<String>,
     /// Time of entry into the current state, when known.
     pub state_entered_at: Option<String>,
+}
+
+fn default_unstarted_state() -> WorkflowStateType {
+    WorkflowStateType::Unstarted
 }
 
 /// A Linear issue state transition event.
@@ -564,6 +572,9 @@ pub struct PriorityGoalReport {
     pub claimed_active_issues: u64,
     /// Configured minimum worker coverage.
     pub minimum_workers: u64,
+    /// Current state of the goal assessment.
+    #[serde(default)]
+    pub status: PriorityGoalStatus,
     /// Open direct or transitive blockers currently holding goal issues.
     #[serde(default)]
     pub blocked_on: Vec<String>,
@@ -578,7 +589,22 @@ pub struct PriorityGoalReport {
     #[serde(default)]
     pub trusted: bool,
     /// Whether the goal lacks recent activity or active work coverage.
-    pub flagged: bool,
+    pub flagged: Option<bool>,
+}
+
+/// Whether a priority goal is blocked, drifting, healthy, or lacks enough evidence.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PriorityGoalStatus {
+    /// Evidence cannot support a reliable activity assessment.
+    #[default]
+    Unknown,
+    /// Every open goal issue is waiting on an open blocker.
+    Blocked,
+    /// The configured staffing or no-progress threshold was breached.
+    Flagged,
+    /// The goal has enough evidence and meets its thresholds.
+    OnTrack,
 }
 
 /// Other-project transitions that coincided with a stalled priority goal.
@@ -1062,33 +1088,53 @@ fn evaluate_priority_goals(
                 .map(|ticket| (ticket.id.as_str(), ticket))
                 .collect();
             let mut goal_ids = BTreeSet::new();
+            let mut open_goal_ids = BTreeSet::new();
             let mut goal_teams = BTreeSet::new();
             let mut pending_blockers = Vec::new();
             for ticket in evidence.tickets.iter().filter(|ticket| belongs(ticket)) {
                 if timestamp_epoch(&ticket.created_at)? <= report_epoch {
                     goal_ids.insert(ticket.id.clone());
                     goal_teams.insert(ticket.team_key.clone());
-                    pending_blockers.extend(ticket.blocked_by.iter().cloned());
+                    if !is_terminal_ticket(ticket) {
+                        open_goal_ids.insert(ticket.id.clone());
+                        pending_blockers.extend(
+                            ticket
+                                .blocked_by
+                                .iter()
+                                .cloned()
+                                .map(|blocker_id| (ticket.id.clone(), blocker_id)),
+                        );
+                    }
                 }
             }
             let mut blocker_ids = BTreeSet::new();
             let mut blocked_on = BTreeSet::new();
             let mut missing_blockers = BTreeSet::new();
-            while let Some(blocker_id) = pending_blockers.pop() {
-                if goal_ids.contains(&blocker_id) || !blocker_ids.insert(blocker_id.clone()) {
+            let mut blocked_goal_ids = BTreeSet::new();
+            let mut visited_blocker_edges = BTreeSet::new();
+            while let Some((blocked_goal_id, blocker_id)) = pending_blockers.pop() {
+                if goal_ids.contains(&blocker_id)
+                    || !visited_blocker_edges.insert((blocked_goal_id.clone(), blocker_id.clone()))
+                {
                     continue;
                 }
+                blocker_ids.insert(blocker_id.clone());
                 let Some(blocker) = tickets_by_id.get(blocker_id.as_str()).copied() else {
                     missing_blockers.insert(blocker_id);
                     continue;
                 };
-                if !matches!(
-                    blocker.state.to_ascii_lowercase().as_str(),
-                    "completed" | "done" | "canceled" | "cancelled"
-                ) {
-                    blocked_on.insert(blocker.identifier.clone());
+                if is_terminal_ticket(blocker) {
+                    continue;
                 }
-                pending_blockers.extend(blocker.blocked_by.iter().cloned());
+                blocked_on.insert(blocker.identifier.clone());
+                blocked_goal_ids.insert(blocked_goal_id.clone());
+                pending_blockers.extend(
+                    blocker
+                        .blocked_by
+                        .iter()
+                        .cloned()
+                        .map(|next| (blocked_goal_id.clone(), next)),
+                );
             }
             for blocker_id in missing_blockers {
                 missing_sources.insert(format!(
@@ -1097,10 +1143,11 @@ fn evaluate_priority_goals(
                 ));
             }
             let linked_ids: BTreeSet<_> = goal_ids.union(&blocker_ids).cloned().collect();
+            let capacity_scope_ids: BTreeSet<_> = open_goal_ids.union(&blocker_ids).cloned().collect();
             let goal_assignees: BTreeSet<_> = evidence
                 .tickets
                 .iter()
-                .filter(|ticket| linked_ids.contains(&ticket.id))
+                .filter(|ticket| capacity_scope_ids.contains(&ticket.id))
                 .filter_map(|ticket| ticket.assignee_id.as_deref())
                 .collect();
             if !goal_teams.is_empty() && goal_assignees.is_empty() {
@@ -1141,10 +1188,7 @@ fn evaluate_priority_goals(
                     belongs(ticket)
                         && timestamp_epoch(&ticket.created_at)
                             .is_ok_and(|created| created <= report_epoch)
-                        && matches!(
-                            ticket.state.to_ascii_lowercase().as_str(),
-                            "coding" | "in progress" | "review"
-                        )
+                        && is_active_ticket(ticket)
                 })
                 .collect();
             let mut recent_active = BTreeSet::new();
@@ -1154,13 +1198,10 @@ fn evaluate_priority_goals(
                 .tickets
                 .iter()
                 .filter(|ticket| {
-                    (goal_ids.contains(&ticket.id) || blocker_ids.contains(&ticket.id))
+                    (open_goal_ids.contains(&ticket.id) || blocker_ids.contains(&ticket.id))
                         && timestamp_epoch(&ticket.created_at)
                             .is_ok_and(|created| created <= report_epoch)
-                        && matches!(
-                            ticket.state.to_ascii_lowercase().as_str(),
-                            "coding" | "in progress" | "review"
-                        )
+                        && is_active_ticket(ticket)
                 })
                 .collect();
             for ticket in &active_goal_tickets {
@@ -1323,10 +1364,32 @@ fn evaluate_priority_goals(
             let crowding_out = group_rows(competing);
             let out_of_team_activity = group_rows(out_of_team);
             let stale = hours_since_progress.is_none_or(|hours| hours >= goal.no_progress_hours);
-            let flagged = missing_goal_history.is_empty()
+            let every_open_goal_ticket_blocked = !open_goal_ids.is_empty()
+                && open_goal_ids
+                    .iter()
+                    .all(|goal_id| blocked_goal_ids.contains(goal_id));
+            let trusted = missing_sources.is_empty();
+            let raw_flag = !open_goal_ids.is_empty()
+                && missing_goal_history.is_empty()
                 && (recent_active.len()
                     < usize::try_from(goal.minimum_workers).unwrap_or(usize::MAX)
                     || (stale && !crowding_out.is_empty()));
+            let flagged = if open_goal_ids.is_empty() {
+                Some(false)
+            } else {
+                (trusted && !every_open_goal_ticket_blocked).then_some(raw_flag)
+            };
+            let status = if every_open_goal_ticket_blocked {
+                PriorityGoalStatus::Blocked
+            } else if open_goal_ids.is_empty() {
+                PriorityGoalStatus::OnTrack
+            } else {
+                match flagged {
+                    Some(true) => PriorityGoalStatus::Flagged,
+                    Some(false) => PriorityGoalStatus::OnTrack,
+                    None => PriorityGoalStatus::Unknown,
+                }
+            };
             Ok(PriorityGoalReport {
                 goal: goal.goal.clone(),
                 last_completion_at: last_completion
@@ -1341,11 +1404,12 @@ fn evaluate_priority_goals(
                     .unwrap_or(u64::MAX),
                 claimed_active_issues: u64::try_from(claimed_active.len()).unwrap_or(u64::MAX),
                 minimum_workers: goal.minimum_workers,
+                status,
                 blocked_on: blocked_on.into_iter().collect(),
                 crowding_out,
                 out_of_team_activity,
                 missing_sources: missing_sources.iter().cloned().collect(),
-                trusted: missing_sources.is_empty(),
+                trusted,
                 flagged,
             })
         })
@@ -1357,6 +1421,21 @@ fn ticket_links_pr(ticket: &DriftTicket, pr: &DriftPullRequest) -> bool {
         || extract_ticket_ids(&pr.branch, &pr.title)
             .iter()
             .any(|identifier| identifier == &ticket.identifier)
+}
+
+fn is_terminal_ticket(ticket: &DriftTicket) -> bool {
+    matches!(
+        ticket.state.to_ascii_lowercase().as_str(),
+        "completed" | "done" | "canceled" | "cancelled" | "duplicate"
+    )
+}
+
+fn is_active_ticket(ticket: &DriftTicket) -> bool {
+    ticket.state_type == WorkflowStateType::Started
+        || matches!(
+            ticket.state.to_ascii_lowercase().as_str(),
+            "coding" | "in progress" | "review" | "active" | "doing" | "in dev"
+        )
 }
 
 fn latest_ticket_activity(
@@ -2154,9 +2233,15 @@ pub fn render_drift_text(report: &DriftReport) -> String {
             out_of_team = "none observed".to_owned();
         }
         format!(
-            "priority_goal {} flagged={} trusted={} {}h_since_progress worked_active_issues={}/{} claimed_active_issues={} blocked_on=[{}] last_activity={} crowding_out=[{}] out_of_team_activity=[{}] missing=[{}]",
+            "priority_goal {} status={} flagged={} trusted={} {}h_since_progress worked_active_issues={}/{} claimed_active_issues={} blocked_on=[{}] last_activity={} crowding_out=[{}] out_of_team_activity=[{}] missing=[{}]",
             goal.goal,
-            goal.flagged,
+            match goal.status {
+                PriorityGoalStatus::Unknown => "unknown",
+                PriorityGoalStatus::Blocked => "blocked",
+                PriorityGoalStatus::Flagged => "flagged",
+                PriorityGoalStatus::OnTrack => "on_track",
+            },
+            goal.flagged.map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
             goal.trusted,
             goal.hours_since_progress
                 .map(|hours| format!("{hours:.1}"))
@@ -2365,6 +2450,13 @@ mod tests {
             milestone_identifier: None,
             linked_pr_urls: Vec::new(),
             state: state.to_owned(),
+            state_type: if matches!(state, "Coding" | "In Progress" | "Review") {
+                WorkflowStateType::Started
+            } else if matches!(state, "Done" | "Completed") {
+                WorkflowStateType::Completed
+            } else {
+                WorkflowStateType::Unstarted
+            },
             spec_state: "Specced".to_owned(),
             priority,
             sort_order: priority,
@@ -2690,6 +2782,7 @@ mod tests {
             };
             let mut item = ticket(id, identifier, target_project_id, state, 1.0);
             item.project_identifier = Some("QSL-L2".to_owned());
+            item.assignee_id = Some(format!("assignee-{id}"));
             item.state_entered_at = Some("2026-10-04T04:00:00Z".to_owned());
             if identifier == "QSL-485" {
                 item.linked_pr_urls
@@ -2781,7 +2874,7 @@ mod tests {
         });
         let report = evaluate_drift(&config, &evidence).expect("valid priority history");
         let goal = &report.priority_goals[0];
-        assert!(goal.flagged);
+        assert_eq!(goal.flagged, Some(true));
         assert_eq!(
             goal.last_completion_at.as_deref(),
             Some("2026-10-04T06:00:00Z")
@@ -2891,10 +2984,8 @@ mod tests {
 
         let report = evaluate_drift(&config, &evidence).expect("blocker-aware report");
         let goal = &report.priority_goals[0];
-        assert!(
-            !goal.flagged,
-            "active blocker work satisfies the reserved worker"
-        );
+        assert_eq!(goal.flagged, None);
+        assert_eq!(goal.status, PriorityGoalStatus::Blocked);
         assert!(!goal.trusted, "missing GitHub activity is explicit");
         assert_eq!(goal.recently_worked_active_issues, 2);
         assert_eq!(goal.blocked_on, vec!["AGE-2224", "AGE-2228"]);
@@ -2906,8 +2997,86 @@ mod tests {
         assert_eq!(goal.out_of_team_activity[0].tickets, vec!["IR-626"]);
         let rendered = render_drift_text(&report);
         assert!(rendered.contains("trusted=false"));
+        assert!(rendered.contains("status=blocked flagged=unknown"));
         assert!(rendered.contains("blocked_on=[AGE-2224,AGE-2228]"));
         assert!(rendered.contains("out_of_team_activity=[IR/IR: IR-626]"));
+    }
+
+    #[test]
+    fn done_goal_ticket_does_not_report_its_open_blocker() {
+        let mut config = config();
+        config.report_time = "2026-10-07T15:10:00Z".to_owned();
+        config.priority_goals.push(PriorityGoalConfig {
+            goal: "QSL L2 plan v2".to_owned(),
+            ticket_ids: vec!["QSL-472".to_owned()],
+            minimum_workers: 1,
+            no_progress_hours: 12.0,
+        });
+        let mut evidence = evidence();
+        let mut done_goal = ticket("qsl472", "QSL-472", "qsl-l2", "Done", 1.0);
+        done_goal.team_key = "QSL".to_owned();
+        done_goal.project_identifier = Some("QSL L2 plan v2".to_owned());
+        done_goal.blocked_by = vec!["std126".to_owned()];
+        let mut blocker = ticket("std126", "STD-126", "standard", "In Progress", 1.0);
+        blocker.team_key = "STD".to_owned();
+        evidence.tickets.extend([done_goal, blocker]);
+
+        let report = evaluate_drift(&config, &evidence).expect("completed goal report");
+        let goal = &report.priority_goals[0];
+        assert!(goal.blocked_on.is_empty());
+        assert_eq!(goal.status, PriorityGoalStatus::OnTrack);
+        assert_eq!(goal.flagged, Some(false));
+    }
+
+    #[test]
+    fn active_linear_transition_with_missing_git_evidence_is_unknown_not_flagged() {
+        let mut config = config();
+        config.report_time = "2026-10-07T15:10:00Z".to_owned();
+        config.priority_goals.push(PriorityGoalConfig {
+            goal: "QSL L2 plan v2".to_owned(),
+            ticket_ids: vec!["QSL-487".to_owned()],
+            minimum_workers: 1,
+            no_progress_hours: 12.0,
+        });
+        let mut evidence = evidence();
+        evidence.missing.extend([
+            MissingEvidence {
+                source: "github.prs".to_owned(),
+                reason: "live source unavailable".to_owned(),
+            },
+            MissingEvidence {
+                source: "github.commits".to_owned(),
+                reason: "live source unavailable".to_owned(),
+            },
+        ]);
+        let mut active = ticket("qsl487", "QSL-487", "qsl-l2", "Coding", 1.0);
+        active.team_key = "QSL".to_owned();
+        active.project_identifier = Some("QSL L2 plan v2".to_owned());
+        active.created_at = "2026-10-01T00:00:00Z".to_owned();
+        active.state_entered_at = Some("2026-10-07T15:09:00Z".to_owned());
+        evidence.tickets.push(active);
+        evidence.transitions.push(IssueTransition {
+            event_id: "qsl487-started".to_owned(),
+            issue_id: "qsl487".to_owned(),
+            ticket_id: "QSL-487".to_owned(),
+            to_state: "Coding".to_owned(),
+            occurred_at: "2026-10-07T15:09:00Z".to_owned(),
+            queue_before: None,
+        });
+
+        let report = evaluate_drift(&config, &evidence).expect("partial activity report");
+        let goal = &report.priority_goals[0];
+        assert!(!goal.trusted);
+        assert_eq!(goal.flagged, None);
+        assert_eq!(goal.status, PriorityGoalStatus::Unknown);
+        assert_eq!(goal.recently_worked_active_issues, 1);
+        assert_eq!(
+            goal.last_activity_at.as_deref(),
+            Some("2026-10-07T15:09:00Z")
+        );
+        assert!(
+            render_drift_text(&report).contains("status=unknown flagged=unknown trusted=false")
+        );
     }
 
     #[test]
