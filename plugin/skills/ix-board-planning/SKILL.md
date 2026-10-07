@@ -14,6 +14,8 @@ If credentials are missing, run `ix-board auth login` in an interactive terminal
 
 1. For "how is this project or initiative going?", progress by milestone, blockers, or current ready work, use the `focus-status` skill with the requested selector. Use `--initiative` for a campaign spanning projects:
 
+   Initiative selectors accept a Linear UUID, visible identifier such as `I-10`, or exact name.
+
    ```bash
    ix-board focus status --initiative <INITIATIVE>
    ix-board focus status --project <PROJECT>
@@ -45,7 +47,7 @@ If credentials are missing, run `ix-board auth login` in an interactive terminal
 
    Names match exactly without case sensitivity. If a name is ambiguous, use its identifier from `search`. Use `focus status --project <EXACT-NAME>` for a progress report. Select focus only from an explicit request or structured Linear context. Run `ix-board focus <COMMAND> --help` when selector syntax is unclear.
 
-5. To check several exact issue states in one read, pass their identifiers to `issues`. Preserve the returned order and exact Linear state names; call out any `missing` selectors without hiding found records:
+5. To check several exact issue states in one read, pass their identifiers to `issues`. Preserve the returned order and exact Linear state names; call out any `missing` selectors without hiding found records. An all-missing batch exits non-zero while still printing the missing list:
 
    ```bash
    ix-board issues SWM-12 SWM-13 SWM-14

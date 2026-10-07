@@ -1181,6 +1181,7 @@ mod tests {
                 team_keys: vec![TeamKey("IR".to_owned())],
                 initiatives: vec![Initiative {
                     id: "in1".to_owned(),
+                    identifier: "I-10".to_owned(),
                     name: "I1".to_owned(),
                 }],
                 milestones: vec![Milestone {

@@ -22,6 +22,7 @@ fn project(id: &str, name: &str) -> Project {
         milestones: vec![],
         initiatives: vec![Initiative {
             id: "initiative".into(),
+            identifier: "I-10".into(),
             name: "Delivery".into(),
         }],
     }
@@ -87,6 +88,23 @@ fn tc_010_01_overlapping_selectors_count_leaves_once_and_exclude_terminal_nonwor
     )
     .unwrap();
     assert_eq!(subtree.leaf_ids, [IssueId("SWM-2".into())].into());
+    let by_identifier = select_scope(
+        &snapshot,
+        &ScopeSelection {
+            initiatives: vec!["i-10".into()],
+            ..ScopeSelection::default()
+        },
+    )
+    .unwrap();
+    let by_name = select_scope(
+        &snapshot,
+        &ScopeSelection {
+            initiatives: vec!["Delivery".into()],
+            ..ScopeSelection::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(by_identifier, by_name);
 }
 
 /// Trace: FR-010-AC-3

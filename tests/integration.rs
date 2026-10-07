@@ -637,6 +637,7 @@ fn focus_expansion_unions_selectors_groups_milestones_and_layers_blockers() {
     let mut first = project("p1", "SWM-P1", "Started", 2, 1.0);
     first.initiatives = vec![ix_board::Initiative {
         id: "init-1".to_owned(),
+        identifier: "I-10".to_owned(),
         name: "Delivery".to_owned(),
     }];
     first.milestones = vec![
