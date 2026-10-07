@@ -36,6 +36,24 @@ pub struct DriftConfig {
     pub min_merged_prs_for_churn: u64,
     /// Leads in the order used by every output format.
     pub leads: Vec<DriftLead>,
+    /// Explicit active priority goals to monitor for crowding.
+    #[serde(default)]
+    pub priority_goals: Vec<PriorityGoalConfig>,
+}
+
+/// A project or milestone that must retain a minimum assigned worker count.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PriorityGoalConfig {
+    /// Exact project or milestone identifier as exposed by Linear.
+    pub goal: String,
+    /// Explicit issue identifiers when the goal is not represented by a Linear project or milestone.
+    #[serde(default)]
+    pub ticket_ids: Vec<String>,
+    /// Positive minimum worker coverage, measured as active issues with recent linked work.
+    pub minimum_workers: u64,
+    /// Hours without goal progress before crowding is reported.
+    pub no_progress_hours: f64,
 }
 
 /// A project state used to reconstruct a queue at a Coding transition.
@@ -106,6 +124,12 @@ pub struct DriftTicket {
     pub project_id: Option<String>,
     /// Current project title, when known.
     pub project_identifier: Option<String>,
+    /// Current milestone identifier, when known.
+    #[serde(default)]
+    pub milestone_identifier: Option<String>,
+    /// GitHub pull request URLs attached to this issue in Linear.
+    #[serde(default)]
+    pub linked_pr_urls: Vec<String>,
     /// Current workflow state.
     pub state: String,
     /// Current spec state.
@@ -158,6 +182,9 @@ pub struct DriftPullRequest {
     pub created_at: String,
     /// Merge time as RFC 3339, when merged.
     pub merged_at: Option<String>,
+    /// Most recent GitHub update timestamp, when supplied by the source.
+    #[serde(default)]
+    pub updated_at: Option<String>,
     /// Stable GitHub event IDs present in the paginated source response.
     pub event_ids: Vec<String>,
 }
@@ -504,8 +531,49 @@ pub struct DriftReport {
     pub window_end: String,
     /// Leads in configured order.
     pub leads: Vec<LeadDriftReport>,
+    /// Configured priority-goal health, in config order.
+    #[serde(default)]
+    pub priority_goals: Vec<PriorityGoalReport>,
     /// Global unassigned PRs, ordered by repository and number.
     pub unassigned_prs: Vec<UnassignedPullRequest>,
+}
+
+/// Progress, staffing, and competing transitions for one configured priority goal.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PriorityGoalReport {
+    /// Configured project or milestone identifier.
+    pub goal: String,
+    /// Last issue completion timestamp on this goal, if observed.
+    pub last_completion_at: Option<String>,
+    /// Last issue state transition timestamp on this goal, if observed.
+    pub last_transition_at: Option<String>,
+    /// Last observed linked work activity (transition, PR change, or commit).
+    pub last_activity_at: Option<String>,
+    /// Hours since the most recent linked work activity.
+    pub hours_since_progress: Option<f64>,
+    /// Active goal issues with activity in the configured window; used as a worker-coverage proxy.
+    pub recently_worked_active_issues: u64,
+    /// Active Coding/In Progress/Review goal issues, including stale claimed issues.
+    pub claimed_active_issues: u64,
+    /// Configured minimum worker coverage.
+    pub minimum_workers: u64,
+    /// Other projects with state transitions in the no-progress window, with ticket IDs.
+    pub crowding_out: Vec<CrowdingOutProject>,
+    /// Missing evidence that prevents a complete activity-age assessment.
+    pub missing_sources: Vec<String>,
+    /// Whether the goal lacks recent activity or active work coverage.
+    pub flagged: bool,
+}
+
+/// Other-project transitions that coincided with a stalled priority goal.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CrowdingOutProject {
+    /// Project identifier, or `(no project)` when the issue has no project.
+    pub project: String,
+    /// Transitioning ticket identifiers in deterministic order.
+    pub tickets: Vec<String>,
 }
 
 /// Invalid drift configuration or evidence that cannot be interpreted safely.
@@ -817,6 +885,7 @@ pub fn evaluate_drift(
             signals,
         });
     }
+    let priority_goals = evaluate_priority_goals(config, evidence, &transitions, report_epoch)?;
     let mut unassigned_prs = collect_unassigned_prs(
         &pull_requests,
         window_start_epoch,
@@ -836,6 +905,7 @@ pub fn evaluate_drift(
         window_start,
         window_end: canonical_timestamp(&config.report_time)?,
         leads,
+        priority_goals,
         unassigned_prs,
     })
 }
@@ -861,6 +931,37 @@ fn validate_config(config: &DriftConfig) -> Result<(), DriftError> {
         });
     }
     timestamp_epoch(&config.report_time)?;
+    let mut goals = HashSet::new();
+    for goal in &config.priority_goals {
+        if goal.goal.trim().is_empty() || goal.minimum_workers == 0 {
+            return Err(DriftError::InvalidConfig {
+                reason:
+                    "priority goal identifier and minimum_workers must be nonempty and positive"
+                        .to_owned(),
+            });
+        }
+        if !goal.no_progress_hours.is_finite() || goal.no_progress_hours <= 0.0 {
+            return Err(DriftError::InvalidConfig {
+                reason: format!(
+                    "priority goal '{}' no_progress_hours must be positive and finite",
+                    goal.goal
+                ),
+            });
+        }
+        if !goals.insert(goal.goal.as_str()) {
+            return Err(DriftError::InvalidConfig {
+                reason: format!("duplicate priority goal '{}'", goal.goal),
+            });
+        }
+        if goal.ticket_ids.iter().any(|id| id.trim().is_empty()) {
+            return Err(DriftError::InvalidConfig {
+                reason: format!(
+                    "priority goal '{}' has an empty ticket identifier",
+                    goal.goal
+                ),
+            });
+        }
+    }
     if !config.window_hours.is_finite() || config.window_hours <= 0.0 {
         return Err(DriftError::InvalidConfig {
             reason: "window_hours must be positive and finite".to_owned(),
@@ -901,6 +1002,288 @@ fn validate_config(config: &DriftConfig) -> Result<(), DriftError> {
         }
     }
     Ok(())
+}
+
+fn evaluate_priority_goals(
+    config: &DriftConfig,
+    evidence: &DriftEvidence,
+    transitions: &[IssueTransition],
+    report_epoch: f64,
+) -> Result<Vec<PriorityGoalReport>, DriftError> {
+    config
+        .priority_goals
+        .iter()
+        .map(|goal| {
+            let belongs = |ticket: &DriftTicket| {
+                ticket.project_identifier.as_deref() == Some(goal.goal.as_str())
+                    || ticket.milestone_identifier.as_deref() == Some(goal.goal.as_str())
+                    || goal
+                        .ticket_ids
+                        .iter()
+                        .any(|id| id.eq_ignore_ascii_case(&ticket.identifier))
+            };
+            let missing_sources = missing_for(
+                evidence,
+                &[
+                    "linear.issues",
+                    "linear.history",
+                    "github.prs",
+                    "github.commits",
+                ],
+            );
+            let missing_goal_history = missing_for(evidence, &["linear.issues", "linear.history"]);
+            let mut goal_ids = HashSet::new();
+            for ticket in evidence.tickets.iter().filter(|ticket| belongs(ticket)) {
+                if timestamp_epoch(&ticket.created_at)? <= report_epoch {
+                    goal_ids.insert(ticket.id.as_str());
+                }
+            }
+            let goal_transitions: Vec<_> = transitions
+                .iter()
+                .filter(|event| goal_ids.contains(event.issue_id.as_str()))
+                .map(|event| Ok((timestamp_epoch(&event.occurred_at)?, event)))
+                .collect::<Result<_, DriftError>>()?;
+            let last_transition = goal_transitions
+                .iter()
+                .map(|(at, event)| (*at, *event))
+                .filter(|(at, _)| *at <= report_epoch)
+                .max_by(|a, b| a.0.total_cmp(&b.0));
+            let last_completion = goal_transitions
+                .iter()
+                .filter(|(_, event)| {
+                    matches!(
+                        event.to_state.to_ascii_lowercase().as_str(),
+                        "completed" | "done"
+                    )
+                })
+                .map(|(at, event)| (*at, *event))
+                .filter(|(at, _)| *at <= report_epoch)
+                .max_by(|a, b| a.0.total_cmp(&b.0));
+            let mut goal_activity = Vec::new();
+            for ticket in evidence.tickets.iter().filter(|ticket| belongs(ticket)) {
+                let at = timestamp_epoch(&ticket.created_at)?;
+                if at <= report_epoch {
+                    goal_activity.push((at, ticket.identifier.as_str()));
+                }
+            }
+            for (at, event) in &goal_transitions {
+                if *at <= report_epoch {
+                    goal_activity.push((*at, event.ticket_id.as_str()));
+                }
+            }
+            let active_goal_tickets: Vec<_> = evidence
+                .tickets
+                .iter()
+                .filter(|ticket| {
+                    belongs(ticket)
+                        && timestamp_epoch(&ticket.created_at)
+                            .is_ok_and(|created| created <= report_epoch)
+                        && matches!(
+                            ticket.state.to_ascii_lowercase().as_str(),
+                            "coding" | "in progress" | "review"
+                        )
+                })
+                .collect();
+            let mut recent_active = BTreeSet::new();
+            let mut claimed_active = BTreeSet::new();
+            for ticket in &active_goal_tickets {
+                claimed_active.insert(ticket.identifier.as_str());
+                let mut latest = goal_transitions
+                    .iter()
+                    .filter(|(_, event)| event.issue_id == ticket.id)
+                    .filter_map(|(at, _)| (*at <= report_epoch).then_some(*at))
+                    .max_by(f64::total_cmp);
+                if let Some(entered) = ticket.state_entered_at.as_deref() {
+                    let at = timestamp_epoch(entered)?;
+                    if at <= report_epoch {
+                        latest = Some(latest.map_or(at, |current| current.max(at)));
+                    }
+                }
+                for pr in evidence
+                    .pull_requests
+                    .iter()
+                    .filter(|pr| ticket_links_pr(ticket, pr))
+                {
+                    for stamp in [
+                        Some(pr.created_at.as_str()),
+                        pr.updated_at.as_deref(),
+                        pr.merged_at.as_deref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        let at = timestamp_epoch(stamp)?;
+                        if at <= report_epoch {
+                            latest = Some(latest.map_or(at, |current| current.max(at)));
+                        }
+                    }
+                }
+                for commit in evidence
+                    .commits
+                    .iter()
+                    .filter(|commit| commit.ticket_ids.iter().any(|id| id == &ticket.identifier))
+                {
+                    let at = timestamp_epoch(&commit.committed_at)?;
+                    if at <= report_epoch {
+                        latest = Some(latest.map_or(at, |current| current.max(at)));
+                    }
+                }
+                if latest.is_some_and(|at| at >= report_epoch - goal.no_progress_hours * 3600.0) {
+                    recent_active.insert(ticket.identifier.as_str());
+                }
+            }
+            for pr in &evidence.pull_requests {
+                if evidence
+                    .tickets
+                    .iter()
+                    .any(|ticket| belongs(ticket) && ticket_links_pr(ticket, pr))
+                {
+                    for stamp in [
+                        Some(pr.created_at.as_str()),
+                        pr.updated_at.as_deref(),
+                        pr.merged_at.as_deref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        let at = timestamp_epoch(stamp)?;
+                        if at <= report_epoch {
+                            goal_activity.push((at, pr.url.as_str()));
+                        }
+                    }
+                }
+            }
+            for commit in &evidence.commits {
+                if evidence.tickets.iter().any(|ticket| {
+                    belongs(ticket) && commit.ticket_ids.iter().any(|id| id == &ticket.identifier)
+                }) {
+                    let at = timestamp_epoch(&commit.committed_at)?;
+                    if at <= report_epoch {
+                        goal_activity.push((at, commit.sha.as_str()));
+                    }
+                }
+            }
+            let last_activity = goal_activity.iter().max_by(|a, b| a.0.total_cmp(&b.0));
+            let hours_since_progress =
+                last_activity.map(|(at, _)| ((report_epoch - at) / 3600.0).max(0.0));
+            let stale_start = report_epoch - goal.no_progress_hours * 3600.0;
+            let mut competing: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+            for event in transitions {
+                let at = timestamp_epoch(&event.occurred_at)?;
+                if at < stale_start
+                    || at > report_epoch
+                    || goal_ids.contains(event.issue_id.as_str())
+                {
+                    continue;
+                }
+                let Some(ticket) = evidence
+                    .tickets
+                    .iter()
+                    .find(|ticket| ticket.id == event.issue_id)
+                else {
+                    continue;
+                };
+                let project = ticket
+                    .project_identifier
+                    .as_deref()
+                    .unwrap_or("(no project)");
+                competing
+                    .entry(project.to_owned())
+                    .or_default()
+                    .insert(event.ticket_id.clone());
+            }
+            for pr in &evidence.pull_requests {
+                let activity_at = [
+                    Some(pr.created_at.as_str()),
+                    pr.updated_at.as_deref(),
+                    pr.merged_at.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .map(timestamp_epoch)
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .max_by(f64::total_cmp);
+                if activity_at
+                    .filter(|at| *at >= stale_start && *at <= report_epoch)
+                    .is_none()
+                {
+                    continue;
+                }
+                for ticket in evidence
+                    .tickets
+                    .iter()
+                    .filter(|ticket| !belongs(ticket) && ticket_links_pr(ticket, pr))
+                {
+                    competing
+                        .entry(
+                            ticket
+                                .project_identifier
+                                .clone()
+                                .unwrap_or_else(|| "(no project)".to_owned()),
+                        )
+                        .or_default()
+                        .insert(ticket.identifier.clone());
+                }
+            }
+            for commit in &evidence.commits {
+                let at = timestamp_epoch(&commit.committed_at)?;
+                if at < stale_start || at > report_epoch {
+                    continue;
+                }
+                for ticket in evidence.tickets.iter().filter(|ticket| {
+                    !belongs(ticket) && commit.ticket_ids.iter().any(|id| id == &ticket.identifier)
+                }) {
+                    competing
+                        .entry(
+                            ticket
+                                .project_identifier
+                                .clone()
+                                .unwrap_or_else(|| "(no project)".to_owned()),
+                        )
+                        .or_default()
+                        .insert(ticket.identifier.clone());
+                }
+            }
+            let crowding_out: Vec<_> = competing
+                .into_iter()
+                .map(|(project, tickets)| CrowdingOutProject {
+                    project,
+                    tickets: tickets.into_iter().collect(),
+                })
+                .collect();
+            let stale = hours_since_progress.is_none_or(|hours| hours >= goal.no_progress_hours);
+            let flagged = missing_goal_history.is_empty()
+                && (recent_active.len()
+                    < usize::try_from(goal.minimum_workers).unwrap_or(usize::MAX)
+                    || (stale && !crowding_out.is_empty()));
+            Ok(PriorityGoalReport {
+                goal: goal.goal.clone(),
+                last_completion_at: last_completion
+                    .map(|(_, event)| canonical_timestamp(&event.occurred_at))
+                    .transpose()?,
+                last_transition_at: last_transition
+                    .map(|(_, event)| canonical_timestamp(&event.occurred_at))
+                    .transpose()?,
+                last_activity_at: last_activity.map(|(at, _)| format_timestamp(*at)),
+                hours_since_progress,
+                recently_worked_active_issues: u64::try_from(recent_active.len())
+                    .unwrap_or(u64::MAX),
+                claimed_active_issues: u64::try_from(claimed_active.len()).unwrap_or(u64::MAX),
+                minimum_workers: goal.minimum_workers,
+                crowding_out,
+                missing_sources: missing_sources.iter().cloned().collect(),
+                flagged,
+            })
+        })
+        .collect()
+}
+
+fn ticket_links_pr(ticket: &DriftTicket, pr: &DriftPullRequest) -> bool {
+    ticket.linked_pr_urls.iter().any(|url| url == &pr.url)
+        || extract_ticket_ids(&pr.branch, &pr.title)
+            .iter()
+            .any(|identifier| identifier == &ticket.identifier)
 }
 
 fn validate_evidence_numbers(evidence: &DriftEvidence) -> Result<(), DriftError> {
@@ -1032,6 +1415,14 @@ fn deduplicated_prs(values: &[DriftPullRequest]) -> Vec<DriftPullRequest> {
             .and_modify(|existing: &mut DriftPullRequest| {
                 if existing.merged_at.is_none() {
                     existing.merged_at.clone_from(&pr.merged_at);
+                }
+                if let Some(updated_at) = pr.updated_at.as_deref() {
+                    let replace = existing.updated_at.as_deref().is_none_or(|current| {
+                        timestamp_epoch(updated_at).ok() > timestamp_epoch(current).ok()
+                    });
+                    if replace {
+                        existing.updated_at = Some(updated_at.to_owned());
+                    }
                 }
                 let mut event_ids = existing.event_ids.iter().cloned().collect::<BTreeSet<_>>();
                 event_ids.extend(pr.event_ids.iter().cloned());
@@ -1549,9 +1940,9 @@ fn derive_alerts(
     }
 }
 
-/// Renders exactly one concise line per configured lead in report order.
+/// Renders concise lead and configured priority-goal lines in report order.
 pub fn render_drift_text(report: &DriftReport) -> String {
-    report
+    let mut lines: Vec<_> = report
         .leads
         .iter()
         .map(|lead| {
@@ -1595,8 +1986,33 @@ pub fn render_drift_text(report: &DriftReport) -> String {
                 reasons.join("; ")
             )
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect();
+    lines.extend(report.priority_goals.iter().map(|goal| {
+        let mut crowding = goal
+            .crowding_out
+            .iter()
+            .map(|project| format!("{}: {}", project.project, project.tickets.join(",")))
+            .collect::<Vec<_>>()
+            .join("; ");
+        if crowding.is_empty() {
+            crowding = "none observed".to_owned();
+        }
+        format!(
+            "priority_goal {} flagged={} {}h_since_progress worked_active_issues={}/{} claimed_active_issues={} last_activity={} crowding_out=[{}] missing=[{}]",
+            goal.goal,
+            goal.flagged,
+            goal.hours_since_progress
+                .map(|hours| format!("{hours:.1}"))
+                .unwrap_or_else(|| "unknown".to_owned()),
+            goal.recently_worked_active_issues,
+            goal.minimum_workers,
+            goal.claimed_active_issues,
+            goal.last_activity_at.as_deref().unwrap_or("unknown"),
+            crowding,
+            goal.missing_sources.join(","),
+        )
+    }));
+    lines.join("\n")
 }
 
 fn unassigned_reason_name(reason: UnassignedReason) -> &'static str {
@@ -1608,7 +2024,7 @@ fn unassigned_reason_name(reason: UnassignedReason) -> &'static str {
     }
 }
 
-fn timestamp_epoch(value: &str) -> Result<f64, DriftError> {
+pub(crate) fn timestamp_epoch(value: &str) -> Result<f64, DriftError> {
     let invalid = || DriftError::InvalidTimestamp {
         value: value.to_owned(),
     };
@@ -1748,6 +2164,7 @@ mod tests {
             spend_threshold: 0.0,
             max_net_ticket_growth: 0,
             min_merged_prs_for_churn: 1,
+            priority_goals: Vec::new(),
             leads: vec![DriftLead {
                 lead_id: "lead-a".to_owned(),
                 team_key: "SWM".to_owned(),
@@ -1785,6 +2202,8 @@ mod tests {
             team_key: "SWM".to_owned(),
             project_id: Some(project_id.to_owned()),
             project_identifier: Some("SWM-P1".to_owned()),
+            milestone_identifier: None,
+            linked_pr_urls: Vec::new(),
             state: state.to_owned(),
             spec_state: "Specced".to_owned(),
             priority,
@@ -1829,6 +2248,7 @@ mod tests {
             branch: branch.to_owned(),
             created_at: created_at.to_owned(),
             merged_at: merged_at.map(str::to_owned),
+            updated_at: None,
             event_ids: vec![format!("pr-{number}")],
         }
     }
@@ -2082,6 +2502,145 @@ mod tests {
     }
 
     #[test]
+    fn priority_goal_flags_qsl_l2_stalled_while_other_projects_advance() {
+        let mut config = config();
+        config.report_time = "2026-10-05T18:00:00Z".to_owned();
+        config.priority_goals.push(PriorityGoalConfig {
+            goal: "QSL-L2".to_owned(),
+            ticket_ids: vec![
+                "QSL-485".to_owned(),
+                "QSL-486".to_owned(),
+                "QSL-487".to_owned(),
+            ],
+            minimum_workers: 1,
+            no_progress_hours: 12.0,
+        });
+        let mut evidence = evidence();
+        let target_project_id = "qsl-l2";
+        for (id, identifier) in [
+            ("qsl485", "QSL-485"),
+            ("qsl486", "QSL-486"),
+            ("qsl487", "QSL-487"),
+        ] {
+            let state = match identifier {
+                "QSL-485" => "In Progress",
+                "QSL-486" => "Coding",
+                _ => "Todo",
+            };
+            let mut item = ticket(id, identifier, target_project_id, state, 1.0);
+            item.project_identifier = Some("QSL-L2".to_owned());
+            item.state_entered_at = Some("2026-10-04T04:00:00Z".to_owned());
+            if identifier == "QSL-485" {
+                item.linked_pr_urls
+                    .push("https://github.com/agent-ix/example/pull/641".to_owned());
+            }
+            evidence.tickets.push(item);
+        }
+        for (id, identifier, project, state, at) in [
+            (
+                "qsl641",
+                "QSL-641",
+                "IR-path",
+                "In Progress",
+                "2026-10-05T07:00:00Z",
+            ),
+            (
+                "qsl635",
+                "QSL-635",
+                "IR-path",
+                "Coding",
+                "2026-10-05T09:00:00Z",
+            ),
+            (
+                "ir626",
+                "IR-626",
+                "IR-path",
+                "In Progress",
+                "2026-10-05T11:00:00Z",
+            ),
+        ] {
+            let mut item = ticket(id, identifier, "other", state, 1.0);
+            item.project_identifier = Some(project.to_owned());
+            if identifier == "QSL-641" || identifier == "IR-626" {
+                item.linked_pr_urls.push(format!(
+                    "https://github.com/agent-ix/example/pull/{}",
+                    if identifier == "QSL-641" { 700 } else { 701 }
+                ));
+            }
+            evidence.tickets.push(item);
+            evidence.transitions.push(IssueTransition {
+                event_id: format!("transition-{id}"),
+                issue_id: id.to_owned(),
+                ticket_id: identifier.to_owned(),
+                to_state: state.to_owned(),
+                occurred_at: at.to_owned(),
+                queue_before: None,
+            });
+        }
+        for (id, identifier) in [
+            ("qsl485", "QSL-485"),
+            ("qsl486", "QSL-486"),
+            ("qsl487", "QSL-487"),
+        ] {
+            evidence.transitions.push(IssueTransition {
+                event_id: format!("last-{id}"),
+                issue_id: id.to_owned(),
+                ticket_id: identifier.to_owned(),
+                to_state: "Todo".to_owned(),
+                occurred_at: "2026-10-05T05:00:00Z".to_owned(),
+                queue_before: None,
+            });
+        }
+        let mut b4_pr = pr(641, "feature/no-issue", "B4", "2026-10-04T00:00:00Z", None);
+        b4_pr.updated_at = Some("2026-10-05T04:00:00Z".to_owned());
+        let mut qsl_pr = pr(
+            700,
+            "feature/QSL-641",
+            "QSL-641",
+            "2026-10-05T16:00:00Z",
+            None,
+        );
+        qsl_pr.updated_at = Some("2026-10-05T17:00:00Z".to_owned());
+        let mut ir_pr = pr(
+            701,
+            "feature/IR-626",
+            "IR-626",
+            "2026-10-05T16:00:00Z",
+            None,
+        );
+        ir_pr.updated_at = Some("2026-10-05T17:00:00Z".to_owned());
+        evidence.pull_requests.extend([b4_pr, qsl_pr, ir_pr]);
+        evidence.transitions.push(IssueTransition {
+            event_id: "qsl-last-completion".to_owned(),
+            issue_id: "qsl485".to_owned(),
+            ticket_id: "QSL-485".to_owned(),
+            to_state: "Done".to_owned(),
+            occurred_at: "2026-10-04T06:00:00Z".to_owned(),
+            queue_before: None,
+        });
+        let report = evaluate_drift(&config, &evidence).expect("valid priority history");
+        let goal = &report.priority_goals[0];
+        assert!(goal.flagged);
+        assert_eq!(
+            goal.last_completion_at.as_deref(),
+            Some("2026-10-04T06:00:00Z")
+        );
+        assert_eq!(
+            goal.last_transition_at.as_deref(),
+            Some("2026-10-05T05:00:00Z")
+        );
+        assert_eq!(goal.hours_since_progress, Some(13.0));
+        assert_eq!(goal.recently_worked_active_issues, 0);
+        assert_eq!(goal.claimed_active_issues, 2);
+        assert_eq!(goal.minimum_workers, 1);
+        assert_eq!(goal.crowding_out[0].project, "IR-path");
+        assert_eq!(
+            goal.crowding_out[0].tickets,
+            vec!["IR-626", "QSL-635", "QSL-641"]
+        );
+    }
+
+    #[test]
     fn duplicate_team_mapping_and_unknown_evidence_version_are_rejected() {
         let mut duplicate = config();
         duplicate.leads.push(DriftLead {
@@ -2156,11 +2715,19 @@ mod tests {
     #[test]
     fn duplicate_pr_rows_keep_merge_metadata_from_the_later_page() {
         let mut evidence = evidence();
-        let original = pr(11, "feature/SWM-1", "SWM-1", "2026-09-10T00:00:00Z", None);
+        let mut original = pr(11, "feature/SWM-1", "SWM-1", "2026-09-10T00:00:00Z", None);
+        original.updated_at = Some("2026-09-24T00:00:00Z".to_owned());
         let mut merged = original.clone();
         merged.merged_at = Some("2026-09-25T00:00:00Z".to_owned());
+        merged.updated_at = Some("2026-09-26T00:00:00Z".to_owned());
         merged.event_ids.push("merge-event".to_owned());
         evidence.pull_requests = vec![original, merged];
+        assert_eq!(
+            deduplicated_prs(&evidence.pull_requests)[0]
+                .updated_at
+                .as_deref(),
+            Some("2026-09-26T00:00:00Z")
+        );
         let report = evaluate_drift(&config(), &evidence).expect("duplicate PR pages merge");
         assert_eq!(report.leads[0].signals.ticket_churn.merged_prs, Some(1));
         assert!(report.leads[0].signals.pr_scope.prs.is_empty());
