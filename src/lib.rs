@@ -800,25 +800,8 @@ fn canonical_selectors(
 ) -> Result<Vec<String>, Error> {
     let mut selectors = BTreeSet::new();
     for value in &selection.initiatives {
-        let matches = snapshot
-            .projects
-            .iter()
-            .flat_map(|project| &project.initiatives)
-            .filter(|initiative| {
-                initiative.id == *value || initiative.name.eq_ignore_ascii_case(value)
-            })
-            .map(|initiative| initiative.id.clone())
-            .collect::<BTreeSet<_>>();
-        if matches.len() != 1 {
-            return Err(Error::ScopeSelection {
-                kind: "initiative",
-                identifier: value.clone(),
-                matches: matches.len(),
-            });
-        }
-        if let Some(id) = matches.first() {
-            selectors.insert(format!("initiative:{id}"));
-        }
+        let id = scope::resolve_initiative_id(snapshot, value)?;
+        selectors.insert(format!("initiative:{id}"));
     }
     for value in &selection.projects {
         let matches = snapshot

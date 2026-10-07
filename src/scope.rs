@@ -49,6 +49,25 @@ fn unique<T>(kind: &'static str, identifier: &str, mut values: Vec<T>) -> Result
     })
 }
 
+/// Resolve one initiative selector to its canonical Linear UUID.
+pub(crate) fn resolve_initiative_id(
+    snapshot: &WorkspaceSnapshot,
+    value: &str,
+) -> Result<String, Error> {
+    let ids = snapshot
+        .projects
+        .iter()
+        .flat_map(|project| &project.initiatives)
+        .filter(|initiative| {
+            initiative.id == value
+                || initiative.identifier.eq_ignore_ascii_case(value)
+                || initiative.name.eq_ignore_ascii_case(value)
+        })
+        .map(|initiative| initiative.id.clone())
+        .collect::<BTreeSet<_>>();
+    unique("initiative", value, ids.into_iter().collect())
+}
+
 /// Resolves explicit selectors and counts each executable leaf task once.
 pub fn select_scope(
     snapshot: &WorkspaceSnapshot,
@@ -104,23 +123,12 @@ pub fn select_scope(
         result.project_ids.insert(project.id.clone());
     }
     for value in &selection.initiatives {
-        let ids: BTreeSet<_> = snapshot
-            .projects
-            .iter()
-            .flat_map(|p| &p.initiatives)
-            .filter(|i| {
-                i.id == *value
-                    || i.identifier.eq_ignore_ascii_case(value)
-                    || i.name.eq_ignore_ascii_case(value)
-            })
-            .map(|i| &i.id)
-            .collect();
-        let id = unique("initiative", value, ids.into_iter().collect())?;
+        let id = resolve_initiative_id(snapshot, value)?;
         result.project_ids.extend(
             snapshot
                 .projects
                 .iter()
-                .filter(|p| p.initiatives.iter().any(|i| &i.id == id))
+                .filter(|p| p.initiatives.iter().any(|i| i.id == id))
                 .map(|p| p.id.clone()),
         );
     }

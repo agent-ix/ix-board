@@ -698,6 +698,35 @@ fn focus_expansion_unions_selectors_groups_milestones_and_layers_blockers() {
     let first_result = reads.focus_expand(&selection).expect("focus expansion");
     let repeated = reads.focus_expand(&selection).expect("repeat expansion");
 
+    let hygiene_by_name = reads
+        .focus_hygiene(
+            &ix_board::FocusSelection {
+                initiatives: vec!["Delivery".to_owned()],
+                ..ix_board::FocusSelection::default()
+            },
+            "2026-10-06T00:00:00Z",
+            30,
+        )
+        .expect("hygiene by initiative name");
+    let hygiene_by_identifier = reads
+        .focus_hygiene(
+            &ix_board::FocusSelection {
+                initiatives: vec!["i-10".to_owned()],
+                ..ix_board::FocusSelection::default()
+            },
+            "2026-10-06T00:00:00Z",
+            30,
+        )
+        .expect("hygiene by initiative identifier");
+    assert_eq!(
+        hygiene_by_identifier.canonical_focus,
+        hygiene_by_name.canonical_focus
+    );
+    assert_eq!(
+        serde_json::to_value(&hygiene_by_identifier.missing_scope.findings).unwrap(),
+        serde_json::to_value(&hygiene_by_name.missing_scope.findings).unwrap()
+    );
+
     assert_eq!(first_result, repeated);
     assert_eq!(first_result.fetched_at, 100);
     assert_eq!(

@@ -40,6 +40,13 @@ since I last reviewed it.
 - **Then** the PR check reports one unavailable reason and marks
   the section incomplete instead of listing duplicate reasons or zero findings
 
+### US-005-EX-4: Use the same initiative selector across focus reports
+
+- **Given** a campaign whose visible Linear initiative identifier is `I-10`
+- **When** the lead runs focus hygiene with `--initiative I-10`
+- **Then** it reports the same focus and findings as selection by exact name
+  and uses the same canonical baseline for later diffs
+
 ## Notes (Informative)
 
 PR state is looked up from a GitHub pull request URL attached to a Linear
