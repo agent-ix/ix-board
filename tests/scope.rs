@@ -103,6 +103,60 @@ fn milestone_members_select_only_assigned_issues_and_union_with_tickets() {
     ));
 }
 
+/// Trace: FR-010-AC-8
+#[test]
+fn slash_in_project_or_milestone_name_resolves_with_or_without_qualification() {
+    let mut first = project("p", "Project / Alpha");
+    first.milestones = vec![Milestone {
+        id: "m1".into(),
+        name: "Derived W/M operators".into(),
+        description: None,
+        sort_order: 1.0,
+        target_date: None,
+    }];
+    let mut second = project("q", "Another");
+    second.milestones = vec![Milestone {
+        id: "m2".into(),
+        name: "Past-time / history profile".into(),
+        description: None,
+        sort_order: 1.0,
+        target_date: None,
+    }];
+    let mut work = issue("SWM-1", None, WorkflowStateType::Started);
+    work.project_milestone_id = Some("m1".into());
+    let snapshot = WorkspaceSnapshot {
+        projects: vec![first, second],
+        issues: vec![work],
+        fetched_at: 0,
+    };
+    for selector in [
+        "Derived W/M operators",
+        "Project / Alpha/Derived W/M operators",
+        "Project / Alpha / Derived W/M operators",
+        "p/Derived W/M operators",
+    ] {
+        let scope = select_scope(
+            &snapshot,
+            &ScopeSelection {
+                milestones: vec![selector.into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(scope.issue_ids, [IssueId("SWM-1".into())].into());
+    }
+    assert!(
+        select_scope(
+            &snapshot,
+            &ScopeSelection {
+                milestones: vec!["Past-time / history profile".into()],
+                ..Default::default()
+            }
+        )
+        .is_ok()
+    );
+}
+
 fn issue(id: &str, parent: Option<&str>, category: WorkflowStateType) -> Issue {
     Issue {
         id: IssueId(id.into()),

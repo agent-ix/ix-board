@@ -1246,26 +1246,16 @@ fn resolve_work_milestones(
 ) -> Result<BTreeSet<String>, Error> {
     let mut ids = BTreeSet::new();
     for selector in selectors {
-        let id = match scope::resolve_milestone_id(snapshot, selector) {
-            Ok(id) => id,
-            Err(Error::ScopeSelection { matches: 0, .. }) => {
-                return Err(Error::WorkMilestoneNotFound {
-                    selector: selector.clone(),
-                });
-            }
-            Err(error) => return Err(error),
-        };
-        if !snapshot.projects.iter().any(|project| {
-            project_ids.contains(&project.id)
-                && project
-                    .milestones
-                    .iter()
-                    .any(|milestone| milestone.id == id)
-        }) {
-            return Err(Error::WorkMilestoneNotFound {
-                selector: selector.clone(),
-            });
-        }
+        let id =
+            match scope::resolve_milestone_id_in_projects(snapshot, selector, Some(project_ids)) {
+                Ok(id) => id,
+                Err(Error::ScopeSelection { matches: 0, .. }) => {
+                    return Err(Error::WorkMilestoneNotFound {
+                        selector: selector.clone(),
+                    });
+                }
+                Err(error) => return Err(error),
+            };
         ids.insert(id);
     }
     Ok(ids)
