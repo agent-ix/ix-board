@@ -182,6 +182,7 @@ fn issue(
                 .map_or(identifier, |(key, _)| key)
                 .to_owned(),
         ),
+        assignee_id: None,
         project_id: project_id.map(|id| ProjectId(id.to_owned())),
         project_milestone_id: None,
         priority,
