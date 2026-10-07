@@ -19,10 +19,11 @@ Selectors form a deduplicated union. Initiative selectors include their projects
 initiative selectors accept Linear UUIDs, human-readable identifiers such as
 `I-10`, and exact names without case sensitivity. The source snapshot SHALL
 retain the structured initiative identifier for this resolution.
-Milestone selectors accept a Linear UUID or a globally unique exact name,
-including case. A milestone contributes only issues assigned to it and its
-containing project for display; it does not select the entire project. An
-ambiguous milestone name fails. A project UUID or identifier takes precedence
+Milestone selectors accept a Linear UUID, a globally unique name without case
+sensitivity, or `<project identifier|name>/<milestone name>`. A milestone
+contributes only issues assigned to it and its containing project for display;
+it does not select the entire project. An ambiguous unqualified name fails and
+lists candidate project names and UUIDs. A project UUID or identifier takes precedence
 over a colliding project name, consistently with `project-chunk`.
 ticket selectors include descendants. Parent relationships are distinct from
 prerequisite dependencies. Completed leaves count as done; canceled and duplicate
@@ -41,7 +42,7 @@ leaves do not count as work. Source fetch timestamps survive cached reads.
 
 | FR-010-AC-6 | Project and initiative membership follows assigned project IDs without expanding into descendants in other projects. Explicit ticket selection includes descendants across projects within the team boundary; global ancestry still prevents counting parents as leaves. | Test |
 | FR-010-AC-7 | A Linear initiative identifier resolves to the same project and issue set as its UUID or exact name; missing and ambiguous selectors still fail explicitly. | Test |
-| FR-010-AC-8 | A milestone UUID or unique exact name selects only its assigned issues, contributes its containing project for reporting, and unions without duplication with other selectors; missing and ambiguous names fail. | Test |
+| FR-010-AC-8 | A milestone UUID, unique name, or project-qualified name selects only its assigned issues, contributes its containing project for reporting, and unions without duplication with other selectors; missing names fail and ambiguous names list the project candidates. | Test |
 
 ## Dependencies
 
