@@ -6,9 +6,9 @@
 use clap::{Parser, Subcommand};
 use ix_board::{
     DriftConfig, DriftError, DriftEvidenceFile, DriftReport, Error, FocusExpansion,
-    FocusHygieneReport, FocusPlanChunk, FocusSelection, FocusStatus, LinearGraphQlSource, NextStep,
-    ProjectChunk, ProjectPriority, ProjectRunStatus, ReadService, ReadyItem, SearchResult,
-    evaluate_drift_file, render_drift_text,
+    FocusHygieneReport, FocusPlanChunk, FocusSelection, FocusStatus, Issue, LinearGraphQlSource,
+    NextStep, ProjectChunk, ProjectPriority, ProjectRunStatus, ReadService, ReadyItem,
+    SearchResult, evaluate_drift_file, render_drift_text,
 };
 use ix_cli_kit::exit::Outcome;
 use ix_cli_kit::secrets::{AppScope, SecretKey, SecretStore, SecretValue};
@@ -65,6 +65,12 @@ enum Command {
     Search {
         /// Case-insensitive substring query.
         query: String,
+    },
+    /// Read multiple exact Linear issues in one cached workspace request.
+    Issues {
+        /// Linear issue identifiers or UUIDs, in desired output order.
+        #[arg(required = true, num_args = 1..)]
+        identifiers: Vec<String>,
     },
     /// Render a deterministic drift report from versioned structured evidence.
     Drift {
@@ -196,6 +202,7 @@ enum Output {
     FocusPlanChunk(FocusPlanChunk),
     FocusHygiene(Box<FocusHygieneReport>),
     Search(Vec<SearchResult>),
+    Issues(Vec<Issue>),
     Drift(DriftReport),
     ProjectStatusUpdated {
         project: String,
@@ -295,6 +302,13 @@ fn validate_command(command: &Command) -> Result<(), Error> {
     match command {
         Command::Next { team } if team.trim().is_empty() => Err(Error::InvalidTeam),
         Command::Search { query } if query.trim().is_empty() => Err(Error::InvalidQuery),
+        Command::Issues { identifiers } if identifiers.iter().any(|id| id.trim().is_empty()) => {
+            Err(Error::ScopeSelection {
+                kind: "issue",
+                identifier: String::new(),
+                matches: 0,
+            })
+        }
         Command::Focus {
             command:
                 FocusCommand::Expand {
@@ -401,6 +415,7 @@ fn run_linear(command: Command) -> Result<Output, Error> {
         Command::Next { team } => service.next(&team).map(Output::Queue),
         Command::ProjectChunk { project } => service.project_chunk(&project).map(Output::Chunk),
         Command::Search { query } => service.search(&query).map(Output::Search),
+        Command::Issues { identifiers } => service.issues(&identifiers).map(Output::Issues),
         Command::Focus {
             command:
                 FocusCommand::Expand {
@@ -541,6 +556,16 @@ fn render_human(output: &Output) -> String {
         Output::Search(results) => results
             .iter()
             .map(|record| format!("{:?} {} — {}", record.kind, record.identifier, record.name))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Output::Issues(issues) => issues
+            .iter()
+            .map(|issue| {
+                format!(
+                    "{} [{}] {}",
+                    issue.identifier, issue.state_name, issue.title
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n"),
         Output::Drift(report) => render_drift_text(report),
