@@ -6,14 +6,16 @@
 use ix_cli_kit::secrets::{AppScope, SecretKey, SecretStore, SecretValue};
 
 use crate::{
-    Clock, Error, Initiative, Issue, IssueId, Milestone, Project, ProjectId, ProjectMutationSource,
+    Clock, DriftConfig, DriftEvidence, DriftTicket, Error, HistoricalProject, Initiative, Issue,
+    IssueId, IssueTransition, Milestone, Project, ProjectId, ProjectMutationSource,
     ProjectPriority, ProjectRunStatus, SystemClock, TeamKey, WorkflowStateType, WorkspaceSnapshot,
     WorkspaceSource,
 };
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::process::Command as ProcessCommand;
 
 // Keep the project query below Linear's complexity limit while retaining nested page coverage.
 const PROJECT_PAGE_SIZE: i32 = 20;
@@ -23,7 +25,7 @@ const PROJECT_NESTED_PAGE_SIZE: i32 = 50;
 const RELATION_PAGE_SIZE: i32 = 50;
 const PAGE_LIMIT: usize = 1_000;
 // Invalidate cached snapshots predating issue-to-project-milestone associations.
-const CACHE_MODEL_VERSION: &str = "v8";
+const CACHE_MODEL_VERSION: &str = "v7";
 const ENDPOINT: &str = "https://api.linear.app/graphql";
 
 const PROJECT_QUERY: &str = r#"
@@ -32,7 +34,7 @@ query WorkspaceProjects($first: Int!, $nestedFirst: Int!, $after: String) {
     nodes {
       id identifier name description content priority sortOrder targetDate
       status { name type }
-      initiatives(first: 10) { nodes { id identifier name } pageInfo { hasNextPage } }
+      initiatives(first: 10) { nodes { id name } pageInfo { hasNextPage } }
       teams(first: $nestedFirst) { nodes { key } pageInfo { hasNextPage } }
       projectMilestones(first: $nestedFirst) {
         nodes { id name description sortOrder targetDate }
@@ -65,6 +67,19 @@ query WorkspaceIssues($first: Int!, $relationFirst: Int!, $after: String) {
     pageInfo { hasNextPage endCursor }
   }
 }"#;
+
+const ISSUE_HISTORY_QUERY: &str = r#"
+query IssueHistory($id: String!, $first: Int!, $after: String) {
+  issue(id: $id) {
+    id
+    history(first: $first, after: $after) {
+      nodes { id createdAt fromState { name type } toState { name type } }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}"#;
+
+const HISTORY_PAGE_SIZE: i32 = 100;
 
 const PROJECT_STATUSES_QUERY: &str = r#"
 query ProjectStatuses($first: Int!, $after: String) {
@@ -123,14 +138,311 @@ impl LinearGraphQlSource {
         })
     }
 
-    /// Resolves LINEAR_API_KEY first, then the saved OS credential.
+    /// Resolves LINEAR_API_KEY, the saved OS credential, then the configured Linear CLI.
     pub fn from_env() -> Result<Self, Error> {
         let scope = AppScope::try_from("ix-board")?;
         let key = SecretKey::try_from("linear-api-key")?;
-        let resolved = SecretStore::system()
-            .resolve(None, Some("LINEAR_API_KEY"), &scope, &key)?
-            .ok_or(Error::MissingApiKey)?;
-        Self::new(resolved.value.expose_secret())
+        if let Some(resolved) =
+            SecretStore::system().resolve(None, Some("LINEAR_API_KEY"), &scope, &key)?
+        {
+            return Self::new(resolved.value.expose_secret());
+        }
+        Self::new(linear_cli_token().ok_or(Error::MissingApiKey)?)
+    }
+
+    /// Reports which configured credential source is available without exposing its value.
+    pub fn credential_source() -> Result<Option<String>, Error> {
+        let scope = AppScope::try_from("ix-board")?;
+        let key = SecretKey::try_from("linear-api-key")?;
+        if let Some(resolved) =
+            SecretStore::system().resolve(None, Some("LINEAR_API_KEY"), &scope, &key)?
+        {
+            return Ok(Some(resolved.source.as_str().to_owned()));
+        }
+        Ok(linear_cli_token().map(|_| "linear_cli".to_owned()))
+    }
+
+    /// Collects current Linear scope and issue transitions for live priority-goal drift.
+    pub fn collect_drift_evidence(&self, config: &DriftConfig) -> Result<DriftEvidence, Error> {
+        let report_epoch = crate::drift::timestamp_epoch(&config.report_time)?;
+        let window_start = report_epoch - config.window_hours * 3600.0;
+        let snapshot = self.fetch_workspace()?;
+        let projects_by_id: HashMap<_, _> = snapshot
+            .projects
+            .iter()
+            .map(|project| (project.id.0.as_str(), project))
+            .collect();
+        let milestones_by_id: HashMap<_, _> = snapshot
+            .projects
+            .iter()
+            .flat_map(|project| {
+                project
+                    .milestones
+                    .iter()
+                    .map(move |milestone| (milestone.id.as_str(), milestone.name.as_str()))
+            })
+            .collect();
+        let mut evidence = DriftEvidence {
+            projects: snapshot
+                .projects
+                .iter()
+                .map(|project| HistoricalProject {
+                    id: project.id.0.clone(),
+                    identifier: project.identifier.clone(),
+                    team_keys: project
+                        .team_keys
+                        .iter()
+                        .map(|team| team.0.clone())
+                        .collect(),
+                    status: project.status.clone(),
+                    priority: project.priority,
+                    sort_order: project.sort_order,
+                })
+                .collect(),
+            ..DriftEvidence::default()
+        };
+
+        let mut history_issue_ids = HashSet::new();
+        for goal in &config.priority_goals {
+            let project_exists = snapshot.projects.iter().any(|project| {
+                project.identifier.as_deref() == Some(goal.goal.as_str())
+                    || project.name == goal.goal
+                    || project
+                        .milestones
+                        .iter()
+                        .any(|milestone| milestone.name == goal.goal)
+            }) || goal
+                .ticket_ids
+                .iter()
+                .any(|id| snapshot.issues.iter().any(|issue| issue.identifier == *id));
+            if !project_exists {
+                evidence.missing.push(crate::MissingEvidence {
+                    source: "linear.issues".to_owned(),
+                    reason: format!("configured priority goal '{}' was not found", goal.goal),
+                });
+            }
+            for ticket_id in &goal.ticket_ids {
+                if !snapshot
+                    .issues
+                    .iter()
+                    .any(|issue| issue.identifier.eq_ignore_ascii_case(ticket_id))
+                {
+                    evidence.missing.push(crate::MissingEvidence {
+                        source: "linear.issues".to_owned(),
+                        reason: format!(
+                            "configured priority goal '{}' ticket '{}' was not found",
+                            goal.goal, ticket_id
+                        ),
+                    });
+                }
+            }
+        }
+
+        for issue in &snapshot.issues {
+            let project = issue
+                .project_id
+                .as_ref()
+                .and_then(|id| projects_by_id.get(id.0.as_str()));
+            let project_identifier = project.map(|project| {
+                project
+                    .identifier
+                    .clone()
+                    .unwrap_or_else(|| project.name.clone())
+            });
+            let milestone_identifier = issue
+                .project_milestone_id
+                .as_deref()
+                .and_then(|id| milestones_by_id.get(id))
+                .map(|name| (*name).to_owned());
+            let belongs_to_goal = config.priority_goals.iter().any(|goal| {
+                project_identifier.as_deref() == Some(goal.goal.as_str())
+                    || milestone_identifier.as_deref() == Some(goal.goal.as_str())
+                    || goal
+                        .ticket_ids
+                        .iter()
+                        .any(|id| id.eq_ignore_ascii_case(&issue.identifier))
+            });
+            let recently_updated = issue
+                .updated_at
+                .as_deref()
+                .map(crate::drift::timestamp_epoch)
+                .transpose()?
+                .is_some_and(|updated| updated >= window_start);
+            if belongs_to_goal || recently_updated {
+                history_issue_ids.insert(issue.id.0.clone());
+            }
+            let Some(created_at) = issue.created_at.clone() else {
+                evidence.missing.push(crate::MissingEvidence {
+                    source: "linear.issues".to_owned(),
+                    reason: format!("{} has no creation timestamp", issue.identifier),
+                });
+                continue;
+            };
+            evidence.tickets.push(DriftTicket {
+                id: issue.id.0.clone(),
+                identifier: issue.identifier.clone(),
+                team_key: issue.team_key.0.clone(),
+                project_id: issue.project_id.as_ref().map(|id| id.0.clone()),
+                project_identifier,
+                milestone_identifier,
+                linked_pr_urls: issue
+                    .attachment_urls
+                    .iter()
+                    .filter(|url| url.contains("github.com/") && url.contains("/pull/"))
+                    .cloned()
+                    .collect(),
+                state: issue.state.clone(),
+                spec_state: "unknown".to_owned(),
+                priority: issue.priority,
+                sort_order: issue.sort_order,
+                blocked_by: issue.blocked_by.iter().map(|id| id.0.clone()).collect(),
+                created_at,
+                state_entered_at: None,
+            });
+        }
+
+        let mut history_ids: Vec<_> = history_issue_ids.into_iter().collect();
+        history_ids.sort();
+        let mut state_events: HashMap<String, Vec<(String, Option<String>, String)>> =
+            HashMap::new();
+        for issue_id in history_ids {
+            let mut after = None;
+            for page in 0..PAGE_LIMIT {
+                let result: IssueHistoryData = self.request(
+                    ISSUE_HISTORY_QUERY,
+                    IssueHistoryVariables {
+                        id: issue_id.clone(),
+                        first: HISTORY_PAGE_SIZE,
+                        after: after.clone(),
+                    },
+                )?;
+                let Some(issue) = result.issue else {
+                    evidence.missing.push(crate::MissingEvidence {
+                        source: "linear.history".to_owned(),
+                        reason: format!("history was unavailable for issue {issue_id}"),
+                    });
+                    break;
+                };
+                for event in issue.history.nodes {
+                    let Some(to_state) = event.to_state else {
+                        continue;
+                    };
+                    let to_state = canonical_issue_state(to_state.name, to_state.status_type);
+                    let from_state = event
+                        .from_state
+                        .map(|state| canonical_issue_state(state.name, state.status_type));
+                    state_events.entry(issue_id.clone()).or_default().push((
+                        event.created_at.clone(),
+                        from_state,
+                        to_state.clone(),
+                    ));
+                    evidence.transitions.push(IssueTransition {
+                        event_id: event.id,
+                        issue_id: issue_id.clone(),
+                        ticket_id: snapshot
+                            .issues
+                            .iter()
+                            .find(|ticket| ticket.id.0 == issue_id)
+                            .map(|ticket| ticket.identifier.clone())
+                            .unwrap_or_else(|| issue_id.clone()),
+                        to_state,
+                        occurred_at: event.created_at,
+                        queue_before: None,
+                    });
+                }
+                if !issue.history.page_info.has_next_page {
+                    break;
+                }
+                after = issue.history.page_info.end_cursor;
+                if after.is_none() {
+                    evidence.missing.push(crate::MissingEvidence {
+                        source: "linear.history".to_owned(),
+                        reason: format!("history page cursor was missing for issue {issue_id}"),
+                    });
+                    break;
+                }
+                if page + 1 == PAGE_LIMIT {
+                    evidence.missing.push(crate::MissingEvidence {
+                        source: "linear.history".to_owned(),
+                        reason: format!(
+                            "history exceeded the {PAGE_LIMIT}-page limit for issue {issue_id}"
+                        ),
+                    });
+                }
+            }
+        }
+
+        for issue in &snapshot.issues {
+            let Some(ticket) = evidence.tickets.iter_mut().find(|row| row.id == issue.id.0) else {
+                continue;
+            };
+            let created_epoch = crate::drift::timestamp_epoch(&ticket.created_at)?;
+            if created_epoch > report_epoch {
+                continue;
+            }
+            let events = state_events.entry(issue.id.0.clone()).or_default();
+            events.sort_by(|left, right| {
+                let left_at = crate::drift::timestamp_epoch(&left.0).unwrap_or(f64::NEG_INFINITY);
+                let right_at = crate::drift::timestamp_epoch(&right.0).unwrap_or(f64::NEG_INFINITY);
+                left_at.total_cmp(&right_at)
+            });
+            let future_state = events
+                .iter()
+                .filter_map(|(at, from_state, _)| {
+                    let at_epoch = crate::drift::timestamp_epoch(at).ok()?;
+                    (at_epoch > report_epoch).then_some((at_epoch, at, from_state))
+                })
+                .min_by(|left, right| left.0.total_cmp(&right.0));
+            let prior_state = events
+                .iter()
+                .filter_map(|(at, _, to_state)| {
+                    let at_epoch = crate::drift::timestamp_epoch(at).ok()?;
+                    (at_epoch <= report_epoch).then_some((at_epoch, at, to_state))
+                })
+                .max_by(|left, right| left.0.total_cmp(&right.0));
+            if let Some((_, _, Some(state))) = future_state {
+                ticket.state = state.clone();
+                ticket.state_entered_at = events
+                    .iter()
+                    .filter_map(|(at, _, to_state)| {
+                        let at_epoch = crate::drift::timestamp_epoch(at).ok()?;
+                        (at_epoch <= report_epoch && to_state == state)
+                            .then_some((at_epoch, at.as_str()))
+                    })
+                    .max_by(|left, right| left.0.total_cmp(&right.0))
+                    .map(|(_, at)| at.to_owned())
+                    .or_else(|| Some(ticket.created_at.clone()));
+            } else if let Some((_, entered_at, state)) = prior_state {
+                ticket.state = state.clone();
+                ticket.state_entered_at = Some(entered_at.clone());
+            } else {
+                ticket.state_entered_at = Some(ticket.created_at.clone());
+            }
+        }
+        evidence.tickets.retain(|ticket| {
+            crate::drift::timestamp_epoch(&ticket.created_at)
+                .is_ok_and(|created| created <= report_epoch)
+        });
+
+        evidence.missing.extend([
+            crate::MissingEvidence {
+                source: "github.prs".to_owned(),
+                reason: "live drift reads Linear issues and state history only".to_owned(),
+            },
+            crate::MissingEvidence {
+                source: "github.commits".to_owned(),
+                reason: "live drift reads Linear issues and state history only".to_owned(),
+            },
+            crate::MissingEvidence {
+                source: "herdr.busy".to_owned(),
+                reason: "no live Herdr source is configured".to_owned(),
+            },
+            crate::MissingEvidence {
+                source: "otel.spend".to_owned(),
+                reason: "no live OTel source is configured".to_owned(),
+            },
+        ]);
+        Ok(evidence)
     }
 
     fn query<T: DeserializeOwned>(
@@ -541,6 +853,14 @@ struct Variables {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IssueHistoryVariables {
+    id: String,
+    first: i32,
+    after: Option<String>,
+}
+
+#[derive(Serialize)]
 struct ProjectIdVariables {
     id: String,
 }
@@ -764,6 +1084,31 @@ struct IssueData {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct IssueHistoryData {
+    issue: Option<RawIssueHistory>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct RawIssueHistory {
+    #[serde(rename = "id")]
+    _id: String,
+    history: Connection<RawIssueHistoryEvent>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct RawIssueHistoryEvent {
+    id: String,
+    created_at: String,
+    from_state: Option<RawState>,
+    to_state: Option<RawState>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
 struct RawIssue {
     id: String,
@@ -808,6 +1153,19 @@ fn canonical_issue_state(name: String, status_type: WorkflowStateType) -> String
         | WorkflowStateType::Unstarted
         | WorkflowStateType::Started => name,
     }
+}
+
+fn linear_cli_token() -> Option<String> {
+    let output = ProcessCommand::new("linear")
+        .args(["auth", "token"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let token = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    (!token.is_empty()).then_some(token)
 }
 
 #[derive(Deserialize)]
@@ -1158,7 +1516,7 @@ mod tests {
             "content": null, "priority": 2, "sortOrder": 1.0,
             "status": {"name": "In Progress", "type": "started"},
             "teams": connection(serde_json::json!([{"key": "SWM"}])),
-            "initiatives": connection(serde_json::json!([{ "id": "init", "identifier": "I-10", "name": "Delivery" }])),
+            "initiatives": connection(serde_json::json!([{ "id": "init", "name": "Delivery" }])),
             "projectMilestones": connection(serde_json::json!([]))
         });
         let completed_blocker = serde_json::json!({
