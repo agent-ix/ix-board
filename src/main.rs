@@ -6,9 +6,9 @@
 use clap::{Parser, Subcommand};
 use ix_board::{
     DriftConfig, DriftError, DriftEvidenceFile, DriftReport, Error, FocusExpansion,
-    FocusHygieneReport, FocusPlanChunk, FocusRecord, FocusSelection, FocusStatus, IssueBatch,
-    LinearGraphQlSource, NextStep, ProjectChunk, ProjectPriority, ProjectRunStatus, ReadService,
-    ReadyItem, SearchResult, evaluate_drift_file, render_drift_text,
+    FocusHygieneReport, FocusPlanChunk, FocusProjectMembership, FocusRecord, FocusSelection,
+    FocusStatus, IssueBatch, LinearGraphQlSource, NextStep, ProjectChunk, ProjectPriority,
+    ProjectRunStatus, ReadService, ReadyItem, SearchResult, evaluate_drift_file, render_drift_text,
 };
 use ix_cli_kit::exit::Outcome;
 use ix_cli_kit::secrets::{AppScope, SecretKey, SecretStore, SecretValue};
@@ -301,6 +301,7 @@ fn main() -> std::process::ExitCode {
                 | Error::EmptyFocus
                 | Error::WorkMilestoneNotFound { .. }
                 | Error::ScopeSelection { .. }
+                | Error::AmbiguousMilestone { .. }
                 | Error::DriftInputRead { .. }
                 | Error::DriftInputDecode { .. }
                 | Error::Drift(_) => Outcome::Invalid,
@@ -764,7 +765,14 @@ fn render_focus_status(status: &FocusStatus) -> String {
         ));
     }
     for project in &status.projects {
-        lines.push(format!("Project {} — {}", project.identifier, project.name));
+        let scope_label = match project.membership {
+            FocusProjectMembership::FullProject => "",
+            FocusProjectMembership::PartialFocus => " (selected focus only)",
+        };
+        lines.push(format!(
+            "Project {} — {}{}",
+            project.identifier, project.name, scope_label
+        ));
         lines.push(format!(
             "  Target date: {}",
             project.target_date.as_deref().unwrap_or("none")
@@ -790,14 +798,19 @@ fn render_focus_status(status: &FocusStatus) -> String {
                 milestone.progress,
             );
         }
-        lines.push("  No milestone:".to_owned());
-        render_status_group(
-            &mut lines,
-            "    ",
-            &project.unmilestoned.open_by_state,
-            &project.unmilestoned.in_progress,
-            project.unmilestoned.progress,
-        );
+        if project.membership == FocusProjectMembership::FullProject
+            || project.unmilestoned.progress.total > 0
+            || !project.unmilestoned.open_by_state.is_empty()
+        {
+            lines.push("  No milestone:".to_owned());
+            render_status_group(
+                &mut lines,
+                "    ",
+                &project.unmilestoned.open_by_state,
+                &project.unmilestoned.in_progress,
+                project.unmilestoned.progress,
+            );
+        }
     }
     lines.push("Blocker layers:".to_owned());
     for (index, layer) in status.blocker_layers.iter().enumerate() {

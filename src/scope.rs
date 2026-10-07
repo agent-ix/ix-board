@@ -101,7 +101,7 @@ pub(crate) fn resolve_project_id(
     )
 }
 
-/// A milestone name must be globally unambiguous; a Linear UUID wins over names.
+/// Resolve a UUID, globally unique name, or project-qualified name.
 pub(crate) fn resolve_milestone_id(
     snapshot: &WorkspaceSnapshot,
     value: &str,
@@ -116,14 +116,46 @@ pub(crate) fn resolve_milestone_id(
     if !exact.is_empty() {
         return unique("milestone", value, exact.into_iter().collect());
     }
+    let (project_id, milestone_name) = if let Some((project, milestone)) = value.rsplit_once('/') {
+        (Some(resolve_project_id(snapshot, project)?), milestone)
+    } else {
+        (None, value)
+    };
     let names = snapshot
         .projects
         .iter()
-        .flat_map(|p| &p.milestones)
-        .filter(|m| m.name == value)
-        .map(|m| m.id.clone())
-        .collect::<BTreeSet<_>>();
-    unique("milestone", value, names.into_iter().collect())
+        .filter(|p| project_id.as_ref().is_none_or(|id| *id == p.id))
+        .flat_map(|p| {
+            p.milestones
+                .iter()
+                .filter(move |m| m.name.eq_ignore_ascii_case(milestone_name))
+                .map(move |m| {
+                    (
+                        m.id.clone(),
+                        format!("{} ({}) / {} ({})", p.name, p.id.0, m.name, m.id),
+                    )
+                })
+        })
+        .collect::<BTreeMap<_, _>>();
+    match names.len() {
+        1 => names
+            .into_keys()
+            .next()
+            .ok_or_else(|| Error::ScopeSelection {
+                kind: "milestone",
+                identifier: value.to_owned(),
+                matches: 0,
+            }),
+        0 => Err(Error::ScopeSelection {
+            kind: "milestone",
+            identifier: value.to_owned(),
+            matches: 0,
+        }),
+        _ => Err(Error::AmbiguousMilestone {
+            selector: value.to_owned(),
+            candidates: names.into_values().collect::<Vec<_>>().join("; "),
+        }),
+    }
 }
 
 pub(crate) fn resolve_ticket_id(
@@ -209,6 +241,8 @@ pub fn select_scope(
     );
     for value in &selection.milestones {
         let id = resolve_milestone_id(snapshot, value)?;
+        // Add the containing project only after full-project expansion above.
+        // Moving this earlier would turn a milestone into the whole project.
         for project in &snapshot.projects {
             if project
                 .milestones

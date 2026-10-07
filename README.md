@@ -36,7 +36,8 @@ make test
 
 ### Signed test builds on macOS
 
-Repeated unsigned builds can cause a new Keychain prompt for the saved Linear
+Do not run unsigned development builds against a saved Linear key. Repeated
+unsigned builds can cause a new Keychain prompt for the saved Linear
 credential. For live development testing, the owner can create a local code
 signing certificate in Keychain Access and keep its private key on this Mac.
 After each build, sign the executable with the same identity and the fixed
@@ -72,6 +73,8 @@ available and which source is active; it never displays the value. If the OS
 credential store is locked or unavailable, the CLI reports that failure and
 does not create a plaintext fallback file.
 
+Do not extract the saved key from Keychain to set `LINEAR_API_KEY` for a test.
+
 Run reads with:
 
 ```bash
@@ -84,6 +87,7 @@ ix-board issues SWM-12 SWM-13 SWM-14
 For a versioned focus record that another client can validate and store as
 JSON, run `ix-board --json focus report --initiative "Initiative name"`.
 Use repeatable `--milestone "M1 Spec"` to save a milestone as a focus member;
+if names repeat across projects, use `--milestone "P-SAPHO-87/M5b Decision-model data"`.
 combine it with initiative, project, and issue selectors to select their union.
 The version 2 record includes typed canonical Linear IDs, the report time, and ix-board's
 status report. This command does not publish to ix-relay.
@@ -107,7 +111,7 @@ team lead and planner role skills consume their results. Install the CLI
 separately:
 
 ```bash
-cargo +1.98.1 install --git https://github.com/agent-ix/ix-board --tag v0.2.1 --locked
+cargo +1.98.1 install --git https://github.com/agent-ix/ix-board --tag v0.3.0 --locked
 ```
 
 For Claude Code:

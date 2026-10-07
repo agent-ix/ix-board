@@ -1032,6 +1032,108 @@ fn focus_status_scopes_progress_blockers_and_ready_work_to_focus_members() {
     );
 }
 
+/// Trace: FR-010-AC-8, FR-012-AC-10, FR-016-AC-4
+#[test]
+fn qualified_milestones_resolve_collisions_and_label_partial_project_rows() {
+    let directory = TempDir::new().expect("temporary directory");
+    let mut first = project("p1", "SWM-P1", "Started", 2, 1.0);
+    let mut second = project("p2", "SWM-P2", "Started", 2, 2.0);
+    first.milestones = vec![
+        Milestone {
+            id: "m1".into(),
+            name: "M5b Decision-model data".into(),
+            description: None,
+            sort_order: 1.0,
+            target_date: None,
+        },
+        Milestone {
+            id: "m1-later".into(),
+            name: "Later".into(),
+            description: None,
+            sort_order: 2.0,
+            target_date: None,
+        },
+    ];
+    second.milestones = vec![
+        Milestone {
+            id: "m2".into(),
+            name: "M5b Decision-model data".into(),
+            description: None,
+            sort_order: 1.0,
+            target_date: None,
+        },
+        Milestone {
+            id: "m2-later".into(),
+            name: "Later".into(),
+            description: None,
+            sort_order: 2.0,
+            target_date: None,
+        },
+    ];
+    let mut issue1 = issue("i1", "SWM-1", Some("p1"), "Completed", 1.0, 1.0, None, &[]);
+    issue1.project_milestone_id = Some("m1".into());
+    let mut issue2 = issue("i2", "SWM-2", Some("p2"), "Specced", 1.0, 1.0, None, &[]);
+    issue2.project_milestone_id = Some("m2".into());
+    let snapshot = WorkspaceSnapshot {
+        projects: vec![first, second],
+        issues: vec![issue1, issue2],
+        fetched_at: 42,
+    };
+    let mut reads = service(
+        FixtureSource::new(snapshot),
+        ManualClock::new(100),
+        &directory,
+    );
+    let ambiguous = ix_board::FocusSelection {
+        milestones: vec!["M5b Decision-model data".into()],
+        ..Default::default()
+    };
+    let error = reads.focus_status(&ambiguous).unwrap_err();
+    assert!(matches!(&error, Error::AmbiguousMilestone { .. }));
+    assert!(error.to_string().contains("Project SWM-P1 (p1)"));
+    assert!(error.to_string().contains("Project SWM-P2 (p2)"));
+    let all_projects = ix_board::FocusSelection {
+        projects: vec!["SWM-P1".into(), "SWM-P2".into()],
+        ..Default::default()
+    };
+    assert!(matches!(
+        reads.focus_status_for_milestones(&all_projects, &["M5b Decision-model data".into()]),
+        Err(Error::AmbiguousMilestone { .. })
+    ));
+    let selected = ix_board::FocusSelection {
+        milestones: vec![
+            "SWM-P1/M5b Decision-model data".into(),
+            "Project SWM-P2/M5b Decision-model data".into(),
+        ],
+        ..Default::default()
+    };
+    let record = reads.focus_record(&selected).unwrap();
+    assert_eq!(
+        record.selection,
+        [
+            ix_board::FocusMember::Milestone("m1".into()),
+            ix_board::FocusMember::Milestone("m2".into())
+        ]
+    );
+    assert_eq!(record.status.projects.len(), 2);
+    for project in &record.status.projects {
+        assert_eq!(
+            project.membership,
+            ix_board::FocusProjectMembership::PartialFocus
+        );
+        assert_eq!(project.milestones.len(), 1);
+        assert_eq!(project.progress.total, 1);
+    }
+    let filtered = reads
+        .focus_status_for_milestones(&all_projects, &["SWM-P1/M5b Decision-model data".into()])
+        .unwrap();
+    assert_eq!(filtered.ready_queue.len(), 0);
+    assert_eq!(
+        filtered.projects[0].membership,
+        ix_board::FocusProjectMembership::FullProject
+    );
+}
+
 /// Trace: FR-012-AC-8
 #[test]
 fn focus_status_work_milestones_limit_ready_and_blocker_roots_without_hiding_progress() {

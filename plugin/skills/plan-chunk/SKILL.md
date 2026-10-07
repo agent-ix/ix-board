@@ -19,7 +19,7 @@ If this plugin is not initialized or an Agent IX command fails, read [the ix-boa
    ```
 
    Append `--size <positive-integer>` only when the caller asks for a bounded chunk. Add `--json` when structured output helps preserve each row.
-   Use `--milestone <ID-OR-EXACT-NAME>` when the milestone is a saved focus member. For a temporary view inside an existing focus, repeat `--work-milestone <ID-OR-EXACT-NAME>`; it does not change focus membership. The chunk includes selected work and its focus-member prerequisites, even when a prerequisite belongs to another milestone. An unknown milestone is an error.
+   Use `--milestone <ID-OR-NAME-OR-PROJECT/NAME>` when the milestone is a saved focus member. For a temporary view inside an existing focus, repeat `--work-milestone` with the same selector forms; it does not change focus membership. The chunk includes selected work and its focus-member prerequisites, even when a prerequisite belongs to another milestone. An unknown milestone is an error; an ambiguous name lists project candidates.
 3. Present rows in the exact order returned by ix-board. Preserve each row's readiness and reasons, blockers and `unblocks`, and acceptance-criteria excerpt. Do not sort, filter, add, remove, or infer rows or dependencies.
 4. Present the returned chunk directly to the designated team lead as the
    handoff. Do not send a separate message or broadcast work. If no recipient

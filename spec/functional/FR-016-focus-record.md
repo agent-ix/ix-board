@@ -30,4 +30,4 @@ storage service.
 | FR-016-AC-1 | A name-based selection produces canonical ID selectors, a version, a report timestamp, and the same status facts as `focus status` over that snapshot. | Test |
 | FR-016-AC-2 | `FocusRecord` has an exportable structural JSON Schema. | Test |
 | FR-016-AC-3 | An empty or unresolved selection fails without a partial record. | Test |
-| FR-016-AC-4 | Version 2 encodes each focus member as `{kind,id}`; repeated reads of the same snapshot and selection produce the same ordered member list and issue set. A milestone member selects assigned issues even without a project selector. | Test |
+| FR-016-AC-4 | Version 2 encodes each focus member as `{kind,id}`; repeated reads of the same snapshot and selection produce the same ordered member list and issue set. Qualified milestone members select assigned issues even when names collide across projects. | Test |

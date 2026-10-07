@@ -1,7 +1,7 @@
 ---
 name: ix-board-planning
 description: Route Linear project planning, ready queues, project context, and blocker questions to ix-board. For focus status, hygiene, or handoff, use this plugin's dedicated focus-status, focus-hygiene, or plan-chunk skill.
-compatibility: Requires ix-board 0.2.1 or newer and a saved Linear key or LINEAR_API_KEY for live Linear queries.
+compatibility: Requires ix-board 0.3.0 or newer for typed milestone focus, and a saved Linear key or LINEAR_API_KEY for live Linear queries.
 ---
 
 # ix-board Planning

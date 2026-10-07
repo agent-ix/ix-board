@@ -33,10 +33,10 @@ pub use linear::LinearGraphQlSource;
 pub use model::{
     ChunkIssue, FocusBlocker, FocusExpansion, FocusIssue, FocusIssueClassification, FocusMember,
     FocusMilestone, FocusMilestoneStatus, FocusPlanChunk, FocusPlanIssue, FocusProgress,
-    FocusProject, FocusProjectStatus, FocusRecord, FocusSelection, FocusStateCount, FocusStatus,
-    FocusUnmilestonedStatus, Initiative, Issue, IssueBatch, IssueId, Milestone, NextStep, Project,
-    ProjectChunk, ProjectId, ProjectPriority, ProjectRunStatus, ReadyItem, SearchKind,
-    SearchResult, TeamKey, WorkflowStateType, WorkspaceSnapshot,
+    FocusProject, FocusProjectMembership, FocusProjectStatus, FocusRecord, FocusSelection,
+    FocusStateCount, FocusStatus, FocusUnmilestonedStatus, Initiative, Issue, IssueBatch, IssueId,
+    Milestone, NextStep, Project, ProjectChunk, ProjectId, ProjectPriority, ProjectRunStatus,
+    ReadyItem, SearchKind, SearchResult, TeamKey, WorkflowStateType, WorkspaceSnapshot,
 };
 
 use model::{compare_f64, issue_is_open};
@@ -68,6 +68,12 @@ pub enum Error {
         identifier: String,
         /// Number of distinct matches.
         matches: usize,
+    },
+    /// A milestone name matched more than one project milestone.
+    #[error("milestone {selector:?} is ambiguous; use <project>/<milestone>: {candidates}")]
+    AmbiguousMilestone {
+        selector: String,
+        candidates: String,
     },
     /// The parent graph contains a cycle and cannot define leaf tasks.
     #[error("issue parent graph contains a cycle at {identifier}")]
@@ -1087,11 +1093,36 @@ fn make_focus_status(
     let work_milestone_ids =
         resolve_work_milestones(snapshot, &scope.project_ids, work_milestones)?;
     let leaf_ids = scope.leaf_ids;
+    let full_project_ids = if selection.initiatives.is_empty() && selection.projects.is_empty() {
+        BTreeSet::new()
+    } else {
+        select_scope(
+            snapshot,
+            &ScopeSelection {
+                team: None,
+                initiatives: selection.initiatives.clone(),
+                projects: selection.projects.clone(),
+                milestones: Vec::new(),
+                tickets: Vec::new(),
+            },
+        )?
+        .project_ids
+    };
+    let selected_milestone_ids = selection
+        .milestones
+        .iter()
+        .map(|value| scope::resolve_milestone_id(snapshot, value))
+        .collect::<Result<BTreeSet<_>, _>>()?;
     let mut projects = snapshot
         .projects
         .iter()
         .filter(|project| scope.project_ids.contains(&project.id))
         .map(|project| {
+            let membership = if full_project_ids.contains(&project.id) {
+                FocusProjectMembership::FullProject
+            } else {
+                FocusProjectMembership::PartialFocus
+            };
             let member_issues = snapshot
                 .issues
                 .iter()
@@ -1106,6 +1137,13 @@ fn make_focus_status(
             });
             let milestone_status = milestones
                 .into_iter()
+                .filter(|milestone| {
+                    membership == FocusProjectMembership::FullProject
+                        || selected_milestone_ids.contains(&milestone.id)
+                        || member_issues.iter().any(|issue| {
+                            issue.project_milestone_id.as_deref() == Some(milestone.id.as_str())
+                        })
+                })
                 .map(|milestone| {
                     let assigned = member_issues
                         .iter()
@@ -1136,6 +1174,7 @@ fn make_focus_status(
                     .clone()
                     .unwrap_or_else(|| project.id.0.clone()),
                 name: project.name.clone(),
+                membership,
                 target_date: project.target_date.clone(),
                 open_by_state: open_state_counts(&member_issues),
                 in_progress: started_issues(&member_issues),
@@ -1207,20 +1246,27 @@ fn resolve_work_milestones(
 ) -> Result<BTreeSet<String>, Error> {
     let mut ids = BTreeSet::new();
     for selector in selectors {
-        let matches = snapshot
-            .projects
-            .iter()
-            .filter(|project| project_ids.contains(&project.id))
-            .flat_map(|project| project.milestones.iter())
-            .filter(|milestone| milestone.id == *selector || milestone.name == *selector)
-            .map(|milestone| milestone.id.clone())
-            .collect::<Vec<_>>();
-        if matches.is_empty() {
+        let id = match scope::resolve_milestone_id(snapshot, selector) {
+            Ok(id) => id,
+            Err(Error::ScopeSelection { matches: 0, .. }) => {
+                return Err(Error::WorkMilestoneNotFound {
+                    selector: selector.clone(),
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        if !snapshot.projects.iter().any(|project| {
+            project_ids.contains(&project.id)
+                && project
+                    .milestones
+                    .iter()
+                    .any(|milestone| milestone.id == id)
+        }) {
             return Err(Error::WorkMilestoneNotFound {
                 selector: selector.clone(),
             });
         }
-        ids.extend(matches);
+        ids.insert(id);
     }
     Ok(ids)
 }

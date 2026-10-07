@@ -404,6 +404,8 @@ pub struct FocusProjectStatus {
     pub identifier: String,
     /// Project name.
     pub name: String,
+    /// Whether the entire project was selected or this row shows partial focus work.
+    pub membership: FocusProjectMembership,
     /// Linear project target date, when configured.
     pub target_date: Option<String>,
     /// Open focus issue counts by Linear workflow-state display name.
@@ -416,6 +418,14 @@ pub struct FocusProjectStatus {
     pub milestones: Vec<FocusMilestoneStatus>,
     /// Status of focus issues assigned to the project without a milestone.
     pub unmilestoned: FocusUnmilestonedStatus,
+}
+
+/// Scope represented by one project status row.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FocusProjectMembership {
+    FullProject,
+    PartialFocus,
 }
 
 /// Status summary for one selected Linear project milestone.
