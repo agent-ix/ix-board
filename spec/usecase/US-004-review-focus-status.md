@@ -45,6 +45,16 @@ relationships:
   time; they are neither product-contract identifiers nor permanent fixture
   identifiers
 
+### US-004-EX-3: Review active campaign milestones without losing progress
+
+- **Given** a two-project initiative with completed milestones, active M1/M2
+  work, and later backlog milestones
+- **When** the lead selects M1 and M2 as work milestones in focus status
+- **Then** the blocker and ready sections show work relevant to M1/M2 while
+  the progress counts still cover every milestone
+- **And** an empty selected ready queue says so and identifies how many
+  otherwise-ready issues were excluded by the filter
+
 ## Notes (Informative)
 
 FR-010 and FR-011 own focus selection, expansion, and blocker-layer membership.

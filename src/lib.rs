@@ -34,7 +34,7 @@ pub use model::{
     ChunkIssue, FocusBlocker, FocusExpansion, FocusIssue, FocusIssueClassification, FocusMilestone,
     FocusMilestoneStatus, FocusPlanChunk, FocusPlanIssue, FocusProgress, FocusProject,
     FocusProjectStatus, FocusSelection, FocusStateCount, FocusStatus, FocusUnmilestonedStatus,
-    Initiative, Issue, IssueId, Milestone, NextStep, Project, ProjectChunk, ProjectId,
+    Initiative, Issue, IssueBatch, IssueId, Milestone, NextStep, Project, ProjectChunk, ProjectId,
     ProjectPriority, ProjectRunStatus, ReadyItem, SearchKind, SearchResult, TeamKey,
     WorkflowStateType, WorkspaceSnapshot,
 };
@@ -397,7 +397,7 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
     }
 
     /// Returns exact issues for requested UUIDs or identifiers, in request order.
-    pub fn issues(&mut self, identifiers: &[String]) -> Result<Vec<Issue>, Error> {
+    pub fn issues(&mut self, identifiers: &[String]) -> Result<IssueBatch, Error> {
         if identifiers.is_empty() || identifiers.iter().any(|value| value.trim().is_empty()) {
             return Err(Error::ScopeSelection {
                 kind: "issue",
@@ -408,6 +408,8 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
         let snapshot = self.snapshot()?;
         let mut result = Vec::new();
         let mut seen = BTreeSet::new();
+        let mut missing = Vec::new();
+        let mut missing_seen = BTreeSet::new();
         for identifier in identifiers {
             let matches = snapshot
                 .issues
@@ -419,6 +421,12 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
                 .collect::<Vec<_>>();
             let issue = match matches.as_slice() {
                 [issue] => *issue,
+                [] => {
+                    if missing_seen.insert(identifier.to_ascii_lowercase()) {
+                        missing.push(identifier.clone());
+                    }
+                    continue;
+                }
                 _ => {
                     return Err(Error::ScopeSelection {
                         kind: "issue",
@@ -431,7 +439,11 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
                 result.push(issue.clone());
             }
         }
-        Ok(result)
+        Ok(IssueBatch {
+            issues: result,
+            complete: missing.is_empty(),
+            missing,
+        })
     }
 
     /// Resolves inline initiative, project, and issue selectors into a focus expansion.

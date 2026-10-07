@@ -221,6 +221,18 @@ pub struct Issue {
     pub attachments_complete: bool,
 }
 
+/// Exact issue records returned for a batch, including unresolved selectors.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IssueBatch {
+    /// Found issues in first-request order, with duplicate issues removed.
+    pub issues: Vec<Issue>,
+    /// Unknown selectors in first-request order.
+    pub missing: Vec<String>,
+    /// True when every selector resolved.
+    pub complete: bool,
+}
+
 /// A complete structured read snapshot used by all read commands.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
