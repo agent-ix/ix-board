@@ -201,6 +201,8 @@ pub struct Issue {
     pub parent_id: Option<IssueId>,
     /// Team identifier.
     pub team_key: TeamKey,
+    /// Linear UUID of the current assignee, when assigned.
+    pub assignee_id: Option<String>,
     /// Associated project UUID.
     pub project_id: Option<ProjectId>,
     /// Associated project milestone UUID, when the issue belongs to a milestone.
