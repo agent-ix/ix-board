@@ -5,32 +5,24 @@ needs, not implemented behavior. Move a story into `spec/usecase/` and trace it
 to functional requirements when work is accepted for implementation. Do not
 describe a proposed story as a current CLI capability.
 
-## Initiative briefing and handoff
+## Typed focus across roles
 
-As a campaign lead taking over an initiative, I want one initiative view with
-its overview, projects, milestones, progress, and a read order so I can
-understand the work without reconstructing it from individual Linear calls.
+As a manager, lead, coder, or reviewer, I want one focus selection made from
+initiatives, projects, and tickets in any combination so each role can use the
+same structured scope at its appropriate level.
 
-- Given a named initiative with two projects and an overview, the view returns
-  the overview and both projects with progress from structured Linear records.
-- A handoff identifies what is done, in review, in progress, blocked, and next
-  per milestone, and makes source age visible.
-- The overview may contain human guidance, but cannot override structured
-  readiness or dependency facts.
-- For initiative `I-10`, the lead can read the initiative `content` brief
-  (goal, role, read order, owner decisions, checkpoints, rules, and deferred
-  work) and titles and URLs of attached plan documents before acting on a
-  plan chunk. `ix-board initiative brief I-10` returns the content verbatim,
-  documents, and fetch age in text and JSON. An empty brief is clearly shown
-  without failing the command. Project-level handoffs expose project `content`
-  the same way.
-- `focus plan-chunk` points to the brief and attached plans before its ordered
-  rows. The brief may constrain the selected work milestones and checkpoints;
-  it does not change a ticket's computed readiness or dependency order.
+- An initiative-only, project-only, ticket-only, or mixed selection resolves to
+  canonical Linear identities and the same issue membership on repeated reads.
+- The saved focus record represents that selection independently from any
+  optional report filter, transport, or live agent session.
+- Role skills use the selected focus without interpreting ticket prose as
+  instructions to add or remove scope.
 
-Current coverage: `focus status` provides progress, blockers, and ready work;
-`focus plan-chunk` provides ordered work rows. Neither shows the initiative
-overview or a complete read order.
+Current coverage: `focus report` stores canonical IDs as kind-prefixed strings
+and status. A typed selector structure and shared role-skill consumption are
+future work. The earlier initiative-brief command proposal was withdrawn:
+standing rules belong in agent instructions and memory; attached plans are
+optional context. Work-milestone view filters are separate from focus.
 
 ## Cached reads without a credential
 
@@ -91,5 +83,5 @@ and source age without reselecting them.
 - A client reports when the record is absent or stale rather than treating it
   as a live agent session.
 
-Current coverage: a focus-record schema and JSON report are under review.
+Current coverage: a focus-record schema and JSON report are implemented.
 Relay publication, retrieval, and shared UI use are not implemented.
