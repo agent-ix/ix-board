@@ -111,7 +111,7 @@ team lead and planner role skills consume their results. Install the CLI
 separately:
 
 ```bash
-cargo +1.98.1 install --git https://github.com/agent-ix/ix-board --tag v0.3.1 --locked
+cargo +1.98.1 install --git https://github.com/agent-ix/ix-board --tag v0.3.2 --locked
 ```
 
 For Claude Code:

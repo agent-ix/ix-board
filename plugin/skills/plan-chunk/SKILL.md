@@ -9,7 +9,7 @@ If this plugin is not initialized or an Agent IX command fails, read [the ix-boa
 
 ## Prepare the handoff
 
-1. Select the focus using one or more supported inline `--initiative`, `--project`, or `--issue` selectors. Use the same selector forms as `focus-status`. Focus is the explicit initiative, project, and ticket selection; do not infer it from ticket or overview prose. Attached plan documents are optional context.
+1. Select the focus using one or more supported inline `--initiative`, `--project`, `--milestone`, or `--issue` selectors. Use the same selector forms as `focus-status`. Focus is the explicit initiative, project, milestone, and ticket selection; do not infer it from ticket or overview prose. Attached plan documents are optional context.
 2. Run the installed ix-board command. Omit `--size` by default so the handoff includes the full returned set of open focus issue rows.
 
    ```bash
@@ -21,6 +21,7 @@ If this plugin is not initialized or an Agent IX command fails, read [the ix-boa
    Append `--size <positive-integer>` only when the caller asks for a bounded chunk. Add `--json` when structured output helps preserve each row.
    Use `--milestone <ID-OR-NAME-OR-PROJECT/NAME>` when the milestone is a saved focus member. For a temporary view inside an existing focus, repeat `--work-milestone` with the same selector forms; it does not change focus membership. The chunk includes selected work and its focus-member prerequisites, even when a prerequisite belongs to another milestone. An unknown milestone is an error; an ambiguous name lists project candidates.
 3. Present rows in the exact order returned by ix-board. Preserve each row's readiness and reasons, blockers and `unblocks`, and acceptance-criteria excerpt. Do not sort, filter, add, remove, or infer rows or dependencies.
+   A `Todo` issue can be open and appear in the handoff while `ready=false`: the new-work queue currently offers only Backlog, Specify, and Specced issues. State that distinction plainly when it affects the next action.
 4. Present the returned chunk directly to the designated team lead as the
    handoff. Do not send a separate message or broadcast work. If no recipient
    is identified, present the chunk as ready for handoff and state that the
