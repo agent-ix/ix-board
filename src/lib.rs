@@ -14,14 +14,14 @@ pub use scope::{ScopeSelection, ScopeSummary, select_scope};
 use cache::SnapshotCache;
 pub use cache::{CACHE_TTL_SECONDS, Clock, SystemClock};
 pub use drift::{
-    AlertKind, Availability, BusyWithoutPrSignal, DRIFT_EVIDENCE_SCHEMA_VERSION, DriftAlert,
-    DriftCommit, DriftConfig, DriftError, DriftEvidence, DriftEvidenceFile, DriftLead,
-    DriftPullRequest, DriftReport, DriftTicket, HistoricalProject, HistoricalTicket,
-    IssueTransition, LeadDriftReport, LeadSignals, LeadStatus, MissingEvidence, PrScopeSignal,
-    QueueEvidence, RunningProject, ScopeClassification, ScopedPullRequest, SignalAvailability,
-    StallSignal, StalledTicket, TicketChurnSignal, UnassignedPullRequest, UnassignedReason,
-    VeeringReason, VeeringSignal, VeeringTicket, evaluate_drift, evaluate_drift_file,
-    render_drift_text,
+    AlertKind, Availability, BusyWithoutPrSignal, CrowdingOutProject,
+    DRIFT_EVIDENCE_SCHEMA_VERSION, DriftAlert, DriftCommit, DriftConfig, DriftError, DriftEvidence,
+    DriftEvidenceFile, DriftLead, DriftPullRequest, DriftReport, DriftTicket, HistoricalProject,
+    HistoricalTicket, IssueTransition, LeadDriftReport, LeadSignals, LeadStatus, MissingEvidence,
+    PrScopeSignal, PriorityGoalConfig, PriorityGoalReport, PriorityGoalStatus, QueueEvidence,
+    RunningProject, ScopeClassification, ScopedPullRequest, SignalAvailability, StallSignal,
+    StalledTicket, TicketChurnSignal, UnassignedPullRequest, UnassignedReason, VeeringReason,
+    VeeringSignal, VeeringTicket, evaluate_drift, evaluate_drift_file, render_drift_text,
 };
 pub use hygiene::{
     DuplicateTitleFinding, FocusBaseline, FocusBaselineIssue, FocusChange, FocusHygieneReport,

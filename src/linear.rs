@@ -363,6 +363,7 @@ impl LinearGraphQlSource {
                     .cloned()
                     .collect(),
                 state: issue.state.clone(),
+                state_type: issue.state_type,
                 spec_state: "unknown".to_owned(),
                 priority: issue.priority,
                 sort_order: issue.sort_order,
