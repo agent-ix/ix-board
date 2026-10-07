@@ -1617,19 +1617,76 @@ fn focus_plan_chunk_keeps_open_coding_review_and_unmapped_spec_candidates() {
         chunk.issues[0]
             .reasons
             .iter()
-            .any(|reason| reason.contains("no new Specify or Coding step"))
+            .any(|reason| reason.contains("no Specify or Coding step is offered"))
     );
     assert!(
         chunk.issues[1]
             .reasons
             .iter()
-            .any(|reason| reason.contains("no new Specify or Coding step"))
+            .any(|reason| reason.contains("no Specify or Coding step is offered"))
     );
     assert!(
         chunk.issues[2]
             .reasons
             .iter()
-            .any(|reason| reason.contains("no new Specify or Coding step"))
+            .any(|reason| reason.contains("no Specify or Coding step is offered"))
+    );
+}
+
+/// Trace: FR-014-AC-11
+#[test]
+fn todo_handoff_explains_open_state_without_claiming_ready_eligibility() {
+    let directory = TempDir::new().expect("temporary directory");
+    let snapshot = WorkspaceSnapshot {
+        fetched_at: 50,
+        projects: vec![project("p1", "IR-P1", "Started", 1, 1.0)],
+        issues: vec![issue(
+            "i1",
+            "IR-TODO",
+            Some("p1"),
+            "Todo",
+            1.0,
+            1.0,
+            None,
+            &[],
+        )],
+    };
+    assert!(
+        ix_board::ready_from_snapshot(&snapshot, "IR")
+            .unwrap()
+            .is_empty()
+    );
+    let mut reads = service(
+        FixtureSource::new(snapshot),
+        ManualClock::new(9_000),
+        &directory,
+    );
+    let chunk = reads
+        .focus_plan_chunk(
+            &ix_board::FocusSelection {
+                projects: vec!["IR-P1".to_owned()],
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+    assert_eq!(chunk.issues.len(), 1);
+    let row = &chunk.issues[0];
+    assert!(!row.ready);
+    assert!(
+        row.reasons
+            .iter()
+            .any(|reason| reason == "workflow state Todo is open")
+    );
+    assert!(
+        row.reasons
+            .iter()
+            .any(|reason| reason.contains("outside this queue's new-work states"))
+    );
+    assert!(
+        !row.reasons
+            .iter()
+            .any(|reason| reason.contains("is eligible"))
     );
 }
 

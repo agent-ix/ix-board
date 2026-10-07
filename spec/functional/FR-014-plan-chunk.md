@@ -45,6 +45,9 @@ rules from FR-001; FR-001 queue ordering SHALL not replace this requirement's
 ordering.
 When a workflow state has no new Specify or Coding step, the readiness reason
 SHALL name that state and explain the eligible planning states in plain language.
+An open state such as `Todo` SHALL be described as open without calling the
+issue ready; its separate step reason SHALL explain why this new-work queue
+does not offer it.
 
 The command SHALL derive each focus issue's dependency layer from the complete
 transitive `blocked_by` closure defined by FR-002. Every node in that closure,
@@ -124,6 +127,7 @@ and dependency cycles SHALL produce explicit errors and no partial chunk.
 | FR-014-AC-8 | Given one focus issue with prerequisite paths of unequal lengths in its complete blocker closure and another focus issue on a shorter path, each node receives layer zero when it has no blocker prerequisites and otherwise one plus its deepest prerequisite layer; the longer path's focus issue sorts after the shorter-path issue regardless of milestone order. | Test |
 | FR-014-AC-9 | Given unmilestoned and milestone-assigned open focus issues across projects, dependency layer sorts first, FR-001 project priority/manual order/project identifier sorts next, and within each project milestone-assigned rows follow Linear milestone order before its unmilestoned rows; stable issue identifier resolves remaining ties. | Test |
 | FR-014-AC-10 | Given a work-milestone filter, the chunk includes selected open work and open focus-member prerequisites from its blocker closure, excludes unrelated later work, preserves dependency order, and rejects unknown milestones. | Test |
+| FR-014-AC-11 | An open `Todo` issue with a running project and completed blockers remains in the handoff with `ready=false`; its reasons call it open, identify that Todo is outside the Backlog/Specify/Specced new-work states, and never call it eligible. | Test |
 
 ## Dependencies
 

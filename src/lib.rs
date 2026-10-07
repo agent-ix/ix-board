@@ -1488,9 +1488,9 @@ fn plan_readiness(
     let mut reasons = Vec::new();
     let state_is_ready = issue_is_open(issue);
     reasons.push(if state_is_ready {
-        format!("workflow state {} is eligible", issue.state_name)
+        format!("workflow state {} is open", issue.state_name)
     } else {
-        format!("workflow state {} is not eligible", issue.state_name)
+        format!("workflow state {} is terminal", issue.state_name)
     });
     let project_running = match &issue.project_id {
         Some(project_id) => {
@@ -1517,7 +1517,7 @@ fn plan_readiness(
     reasons.push(match step {
         Some(step) => format!("spec state {} maps to {:?}", issue.state, step),
         None => format!(
-            "workflow state {} has no new Specify or Coding step (ready states: Backlog, Specify, Specced)",
+            "workflow state {} is outside this queue's new-work states (Backlog, Specify, Specced); no Specify or Coding step is offered",
             issue.state
         ),
     });
