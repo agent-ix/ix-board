@@ -168,6 +168,7 @@ fn issue(id: &str, parent: Option<&str>, category: WorkflowStateType) -> Issue {
         state_type: category,
         parent_id: parent.map(|id| IssueId(id.into())),
         team_key: TeamKey("SWM".into()),
+        assignee_id: None,
         project_id: Some(ProjectId("p".into())),
         project_milestone_id: None,
         priority: 2.0,
