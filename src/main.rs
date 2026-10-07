@@ -8,7 +8,8 @@ use ix_board::{
     DriftConfig, DriftError, DriftEvidenceFile, DriftReport, Error, FocusExpansion,
     FocusHygieneReport, FocusPlanChunk, FocusProjectMembership, FocusRecord, FocusSelection,
     FocusStatus, IssueBatch, LinearGraphQlSource, NextStep, ProjectChunk, ProjectPriority,
-    ProjectRunStatus, ReadService, ReadyItem, SearchResult, evaluate_drift_file, render_drift_text,
+    ProjectRunStatus, ReadService, ReadyItem, SearchResult, evaluate_drift, evaluate_drift_file,
+    render_drift_text,
 };
 use ix_cli_kit::exit::Outcome;
 use ix_cli_kit::secrets::{AppScope, SecretKey, SecretStore, SecretValue};
@@ -78,8 +79,11 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
         /// JSON file containing source records and completeness attestations.
-        #[arg(long)]
-        evidence: PathBuf,
+        #[arg(long, required_unless_present = "live", conflicts_with = "live")]
+        evidence: Option<PathBuf>,
+        /// Collect issue and state-history evidence directly from Linear.
+        #[arg(long, conflicts_with = "evidence")]
+        live: bool,
     },
     /// Resolve an inline Linear initiative/project/issue focus.
     Focus {
@@ -423,7 +427,11 @@ fn validate_command(command: &Command) -> Result<(), Error> {
 fn run(command: Command) -> Result<Output, Error> {
     match command {
         Command::Auth { command } => run_auth(command),
-        Command::Drift { config, evidence } => run_drift(&config, &evidence).map(Output::Drift),
+        Command::Drift {
+            config,
+            evidence,
+            live,
+        } => run_drift(&config, evidence.as_ref(), live).map(Output::Drift),
         other => run_linear(other),
     }
 }
@@ -453,9 +461,7 @@ fn run_auth(command: AuthCommand) -> Result<Output, Error> {
             })
         }
         AuthCommand::Status => {
-            let source = store
-                .resolve(None, Some("LINEAR_API_KEY"), &scope, &key)?
-                .map(|resolved| resolved.source.as_str().to_owned());
+            let source = LinearGraphQlSource::credential_source()?;
             Ok(Output::Auth {
                 status: if source.is_some() { "ready" } else { "missing" }.to_owned(),
                 source,
@@ -605,7 +611,11 @@ fn run_linear(command: Command) -> Result<Output, Error> {
     }
 }
 
-fn run_drift(config_path: &PathBuf, evidence_path: &PathBuf) -> Result<DriftReport, Error> {
+fn run_drift(
+    config_path: &PathBuf,
+    evidence_path: Option<&PathBuf>,
+    live: bool,
+) -> Result<DriftReport, Error> {
     let config_text =
         std::fs::read_to_string(config_path).map_err(|source| Error::DriftInputRead {
             path: config_path.display().to_string(),
@@ -616,6 +626,16 @@ fn run_drift(config_path: &PathBuf, evidence_path: &PathBuf) -> Result<DriftRepo
             path: config_path.display().to_string(),
             source,
         })?;
+    if live {
+        let source = LinearGraphQlSource::from_env()?;
+        let evidence = source.collect_drift_evidence(&config)?;
+        return Ok(evaluate_drift(&config, &evidence)?);
+    }
+    let evidence_path = evidence_path.ok_or_else(|| {
+        Error::Drift(DriftError::InvalidConfig {
+            reason: "drift requires --evidence or --live".to_owned(),
+        })
+    })?;
     let evidence_text =
         std::fs::read_to_string(evidence_path).map_err(|source| Error::DriftInputRead {
             path: evidence_path.display().to_string(),

@@ -2207,6 +2207,7 @@ fn drift_cli_emits_stable_typed_json_and_one_line_per_lead() {
         spend_threshold: 0.0,
         max_net_ticket_growth: 0,
         min_merged_prs_for_churn: 1,
+        priority_goals: Vec::new(),
         leads: vec![DriftLead {
             lead_id: "lead-a".to_owned(),
             team_key: "SWM".to_owned(),
