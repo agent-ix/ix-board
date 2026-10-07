@@ -10,6 +10,7 @@ If this plugin is not initialized or an Agent IX command fails, read [the ix-boa
 ## Prepare the handoff
 
 1. Select the focus using one or more supported inline `--initiative`, `--project`, or `--issue` selectors. Use the same selector forms as `focus-status`.
+   For a handoff, read the initiative or project overview and attached plan documents in Linear before choosing work milestones; ix-board does not yet show that brief. If it is unavailable, tell the new lead. Use the brief to identify stated work scope and checkpoints without changing ix-board's computed readiness or row order.
 2. Run the installed ix-board command. Omit `--size` by default so the handoff includes the full returned set of open focus issue rows.
 
    ```bash

@@ -10,6 +10,7 @@ If this plugin is not initialized or an Agent IX command fails, read [the ix-boa
 ## Run the report
 
 1. Select a focus using one or more supported inline selectors: `--initiative`, `--project`, or `--issue`. For a campaign spanning projects, select its initiative. Use identifiers or exact names supplied by the caller or established in Linear; do not select a focus from ticket prose.
+   For a handoff or next-work decision, also read the initiative or project overview and attached plan documents in Linear. State when that context is unavailable; it does not change ix-board's readiness facts.
 2. Run the installed ix-board CLI with the selected selectors:
 
    ```bash

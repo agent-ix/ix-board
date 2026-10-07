@@ -17,10 +17,35 @@ understand the work without reconstructing it from individual Linear calls.
   per milestone, and makes source age visible.
 - The overview may contain human guidance, but cannot override structured
   readiness or dependency facts.
+- For initiative `I-10`, the lead can read the initiative `content` brief
+  (goal, role, read order, owner decisions, checkpoints, rules, and deferred
+  work) and titles and URLs of attached plan documents before acting on a
+  plan chunk. `ix-board initiative brief I-10` returns the content verbatim,
+  documents, and fetch age in text and JSON. An empty brief is clearly shown
+  without failing the command. Project-level handoffs expose project `content`
+  the same way.
+- `focus plan-chunk` points to the brief and attached plans before its ordered
+  rows. The brief may constrain the selected work milestones and checkpoints;
+  it does not change a ticket's computed readiness or dependency order.
 
 Current coverage: `focus status` provides progress, blockers, and ready work;
 `focus plan-chunk` provides ordered work rows. Neither shows the initiative
 overview or a complete read order.
+
+## Cached reads without a credential
+
+As a lead using a new build or a locked Keychain, I want to read the last
+cached focus snapshot without resolving a credential so I can see its known
+status and source age promptly.
+
+- `ix-board focus status --initiative I-10 --offline` reads only the matching
+  cached snapshot, exits successfully, and prints its actual fetch age.
+- With no cached snapshot, it exits non-zero with a clear cache-miss message.
+- Offline output is labeled as cached evidence and never implies a live Linear
+  refresh or a current agent session.
+
+Current coverage: warm reads are fast but CLI credential resolution happens
+before the snapshot cache is consulted. There is no offline mode.
 
 ## Ticket and PR work in one place
 
