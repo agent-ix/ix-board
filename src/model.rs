@@ -296,6 +296,8 @@ pub struct FocusSelection {
     pub initiatives: Vec<String>,
     /// Project UUIDs, identifiers, or exact names.
     pub projects: Vec<String>,
+    /// Milestone UUIDs or exact names; a name must identify one milestone.
+    pub milestones: Vec<String>,
     /// Issue UUIDs or identifiers, including descendants.
     pub issues: Vec<String>,
 }
@@ -340,12 +342,22 @@ pub struct FocusStatus {
 pub struct FocusRecord {
     /// Wire contract version for readers that do not share this Rust crate.
     pub schema_version: u32,
-    /// Canonical initiative/project/issue selectors using Linear IDs.
-    pub selection: Vec<String>,
+    /// Canonical typed focus members using Linear IDs.
+    pub selection: Vec<FocusMember>,
     /// Unix seconds when ix-board produced this record.
     pub reported_at: i64,
     /// Linear-backed status and source fetch time.
     pub status: FocusStatus,
+}
+
+/// One saved focus member, identified by its canonical Linear ID.
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize, JsonSchema)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+pub enum FocusMember {
+    Initiative(String),
+    Project(String),
+    Milestone(String),
+    Issue(String),
 }
 
 /// A bounded dependency-ordered handoff for an inline focus.

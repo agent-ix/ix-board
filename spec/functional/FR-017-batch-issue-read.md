@@ -1,12 +1,12 @@
 ---
-id: FR-015
+id: FR-017
 title: Read multiple exact Linear issues in one request
 type: FR
 relationships:
   - target: "ix://agent-ix/ix-board/US-001"
     type: implements
 ---
-# FR-015: Read multiple exact Linear issues
+# FR-017: Read multiple exact Linear issues
 
 ## Description
 
@@ -29,7 +29,7 @@ and exit non-zero.
 
 | ID | Criteria | Verification |
 |----|----------|--------------|
-| FR-015-AC-1 | A batch of identifiers reads one workspace snapshot and returns exact issues in request order with duplicates removed. | Test |
-| FR-015-AC-2 | Unknown selectors are reported once in request order while found issues are returned; an ambiguous selector fails without partial output. | Test |
-| FR-015-AC-3 | Text shows exact state names and missing selectors; JSON retains the structured issue records and completeness flag. | Inspection |
-| FR-015-AC-4 | When every selector is missing, the CLI emits the missing list and exits non-zero; a partial result exits successfully. | Test |
+| FR-017-AC-1 | A batch of identifiers reads one workspace snapshot and returns exact issues in request order with duplicates removed. | Test |
+| FR-017-AC-2 | Unknown selectors are reported once in request order while found issues are returned; an ambiguous selector fails without partial output. | Test |
+| FR-017-AC-3 | Text shows exact state names and missing selectors; JSON retains the structured issue records and completeness flag. | Inspection |
+| FR-017-AC-4 | When every selector is missing, the CLI emits the missing list and exits non-zero; a partial result exits successfully. | Test |

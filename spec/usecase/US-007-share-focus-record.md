@@ -31,6 +31,13 @@ selectors and status facts
 - **Then** the client can use its published schema without the report command
   writing to the relay or choosing persistence policy
 
+### US-007-EX-3: Carry one milestone as focus across clients
+
+- **Given** a lead selects `M1 Spec` alongside a particular ticket
+- **When** ix-board emits a focus record
+- **Then** the record contains typed milestone and issue members with canonical
+  IDs, and its status covers the union of their issues from one snapshot
+
 ## Notes (Informative)
 
 Relay publication, retrieval, and persistence are future work. The record
