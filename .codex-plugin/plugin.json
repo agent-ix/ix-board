@@ -1,6 +1,6 @@
 {
   "name": "ix-board",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Linear project and task planning plus structured early-alpha feedback using ix-board.",
   "author": {
     "name": "Agent IX",
@@ -27,7 +27,8 @@
       "Planning"
     ],
     "defaultPrompt": [
-      "Plan the next work for this project.",
+      "How is this initiative going by milestone?",
+      "Hand this project off to the next lead.",
       "Show the blockers and ready tasks for this focus.",
       "Report this ix-board friction to Alpha Feedback."
     ]

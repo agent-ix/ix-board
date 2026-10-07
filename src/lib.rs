@@ -25,17 +25,18 @@ pub use drift::{
 };
 pub use hygiene::{
     DuplicateTitleFinding, FocusBaseline, FocusBaselineIssue, FocusChange, FocusHygieneReport,
-    FocusMembershipChange, GroupStatus, HygieneError, HygieneGroup, MissingScopeFinding,
-    OverdueMilestoneFinding, PullRequestFinding, PullRequestMismatchKind, StaleIssueFinding,
-    TITLE_PAIR_LIMIT,
+    FocusMembershipChange, GroupStatus, HygieneError, HygieneGroup, IssueReference,
+    MissingScopeFinding, OverdueMilestoneFinding, PullRequestFinding, PullRequestMismatchKind,
+    StaleIssueFinding, TITLE_PAIR_LIMIT,
 };
 pub use linear::LinearGraphQlSource;
 pub use model::{
     ChunkIssue, FocusBlocker, FocusExpansion, FocusIssue, FocusIssueClassification, FocusMilestone,
     FocusMilestoneStatus, FocusPlanChunk, FocusPlanIssue, FocusProgress, FocusProject,
-    FocusProjectStatus, FocusSelection, FocusStateCount, FocusStatus, Initiative, Issue, IssueId,
-    Milestone, NextStep, Project, ProjectChunk, ProjectId, ProjectPriority, ProjectRunStatus,
-    ReadyItem, SearchKind, SearchResult, TeamKey, WorkflowStateType, WorkspaceSnapshot,
+    FocusProjectStatus, FocusSelection, FocusStateCount, FocusStatus, FocusUnmilestonedStatus,
+    Initiative, Issue, IssueId, Milestone, NextStep, Project, ProjectChunk, ProjectId,
+    ProjectPriority, ProjectRunStatus, ReadyItem, SearchKind, SearchResult, TeamKey,
+    WorkflowStateType, WorkspaceSnapshot,
 };
 
 use model::{compare_f64, issue_is_open};
@@ -1031,6 +1032,11 @@ fn make_focus_status(
                     }
                 })
                 .collect();
+            let without_milestone = member_issues
+                .iter()
+                .copied()
+                .filter(|issue| issue.project_milestone_id.is_none())
+                .collect::<Vec<_>>();
             FocusProjectStatus {
                 id: project.id.clone(),
                 identifier: project
@@ -1043,6 +1049,11 @@ fn make_focus_status(
                 in_progress: started_issues(&member_issues),
                 progress: leaf_progress(&member_issues, &leaf_ids),
                 milestones: milestone_status,
+                unmilestoned: FocusUnmilestonedStatus {
+                    open_by_state: open_state_counts(&without_milestone),
+                    in_progress: started_issues(&without_milestone),
+                    progress: leaf_progress(&without_milestone, &leaf_ids),
+                },
             }
         })
         .collect::<Vec<_>>();
@@ -1313,7 +1324,10 @@ fn plan_readiness(
     let step = spec_step(&issue.state);
     reasons.push(match step {
         Some(step) => format!("spec state {} maps to {:?}", issue.state, step),
-        None => format!("spec state {} has no FR-001 next step", issue.state),
+        None => format!(
+            "workflow state {} has no new Specify or Coding step (ready states: Backlog, Specify, Specced)",
+            issue.state
+        ),
     });
     let unresolved = unresolved_blockers(issue, issues)?;
     let blockers_ready = unresolved.is_empty();

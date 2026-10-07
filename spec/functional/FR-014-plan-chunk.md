@@ -37,6 +37,8 @@ readiness facts explaining why it is or is not ready. ix-board SHALL derive
 readiness using the issue's owning project/team and full transitive blocker
 rules from FR-001; FR-001 queue ordering SHALL not replace this requirement's
 ordering.
+When a workflow state has no new Specify or Coding step, the readiness reason
+SHALL name that state and explain the eligible planning states in plain language.
 
 The command SHALL derive each focus issue's dependency layer from the complete
 transitive `blocked_by` closure defined by FR-002. Every node in that closure,

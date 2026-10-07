@@ -35,6 +35,12 @@ when its Linear workflow-state type is `started`. Open-state groups and issue
 lists SHALL be ordered deterministically by state display name and stable
 Linear issue identifier, respectively.
 
+Each project SHALL also report an `unmilestoned` group for focus issues
+assigned to that project without a milestone. It SHALL use the same open-state,
+in-progress, and leaf-progress rules as milestone groups, including when the
+group is empty. Terminal output SHALL label open-state counts as including
+parent issues and progress as counting leaf tasks.
+
 Open-state counts and in-progress rows SHALL include only resolved focus
 member issues assigned to the corresponding project or milestone. Blocker-only
 issues SHALL NOT contribute to these counts or rows unless they are also
@@ -94,6 +100,8 @@ produce an explicit error and no partial status result.
 - The FR-001 eligible ready queue for focus issues, with deterministic order
   and reasons.
 - The actual snapshot fetch timestamp, preserving cache age under FR-010.
+  Terminal output SHALL show the fetch time as UTC ISO time and its age; JSON
+  SHALL retain the Unix-second `fetched_at` value.
 
 ## Acceptance Criteria
 
@@ -105,6 +113,7 @@ produce an explicit error and no partial status result.
 | FR-012-AC-4 | Given focus issues with different project, spec, and blocker eligibility, the ready queue includes exactly the focus issues eligible under FR-001, applies FR-001 ordering, and includes its readiness reasons; blocker-only issues are excluded. | Test |
 | FR-012-AC-5 | Given identical complete Linear records, repeated `focus status` calls return identical project and milestone groups, issue lists, blocker layers, ready queue order, and reasons; the result reports the source snapshot's actual fetch timestamp. | Test |
 | FR-012-AC-6 | An empty focus, incomplete source snapshot, missing blocker record, or dependency cycle returns an explicit error and no partial status result. | Test |
+| FR-012-AC-7 | Project focus issues without a milestone appear in `unmilestoned` with open-state, in-progress, and leaf-progress facts; parent issues contribute to open-state counts but not leaf progress, and terminal output explains the difference. The terminal fetch time is readable UTC with age while JSON retains `fetched_at`. | Test |
 
 ## Dependencies
 

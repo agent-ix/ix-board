@@ -707,7 +707,7 @@ fn focus_expansion_unions_selectors_groups_milestones_and_layers_blockers() {
     assert_eq!(first_result.blocker_layers[2], ["SWM-10"]);
 }
 
-/// Trace: FR-012-AC-1, FR-012-AC-2, FR-012-AC-3, FR-012-AC-4, FR-012-AC-5
+/// Trace: FR-012-AC-1, FR-012-AC-2, FR-012-AC-3, FR-012-AC-4, FR-012-AC-5, FR-012-AC-7
 #[test]
 fn focus_status_scopes_progress_blockers_and_ready_work_to_focus_members() {
     let directory = TempDir::new().expect("temporary directory");
@@ -815,6 +815,28 @@ fn focus_status_scopes_progress_blockers_and_ready_work_to_focus_members() {
     );
     assert_eq!(project.milestones[0].progress.done, 1);
     assert_eq!(project.milestones[0].progress.total, 3);
+    assert_eq!(project.unmilestoned.progress.done, 0);
+    assert_eq!(project.unmilestoned.progress.total, 3);
+    assert_eq!(
+        project
+            .unmilestoned
+            .in_progress
+            .iter()
+            .map(|issue| issue.identifier.as_str())
+            .collect::<Vec<_>>(),
+        ["SWM-3", "SWM-8", "SWM-9"]
+    );
+    assert_eq!(
+        project
+            .unmilestoned
+            .open_by_state
+            .iter()
+            .find(|count| count.state == "Todo")
+            .map(|count| count.count),
+        Some(3)
+    );
+    let json = serde_json::to_value(&status).expect("serialize focus status");
+    assert_eq!(json["projects"][0]["unmilestoned"]["progress"]["total"], 3);
     assert_eq!(
         project
             .in_progress
@@ -1238,19 +1260,19 @@ fn focus_plan_chunk_keeps_open_coding_review_and_unmapped_spec_candidates() {
         chunk.issues[0]
             .reasons
             .iter()
-            .any(|reason| reason.contains("no FR-001 next step"))
+            .any(|reason| reason.contains("no new Specify or Coding step"))
     );
     assert!(
         chunk.issues[1]
             .reasons
             .iter()
-            .any(|reason| reason.contains("no FR-001 next step"))
+            .any(|reason| reason.contains("no new Specify or Coding step"))
     );
     assert!(
         chunk.issues[2]
             .reasons
             .iter()
-            .any(|reason| reason.contains("no FR-001 next step"))
+            .any(|reason| reason.contains("no new Specify or Coding step"))
     );
 }
 

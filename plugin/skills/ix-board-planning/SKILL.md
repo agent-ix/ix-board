@@ -1,7 +1,7 @@
 ---
 name: ix-board-planning
-description: Use for Linear project or task planning, ready-work queues, project context, blockers, focus status, handoff chunks, and hygiene. Run the ix-board CLI and preserve its structured results.
-compatibility: Requires ix-board 0.2.0 or newer and a saved Linear key or LINEAR_API_KEY for live Linear queries.
+description: Route Linear project planning, ready queues, project context, and blocker questions to ix-board. For focus status, hygiene, or handoff, use this plugin's dedicated focus-status, focus-hygiene, or plan-chunk skill.
+compatibility: Requires ix-board 0.2.1 or newer and a saved Linear key or LINEAR_API_KEY for live Linear queries.
 ---
 
 # ix-board Planning
@@ -12,33 +12,36 @@ If credentials are missing, run `ix-board auth login` in an interactive terminal
 
 ## Choose a report
 
-1. For a team's ordered ready queue, identify the team key from the user's request or repository context, then run:
+1. For "how is this project or initiative going?", progress by milestone, blockers, or current ready work, use the `focus-status` skill with the requested selector. Use `--initiative` for a campaign spanning projects:
+
+   ```bash
+   ix-board focus status --initiative <INITIATIVE>
+   ix-board focus status --project <PROJECT>
+   ```
+
+2. For "hand this work off" or "what should the next lead take?", use the `plan-chunk` skill. For "is Linear out of date?" or "what changed?", use the `focus-hygiene` skill:
+
+   ```bash
+   ix-board focus plan-chunk --initiative <INITIATIVE>
+   ix-board focus hygiene --initiative <INITIATIVE>
+   ```
+
+   Use `--project` or `--issue` when those are the requested focus. Hygiene checks linked PRs only when Linear contains structured PR attachments; report unavailable checks and missing links as limits, not clean results.
+
+3. For a team's ordered ready queue, identify the team key from the user's request or repository context, then run:
 
    ```bash
    ix-board next --team <TEAM>
    ```
 
-2. For a project's goal, milestones, open issues, and dependency layers, run:
+4. For a project's goal, open issues, and dependency layers, use its Linear project identifier or UUID with `project-chunk`. For structured discovery, use `search`:
 
    ```bash
-   ix-board project-chunk <PROJECT>
-   ```
-
-3. For structured discovery by project or issue fields, run:
-
-   ```bash
+   ix-board project-chunk <PROJECT-ID>
    ix-board search "<QUERY>"
    ```
 
-4. For an identified initiative, project, or issue focus, use the matching report and selector:
-
-   ```bash
-   ix-board focus status --project <PROJECT>
-   ix-board focus hygiene --project <PROJECT>
-   ix-board focus plan-chunk --project <PROJECT>
-   ```
-
-   Use `--initiative` or `--issue` when those are the requested focus. Select only from an explicit request or structured Linear context. Run `ix-board focus <COMMAND> --help` when selector syntax or options are unclear.
+   `project-chunk` does not accept project names. Use `focus status --project <EXACT-NAME>` for a name-based progress report. Select focus only from an explicit request or structured Linear context. Run `ix-board focus <COMMAND> --help` when selector syntax is unclear.
 
 ## Preserve the result
 
