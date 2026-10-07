@@ -905,6 +905,97 @@ fn focus_status_scopes_progress_blockers_and_ready_work_to_focus_members() {
     );
 }
 
+/// Trace: FR-012-AC-8
+#[test]
+fn focus_status_work_milestones_limit_ready_and_blocker_roots_without_hiding_progress() {
+    let directory = TempDir::new().expect("temporary directory");
+    let mut selected = project("p1", "SWM-P1", "Started", 2, 1.0);
+    selected.milestones = vec![
+        Milestone {
+            id: "m1".to_owned(),
+            name: "M1".to_owned(),
+            description: None,
+            sort_order: 1.0,
+            target_date: None,
+        },
+        Milestone {
+            id: "m7".to_owned(),
+            name: "M7".to_owned(),
+            description: None,
+            sort_order: 7.0,
+            target_date: None,
+        },
+    ];
+    let mut now = issue("i1", "SWM-1", Some("p1"), "Specced", 1.0, 1.0, None, &[]);
+    now.project_milestone_id = Some("m1".to_owned());
+    let mut later = issue(
+        "i7",
+        "SWM-7",
+        Some("p1"),
+        "Specced",
+        1.0,
+        7.0,
+        None,
+        &["b7"],
+    );
+    later.project_milestone_id = Some("m7".to_owned());
+    let blocker = issue("b7", "OPS-7", None, "Completed", 1.0, 1.0, None, &[]);
+    let snapshot = WorkspaceSnapshot {
+        projects: vec![selected],
+        issues: vec![now, later, blocker],
+        fetched_at: 0,
+    };
+    let mut reads = service(
+        FixtureSource::new(snapshot),
+        ManualClock::new(2_000),
+        &directory,
+    );
+    let focus = ix_board::FocusSelection {
+        projects: vec!["SWM-P1".to_owned()],
+        ..Default::default()
+    };
+    let all = reads.focus_status(&focus).expect("unfiltered status");
+    assert_eq!(all.ready_queue.len(), 2);
+    assert!(
+        all.blocker_layers
+            .iter()
+            .flatten()
+            .any(|item| item.identifier == "OPS-7")
+    );
+
+    let active = reads
+        .focus_status_for_milestones(&focus, &["M1".to_owned()])
+        .expect("M1 status");
+    assert_eq!(active.work_milestones, ["M1"]);
+    assert_eq!(active.excluded_ready_count, 1);
+    assert_eq!(
+        active
+            .ready_queue
+            .iter()
+            .map(|item| item.identifier.as_str())
+            .collect::<Vec<_>>(),
+        ["SWM-1"]
+    );
+    assert_eq!(
+        active
+            .blocker_layers
+            .iter()
+            .flatten()
+            .map(|item| item.identifier.as_str())
+            .collect::<Vec<_>>(),
+        ["SWM-1"]
+    );
+    assert_eq!(
+        active.projects[0].progress.total,
+        all.projects[0].progress.total
+    );
+    assert_eq!(active.projects[0].milestones.len(), 2);
+    assert!(matches!(
+        reads.focus_status_for_milestones(&focus, &["M9".to_owned()]),
+        Err(Error::WorkMilestoneNotFound { .. })
+    ));
+}
+
 /// Trace: FR-012-AC-2
 #[test]
 fn focus_status_reports_null_percent_for_groups_without_countable_leaves() {
@@ -940,7 +1031,7 @@ fn focus_status_reports_null_percent_for_groups_without_countable_leaves() {
     assert_eq!(status.projects[0].target_date, None);
 }
 
-/// Trace: FR-014-AC-1, FR-014-AC-2, FR-014-AC-3, FR-014-AC-4, FR-014-AC-5, FR-014-AC-6, FR-014-AC-8, FR-014-AC-9
+/// Trace: FR-014-AC-1, FR-014-AC-2, FR-014-AC-3, FR-014-AC-4, FR-014-AC-5, FR-014-AC-6, FR-014-AC-8, FR-014-AC-9, FR-014-AC-10
 #[test]
 fn focus_plan_chunk_orders_full_closure_and_returns_handoff_facts() {
     let directory = TempDir::new().expect("temporary directory");
@@ -1080,6 +1171,22 @@ fn focus_plan_chunk_orders_full_closure_and_returns_handoff_facts() {
     );
     assert_eq!(chunk.issues[5].milestone.as_deref(), Some("M1"));
     assert_eq!(chunk.issues[0].unblocks, ["IR-318", "IR-319"]);
+    let m1_chunk = reads
+        .focus_plan_chunk_for_milestones(&selection, None, &["M1".to_owned()])
+        .expect("M1 handoff");
+    assert_eq!(m1_chunk.work_milestones, ["M1"]);
+    assert_eq!(
+        m1_chunk
+            .issues
+            .iter()
+            .map(|row| row.identifier.as_str())
+            .collect::<Vec<_>>(),
+        ["IR-317", "IR-315", "IR-318"]
+    );
+    assert!(matches!(
+        reads.focus_plan_chunk_for_milestones(&selection, None, &["M9".to_owned()]),
+        Err(Error::WorkMilestoneNotFound { .. })
+    ));
     assert_eq!(
         chunk.issues[0].acceptance_criteria.as_deref(),
         Some("First criterion.")

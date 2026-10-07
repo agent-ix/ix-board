@@ -310,6 +310,10 @@ pub struct FocusExpansion {
 pub struct FocusStatus {
     /// Unix seconds when the source snapshot was fetched.
     pub fetched_at: i64,
+    /// Exact milestone IDs or names limiting blocker roots and ready work; empty means all focus work.
+    pub work_milestones: Vec<String>,
+    /// Ready issues outside the selected work milestones; zero without a filter.
+    pub excluded_ready_count: usize,
     /// Selected projects and milestone status, in deterministic order.
     pub projects: Vec<FocusProjectStatus>,
     /// Complete prerequisite closure in FR-002 layer order.
@@ -324,6 +328,8 @@ pub struct FocusStatus {
 pub struct FocusPlanChunk {
     /// Unix seconds when the source snapshot was fetched.
     pub fetched_at: i64,
+    /// Exact milestone IDs or names limiting handoff roots; empty means all focus work.
+    pub work_milestones: Vec<String>,
     /// Ordered open focus issues included in the handoff.
     pub issues: Vec<FocusPlanIssue>,
 }
