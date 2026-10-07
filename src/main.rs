@@ -6,9 +6,10 @@
 use clap::{Parser, Subcommand};
 use ix_board::{
     DriftConfig, DriftError, DriftEvidenceFile, DriftReport, Error, FocusExpansion,
-    FocusHygieneReport, FocusPlanChunk, FocusSelection, FocusStatus, LinearGraphQlSource, NextStep,
-    ProjectChunk, ProjectPriority, ProjectRunStatus, ReadService, ReadyItem, SearchResult,
-    evaluate_drift, evaluate_drift_file, render_drift_text,
+    FocusHygieneReport, FocusPlanChunk, FocusProjectMembership, FocusRecord, FocusSelection,
+    FocusStatus, IssueBatch, LinearGraphQlSource, NextStep, ProjectChunk, ProjectPriority,
+    ProjectRunStatus, ReadService, ReadyItem, SearchResult, evaluate_drift, evaluate_drift_file,
+    render_drift_text,
 };
 use ix_cli_kit::exit::Outcome;
 use ix_cli_kit::secrets::{AppScope, SecretKey, SecretStore, SecretValue};
@@ -58,13 +59,19 @@ enum Command {
     },
     /// Return a project's goal, milestones, open tickets, and blocker layers.
     ProjectChunk {
-        /// Linear project identifier or UUID.
+        /// Linear project identifier, UUID, or exact name.
         project: String,
     },
     /// Search structured project and issue fields.
     Search {
         /// Case-insensitive substring query.
         query: String,
+    },
+    /// Read multiple exact Linear issues in one cached workspace request.
+    Issues {
+        /// Linear issue identifiers or UUIDs, in desired output order.
+        #[arg(required = true, num_args = 1..)]
+        identifiers: Vec<String>,
     },
     /// Render a deterministic drift report from versioned structured evidence.
     Drift {
@@ -106,51 +113,80 @@ enum AuthCommand {
 
 #[derive(Subcommand, Debug)]
 enum FocusCommand {
+    /// Emit a versioned focus record suitable for shared storage and dashboards.
+    Report {
+        #[arg(long = "initiative", action = clap::ArgAction::Append)]
+        initiatives: Vec<String>,
+        #[arg(long = "project", action = clap::ArgAction::Append)]
+        projects: Vec<String>,
+        #[arg(long = "milestone", action = clap::ArgAction::Append)]
+        milestones: Vec<String>,
+        #[arg(long = "issue", action = clap::ArgAction::Append)]
+        issues: Vec<String>,
+    },
     /// Expand selectors into focus issues and prerequisite layers.
     Expand {
-        /// Linear initiative UUID or exact name; may be repeated.
+        /// Linear initiative UUID, identifier (for example I-10), or exact name; may be repeated.
         #[arg(long = "initiative", action = clap::ArgAction::Append)]
         initiatives: Vec<String>,
         /// Linear project UUID, identifier, or exact name; may be repeated.
         #[arg(long = "project", action = clap::ArgAction::Append)]
         projects: Vec<String>,
+        /// Linear milestone UUID or exact globally unique name; may be repeated.
+        #[arg(long = "milestone", action = clap::ArgAction::Append)]
+        milestones: Vec<String>,
         /// Linear issue UUID or identifier; may be repeated.
         #[arg(long = "issue", action = clap::ArgAction::Append)]
         issues: Vec<String>,
     },
     /// Report project and milestone status, blockers, and ready focus issues.
     Status {
-        /// Linear initiative UUID or exact name; may be repeated.
+        /// Linear initiative UUID, identifier (for example I-10), or exact name; may be repeated.
         #[arg(long = "initiative", action = clap::ArgAction::Append)]
         initiatives: Vec<String>,
         /// Linear project UUID, identifier, or exact name; may be repeated.
         #[arg(long = "project", action = clap::ArgAction::Append)]
         projects: Vec<String>,
+        /// Linear milestone UUID or exact globally unique name; may be repeated.
+        #[arg(long = "milestone", action = clap::ArgAction::Append)]
+        milestones: Vec<String>,
         /// Linear issue UUID or identifier; may be repeated.
         #[arg(long = "issue", action = clap::ArgAction::Append)]
         issues: Vec<String>,
+        /// Limit blocker roots and ready issues to these exact milestone IDs or names; repeatable.
+        #[arg(long = "work-milestone", action = clap::ArgAction::Append)]
+        work_milestones: Vec<String>,
     },
     /// Prepare a bounded dependency-ordered handoff chunk for a focus.
     PlanChunk {
-        /// Linear initiative UUID or exact name; may be repeated.
+        /// Linear initiative UUID, identifier (for example I-10), or exact name; may be repeated.
         #[arg(long = "initiative", action = clap::ArgAction::Append)]
         initiatives: Vec<String>,
         /// Linear project UUID, identifier, or exact name; may be repeated.
         #[arg(long = "project", action = clap::ArgAction::Append)]
         projects: Vec<String>,
+        /// Linear milestone UUID or exact globally unique name; may be repeated.
+        #[arg(long = "milestone", action = clap::ArgAction::Append)]
+        milestones: Vec<String>,
         /// Linear issue UUID or identifier; may be repeated.
         #[arg(long = "issue", action = clap::ArgAction::Append)]
         issues: Vec<String>,
+        /// Limit handoff roots to these exact milestone IDs or names; repeatable.
+        #[arg(long = "work-milestone", action = clap::ArgAction::Append)]
+        work_milestones: Vec<String>,
         /// Maximum number of open focus issues to emit.
         #[arg(long, value_parser = parse_positive_size)]
         size: Option<NonZeroUsize>,
     },
     /// Report hygiene findings and changes for a focus.
     Hygiene {
+        /// Linear initiative UUID, identifier (for example I-10), or exact name; may be repeated.
         #[arg(long = "initiative", action = clap::ArgAction::Append)]
         initiatives: Vec<String>,
         #[arg(long = "project", action = clap::ArgAction::Append)]
         projects: Vec<String>,
+        #[arg(long = "milestone", action = clap::ArgAction::Append)]
+        milestones: Vec<String>,
         #[arg(long = "issue", action = clap::ArgAction::Append)]
         issues: Vec<String>,
         /// Stale threshold in positive whole days.
@@ -190,9 +226,11 @@ enum Output {
     Chunk(ProjectChunk),
     Focus(FocusExpansion),
     FocusStatus(FocusStatus),
+    FocusRecord(FocusRecord),
     FocusPlanChunk(FocusPlanChunk),
     FocusHygiene(Box<FocusHygieneReport>),
     Search(Vec<SearchResult>),
+    Issues(IssueBatch),
     Drift(DriftReport),
     ProjectStatusUpdated {
         project: String,
@@ -244,7 +282,7 @@ fn main() -> std::process::ExitCode {
             match rendered {
                 Ok(text) => {
                     emit_result(&text);
-                    std::process::ExitCode::from(Outcome::Ok)
+                    std::process::ExitCode::from(output_outcome(&output))
                 }
                 Err(error) => {
                     emit_diagnostic(
@@ -257,7 +295,7 @@ fn main() -> std::process::ExitCode {
             }
         }
         Err(error) => {
-            emit_diagnostic(diagnostics, "error", &error.to_string());
+            emit_diagnostic(diagnostics, "error", &format_cli_error(&error));
             std::process::ExitCode::from(match error {
                 Error::InvalidTeam
                 | Error::InvalidQuery
@@ -265,7 +303,9 @@ fn main() -> std::process::ExitCode {
                 | Error::InvalidProjectStatus { .. }
                 | Error::InvalidProjectPriority { .. }
                 | Error::EmptyFocus
+                | Error::WorkMilestoneNotFound { .. }
                 | Error::ScopeSelection { .. }
+                | Error::AmbiguousMilestone { .. }
                 | Error::DriftInputRead { .. }
                 | Error::DriftInputDecode { .. }
                 | Error::Drift(_) => Outcome::Invalid,
@@ -276,18 +316,65 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+fn output_outcome(output: &Output) -> Outcome {
+    match output {
+        Output::Issues(batch) if batch.issues.is_empty() && !batch.missing.is_empty() => {
+            Outcome::Invalid
+        }
+        _ => Outcome::Ok,
+    }
+}
+
+fn format_cli_error(error: &Error) -> String {
+    #[cfg(target_os = "macos")]
+    if matches!(
+        error,
+        Error::Credential(ix_cli_kit::secrets::SecretError::Unavailable)
+    ) {
+        return "Linear credential store unavailable or access denied for this binary; if another ix-board build works, grant this build access to the saved ix-board item in Keychain Access (see setup.md)".to_owned();
+    }
+    error.to_string()
+}
+
 fn validate_command(command: &Command) -> Result<(), Error> {
     match command {
         Command::Next { team } if team.trim().is_empty() => Err(Error::InvalidTeam),
         Command::Search { query } if query.trim().is_empty() => Err(Error::InvalidQuery),
+        Command::Issues { identifiers } if identifiers.iter().any(|id| id.trim().is_empty()) => {
+            Err(Error::ScopeSelection {
+                kind: "issue",
+                identifier: String::new(),
+                matches: 0,
+            })
+        }
+        Command::Focus {
+            command:
+                FocusCommand::Report {
+                    initiatives,
+                    projects,
+                    milestones,
+                    issues,
+                },
+        } if initiatives.is_empty()
+            && projects.is_empty()
+            && milestones.is_empty()
+            && issues.is_empty() =>
+        {
+            Err(Error::EmptyFocus)
+        }
         Command::Focus {
             command:
                 FocusCommand::Expand {
                     initiatives,
                     projects,
+                    milestones,
                     issues,
                 },
-        } if initiatives.is_empty() && projects.is_empty() && issues.is_empty() => {
+        } if initiatives.is_empty()
+            && projects.is_empty()
+            && milestones.is_empty()
+            && issues.is_empty() =>
+        {
             Err(Error::EmptyFocus)
         }
         Command::Focus {
@@ -295,10 +382,15 @@ fn validate_command(command: &Command) -> Result<(), Error> {
                 FocusCommand::Hygiene {
                     initiatives,
                     projects,
+                    milestones,
                     issues,
                     ..
                 },
-        } if initiatives.is_empty() && projects.is_empty() && issues.is_empty() => {
+        } if initiatives.is_empty()
+            && projects.is_empty()
+            && milestones.is_empty()
+            && issues.is_empty() =>
+        {
             Err(Error::EmptyFocus)
         }
         Command::Focus {
@@ -306,9 +398,15 @@ fn validate_command(command: &Command) -> Result<(), Error> {
                 FocusCommand::Status {
                     initiatives,
                     projects,
+                    milestones,
                     issues,
+                    ..
                 },
-        } if initiatives.is_empty() && projects.is_empty() && issues.is_empty() => {
+        } if initiatives.is_empty()
+            && projects.is_empty()
+            && milestones.is_empty()
+            && issues.is_empty() =>
+        {
             Err(Error::EmptyFocus)
         }
         Command::ProjectChunk { project } if project.trim().is_empty() => {
@@ -387,17 +485,36 @@ fn run_linear(command: Command) -> Result<Output, Error> {
         Command::Next { team } => service.next(&team).map(Output::Queue),
         Command::ProjectChunk { project } => service.project_chunk(&project).map(Output::Chunk),
         Command::Search { query } => service.search(&query).map(Output::Search),
+        Command::Issues { identifiers } => service.issues(&identifiers).map(Output::Issues),
+        Command::Focus {
+            command:
+                FocusCommand::Report {
+                    initiatives,
+                    projects,
+                    milestones,
+                    issues,
+                },
+        } => service
+            .focus_record(&FocusSelection {
+                initiatives,
+                projects,
+                milestones,
+                issues,
+            })
+            .map(Output::FocusRecord),
         Command::Focus {
             command:
                 FocusCommand::Expand {
                     initiatives,
                     projects,
+                    milestones,
                     issues,
                 },
         } => service
             .focus_expand(&FocusSelection {
                 initiatives,
                 projects,
+                milestones,
                 issues,
             })
             .map(Output::Focus),
@@ -406,31 +523,41 @@ fn run_linear(command: Command) -> Result<Output, Error> {
                 FocusCommand::Status {
                     initiatives,
                     projects,
+                    milestones,
                     issues,
+                    work_milestones,
                 },
         } => service
-            .focus_status(&FocusSelection {
-                initiatives,
-                projects,
-                issues,
-            })
+            .focus_status_for_milestones(
+                &FocusSelection {
+                    initiatives,
+                    projects,
+                    milestones,
+                    issues,
+                },
+                &work_milestones,
+            )
             .map(Output::FocusStatus),
         Command::Focus {
             command:
                 FocusCommand::PlanChunk {
                     initiatives,
                     projects,
+                    milestones,
                     issues,
+                    work_milestones,
                     size,
                 },
         } => service
-            .focus_plan_chunk(
+            .focus_plan_chunk_for_milestones(
                 &FocusSelection {
                     initiatives,
                     projects,
+                    milestones,
                     issues,
                 },
                 size,
+                &work_milestones,
             )
             .map(Output::FocusPlanChunk),
         Command::Focus {
@@ -438,6 +565,7 @@ fn run_linear(command: Command) -> Result<Output, Error> {
                 FocusCommand::Hygiene {
                     initiatives,
                     projects,
+                    milestones,
                     issues,
                     stale_days,
                 },
@@ -452,6 +580,7 @@ fn run_linear(command: Command) -> Result<Output, Error> {
                     &FocusSelection {
                         initiatives,
                         projects,
+                        milestones,
                         issues,
                     },
                     &format_utc(now),
@@ -530,6 +659,23 @@ fn render_human(output: &Output) -> String {
         Output::Chunk(chunk) => render_chunk(chunk),
         Output::Focus(expansion) => render_focus(expansion),
         Output::FocusStatus(status) => render_focus_status(status),
+        Output::FocusRecord(record) => format!(
+            "Focus record v{} at {}\nSelection: {}\n{}",
+            record.schema_version,
+            format_utc(record.reported_at),
+            record
+                .selection
+                .iter()
+                .map(|member| match member {
+                    ix_board::FocusMember::Initiative(id) => format!("initiative:{id}"),
+                    ix_board::FocusMember::Project(id) => format!("project:{id}"),
+                    ix_board::FocusMember::Milestone(id) => format!("milestone:{id}"),
+                    ix_board::FocusMember::Issue(id) => format!("issue:{id}"),
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+            render_focus_status(&record.status)
+        ),
         Output::FocusPlanChunk(chunk) => render_focus_plan_chunk(chunk),
         Output::FocusHygiene(report) => render_focus_hygiene(report),
         Output::Search(results) => results
@@ -537,6 +683,22 @@ fn render_human(output: &Output) -> String {
             .map(|record| format!("{:?} {} — {}", record.kind, record.identifier, record.name))
             .collect::<Vec<_>>()
             .join("\n"),
+        Output::Issues(batch) => {
+            let mut lines = batch
+                .issues
+                .iter()
+                .map(|issue| {
+                    format!(
+                        "{} [{}] {}",
+                        issue.identifier, issue.state_name, issue.title
+                    )
+                })
+                .collect::<Vec<_>>();
+            if !batch.missing.is_empty() {
+                lines.push(format!("Missing: {}", batch.missing.join(", ")));
+            }
+            lines.join("\n")
+        }
         Output::Drift(report) => render_drift_text(report),
         Output::ProjectStatusUpdated { project, status } => {
             format!("Project {project} status set to {status}")
@@ -554,7 +716,7 @@ fn render_human(output: &Output) -> String {
 fn render_focus(expansion: &FocusExpansion) -> String {
     let mut lines = vec![format!(
         "Focus snapshot fetched at {}",
-        expansion.fetched_at
+        format_snapshot_time(expansion.fetched_at)
     )];
     lines.push("Selected projects:".to_owned());
     if expansion.projects.is_empty() {
@@ -612,9 +774,25 @@ fn render_focus(expansion: &FocusExpansion) -> String {
 }
 
 fn render_focus_status(status: &FocusStatus) -> String {
-    let mut lines = vec![format!("Focus snapshot fetched at {}", status.fetched_at)];
+    let mut lines = vec![format!(
+        "Focus snapshot fetched at {}",
+        format_snapshot_time(status.fetched_at)
+    )];
+    if !status.work_milestones.is_empty() {
+        lines.push(format!(
+            "Work milestones (ready queue and blocker roots): {}",
+            status.work_milestones.join(", ")
+        ));
+    }
     for project in &status.projects {
-        lines.push(format!("Project {} — {}", project.identifier, project.name));
+        let scope_label = match project.membership {
+            FocusProjectMembership::FullProject => "",
+            FocusProjectMembership::PartialFocus => " (selected focus only)",
+        };
+        lines.push(format!(
+            "Project {} — {}{}",
+            project.identifier, project.name, scope_label
+        ));
         lines.push(format!(
             "  Target date: {}",
             project.target_date.as_deref().unwrap_or("none")
@@ -640,6 +818,19 @@ fn render_focus_status(status: &FocusStatus) -> String {
                 milestone.progress,
             );
         }
+        if project.membership == FocusProjectMembership::FullProject
+            || project.unmilestoned.progress.total > 0
+            || !project.unmilestoned.open_by_state.is_empty()
+        {
+            lines.push("  No milestone:".to_owned());
+            render_status_group(
+                &mut lines,
+                "    ",
+                &project.unmilestoned.open_by_state,
+                &project.unmilestoned.in_progress,
+                project.unmilestoned.progress,
+            );
+        }
     }
     lines.push("Blocker layers:".to_owned());
     for (index, layer) in status.blocker_layers.iter().enumerate() {
@@ -656,6 +847,17 @@ fn render_focus_status(status: &FocusStatus) -> String {
         }));
     }
     lines.push("Ready focus issues:".to_owned());
+    if status.ready_queue.is_empty() {
+        lines.push(if status.work_milestones.is_empty() {
+            "  (none)".to_owned()
+        } else {
+            format!(
+                "  (none in {}; {} ready in other milestones excluded)",
+                status.work_milestones.join(", "),
+                status.excluded_ready_count
+            )
+        });
+    }
     lines.extend(
         status
             .ready_queue
@@ -666,7 +868,16 @@ fn render_focus_status(status: &FocusStatus) -> String {
 }
 
 fn render_focus_plan_chunk(chunk: &FocusPlanChunk) -> String {
-    let mut lines = vec![format!("Focus snapshot fetched at {}", chunk.fetched_at)];
+    let mut lines = vec![format!(
+        "Focus snapshot fetched at {}",
+        format_snapshot_time(chunk.fetched_at)
+    )];
+    if !chunk.work_milestones.is_empty() {
+        lines.push(format!(
+            "Work milestones: {}",
+            chunk.work_milestones.join(", ")
+        ));
+    }
     lines.push("Plan chunk:".to_owned());
     if chunk.issues.is_empty() {
         lines.push("  (no open focus issues)".to_owned());
@@ -693,7 +904,16 @@ fn render_focus_hygiene(report: &FocusHygieneReport) -> String {
     )];
     macro_rules! group_header {
         ($name:literal, $group:expr) => {
-            lines.push(format!("{}: {:?}", $name, $group.availability));
+            lines.push(format!(
+                "{}: {} ({} findings)",
+                $name,
+                if matches!($group.availability, ix_board::GroupStatus::Available) {
+                    "checked"
+                } else {
+                    "incomplete"
+                },
+                $group.findings.len()
+            ));
             for reason in &$group.reasons {
                 lines.push(format!("  unavailable: {reason}"));
             }
@@ -702,8 +922,8 @@ fn render_focus_hygiene(report: &FocusHygieneReport) -> String {
     group_header!("Missing scope", report.missing_scope);
     for finding in &report.missing_scope.findings {
         lines.push(format!(
-            "  {} missing {}",
-            finding.issue_id.0,
+            "  {}: missing {}",
+            issue_label(report, &finding.issue_id),
             finding.missing_fields.join(", ")
         ));
     }
@@ -717,16 +937,16 @@ fn render_focus_hygiene(report: &FocusHygieneReport) -> String {
             finding
                 .open_issue_ids
                 .iter()
-                .map(|id| id.0.as_str())
+                .map(|id| issue_label(report, id))
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join("; ")
         ));
     }
     group_header!("Pull requests", report.pull_requests);
     for finding in &report.pull_requests.findings {
         lines.push(format!(
             "  {} {}#{} {}",
-            finding.issue_id.0,
+            issue_label(report, &finding.issue_id),
             finding.repository,
             finding.number,
             finding.kind.as_str()
@@ -736,7 +956,9 @@ fn render_focus_hygiene(report: &FocusHygieneReport) -> String {
     for finding in &report.stale_issues.findings {
         lines.push(format!(
             "  {} last updated {} ({} days)",
-            finding.issue_id.0, finding.updated_at, finding.elapsed_days
+            issue_label(report, &finding.issue_id),
+            finding.updated_at,
+            finding.elapsed_days
         ));
     }
     group_header!("Near-duplicate titles", report.near_duplicate_titles);
@@ -746,14 +968,17 @@ fn render_focus_hygiene(report: &FocusHygieneReport) -> String {
             finding
                 .issue_ids
                 .iter()
-                .map(|id| id.0.as_str())
+                .map(|id| issue_label(report, id))
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join("; ")
         ));
     }
     group_header!("Diff", report.diff);
     for finding in &report.diff.findings {
-        lines.push(format!("  {finding:?}"));
+        lines.push(format!(
+            "  {}: {finding:?}",
+            issue_label(report, change_issue_id(finding))
+        ));
     }
     lines.join("\n")
 }
@@ -779,6 +1004,49 @@ fn format_utc(epoch: i64) -> String {
     )
 }
 
+fn format_snapshot_time(epoch: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok());
+    format_snapshot_time_at(epoch, now)
+}
+
+fn format_snapshot_time_at(epoch: i64, now: Option<i64>) -> String {
+    match now.and_then(|now| now.checked_sub(epoch)) {
+        Some(age) if age >= 0 => format!("{} ({}s old)", format_utc(epoch), age),
+        Some(_) => format!("{} (clock ahead of local time)", format_utc(epoch)),
+        None => format!("{} (age unavailable)", format_utc(epoch)),
+    }
+}
+
+fn issue_label(report: &FocusHygieneReport, id: &ix_board::IssueId) -> String {
+    format_issue_ref(&report.issue_refs, id)
+}
+
+fn format_issue_ref(
+    refs: &std::collections::BTreeMap<ix_board::IssueId, ix_board::IssueReference>,
+    id: &ix_board::IssueId,
+) -> String {
+    refs.get(id).map_or_else(
+        || id.0.clone(),
+        |reference| format!("{} — {}", reference.identifier, reference.title),
+    )
+}
+
+fn change_issue_id(change: &ix_board::FocusChange) -> &ix_board::IssueId {
+    use ix_board::FocusChange;
+    match change {
+        FocusChange::Membership { issue_id, .. }
+        | FocusChange::State { issue_id, .. }
+        | FocusChange::Project { issue_id, .. }
+        | FocusChange::Milestone { issue_id, .. }
+        | FocusChange::Blockers { issue_id, .. }
+        | FocusChange::Created { issue_id }
+        | FocusChange::Closed { issue_id } => issue_id,
+    }
+}
+
 fn render_status_group(
     lines: &mut Vec<String>,
     indent: &str,
@@ -787,14 +1055,14 @@ fn render_status_group(
     progress: ix_board::FocusProgress,
 ) {
     lines.push(format!(
-        "{indent}Progress: {}/{} leaves ({})",
+        "{indent}Progress: {}/{} leaf tasks, excluding parents ({})",
         progress.done,
         progress.total,
         progress
             .completed_percent
             .map_or_else(|| "n/a".to_owned(), |percent| format!("{percent:.1}%"))
     ));
-    lines.push(format!("{indent}Open by state:"));
+    lines.push(format!("{indent}Open by state, including parents:"));
     lines.extend(
         open_by_state
             .iter()
@@ -870,8 +1138,75 @@ fn render_chunk(chunk: &ProjectChunk) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, FocusCommand};
+    use super::{
+        Cli, Command, FocusCommand, Output, format_issue_ref, format_snapshot_time_at,
+        output_outcome, render_focus_status,
+    };
     use clap::Parser;
+    use ix_board::{FocusStatus, IssueBatch, IssueId, IssueReference};
+    use ix_cli_kit::exit::Outcome;
+
+    /// Trace: FR-012-AC-9
+    #[test]
+    fn empty_filtered_ready_queue_explains_excluded_work() {
+        let status = FocusStatus {
+            fetched_at: 1_791_232_484,
+            work_milestones: vec!["M1 Spec".to_owned(), "M2 Core on Qwen".to_owned()],
+            excluded_ready_count: 15,
+            projects: Vec::new(),
+            blocker_layers: Vec::new(),
+            ready_queue: Vec::new(),
+        };
+        assert!(
+            render_focus_status(&status).contains(
+                "(none in M1 Spec, M2 Core on Qwen; 15 ready in other milestones excluded)"
+            )
+        );
+    }
+    /// Trace: FR-017-AC-4
+    #[test]
+    fn all_missing_issue_batch_exits_nonzero_after_rendering() {
+        assert_eq!(
+            output_outcome(&Output::Issues(IssueBatch {
+                issues: Vec::new(),
+                missing: vec!["SAPHO-9999".to_owned()],
+                complete: false,
+            })) as u8,
+            Outcome::Invalid as u8
+        );
+    }
+    use std::collections::BTreeMap;
+
+    /// Trace: FR-012-AC-7
+    #[test]
+    fn snapshot_time_is_readable_and_reports_age() {
+        assert_eq!(
+            format_snapshot_time_at(1_791_232_484, Some(1_791_232_514)),
+            "2026-10-05T20:34:44Z (30s old)"
+        );
+        assert!(format_snapshot_time_at(10, Some(9)).contains("clock ahead"));
+    }
+
+    /// Trace: FR-013-AC-12
+    #[test]
+    fn hygiene_issue_label_uses_identifier_and_title_with_uuid_fallback() {
+        let id = IssueId("issue-uuid".to_owned());
+        let refs = BTreeMap::from([(
+            id.clone(),
+            IssueReference {
+                identifier: "SAPHO-57".to_owned(),
+                title: "Add Extractor port".to_owned(),
+            },
+        )]);
+        assert_eq!(
+            format_issue_ref(&refs, &id),
+            "SAPHO-57 — Add Extractor port"
+        );
+        assert_eq!(
+            format_issue_ref(&refs, &IssueId("missing-uuid".to_owned())),
+            "missing-uuid"
+        );
+    }
 
     /// Trace: FR-011-AC-1
     #[test]
@@ -886,6 +1221,8 @@ mod tests {
             "SWM-P1",
             "--project",
             "SWM-P2",
+            "--milestone",
+            "M1 Spec",
             "--issue",
             "SWM-1",
             "--issue",
@@ -898,10 +1235,12 @@ mod tests {
                 command: FocusCommand::Expand {
                     initiatives,
                     projects,
+                    milestones,
                     issues,
                 }
             } if initiatives == ["Delivery"]
                 && projects == ["SWM-P1", "SWM-P2"]
+                && milestones == ["M1 Spec"]
                 && issues == ["SWM-1", "SWM-2"]
         ));
     }
@@ -919,6 +1258,8 @@ mod tests {
             "SWM-P1",
             "--issue",
             "SWM-1",
+            "--work-milestone",
+            "M1",
         ])
         .expect("parse focus status selectors");
         assert!(matches!(
@@ -928,10 +1269,13 @@ mod tests {
                     initiatives,
                     projects,
                     issues,
+                    work_milestones,
+                    ..
                 }
             } if initiatives == ["Delivery"]
                 && projects == ["SWM-P1"]
                 && issues == ["SWM-1"]
+                && work_milestones == ["M1"]
         ));
     }
 
@@ -948,6 +1292,8 @@ mod tests {
             "IR-P1",
             "--issue",
             "IR-317",
+            "--work-milestone",
+            "M1",
             "--size",
             "4",
         ])
@@ -959,11 +1305,14 @@ mod tests {
                     initiatives,
                     projects,
                     issues,
+                    work_milestones,
                     size: Some(size),
+                    ..
                 }
             } if initiatives == ["Delivery"]
                 && projects == ["IR-P1"]
                 && issues == ["IR-317"]
+                && work_milestones == ["M1"]
                 && size.get() == 4
         ));
         for value in ["0", "-1", "abc"] {
