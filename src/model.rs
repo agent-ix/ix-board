@@ -334,6 +334,20 @@ pub struct FocusStatus {
     pub ready_queue: Vec<ReadyItem>,
 }
 
+/// Versioned ix-board focus value for storage or transport by an opaque data service.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FocusRecord {
+    /// Wire contract version for readers that do not share this Rust crate.
+    pub schema_version: u32,
+    /// Canonical initiative/project/issue selectors using Linear IDs.
+    pub selection: Vec<String>,
+    /// Unix seconds when ix-board produced this record.
+    pub reported_at: i64,
+    /// Linear-backed status and source fetch time.
+    pub status: FocusStatus,
+}
+
 /// A bounded dependency-ordered handoff for an inline focus.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
