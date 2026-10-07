@@ -36,7 +36,8 @@ make test
 
 ### Signed test builds on macOS
 
-Repeated unsigned builds can cause a new Keychain prompt for the saved Linear
+Do not run unsigned development builds against a saved Linear key. Repeated
+unsigned builds can cause a new Keychain prompt for the saved Linear
 credential. For live development testing, the owner can create a local code
 signing certificate in Keychain Access and keep its private key on this Mac.
 After each build, sign the executable with the same identity and the fixed
@@ -71,6 +72,8 @@ logout` removes the saved key. `auth status` only reports whether a key is
 available and which source is active; it never displays the value. If the OS
 credential store is locked or unavailable, the CLI reports that failure and
 does not create a plaintext fallback file.
+
+Do not extract the saved key from Keychain to set `LINEAR_API_KEY` for a test.
 
 Run reads with:
 
@@ -107,7 +110,7 @@ team lead and planner role skills consume their results. Install the CLI
 separately:
 
 ```bash
-cargo +1.98.1 install --git https://github.com/agent-ix/ix-board --tag v0.2.1 --locked
+cargo +1.98.1 install --git https://github.com/agent-ix/ix-board --tag v0.3.0 --locked
 ```
 
 For Claude Code:
