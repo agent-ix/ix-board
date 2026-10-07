@@ -15,6 +15,8 @@ pub struct ScopeSelection {
     pub initiatives: Vec<String>,
     /// Project UUIDs, identifiers, or exact names.
     pub projects: Vec<String>,
+    /// Milestone UUIDs or exact names; selected issues belong to that milestone.
+    pub milestones: Vec<String>,
     /// Ticket UUIDs or identifiers, including their descendants.
     pub tickets: Vec<String>,
 }
@@ -68,6 +70,80 @@ pub(crate) fn resolve_initiative_id(
     unique("initiative", value, ids.into_iter().collect())
 }
 
+/// Resolve a project selector, preferring its UUID or identifier over a colliding name.
+pub(crate) fn resolve_project_id(
+    snapshot: &WorkspaceSnapshot,
+    value: &str,
+) -> Result<ProjectId, Error> {
+    let exact = snapshot
+        .projects
+        .iter()
+        .filter(|p| {
+            p.id.0.eq_ignore_ascii_case(value)
+                || p.identifier
+                    .as_deref()
+                    .is_some_and(|id| id.eq_ignore_ascii_case(value))
+        })
+        .map(|p| p.id.clone())
+        .collect::<Vec<_>>();
+    if !exact.is_empty() {
+        return unique("project", value, exact);
+    }
+    unique(
+        "project",
+        value,
+        snapshot
+            .projects
+            .iter()
+            .filter(|p| p.name.eq_ignore_ascii_case(value))
+            .map(|p| p.id.clone())
+            .collect(),
+    )
+}
+
+/// A milestone name must be globally unambiguous; a Linear UUID wins over names.
+pub(crate) fn resolve_milestone_id(
+    snapshot: &WorkspaceSnapshot,
+    value: &str,
+) -> Result<String, Error> {
+    let exact = snapshot
+        .projects
+        .iter()
+        .flat_map(|p| &p.milestones)
+        .filter(|m| m.id.eq_ignore_ascii_case(value))
+        .map(|m| m.id.clone())
+        .collect::<BTreeSet<_>>();
+    if !exact.is_empty() {
+        return unique("milestone", value, exact.into_iter().collect());
+    }
+    let names = snapshot
+        .projects
+        .iter()
+        .flat_map(|p| &p.milestones)
+        .filter(|m| m.name == value)
+        .map(|m| m.id.clone())
+        .collect::<BTreeSet<_>>();
+    unique("milestone", value, names.into_iter().collect())
+}
+
+pub(crate) fn resolve_ticket_id(
+    snapshot: &WorkspaceSnapshot,
+    value: &str,
+) -> Result<IssueId, Error> {
+    unique(
+        "ticket",
+        value,
+        snapshot
+            .issues
+            .iter()
+            .filter(|i| {
+                i.id.0.eq_ignore_ascii_case(value) || i.identifier.eq_ignore_ascii_case(value)
+            })
+            .map(|i| i.id.clone())
+            .collect(),
+    )
+}
+
 /// Resolves explicit selectors and counts each executable leaf task once.
 pub fn select_scope(
     snapshot: &WorkspaceSnapshot,
@@ -86,6 +162,7 @@ pub fn select_scope(
         }
         if selection.initiatives.is_empty()
             && selection.projects.is_empty()
+            && selection.milestones.is_empty()
             && selection.tickets.is_empty()
         {
             result.project_ids.extend(
@@ -105,22 +182,9 @@ pub fn select_scope(
         }
     }
     for value in &selection.projects {
-        let project = unique(
-            "project",
-            value,
-            snapshot
-                .projects
-                .iter()
-                .filter(|p| {
-                    p.id.0 == *value
-                        || p.name.eq_ignore_ascii_case(value)
-                        || p.identifier
-                            .as_ref()
-                            .is_some_and(|id| id.eq_ignore_ascii_case(value))
-                })
-                .collect(),
-        )?;
-        result.project_ids.insert(project.id.clone());
+        result
+            .project_ids
+            .insert(resolve_project_id(snapshot, value)?);
     }
     for value in &selection.initiatives {
         let id = resolve_initiative_id(snapshot, value)?;
@@ -143,19 +207,30 @@ pub fn select_scope(
             })
             .map(|i| i.id.clone()),
     );
-    let mut pending = VecDeque::new();
-    for value in &selection.tickets {
-        let issue = unique(
-            "ticket",
-            value,
+    for value in &selection.milestones {
+        let id = resolve_milestone_id(snapshot, value)?;
+        for project in &snapshot.projects {
+            if project
+                .milestones
+                .iter()
+                .any(|milestone| milestone.id == id)
+            {
+                result.project_ids.insert(project.id.clone());
+            }
+        }
+        result.issue_ids.extend(
             snapshot
                 .issues
                 .iter()
-                .filter(|i| i.id.0 == *value || i.identifier.eq_ignore_ascii_case(value))
-                .collect(),
-        )?;
-        result.issue_ids.insert(issue.id.clone());
-        pending.push_back(issue.id.clone());
+                .filter(|issue| issue.project_milestone_id.as_deref() == Some(id.as_str()))
+                .map(|issue| issue.id.clone()),
+        );
+    }
+    let mut pending = VecDeque::new();
+    for value in &selection.tickets {
+        let id = resolve_ticket_id(snapshot, value)?;
+        result.issue_ids.insert(id.clone());
+        pending.push_back(id);
     }
     let mut children: BTreeMap<_, Vec<_>> = BTreeMap::new();
     for issue in &snapshot.issues {

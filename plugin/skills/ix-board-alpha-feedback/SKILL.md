@@ -13,7 +13,7 @@ If this plugin is not initialized or an Agent IX command fails, read [the ix-boa
 1. Record the ix-board version or commit, plugin version, operating system, agent client, exact command or action, and the observed result.
 2. Classify the finding as a bug, friction, or gap. Include expected behavior, actual behavior, impact, and a reproducible example when available.
 3. File only observations from real use. Do not report hypothetical issues or infer defects from missing evidence.
-4. When feedback includes a feature request or user story, record the lead's need and acceptance example in the ix-board spec. Use `spec/usecase/` for accepted behavior with requirement trace links; keep unaccepted proposals in `spec/roadmap/` and label them proposed. Keep the skill focused on routing and evidence rather than copying full stories into it.
+4. When feedback includes a feature request or user story, put the lead's need and acceptance example in the feedback ticket. The ix-board maintainer then records accepted behavior in `spec/usecase/` with requirement trace links, or keeps an unaccepted proposal in `spec/roadmap/` labeled proposed. Keep this skill focused on routing and evidence rather than copying full stories into it.
 
 ## Check for duplicates and file
 

@@ -83,7 +83,9 @@ ix-board issues SWM-12 SWM-13 SWM-14
 
 For a versioned focus record that another client can validate and store as
 JSON, run `ix-board --json focus report --initiative "Initiative name"`.
-The record includes canonical Linear IDs, the report time, and ix-board's
+Use repeatable `--milestone "M1 Spec"` to save a milestone as a focus member;
+combine it with initiative, project, and issue selectors to select their union.
+The version 2 record includes typed canonical Linear IDs, the report time, and ix-board's
 status report. This command does not publish to ix-relay.
 
 Add `--json` to any command for machine-readable output. The CLI stores one

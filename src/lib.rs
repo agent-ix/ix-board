@@ -31,12 +31,12 @@ pub use hygiene::{
 };
 pub use linear::LinearGraphQlSource;
 pub use model::{
-    ChunkIssue, FocusBlocker, FocusExpansion, FocusIssue, FocusIssueClassification, FocusMilestone,
-    FocusMilestoneStatus, FocusPlanChunk, FocusPlanIssue, FocusProgress, FocusProject,
-    FocusProjectStatus, FocusRecord, FocusSelection, FocusStateCount, FocusStatus,
+    ChunkIssue, FocusBlocker, FocusExpansion, FocusIssue, FocusIssueClassification, FocusMember,
+    FocusMilestone, FocusMilestoneStatus, FocusPlanChunk, FocusPlanIssue, FocusProgress,
+    FocusProject, FocusProjectStatus, FocusRecord, FocusSelection, FocusStateCount, FocusStatus,
     FocusUnmilestonedStatus, Initiative, Issue, IssueBatch, IssueId, Milestone, NextStep, Project,
-    ProjectChunk, ProjectId, ProjectPriority, ProjectRunStatus, ReadyItem, SearchKind, SearchResult,
-    TeamKey, WorkflowStateType, WorkspaceSnapshot,
+    ProjectChunk, ProjectId, ProjectPriority, ProjectRunStatus, ReadyItem, SearchKind,
+    SearchResult, TeamKey, WorkflowStateType, WorkspaceSnapshot,
 };
 
 use model::{compare_f64, issue_is_open};
@@ -46,7 +46,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error as ThisError;
 
 /// Current ix-board focus record JSON contract.
-pub const FOCUS_RECORD_SCHEMA_VERSION: u32 = 1;
+pub const FOCUS_RECORD_SCHEMA_VERSION: u32 = 2;
 
 /// Errors returned by the library's read and cache boundaries.
 #[derive(Debug, ThisError)]
@@ -449,10 +449,11 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
         })
     }
 
-    /// Resolves inline initiative, project, and issue selectors into a focus expansion.
+    /// Resolves inline initiative, project, milestone, and issue selectors into a focus expansion.
     pub fn focus_expand(&mut self, selection: &FocusSelection) -> Result<FocusExpansion, Error> {
         if selection.initiatives.is_empty()
             && selection.projects.is_empty()
+            && selection.milestones.is_empty()
             && selection.issues.is_empty()
         {
             return Err(Error::EmptyFocus);
@@ -474,6 +475,7 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
     ) -> Result<FocusStatus, Error> {
         if selection.initiatives.is_empty()
             && selection.projects.is_empty()
+            && selection.milestones.is_empty()
             && selection.issues.is_empty()
         {
             return Err(Error::EmptyFocus);
@@ -486,6 +488,7 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
     pub fn focus_record(&mut self, selection: &FocusSelection) -> Result<FocusRecord, Error> {
         if selection.initiatives.is_empty()
             && selection.projects.is_empty()
+            && selection.milestones.is_empty()
             && selection.issues.is_empty()
         {
             return Err(Error::EmptyFocus);
@@ -517,6 +520,7 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
     ) -> Result<FocusPlanChunk, Error> {
         if selection.initiatives.is_empty()
             && selection.projects.is_empty()
+            && selection.milestones.is_empty()
             && selection.issues.is_empty()
         {
             return Err(Error::EmptyFocus);
@@ -534,6 +538,7 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
     ) -> Result<FocusHygieneReport, Error> {
         if selection.initiatives.is_empty()
             && selection.projects.is_empty()
+            && selection.milestones.is_empty()
             && selection.issues.is_empty()
         {
             return Err(Error::EmptyFocus);
@@ -545,13 +550,22 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
                 team: None,
                 initiatives: selection.initiatives.clone(),
                 projects: selection.projects.clone(),
+                milestones: selection.milestones.clone(),
                 tickets: selection.issues.clone(),
             },
         )?;
-        if scope.issue_ids.is_empty() {
+        if scope.issue_ids.is_empty() && scope.project_ids.is_empty() {
             return Err(Error::EmptyFocus);
         }
-        let canonical_focus = canonical_selectors(&snapshot, selection)?;
+        let canonical_focus = canonical_selectors(&snapshot, selection)?
+            .into_iter()
+            .map(|member| match member {
+                FocusMember::Initiative(id) => format!("initiative:{id}"),
+                FocusMember::Project(id) => format!("project:{id}"),
+                FocusMember::Milestone(id) => format!("milestone:{id}"),
+                FocusMember::Issue(id) => format!("issue:{id}"),
+            })
+            .collect::<Vec<_>>();
         let focus_key = serde_json::to_string(&canonical_focus).map_err(Error::CacheEncode)?;
         let (prior, prior_unavailable) = match self.cache.hygiene_baseline(&focus_key) {
             Ok(prior) => (prior, None),
@@ -817,54 +831,26 @@ fn unresolved_blockers(
 fn canonical_selectors(
     snapshot: &WorkspaceSnapshot,
     selection: &FocusSelection,
-) -> Result<Vec<String>, Error> {
+) -> Result<Vec<FocusMember>, Error> {
     let mut selectors = BTreeSet::new();
     for value in &selection.initiatives {
         let id = scope::resolve_initiative_id(snapshot, value)?;
-        selectors.insert(format!("initiative:{id}"));
+        selectors.insert(FocusMember::Initiative(id));
     }
     for value in &selection.projects {
-        let matches = snapshot
-            .projects
-            .iter()
-            .filter(|project| {
-                project.id.0 == *value
-                    || project.name.eq_ignore_ascii_case(value)
-                    || project
-                        .identifier
-                        .as_ref()
-                        .is_some_and(|id| id.eq_ignore_ascii_case(value))
-            })
-            .map(|project| project.id.0.clone())
-            .collect::<BTreeSet<_>>();
-        if matches.len() != 1 {
-            return Err(Error::ScopeSelection {
-                kind: "project",
-                identifier: value.clone(),
-                matches: matches.len(),
-            });
-        }
-        if let Some(id) = matches.first() {
-            selectors.insert(format!("project:{id}"));
-        }
+        selectors.insert(FocusMember::Project(
+            scope::resolve_project_id(snapshot, value)?.0,
+        ));
+    }
+    for value in &selection.milestones {
+        selectors.insert(FocusMember::Milestone(scope::resolve_milestone_id(
+            snapshot, value,
+        )?));
     }
     for value in &selection.issues {
-        let matches = snapshot
-            .issues
-            .iter()
-            .filter(|issue| issue.id.0 == *value || issue.identifier.eq_ignore_ascii_case(value))
-            .map(|issue| issue.id.0.clone())
-            .collect::<BTreeSet<_>>();
-        if matches.len() != 1 {
-            return Err(Error::ScopeSelection {
-                kind: "issue",
-                identifier: value.clone(),
-                matches: matches.len(),
-            });
-        }
-        if let Some(id) = matches.first() {
-            selectors.insert(format!("issue:{id}"));
-        }
+        selectors.insert(FocusMember::Issue(
+            scope::resolve_ticket_id(snapshot, value)?.0,
+        ));
     }
     Ok(selectors.into_iter().collect())
 }
@@ -964,6 +950,7 @@ fn make_focus_expansion(
 ) -> Result<FocusExpansion, Error> {
     if selection.initiatives.is_empty()
         && selection.projects.is_empty()
+        && selection.milestones.is_empty()
         && selection.issues.is_empty()
     {
         return Err(Error::EmptyFocus);
@@ -973,6 +960,7 @@ fn make_focus_expansion(
         team: None,
         initiatives: selection.initiatives.clone(),
         projects: selection.projects.clone(),
+        milestones: selection.milestones.clone(),
         tickets: selection.issues.clone(),
     };
     let scope = select_scope(snapshot, &scope_selection)?;
@@ -985,6 +973,7 @@ fn make_focus_expansion(
                 team: None,
                 initiatives: Vec::new(),
                 projects: Vec::new(),
+                milestones: Vec::new(),
                 tickets: selection.issues.clone(),
             },
         )?
@@ -1083,10 +1072,11 @@ fn make_focus_status(
             team: None,
             initiatives: selection.initiatives.clone(),
             projects: selection.projects.clone(),
+            milestones: selection.milestones.clone(),
             tickets: selection.issues.clone(),
         },
     )?;
-    if expansion.focus_issues.is_empty() {
+    if expansion.focus_issues.is_empty() && scope.project_ids.is_empty() {
         return Err(Error::EmptyFocus);
     }
     let issues_by_id: BTreeMap<_, _> = snapshot
@@ -1247,10 +1237,11 @@ fn make_focus_plan_chunk(
             team: None,
             initiatives: selection.initiatives.clone(),
             projects: selection.projects.clone(),
+            milestones: selection.milestones.clone(),
             tickets: selection.issues.clone(),
         },
     )?;
-    if scope.issue_ids.is_empty() {
+    if scope.issue_ids.is_empty() && scope.project_ids.is_empty() {
         return Err(Error::EmptyFocus);
     }
 

@@ -115,6 +115,8 @@ enum FocusCommand {
         initiatives: Vec<String>,
         #[arg(long = "project", action = clap::ArgAction::Append)]
         projects: Vec<String>,
+        #[arg(long = "milestone", action = clap::ArgAction::Append)]
+        milestones: Vec<String>,
         #[arg(long = "issue", action = clap::ArgAction::Append)]
         issues: Vec<String>,
     },
@@ -126,6 +128,9 @@ enum FocusCommand {
         /// Linear project UUID, identifier, or exact name; may be repeated.
         #[arg(long = "project", action = clap::ArgAction::Append)]
         projects: Vec<String>,
+        /// Linear milestone UUID or exact globally unique name; may be repeated.
+        #[arg(long = "milestone", action = clap::ArgAction::Append)]
+        milestones: Vec<String>,
         /// Linear issue UUID or identifier; may be repeated.
         #[arg(long = "issue", action = clap::ArgAction::Append)]
         issues: Vec<String>,
@@ -138,6 +143,9 @@ enum FocusCommand {
         /// Linear project UUID, identifier, or exact name; may be repeated.
         #[arg(long = "project", action = clap::ArgAction::Append)]
         projects: Vec<String>,
+        /// Linear milestone UUID or exact globally unique name; may be repeated.
+        #[arg(long = "milestone", action = clap::ArgAction::Append)]
+        milestones: Vec<String>,
         /// Linear issue UUID or identifier; may be repeated.
         #[arg(long = "issue", action = clap::ArgAction::Append)]
         issues: Vec<String>,
@@ -153,6 +161,9 @@ enum FocusCommand {
         /// Linear project UUID, identifier, or exact name; may be repeated.
         #[arg(long = "project", action = clap::ArgAction::Append)]
         projects: Vec<String>,
+        /// Linear milestone UUID or exact globally unique name; may be repeated.
+        #[arg(long = "milestone", action = clap::ArgAction::Append)]
+        milestones: Vec<String>,
         /// Linear issue UUID or identifier; may be repeated.
         #[arg(long = "issue", action = clap::ArgAction::Append)]
         issues: Vec<String>,
@@ -170,6 +181,8 @@ enum FocusCommand {
         initiatives: Vec<String>,
         #[arg(long = "project", action = clap::ArgAction::Append)]
         projects: Vec<String>,
+        #[arg(long = "milestone", action = clap::ArgAction::Append)]
+        milestones: Vec<String>,
         #[arg(long = "issue", action = clap::ArgAction::Append)]
         issues: Vec<String>,
         /// Stale threshold in positive whole days.
@@ -334,9 +347,14 @@ fn validate_command(command: &Command) -> Result<(), Error> {
                 FocusCommand::Report {
                     initiatives,
                     projects,
+                    milestones,
                     issues,
                 },
-        } if initiatives.is_empty() && projects.is_empty() && issues.is_empty() => {
+        } if initiatives.is_empty()
+            && projects.is_empty()
+            && milestones.is_empty()
+            && issues.is_empty() =>
+        {
             Err(Error::EmptyFocus)
         }
         Command::Focus {
@@ -344,9 +362,14 @@ fn validate_command(command: &Command) -> Result<(), Error> {
                 FocusCommand::Expand {
                     initiatives,
                     projects,
+                    milestones,
                     issues,
                 },
-        } if initiatives.is_empty() && projects.is_empty() && issues.is_empty() => {
+        } if initiatives.is_empty()
+            && projects.is_empty()
+            && milestones.is_empty()
+            && issues.is_empty() =>
+        {
             Err(Error::EmptyFocus)
         }
         Command::Focus {
@@ -354,10 +377,15 @@ fn validate_command(command: &Command) -> Result<(), Error> {
                 FocusCommand::Hygiene {
                     initiatives,
                     projects,
+                    milestones,
                     issues,
                     ..
                 },
-        } if initiatives.is_empty() && projects.is_empty() && issues.is_empty() => {
+        } if initiatives.is_empty()
+            && projects.is_empty()
+            && milestones.is_empty()
+            && issues.is_empty() =>
+        {
             Err(Error::EmptyFocus)
         }
         Command::Focus {
@@ -365,10 +393,15 @@ fn validate_command(command: &Command) -> Result<(), Error> {
                 FocusCommand::Status {
                     initiatives,
                     projects,
+                    milestones,
                     issues,
                     ..
                 },
-        } if initiatives.is_empty() && projects.is_empty() && issues.is_empty() => {
+        } if initiatives.is_empty()
+            && projects.is_empty()
+            && milestones.is_empty()
+            && issues.is_empty() =>
+        {
             Err(Error::EmptyFocus)
         }
         Command::ProjectChunk { project } if project.trim().is_empty() => {
@@ -451,12 +484,14 @@ fn run_linear(command: Command) -> Result<Output, Error> {
                 FocusCommand::Report {
                     initiatives,
                     projects,
+                    milestones,
                     issues,
                 },
         } => service
             .focus_record(&FocusSelection {
                 initiatives,
                 projects,
+                milestones,
                 issues,
             })
             .map(Output::FocusRecord),
@@ -465,12 +500,14 @@ fn run_linear(command: Command) -> Result<Output, Error> {
                 FocusCommand::Expand {
                     initiatives,
                     projects,
+                    milestones,
                     issues,
                 },
         } => service
             .focus_expand(&FocusSelection {
                 initiatives,
                 projects,
+                milestones,
                 issues,
             })
             .map(Output::Focus),
@@ -479,6 +516,7 @@ fn run_linear(command: Command) -> Result<Output, Error> {
                 FocusCommand::Status {
                     initiatives,
                     projects,
+                    milestones,
                     issues,
                     work_milestones,
                 },
@@ -487,6 +525,7 @@ fn run_linear(command: Command) -> Result<Output, Error> {
                 &FocusSelection {
                     initiatives,
                     projects,
+                    milestones,
                     issues,
                 },
                 &work_milestones,
@@ -497,6 +536,7 @@ fn run_linear(command: Command) -> Result<Output, Error> {
                 FocusCommand::PlanChunk {
                     initiatives,
                     projects,
+                    milestones,
                     issues,
                     work_milestones,
                     size,
@@ -506,6 +546,7 @@ fn run_linear(command: Command) -> Result<Output, Error> {
                 &FocusSelection {
                     initiatives,
                     projects,
+                    milestones,
                     issues,
                 },
                 size,
@@ -517,6 +558,7 @@ fn run_linear(command: Command) -> Result<Output, Error> {
                 FocusCommand::Hygiene {
                     initiatives,
                     projects,
+                    milestones,
                     issues,
                     stale_days,
                 },
@@ -531,6 +573,7 @@ fn run_linear(command: Command) -> Result<Output, Error> {
                     &FocusSelection {
                         initiatives,
                         projects,
+                        milestones,
                         issues,
                     },
                     &format_utc(now),
@@ -599,7 +642,17 @@ fn render_human(output: &Output) -> String {
             "Focus record v{} at {}\nSelection: {}\n{}",
             record.schema_version,
             format_utc(record.reported_at),
-            record.selection.join(", "),
+            record
+                .selection
+                .iter()
+                .map(|member| match member {
+                    ix_board::FocusMember::Initiative(id) => format!("initiative:{id}"),
+                    ix_board::FocusMember::Project(id) => format!("project:{id}"),
+                    ix_board::FocusMember::Milestone(id) => format!("milestone:{id}"),
+                    ix_board::FocusMember::Issue(id) => format!("issue:{id}"),
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
             render_focus_status(&record.status)
         ),
         Output::FocusPlanChunk(chunk) => render_focus_plan_chunk(chunk),
@@ -1077,7 +1130,7 @@ mod tests {
             )
         );
     }
-    /// Trace: FR-015-AC-4
+    /// Trace: FR-017-AC-4
     #[test]
     fn all_missing_issue_batch_exits_nonzero_after_rendering() {
         assert_eq!(
@@ -1135,6 +1188,8 @@ mod tests {
             "SWM-P1",
             "--project",
             "SWM-P2",
+            "--milestone",
+            "M1 Spec",
             "--issue",
             "SWM-1",
             "--issue",
@@ -1147,10 +1202,12 @@ mod tests {
                 command: FocusCommand::Expand {
                     initiatives,
                     projects,
+                    milestones,
                     issues,
                 }
             } if initiatives == ["Delivery"]
                 && projects == ["SWM-P1", "SWM-P2"]
+                && milestones == ["M1 Spec"]
                 && issues == ["SWM-1", "SWM-2"]
         ));
     }
@@ -1180,6 +1237,7 @@ mod tests {
                     projects,
                     issues,
                     work_milestones,
+                    ..
                 }
             } if initiatives == ["Delivery"]
                 && projects == ["SWM-P1"]
@@ -1216,6 +1274,7 @@ mod tests {
                     issues,
                     work_milestones,
                     size: Some(size),
+                    ..
                 }
             } if initiatives == ["Delivery"]
                 && projects == ["IR-P1"]

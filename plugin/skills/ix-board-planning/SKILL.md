@@ -21,7 +21,7 @@ If credentials are missing, run `ix-board auth login` in an interactive terminal
    ix-board focus status --project <PROJECT>
    ```
 
-   To report only current work from named milestones, add repeatable `--work-milestone <ID-OR-EXACT-NAME>` as described in `focus-status`. The status report retains full project and milestone progress.
+   To select a milestone as part of the saved focus, add repeatable `--milestone <ID-OR-EXACT-NAME>`. For a temporary milestone view within a broader focus, use `--work-milestone` as described in `focus-status`.
 
 2. For "hand this work off" or "what should the next lead take?", use the `plan-chunk` skill. For "is Linear out of date?" or "what changed?", use the `focus-hygiene` skill:
 
@@ -30,7 +30,7 @@ If credentials are missing, run `ix-board auth login` in an interactive terminal
    ix-board focus hygiene --initiative <INITIATIVE>
    ```
 
-   Use `--project` or `--issue` when those are the requested focus. For an active-milestone handoff, add repeatable `--work-milestone <ID-OR-EXACT-NAME>` to `focus plan-chunk`. Hygiene checks linked PRs only when Linear contains structured PR attachments; report unavailable checks and missing links as limits, not clean results.
+   Use `--project`, `--milestone`, or `--issue` when those are the requested focus. For an active-milestone handoff within a broader focus, add repeatable `--work-milestone <ID-OR-EXACT-NAME>` to `focus plan-chunk`. Hygiene checks linked PRs only when Linear contains structured PR attachments; report unavailable checks and missing links as limits, not clean results.
 
 3. For a team's ordered ready queue, identify the team key from the user's request or repository context, then run:
 

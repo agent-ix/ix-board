@@ -694,6 +694,7 @@ fn focus_expansion_unions_selectors_groups_milestones_and_layers_blockers() {
         initiatives: vec!["Delivery".to_owned()],
         projects: vec!["SWM-P1".to_owned()],
         issues: vec!["SWM-10".to_owned()],
+        ..Default::default()
     };
     let first_result = reads.focus_expand(&selection).expect("focus expansion");
     let repeated = reads.focus_expand(&selection).expect("repeat expansion");
@@ -762,7 +763,48 @@ fn focus_expansion_unions_selectors_groups_milestones_and_layers_blockers() {
     assert_eq!(first_result.blocker_layers[2], ["SWM-10"]);
 }
 
-/// Trace: FR-012-AC-1, FR-012-AC-2, FR-012-AC-3, FR-012-AC-4, FR-012-AC-5, FR-012-AC-7
+/// Trace: FR-010-AC-8, FR-016-AC-4
+#[test]
+fn empty_milestone_is_a_valid_saved_focus_member() {
+    let directory = TempDir::new().expect("temporary directory");
+    let mut selected = project("p1", "SWM-P1", "Started", 2, 1.0);
+    selected.milestones = vec![Milestone {
+        id: "m1".to_owned(),
+        name: "M1 Spec".to_owned(),
+        description: None,
+        sort_order: 1.0,
+        target_date: None,
+    }];
+    let snapshot = WorkspaceSnapshot {
+        projects: vec![selected],
+        issues: vec![],
+        fetched_at: 42,
+    };
+    let mut reads = service(
+        FixtureSource::new(snapshot),
+        ManualClock::new(100),
+        &directory,
+    );
+    let selection = ix_board::FocusSelection {
+        milestones: vec!["M1 Spec".to_owned()],
+        ..Default::default()
+    };
+    let record = reads
+        .focus_record(&selection)
+        .expect("empty milestone record");
+    assert_eq!(
+        record.selection,
+        [ix_board::FocusMember::Milestone("m1".to_owned())]
+    );
+    assert_eq!(record.status.projects[0].progress.total, 0);
+    assert!(record.status.ready_queue.is_empty());
+    assert_eq!(
+        serde_json::to_value(&record).unwrap()["selection"][0],
+        serde_json::json!({"kind": "milestone", "id": "m1"})
+    );
+}
+
+/// Trace: FR-012-AC-1, FR-012-AC-2, FR-012-AC-3, FR-012-AC-4, FR-012-AC-5, FR-012-AC-7, FR-016-AC-4
 #[test]
 fn focus_status_scopes_progress_blockers_and_ready_work_to_focus_members() {
     let directory = TempDir::new().expect("temporary directory");
@@ -857,7 +899,27 @@ fn focus_status_scopes_progress_blockers_and_ready_work_to_focus_members() {
         })
         .expect("focus record");
     assert_eq!(record.schema_version, ix_board::FOCUS_RECORD_SCHEMA_VERSION);
-    assert_eq!(record.selection, ["project:p1"]);
+    assert_eq!(
+        record.selection,
+        [ix_board::FocusMember::Project("p1".to_owned())]
+    );
+    let milestone_selection = ix_board::FocusSelection {
+        milestones: vec!["First".to_owned()],
+        ..Default::default()
+    };
+    let milestone_record = reads
+        .focus_record(&milestone_selection)
+        .expect("milestone record");
+    assert_eq!(
+        milestone_record.selection,
+        [ix_board::FocusMember::Milestone("m1".to_owned())]
+    );
+    assert_eq!(milestone_record.status.projects[0].progress.done, 1);
+    assert_eq!(milestone_record.status.projects[0].progress.total, 3);
+    assert_eq!(
+        milestone_record.status,
+        reads.focus_status(&milestone_selection).unwrap()
+    );
     assert_eq!(record.reported_at, 9_000);
     assert_eq!(record.status, status);
     assert_eq!(status.fetched_at, 9_000);
@@ -1607,7 +1669,7 @@ fn search_is_case_insensitive_structured_and_ordered_by_kind_then_identifier() {
     );
 }
 
-/// Trace: FR-015-AC-1, FR-015-AC-2
+/// Trace: FR-017-AC-1, FR-017-AC-2
 #[test]
 fn issue_batch_returns_exact_states_in_request_order_with_one_snapshot() {
     let directory = TempDir::new().expect("temporary directory");

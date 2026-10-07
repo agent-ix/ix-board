@@ -8,21 +8,22 @@ describe a proposed story as a current CLI capability.
 ## Typed focus across roles
 
 As a manager, lead, coder, or reviewer, I want one focus selection made from
-initiatives, projects, and tickets in any combination so each role can use the
+initiatives, projects, milestones, and tickets in any combination so each role can use the
 same structured scope at its appropriate level.
 
-- An initiative-only, project-only, ticket-only, or mixed selection resolves to
+- An initiative-only, project-only, milestone-only, ticket-only, or mixed selection resolves to
   canonical Linear identities and the same issue membership on repeated reads.
 - The saved focus record represents that selection independently from any
   optional report filter, transport, or live agent session.
 - Role skills use the selected focus without interpreting ticket prose as
   instructions to add or remove scope.
 
-Current coverage: `focus report` stores canonical IDs as kind-prefixed strings
-and status. A typed selector structure and shared role-skill consumption are
-future work. The earlier initiative-brief command proposal was withdrawn:
+Current coverage: `focus report` emits version 2 typed canonical members and
+status. Shared role-skill consumption is future work. The earlier
+initiative-brief command proposal was withdrawn:
 standing rules belong in agent instructions and memory; attached plans are
-optional context. Work-milestone view filters are separate from focus.
+optional context. `--milestone` selects focus membership; the older
+`--work-milestone` view filter still restricts visible work within that focus.
 
 ## Cached reads without a credential
 

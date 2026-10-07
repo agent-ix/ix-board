@@ -3,8 +3,8 @@
 //! Acceptance tests for explicit session work selection (FR-010).
 
 use ix_board::{
-    Initiative, Issue, IssueId, Project, ProjectId, ScopeSelection, TeamKey, WorkflowStateType,
-    WorkspaceSnapshot, select_scope,
+    Initiative, Issue, IssueId, Milestone, Project, ProjectId, ScopeSelection, TeamKey,
+    WorkflowStateType, WorkspaceSnapshot, select_scope,
 };
 
 fn project(id: &str, name: &str) -> Project {
@@ -26,6 +26,81 @@ fn project(id: &str, name: &str) -> Project {
             name: "Delivery".into(),
         }],
     }
+}
+
+/// Trace: FR-010-AC-8
+#[test]
+fn milestone_members_select_only_assigned_issues_and_union_with_tickets() {
+    let mut selected = project("p", "Product");
+    selected.milestones = vec![
+        Milestone {
+            id: "m1".into(),
+            name: "M1 Spec".into(),
+            description: None,
+            sort_order: 1.0,
+            target_date: None,
+        },
+        Milestone {
+            id: "m2".into(),
+            name: "M2 Core".into(),
+            description: None,
+            sort_order: 2.0,
+            target_date: None,
+        },
+    ];
+    let mut first = issue("SWM-1", None, WorkflowStateType::Completed);
+    first.project_milestone_id = Some("m1".into());
+    let mut later = issue("SWM-2", None, WorkflowStateType::Started);
+    later.project_milestone_id = Some("m2".into());
+    let snapshot = WorkspaceSnapshot {
+        projects: vec![selected],
+        issues: vec![first, later],
+        fetched_at: 0,
+    };
+    let by_name = select_scope(
+        &snapshot,
+        &ScopeSelection {
+            milestones: vec!["M1 Spec".into()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let by_id = select_scope(
+        &snapshot,
+        &ScopeSelection {
+            milestones: vec!["m1".into()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(by_name, by_id);
+    assert_eq!(by_name.issue_ids, [IssueId("SWM-1".into())].into());
+    assert_eq!(by_name.project_ids, [ProjectId("p".into())].into());
+    let union = select_scope(
+        &snapshot,
+        &ScopeSelection {
+            milestones: vec!["m1".into()],
+            tickets: vec!["SWM-2".into()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(union.issue_ids.len(), 2);
+    assert_eq!(union.done, 1);
+    assert!(matches!(
+        select_scope(
+            &snapshot,
+            &ScopeSelection {
+                milestones: vec!["M3".into()],
+                ..Default::default()
+            }
+        ),
+        Err(ix_board::Error::ScopeSelection {
+            kind: "milestone",
+            matches: 0,
+            ..
+        })
+    ));
 }
 
 fn issue(id: &str, parent: Option<&str>, category: WorkflowStateType) -> Issue {
