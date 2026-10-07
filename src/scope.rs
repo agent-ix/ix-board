@@ -106,9 +106,24 @@ pub(crate) fn resolve_milestone_id(
     snapshot: &WorkspaceSnapshot,
     value: &str,
 ) -> Result<String, Error> {
+    resolve_milestone_id_in_projects(snapshot, value, None)
+}
+
+/// The same selector grammar restricted to projects already in a focus.
+pub(crate) fn resolve_milestone_id_in_projects(
+    snapshot: &WorkspaceSnapshot,
+    value: &str,
+    allowed_projects: Option<&BTreeSet<ProjectId>>,
+) -> Result<String, Error> {
+    let projects = snapshot
+        .projects
+        .iter()
+        .filter(|p| allowed_projects.is_none_or(|ids| ids.contains(&p.id)))
+        .collect::<Vec<_>>();
     let exact = snapshot
         .projects
         .iter()
+        .filter(|p| allowed_projects.is_none_or(|ids| ids.contains(&p.id)))
         .flat_map(|p| &p.milestones)
         .filter(|m| m.id.eq_ignore_ascii_case(value))
         .map(|m| m.id.clone())
@@ -116,27 +131,61 @@ pub(crate) fn resolve_milestone_id(
     if !exact.is_empty() {
         return unique("milestone", value, exact.into_iter().collect());
     }
-    let (project_id, milestone_name) = if let Some((project, milestone)) = value.rsplit_once('/') {
-        (Some(resolve_project_id(snapshot, project)?), milestone)
-    } else {
-        (None, value)
-    };
-    let names = snapshot
-        .projects
-        .iter()
-        .filter(|p| project_id.as_ref().is_none_or(|id| *id == p.id))
-        .flat_map(|p| {
-            p.milestones
+    let mut names = BTreeMap::new();
+    // A slash may belong to either name. Consider the whole name and every
+    // split point; deduplicate by canonical milestone ID.
+    for project in &projects {
+        for milestone in &project.milestones {
+            if milestone.name.eq_ignore_ascii_case(value.trim()) {
+                names.insert(
+                    milestone.id.clone(),
+                    format!(
+                        "{} ({}) / {} ({})",
+                        project.name, project.id.0, milestone.name, milestone.id
+                    ),
+                );
+            }
+        }
+    }
+    for (index, character) in value.char_indices() {
+        if character != '/' {
+            continue;
+        }
+        let prefix = value[..index].trim();
+        let suffix = value[index + 1..].trim();
+        let by_identifier = projects
+            .iter()
+            .filter(|p| {
+                p.id.0.eq_ignore_ascii_case(prefix)
+                    || p.identifier
+                        .as_deref()
+                        .is_some_and(|id| id.eq_ignore_ascii_case(prefix))
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        let matches = if by_identifier.is_empty() {
+            projects
                 .iter()
-                .filter(move |m| m.name.eq_ignore_ascii_case(milestone_name))
-                .map(move |m| {
-                    (
-                        m.id.clone(),
-                        format!("{} ({}) / {} ({})", p.name, p.id.0, m.name, m.id),
-                    )
-                })
-        })
-        .collect::<BTreeMap<_, _>>();
+                .filter(|p| p.name.eq_ignore_ascii_case(prefix))
+                .copied()
+                .collect::<Vec<_>>()
+        } else {
+            by_identifier
+        };
+        for project in matches {
+            for milestone in &project.milestones {
+                if milestone.name.eq_ignore_ascii_case(suffix) {
+                    names.insert(
+                        milestone.id.clone(),
+                        format!(
+                            "{} ({}) / {} ({})",
+                            project.name, project.id.0, milestone.name, milestone.id
+                        ),
+                    );
+                }
+            }
+        }
+    }
     match names.len() {
         1 => names
             .into_keys()
@@ -298,6 +347,14 @@ pub fn select_scope(
                     .any(|i| result.issue_ids.contains(&i.id) && i.project_id.as_ref() == Some(id))
         });
     }
+    // Selected tickets contribute their containing projects for status rows,
+    // after full-project issue expansion so ticket focus stays partial.
+    result.project_ids.extend(
+        result
+            .issue_ids
+            .iter()
+            .filter_map(|id| by_id.get(id).and_then(|issue| issue.project_id.clone())),
+    );
     let mut checked = BTreeSet::new();
     for issue in snapshot
         .issues

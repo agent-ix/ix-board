@@ -1100,6 +1100,15 @@ fn qualified_milestones_resolve_collisions_and_label_partial_project_rows() {
         reads.focus_status_for_milestones(&all_projects, &["M5b Decision-model data".into()]),
         Err(Error::AmbiguousMilestone { .. })
     ));
+    let one_project = ix_board::FocusSelection {
+        projects: vec!["SWM-P1".into()],
+        ..Default::default()
+    };
+    assert!(
+        reads
+            .focus_status_for_milestones(&one_project, &["M5b Decision-model data".into()])
+            .is_ok()
+    );
     let selected = ix_board::FocusSelection {
         milestones: vec![
             "SWM-P1/M5b Decision-model data".into(),
@@ -1124,6 +1133,18 @@ fn qualified_milestones_resolve_collisions_and_label_partial_project_rows() {
         assert_eq!(project.milestones.len(), 1);
         assert_eq!(project.progress.total, 1);
     }
+    let issue_only = reads
+        .focus_status(&ix_board::FocusSelection {
+            issues: vec!["SWM-2".into()],
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(issue_only.projects.len(), 1);
+    assert_eq!(
+        issue_only.projects[0].membership,
+        ix_board::FocusProjectMembership::PartialFocus
+    );
+    assert_eq!(issue_only.projects[0].milestones[0].id, "m2");
     let filtered = reads
         .focus_status_for_milestones(&all_projects, &["SWM-P1/M5b Decision-model data".into()])
         .unwrap();
