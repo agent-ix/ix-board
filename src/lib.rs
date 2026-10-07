@@ -495,7 +495,7 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
             schema_version: FOCUS_RECORD_SCHEMA_VERSION,
             selection: canonical_selectors(&snapshot, selection)?,
             reported_at: self.clock.now_epoch_seconds(),
-            status: make_focus_status(&snapshot, selection)?,
+            status: make_focus_status(&snapshot, selection, &[])?,
         })
     }
 

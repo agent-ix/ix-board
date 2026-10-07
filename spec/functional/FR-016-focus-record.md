@@ -3,6 +3,8 @@ id: FR-016
 title: Produce an ix-board-owned focus record for shared storage
 type: FR
 relationships:
+  - target: "ix://agent-ix/ix-board/US-007"
+    type: implements
   - target: "ix://agent-ix/ix-board/FR-011"
     type: depends_on
   - target: "ix://agent-ix/ix-board/FR-012"

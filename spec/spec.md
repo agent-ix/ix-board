@@ -47,6 +47,8 @@ that focus.
   title groups, plus a diff from the most recent successful report (FR-013).
 - Dependency-ordered handoff chunks from a focus, with per-issue readiness and
   acceptance excerpts (FR-014).
+- A versioned JSON focus record with canonical selectors and status facts for
+  clients that choose their own storage or transport (FR-016).
 - `drift` reports per-lead scope and churn signals from structured Linear,
   GitHub, herdr, and OpenTelemetry records, with configurable thresholds,
   a stable JSON field contract, and one text line per lead. Its time-based
@@ -103,6 +105,8 @@ US-005 traces to FR-013, which uses the canonical focus from FR-011 and the
 structured-source boundary in FR-005.
 US-006 traces to FR-010, FR-011, FR-012, and FR-014, composing focus
 membership, blocker layers, and readiness into an ordered handoff slice.
+US-007 traces to FR-016, which packages a canonical focus and status for
+shared clients without choosing a storage service.
 Functional acceptance criteria include fixture checks for each drift signal,
 queue rules, and cache behavior; NFR-001 specifies a lightweight warm-cache
 fixture benchmark.
