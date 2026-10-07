@@ -805,7 +805,9 @@ fn canonical_selectors(
             .iter()
             .flat_map(|project| &project.initiatives)
             .filter(|initiative| {
-                initiative.id == *value || initiative.name.eq_ignore_ascii_case(value)
+                initiative.id == *value
+                    || initiative.identifier.eq_ignore_ascii_case(value)
+                    || initiative.name.eq_ignore_ascii_case(value)
             })
             .map(|initiative| initiative.id.clone())
             .collect::<BTreeSet<_>>();
