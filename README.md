@@ -66,7 +66,8 @@ ix-board auth login
 ix-board auth status
 ```
 
-The prompt hides the key. For scripts, pipe the key to `ix-board auth login --stdin`.
+The prompt shows one `*` per character, including pasted characters, while
+keeping the key hidden. For scripts, pipe the key to `ix-board auth login --stdin`.
 `LINEAR_API_KEY` overrides the saved key without changing it. `ix-board auth
 logout` removes the saved key. `auth status` only reports whether a key is
 available and which source is active; it never displays the value. If the OS
