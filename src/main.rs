@@ -99,7 +99,7 @@ enum Command {
 
 #[derive(Subcommand, Debug)]
 enum AuthCommand {
-    /// Save a Linear API key; prompt without echoing by default.
+    /// Save a Linear API key; prompt with masked feedback by default.
     Login {
         /// Read the key from stdin for scripts instead of prompting.
         #[arg(long)]
@@ -449,7 +449,11 @@ fn run_auth(command: AuthCommand) -> Result<Output, Error> {
                     .map_err(Error::CredentialInput)?;
                 value.trim_end_matches(['\r', '\n']).to_owned()
             } else {
-                rpassword::prompt_password("Linear API key: ").map_err(Error::CredentialInput)?
+                let prompt = rpassword::ConfigBuilder::new()
+                    .password_feedback_mask('*')
+                    .build();
+                rpassword::prompt_password_with_config("Linear API key: ", prompt)
+                    .map_err(Error::CredentialInput)?
             };
             if value.trim().is_empty() {
                 return Err(Error::EmptyCredentialInput);
