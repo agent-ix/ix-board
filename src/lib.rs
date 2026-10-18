@@ -3,6 +3,7 @@
 
 //! Deterministic Linear project controls and cached reads for ready work, context, and search.
 
+pub mod agents;
 mod cache;
 mod drift;
 mod hygiene;
@@ -171,6 +172,9 @@ pub enum Error {
     /// Drift configuration or evaluation failed.
     #[error(transparent)]
     Drift(#[from] drift::DriftError),
+    /// Reading herdr or an agent machine failed.
+    #[error(transparent)]
+    Agents(#[from] agents::AgentsError),
     /// The requested project was not present in the source snapshot.
     #[error("project not found: {identifier}")]
     ProjectNotFound { identifier: String },

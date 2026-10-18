@@ -19,6 +19,8 @@ relationships:
     type: traces_to
   - target: "ix://agent-ix/ix-board/FR-017"
     type: traces_to
+  - target: "ix://agent-ix/ix-board/FR-018"
+    type: traces_to
   - target: "ix://agent-ix/ix-board/NFR-001"
     type: traces_to
 ---

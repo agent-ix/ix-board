@@ -1,0 +1,4 @@
+{"timestamp":"2026-10-18T10:00:00.000Z","ordinal":0,"type":"session_meta","payload":{"id":"fixture-session","cwd":"/work"}}
+{"timestamp":"2026-10-18T10:00:01.000Z","ordinal":1,"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}
+{"timestamp":"2026-10-18T10:00:08.000Z","ordinal":2,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The spec is written. Should I open the PR now?"}]}}
+{"timestamp":"2026-10-18T10:00:09.000Z","ordinal":3,"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","last_agent_message":"The spec is written. Should I open the PR now?"}}

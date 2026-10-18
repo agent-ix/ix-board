@@ -4,6 +4,10 @@
 //! Command-line interface for deterministic cached Linear reads.
 
 use clap::{Parser, Subcommand};
+use ix_board::agents::{
+    AgentsReport, Host, ReadyTicket, SystemHost, build_report, parse_duration, parse_machines,
+    render_text,
+};
 use ix_board::{
     DriftConfig, DriftError, DriftEvidenceFile, DriftReport, Error, FocusExpansion,
     FocusHygieneReport, FocusPlanChunk, FocusProjectMembership, FocusRecord, FocusSelection,
@@ -72,6 +76,15 @@ enum Command {
         /// Linear issue identifiers or UUIDs, in desired output order.
         #[arg(required = true, num_args = 1..)]
         identifiers: Vec<String>,
+    },
+    /// Say whether each agent in a team's herdr workspaces is working right now.
+    Agents {
+        /// Team names: herdr workspace labels, on any machine.
+        #[arg(required = true, num_args = 1..)]
+        teams: Vec<String>,
+        /// Quiet time after which a ready agent counts as idle (for example 90s, 20m, 2h).
+        #[arg(long, default_value = "20m", value_parser = parse_duration)]
+        idle_after: u64,
     },
     /// Render a deterministic drift report from versioned structured evidence.
     Drift {
@@ -232,6 +245,7 @@ enum Output {
     Search(Vec<SearchResult>),
     Issues(IssueBatch),
     Drift(DriftReport),
+    Agents(AgentsReport),
     ProjectStatusUpdated {
         project: String,
         status: String,
@@ -321,6 +335,7 @@ fn output_outcome(output: &Output) -> Outcome {
         Output::Issues(batch) if batch.issues.is_empty() && !batch.missing.is_empty() => {
             Outcome::Invalid
         }
+        Output::Agents(report) if !report.errors.is_empty() => Outcome::Internal,
         _ => Outcome::Ok,
     }
 }
@@ -432,8 +447,40 @@ fn run(command: Command) -> Result<Output, Error> {
             evidence,
             live,
         } => run_drift(&config, evidence.as_ref(), live).map(Output::Drift),
+        Command::Agents { teams, idle_after } => run_agents(&teams, idle_after).map(Output::Agents),
         other => run_linear(other),
     }
+}
+
+fn run_agents(teams: &[String], idle_after: u64) -> Result<AgentsReport, Error> {
+    let local = SystemHost::local();
+    let machines = parse_machines(&local.herdr(&["machine", "list", "--json"])?)?;
+    let mut hosts: Vec<Box<dyn Host>> = vec![Box::new(local)];
+    hosts.extend(
+        machines
+            .into_iter()
+            .filter(|machine| machine.enabled)
+            .map(|machine| {
+                Box::new(SystemHost::remote(machine.label, machine.target)) as Box<dyn Host>
+            }),
+    );
+    let mut service = None;
+    let mut next_ready = |team: &str| -> Result<Option<ReadyTicket>, String> {
+        if service.is_none() {
+            let source = LinearGraphQlSource::from_env().map_err(|error| error.to_string())?;
+            service = Some(ReadService::open_default(source).map_err(|error| error.to_string())?);
+        }
+        let queue = service
+            .as_mut()
+            .ok_or_else(|| "ready queue unavailable".to_owned())?
+            .next(team)
+            .map_err(|error| error.to_string())?;
+        Ok(queue.into_iter().next().map(|item| ReadyTicket {
+            identifier: item.identifier,
+            title: item.title,
+        }))
+    };
+    Ok(build_report(&hosts, teams, idle_after, &mut next_ready))
 }
 
 fn run_auth(command: AuthCommand) -> Result<Output, Error> {
@@ -486,6 +533,7 @@ fn run_linear(command: Command) -> Result<Output, Error> {
     let mut service = ReadService::open_default(source)?;
     match command {
         Command::Auth { .. } => unreachable!("auth commands are handled before Linear dispatch"),
+        Command::Agents { .. } => unreachable!("agents is handled before Linear dispatch"),
         Command::Next { team } => service.next(&team).map(Output::Queue),
         Command::ProjectChunk { project } => service.project_chunk(&project).map(Output::Chunk),
         Command::Search { query } => service.search(&query).map(Output::Search),
@@ -704,6 +752,7 @@ fn render_human(output: &Output) -> String {
             lines.join("\n")
         }
         Output::Drift(report) => render_drift_text(report),
+        Output::Agents(report) => render_text(report),
         Output::ProjectStatusUpdated { project, status } => {
             format!("Project {project} status set to {status}")
         }

@@ -1,0 +1,3 @@
+{"type":"user","message":{"role":"user","content":"start the work"},"timestamp":"2026-10-18T10:00:00.000Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"All gates are green and the PR is open."}]},"timestamp":"2026-10-18T10:00:09.000Z"}
+{"type":"system","subtype":"turn_duration","durationMs":9000,"timestamp":"2026-10-18T10:00:10.000Z"}
