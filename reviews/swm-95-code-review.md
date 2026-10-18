@@ -60,3 +60,22 @@ Not run. Free disk on `/` was 8.8 GiB, under the 20 GiB floor for builds, so
 no cargo build was started. FND-001 was confirmed from real `ps` output on
 terra (`1       0 systemd         /lib/systemd/...`) against the Rust
 `splitn` semantics; `quire validate` and `quoin matrix` were run.
+
+## New findings (disposition pass 1)
+
+| ID | Severity | Summary | Refs |
+| --- | --- | --- | --- |
+| FND-007 | high | Fix commit 3e1c077 does not compile: `impl Trait` in a closure parameter (E0562) in the pipe-drain closure; `make ci` on titan stops at lint. | src/agents/probe.rs:250 |
+
+## Dispositions
+
+| FND | Outcome | sha/reason |
+| --- | --- | --- |
+| FND-001 | fixed | 3e1c077 (logic verified; probe.sh snippet run on terra emits tab-delimited records that keep `npm exec prism-` whole) |
+| FND-002 | fixed | 3e1c077 (60 s limit on every herdr and probe call, kill on expiry, unit test) |
+| FND-003 | accepted-no-change | owner ruling (one reviewer, major bugs only): mediums and lows are recorded, not fixed in this PR |
+| FND-004 | accepted-no-change | owner ruling (one reviewer, major bugs only): mediums and lows are recorded, not fixed in this PR |
+| FND-005 | accepted-no-change | owner ruling (one reviewer, major bugs only): mediums and lows are recorded, not fixed in this PR |
+| FND-006 | accepted-no-change | owner ruling (one reviewer, major bugs only): mediums and lows are recorded, not fixed in this PR |
+| FND-007 | still-open | does not compile at 3e1c077; new head expected |
+| FND-007 | fixed | c8f8798 (pipe drain is now a generic fn; `make ci` on titan at c8f8798 exit 0, all suites ok) |

@@ -34,3 +34,9 @@ FND-001). AC-5's parser test shares the same unrealistic fixture.
 | ID | Severity | Summary | Refs |
 | --- | --- | --- | --- |
 | FND-001 | high | FR-018-AC-2/AC-3 child-process coverage uses single-spaced `@@PS` fixtures; real `ps` pads columns, so the tested path differs from production and the tests cannot fail on the real defect. | tests/agents.rs:134-137, tests/agents.rs:392-396 |
+
+## Dispositions
+
+| FND | Outcome | sha/reason |
+| --- | --- | --- |
+| FND-001 | fixed | 3e1c077 (`ps` parsing removed; parser test now uses real-shaped tab records including a comm with spaces) |

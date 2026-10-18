@@ -32,3 +32,11 @@ definition (idle only after `--idle-after`). No major defects.
 | FND-001 | medium | FR-018 fails `quire validate` structurally: required `## Dependencies` section is missing (FR-017 on main has the same gap). | spec/functional/FR-018-agent-activity-verdicts.md |
 | FND-002 | low | Four agentless passive SHALL clauses (`shall be listed`, `shall be measured`, `shall be reported`) flagged by quire grammar checks. | spec/functional/FR-018-agent-activity-verdicts.md:19-27,69 |
 | FND-003 | low | The Description packs many SHALL obligations into one FR statement (command, machines, rows, signals, rules, output, exit code). | spec/functional/FR-018-agent-activity-verdicts.md:13-82 |
+
+## Dispositions
+
+| FND | Outcome | sha/reason |
+| --- | --- | --- |
+| FND-001 | accepted-no-change | owner ruling (one reviewer, major bugs only): mediums and lows are recorded, not fixed in this PR |
+| FND-002 | accepted-no-change | owner ruling (one reviewer, major bugs only): mediums and lows are recorded, not fixed in this PR |
+| FND-003 | accepted-no-change | owner ruling (one reviewer, major bugs only): mediums and lows are recorded, not fixed in this PR |
