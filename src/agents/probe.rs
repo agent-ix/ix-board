@@ -227,6 +227,16 @@ impl SystemHost {
 /// Longest a single herdr or ssh call may take before it becomes an error.
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
+fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut bytes);
+        }
+        bytes
+    })
+}
+
 fn run(
     command: &mut Command,
     stdin: Option<&str>,
@@ -247,15 +257,6 @@ fn run(
         .stderr(Stdio::piped());
     let mut child = command.spawn().map_err(spawn_error)?;
     let readers = (child.stdout.take(), child.stderr.take());
-    let drain = |pipe: Option<impl Read + Send + 'static>| {
-        std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut bytes);
-            }
-            bytes
-        })
-    };
     let (out_reader, err_reader) = (drain(readers.0), drain(readers.1));
     if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
         // A child that exits early closes the pipe; its status reports why.
