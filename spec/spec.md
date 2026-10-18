@@ -49,6 +49,9 @@ that focus.
   acceptance excerpts (FR-014).
 - A versioned JSON focus record with canonical selectors and status facts for
   clients that choose their own storage or transport (FR-016).
+- `agents` reports a per-agent activity verdict (working, waiting-stuck, prompt,
+  asking, idle, unknown) for the herdr workspaces of named teams on every
+  machine, measured in minutes from transcripts, subagents and processes (FR-018).
 - `drift` reports per-lead scope and churn signals from structured Linear,
   GitHub, herdr, and OpenTelemetry records, with configurable thresholds,
   a stable JSON field contract, and one text line per lead. Its time-based
