@@ -55,8 +55,8 @@ Verdicts, evaluated in this order, first match wins:
 1. `PROMPT`: herdr state `blocked`; carries the dialog text from the tail.
 2. `WORKING`: herdr state `working`.
 3. `WORKING`: a live subagent or a child process exists.
-4. `WAITING-STUCK`: the tail says it is waiting for background agents and no
-   subagent was written in the last 15 minutes.
+4. `WAITING-STUCK`: the tail says it is waiting for background agents and
+   neither the last turn nor any subagent write is younger than 15 minutes.
 5. `UNKNOWN`: herdr state `unknown`; carries the raw herdr fields.
 6. `ASKING`: herdr state `idle` or `done` and the last assistant message ends
    with a question or asks for permission; carries the excerpt.
