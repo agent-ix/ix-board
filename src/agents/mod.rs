@@ -61,6 +61,14 @@ pub enum AgentsError {
         /// Trimmed standard error.
         stderr: String,
     },
+    /// A command ran past its time limit and was killed.
+    #[error("{command} did not finish within {secs}s")]
+    Timeout {
+        /// Rendered command.
+        command: String,
+        /// Limit in seconds.
+        secs: u64,
+    },
     /// herdr returned JSON of an unexpected shape.
     #[error("could not decode {what}: {source}")]
     Decode {

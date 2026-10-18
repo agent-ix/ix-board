@@ -7,8 +7,9 @@
 
 use super::{AgentsError, harness::HarnessKind};
 use std::collections::BTreeMap;
-use std::io::Write;
-use std::process::{Command, Output, Stdio};
+use std::io::{Read, Write};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 const PROBE_SCRIPT: &str = include_str!("probe.sh");
 
@@ -119,8 +120,6 @@ fn number(line: &str, text: &str) -> Result<u64, AgentsError> {
 pub fn parse_probe(text: &str) -> Result<Probe, AgentsError> {
     let mut probe = Probe::default();
     let mut section = Section::None;
-    let mut pane_of_pid: BTreeMap<u32, String> = BTreeMap::new();
-    let mut ps: Vec<(u32, String, String)> = Vec::new();
     for line in text.lines() {
         if let Section::Tail(sid) = &section {
             if line == "@@END" {
@@ -170,31 +169,23 @@ pub fn parse_probe(text: &str) -> Result<Probe, AgentsError> {
             }
             ("END", _) => section = Section::None,
             ("P", _) => {
-                let (pid, pane) = value.split_once(' ').ok_or_else(|| bad(line))?;
-                let pid = pid.parse().map_err(|_| bad(line))?;
-                pane_of_pid.insert(pid, pane.trim().to_owned());
-            }
-            ("PS", _) => {
-                let mut fields = value.splitn(4, char::is_whitespace);
-                let pid = fields.next().and_then(|field| field.parse().ok());
-                let _ppid = fields.next();
-                let comm = fields.next();
-                let args = fields.next().unwrap_or("");
-                let (Some(pid), Some(comm)) = (pid, comm) else {
+                let mut fields = value.splitn(4, '\t');
+                let (Some(pid), Some(pane), Some(comm)) =
+                    (fields.next(), fields.next(), fields.next())
+                else {
                     return Err(bad(line));
                 };
-                ps.push((pid, comm.to_owned(), args.trim().to_owned()));
+                pid.parse::<u32>().map_err(|_| bad(line))?;
+                probe
+                    .processes
+                    .entry(pane.to_owned())
+                    .or_default()
+                    .push(PaneProcess {
+                        comm: comm.to_owned(),
+                        args: fields.next().unwrap_or("").trim().to_owned(),
+                    });
             }
             _ => return Err(bad(line)),
-        }
-    }
-    for (pid, comm, args) in ps {
-        if let Some(pane) = pane_of_pid.get(&pid) {
-            probe
-                .processes
-                .entry(pane.clone())
-                .or_default()
-                .push(PaneProcess { comm, args });
         }
     }
     Ok(probe)
@@ -233,7 +224,14 @@ impl SystemHost {
     }
 }
 
-fn run(command: &mut Command, stdin: Option<&str>) -> Result<String, AgentsError> {
+/// Longest a single herdr or ssh call may take before it becomes an error.
+const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn run(
+    command: &mut Command,
+    stdin: Option<&str>,
+    timeout: Duration,
+) -> Result<String, AgentsError> {
     let rendered = format!("{command:?}");
     let spawn_error = |source| AgentsError::Spawn {
         command: rendered.clone(),
@@ -248,14 +246,38 @@ fn run(command: &mut Command, stdin: Option<&str>) -> Result<String, AgentsError
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().map_err(spawn_error)?;
+    let readers = (child.stdout.take(), child.stderr.take());
+    let drain = |pipe: Option<impl Read + Send + 'static>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let (out_reader, err_reader) = (drain(readers.0), drain(readers.1));
     if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
-        pipe.write_all(text.as_bytes()).map_err(spawn_error)?;
+        // A child that exits early closes the pipe; its status reports why.
+        let _ = pipe.write_all(text.as_bytes());
     }
-    let Output {
-        status,
-        stdout,
-        stderr,
-    } = child.wait_with_output().map_err(spawn_error)?;
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait().map_err(spawn_error)? {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(AgentsError::Timeout {
+                    command: rendered,
+                    secs: timeout.as_secs(),
+                });
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    let stdout = out_reader.join().unwrap_or_default();
+    let stderr = err_reader.join().unwrap_or_default();
     if !status.success() {
         return Err(AgentsError::CommandFailed {
             command: rendered,
@@ -281,7 +303,7 @@ impl Host for SystemHost {
         if let Some(machine) = &self.machine {
             command.args(["--machine", &machine.herdr_label]);
         }
-        run(command.args(args), None)
+        run(command.args(args), None, CALL_TIMEOUT)
     }
 
     fn probe(&self, request: &ProbeRequest) -> Result<Probe, AgentsError> {
@@ -290,6 +312,7 @@ impl Host for SystemHost {
             None => run(
                 Command::new("sh").args(["-s", "--"]).args(&args),
                 Some(PROBE_SCRIPT),
+                CALL_TIMEOUT,
             )?,
             Some(machine) => {
                 let quoted: Vec<String> = args.iter().map(|arg| shell_quote(arg)).collect();
@@ -300,6 +323,7 @@ impl Host for SystemHost {
                         .arg(&machine.ssh_target)
                         .arg(remote),
                     Some(PROBE_SCRIPT),
+                    CALL_TIMEOUT,
                 )?
             }
         };
@@ -314,5 +338,20 @@ mod tests {
     #[test]
     fn shell_quote_survives_single_quotes() {
         assert_eq!(shell_quote("a'b c"), r"'a'\''b c'");
+    }
+
+    #[test]
+    fn a_hung_command_is_killed_and_reported_as_a_timeout() {
+        let started = Instant::now();
+        let result = run(
+            Command::new("sleep").arg("30"),
+            None,
+            Duration::from_millis(150),
+        );
+        assert!(
+            matches!(result, Err(AgentsError::Timeout { .. })),
+            "{result:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 }

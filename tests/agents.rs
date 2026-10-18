@@ -106,6 +106,7 @@ struct FakeHost {
     workspace: &'static str,
     scenario: Option<Scenario>,
     herdr_down: bool,
+    herdr_hangs: bool,
 }
 
 impl FakeHost {
@@ -115,6 +116,7 @@ impl FakeHost {
             workspace,
             scenario: Some(scenario),
             herdr_down: false,
+            herdr_hangs: false,
         }
     }
 
@@ -133,7 +135,7 @@ impl FakeHost {
         text += &format!("@@GIT /work\n@@COMMIT {}\n@@END\n", NOW - 3 * 3600);
         for (index, (comm, args)) in scenario.processes.iter().enumerate() {
             let pid = 100 + index;
-            text += &format!("@@P {pid} {PANE}\n@@PS {pid} 1 {comm} {args}\n");
+            text += &format!("@@P {pid}\t{PANE}\t{comm}\t{args}\n");
         }
         text
     }
@@ -145,6 +147,12 @@ impl Host for FakeHost {
     }
 
     fn herdr(&self, args: &[&str]) -> Result<String, AgentsError> {
+        if self.herdr_hangs {
+            return Err(AgentsError::Timeout {
+                command: "herdr --machine titan".into(),
+                secs: 60,
+            });
+        }
         if self.herdr_down {
             return Err(AgentsError::CommandFailed {
                 command: "herdr".into(),
@@ -372,6 +380,21 @@ fn rows_cover_every_machine_and_failures_do_not_hide_other_rows() {
     assert!(report.missing_teams.is_empty());
 }
 
+/// Trace: FR-018-AC-1, FR-018-AC-5
+#[test]
+fn a_machine_that_times_out_becomes_an_error_and_other_rows_survive() {
+    let mut hung = FakeHost::new("titan", "QSL", Scenario::new(Harness::Claude, "idle"));
+    hung.herdr_hangs = true;
+    let report = report_for(vec![
+        FakeHost::new("local", "QSL", Scenario::new(Harness::Claude, "working")),
+        hung,
+    ]);
+    assert_eq!(report.agents.len(), 1);
+    assert_eq!(report.errors.len(), 1);
+    assert!(report.errors[0].starts_with("titan: "));
+    assert!(report.errors[0].contains("did not finish within 60s"));
+}
+
 /// Trace: FR-018-AC-1
 #[test]
 fn unmatched_team_is_listed_as_missing() {
@@ -391,8 +414,9 @@ fn unmatched_team_is_listed_as_missing() {
 fn probe_parser_joins_processes_to_panes_and_keeps_the_remote_clock() {
     let text = format!(
         "@@NOW {NOW}\n@@SESSION s\n@@MTIME 5\n@@CHILD 6\n@@TAIL\n{{\"a\":1}}\n@@END\n\
-         @@GIT /w\n@@COMMIT 7\n@@DIRTY 8\n@@END\n@@P 10 w1:p2\n\
-         @@PS 10 1 cargo cargo test --all\n@@PS 11 1 bash -bash\n"
+         @@GIT /w\n@@COMMIT 7\n@@DIRTY 8\n@@END\n\
+         @@P 10\tw1:p2\tcargo\tcargo test --all\n\
+         @@P 11\tw1:p2\tnpm exec prism-\tnode /x/prism-mcp\n"
     );
     let probe = parse_probe(&text).unwrap();
     assert_eq!(probe.now, NOW);
@@ -403,8 +427,10 @@ fn probe_parser_joins_processes_to_panes_and_keeps_the_remote_clock() {
     assert_eq!(probe.git["/w"].last_commit, Some(7));
     assert_eq!(probe.git["/w"].uncommitted, Some(8));
     let procs = &probe.processes["w1:p2"];
-    assert_eq!(procs.len(), 1);
+    assert_eq!(procs.len(), 2);
+    assert_eq!(procs[0].comm, "cargo");
     assert_eq!(procs[0].args, "cargo test --all");
+    assert_eq!(procs[1].comm, "npm exec prism-", "comm keeps its spaces");
     assert!(parse_probe("@@NOPE 1\n").is_err());
 }
 

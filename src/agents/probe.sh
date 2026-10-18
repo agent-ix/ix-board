@@ -74,8 +74,14 @@ for spec in "$@"; do
   esac
 done
 
+# One record per process that carries a herdr pane id:
+# "@@P <pid>" then TAB-separated pane id, /proc comm (may contain spaces), args.
 if [ -d /proc/self ]; then
   grep -a -z -o -H '^HERDR_PANE_ID=[^[:cntrl:]]*' /proc/[0-9]*/environ 2>/dev/null | tr '\0' '\n' |
-    sed -n 's#^/proc/\([0-9]*\)/environ:HERDR_PANE_ID=\(.*\)$#@@P \1 \2#p'
+    sed -n 's#^/proc/\([0-9]*\)/environ:HERDR_PANE_ID=\(.*\)$#\1 \2#p' |
+    while read -r pid pane; do
+      comm=$(cat "/proc/$pid/comm" 2>/dev/null) || continue
+      args=$(tr '\0\t' '  ' <"/proc/$pid/cmdline" 2>/dev/null)
+      printf '@@P %s\t%s\t%s\t%s\n' "$pid" "$pane" "$comm" "$args"
+    done
 fi
-ps -eo pid=,ppid=,comm=,args= 2>/dev/null | sed 's/^ */@@PS /'
