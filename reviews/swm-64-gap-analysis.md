@@ -62,3 +62,13 @@ Planless repository audit of ix-board's computed requirement matrix, source, and
 - `src/drift.rs:2667-3093` — in-memory evaluator tests exist but have no trace bindings for those criteria.
 - `src/linear.rs:206-465` — live evidence collection implementation; owned by FR-008/FR-009 and reviewed in SR-6020.
 - No explicit implementation plan was supplied; repository-driven planless mode was used.
+
+## Dispositions
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-001 | fixed | The computed matrix now tags all nine criteria FR-008-AC-11..16 and FR-009-AC-8..10. I re-ran `quire matrix`; each criterion reports `tagged` with concrete test-function binders, including the new exact text-output, history-window, and missing-history tests. |
+
+### FND-001 after excerpt
+
+`/// Trace: FR-008-AC-11, FR-008-AC-12, FR-008-AC-13, FR-008-AC-14, FR-009-AC-8, FR-009-AC-10`

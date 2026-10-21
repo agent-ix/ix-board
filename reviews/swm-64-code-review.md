@@ -60,3 +60,23 @@ Reviewed PR #57 at `d3be5b030350b703257f5adb96fbc7beb6df3a8e` against base `73d5
 ## Review Notes
 
 The changed tests cover repeated goal assignees, blank assignees, one distinct direct blocker worker, transitive blocker traversal, serialized JSON fields, and missing Linear issue evidence. I inspected tests and matrix bindings but did not execute the Rust test suite or other CI gates in this review.
+
+## Dispositions
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-001 | fixed | `format_priority_goal_line` now emits the specified field order, JSON-quotes the goal and arrays, uses `workers`/`missing_sources`, and distinguishes `null` for complete absent history from `unknown` when Linear issue/history evidence is missing. The new exact-line test checks escaping, keys, field order, arrays, and null timestamps. |
+| FND-002 | fixed | History selection now includes every issue with `updatedAt` at or after the earliest configured priority-goal cutoff, across teams, while retaining goal issues and blockers. Missing timestamps are fetched conservatively; request, absent issue, cursor, and page-limit failures are recorded as `linear.history` missing evidence. A boundary test covers cross-team and older-than-general-window transitions. |
+| FND-003 | fixed | Crowding now derives only from issue state transitions in the half-open interval: the upper-bound comparison excludes events at `report_time`, and PR/commit-derived crowding was removed. The new regression test verifies PR-only/commit-only activity and an event at the endpoint do not crowd, while a transition at the interval start does. |
+
+### FND-001 after excerpt
+
+`priority_goal={} status={status} flagged={flagged} trusted={} workers={workers}/{} no_progress_hours={no_progress}/{:.1} last_completion_at={} last_transition_at={} blocked_on={} crowding_out={} out_of_team_activity={} missing_sources={}`
+
+### FND-002 after excerpt
+
+`priority_goal_history_start.is_some_and(|start| updated_at >= start) || (updated_at >= window_start && relevant_to_goal_capacity)`
+
+### FND-003 after excerpt
+
+`if at < stale_start || at >= report_epoch || linked_ids.contains(&event.issue_id) { continue; }`
