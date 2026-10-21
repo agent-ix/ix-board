@@ -1343,6 +1343,8 @@ fn evaluate_priority_goals(
                     .iter()
                     .all(|goal_id| blocked_goal_ids.contains(goal_id));
             let trusted = missing_sources.is_empty();
+            let goal_structure_complete =
+                missing_for(evidence, &["linear.issues"]).is_empty() && worker_evidence_complete;
             let staffing_shortfall = worker_evidence_complete
                 && active_workers.len()
                     < usize::try_from(goal.minimum_workers).unwrap_or(usize::MAX);
@@ -1351,7 +1353,7 @@ fn evaluate_priority_goals(
             let raw_flag =
                 !open_goal_ids.is_empty() && (staffing_shortfall || stale_with_competing_work);
             let flagged = if open_goal_ids.is_empty() {
-                Some(false)
+                trusted.then_some(false)
             } else if every_open_goal_ticket_blocked {
                 None
             } else if raw_flag {
@@ -1359,9 +1361,9 @@ fn evaluate_priority_goals(
             } else {
                 (trusted && !every_open_goal_ticket_blocked).then_some(raw_flag)
             };
-            let status = if every_open_goal_ticket_blocked {
+            let status = if goal_structure_complete && every_open_goal_ticket_blocked {
                 PriorityGoalStatus::Blocked
-            } else if open_goal_ids.is_empty() {
+            } else if open_goal_ids.is_empty() && trusted {
                 PriorityGoalStatus::OnTrack
             } else {
                 match flagged {
