@@ -356,6 +356,18 @@ pub struct ProgramRoadmap {
     pub unplaced_projects: Vec<RoadmapUnplacedProject>,
     pub initiatives_without_projects: Vec<String>,
     pub projects_in_multiple_initiatives: Vec<String>,
+    pub projects_missing_from_scope: Vec<String>,
+    pub project_membership_mismatches: Vec<ProjectInitiativeMismatch>,
+    pub missing_scope_initiatives: Vec<String>,
+    pub missing_scope_projects: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectInitiativeMismatch {
+    pub project: String,
+    pub missing_from_linear: Vec<String>,
+    pub missing_from_scope: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -426,12 +438,57 @@ pub fn build_roadmap(
         }
         None => initiatives.iter().collect(),
     };
+    let selected_names = selected_initiatives
+        .iter()
+        .map(|initiative| initiative.name.clone())
+        .collect::<BTreeSet<_>>();
+    let missing_scope_initiatives = scope
+        .into_iter()
+        .flat_map(|scope| {
+            scope
+                .initiatives
+                .iter()
+                .map(|item| item.name.clone())
+                .chain(scope.projects.iter().flat_map(|placement| {
+                    std::iter::once(placement.primary_initiative.clone())
+                        .chain(placement.also_in.iter().cloned())
+                }))
+        })
+        .filter(|name| {
+            !initiatives
+                .iter()
+                .any(|initiative| same_name(&initiative.name, name))
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let missing_scope_projects = scope
+        .into_iter()
+        .flat_map(|scope| {
+            scope
+                .projects
+                .iter()
+                .map(|placement| placement.name.clone())
+        })
+        .filter(|name| {
+            !workspace
+                .projects
+                .iter()
+                .any(|project| same_name(&project.name, name))
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
 
     let mut result = ProgramRoadmap {
         initiatives: Vec::new(),
         unplaced_projects: Vec::new(),
         initiatives_without_projects: Vec::new(),
         projects_in_multiple_initiatives: Vec::new(),
+        projects_missing_from_scope: Vec::new(),
+        project_membership_mismatches: Vec::new(),
+        missing_scope_initiatives,
+        missing_scope_projects,
     };
     let mut assigned = BTreeSet::<String>::new();
     for initiative in selected_initiatives {
@@ -503,6 +560,55 @@ pub fn build_roadmap(
             result
                 .unplaced_projects
                 .push(roadmap_unplaced(project, &workspace.issues));
+        } else if scope.is_some()
+            && !included
+            && project.initiatives.iter().any(|membership| {
+                selected_names
+                    .iter()
+                    .any(|name| same_name(name, &membership.name))
+            })
+        {
+            result
+                .projects_missing_from_scope
+                .push(project.name.clone());
+        }
+    }
+    if let Some(scope) = scope {
+        for placement in &scope.projects {
+            let Some(project) = workspace
+                .projects
+                .iter()
+                .find(|project| same_name(&project.name, &placement.name))
+            else {
+                continue;
+            };
+            let expected = std::iter::once(placement.primary_initiative.as_str())
+                .chain(placement.also_in.iter().map(String::as_str))
+                .collect::<BTreeSet<_>>();
+            let actual = project
+                .initiatives
+                .iter()
+                .map(|initiative| initiative.name.as_str())
+                .collect::<BTreeSet<_>>();
+            let missing_from_linear = expected
+                .iter()
+                .filter(|name| !actual.iter().any(|actual| same_name(name, actual)))
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>();
+            let missing_from_scope = actual
+                .iter()
+                .filter(|name| !expected.iter().any(|expected| same_name(name, expected)))
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>();
+            if !missing_from_linear.is_empty() || !missing_from_scope.is_empty() {
+                result
+                    .project_membership_mismatches
+                    .push(ProjectInitiativeMismatch {
+                        project: project.name.clone(),
+                        missing_from_linear,
+                        missing_from_scope,
+                    });
+            }
         }
     }
     result
@@ -518,6 +624,12 @@ pub fn build_roadmap(
         .projects_in_multiple_initiatives
         .sort_by_key(|item| item.to_lowercase());
     result.projects_in_multiple_initiatives.dedup();
+    result
+        .projects_missing_from_scope
+        .sort_by_key(|item| item.to_lowercase());
+    result
+        .project_membership_mismatches
+        .sort_by_key(|item| item.project.to_lowercase());
     result
 }
 
@@ -889,5 +1001,55 @@ owns = "program review"
         server.join().unwrap();
         assert!(diagnostic.contains("agent-ix/quire"));
         assert!(timed_out, "expected request timeout, got: {diagnostic}");
+    }
+
+    #[test]
+    fn scoped_roadmap_reports_projects_outside_scope_and_membership_mismatches() {
+        let core = initiative("QSL Core", "2");
+        let ecosystem = initiative("QSL Ecosystem", "4");
+        let compiler = project("Compiler", vec![ecosystem.clone()]);
+        let runtime = project("Runtime", vec![core.clone()]);
+        let workspace = WorkspaceSnapshot {
+            projects: vec![compiler, runtime],
+            issues: Vec::new(),
+            fetched_at: 0,
+        };
+
+        let report = build_roadmap(&[core], &workspace, Some(&scope()));
+
+        assert_eq!(report.projects_missing_from_scope, ["Runtime"]);
+        assert_eq!(report.project_membership_mismatches.len(), 1);
+        assert_eq!(
+            report.project_membership_mismatches[0],
+            ProjectInitiativeMismatch {
+                project: "Compiler".to_owned(),
+                missing_from_linear: vec!["QSL Core".to_owned()],
+                missing_from_scope: vec!["QSL Ecosystem".to_owned()],
+            }
+        );
+    }
+
+    #[test]
+    fn scoped_roadmap_reports_missing_scope_catalog_entries() {
+        let core = initiative("QSL Core", "2");
+        let workspace = WorkspaceSnapshot {
+            projects: vec![project("Compiler", vec![core.clone()])],
+            issues: Vec::new(),
+            fetched_at: 0,
+        };
+        let mut scope = scope();
+        scope.initiatives.push(NamedRef {
+            name: "Missing Initiative".to_owned(),
+        });
+        scope.projects.push(ProjectPlacement {
+            name: "Missing Project".to_owned(),
+            primary_initiative: "Missing Initiative".to_owned(),
+            also_in: Vec::new(),
+        });
+
+        let report = build_roadmap(&[core], &workspace, Some(&scope));
+
+        assert_eq!(report.missing_scope_initiatives, ["Missing Initiative"]);
+        assert_eq!(report.missing_scope_projects, ["Missing Project"]);
     }
 }
