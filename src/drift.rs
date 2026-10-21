@@ -3005,10 +3005,10 @@ mod tests {
         assert_eq!(goal.active_workers, Some(1));
         assert_eq!(goal.blocked_on, vec!["AGE-2224", "AGE-2228"]);
         assert_eq!(goal.crowding_out.len(), 3);
-        assert_eq!(goal.crowding_out[0].team_key, "QSL");
-        assert_eq!(goal.crowding_out[0].tickets, vec!["QSL-635"]);
-        assert_eq!(goal.crowding_out[1].team_key, "IR");
-        assert_eq!(goal.crowding_out[1].tickets, vec!["IR-626"]);
+        assert_eq!(goal.crowding_out[0].team_key, "IR");
+        assert_eq!(goal.crowding_out[0].tickets, vec!["IR-626"]);
+        assert_eq!(goal.crowding_out[1].team_key, "QSL");
+        assert_eq!(goal.crowding_out[1].tickets, vec!["QSL-635"]);
         assert_eq!(goal.crowding_out[2].team_key, "SAPHO");
         assert_eq!(goal.crowding_out[2].tickets, vec!["SAPHO-39"]);
         assert_eq!(goal.out_of_team_activity.len(), 1);
