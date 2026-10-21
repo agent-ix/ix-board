@@ -24,7 +24,9 @@ not landing. SWM-33 adds inline planner focus inputs that expand initiatives,
 projects, and issues into Linear issue sets and blocker layers. SWM-34 adds
 focus status, blocker-state, and ready-queue reporting. SWM-35 adds a
 focus hygiene report and a comparison with the last successful report for
-that focus.
+that focus. SWM-102 adds program scope validation against live Linear and
+GitHub catalogs; SWM-103 adds a live program roadmap with derived project
+progress.
 
 ## Scope
 
@@ -57,6 +59,9 @@ that focus.
   a stable JSON field contract, and one text line per lead. Its time-based
   decisions require complete event enumeration and contemporaneous queue
   evidence; incomplete reads produce unavailable signal results.
+- Program scope files are checked against live Linear and GitHub catalogs, and
+  program roadmaps derive project progress from live issue records (FR-019 and
+  FR-020).
 
 ### Out of Scope
 
@@ -95,6 +100,8 @@ records through Linear GraphQL and caches read results locally.
   planned work, correct tracking gaps, and see changes since a prior report.
 - Team leads use `focus plan-chunk` to hand off an ordered slice of open focus
   issues with their readiness and dependency context.
+- Program reviewers use `scope check` to validate a declared program boundary
+  and `roadmap` to report initiative and project progress from live records.
 - Library consumers rely on the same deterministic read results and queue rules.
 
 ## Requirements Architecture
@@ -109,7 +116,9 @@ structured-source boundary in FR-005.
 US-006 traces to FR-010, FR-011, FR-012, and FR-014, composing focus
 membership, blocker layers, and readiness into an ordered handoff slice.
 US-007 traces to FR-016, which packages a canonical focus and status for
-shared clients without choosing a storage service.
+shared clients without choosing a storage service. US-008 traces to FR-019
+and FR-020 for validating a declared program scope and building its live
+roadmap.
 Functional acceptance criteria include fixture checks for each drift signal,
 queue rules, and cache behavior; NFR-001 specifies a lightweight warm-cache
 fixture benchmark.

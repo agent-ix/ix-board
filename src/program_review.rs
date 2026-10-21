@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 use thiserror::Error as ThisError;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -25,6 +26,15 @@ pub struct ProgramScope {
     pub lanes: Vec<LaneRef>,
     #[serde(default)]
     pub out_of_scope: Vec<String>,
+}
+
+const GITHUB_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn github_client(timeout: Duration) -> Result<Client, reqwest::Error> {
+    Client::builder()
+        .user_agent("ix-board")
+        .timeout(timeout)
+        .build()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -182,10 +192,8 @@ pub fn check_scope(
     workspace: &WorkspaceSnapshot,
 ) -> Result<ScopeCheckReport, ProgramReviewError> {
     let mut report = validate_scope_catalog(scope, initiatives, &workspace.projects);
-    let client = Client::builder()
-        .user_agent("ix-board")
-        .build()
-        .map_err(|source| ProgramReviewError::Github {
+    let client =
+        github_client(GITHUB_REQUEST_TIMEOUT).map_err(|source| ProgramReviewError::Github {
             repository: "<client initialization>".to_owned(),
             source,
         })?;
@@ -195,22 +203,43 @@ pub fn check_scope(
         github_cli_token,
     );
     for repo in &scope.repos {
-        let mut request = client.get(format!("https://api.github.com/repos/{}", repo.name));
-        if let Some(token) = token.as_deref() {
-            request = request.bearer_auth(token);
-        }
-        let response = request
-            .send()
-            .map_err(|source| ProgramReviewError::Github {
-                repository: repo.name.clone(),
-                source,
-            })?;
+        let response = request_github_repository(
+            &client,
+            &format!("https://api.github.com/repos/{}", repo.name),
+            &repo.name,
+            token.as_deref(),
+        )?;
         if repository_is_missing(response.status().as_u16(), token.is_some(), &repo.name)? {
             report.missing_repositories.push(repo.name.clone());
         }
     }
     report.missing_repositories.sort();
     Ok(report)
+}
+
+fn github_repository_request(
+    client: &Client,
+    url: &str,
+    token: Option<&str>,
+) -> Result<reqwest::blocking::Response, reqwest::Error> {
+    let request = client.get(url);
+    let request = match token {
+        Some(token) => request.bearer_auth(token),
+        None => request,
+    };
+    request.send()
+}
+
+fn request_github_repository(
+    client: &Client,
+    url: &str,
+    repository: &str,
+    token: Option<&str>,
+) -> Result<reqwest::blocking::Response, ProgramReviewError> {
+    github_repository_request(client, url, token).map_err(|source| ProgramReviewError::Github {
+        repository: repository.to_owned(),
+        source,
+    })
 }
 
 fn selected_github_token(
@@ -604,6 +633,7 @@ owns = "program review"
     }
 
     #[test]
+    /// Trace: FR-019-AC-2
     fn unauthenticated_not_found_is_unverifiable_and_names_the_repository() {
         let error = repository_is_missing(404, false, "agent-ix/private-repo").unwrap_err();
         let diagnostic = error.to_string();
@@ -640,6 +670,7 @@ owns = "program review"
     }
 
     #[test]
+    /// Trace: FR-019-AC-1
     fn parses_scope_and_rejects_stored_tallies() {
         let parsed = scope();
         parsed.validate().unwrap();
@@ -654,6 +685,7 @@ count=17"#
     }
 
     #[test]
+    /// Trace: FR-019-AC-1
     fn scope_loader_reads_the_documented_toml_format() {
         let input = r#"program = "QSL"
 [[initiatives]]
@@ -676,6 +708,7 @@ owns = "program review"
     }
 
     #[test]
+    /// Trace: FR-019-AC-2
     fn catalog_check_reports_missing_projects_and_unplaced_projects() {
         let scope = scope();
         let initiatives = vec![initiative("QSL Core", "2")];
@@ -687,6 +720,7 @@ owns = "program review"
     }
 
     #[test]
+    /// Trace: FR-020-AC-1, FR-020-AC-2
     fn roadmap_places_shared_project_once_and_uses_live_issue_counts() {
         let core = initiative("QSL Core", "2");
         let ecosystem = initiative("QSL Ecosystem", "4");
@@ -755,5 +789,82 @@ owns = "program review"
             listed[0].last_activity.as_deref(),
             Some("2026-10-21T00:00:00Z")
         );
+    }
+
+    #[test]
+    /// Trace: FR-020-AC-3, FR-020-AC-4
+    fn scoped_roadmap_reports_empty_and_unplaced_members_in_stable_order() {
+        let core = initiative("QSL Core", "2");
+        let ecosystem = initiative("QSL Ecosystem", "4");
+        let zulu = project("Zulu", vec![core.clone(), ecosystem.clone()]);
+        let alpha = project("Alpha", Vec::new());
+        let mut file = scope();
+        file.projects.push(ProjectPlacement {
+            name: "Zulu".into(),
+            primary_initiative: "QSL Core".into(),
+            also_in: vec!["QSL Ecosystem".into()],
+        });
+        file.projects.push(ProjectPlacement {
+            name: "Alpha".into(),
+            primary_initiative: "QSL Core".into(),
+            also_in: Vec::new(),
+        });
+        file.initiatives.push(NamedRef {
+            name: "QSL Empty".into(),
+        });
+        let initiatives = [initiative("QSL Empty", "8"), ecosystem, core];
+        let workspace = WorkspaceSnapshot {
+            projects: vec![zulu, alpha],
+            issues: Vec::new(),
+            fetched_at: 0,
+        };
+        let report = build_roadmap(&initiatives, &workspace, Some(&file));
+        assert_eq!(
+            report
+                .initiatives
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            ["QSL Core", "QSL Ecosystem", "QSL Empty"]
+        );
+        assert_eq!(
+            report.initiatives_without_projects,
+            ["QSL Ecosystem", "QSL Empty"]
+        );
+        assert!(report.unplaced_projects.is_empty());
+        assert_eq!(report.projects_in_multiple_initiatives, ["Zulu"]);
+        let unscoped = build_roadmap(&initiatives, &workspace, None);
+        assert_eq!(unscoped.unplaced_projects[0].name, "Alpha");
+    }
+
+    #[test]
+    /// Trace: FR-019-AC-3
+    fn scope_repository_probe_times_out() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        assert!(!GITHUB_REQUEST_TIMEOUT.is_zero());
+        assert!(GITHUB_REQUEST_TIMEOUT <= Duration::from_secs(30));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 512];
+            let _ = stream.read(&mut request);
+            thread::sleep(Duration::from_millis(200));
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        });
+        let client = github_client(Duration::from_millis(30)).unwrap();
+        let error = request_github_repository(
+            &client,
+            &format!("http://{address}/repos/agent-ix/quire"),
+            "agent-ix/quire",
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("agent-ix/quire"));
+        assert!(matches!(error, ProgramReviewError::Github { source, .. } if source.is_timeout()));
+        server.join().unwrap();
     }
 }
