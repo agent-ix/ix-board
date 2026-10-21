@@ -9,7 +9,7 @@ review_set: subset
 
 ## Summary
 
-Reviewed SWM-104 at `2864aea6ef591834bd523bcc13e05b82a4e7fa97` against base `8b83413bde585a7b483e355ed301eac0715f74a3`, including CLI wiring, reconciliation logic, fixtures, output, and live GitHub evidence. One attachment-completeness edge case can produce a false positive.
+Disposition recheck of SWM-104 at `37cc3184edf6a6445ec54eebf3347830804f3e14` against base `699080d633f58c51c0bfa965d900c3be76ea29f0`, including CLI wiring, reconciliation logic, fixtures, output, and live GitHub evidence. One attachment-completeness edge case can produce a false positive.
 
 ## Verdict
 
@@ -30,3 +30,11 @@ Reviewed SWM-104 at `2864aea6ef591834bd523bcc13e05b82a4e7fa97` against base `8b8
 - `bash scripts/check_unsafe_comments.sh`: passed; 0 unsafe blocks.
 - Live `ix-board reconcile "Repeatable Program Review" --json`: passed with all five groups empty and no warnings. The command paginated current PR lists and branch lists across `agent-ix/dev-team`, `agent-ix/ix-board`, `agent-ix/ix-relay`, and `agent-ix/quire-research`; live PR totals were 16, 54, 26, and 11.
 - PR #52 exact head is `2864aea6ef591834bd523bcc13e05b82a4e7fa97`; base is `peter/swm-102-103` at `8b83413bde585a7b483e355ed301eac0715f74a3`; GitHub reports OPEN and MERGEABLE.
+
+## Dispositions
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-001 | fixed | The merged-PR/open-ticket conclusion now requires `attachments_complete`; the regression fixture verifies 50 returned merged PRs plus an unseen open 51st PR do not produce the all-merged finding. |
+
+After excerpt: `if issue.attachments_complete && !ticket_prs.is_empty() && merged.len() == ticket_prs.len() && !is_terminal(issue.state_type)`

@@ -9,11 +9,11 @@ review_set: subset
 
 ## Summary
 
-Planless repository gap analysis of ix-board plus SWM-104 acceptance. The new reconcile command is absent from the formal requirement set, and the repository matrix reports 50 untagged criteria; plan completion was not assessed.
+Disposition recheck of SWM-104 at `37cc3184edf6a6445ec54eebf3347830804f3e14` against base `699080d633f58c51c0bfa965d900c3be76ea29f0`. FR-021 now owns and trace-tags reconciliation; the same 50 baseline criteria remain untagged. Plan completion was not assessed.
 
 ## Verdict
 
-**FAIL** — the new user-visible command has no owning requirement, and the computed matrix contains untagged criteria.
+**CONDITIONAL** — FND-001 is fixed; FND-002..051 remain unchanged repository-baseline gaps accepted without change for this ticket.
 
 ## Findings
 
@@ -75,8 +75,65 @@ Planless repository gap analysis of ix-board plus SWM-104 acceptance. The new re
 
 - Reconciliation: quoin matrix (quoin 0.28.3, quire 0.36.2).
 - Plan completion: not assessed.
-- Criteria: tagged 65 · untagged 50 · tagged-by-ignored-test 0 · method-without-symbol 6.
-- Evidence: bound 0 · stale 0 · suspect 0 · undischarged 0 · no run evidence 121.
-- The matrix includes 19 declared requirements and no reconcile-specific FR. The new command is one identified untraced behavior; source stubs 0; test stubs 0.
+- Criteria: tagged 75 · untagged 50 · tagged-by-ignored-test 0 · method-without-symbol 8.
+- Evidence: bound 0 · stale 0 · suspect 0 · undischarged 0 · no run evidence 133.
+- The matrix includes 20 declared requirements. FR-021 has three criteria and all are tagged; the exact 50 pre-existing untagged criteria remain. Source stubs 0; test stubs 0.
 - Semantic review: skipped (optional; not requested).
 - `spec/spec.md` has no `id`, so no root `ix://` reference edge could be resolved without inventing one.
+
+
+## Dispositions
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-001 | fixed | FR-021 now owns reconcile; all three new criteria are trace-tagged, including AC-2 for incomplete attachment pagination. |
+| FND-002 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-003 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-004 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-005 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-006 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-007 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-008 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-009 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-010 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-011 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-012 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-013 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-014 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-015 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-016 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-017 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-018 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-019 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-020 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-021 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-022 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-023 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-024 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-025 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-026 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-027 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-028 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-029 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-030 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-031 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-032 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-033 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-034 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-035 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-036 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-037 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-038 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-039 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-040 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-041 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-042 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-043 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-044 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-045 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-046 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-047 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-048 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-049 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-050 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
+| FND-051 | accepted-no-change | Unchanged repository-baseline matrix gap outside SWM-104 reconciliation scope; the team chose to keep this ticket scoped to reconcile and not include unrelated traceability backfill. |
