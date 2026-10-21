@@ -3141,7 +3141,7 @@ mod tests {
         assert_eq!(goal.hours_since_progress, None);
         assert_eq!(goal.last_completion_at, None);
         assert_eq!(goal.last_transition_at, None);
-        assert_eq!(goal.trusted, false);
+        assert!(!goal.trusted);
         assert_eq!(goal.status, PriorityGoalStatus::Unknown);
         assert!(
             goal.missing_sources
