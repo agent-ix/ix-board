@@ -842,29 +842,50 @@ owns = "program review"
     fn scope_repository_probe_times_out() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
+        use std::sync::mpsc;
         use std::thread;
 
         assert!(!GITHUB_REQUEST_TIMEOUT.is_zero());
         assert!(GITHUB_REQUEST_TIMEOUT <= Duration::from_secs(30));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
+        let (request_ready_tx, request_ready_rx) = mpsc::channel();
+        let (respond_tx, respond_rx) = mpsc::channel();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
             let mut request = [0; 512];
             let _ = stream.read(&mut request);
-            thread::sleep(Duration::from_millis(200));
+            request_ready_tx.send(()).unwrap();
+            respond_rx.recv().unwrap();
             let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
         });
         let client = github_client(Duration::from_millis(30)).unwrap();
-        let error = request_github_repository(
-            &client,
-            &format!("http://{address}/repos/agent-ix/quire"),
-            "agent-ix/quire",
-            None,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("agent-ix/quire"));
-        assert!(matches!(error, ProgramReviewError::Github { source, .. } if source.is_timeout()));
+        let (result_tx, result_rx) = mpsc::channel();
+        let request_url = format!("http://{address}/repos/agent-ix/quire");
+        let client_thread = thread::spawn(move || {
+            let result = request_github_repository(&client, &request_url, "agent-ix/quire", None);
+            let result = match result {
+                Err(error) => (
+                    error.to_string(),
+                    matches!(error, ProgramReviewError::Github { source, .. } if source.is_timeout()),
+                ),
+                Ok(_) => ("request unexpectedly succeeded".to_owned(), false),
+            };
+            result_tx.send(result).unwrap();
+        });
+        request_ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server accepted the repository request");
+        let (diagnostic, timed_out) = result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("client completed the bounded request");
+        respond_tx.send(()).unwrap();
+        client_thread.join().unwrap();
         server.join().unwrap();
+        assert!(diagnostic.contains("agent-ix/quire"));
+        assert!(timed_out, "expected request timeout, got: {diagnostic}");
     }
 }

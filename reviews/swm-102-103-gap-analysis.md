@@ -9,7 +9,7 @@ review_set: subset
 
 ## Summary
 
-Ran the repository-wide evidence-backed matrix and inspected the new program-review command surface against the repository specification. The new `scope check` and `roadmap` behaviors have no owning requirement in `spec/`; the repository also has 50 existing untagged criteria, unchanged from the PR parent.
+The initial audit at head `8b83413bde585a7b483e355ed301eac0715f74a3` found no specification for the new commands. At head `459133268c1d3304d3ff92fe1bf8e51084d2deb4`, FR-019 and FR-020, US-008, and trace bindings now cover the new behavior; 50 untagged criteria and 24 untracked symbols remain unchanged from the PR parent.
 
 ## Verdict
 
@@ -34,3 +34,23 @@ Ran the repository-wide evidence-backed matrix and inspected the new program-rev
 - Plan completion: not assessed.
 - Semantic review: skipped; no explicit opt-in was given.
 - `spec/spec.md` has no artifact `id`, so no `ix://` spec-root relationship was authored.
+
+
+## Dispositions
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-001 | accepted-no-change | The 50 criteria are unchanged from the PR parent and outside SWM-102/103; this fix adds only the program-review requirements. |
+| FND-002 | fixed | FR-019/FR-020 and US-008 now specify both commands, with matrix bindings for all test-verified criteria. |
+| FND-003 | accepted-no-change | The same 24 test symbols were present at the PR parent; this fix does not change those legacy tests. |
+
+### FND-002 after excerpt
+
+```text
+The `scope check` command SHALL validate a TOML program scope file against
+structured Linear initiative and project catalogs and GitHub repository
+availability.
+
+The `roadmap` command SHALL build a deterministic program view from one
+structured Linear workspace snapshot, with an optional program scope file.
+```
