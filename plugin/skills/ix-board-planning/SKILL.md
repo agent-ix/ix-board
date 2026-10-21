@@ -50,6 +50,15 @@ ix-board roadmap
 
 Projects appear once under their primary initiative. The report includes their other initiative memberships, current Linear issue-state counts, progress, and last activity. It also reports projects with no initiative and initiatives with no projects.
 
+To compare a project's current Linear issue states with its linked pull requests and branches, run `reconcile`. Repositories from linked PR URLs are checked automatically; pass the program scope to search its repositories for matching branches when tickets have no linked PR. The stale threshold defaults to 14 days:
+
+```bash
+ix-board reconcile <PROJECT-ID-OR-EXACT-NAME> --scope qsl.toml --stale-days 14
+ix-board --json reconcile <PROJECT-ID-OR-EXACT-NAME> --scope qsl.toml
+```
+
+Reconcile is read-only. It groups merged PRs with open tickets, completed tickets without merged PRs, long-running tickets without a PR or branch, stale open PRs, and draft PRs attached to completed tickets. Review the findings before changing Linear state.
+
 1. For "how is this project or initiative going?", progress by milestone, blockers, or current ready work, use the `focus-status` skill with the requested selector. Use `--initiative` for a campaign spanning projects:
 
    Initiative selectors accept a Linear UUID, visible identifier such as `I-10`, or exact name.

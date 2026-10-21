@@ -11,12 +11,16 @@ use ix_board::agents::{
 use ix_board::program_review::{
     ProgramRoadmap, ProgramScope, ScopeCheckReport, build_roadmap, check_scope,
 };
+use ix_board::reconcile::{
+    DEFAULT_STALE_DAYS, ReconcileReport, collect_github_evidence, evaluate_reconcile,
+    repositories_for_scope, resolve_project,
+};
 use ix_board::{
     DriftConfig, DriftError, DriftEvidenceFile, DriftReport, Error, FocusExpansion,
     FocusHygieneReport, FocusPlanChunk, FocusProjectMembership, FocusRecord, FocusSelection,
     FocusStatus, IssueBatch, LinearGraphQlSource, NextStep, ProjectChunk, ProjectPriority,
-    ProjectRunStatus, ReadService, ReadyItem, SearchResult, evaluate_drift, evaluate_drift_file,
-    render_drift_text,
+    ProjectRunStatus, ReadService, ReadyItem, SearchResult, WorkspaceSource, evaluate_drift,
+    evaluate_drift_file, render_drift_text,
 };
 use ix_cli_kit::exit::Outcome;
 use ix_cli_kit::secrets::{AppScope, SecretKey, SecretStore, SecretValue};
@@ -121,6 +125,17 @@ enum Command {
         /// Restrict the report to the initiatives and projects in this scope file.
         #[arg(long)]
         scope: Option<PathBuf>,
+    },
+    /// Compare a project's Linear state with its linked GitHub pull requests and branches.
+    Reconcile {
+        /// Linear project identifier, UUID, or exact name.
+        project: String,
+        /// Program scope file whose repositories should be searched for branches.
+        #[arg(long)]
+        scope: Option<PathBuf>,
+        /// Staleness threshold in positive whole days.
+        #[arg(long, default_value_t = DEFAULT_STALE_DAYS, value_parser = parse_positive_days)]
+        stale_days: u32,
     },
 }
 
@@ -281,6 +296,7 @@ enum Output {
     },
     ProgramScopeCheck(ScopeCheckReport),
     ProgramRoadmap(ProgramRoadmap),
+    Reconcile(ReconcileReport),
 }
 
 fn parse_project_status(value: &str) -> Result<ProjectRunStatus, String> {
@@ -456,6 +472,11 @@ fn validate_command(command: &Command) -> Result<(), Error> {
                 identifier: project.clone(),
             })
         }
+        Command::Reconcile { project, .. } if project.trim().is_empty() => {
+            Err(Error::ProjectNotFound {
+                identifier: project.clone(),
+            })
+        }
         Command::Project {
             command:
                 ProjectCommand::SetStatus { project, .. } | ProjectCommand::SetPriority { project, .. },
@@ -502,6 +523,45 @@ fn run(command: Command) -> Result<Output, Error> {
                 &workspace,
                 scope.as_ref(),
             )))
+        }
+        Command::Reconcile {
+            project,
+            scope,
+            stale_days,
+        } => {
+            let scope = scope.map(ProgramScope::load).transpose().map_err(|error| {
+                Error::ProgramReview {
+                    message: error.to_string(),
+                }
+            })?;
+            let source = LinearGraphQlSource::from_env()?;
+            let workspace = source.fetch_workspace()?;
+            let project_record = resolve_project(&workspace, &project).map_err(Error::from)?;
+            let project_issues = workspace
+                .issues
+                .iter()
+                .filter(|issue| issue.project_id.as_ref() == Some(&project_record.id))
+                .cloned()
+                .collect::<Vec<_>>();
+            let repositories = repositories_for_scope(scope.as_ref(), &project_issues);
+            let evidence =
+                collect_github_evidence(repositories.iter().cloned()).map_err(Error::from)?;
+            let now_epoch = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|error| Error::ProgramReview {
+                    message: format!("system clock is before Unix epoch: {error}"),
+                })?
+                .as_secs_f64();
+            evaluate_reconcile(
+                project_record,
+                &project_issues,
+                &evidence,
+                repositories.into_iter().collect(),
+                stale_days,
+                now_epoch,
+            )
+            .map(Output::Reconcile)
+            .map_err(Error::from)
         }
         other => run_linear(other),
     }
@@ -589,7 +649,7 @@ fn run_linear(command: Command) -> Result<Output, Error> {
     match command {
         Command::Auth { .. } => unreachable!("auth commands are handled before Linear dispatch"),
         Command::Agents { .. } => unreachable!("agents is handled before Linear dispatch"),
-        Command::Scope { .. } | Command::Roadmap { .. } => {
+        Command::Scope { .. } | Command::Roadmap { .. } | Command::Reconcile { .. } => {
             unreachable!("program review commands are handled before Linear dispatch")
         }
         Command::Next { team } => service.next(&team).map(Output::Queue),
@@ -831,6 +891,7 @@ fn render_human(output: &Output) -> String {
             lines.join("\n")
         }
         Output::ProgramRoadmap(report) => render_roadmap(report),
+        Output::Reconcile(report) => render_reconcile(report),
         Output::ProjectStatusUpdated { project, status } => {
             format!("Project {project} status set to {status}")
         }
@@ -877,6 +938,76 @@ fn render_roadmap(report: &ProgramRoadmap) -> String {
     }
     for project in &report.projects_in_multiple_initiatives {
         lines.push(format!("project in multiple initiatives: {project}"));
+    }
+    lines.join("\n")
+}
+
+fn render_reconcile(report: &ReconcileReport) -> String {
+    let mut lines = vec![format!(
+        "Reconcile {} (stale threshold: {} days)",
+        report.project, report.stale_days
+    )];
+    if !report.searched_repositories.is_empty() {
+        lines.push(format!(
+            "Searched repositories: {}",
+            report.searched_repositories.join(", ")
+        ));
+    }
+    for warning in &report.warnings {
+        lines.push(format!("warning: {warning}"));
+    }
+    let ticket_groups = [
+        (
+            "Merged PR, ticket still open",
+            &report.findings.merged_pr_open_ticket,
+        ),
+        (
+            "Done without merged PR",
+            &report.findings.done_without_merged_pr,
+        ),
+        (
+            "In Progress without PR or branch",
+            &report.findings.in_progress_without_pr_or_branch,
+        ),
+    ];
+    for (title, findings) in ticket_groups {
+        lines.push(format!("{title} ({}):", findings.len()));
+        if findings.is_empty() {
+            lines.push("  (none)".to_owned());
+        }
+        for finding in findings {
+            let age = finding
+                .age_days
+                .map(|days| format!(" | {} days", days))
+                .unwrap_or_default();
+            let prs = if finding.pull_requests.is_empty() {
+                String::new()
+            } else {
+                format!(" | PRs: {}", finding.pull_requests.join(", "))
+            };
+            lines.push(format!(
+                "  {} [{}] {}{}{}",
+                finding.identifier, finding.state, finding.title, age, prs
+            ));
+        }
+    }
+    for (title, findings) in [
+        ("Stale open PR", &report.findings.stale_open_pr),
+        (
+            "Draft PR with closed ticket",
+            &report.findings.draft_pr_closed_ticket,
+        ),
+    ] {
+        lines.push(format!("{title} ({}):", findings.len()));
+        if findings.is_empty() {
+            lines.push("  (none)".to_owned());
+        }
+        for finding in findings {
+            lines.push(format!(
+                "  {} [{}] {} | {} | {} days",
+                finding.identifier, finding.state, finding.title, finding.url, finding.age_days
+            ));
+        }
     }
     lines.join("\n")
 }
@@ -1308,7 +1439,7 @@ fn render_chunk(chunk: &ProjectChunk) -> String {
 mod tests {
     use super::{
         Cli, Command, FocusCommand, Output, ProgramScopeCommand, format_issue_ref,
-        format_snapshot_time_at, output_outcome, render_focus_status,
+        format_snapshot_time_at, output_outcome, render_focus_status, render_reconcile,
     };
     use clap::Parser;
     use ix_board::program_review::ScopeCheckReport;
@@ -1359,6 +1490,61 @@ mod tests {
             matches!(roadmap.command, Command::Roadmap { scope: Some(scope) } if scope.to_str() == Some("qsl.toml"))
         );
         assert!(Cli::try_parse_from(["ix-board", "roadmap"]).is_ok());
+
+        let reconcile = Cli::try_parse_from([
+            "ix-board",
+            "reconcile",
+            "SWM",
+            "--scope",
+            "qsl.toml",
+            "--stale-days",
+            "21",
+        ])
+        .expect("parse scoped reconcile");
+        assert!(matches!(
+            reconcile.command,
+            Command::Reconcile {
+                project,
+                scope: Some(scope),
+                stale_days: 21
+            } if project == "SWM" && scope.to_str() == Some("qsl.toml")
+        ));
+        assert!(Cli::try_parse_from(["ix-board", "reconcile", "SWM"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["ix-board", "reconcile", "SWM", "--stale-days", "0"]).is_err()
+        );
+    }
+
+    #[test]
+    fn reconcile_human_and_json_outputs_expose_all_five_finding_groups() {
+        let report = ix_board::reconcile::ReconcileReport {
+            project: "SWM".to_owned(),
+            project_id: ix_board::ProjectId("project-1".to_owned()),
+            stale_days: 14,
+            searched_repositories: vec!["agent-ix/ix-board".to_owned()],
+            warnings: Vec::new(),
+            findings: ix_board::reconcile::ReconcileFindings::default(),
+        };
+        let human = render_reconcile(&report);
+        for heading in [
+            "Merged PR, ticket still open",
+            "Done without merged PR",
+            "In Progress without PR or branch",
+            "Stale open PR",
+            "Draft PR with closed ticket",
+        ] {
+            assert!(human.contains(heading));
+        }
+        let json = serde_json::to_value(Output::Reconcile(report)).unwrap();
+        for group in [
+            "merged_pr_open_ticket",
+            "done_without_merged_pr",
+            "in_progress_without_pr_or_branch",
+            "stale_open_pr",
+            "draft_pr_closed_ticket",
+        ] {
+            assert!(json["findings"][group].is_array());
+        }
     }
 
     #[test]

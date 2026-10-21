@@ -1,0 +1,32 @@
+[
+  {
+    "number": 1,
+    "url": "https://github.com/agent-ix/reconcile-demo/pull/1",
+    "state": "MERGED",
+    "isDraft": false,
+    "updatedAt": "2026-09-01T00:00:00Z",
+    "mergedAt": "2026-09-02T00:00:00Z",
+    "headRefName": "feature/SWM-101-work",
+    "title": "SWM-101 implement work"
+  },
+  {
+    "number": 2,
+    "url": "https://github.com/agent-ix/reconcile-demo/pull/2",
+    "state": "OPEN",
+    "isDraft": false,
+    "updatedAt": "2026-09-01T00:00:00Z",
+    "mergedAt": null,
+    "headRefName": "feature/SWM-104-work",
+    "title": "SWM-104 stale work"
+  },
+  {
+    "number": 3,
+    "url": "https://github.com/agent-ix/reconcile-demo/pull/3",
+    "state": "OPEN",
+    "isDraft": true,
+    "updatedAt": "2026-10-20T00:00:00Z",
+    "mergedAt": null,
+    "headRefName": "feature/SWM-105-work",
+    "title": "SWM-105 draft work"
+  }
+]
