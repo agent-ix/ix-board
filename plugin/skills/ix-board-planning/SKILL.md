@@ -109,6 +109,15 @@ Reconcile is read-only. It groups merged PRs with open tickets, completed ticket
    ix-board issues SWM-12 SWM-13 SWM-14
    ```
 
+6. For a configured priority goal in a drift report, use `active_workers` as
+   the number of distinct Linear assignee IDs on active goal issues and their
+   open blockers. It is not an issue count: repeated assignees count once, and
+   unassigned or inactive issues add no workers. Treat a null count or
+   `trusted=false` as incomplete evidence, not as zero. Compare the count with
+   `minimum_workers` before deciding whether staffing is short; use the named
+   competing projects and tickets to identify work that may be crowding out the
+   goal.
+
 ## Preserve the result
 
 - Treat ix-board output as authoritative for readiness, ordering, project status, dependencies, focus membership, and blockers. Do not reconstruct those facts from issue descriptions or comments.
