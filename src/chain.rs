@@ -513,7 +513,7 @@ owns = "ECZ work"
     }
 
     #[test]
-    /// Trace: FR-019-AC-1, FR-019-AC-2
+    /// Trace: FR-022-AC-1, FR-022-AC-2
     fn fixture_expands_cross_team_chain_and_prioritizes_unowned_root() {
         let snapshot = snapshot();
         let scope = scope();
@@ -546,7 +546,7 @@ owns = "ECZ work"
     }
 
     #[test]
-    /// Trace: FR-019-AC-3
+    /// Trace: FR-022-AC-3
     fn unavailable_blocker_keeps_known_downstream_paths_visible() {
         let mut snapshot = snapshot();
         snapshot.issues[0]
@@ -566,7 +566,7 @@ owns = "ECZ work"
     }
 
     #[test]
-    /// Trace: FR-019-AC-4
+    /// Trace: FR-022-AC-4
     fn dense_cycle_graph_has_independent_cycle_and_work_bounds() {
         let mut snapshot = snapshot();
         let template = snapshot.issues[0].clone();
@@ -594,7 +594,7 @@ owns = "ECZ work"
     }
 
     #[test]
-    /// Trace: FR-019-AC-2
+    /// Trace: FR-022-AC-2
     fn fixture_reports_dependency_cycles_without_recursing_forever() {
         let snapshot = snapshot();
         let report = evaluate_chain(&snapshot, &[IssueId("issue-qsl-4".to_owned())], None, now())
@@ -617,7 +617,7 @@ owns = "ECZ work"
     }
 
     #[test]
-    /// Trace: FR-019-AC-5
+    /// Trace: FR-022-AC-5
     fn long_blocker_chain_uses_heap_frames_instead_of_call_stack() {
         let mut snapshot = snapshot();
         let template = snapshot.issues[0].clone();

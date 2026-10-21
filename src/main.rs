@@ -1692,7 +1692,7 @@ mod tests {
     }
 
     #[test]
-    /// Trace: FR-019-AC-1
+    /// Trace: FR-022-AC-1
     fn chain_human_and_json_outputs_include_graph_details() {
         let report = ix_board::chain::ChainReport {
             starts: vec!["QSL-1".to_owned()],

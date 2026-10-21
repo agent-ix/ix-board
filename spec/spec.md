@@ -63,6 +63,9 @@ with the last successful report for that focus.
 - Program scope files are checked against live Linear and GitHub catalogs, and
   program roadmaps derive project progress from live issue records (FR-019 and
   FR-020).
+- `chain` expands cross-team blockers from an issue or all open issues in a
+  declared project scope, retaining known paths under partial data and bounding
+  cycle and path enumeration (FR-022).
 - `reconcile` compares a Linear project's issue state and structured pull
   request attachments with paginated GitHub pull-request and branch records;
   incomplete attachment data suppresses conclusions that require a complete
