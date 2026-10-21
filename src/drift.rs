@@ -51,7 +51,7 @@ pub struct PriorityGoalConfig {
     /// Explicit issue identifiers when the goal is not represented by a Linear project or milestone.
     #[serde(default)]
     pub ticket_ids: Vec<String>,
-    /// Positive minimum worker coverage, measured as active issues with recent linked work.
+    /// Positive minimum number of distinct active assignees required for the goal.
     pub minimum_workers: u64,
     /// Hours without goal progress before crowding is reported.
     pub no_progress_hours: f64,
@@ -566,10 +566,8 @@ pub struct PriorityGoalReport {
     pub last_activity_at: Option<String>,
     /// Hours since the most recent linked work activity.
     pub hours_since_progress: Option<f64>,
-    /// Active goal issues with activity in the configured window; used as a worker-coverage proxy.
-    pub recently_worked_active_issues: u64,
-    /// Active Coding/In Progress/Review goal issues, including stale claimed issues.
-    pub claimed_active_issues: u64,
+    /// Distinct nonempty assignee IDs on active goal issues and open blockers, if complete.
+    pub active_workers: Option<u64>,
     /// Configured minimum worker coverage.
     pub minimum_workers: u64,
     /// Current state of the goal assessment.
@@ -1136,6 +1134,8 @@ fn evaluate_priority_goals(
                         .map(|next| (blocked_goal_id.clone(), next)),
                 );
             }
+            let worker_evidence_complete =
+                missing_for(evidence, &["linear.issues"]).is_empty() && missing_blockers.is_empty();
             for blocker_id in missing_blockers {
                 missing_sources.insert(format!(
                     "linear.issues: blocker {blocker_id} for '{}' was not returned",
@@ -1143,18 +1143,6 @@ fn evaluate_priority_goals(
                 ));
             }
             let linked_ids: BTreeSet<_> = goal_ids.union(&blocker_ids).cloned().collect();
-            let capacity_scope_ids: BTreeSet<_> = open_goal_ids.union(&blocker_ids).cloned().collect();
-            let goal_assignees: BTreeSet<_> = evidence
-                .tickets
-                .iter()
-                .filter(|ticket| capacity_scope_ids.contains(&ticket.id))
-                .filter_map(|ticket| ticket.assignee_id.as_deref())
-                .collect();
-            if !goal_teams.is_empty() && goal_assignees.is_empty() {
-                missing_sources.insert(
-                    "linear.issues: goal and blocker assignee identities unavailable; cross-team work cannot be attributed".to_owned(),
-                );
-            }
             let goal_transitions: Vec<_> = transitions
                 .iter()
                 .filter(|event| goal_ids.contains(&event.issue_id))
@@ -1181,18 +1169,7 @@ fn evaluate_priority_goals(
                 .map(|(at, event)| (*at, *event))
                 .filter(|(at, _)| *at <= report_epoch)
                 .max_by(|a, b| a.0.total_cmp(&b.0));
-            let active_goal_tickets: Vec<_> = evidence
-                .tickets
-                .iter()
-                .filter(|ticket| {
-                    belongs(ticket)
-                        && timestamp_epoch(&ticket.created_at)
-                            .is_ok_and(|created| created <= report_epoch)
-                        && is_active_ticket(ticket)
-                })
-                .collect();
-            let mut recent_active = BTreeSet::new();
-            let mut claimed_active = BTreeSet::new();
+            let mut active_workers = BTreeSet::new();
             let mut goal_activity = Vec::new();
             let active_scope_tickets: Vec<_> = evidence
                 .tickets
@@ -1204,10 +1181,14 @@ fn evaluate_priority_goals(
                         && is_active_ticket(ticket)
                 })
                 .collect();
-            for ticket in &active_goal_tickets {
-                claimed_active.insert(ticket.identifier.as_str());
-            }
             for ticket in &active_scope_tickets {
+                if let Some(assignee) = ticket
+                    .assignee_id
+                    .as_deref()
+                    .filter(|assignee| !assignee.trim().is_empty())
+                {
+                    active_workers.insert(assignee);
+                }
                 let latest = latest_ticket_activity(
                     ticket,
                     &linked_transitions,
@@ -1217,9 +1198,6 @@ fn evaluate_priority_goals(
                 )?;
                 if let Some(at) = latest {
                     goal_activity.push((at, ticket.identifier.as_str()));
-                    if at >= report_epoch - goal.no_progress_hours * 3600.0 {
-                        recent_active.insert(ticket.identifier.as_str());
-                    }
                 }
             }
             for ticket in evidence
@@ -1264,7 +1242,7 @@ fn evaluate_priority_goals(
                 } else if ticket
                     .assignee_id
                     .as_deref()
-                    .is_some_and(|assignee| goal_assignees.contains(assignee))
+                    .is_some_and(|assignee| active_workers.contains(assignee))
                 {
                     &mut out_of_team
                 } else {
@@ -1301,7 +1279,7 @@ fn evaluate_priority_goals(
                     } else if ticket
                         .assignee_id
                         .as_deref()
-                        .is_some_and(|assignee| goal_assignees.contains(assignee))
+                        .is_some_and(|assignee| active_workers.contains(assignee))
                     {
                         &mut out_of_team
                     } else {
@@ -1333,7 +1311,7 @@ fn evaluate_priority_goals(
                     } else if ticket
                         .assignee_id
                         .as_deref()
-                        .is_some_and(|assignee| goal_assignees.contains(assignee))
+                        .is_some_and(|assignee| active_workers.contains(assignee))
                     {
                         &mut out_of_team
                     } else {
@@ -1369,13 +1347,19 @@ fn evaluate_priority_goals(
                     .iter()
                     .all(|goal_id| blocked_goal_ids.contains(goal_id));
             let trusted = missing_sources.is_empty();
-            let raw_flag = !open_goal_ids.is_empty()
-                && missing_goal_history.is_empty()
-                && (recent_active.len()
-                    < usize::try_from(goal.minimum_workers).unwrap_or(usize::MAX)
-                    || (stale && !crowding_out.is_empty()));
+            let staffing_shortfall = worker_evidence_complete
+                && active_workers.len()
+                    < usize::try_from(goal.minimum_workers).unwrap_or(usize::MAX);
+            let stale_with_competing_work =
+                missing_goal_history.is_empty() && stale && !crowding_out.is_empty();
+            let raw_flag =
+                !open_goal_ids.is_empty() && (staffing_shortfall || stale_with_competing_work);
             let flagged = if open_goal_ids.is_empty() {
                 Some(false)
+            } else if every_open_goal_ticket_blocked {
+                None
+            } else if raw_flag {
+                Some(true)
             } else {
                 (trusted && !every_open_goal_ticket_blocked).then_some(raw_flag)
             };
@@ -1400,9 +1384,8 @@ fn evaluate_priority_goals(
                     .transpose()?,
                 last_activity_at: last_activity.map(|(at, _)| format_timestamp(*at)),
                 hours_since_progress,
-                recently_worked_active_issues: u64::try_from(recent_active.len())
-                    .unwrap_or(u64::MAX),
-                claimed_active_issues: u64::try_from(claimed_active.len()).unwrap_or(u64::MAX),
+                active_workers: worker_evidence_complete
+                    .then(|| u64::try_from(active_workers.len()).unwrap_or(u64::MAX)),
                 minimum_workers: goal.minimum_workers,
                 status,
                 blocked_on: blocked_on.into_iter().collect(),
@@ -1434,7 +1417,7 @@ fn is_active_ticket(ticket: &DriftTicket) -> bool {
     ticket.state_type == WorkflowStateType::Started
         || matches!(
             ticket.state.to_ascii_lowercase().as_str(),
-            "coding" | "in progress" | "review" | "active" | "doing" | "in dev"
+            "coding" | "in progress"
         )
 }
 
@@ -2233,7 +2216,7 @@ pub fn render_drift_text(report: &DriftReport) -> String {
             out_of_team = "none observed".to_owned();
         }
         format!(
-            "priority_goal {} status={} flagged={} trusted={} {}h_since_progress worked_active_issues={}/{} claimed_active_issues={} blocked_on=[{}] last_activity={} crowding_out=[{}] out_of_team_activity=[{}] missing=[{}]",
+            "priority_goal {} status={} flagged={} trusted={} {}h_since_progress active_workers={}/{} blocked_on=[{}] last_activity={} crowding_out=[{}] out_of_team_activity=[{}] missing=[{}]",
             goal.goal,
             match goal.status {
                 PriorityGoalStatus::Unknown => "unknown",
@@ -2246,9 +2229,9 @@ pub fn render_drift_text(report: &DriftReport) -> String {
             goal.hours_since_progress
                 .map(|hours| format!("{hours:.1}"))
                 .unwrap_or_else(|| "unknown".to_owned()),
-            goal.recently_worked_active_issues,
+            goal.active_workers
+                .map_or_else(|| "unknown".to_owned(), |workers| workers.to_string()),
             goal.minimum_workers,
-            goal.claimed_active_issues,
             if goal.blocked_on.is_empty() { "none".to_owned() } else { goal.blocked_on.join(",") },
             goal.last_activity_at.as_deref().unwrap_or("unknown"),
             crowding,
@@ -2782,14 +2765,26 @@ mod tests {
             };
             let mut item = ticket(id, identifier, target_project_id, state, 1.0);
             item.project_identifier = Some("QSL-L2".to_owned());
-            item.assignee_id = Some(format!("assignee-{id}"));
+            item.assignee_id = Some(if identifier == "QSL-487" {
+                "inactive-worker".to_owned()
+            } else {
+                "goal-worker".to_owned()
+            });
             item.state_entered_at = Some("2026-10-04T04:00:00Z".to_owned());
+            if identifier == "QSL-487" {
+                item.blocked_by.push("age900".to_owned());
+            }
             if identifier == "QSL-485" {
                 item.linked_pr_urls
                     .push("https://github.com/agent-ix/example/pull/641".to_owned());
             }
             evidence.tickets.push(item);
         }
+        let mut unassigned_active =
+            ticket("qsl488", "QSL-488", target_project_id, "In Progress", 1.0);
+        unassigned_active.project_identifier = Some("QSL-L2".to_owned());
+        unassigned_active.assignee_id = Some("   ".to_owned());
+        evidence.tickets.push(unassigned_active);
         for (id, identifier, project, state, at) in [
             (
                 "qsl641",
@@ -2830,6 +2825,18 @@ mod tests {
                 occurred_at: at.to_owned(),
                 queue_before: None,
             });
+        }
+        let mut blocker = ticket("age900", "AGE-900", "age-project", "In Progress", 1.0);
+        blocker.team_key = "AGE".to_owned();
+        blocker.project_identifier = Some("AGE-Project".to_owned());
+        blocker.assignee_id = Some("blocker-worker".to_owned());
+        evidence.tickets.push(blocker);
+        if let Some(ir626) = evidence
+            .tickets
+            .iter_mut()
+            .find(|item| item.identifier == "IR-626")
+        {
+            ir626.assignee_id = Some("goal-worker".to_owned());
         }
         for (id, identifier) in [
             ("qsl485", "QSL-485"),
@@ -2884,14 +2891,20 @@ mod tests {
             Some("2026-10-05T05:00:00Z")
         );
         assert_eq!(goal.hours_since_progress, Some(13.0));
-        assert_eq!(goal.recently_worked_active_issues, 0);
-        assert_eq!(goal.claimed_active_issues, 2);
+        assert_eq!(goal.active_workers, Some(2));
         assert_eq!(goal.minimum_workers, 1);
         assert_eq!(goal.crowding_out[0].project, "IR-path");
         assert_eq!(
             goal.crowding_out[0].tickets,
             vec!["IR-626", "QSL-635", "QSL-641"]
         );
+        assert_eq!(goal.out_of_team_activity.len(), 1);
+        assert_eq!(goal.out_of_team_activity[0].tickets, vec!["IR-626"]);
+        let json = serde_json::to_value(goal).expect("priority goal JSON");
+        assert_eq!(json["active_workers"], 2);
+        assert!(json.get("recently_worked_active_issues").is_none());
+        assert!(json.get("claimed_active_issues").is_none());
+        assert!(render_drift_text(&report).contains("active_workers=2/1"));
     }
 
     #[test]
@@ -2987,7 +3000,7 @@ mod tests {
         assert_eq!(goal.flagged, None);
         assert_eq!(goal.status, PriorityGoalStatus::Blocked);
         assert!(!goal.trusted, "missing GitHub activity is explicit");
-        assert_eq!(goal.recently_worked_active_issues, 2);
+        assert_eq!(goal.active_workers, Some(1));
         assert_eq!(goal.blocked_on, vec!["AGE-2224", "AGE-2228"]);
         assert_eq!(goal.crowding_out.len(), 1);
         assert_eq!(goal.crowding_out[0].team_key, "QSL");
@@ -3026,6 +3039,7 @@ mod tests {
         assert!(goal.blocked_on.is_empty());
         assert_eq!(goal.status, PriorityGoalStatus::OnTrack);
         assert_eq!(goal.flagged, Some(false));
+        assert_eq!(goal.active_workers, Some(0));
     }
 
     #[test]
@@ -3069,7 +3083,7 @@ mod tests {
         assert!(!goal.trusted);
         assert_eq!(goal.flagged, None);
         assert_eq!(goal.status, PriorityGoalStatus::Unknown);
-        assert_eq!(goal.recently_worked_active_issues, 1);
+        assert_eq!(goal.active_workers, Some(1));
         assert_eq!(
             goal.last_activity_at.as_deref(),
             Some("2026-10-07T15:09:00Z")
@@ -3077,6 +3091,41 @@ mod tests {
         assert!(
             render_drift_text(&report).contains("status=unknown flagged=unknown trusted=false")
         );
+    }
+
+    #[test]
+    fn priority_goal_worker_count_is_unknown_when_linear_issue_evidence_is_incomplete() {
+        let mut config = config();
+        config.report_time = "2026-10-07T15:10:00Z".to_owned();
+        config.priority_goals.push(PriorityGoalConfig {
+            goal: "QSL L2 plan v2".to_owned(),
+            ticket_ids: vec!["QSL-487".to_owned()],
+            minimum_workers: 1,
+            no_progress_hours: 12.0,
+        });
+        let mut evidence = evidence();
+        evidence.missing.push(MissingEvidence {
+            source: "linear.issues".to_owned(),
+            reason: "issue page was unavailable".to_owned(),
+        });
+        let mut active = ticket("qsl487", "QSL-487", "qsl-l2", "Coding", 1.0);
+        active.team_key = "QSL".to_owned();
+        active.assignee_id = Some("worker-1".to_owned());
+        active.project_identifier = Some("QSL L2 plan v2".to_owned());
+        evidence.tickets.push(active);
+
+        let report = evaluate_drift(&config, &evidence).expect("partial Linear evidence report");
+        let goal = &report.priority_goals[0];
+        assert_eq!(goal.active_workers, None);
+        assert_eq!(goal.status, PriorityGoalStatus::Unknown);
+        assert!(
+            goal.missing_sources
+                .iter()
+                .any(|source| source.contains("linear.issues"))
+        );
+        let json = serde_json::to_value(goal).expect("priority goal JSON");
+        assert!(json["active_workers"].is_null());
+        assert!(render_drift_text(&report).contains("active_workers=unknown/1"));
     }
 
     #[test]

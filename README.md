@@ -168,16 +168,18 @@ when the goal has no structured project or milestone membership:
 ```
 
 The report includes last completion and transition times, hours since linked
-progress, claimed active issues versus recently worked active issues, the
-configured minimum, current direct and transitive blockers, and other projects
-with transitions in the no-progress interval. Active blocker work counts toward
-the goal's recent activity and worker minimum. Same-team activity is reported as
-crowding out. Cross-team activity is reported separately only when the issue is
-assigned to a worker on the goal or its blockers. `trusted=false` means a
-missing source can hide relevant work; the report names those sources. Live mode
-collects Linear issue/history evidence, so GitHub, Herdr, and OTel gaps remain
-explicit. The collector limits history reads to the goal's team, its blockers,
-and other-team issues assigned to the same workers.
+progress, the distinct active assignee count and configured minimum, current
+direct and transitive blockers, and other projects with transitions in the
+no-progress interval. A worker counts once by Linear assignee ID across active
+goal issues and open blockers; unassigned and inactive issues add no workers.
+Same-team activity is reported as crowding out. Cross-team activity is reported
+separately only when the issue is assigned to a currently counted worker.
+`active_workers` is null when issue, membership, blocker, or assignee evidence
+is incomplete. `trusted=false` means a required source can hide relevant work;
+the report names those sources. Live mode collects Linear issue/history
+evidence, so GitHub, Herdr, and OTel gaps remain explicit. The collector limits
+history reads to the goal's team, its blockers, and other-team issues assigned
+to the same workers.
 
 The evidence JSON envelope is strict and versioned:
 

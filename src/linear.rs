@@ -9,7 +9,7 @@ use crate::{
     Clock, DriftConfig, DriftEvidence, DriftTicket, Error, HistoricalProject, Initiative, Issue,
     IssueId, IssueTransition, Milestone, Project, ProjectId, ProjectMutationSource,
     ProjectPriority, ProjectRunStatus, SystemClock, TeamKey, WorkflowStateType, WorkspaceSnapshot,
-    WorkspaceSource,
+    WorkspaceSource, issue_is_open,
 };
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -317,10 +317,17 @@ impl LinearGraphQlSource {
             .filter(|issue| issue_matches_goal(issue))
         {
             priority_goal_team_keys.insert(issue.team_key.0.clone());
-            if let Some(assignee) = issue.assignee_id.as_deref() {
+            if issue.state_type == WorkflowStateType::Started
+                && let Some(assignee) = issue
+                    .assignee_id
+                    .as_deref()
+                    .filter(|assignee| !assignee.trim().is_empty())
+            {
                 priority_goal_assignees.insert(assignee.to_owned());
             }
-            pending_blockers.extend(issue.blocked_by.iter().map(|id| id.0.clone()));
+            if issue_is_open(issue) {
+                pending_blockers.extend(issue.blocked_by.iter().map(|id| id.0.clone()));
+            }
         }
         let mut visited_blockers = HashSet::new();
         while let Some(blocker_id) = pending_blockers.pop() {
@@ -329,17 +336,18 @@ impl LinearGraphQlSource {
             }
             history_issue_ids.insert(blocker_id.clone());
             if let Some(blocker) = issues_by_id.get(blocker_id.as_str()) {
-                if let Some(assignee) = blocker.assignee_id.as_deref() {
+                if blocker.state_type == WorkflowStateType::Started
+                    && let Some(assignee) = blocker
+                        .assignee_id
+                        .as_deref()
+                        .filter(|assignee| !assignee.trim().is_empty())
+                {
                     priority_goal_assignees.insert(assignee.to_owned());
                 }
-                pending_blockers.extend(blocker.blocked_by.iter().map(|id| id.0.clone()));
+                if issue_is_open(blocker) {
+                    pending_blockers.extend(blocker.blocked_by.iter().map(|id| id.0.clone()));
+                }
             }
-        }
-        if !priority_goal_team_keys.is_empty() && priority_goal_assignees.is_empty() {
-            evidence.missing.push(crate::MissingEvidence {
-                source: "linear.issues".to_owned(),
-                reason: "priority goal issues and their blockers have no assignee identities; cross-team activity cannot be attributed".to_owned(),
-            });
         }
 
         for issue in &snapshot.issues {
