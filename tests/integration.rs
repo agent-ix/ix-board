@@ -140,6 +140,7 @@ fn project(id: &str, identifier: &str, status: &str, priority: i32, sort_order: 
         id: ProjectId(id.to_owned()),
         identifier: Some(identifier.to_owned()),
         name: format!("Project {identifier}"),
+        updated_at: None,
         description: format!("Goal {identifier}"),
         content: Some("Project context".to_owned()),
         status: status.to_owned(),

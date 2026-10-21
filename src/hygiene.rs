@@ -1173,6 +1173,7 @@ mod tests {
                 id: ProjectId("p1".to_owned()),
                 identifier: None,
                 name: "P1".to_owned(),
+                updated_at: None,
                 description: String::new(),
                 content: None,
                 status: "Started".to_owned(),

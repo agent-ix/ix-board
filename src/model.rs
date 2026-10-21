@@ -143,6 +143,8 @@ pub struct Project {
     pub identifier: Option<String>,
     /// Project name.
     pub name: String,
+    /// UTC timestamp of the latest Linear project activity.
+    pub updated_at: Option<String>,
     /// Project description, used as the project goal.
     pub description: String,
     /// Project content in markdown.

@@ -9,6 +9,7 @@ mod drift;
 mod hygiene;
 mod linear;
 mod model;
+pub mod program_review;
 mod scope;
 pub use scope::{ScopeSelection, ScopeSummary, select_scope};
 
@@ -52,6 +53,9 @@ pub const FOCUS_RECORD_SCHEMA_VERSION: u32 = 2;
 /// Errors returned by the library's read and cache boundaries.
 #[derive(Debug, ThisError)]
 pub enum Error {
+    /// Program scope or roadmap operation failed.
+    #[error("program review failed: {message}")]
+    ProgramReview { message: String },
     /// A referenced ancestor was absent from the complete snapshot.
     #[error("ticket {identifier} has an unavailable parent {parent:?}")]
     MissingParent {
