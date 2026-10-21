@@ -313,35 +313,59 @@ fn walk_paths(
     cycles: &mut BTreeSet<Vec<IssueId>>,
     warnings: &mut Vec<String>,
 ) {
-    if active.len() >= edges.len().max(1) {
+    if paths.len() >= PATH_LIMIT {
+        warnings.push(format!(
+            "path output limited to {PATH_LIMIT} distinct chains"
+        ));
         return;
     }
+    let mut active_positions = active
+        .iter()
+        .enumerate()
+        .map(|(position, id)| (id.clone(), position))
+        .collect::<BTreeMap<_, _>>();
+    let mut frames = Vec::<(IssueId, usize)>::new();
     path.push(current.clone());
     active.push(current.clone());
-    let blockers = edges.get(current).map(Vec::as_slice).unwrap_or_default();
-    if blockers.is_empty() || unresolved.contains(current) {
-        paths.insert(path.clone());
-    } else {
-        for blocker in blockers {
-            if let Some(cycle_start) = active.iter().position(|id| id == blocker) {
-                let mut cycle = active[cycle_start..].to_vec();
-                cycle.push(blocker.clone());
-                cycles.insert(canonical_cycle(cycle));
-                continue;
-            }
-            if paths.len() >= PATH_LIMIT {
-                warnings.push(format!(
-                    "path output limited to {PATH_LIMIT} distinct chains"
-                ));
-                break;
-            }
-            walk_paths(
-                blocker, edges, unresolved, path, active, paths, cycles, warnings,
-            );
+    active_positions.insert(current.clone(), active.len() - 1);
+    frames.push((current.clone(), 0));
+
+    while let Some((issue_id, next_index)) = frames.last_mut() {
+        if paths.len() >= PATH_LIMIT {
+            warnings.push(format!(
+                "path output limited to {PATH_LIMIT} distinct chains"
+            ));
+            break;
         }
+        let blockers = edges.get(issue_id).map(Vec::as_slice).unwrap_or_default();
+        if blockers.is_empty() || unresolved.contains(issue_id) || *next_index >= blockers.len() {
+            if blockers.is_empty() || unresolved.contains(issue_id) {
+                paths.insert(path.clone());
+            }
+            let (finished, _) = frames.pop().expect("path frame exists");
+            active_positions.remove(&finished);
+            active.pop();
+            path.pop();
+            continue;
+        }
+        let blocker = blockers[*next_index].clone();
+        *next_index += 1;
+        if let Some(cycle_start) = active_positions.get(&blocker).copied() {
+            let mut cycle = active[cycle_start..].to_vec();
+            cycle.push(blocker);
+            cycles.insert(canonical_cycle(cycle));
+            continue;
+        }
+        active_positions.insert(blocker.clone(), active.len());
+        path.push(blocker.clone());
+        active.push(blocker.clone());
+        frames.push((blocker, 0));
     }
-    active.pop();
-    path.pop();
+    while let Some((id, _)) = frames.pop() {
+        active_positions.remove(&id);
+        active.pop();
+        path.pop();
+    }
 }
 
 fn canonical_cycle(cycle: Vec<IssueId>) -> Vec<IssueId> {
@@ -489,6 +513,39 @@ owns = "ECZ work"
             issues
                 .iter()
                 .all(|issue| issue.state_type != WorkflowStateType::Completed)
+        );
+    }
+
+    #[test]
+    fn long_blocker_chain_uses_heap_frames_instead_of_call_stack() {
+        let mut snapshot = snapshot();
+        let template = snapshot.issues[0].clone();
+        let chain_length = 12_000;
+        snapshot.issues = (0..chain_length)
+            .map(|index| {
+                let mut issue = template.clone();
+                issue.id = IssueId(format!("chain-{index}"));
+                issue.identifier = format!("CHN-{index:05}");
+                issue.blocked_by = if index + 1 < chain_length {
+                    vec![IssueId(format!("chain-{}", index + 1))]
+                } else {
+                    Vec::new()
+                };
+                issue
+            })
+            .collect();
+        let report = evaluate_chain(
+            &snapshot,
+            &[IssueId("chain-0".to_owned())],
+            None,
+            1_800_000_000.0,
+        )
+        .expect("evaluate a long dependency chain");
+        assert_eq!(report.paths.len(), 1);
+        assert_eq!(report.paths[0].issues.len(), chain_length);
+        assert_eq!(
+            report.root_blockers,
+            [format!("CHN-{:05}", chain_length - 1)]
         );
     }
 }
