@@ -117,3 +117,11 @@ dispositions:
         when the `--scope` selector is used.
       - **Downstream**: No dependent requirement is currently declared.
 ```
+
+## Acceptance re-check — implementation commit `20b50d15304d3b77274388c67a10c8f5fcf623c0`
+
+**PASS** — the current implementation satisfies all five FR-022 acceptance criteria. The edge budget is enforced before closure discovery can inspect more than 100,000 dependency edges; a limit produces incomplete-traversal evidence. Cycle enumeration is bounded and cycle canonicalization is linear-time. The scoped selection/report test is tagged to FR-022-AC-1.
+
+- `cargo test chain::tests -- --nocapture`: 10 tests passed.
+- The computed Quoin matrix binds FR-022-AC-1 through AC-5 to relevant tests; AC-1 includes the scope selection/report path.
+- `quire validate` passed for FR-022 and the review artifacts; `git diff --check` passed.

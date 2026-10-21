@@ -58,3 +58,12 @@ dispositions:
 ## Post-fix code review
 
 At `acda4af19470b139c2ee16bea62ccb97ea5961ed`, rechecked both original findings against the fix commit: FND-001 and FND-002 are fixed. No new code findings were identified. At `cc36aece6b5767fc566833e9eb99e0a3df702728`, the `src/chain.rs` and `src/main.rs` delta only changes trace IDs from FR-019 to FR-022 to match the uniquely numbered chain requirement; the reviewed traversal implementation is unchanged. No additional code-review finding or Linear comment is needed for this head.
+
+## Re-review — implementation commit `20b50d15304d3b77274388c67a10c8f5fcf623c0`
+
+**PASS** — the traversal budget is charged during closure discovery before inspecting each dependency edge, and limited nodes are marked unresolved with an incomplete-traversal warning. Cycle canonicalization uses a linear-time least-rotation algorithm. The scope selection/report test is trace-tagged to FR-022-AC-1.
+
+- Reviewed the complete SWM-111 code delta against the ticket and FR-022.
+- `cargo test chain::tests -- --nocapture`: 10 tests passed, including the exact 100,000-edge bound, dense cycles, a 50,000-node cycle, and a 12,000-node chain.
+- `make ci` passed on the fix commit (format, Clippy, tests, deny, unsafe audit, docs, and matrix gates).
+- Quoin matrix binds FR-022-AC-1 through AC-5 to relevant tests; `git diff --check` passed.
