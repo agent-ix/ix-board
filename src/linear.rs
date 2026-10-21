@@ -22,17 +22,18 @@ const PROJECT_PAGE_SIZE: i32 = 20;
 // 50 issues with up to 50 relations and 50 attachments each remain below the query complexity limit.
 const ISSUE_PAGE_SIZE: i32 = 50;
 const PROJECT_NESTED_PAGE_SIZE: i32 = 50;
+const INITIATIVE_PAGE_SIZE: i32 = 50;
 const RELATION_PAGE_SIZE: i32 = 50;
 const PAGE_LIMIT: usize = 1_000;
-// Invalidate cached snapshots predating assignee identity support.
-const CACHE_MODEL_VERSION: &str = "v9";
+// Invalidate cached snapshots predating the project activity timestamp.
+const CACHE_MODEL_VERSION: &str = "v10";
 const ENDPOINT: &str = "https://api.linear.app/graphql";
 
 const PROJECT_QUERY: &str = r#"
 query WorkspaceProjects($first: Int!, $nestedFirst: Int!, $after: String) {
   projects(first: $first, after: $after) {
     nodes {
-      id identifier name description content priority sortOrder targetDate
+      id identifier name description content priority sortOrder targetDate updatedAt
       status { name type }
       initiatives(first: 10) { nodes { id identifier name } pageInfo { hasNextPage } }
       teams(first: $nestedFirst) { nodes { key } pageInfo { hasNextPage } }
@@ -41,6 +42,14 @@ query WorkspaceProjects($first: Int!, $nestedFirst: Int!, $after: String) {
         pageInfo { hasNextPage }
       }
     }
+    pageInfo { hasNextPage endCursor }
+  }
+}"#;
+
+const INITIATIVES_QUERY: &str = r#"
+query WorkspaceInitiatives($first: Int!, $after: String) {
+  initiatives(first: $first, after: $after) {
+    nodes { id identifier name }
     pageInfo { hasNextPage endCursor }
   }
 }"#;
@@ -161,6 +170,36 @@ impl LinearGraphQlSource {
             return Ok(Some(resolved.source.as_str().to_owned()));
         }
         Ok(linear_cli_token().map(|_| "linear_cli".to_owned()))
+    }
+
+    /// Fetches every workspace initiative through Linear's paged initiatives connection.
+    pub fn fetch_initiatives(&self) -> Result<Vec<Initiative>, Error> {
+        let mut initiatives = Vec::new();
+        let mut after = None;
+        for page in 0..PAGE_LIMIT {
+            let result: InitiativeData = self.request(
+                INITIATIVES_QUERY,
+                PageVariables {
+                    first: INITIATIVE_PAGE_SIZE,
+                    after,
+                },
+            )?;
+            let connection = result.initiatives;
+            initiatives.extend(connection.nodes);
+            if !connection.page_info.has_next_page {
+                return Ok(initiatives);
+            }
+            after = Some(
+                connection
+                    .page_info
+                    .end_cursor
+                    .ok_or(Error::MissingCursor)?,
+            );
+            if page + 1 == PAGE_LIMIT {
+                return Err(Error::PaginationLimit { pages: PAGE_LIMIT });
+            }
+        }
+        Err(Error::PaginationLimit { pages: PAGE_LIMIT })
     }
 
     /// Collects current Linear scope and issue transitions for live priority-goal drift.
@@ -622,6 +661,7 @@ impl WorkspaceSource for LinearGraphQlSource {
                     id: ProjectId(raw.id),
                     identifier: raw.identifier,
                     name: raw.name,
+                    updated_at: raw.updated_at,
                     description: raw.description,
                     content: raw.content,
                     status: canonical_project_status(raw.status.name, raw.status.status_type),
@@ -931,6 +971,13 @@ struct Variables {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct PageVariables {
+    first: i32,
+    after: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct IssueHistoryVariables {
     id: String,
     first: i32,
@@ -1037,6 +1084,12 @@ struct ProjectData {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct InitiativeData {
+    initiatives: Connection<Initiative>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
 struct ProjectStatusesData {
     project_statuses: Connection<RawProjectStatusOption>,
@@ -1095,6 +1148,7 @@ struct RawProject {
     id: String,
     identifier: Option<String>,
     name: String,
+    updated_at: Option<String>,
     description: String,
     content: Option<String>,
     priority: i32,
@@ -1278,7 +1332,7 @@ struct RawRelationIssue {
 #[cfg(test)]
 mod tests {
     use super::{
-        CACHE_MODEL_VERSION, ISSUE_PAGE_SIZE, IssueData, LinearGraphQlSource,
+        CACHE_MODEL_VERSION, INITIATIVE_PAGE_SIZE, ISSUE_PAGE_SIZE, IssueData, LinearGraphQlSource,
         LinearProjectStatusType, PROJECT_PAGE_SIZE, PROJECT_UPDATE_MUTATION, ProjectData,
         ProjectUpdateInput, RawProjectStatusOption, canonical_project_status, collect_blocked_by,
         resolve_project_status_id,
@@ -1316,6 +1370,34 @@ mod tests {
                 .map(|body| (200, Vec::new(), body))
                 .collect(),
         )
+    }
+
+    #[test]
+    fn workspace_initiatives_follow_recorded_pages() {
+        let first: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/linear/initiative-page-one.json"
+        ))
+        .expect("decode first recorded initiative page");
+        let second: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/linear/initiative-page-two.json"
+        ))
+        .expect("decode second recorded initiative page");
+        let (endpoint, server) = mock_linear(vec![first, second]);
+        let source = LinearGraphQlSource::with_endpoint("test-key", endpoint)
+            .expect("source with local endpoint");
+        let initiatives = source.fetch_initiatives().expect("all initiative pages");
+        let requests = server.join().expect("mock server");
+        assert_eq!(
+            initiatives
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["QSL Core", "QSL Ecosystem"]
+        );
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["variables"]["first"], INITIATIVE_PAGE_SIZE);
+        assert!(requests[0]["variables"]["after"].is_null());
+        assert_eq!(requests[1]["variables"]["after"], "cursor-core");
     }
 
     type MockResponse = (u16, Vec<(&'static str, String)>, Value);
@@ -1693,6 +1775,7 @@ mod tests {
                 id: ProjectId("project-id".to_owned()),
                 identifier: Some("SWM-P1".to_owned()),
                 name: "Project".to_owned(),
+                updated_at: None,
                 description: "Goal".to_owned(),
                 content: None,
                 status: "Started".to_owned(),

@@ -32,6 +32,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
 schemars = "1.2"
 rpassword = "7"
+toml = "0.8"
 
 [dev-dependencies]
 assert_cmd = "2"

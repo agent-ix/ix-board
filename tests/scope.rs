@@ -12,6 +12,7 @@ fn project(id: &str, name: &str) -> Project {
         id: ProjectId(id.into()),
         identifier: None,
         name: name.into(),
+        updated_at: None,
         description: String::new(),
         content: None,
         status: "Started".into(),

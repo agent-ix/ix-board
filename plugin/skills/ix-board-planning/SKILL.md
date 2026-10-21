@@ -12,6 +12,44 @@ If credentials are missing, run `ix-board auth login` in an interactive terminal
 
 ## Choose a report
 
+For a program review, keep one scope file beside the program's working notes and pass it to every review command. The file uses TOML and stores names rather than counts, SHAs, or versions. `primary_initiative` determines where a project is listed; `also_in` keeps secondary membership visible without duplicating the project.
+
+```toml
+program = "QSL"
+out_of_scope = ["Sapho"]
+
+[[initiatives]]
+name = "QSL Core"
+
+[[projects]]
+name = "QSL Compiler, Runtime & Tooling"
+primary_initiative = "QSL Core"
+also_in = []
+
+[[repos]]
+name = "agent-ix/quire"
+purpose = "QSpec tooling and language requirements"
+
+[[lanes]]
+address = "terra:QSL:program-review"
+owns = "cross-lane QSL review"
+```
+
+Check the listed initiatives, projects, and GitHub repositories, and see projects in the chosen initiatives that the file has not placed:
+
+```bash
+ix-board scope check --scope qsl.toml
+ix-board roadmap --scope qsl.toml
+```
+
+The full workspace roadmap works without a scope file:
+
+```bash
+ix-board roadmap
+```
+
+Projects appear once under their primary initiative. The report includes their other initiative memberships, current Linear issue-state counts, progress, and last activity. It also reports projects with no initiative and initiatives with no projects.
+
 1. For "how is this project or initiative going?", progress by milestone, blockers, or current ready work, use the `focus-status` skill with the requested selector. Use `--initiative` for a campaign spanning projects:
 
    Initiative selectors accept a Linear UUID, visible identifier such as `I-10`, or exact name.

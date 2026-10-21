@@ -8,6 +8,9 @@ use ix_board::agents::{
     AgentsReport, Host, ReadyTicket, SystemHost, build_report, parse_duration, parse_machines,
     render_text,
 };
+use ix_board::program_review::{
+    ProgramRoadmap, ProgramScope, ScopeCheckReport, build_roadmap, check_scope,
+};
 use ix_board::{
     DriftConfig, DriftError, DriftEvidenceFile, DriftReport, Error, FocusExpansion,
     FocusHygieneReport, FocusPlanChunk, FocusProjectMembership, FocusRecord, FocusSelection,
@@ -107,6 +110,27 @@ enum Command {
     Project {
         #[command(subcommand)]
         command: ProjectCommand,
+    },
+    /// Validate a program scope file against Linear and GitHub.
+    Scope {
+        #[command(subcommand)]
+        command: ProgramScopeCommand,
+    },
+    /// List initiatives and projects with current progress and issue counts.
+    Roadmap {
+        /// Restrict the report to the initiatives and projects in this scope file.
+        #[arg(long)]
+        scope: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ProgramScopeCommand {
+    /// Check listed records and report unplaced projects.
+    Check {
+        /// TOML program scope file.
+        #[arg(long, required = true)]
+        scope: PathBuf,
     },
 }
 
@@ -255,6 +279,8 @@ enum Output {
         priority: i32,
         label: String,
     },
+    ProgramScopeCheck(ScopeCheckReport),
+    ProgramRoadmap(ProgramRoadmap),
 }
 
 fn parse_project_status(value: &str) -> Result<ProjectRunStatus, String> {
@@ -336,6 +362,7 @@ fn output_outcome(output: &Output) -> Outcome {
             Outcome::Invalid
         }
         Output::Agents(report) if !report.errors.is_empty() => Outcome::Internal,
+        Output::ProgramScopeCheck(report) if !report.is_valid() => Outcome::Partial,
         _ => Outcome::Ok,
     }
 }
@@ -448,6 +475,34 @@ fn run(command: Command) -> Result<Output, Error> {
             live,
         } => run_drift(&config, evidence.as_ref(), live).map(Output::Drift),
         Command::Agents { teams, idle_after } => run_agents(&teams, idle_after).map(Output::Agents),
+        Command::Scope {
+            command: ProgramScopeCommand::Check { scope },
+        } => {
+            let scope = ProgramScope::load(scope).map_err(|error| Error::ProgramReview {
+                message: error.to_string(),
+            })?;
+            let source = LinearGraphQlSource::from_env()?;
+            let initiatives = source.fetch_initiatives()?;
+            let workspace = ix_board::WorkspaceSource::fetch_workspace(&source)?;
+            check_scope(&scope, &initiatives, &workspace)
+                .map(Output::ProgramScopeCheck)
+                .map_err(Error::from)
+        }
+        Command::Roadmap { scope } => {
+            let scope = scope.map(ProgramScope::load).transpose().map_err(|error| {
+                Error::ProgramReview {
+                    message: error.to_string(),
+                }
+            })?;
+            let source = LinearGraphQlSource::from_env()?;
+            let initiatives = source.fetch_initiatives()?;
+            let workspace = ix_board::WorkspaceSource::fetch_workspace(&source)?;
+            Ok(Output::ProgramRoadmap(build_roadmap(
+                &initiatives,
+                &workspace,
+                scope.as_ref(),
+            )))
+        }
         other => run_linear(other),
     }
 }
@@ -534,6 +589,9 @@ fn run_linear(command: Command) -> Result<Output, Error> {
     match command {
         Command::Auth { .. } => unreachable!("auth commands are handled before Linear dispatch"),
         Command::Agents { .. } => unreachable!("agents is handled before Linear dispatch"),
+        Command::Scope { .. } | Command::Roadmap { .. } => {
+            unreachable!("program review commands are handled before Linear dispatch")
+        }
         Command::Next { team } => service.next(&team).map(Output::Queue),
         Command::ProjectChunk { project } => service.project_chunk(&project).map(Output::Chunk),
         Command::Search { query } => service.search(&query).map(Output::Search),
@@ -753,6 +811,26 @@ fn render_human(output: &Output) -> String {
         }
         Output::Drift(report) => render_drift_text(report),
         Output::Agents(report) => render_text(report),
+        Output::ProgramScopeCheck(report) => {
+            let mut lines = Vec::new();
+            for name in &report.missing_initiatives {
+                lines.push(format!("missing initiative: {name}"));
+            }
+            for name in &report.missing_projects {
+                lines.push(format!("missing project: {name}"));
+            }
+            for name in &report.missing_repositories {
+                lines.push(format!("missing repository: {name}"));
+            }
+            for name in &report.unplaced_projects {
+                lines.push(format!("unplaced project: {name}"));
+            }
+            if lines.is_empty() {
+                lines.push("scope valid".to_owned());
+            }
+            lines.join("\n")
+        }
+        Output::ProgramRoadmap(report) => render_roadmap(report),
         Output::ProjectStatusUpdated { project, status } => {
             format!("Project {project} status set to {status}")
         }
@@ -764,6 +842,43 @@ fn render_human(output: &Output) -> String {
             format!("Project {project} priority set to {priority} ({label})")
         }
     }
+}
+
+fn render_roadmap(report: &ProgramRoadmap) -> String {
+    let mut lines = Vec::new();
+    for initiative in &report.initiatives {
+        lines.push(initiative.name.clone());
+        for project in &initiative.projects {
+            lines.push(format!(
+                "  {} | {} | {}% | open {} done {} canceled {} | last activity {}{}",
+                project.name,
+                project.status,
+                project.progress_percent,
+                project.open,
+                project.done,
+                project.canceled,
+                project.last_activity.as_deref().unwrap_or("unknown"),
+                if project.also_in.is_empty() {
+                    String::new()
+                } else {
+                    format!(" | also in: {}", project.also_in.join(", "))
+                }
+            ));
+        }
+    }
+    for project in &report.unplaced_projects {
+        lines.push(format!(
+            "unplaced project: {} | {} | {}%",
+            project.name, project.status, project.progress_percent
+        ));
+    }
+    for initiative in &report.initiatives_without_projects {
+        lines.push(format!("initiative without projects: {initiative}"));
+    }
+    for project in &report.projects_in_multiple_initiatives {
+        lines.push(format!("project in multiple initiatives: {project}"));
+    }
+    lines.join("\n")
 }
 
 fn render_focus(expansion: &FocusExpansion) -> String {
@@ -1192,10 +1307,11 @@ fn render_chunk(chunk: &ProjectChunk) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, FocusCommand, Output, format_issue_ref, format_snapshot_time_at,
-        output_outcome, render_focus_status,
+        Cli, Command, FocusCommand, Output, ProgramScopeCommand, format_issue_ref,
+        format_snapshot_time_at, output_outcome, render_focus_status,
     };
     use clap::Parser;
+    use ix_board::program_review::ScopeCheckReport;
     use ix_board::{FocusStatus, IssueBatch, IssueId, IssueReference};
     use ix_cli_kit::exit::Outcome;
 
@@ -1226,6 +1342,33 @@ mod tests {
                 complete: false,
             })) as u8,
             Outcome::Invalid as u8
+        );
+    }
+
+    #[test]
+    fn program_review_commands_accept_the_scope_file_option() {
+        let scope = Cli::try_parse_from(["ix-board", "scope", "check", "--scope", "qsl.toml"])
+            .expect("parse scope check");
+        assert!(
+            matches!(scope.command, Command::Scope { command: ProgramScopeCommand::Check { scope } } if scope.to_str() == Some("qsl.toml"))
+        );
+
+        let roadmap = Cli::try_parse_from(["ix-board", "roadmap", "--scope", "qsl.toml"])
+            .expect("parse scoped roadmap");
+        assert!(
+            matches!(roadmap.command, Command::Roadmap { scope: Some(scope) } if scope.to_str() == Some("qsl.toml"))
+        );
+        assert!(Cli::try_parse_from(["ix-board", "roadmap"]).is_ok());
+    }
+
+    #[test]
+    fn scope_findings_produce_a_nonzero_partial_outcome() {
+        assert_eq!(
+            output_outcome(&Output::ProgramScopeCheck(ScopeCheckReport {
+                missing_projects: vec!["Missing project".to_owned()],
+                ..Default::default()
+            })) as u8,
+            Outcome::Partial as u8
         );
     }
     use std::collections::BTreeMap;
