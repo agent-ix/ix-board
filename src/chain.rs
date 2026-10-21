@@ -10,6 +10,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use thiserror::Error as ThisError;
 
 const PATH_LIMIT: usize = 2_000;
+const CYCLE_LIMIT: usize = 2_000;
+const TRAVERSAL_STEP_LIMIT: usize = 100_000;
 
 #[derive(Debug, ThisError)]
 pub enum ChainError {
@@ -217,25 +219,47 @@ pub fn evaluate_chain(
 
     let mut path_ids = BTreeSet::<Vec<IssueId>>::new();
     let mut cycles_by_id = BTreeSet::<Vec<IssueId>>::new();
+    let mut traversal_steps = 0;
+    let mut traversal_limited = false;
+    let mut cycles_limited = false;
     for start in &starts {
-        let mut path = Vec::new();
-        let mut active = Vec::new();
+        let mut traversal = TraversalPath::default();
+        let mut limits = TraversalLimits {
+            steps: traversal_steps,
+            traversal_limited,
+            cycles_limited,
+        };
         walk_paths(
             start,
             &edges,
             &unresolved,
-            &mut path,
-            &mut active,
+            &mut traversal,
             &mut path_ids,
             &mut cycles_by_id,
             &mut warnings,
+            &mut limits,
         );
-        if path_ids.len() >= PATH_LIMIT {
-            warnings.push(format!(
-                "path output limited to {PATH_LIMIT} distinct chains"
-            ));
+        traversal_steps = limits.steps;
+        traversal_limited = limits.traversal_limited;
+        cycles_limited = limits.cycles_limited;
+        if path_ids.len() >= PATH_LIMIT || traversal_limited || cycles_limited {
             break;
         }
+    }
+    if traversal_limited {
+        warnings.push(format!(
+            "graph traversal limited to {TRAVERSAL_STEP_LIMIT} edge visits"
+        ));
+    }
+    if cycles_limited {
+        warnings.push(format!(
+            "cycle output limited to {CYCLE_LIMIT} distinct cycles"
+        ));
+    }
+    if path_ids.len() >= PATH_LIMIT {
+        warnings.push(format!(
+            "path output limited to {PATH_LIMIT} distinct chains"
+        ));
     }
     let paths = path_ids
         .into_iter()
@@ -303,15 +327,27 @@ fn lane_map(scope: Option<&ProgramScope>) -> BTreeMap<String, String> {
         .collect()
 }
 
+#[derive(Default)]
+struct TraversalPath {
+    path: Vec<IssueId>,
+    active: Vec<IssueId>,
+}
+
+struct TraversalLimits {
+    steps: usize,
+    traversal_limited: bool,
+    cycles_limited: bool,
+}
+
 fn walk_paths(
     current: &IssueId,
     edges: &BTreeMap<IssueId, Vec<IssueId>>,
     unresolved: &BTreeSet<IssueId>,
-    path: &mut Vec<IssueId>,
-    active: &mut Vec<IssueId>,
+    traversal: &mut TraversalPath,
     paths: &mut BTreeSet<Vec<IssueId>>,
     cycles: &mut BTreeSet<Vec<IssueId>>,
     warnings: &mut Vec<String>,
+    limits: &mut TraversalLimits,
 ) {
     if paths.len() >= PATH_LIMIT {
         warnings.push(format!(
@@ -319,15 +355,16 @@ fn walk_paths(
         ));
         return;
     }
-    let mut active_positions = active
+    let mut active_positions = traversal
+        .active
         .iter()
         .enumerate()
         .map(|(position, id)| (id.clone(), position))
         .collect::<BTreeMap<_, _>>();
     let mut frames = Vec::<(IssueId, usize)>::new();
-    path.push(current.clone());
-    active.push(current.clone());
-    active_positions.insert(current.clone(), active.len() - 1);
+    traversal.path.push(current.clone());
+    traversal.active.push(current.clone());
+    active_positions.insert(current.clone(), traversal.active.len() - 1);
     frames.push((current.clone(), 0));
 
     while let Some((issue_id, next_index)) = frames.last_mut() {
@@ -338,33 +375,46 @@ fn walk_paths(
             break;
         }
         let blockers = edges.get(issue_id).map(Vec::as_slice).unwrap_or_default();
-        if blockers.is_empty() || unresolved.contains(issue_id) || *next_index >= blockers.len() {
-            if blockers.is_empty() || unresolved.contains(issue_id) {
-                paths.insert(path.clone());
+        if blockers.is_empty() || *next_index >= blockers.len() {
+            if blockers.is_empty() {
+                paths.insert(traversal.path.clone());
             }
             let (finished, _) = frames.pop().expect("path frame exists");
             active_positions.remove(&finished);
-            active.pop();
-            path.pop();
+            traversal.active.pop();
+            traversal.path.pop();
             continue;
         }
+        if limits.steps >= TRAVERSAL_STEP_LIMIT {
+            limits.traversal_limited = true;
+            break;
+        }
+        limits.steps += 1;
         let blocker = blockers[*next_index].clone();
         *next_index += 1;
+        if unresolved.contains(issue_id) {
+            // Keep the known partial route visible while also exploring its known branches.
+            paths.insert(traversal.path.clone());
+        }
         if let Some(cycle_start) = active_positions.get(&blocker).copied() {
-            let mut cycle = active[cycle_start..].to_vec();
+            let mut cycle = traversal.active[cycle_start..].to_vec();
             cycle.push(blocker);
             cycles.insert(canonical_cycle(cycle));
+            if cycles.len() >= CYCLE_LIMIT {
+                limits.cycles_limited = true;
+                break;
+            }
             continue;
         }
-        active_positions.insert(blocker.clone(), active.len());
-        path.push(blocker.clone());
-        active.push(blocker.clone());
+        active_positions.insert(blocker.clone(), traversal.active.len());
+        traversal.path.push(blocker.clone());
+        traversal.active.push(blocker.clone());
         frames.push((blocker, 0));
     }
     while let Some((id, _)) = frames.pop() {
         active_positions.remove(&id);
-        active.pop();
-        path.pop();
+        traversal.active.pop();
+        traversal.path.pop();
     }
 }
 
@@ -463,6 +513,7 @@ owns = "ECZ work"
     }
 
     #[test]
+    /// Trace: FR-019-AC-1, FR-019-AC-2
     fn fixture_expands_cross_team_chain_and_prioritizes_unowned_root() {
         let snapshot = snapshot();
         let scope = scope();
@@ -495,6 +546,55 @@ owns = "ECZ work"
     }
 
     #[test]
+    /// Trace: FR-019-AC-3
+    fn unavailable_blocker_keeps_known_downstream_paths_visible() {
+        let mut snapshot = snapshot();
+        snapshot.issues[0]
+            .blocked_by
+            .push(IssueId("missing-blocker".to_owned()));
+        let report = evaluate_chain(&snapshot, &[IssueId("issue-qsl-1".to_owned())], None, now())
+            .expect("evaluate partial blocker graph");
+
+        assert!(report.paths.iter().any(|path| path.issues == ["QSL-1"]));
+        assert!(
+            report
+                .paths
+                .iter()
+                .any(|path| path.issues == ["QSL-1", "IR-2", "ECZ-3"])
+        );
+        assert_eq!(report.warnings.len(), 1);
+    }
+
+    #[test]
+    /// Trace: FR-019-AC-4
+    fn dense_cycle_graph_has_independent_cycle_and_work_bounds() {
+        let mut snapshot = snapshot();
+        let template = snapshot.issues[0].clone();
+        let node_count = 24;
+        snapshot.issues = (0..node_count)
+            .map(|index| {
+                let mut issue = template.clone();
+                issue.id = IssueId(format!("dense-{index}"));
+                issue.identifier = format!("DNS-{index:02}");
+                issue.blocked_by = (0..node_count)
+                    .filter(|other| *other != index)
+                    .map(|other| IssueId(format!("dense-{other}")))
+                    .collect();
+                issue
+            })
+            .collect();
+        let report = evaluate_chain(&snapshot, &[IssueId("dense-0".to_owned())], None, now())
+            .expect("evaluate dense cyclic graph");
+
+        assert!(report.paths.is_empty());
+        assert!(report.cycles.len() <= CYCLE_LIMIT);
+        assert!(report.warnings.iter().any(|warning| {
+            warning.contains("cycle output limited") || warning.contains("graph traversal limited")
+        }));
+    }
+
+    #[test]
+    /// Trace: FR-019-AC-2
     fn fixture_reports_dependency_cycles_without_recursing_forever() {
         let snapshot = snapshot();
         let report = evaluate_chain(&snapshot, &[IssueId("issue-qsl-4".to_owned())], None, now())
@@ -517,6 +617,7 @@ owns = "ECZ work"
     }
 
     #[test]
+    /// Trace: FR-019-AC-5
     fn long_blocker_chain_uses_heap_frames_instead_of_call_stack() {
         let mut snapshot = snapshot();
         let template = snapshot.issues[0].clone();
