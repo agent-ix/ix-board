@@ -8,6 +8,7 @@ use ix_board::agents::{
     AgentsReport, Host, ReadyTicket, SystemHost, build_report, parse_duration, parse_machines,
     render_text,
 };
+use ix_board::chain::{ChainReport, evaluate_chain, open_scope_issues, resolve_issue};
 use ix_board::program_review::{
     ProgramRoadmap, ProgramScope, ScopeCheckReport, build_roadmap, check_scope,
 };
@@ -136,6 +137,14 @@ enum Command {
         /// Staleness threshold in positive whole days.
         #[arg(long, default_value_t = DEFAULT_STALE_DAYS, value_parser = parse_positive_days)]
         stale_days: u32,
+    },
+    /// Expand blocker chains from one issue or every open ticket in a program scope.
+    Chain {
+        /// Linear issue identifier or UUID.
+        issue: Option<String>,
+        /// Program scope file; when issue is omitted, expands all open project tickets in it.
+        #[arg(long, required_unless_present = "issue")]
+        scope: Option<PathBuf>,
     },
 }
 
@@ -297,6 +306,7 @@ enum Output {
     ProgramScopeCheck(ScopeCheckReport),
     ProgramRoadmap(ProgramRoadmap),
     Reconcile(ReconcileReport),
+    Chain(ChainReport),
 }
 
 fn parse_project_status(value: &str) -> Result<ProjectRunStatus, String> {
@@ -563,6 +573,43 @@ fn run(command: Command) -> Result<Output, Error> {
             .map(Output::Reconcile)
             .map_err(Error::from)
         }
+        Command::Chain { issue, scope } => {
+            let scope = scope.map(ProgramScope::load).transpose().map_err(|error| {
+                Error::ProgramReview {
+                    message: error.to_string(),
+                }
+            })?;
+            let source = LinearGraphQlSource::from_env()?;
+            let workspace = source.fetch_workspace()?;
+            let starts = if let Some(issue) = issue.as_deref() {
+                vec![
+                    resolve_issue(&workspace, issue)
+                        .map_err(Error::from)?
+                        .id
+                        .clone(),
+                ]
+            } else if let Some(scope) = scope.as_ref() {
+                open_scope_issues(&workspace, scope)
+                    .map_err(Error::from)?
+                    .into_iter()
+                    .map(|issue| issue.id.clone())
+                    .collect::<Vec<_>>()
+            } else {
+                return Err(Error::EmptyFocus);
+            };
+            if starts.is_empty() {
+                return Err(Error::EmptyFocus);
+            }
+            let now_epoch = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|error| Error::ProgramReview {
+                    message: format!("system clock is before Unix epoch: {error}"),
+                })?
+                .as_secs_f64();
+            evaluate_chain(&workspace, &starts, scope.as_ref(), now_epoch)
+                .map(Output::Chain)
+                .map_err(Error::from)
+        }
         other => run_linear(other),
     }
 }
@@ -649,7 +696,10 @@ fn run_linear(command: Command) -> Result<Output, Error> {
     match command {
         Command::Auth { .. } => unreachable!("auth commands are handled before Linear dispatch"),
         Command::Agents { .. } => unreachable!("agents is handled before Linear dispatch"),
-        Command::Scope { .. } | Command::Roadmap { .. } | Command::Reconcile { .. } => {
+        Command::Scope { .. }
+        | Command::Roadmap { .. }
+        | Command::Reconcile { .. }
+        | Command::Chain { .. } => {
             unreachable!("program review commands are handled before Linear dispatch")
         }
         Command::Next { team } => service.next(&team).map(Output::Queue),
@@ -892,6 +942,7 @@ fn render_human(output: &Output) -> String {
         }
         Output::ProgramRoadmap(report) => render_roadmap(report),
         Output::Reconcile(report) => render_reconcile(report),
+        Output::Chain(report) => render_chain(report),
         Output::ProjectStatusUpdated { project, status } => {
             format!("Project {project} status set to {status}")
         }
@@ -1010,6 +1061,84 @@ fn render_reconcile(report: &ReconcileReport) -> String {
         }
     }
     lines.join("\n")
+}
+
+fn render_chain(report: &ChainReport) -> String {
+    let nodes = report
+        .nodes
+        .iter()
+        .map(|node| (node.identifier.as_str(), node))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut lines = vec![format!("Blocker chain for {}", report.starts.join(", "))];
+    lines.push(format!(
+        "Root blockers without assignee or lane ({}):",
+        report.unowned_root_blockers.len()
+    ));
+    if report.unowned_root_blockers.is_empty() {
+        lines.push("  (none)".to_owned());
+    }
+    for identifier in &report.unowned_root_blockers {
+        if let Some(node) = nodes.get(identifier.as_str()) {
+            lines.push(format!("  {}", format_chain_node(node)));
+        }
+    }
+    lines.push(format!(
+        "All root blockers ({}):",
+        report.root_blockers.len()
+    ));
+    if report.root_blockers.is_empty() {
+        lines.push("  (none; cycles or unresolved blockers may prevent a root)".to_owned());
+    }
+    for identifier in &report.root_blockers {
+        if let Some(node) = nodes.get(identifier.as_str()) {
+            lines.push(format!("  {}", format_chain_node(node)));
+        }
+    }
+    lines.push(format!("Blocker paths ({}):", report.paths.len()));
+    if report.paths.is_empty() {
+        lines.push("  (none)".to_owned());
+    }
+    for path in &report.paths {
+        lines.push(format!("  {}", path.issues.join(" -> ")));
+        for identifier in &path.issues {
+            if let Some(node) = nodes.get(identifier.as_str()) {
+                lines.push(format!("    {}", format_chain_node(node)));
+            }
+        }
+    }
+    lines.push(format!("Cycles ({}):", report.cycles.len()));
+    if report.cycles.is_empty() {
+        lines.push("  (none)".to_owned());
+    }
+    for cycle in &report.cycles {
+        lines.push(format!("  {}", cycle.join(" -> ")));
+        for identifier in cycle.iter().take(cycle.len().saturating_sub(1)) {
+            if let Some(node) = nodes.get(identifier.as_str()) {
+                lines.push(format!("    {}", format_chain_node(node)));
+            }
+        }
+    }
+    for warning in &report.warnings {
+        lines.push(format!("warning: {warning}"));
+    }
+    lines.join("\n")
+}
+
+fn format_chain_node(node: &ix_board::chain::ChainNode) -> String {
+    let owner = node
+        .assignee_name
+        .as_deref()
+        .or(node.assignee_id.as_deref())
+        .unwrap_or("unassigned");
+    let lane = node.owner_lane.as_deref().unwrap_or("unknown");
+    let age = node
+        .age_days
+        .map(|days| format!("{days} days old"))
+        .unwrap_or_else(|| "age unknown".to_owned());
+    format!(
+        "{} [{}] team={} lane={} owner={} age={} — {}",
+        node.identifier, node.state, node.team, lane, owner, age, node.title
+    )
 }
 
 fn render_focus(expansion: &FocusExpansion) -> String {
@@ -1439,7 +1568,8 @@ fn render_chunk(chunk: &ProjectChunk) -> String {
 mod tests {
     use super::{
         Cli, Command, FocusCommand, Output, ProgramScopeCommand, format_issue_ref,
-        format_snapshot_time_at, output_outcome, render_focus_status, render_reconcile,
+        format_snapshot_time_at, output_outcome, render_chain, render_focus_status,
+        render_reconcile,
     };
     use clap::Parser;
     use ix_board::program_review::ScopeCheckReport;
@@ -1514,6 +1644,18 @@ mod tests {
         assert!(
             Cli::try_parse_from(["ix-board", "reconcile", "SWM", "--stale-days", "0"]).is_err()
         );
+
+        let chain =
+            Cli::try_parse_from(["ix-board", "chain", "QSL-42"]).expect("parse single issue chain");
+        assert!(
+            matches!(chain.command, Command::Chain { issue: Some(issue), scope: None } if issue == "QSL-42")
+        );
+        let scoped_chain = Cli::try_parse_from(["ix-board", "chain", "--scope", "program.toml"])
+            .expect("parse scoped chain");
+        assert!(
+            matches!(scoped_chain.command, Command::Chain { issue: None, scope: Some(scope) } if scope.to_str() == Some("program.toml"))
+        );
+        assert!(Cli::try_parse_from(["ix-board", "chain"]).is_err());
     }
 
     /// Trace: FR-021-AC-3
@@ -1547,6 +1689,60 @@ mod tests {
         ] {
             assert!(json["findings"][group].is_array());
         }
+    }
+
+    #[test]
+    /// Trace: FR-022-AC-1
+    fn chain_human_and_json_outputs_include_graph_details() {
+        let report = ix_board::chain::ChainReport {
+            starts: vec!["QSL-1".to_owned()],
+            nodes: vec![ix_board::chain::ChainNode {
+                id: IssueId("issue-1".to_owned()),
+                identifier: "QSL-1".to_owned(),
+                title: "Review API".to_owned(),
+                state: "In Progress".to_owned(),
+                team: "QSL".to_owned(),
+                owner_lane: Some("terra:QSL:code".to_owned()),
+                assignee_id: Some("user-1".to_owned()),
+                assignee_name: Some("Quill Dev".to_owned()),
+                age_days: Some(12),
+                blocked_by: vec!["IR-2".to_owned()],
+                root_blocker: false,
+                unowned_root_blocker: false,
+            }],
+            paths: vec![ix_board::chain::ChainPath {
+                start: "QSL-1".to_owned(),
+                issues: vec!["QSL-1".to_owned(), "IR-2".to_owned()],
+            }],
+            root_blockers: vec!["IR-2".to_owned()],
+            unowned_root_blockers: vec!["IR-2".to_owned()],
+            cycles: vec![vec![
+                "QSL-4".to_owned(),
+                "QSL-5".to_owned(),
+                "QSL-4".to_owned(),
+            ]],
+            warnings: Vec::new(),
+        };
+        let human = render_chain(&report);
+        for detail in [
+            "QSL-1",
+            "In Progress",
+            "team=QSL",
+            "terra:QSL:code",
+            "Quill Dev",
+            "12 days old",
+            "QSL-4 -> QSL-5 -> QSL-4",
+        ] {
+            assert!(
+                human.contains(detail),
+                "human output should include {detail}"
+            );
+        }
+        let json = serde_json::to_value(Output::Chain(report)).unwrap();
+        assert!(json["nodes"].is_array());
+        assert_eq!(json["nodes"][0]["assignee_name"], "Quill Dev");
+        assert_eq!(json["cycles"][0][1], "QSL-5");
+        assert_eq!(json["unowned_root_blockers"][0], "IR-2");
     }
 
     #[test]

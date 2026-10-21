@@ -25,8 +25,8 @@ const PROJECT_NESTED_PAGE_SIZE: i32 = 50;
 const INITIATIVE_PAGE_SIZE: i32 = 50;
 const RELATION_PAGE_SIZE: i32 = 50;
 const PAGE_LIMIT: usize = 1_000;
-// Invalidate cached snapshots predating the project activity timestamp.
-const CACHE_MODEL_VERSION: &str = "v10";
+// Invalidate cached snapshots predating the project activity and issue assignee fields.
+const CACHE_MODEL_VERSION: &str = "v11";
 const ENDPOINT: &str = "https://api.linear.app/graphql";
 
 const PROJECT_QUERY: &str = r#"
@@ -61,7 +61,7 @@ query WorkspaceIssues($first: Int!, $relationFirst: Int!, $after: String) {
       id identifier title description priority sortOrder createdAt updatedAt
       state { name type }
       team { key }
-      assignee { id }
+      assignee { id name }
       project { id }
       projectMilestone { id }
       parent { id }
@@ -752,7 +752,8 @@ impl WorkspaceSource for LinearGraphQlSource {
                     state_type,
                     parent_id: raw.parent.map(|p| IssueId(p.id)),
                     team_key: TeamKey(raw.team.key),
-                    assignee_id: raw.assignee.map(|assignee| assignee.id),
+                    assignee_id: raw.assignee.as_ref().map(|assignee| assignee.id.clone()),
+                    assignee_name: raw.assignee.and_then(|assignee| assignee.name),
                     project_id: raw.project.map(|project| ProjectId(project.id)),
                     project_milestone_id: raw.project_milestone.map(|milestone| milestone.id),
                     priority: raw.priority,
@@ -1200,6 +1201,7 @@ struct RawTeam {
 #[serde(deny_unknown_fields)]
 struct RawUser {
     id: String,
+    name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1798,6 +1800,7 @@ mod tests {
                     state_name: "Done".to_owned(),
                     team_key: TeamKey("SWM".to_owned()),
                     assignee_id: None,
+                    assignee_name: None,
                     project_id: None,
                     project_milestone_id: None,
                     priority: 2.0,
@@ -1820,6 +1823,7 @@ mod tests {
                     state_name: "Specced".to_owned(),
                     team_key: TeamKey("SWM".to_owned()),
                     assignee_id: None,
+                    assignee_name: None,
                     project_id: Some(ProjectId("project-id".to_owned())),
                     project_milestone_id: None,
                     priority: 2.0,
@@ -2022,7 +2026,7 @@ mod tests {
         assert_eq!(requests[0]["variables"]["first"], 20);
         assert_eq!(requests[0]["variables"]["nestedFirst"], 50);
         assert!(requests[1]["query"].as_str().is_some_and(|query| {
-            query.contains("state { name type }") && query.contains("assignee { id }")
+            query.contains("state { name type }") && query.contains("assignee { id name }")
         }));
         assert_eq!(requests[1]["variables"]["first"], 50);
         assert!(requests[1]["variables"]["nestedFirst"].is_null());
@@ -2140,7 +2144,7 @@ mod tests {
                     "sortOrder": 3.0,
                     "state": {"name": "Specced", "type": "started"},
                     "team": {"key": "SWM"},
-                    "assignee": {"id": "worker-uuid"},
+                    "assignee": {"id": "worker-uuid", "name": "Worker One"},
                     "project": {"id": "project-uuid"},
                     "relations": {
                         "nodes": [{
@@ -2169,6 +2173,13 @@ mod tests {
                 .as_ref()
                 .map(|assignee| assignee.id.as_str()),
             Some("worker-uuid")
+        );
+        assert_eq!(
+            issues.issues.nodes[0]
+                .assignee
+                .as_ref()
+                .and_then(|assignee| assignee.name.as_deref()),
+            Some("Worker One")
         );
         assert!(
             collect_blocked_by(&issues.issues.nodes)

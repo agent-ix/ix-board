@@ -5,6 +5,7 @@
 
 pub mod agents;
 mod cache;
+pub mod chain;
 mod drift;
 mod hygiene;
 mod linear;

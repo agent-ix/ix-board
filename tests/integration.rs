@@ -184,6 +184,7 @@ fn issue(
                 .to_owned(),
         ),
         assignee_id: None,
+        assignee_name: None,
         project_id: project_id.map(|id| ProjectId(id.to_owned())),
         project_milestone_id: None,
         priority,

@@ -205,6 +205,9 @@ pub struct Issue {
     pub team_key: TeamKey,
     /// Linear UUID of the current assignee, when assigned.
     pub assignee_id: Option<String>,
+    /// Display name of the current assignee, when Linear provides it.
+    #[serde(default)]
+    pub assignee_name: Option<String>,
     /// Associated project UUID.
     pub project_id: Option<ProjectId>,
     /// Associated project milestone UUID, when the issue belongs to a milestone.

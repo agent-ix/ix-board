@@ -1155,6 +1155,7 @@ mod tests {
             parent_id: None,
             team_key: TeamKey("IR".to_owned()),
             assignee_id: None,
+            assignee_name: None,
             project_id: Some(ProjectId("p1".to_owned())),
             project_milestone_id: Some("m1".to_owned()),
             priority: 2.0,
