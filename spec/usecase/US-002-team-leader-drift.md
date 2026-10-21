@@ -59,6 +59,19 @@ guessing a lead.
 - **Then** the affected signal explains that its evidence is incomplete,
   without presenting a clean status based on the partial view
 
+### US-002-EX-6: Rebalance a crowded priority goal
+
+- **Given** a configured priority goal with a positive minimum number of
+  workers and a no-progress-hours threshold
+- **When** a drift report finds no goal completion or state transition for
+  that threshold while other project tickets advance
+- **Then** the report names the goal, elapsed hours, distinct active assignees
+  versus the minimum, and the advancing projects and ticket IDs so the team
+  leader can return a worker to the goal
+- **And** when issue, assignee, membership, blocker, or history evidence is
+  incomplete, the report identifies the missing evidence and does not present
+  an on-track result
+
 ## Notes (Informative)
 
 The shared GitHub account cannot establish which lead owns a PR without a

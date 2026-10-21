@@ -20,7 +20,9 @@ SWM-2 gives team leaders deterministic Linear reads for ready work, project
 context, and search through the ix-board CLI and library. SWM-3 adds explicit
 project status and priority writes so team leaders can control the run queue.
 SWM-4 reports evidence of work outside that queue and work that is active but
-not landing. SWM-102 adds program scope validation against live Linear and
+not landing. SWM-64 extends drift with priority-goal staffing and crowding
+assessments using configured distinct-worker minimums and stale thresholds.
+SWM-102 adds program scope validation against live Linear and
 GitHub catalogs; SWM-103 adds a live program roadmap with derived project
 progress. SWM-104 adds read-only reconciliation between Linear project issue
 state and linked GitHub pull requests (FR-021). SWM-112 adds a read-only report
@@ -64,6 +66,10 @@ with the last successful report for that focus.
   a stable JSON field contract, and one text line per lead. Its time-based
   decisions require complete event enumeration and contemporaneous queue
   evidence; incomplete reads produce unavailable signal results.
+- `drift` assesses configured priority goals on every invocation, reporting
+  completion/transition age against each goal's configured no-progress
+  threshold, distinct active assignees against the minimum, and projects and
+  ticket IDs that advanced while a goal was stale.
 - Program scope files are checked against live Linear and GitHub catalogs, and
   program roadmaps derive project progress from live issue records (FR-019 and
   FR-020).
@@ -145,4 +151,5 @@ fixture benchmark.
 
 - SWM-2, “ix-board: next, project-chunk and search with cache” (Linear).
 - SWM-4, “ix-board drift: out-of-scope and churn alerts” (Linear).
+- SWM-64, “Detect priority goal crowding and rebalance planner capacity” (Linear).
 - The ix-board README and source repository.
