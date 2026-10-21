@@ -167,8 +167,9 @@ when the goal has no structured project or milestone membership:
 }
 ```
 
-The report includes last completion and transition times, hours since linked
-progress, the distinct active assignee count and configured minimum, current
+The report includes last completion and transition times, hours since the
+latest completion or state transition, the no-progress threshold, the distinct
+active assignee count and configured minimum, current
 direct and transitive blockers, and other projects with transitions in the
 no-progress interval. A worker counts once by Linear assignee ID across active
 goal issues and open blockers; unassigned and inactive issues add no workers.

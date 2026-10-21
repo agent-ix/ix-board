@@ -558,13 +558,13 @@ pub struct DriftReport {
 pub struct PriorityGoalReport {
     /// Configured project or milestone identifier.
     pub goal: String,
+    /// Configured threshold for stale progress, in hours.
+    pub no_progress_hours: f64,
     /// Last issue completion timestamp on this goal, if observed.
     pub last_completion_at: Option<String>,
     /// Last issue state transition timestamp on this goal, if observed.
     pub last_transition_at: Option<String>,
-    /// Last observed linked work activity (transition, PR change, or commit).
-    pub last_activity_at: Option<String>,
-    /// Hours since the most recent linked work activity.
+    /// Elapsed UTC hours since the latest state transition or completion.
     pub hours_since_progress: Option<f64>,
     /// Distinct nonempty assignee IDs on active goal issues and open blockers, if complete.
     pub active_workers: Option<u64>,
@@ -1148,11 +1148,6 @@ fn evaluate_priority_goals(
                 .filter(|event| goal_ids.contains(&event.issue_id))
                 .map(|event| Ok((timestamp_epoch(&event.occurred_at)?, event)))
                 .collect::<Result<_, DriftError>>()?;
-            let linked_transitions: Vec<_> = transitions
-                .iter()
-                .filter(|event| linked_ids.contains(&event.issue_id))
-                .map(|event| Ok((timestamp_epoch(&event.occurred_at)?, event)))
-                .collect::<Result<_, DriftError>>()?;
             let last_transition = goal_transitions
                 .iter()
                 .map(|(at, event)| (*at, *event))
@@ -1170,7 +1165,6 @@ fn evaluate_priority_goals(
                 .filter(|(at, _)| *at <= report_epoch)
                 .max_by(|a, b| a.0.total_cmp(&b.0));
             let mut active_workers = BTreeSet::new();
-            let mut goal_activity = Vec::new();
             let active_scope_tickets: Vec<_> = evidence
                 .tickets
                 .iter()
@@ -1189,35 +1183,24 @@ fn evaluate_priority_goals(
                 {
                     active_workers.insert(assignee);
                 }
-                let latest = latest_ticket_activity(
-                    ticket,
-                    &linked_transitions,
-                    &evidence.pull_requests,
-                    &evidence.commits,
-                    report_epoch,
-                )?;
-                if let Some(at) = latest {
-                    goal_activity.push((at, ticket.identifier.as_str()));
-                }
             }
-            for ticket in evidence
-                .tickets
+            let history_complete = missing_goal_history.is_empty();
+            let baseline = goal_ids
                 .iter()
-                .filter(|ticket| linked_ids.contains(&ticket.id))
-            {
-                if let Some(at) = latest_ticket_activity(
-                    ticket,
-                    &linked_transitions,
-                    &evidence.pull_requests,
-                    &evidence.commits,
-                    report_epoch,
-                )? {
-                    goal_activity.push((at, ticket.identifier.as_str()));
-                }
-            }
-            let last_activity = goal_activity.iter().max_by(|a, b| a.0.total_cmp(&b.0));
-            let hours_since_progress =
-                last_activity.map(|(at, _)| ((report_epoch - at) / 3600.0).max(0.0));
+                .filter_map(|id| tickets_by_id.get(id.as_str()))
+                .map(|ticket| timestamp_epoch(&ticket.created_at))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .min_by(f64::total_cmp);
+            let progress_at = last_completion
+                .map(|(at, _)| at)
+                .into_iter()
+                .chain(last_transition.map(|(at, _)| at))
+                .max_by(f64::total_cmp)
+                .or(baseline);
+            let hours_since_progress = history_complete
+                .then(|| progress_at.map(|at| ((report_epoch - at) / 3600.0).max(0.0)))
+                .flatten();
             let stale_start = report_epoch - goal.no_progress_hours * 3600.0;
             let mut competing: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
             let mut out_of_team: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
@@ -1337,14 +1320,13 @@ fn evaluate_priority_goals(
             };
             let crowding_out = group_rows(competing);
             let out_of_team_activity = group_rows(out_of_team);
-            let stale = hours_since_progress.is_none_or(|hours| hours >= goal.no_progress_hours);
+            let stale = hours_since_progress.is_some_and(|hours| hours >= goal.no_progress_hours);
             let every_open_goal_ticket_blocked = !open_goal_ids.is_empty()
                 && open_goal_ids
                     .iter()
                     .all(|goal_id| blocked_goal_ids.contains(goal_id));
             let trusted = missing_sources.is_empty();
-            let goal_structure_complete =
-                missing_for(evidence, &["linear.issues"]).is_empty() && worker_evidence_complete;
+            let goal_structure_complete = worker_evidence_complete;
             let staffing_shortfall = worker_evidence_complete
                 && active_workers.len()
                     < usize::try_from(goal.minimum_workers).unwrap_or(usize::MAX);
@@ -1374,13 +1356,17 @@ fn evaluate_priority_goals(
             };
             Ok(PriorityGoalReport {
                 goal: goal.goal.clone(),
-                last_completion_at: last_completion
+                no_progress_hours: goal.no_progress_hours,
+                last_completion_at: history_complete
+                    .then_some(last_completion)
+                    .flatten()
                     .map(|(_, event)| canonical_timestamp(&event.occurred_at))
                     .transpose()?,
-                last_transition_at: last_transition
+                last_transition_at: history_complete
+                    .then_some(last_transition)
+                    .flatten()
                     .map(|(_, event)| canonical_timestamp(&event.occurred_at))
                     .transpose()?,
-                last_activity_at: last_activity.map(|(at, _)| format_timestamp(*at)),
                 hours_since_progress,
                 active_workers: worker_evidence_complete
                     .then(|| u64::try_from(active_workers.len()).unwrap_or(u64::MAX)),
@@ -1417,66 +1403,6 @@ fn is_active_ticket(ticket: &DriftTicket) -> bool {
             ticket.state.to_ascii_lowercase().as_str(),
             "coding" | "in progress"
         )
-}
-
-fn latest_ticket_activity(
-    ticket: &DriftTicket,
-    transitions: &[(f64, &IssueTransition)],
-    pull_requests: &[DriftPullRequest],
-    commits: &[DriftCommit],
-    report_epoch: f64,
-) -> Result<Option<f64>, DriftError> {
-    let mut latest = timestamp_epoch(&ticket.created_at)?;
-    if let Some(updated_at) = ticket.updated_at.as_deref() {
-        let at = timestamp_epoch(updated_at)?;
-        if at <= report_epoch {
-            latest = latest.max(at);
-        }
-    }
-    if let Some(entered) = ticket.state_entered_at.as_deref() {
-        let at = timestamp_epoch(entered)?;
-        if at <= report_epoch {
-            latest = latest.max(at);
-        }
-    }
-    for (at, _) in transitions
-        .iter()
-        .filter(|(_, event)| event.issue_id == ticket.id)
-    {
-        if *at <= report_epoch {
-            latest = latest.max(*at);
-        }
-    }
-    for pr in pull_requests
-        .iter()
-        .filter(|pr| ticket_links_pr(ticket, pr))
-    {
-        for stamp in [
-            Some(pr.created_at.as_str()),
-            pr.updated_at.as_deref(),
-            pr.merged_at.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let at = timestamp_epoch(stamp)?;
-            if at <= report_epoch {
-                latest = latest.max(at);
-            }
-        }
-    }
-    for commit in commits.iter().filter(|commit| {
-        commit
-            .ticket_ids
-            .iter()
-            .any(|id| id.eq_ignore_ascii_case(&ticket.identifier))
-    }) {
-        let at = timestamp_epoch(&commit.committed_at)?;
-        if at <= report_epoch {
-            latest = latest.max(at);
-        }
-    }
-    Ok((latest <= report_epoch).then_some(latest))
 }
 
 fn validate_evidence_numbers(evidence: &DriftEvidence) -> Result<(), DriftError> {
@@ -2214,7 +2140,7 @@ pub fn render_drift_text(report: &DriftReport) -> String {
             out_of_team = "none observed".to_owned();
         }
         format!(
-            "priority_goal {} status={} flagged={} trusted={} {}h_since_progress active_workers={}/{} blocked_on=[{}] last_activity={} crowding_out=[{}] out_of_team_activity=[{}] missing=[{}]",
+            "priority_goal {} status={} flagged={} trusted={} hours_since_progress={} no_progress_hours={} active_workers={}/{} last_completion_at={} last_transition_at={} blocked_on=[{}] crowding_out=[{}] out_of_team_activity=[{}] missing=[{}]",
             goal.goal,
             match goal.status {
                 PriorityGoalStatus::Unknown => "unknown",
@@ -2227,11 +2153,13 @@ pub fn render_drift_text(report: &DriftReport) -> String {
             goal.hours_since_progress
                 .map(|hours| format!("{hours:.1}"))
                 .unwrap_or_else(|| "unknown".to_owned()),
+            goal.no_progress_hours,
             goal.active_workers
                 .map_or_else(|| "unknown".to_owned(), |workers| workers.to_string()),
             goal.minimum_workers,
+            goal.last_completion_at.as_deref().unwrap_or("unknown"),
+            goal.last_transition_at.as_deref().unwrap_or("unknown"),
             if goal.blocked_on.is_empty() { "none".to_owned() } else { goal.blocked_on.join(",") },
-            goal.last_activity_at.as_deref().unwrap_or("unknown"),
             crowding,
             out_of_team,
             goal.missing_sources.join(","),
@@ -2875,6 +2803,12 @@ mod tests {
         );
         ir_pr.updated_at = Some("2026-10-05T17:00:00Z".to_owned());
         evidence.pull_requests.extend([b4_pr, qsl_pr, ir_pr]);
+        evidence.commits.push(DriftCommit {
+            sha: "goal-progress-commit".to_owned(),
+            repository: "agent-ix/example".to_owned(),
+            committed_at: "2026-10-05T17:30:00Z".to_owned(),
+            ticket_ids: vec!["QSL-485".to_owned()],
+        });
         evidence.transitions.push(IssueTransition {
             event_id: "qsl-last-completion".to_owned(),
             issue_id: "qsl485".to_owned(),
@@ -2895,6 +2829,7 @@ mod tests {
             Some("2026-10-05T05:00:00Z")
         );
         assert_eq!(goal.hours_since_progress, Some(13.0));
+        assert_eq!(goal.no_progress_hours, 12.0);
         assert_eq!(goal.active_workers, Some(2));
         assert_eq!(goal.minimum_workers, 1);
         assert_eq!(goal.crowding_out.len(), 2);
@@ -2906,8 +2841,31 @@ mod tests {
         assert_eq!(goal.out_of_team_activity[0].tickets, vec!["IR-626"]);
         let json = serde_json::to_value(goal).expect("priority goal JSON");
         assert_eq!(json["active_workers"], 2);
-        assert!(json.get("recently_worked_active_issues").is_none());
-        assert!(json.get("claimed_active_issues").is_none());
+        let fields: BTreeSet<_> = json
+            .as_object()
+            .expect("priority goal object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            fields,
+            BTreeSet::from([
+                "goal",
+                "no_progress_hours",
+                "last_completion_at",
+                "last_transition_at",
+                "hours_since_progress",
+                "active_workers",
+                "minimum_workers",
+                "status",
+                "flagged",
+                "trusted",
+                "blocked_on",
+                "crowding_out",
+                "out_of_team_activity",
+                "missing_sources",
+            ])
+        );
         assert!(render_drift_text(&report).contains("active_workers=2/1"));
     }
 
@@ -3093,10 +3051,7 @@ mod tests {
         assert_eq!(goal.flagged, None);
         assert_eq!(goal.status, PriorityGoalStatus::Unknown);
         assert_eq!(goal.active_workers, Some(1));
-        assert_eq!(
-            goal.last_activity_at.as_deref(),
-            Some("2026-10-07T15:09:00Z")
-        );
+        assert!((goal.hours_since_progress.unwrap_or_default() - (1.0 / 60.0)).abs() < 1e-9);
         assert!(
             render_drift_text(&report).contains("status=unknown flagged=unknown trusted=false")
         );
