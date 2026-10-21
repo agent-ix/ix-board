@@ -1,9 +1,9 @@
 program = "Review"
 
 [[projects]]
-name = "QSL Language Spec"
+name = "qsl language spec"
 primary_initiative = "QSL"
 
 [[projects]]
-name = "Infra"
+name = "infra"
 primary_initiative = "Tooling"

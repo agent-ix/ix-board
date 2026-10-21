@@ -196,6 +196,7 @@ fn starts_with_prefix(title: &str, prefix: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Trace: FR-023-AC-1, FR-023-AC-2
     #[test]
     fn recorded_fixtures_separate_open_done_and_warn_on_team_mismatch() {
         let snapshot: WorkspaceSnapshot =
@@ -231,8 +232,10 @@ mod tests {
         assert!(!team_match.suggestions[0].team_mismatch);
         assert!(team_match.suggestions[0].reason.contains("team QSL"));
         assert!(!report.open.iter().any(|issue| issue.identifier == "QSL-13"));
+        assert!(!report.open.iter().any(|issue| issue.identifier == "QSL-15"));
     }
 
+    /// Trace: FR-023-AC-1
     #[test]
     fn missing_scope_project_is_an_error() {
         let snapshot = WorkspaceSnapshot::default();

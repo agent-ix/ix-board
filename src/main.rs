@@ -1666,7 +1666,7 @@ mod tests {
         );
     }
 
-    /// Trace: FR-021-AC-3
+    /// Trace: FR-021-AC-3, FR-023-AC-1
     #[test]
     fn program_review_commands_accept_the_scope_file_option() {
         let scope = Cli::try_parse_from(["ix-board", "scope", "check", "--scope", "qsl.toml"])
@@ -1811,6 +1811,7 @@ mod tests {
         assert_eq!(json["unowned_root_blockers"][0], "IR-2");
     }
 
+    /// Trace: FR-023-AC-3
     #[test]
     fn orphans_human_and_json_outputs_expose_both_groups_and_warnings() {
         let report = ix_board::orphans::OrphansReport {
