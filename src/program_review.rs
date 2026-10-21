@@ -349,6 +349,16 @@ fn same_name(left: &str, right: &str) -> bool {
     left.eq_ignore_ascii_case(right)
 }
 
+fn compare_names(left: &str, right: &str) -> std::cmp::Ordering {
+    left.to_lowercase()
+        .cmp(&right.to_lowercase())
+        .then_with(|| left.cmp(right))
+}
+
+fn sort_names(names: &mut [String]) {
+    names.sort_by(|left, right| compare_names(left, right));
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProgramRoadmap {
@@ -442,7 +452,7 @@ pub fn build_roadmap(
         .iter()
         .map(|initiative| initiative.name.clone())
         .collect::<BTreeSet<_>>();
-    let missing_scope_initiatives = scope
+    let mut missing_scope_initiatives = scope
         .into_iter()
         .flat_map(|scope| {
             scope
@@ -461,8 +471,9 @@ pub fn build_roadmap(
         })
         .collect::<BTreeSet<_>>()
         .into_iter()
-        .collect();
-    let missing_scope_projects = scope
+        .collect::<Vec<_>>();
+    sort_names(&mut missing_scope_initiatives);
+    let mut missing_scope_projects = scope
         .into_iter()
         .flat_map(|scope| {
             scope
@@ -478,7 +489,8 @@ pub fn build_roadmap(
         })
         .collect::<BTreeSet<_>>()
         .into_iter()
-        .collect();
+        .collect::<Vec<_>>();
+    sort_names(&mut missing_scope_projects);
 
     let mut result = ProgramRoadmap {
         initiatives: Vec::new(),
@@ -536,7 +548,7 @@ pub fn build_roadmap(
             }
             rows.push(roadmap_project(project, &workspace.issues, also_in));
         }
-        rows.sort_by_key(|item| item.name.to_lowercase());
+        rows.sort_by(|left, right| compare_names(&left.name, &right.name));
         if rows.is_empty() {
             result
                 .initiatives_without_projects
@@ -590,16 +602,18 @@ pub fn build_roadmap(
                 .iter()
                 .map(|initiative| initiative.name.as_str())
                 .collect::<BTreeSet<_>>();
-            let missing_from_linear = expected
+            let mut missing_from_linear = expected
                 .iter()
                 .filter(|name| !actual.iter().any(|actual| same_name(name, actual)))
                 .map(|name| (*name).to_owned())
                 .collect::<Vec<_>>();
-            let missing_from_scope = actual
+            let mut missing_from_scope = actual
                 .iter()
                 .filter(|name| !expected.iter().any(|expected| same_name(name, expected)))
                 .map(|name| (*name).to_owned())
                 .collect::<Vec<_>>();
+            sort_names(&mut missing_from_linear);
+            sort_names(&mut missing_from_scope);
             if !missing_from_linear.is_empty() || !missing_from_scope.is_empty() {
                 result
                     .project_membership_mismatches
@@ -613,23 +627,17 @@ pub fn build_roadmap(
     }
     result
         .initiatives
-        .sort_by_key(|item| item.name.to_lowercase());
+        .sort_by(|left, right| compare_names(&left.name, &right.name));
     result
         .unplaced_projects
-        .sort_by_key(|item| item.name.to_lowercase());
-    result
-        .initiatives_without_projects
-        .sort_by_key(|item| item.to_lowercase());
-    result
-        .projects_in_multiple_initiatives
-        .sort_by_key(|item| item.to_lowercase());
+        .sort_by(|left, right| compare_names(&left.name, &right.name));
+    sort_names(&mut result.initiatives_without_projects);
+    sort_names(&mut result.projects_in_multiple_initiatives);
     result.projects_in_multiple_initiatives.dedup();
-    result
-        .projects_missing_from_scope
-        .sort_by_key(|item| item.to_lowercase());
+    sort_names(&mut result.projects_missing_from_scope);
     result
         .project_membership_mismatches
-        .sort_by_key(|item| item.project.to_lowercase());
+        .sort_by(|left, right| compare_names(&left.project, &right.project));
     result
 }
 
@@ -1053,5 +1061,92 @@ owns = "program review"
 
         assert_eq!(report.missing_scope_initiatives, ["Missing Initiative"]);
         assert_eq!(report.missing_scope_projects, ["Missing Project"]);
+    }
+
+    #[test]
+    /// Trace: FR-020-AC-4, FR-020-AC-6
+    fn scoped_roadmap_diagnostic_names_sort_case_insensitively_with_stable_ties() {
+        let core = initiative("QSL Core", "2");
+        let gamma = initiative("QSL Gamma", "3");
+        let epsilon = initiative("QSL epsilon", "4");
+        let mut file = scope();
+        file.initiatives.extend([
+            NamedRef {
+                name: "zeta Initiative".into(),
+            },
+            NamedRef {
+                name: "alpha Initiative".into(),
+            },
+        ]);
+        file.projects[0] = ProjectPlacement {
+            name: "zeta Compiler".into(),
+            primary_initiative: "QSL Omega".into(),
+            also_in: vec!["QSL beta".into(), "QSL Delta".into()],
+        };
+        file.projects.push(ProjectPlacement {
+            name: "Alpha Compiler".into(),
+            primary_initiative: "qsl alpha".into(),
+            also_in: Vec::new(),
+        });
+        for name in ["zeta Project", "alpha Project", "Alpha Project"] {
+            file.projects.push(ProjectPlacement {
+                name: name.into(),
+                primary_initiative: "QSL Core".into(),
+                also_in: Vec::new(),
+            });
+        }
+        let workspace = WorkspaceSnapshot {
+            projects: vec![
+                project("zeta Compiler", vec![gamma, epsilon]),
+                project("Alpha Compiler", vec![core.clone()]),
+                project("zeta Runtime", vec![core.clone()]),
+                project("alpha Runtime", vec![core.clone()]),
+                project("Alpha Runtime", vec![core.clone()]),
+            ],
+            issues: Vec::new(),
+            fetched_at: 0,
+        };
+
+        let report = build_roadmap(&[core], &workspace, Some(&file));
+
+        assert_eq!(
+            report.missing_scope_initiatives,
+            [
+                "alpha Initiative",
+                "qsl alpha",
+                "QSL beta",
+                "QSL Delta",
+                "QSL Omega",
+                "zeta Initiative"
+            ]
+        );
+        assert_eq!(
+            report.missing_scope_projects,
+            ["Alpha Project", "alpha Project", "zeta Project"]
+        );
+        assert_eq!(
+            report.projects_missing_from_scope,
+            ["Alpha Runtime", "alpha Runtime", "zeta Runtime"]
+        );
+        assert_eq!(
+            report
+                .project_membership_mismatches
+                .iter()
+                .map(|mismatch| mismatch.project.as_str())
+                .collect::<Vec<_>>(),
+            ["Alpha Compiler", "zeta Compiler"]
+        );
+        assert_eq!(
+            report.project_membership_mismatches[0].missing_from_linear,
+            ["qsl alpha"]
+        );
+        assert_eq!(
+            report.project_membership_mismatches[1].missing_from_linear,
+            ["QSL beta", "QSL Delta", "QSL Omega"]
+        );
+        assert_eq!(
+            report.project_membership_mismatches[1].missing_from_scope,
+            ["QSL epsilon", "QSL Gamma"]
+        );
     }
 }
