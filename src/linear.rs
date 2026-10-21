@@ -206,6 +206,11 @@ impl LinearGraphQlSource {
     pub fn collect_drift_evidence(&self, config: &DriftConfig) -> Result<DriftEvidence, Error> {
         let report_epoch = crate::drift::timestamp_epoch(&config.report_time)?;
         let window_start = report_epoch - config.window_hours * 3600.0;
+        let priority_goal_history_start = config
+            .priority_goals
+            .iter()
+            .map(|goal| report_epoch - goal.no_progress_hours * 3600.0)
+            .min_by(f64::total_cmp);
         let snapshot = self.fetch_workspace()?;
         let projects_by_id: HashMap<_, _> = snapshot
             .projects
@@ -374,18 +379,22 @@ impl LinearGraphQlSource {
                         .iter()
                         .any(|id| id.eq_ignore_ascii_case(&issue.identifier))
             });
-            let recently_updated = issue
-                .updated_at
-                .as_deref()
-                .map(crate::drift::timestamp_epoch)
-                .transpose()?
-                .is_some_and(|updated| updated >= window_start);
             let relevant_to_goal_capacity = priority_goal_team_keys.contains(&issue.team_key.0)
                 || issue
                     .assignee_id
                     .as_ref()
                     .is_some_and(|assignee| priority_goal_assignees.contains(assignee));
-            if belongs_to_goal || (recently_updated && relevant_to_goal_capacity) {
+            // `updatedAt` advances when an issue transitions. Query across all
+            // teams from the earliest configured goal cutoff so no transition
+            // in any goal's interval is filtered by the general drift window.
+            // Missing timestamps stay in scope because they cannot bound history.
+            if should_fetch_issue_history(
+                issue.updated_at.as_deref(),
+                belongs_to_goal,
+                relevant_to_goal_capacity,
+                window_start,
+                priority_goal_history_start,
+            )? {
                 history_issue_ids.insert(issue.id.0.clone());
             }
             let Some(created_at) = issue.created_at.clone() else {
@@ -431,14 +440,23 @@ impl LinearGraphQlSource {
         for issue_id in history_ids {
             let mut after = None;
             for page in 0..PAGE_LIMIT {
-                let result: IssueHistoryData = self.request(
+                let result: IssueHistoryData = match self.request(
                     ISSUE_HISTORY_QUERY,
                     IssueHistoryVariables {
                         id: issue_id.clone(),
                         first: HISTORY_PAGE_SIZE,
                         after: after.clone(),
                     },
-                )?;
+                ) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        evidence.missing.push(crate::MissingEvidence {
+                            source: "linear.history".to_owned(),
+                            reason: format!("history request failed for issue {issue_id}: {error}"),
+                        });
+                        break;
+                    }
+                };
                 let Some(issue) = result.issue else {
                     evidence.missing.push(crate::MissingEvidence {
                         source: "linear.history".to_owned(),
@@ -911,6 +929,26 @@ impl LinearGraphQlSource {
     }
 }
 
+fn should_fetch_issue_history(
+    updated_at: Option<&str>,
+    belongs_to_goal: bool,
+    relevant_to_goal_capacity: bool,
+    window_start: f64,
+    priority_goal_history_start: Option<f64>,
+) -> Result<bool, Error> {
+    if belongs_to_goal {
+        return Ok(true);
+    }
+    let Some(updated_at) = updated_at else {
+        return Ok(priority_goal_history_start.is_some());
+    };
+    let updated_at = crate::drift::timestamp_epoch(updated_at)?;
+    Ok(
+        priority_goal_history_start.is_some_and(|start| updated_at >= start)
+            || (updated_at >= window_start && relevant_to_goal_capacity),
+    )
+}
+
 fn resolve_project_status_id(
     statuses: &[RawProjectStatusOption],
     requested: ProjectRunStatus,
@@ -1345,7 +1383,7 @@ mod tests {
         CACHE_MODEL_VERSION, INITIATIVE_PAGE_SIZE, ISSUE_PAGE_SIZE, IssueData, LinearGraphQlSource,
         LinearProjectStatusType, PROJECT_PAGE_SIZE, PROJECT_UPDATE_MUTATION, ProjectData,
         ProjectUpdateInput, RawProjectStatusOption, canonical_project_status, collect_blocked_by,
-        resolve_project_status_id,
+        resolve_project_status_id, should_fetch_issue_history,
     };
     use crate::Error;
     use crate::{
@@ -1408,6 +1446,59 @@ mod tests {
         assert_eq!(requests[0]["variables"]["first"], INITIATIVE_PAGE_SIZE);
         assert!(requests[0]["variables"]["after"].is_null());
         assert_eq!(requests[1]["variables"]["after"], "cursor-core");
+    }
+
+    /// Trace: FR-008-AC-14, FR-008-AC-15
+    #[test]
+    fn priority_goal_history_fetch_covers_cross_team_goal_interval() {
+        let start = crate::drift::timestamp_epoch("2026-10-01T00:00:00Z")
+            .expect("valid priority history start");
+        let window_start = crate::drift::timestamp_epoch("2026-10-19T00:00:00Z")
+            .expect("valid general window start");
+        assert!(
+            should_fetch_issue_history(
+                Some("2026-10-01T00:00:00Z"),
+                false,
+                false,
+                window_start,
+                Some(start),
+            )
+            .expect("valid timestamp")
+        );
+        assert!(
+            should_fetch_issue_history(
+                Some("2026-10-05T00:00:00Z"),
+                false,
+                false,
+                window_start,
+                Some(start),
+            )
+            .expect("valid timestamp")
+        );
+        assert!(
+            !should_fetch_issue_history(
+                Some("2026-09-30T23:59:59Z"),
+                false,
+                false,
+                window_start,
+                Some(start),
+            )
+            .expect("valid timestamp")
+        );
+        assert!(
+            should_fetch_issue_history(None, false, false, window_start, Some(start),)
+                .expect("missing updated time is fetched conservatively")
+        );
+        assert!(
+            should_fetch_issue_history(
+                Some("2020-01-01T00:00:00Z"),
+                true,
+                false,
+                window_start,
+                None,
+            )
+            .expect("goal history is always fetched")
+        );
     }
 
     type MockResponse = (u16, Vec<(&'static str, String)>, Value);
