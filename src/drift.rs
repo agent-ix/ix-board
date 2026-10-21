@@ -2836,6 +2836,7 @@ mod tests {
             .iter_mut()
             .find(|item| item.identifier == "IR-626")
         {
+            ir626.team_key = "IR".to_owned();
             ir626.assignee_id = Some("goal-worker".to_owned());
         }
         for (id, identifier) in [
