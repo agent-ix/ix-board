@@ -2028,6 +2028,65 @@ mod tests {
         assert!(requests[1]["variables"]["nestedFirst"].is_null());
     }
 
+    /// Trace: FR-021-AC-2
+    #[test]
+    fn reconcile_does_not_claim_all_prs_merged_from_truncated_linear_attachments() {
+        let project = serde_json::json!({
+            "id": "project-reconcile",
+            "identifier": "SWM",
+            "name": "Program Review",
+            "updatedAt": null,
+            "description": "",
+            "content": null,
+            "priority": 0,
+            "sortOrder": 0.0,
+            "targetDate": null,
+            "status": {"name": "Started", "type": "started"},
+            "teams": connection(serde_json::json!([{"key": "SWM"}])),
+            "projectMilestones": connection(serde_json::json!([])),
+            "initiatives": connection(serde_json::json!([]))
+        });
+        let project_response = serde_json::json!({
+            "data": {"projects": connection(serde_json::json!([project]))}
+        });
+        let issue_response: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/reconcile/linear-oversubscribed-issue-attachments.json"
+        ))
+        .expect("decode Linear response with more than 50 attachments");
+        let (endpoint, server) = mock_linear(vec![project_response, issue_response]);
+        let source = LinearGraphQlSource::with_endpoint("test-key", endpoint)
+            .expect("source with local endpoint");
+        let snapshot = source.fetch_workspace().expect("fetch fixture workspace");
+        server.join().expect("mock server");
+
+        let issue = snapshot.issues.first().expect("fixture issue");
+        assert_eq!(issue.attachment_urls.len(), 50);
+        assert!(!issue.attachments_complete);
+        let evidence: crate::reconcile::ReconcileEvidence = serde_json::from_str(include_str!(
+            "../tests/fixtures/reconcile/github-oversubscribed-prs.json"
+        ))
+        .expect("decode GitHub evidence with an unseen open PR");
+        let pull_requests = &evidence.pull_requests["agent-ix/reconcile-demo"];
+        assert_eq!(pull_requests.len(), 51);
+        assert_eq!(pull_requests[50].state, "OPEN");
+        assert!(!issue.attachment_urls.contains(&pull_requests[50].url));
+        let report = crate::reconcile::evaluate_reconcile(
+            snapshot.projects.first().expect("fixture project"),
+            &snapshot.issues,
+            &evidence,
+            vec!["agent-ix/reconcile-demo".to_owned()],
+            crate::reconcile::DEFAULT_STALE_DAYS,
+            crate::drift::timestamp_epoch("2026-10-21T00:00:00Z").unwrap(),
+        )
+        .expect("reconcile fixture evidence");
+
+        assert!(report.findings.merged_pr_open_ticket.is_empty());
+        assert!(report.warnings.iter().any(|warning| {
+            warning.contains("incomplete attachment data")
+                && warning.contains("all-linked-PRs-merged")
+        }));
+    }
+
     #[test]
     fn typed_graphql_records_decode_selected_camel_case_fields() {
         let project: ProjectData = serde_json::from_value(serde_json::json!({

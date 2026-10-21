@@ -275,7 +275,8 @@ pub fn evaluate_reconcile(
             .collect::<Vec<_>>();
         let issue_is_done = issue.state_type == WorkflowStateType::Completed;
 
-        if !ticket_prs.is_empty()
+        if issue.attachments_complete
+            && !ticket_prs.is_empty()
             && merged.len() == ticket_prs.len()
             && !is_terminal(issue.state_type)
         {
@@ -385,7 +386,7 @@ pub fn evaluate_reconcile(
                 .iter()
                 .any(|issue| !issue.attachments_complete)
             {
-                warnings.push("one or more Linear issues have incomplete attachment data; absence-of-PR findings may be omitted".to_owned());
+                warnings.push("one or more Linear issues have incomplete attachment data; absence-of-PR and all-linked-PRs-merged findings may be omitted".to_owned());
             }
             warnings
         },
@@ -560,11 +561,41 @@ mod tests {
         .unwrap()
     }
 
+    /// Trace: FR-021-AC-1
+    #[test]
+    fn project_resolution_requires_one_exact_identifier_or_name_match() {
+        let selected = project();
+        let snapshot = WorkspaceSnapshot {
+            projects: vec![selected.clone()],
+            issues: Vec::new(),
+            fetched_at: 0,
+        };
+        assert_eq!(resolve_project(&snapshot, "SWM").unwrap(), &selected);
+        assert_eq!(
+            resolve_project(&snapshot, "program review").unwrap(),
+            &selected
+        );
+        assert!(resolve_project(&snapshot, "SWM-PROGRAM").is_err());
+
+        let mut duplicate_name = selected.clone();
+        duplicate_name.id = ProjectId("another-project".to_owned());
+        duplicate_name.identifier = Some("OTHER".to_owned());
+        let ambiguous = WorkspaceSnapshot {
+            projects: vec![selected, duplicate_name],
+            issues: Vec::new(),
+            fetched_at: 0,
+        };
+        assert!(resolve_project(&ambiguous, "program review").is_err());
+    }
+
+    /// Trace: FR-021-AC-1
     #[test]
     fn recorded_linear_and_github_fixtures_cover_every_reconcile_finding() {
         let (issues, evidence) = recorded_evidence();
         assert_eq!(issues.len(), 5);
-        let report = report(&evidence);
+        let first_report = report(&evidence);
+        assert_eq!(first_report, report(&evidence));
+        let report = first_report;
         assert_eq!(report.findings.merged_pr_open_ticket.len(), 1);
         assert_eq!(
             report.findings.merged_pr_open_ticket[0].identifier,
@@ -594,6 +625,7 @@ mod tests {
         );
     }
 
+    /// Trace: FR-021-AC-1
     #[test]
     fn matching_branch_suppresses_the_no_pr_or_branch_finding() {
         let (_, mut evidence) = recorded_evidence();

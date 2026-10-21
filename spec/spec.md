@@ -20,13 +20,14 @@ SWM-2 gives team leaders deterministic Linear reads for ready work, project
 context, and search through the ix-board CLI and library. SWM-3 adds explicit
 project status and priority writes so team leaders can control the run queue.
 SWM-4 reports evidence of work outside that queue and work that is active but
-not landing. SWM-33 adds inline planner focus inputs that expand initiatives,
-projects, and issues into Linear issue sets and blocker layers. SWM-34 adds
-focus status, blocker-state, and ready-queue reporting. SWM-35 adds a
-focus hygiene report and a comparison with the last successful report for
-that focus. SWM-102 adds program scope validation against live Linear and
+not landing. SWM-102 adds program scope validation against live Linear and
 GitHub catalogs; SWM-103 adds a live program roadmap with derived project
-progress.
+progress. SWM-104 adds read-only reconciliation between Linear project issue
+state and linked GitHub pull requests (FR-021). SWM-33 adds inline planner
+focus inputs that expand initiatives, projects, and issues into Linear issue
+sets and blocker layers. SWM-34 adds focus status, blocker-state, and
+ready-queue reporting. SWM-35 adds a focus hygiene report and a comparison
+with the last successful report for that focus.
 
 ## Scope
 
@@ -62,6 +63,10 @@ progress.
 - Program scope files are checked against live Linear and GitHub catalogs, and
   program roadmaps derive project progress from live issue records (FR-019 and
   FR-020).
+- `reconcile` compares a Linear project's issue state and structured pull
+  request attachments with paginated GitHub pull-request and branch records;
+  incomplete attachment data suppresses conclusions that require a complete
+  attachment inventory (FR-021).
 
 ### Out of Scope
 
@@ -84,7 +89,9 @@ cached Linear reads for a team leader: a reasoned ready queue, a project summary
 and search across tickets and projects. SWM-3 adds narrow project controls:
 `Started` runs a project and `Paused` holds it; project priority participates in
 the queue order defined by FR-001. SWM-4 adds a read-only drift report for the
-configured leads. SWM-33 adds inline focus expansion from structured Linear
+configured leads. SWM-102 and SWM-103 add scope validation and live roadmap
+reports. SWM-104 adds read-only project-to-pull-request reconciliation through
+FR-021. SWM-33 adds inline focus expansion from structured Linear
 records; SWM-34 composes that focus with project and milestone status, blocker
 states, and the FR-001 ready queue. The library obtains structured source
 records through Linear GraphQL and caches read results locally.
@@ -118,7 +125,8 @@ membership, blocker layers, and readiness into an ordered handoff slice.
 US-007 traces to FR-016, which packages a canonical focus and status for
 shared clients without choosing a storage service. US-008 traces to FR-019
 and FR-020 for validating a declared program scope and building its live
-roadmap.
+roadmap. US-001 also traces to FR-021, which reconciles a selected project's
+Linear issues and attachments with GitHub pull-request and branch evidence.
 Functional acceptance criteria include fixture checks for each drift signal,
 queue rules, and cache behavior; NFR-001 specifies a lightweight warm-cache
 fixture benchmark.

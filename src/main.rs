@@ -1476,6 +1476,7 @@ mod tests {
         );
     }
 
+    /// Trace: FR-021-AC-3
     #[test]
     fn program_review_commands_accept_the_scope_file_option() {
         let scope = Cli::try_parse_from(["ix-board", "scope", "check", "--scope", "qsl.toml"])
@@ -1515,6 +1516,7 @@ mod tests {
         );
     }
 
+    /// Trace: FR-021-AC-3
     #[test]
     fn reconcile_human_and_json_outputs_expose_all_five_finding_groups() {
         let report = ix_board::reconcile::ReconcileReport {
