@@ -1004,6 +1004,7 @@ owns = "program review"
     }
 
     #[test]
+    /// Trace: FR-020-AC-6
     fn scoped_roadmap_reports_projects_outside_scope_and_membership_mismatches() {
         let core = initiative("QSL Core", "2");
         let ecosystem = initiative("QSL Ecosystem", "4");
@@ -1030,6 +1031,7 @@ owns = "program review"
     }
 
     #[test]
+    /// Trace: FR-020-AC-6
     fn scoped_roadmap_reports_missing_scope_catalog_entries() {
         let core = initiative("QSL Core", "2");
         let workspace = WorkspaceSnapshot {

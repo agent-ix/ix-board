@@ -30,6 +30,7 @@ deterministic ordering.
 | FR-020-AC-3 | Scoped output contains only scope-declared initiatives and projects; the roadmap reports declared initiatives without projects and projects in multiple initiatives, and an unscoped roadmap reports projects with no initiative membership as unplaced. | Test |
 | FR-020-AC-4 | Initiative, project, and diagnostic rows have deterministic case-insensitive name ordering for identical input records. | Test |
 | FR-020-AC-5 | The roadmap uses a structured Linear snapshot and performs no Linear or GitHub writes. | Inspection |
+| FR-020-AC-6 | For scoped output, a project assigned in Linear to a scope-declared initiative but absent from the scope file is reported as missing from scope; each scope-listed project with differing declared and Linear initiative memberships is reported with declared memberships absent from Linear as `missing_from_linear` and Linear memberships absent from the scope file as `missing_from_scope`. | Test |
 
 ## Dependencies
 
