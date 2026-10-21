@@ -133,18 +133,7 @@ pub fn collect_github_evidence(
     let mut evidence = ReconcileEvidence::default();
     for repository in repositories {
         let prs_output = Command::new("gh")
-            .args([
-                "pr",
-                "list",
-                "--repo",
-                &repository,
-                "--state",
-                "all",
-                "--limit",
-                "1000",
-                "--json",
-                "number,url,state,isDraft,updatedAt,mergedAt,headRefName,title",
-            ])
+            .args(github_pull_request_args(&repository))
             .stdin(Stdio::null())
             .output()
             .map_err(|error| {
@@ -159,7 +148,7 @@ pub fn collect_github_evidence(
                     .to_owned(),
             ));
         }
-        let pull_requests = serde_json::from_slice(&prs_output.stdout).map_err(|error| {
+        let pull_requests = decode_paged_pull_requests(&prs_output.stdout).map_err(|error| {
             github_error(&repository, "pull request decoding", error.to_string())
         })?;
 
@@ -193,6 +182,63 @@ pub fn collect_github_evidence(
         evidence.branches.insert(repository, branch_names);
     }
     Ok(evidence)
+}
+
+fn github_pull_request_args(repository: &str) -> Vec<String> {
+    vec![
+        "api".to_owned(),
+        "--paginate".to_owned(),
+        "--slurp".to_owned(),
+        "--method".to_owned(),
+        "GET".to_owned(),
+        format!("repos/{repository}/pulls"),
+        "-f".to_owned(),
+        "state=all".to_owned(),
+        "-F".to_owned(),
+        "per_page=100".to_owned(),
+    ]
+}
+
+#[derive(Deserialize)]
+struct GithubRestPullRequest {
+    number: u64,
+    html_url: String,
+    state: String,
+    draft: bool,
+    updated_at: String,
+    merged_at: Option<String>,
+    head: GithubRestPullRequestHead,
+    title: String,
+}
+
+#[derive(Deserialize)]
+struct GithubRestPullRequestHead {
+    #[serde(rename = "ref")]
+    branch: String,
+}
+
+fn decode_paged_pull_requests(
+    input: &[u8],
+) -> Result<Vec<ReconcilePullRequest>, serde_json::Error> {
+    let pages: Vec<Vec<GithubRestPullRequest>> = serde_json::from_slice(input)?;
+    Ok(pages
+        .into_iter()
+        .flatten()
+        .map(|pull_request| ReconcilePullRequest {
+            number: pull_request.number,
+            url: pull_request.html_url,
+            state: if pull_request.merged_at.is_some() {
+                "MERGED".to_owned()
+            } else {
+                pull_request.state.to_ascii_uppercase()
+            },
+            is_draft: pull_request.draft,
+            updated_at: pull_request.updated_at,
+            merged_at: pull_request.merged_at,
+            head_ref_name: pull_request.head.branch,
+            title: pull_request.title,
+        })
+        .collect())
 }
 
 fn github_error(repository: &str, operation: &'static str, message: String) -> ReconcileError {
@@ -588,5 +634,35 @@ mod tests {
             repositories_for_scope(None, &issues),
             BTreeSet::from(["agent-ix/reconcile-demo".to_owned()])
         );
+    }
+
+    #[test]
+    fn github_pull_request_query_uses_api_pagination_without_a_fixed_count() {
+        let args = github_pull_request_args("agent-ix/ix-board");
+        assert!(args.iter().any(|arg| arg == "--paginate"));
+        assert!(args.iter().any(|arg| arg == "--slurp"));
+        assert!(args.iter().any(|arg| arg == "per_page=100"));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "repos/agent-ix/ix-board/pulls")
+        );
+        assert!(!args.iter().any(|arg| arg == "1000"));
+    }
+
+    #[test]
+    fn paged_rest_pr_records_decode_into_the_reconcile_model() {
+        let pages = r#"[
+          [
+            {"number":1,"html_url":"https://github.com/agent-ix/repo/pull/1","state":"closed","draft":false,"updated_at":"2026-10-19T00:00:00Z","merged_at":"2026-10-18T00:00:00Z","head":{"ref":"feature/SWM-1"},"title":"SWM-1"}
+          ],
+          [
+            {"number":2,"html_url":"https://github.com/agent-ix/repo/pull/2","state":"open","draft":true,"updated_at":"2026-10-20T00:00:00Z","merged_at":null,"head":{"ref":"feature/SWM-2"},"title":"SWM-2"}
+          ]
+        ]"#;
+        let pull_requests = decode_paged_pull_requests(pages.as_bytes()).unwrap();
+        assert_eq!(pull_requests.len(), 2);
+        assert_eq!(pull_requests[0].state, "MERGED");
+        assert!(pull_requests[1].is_draft);
+        assert_eq!(pull_requests[0].head_ref_name, "feature/SWM-1");
     }
 }
