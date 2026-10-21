@@ -1237,21 +1237,21 @@ fn evaluate_priority_goals(
                     .project_identifier
                     .as_deref()
                     .unwrap_or("(no project)");
-                let groups = if goal_teams.contains(&ticket.team_key) {
-                    &mut competing
-                } else if ticket
-                    .assignee_id
-                    .as_deref()
-                    .is_some_and(|assignee| active_workers.contains(assignee))
-                {
-                    &mut out_of_team
-                } else {
-                    continue;
-                };
-                groups
+                competing
                     .entry((ticket.team_key.clone(), project.to_owned()))
                     .or_default()
                     .insert(event.ticket_id.clone());
+                if !goal_teams.contains(&ticket.team_key)
+                    && ticket
+                        .assignee_id
+                        .as_deref()
+                        .is_some_and(|assignee| active_workers.contains(assignee))
+                {
+                    out_of_team
+                        .entry((ticket.team_key.clone(), project.to_owned()))
+                        .or_default()
+                        .insert(event.ticket_id.clone());
+                }
             }
             for pr in &evidence.pull_requests {
                 let activity_at = [
@@ -1274,27 +1274,25 @@ fn evaluate_priority_goals(
                 for ticket in evidence.tickets.iter().filter(|ticket| {
                     !linked_ids.contains(&ticket.id) && ticket_links_pr(ticket, pr)
                 }) {
-                    let groups = if goal_teams.contains(&ticket.team_key) {
-                        &mut competing
-                    } else if ticket
-                        .assignee_id
-                        .as_deref()
-                        .is_some_and(|assignee| active_workers.contains(assignee))
-                    {
-                        &mut out_of_team
-                    } else {
-                        continue;
-                    };
-                    groups
-                        .entry((
-                            ticket.team_key.clone(),
-                            ticket
-                                .project_identifier
-                                .clone()
-                                .unwrap_or_else(|| "(no project)".to_owned()),
-                        ))
+                    let project = ticket
+                        .project_identifier
+                        .clone()
+                        .unwrap_or_else(|| "(no project)".to_owned());
+                    competing
+                        .entry((ticket.team_key.clone(), project.clone()))
                         .or_default()
                         .insert(ticket.identifier.clone());
+                    if !goal_teams.contains(&ticket.team_key)
+                        && ticket
+                            .assignee_id
+                            .as_deref()
+                            .is_some_and(|assignee| active_workers.contains(assignee))
+                    {
+                        out_of_team
+                            .entry((ticket.team_key.clone(), project))
+                            .or_default()
+                            .insert(ticket.identifier.clone());
+                    }
                 }
             }
             for commit in &evidence.commits {
@@ -1306,27 +1304,25 @@ fn evaluate_priority_goals(
                     !linked_ids.contains(&ticket.id)
                         && commit.ticket_ids.iter().any(|id| id == &ticket.identifier)
                 }) {
-                    let groups = if goal_teams.contains(&ticket.team_key) {
-                        &mut competing
-                    } else if ticket
-                        .assignee_id
-                        .as_deref()
-                        .is_some_and(|assignee| active_workers.contains(assignee))
-                    {
-                        &mut out_of_team
-                    } else {
-                        continue;
-                    };
-                    groups
-                        .entry((
-                            ticket.team_key.clone(),
-                            ticket
-                                .project_identifier
-                                .clone()
-                                .unwrap_or_else(|| "(no project)".to_owned()),
-                        ))
+                    let project = ticket
+                        .project_identifier
+                        .clone()
+                        .unwrap_or_else(|| "(no project)".to_owned());
+                    competing
+                        .entry((ticket.team_key.clone(), project.clone()))
                         .or_default()
                         .insert(ticket.identifier.clone());
+                    if !goal_teams.contains(&ticket.team_key)
+                        && ticket
+                            .assignee_id
+                            .as_deref()
+                            .is_some_and(|assignee| active_workers.contains(assignee))
+                    {
+                        out_of_team
+                            .entry((ticket.team_key.clone(), project))
+                            .or_default()
+                            .insert(ticket.identifier.clone());
+                    }
                 }
             }
             let group_rows = |groups: BTreeMap<(String, String), BTreeSet<String>>| {
@@ -2839,6 +2835,11 @@ mod tests {
             ir626.team_key = "IR".to_owned();
             ir626.assignee_id = Some("goal-worker".to_owned());
         }
+        for issue in &mut evidence.tickets {
+            if matches!(issue.identifier.as_str(), "QSL-635" | "QSL-641") {
+                issue.team_key = "QSL".to_owned();
+            }
+        }
         for (id, identifier) in [
             ("qsl485", "QSL-485"),
             ("qsl486", "QSL-486"),
@@ -2894,11 +2895,11 @@ mod tests {
         assert_eq!(goal.hours_since_progress, Some(13.0));
         assert_eq!(goal.active_workers, Some(2));
         assert_eq!(goal.minimum_workers, 1);
-        assert_eq!(goal.crowding_out[0].project, "IR-path");
-        assert_eq!(
-            goal.crowding_out[0].tickets,
-            vec!["IR-626", "QSL-635", "QSL-641"]
-        );
+        assert_eq!(goal.crowding_out.len(), 2);
+        assert_eq!(goal.crowding_out[0].team_key, "IR");
+        assert_eq!(goal.crowding_out[0].tickets, vec!["IR-626"]);
+        assert_eq!(goal.crowding_out[1].team_key, "QSL");
+        assert_eq!(goal.crowding_out[1].tickets, vec!["QSL-635", "QSL-641"]);
         assert_eq!(goal.out_of_team_activity.len(), 1);
         assert_eq!(goal.out_of_team_activity[0].tickets, vec!["IR-626"]);
         let json = serde_json::to_value(goal).expect("priority goal JSON");
@@ -3003,9 +3004,13 @@ mod tests {
         assert!(!goal.trusted, "missing GitHub activity is explicit");
         assert_eq!(goal.active_workers, Some(1));
         assert_eq!(goal.blocked_on, vec!["AGE-2224", "AGE-2228"]);
-        assert_eq!(goal.crowding_out.len(), 1);
+        assert_eq!(goal.crowding_out.len(), 3);
         assert_eq!(goal.crowding_out[0].team_key, "QSL");
         assert_eq!(goal.crowding_out[0].tickets, vec!["QSL-635"]);
+        assert_eq!(goal.crowding_out[1].team_key, "IR");
+        assert_eq!(goal.crowding_out[1].tickets, vec!["IR-626"]);
+        assert_eq!(goal.crowding_out[2].team_key, "SAPHO");
+        assert_eq!(goal.crowding_out[2].tickets, vec!["SAPHO-39"]);
         assert_eq!(goal.out_of_team_activity.len(), 1);
         assert_eq!(goal.out_of_team_activity[0].team_key, "IR");
         assert_eq!(goal.out_of_team_activity[0].tickets, vec!["IR-626"]);
