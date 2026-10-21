@@ -523,7 +523,7 @@ pub fn build_roadmap(
                 .iter()
                 .filter_map(|item| initiative_by_id.get(&item.id).cloned())
                 .collect();
-            memberships.sort_by_key(|name| name.to_lowercase());
+            memberships.sort_by(|left, right| compare_names(left, right));
             memberships.dedup_by(|a, b| same_name(a, b));
             let primary = declared
                 .map(|item| item.primary_initiative.as_str())
@@ -532,7 +532,7 @@ pub fn build_roadmap(
                 assigned.remove(&project.id.0);
                 continue;
             }
-            let also_in = declared
+            let mut also_in = declared
                 .map(|item| item.also_in.clone())
                 .unwrap_or_else(|| {
                     memberships
@@ -541,6 +541,7 @@ pub fn build_roadmap(
                         .cloned()
                         .collect()
                 });
+            sort_names(&mut also_in);
             if memberships.len() > 1 {
                 result
                     .projects_in_multiple_initiatives
@@ -1147,6 +1148,88 @@ owns = "program review"
         assert_eq!(
             report.project_membership_mismatches[1].missing_from_scope,
             ["QSL epsilon", "QSL Gamma"]
+        );
+    }
+
+    #[test]
+    /// Trace: FR-020-AC-1, FR-020-AC-4
+    fn roadmap_also_in_names_sort_case_insensitively_in_scoped_and_unscoped_modes() {
+        let core = initiative("QSL Core", "2");
+        let upper_alpha = initiative("QSL Alpha", "3");
+        let lower_alpha = initiative("qsl alpha", "4");
+        let beta = initiative("QSL beta", "5");
+        let zeta = initiative("QSL zeta", "6");
+        let initiatives = [
+            core.clone(),
+            zeta.clone(),
+            beta.clone(),
+            lower_alpha.clone(),
+            upper_alpha.clone(),
+        ];
+        let memberships = vec![
+            core.clone(),
+            zeta.clone(),
+            beta.clone(),
+            lower_alpha.clone(),
+            upper_alpha.clone(),
+        ];
+        let mut file = scope();
+        file.projects[0] = ProjectPlacement {
+            name: "Scoped".into(),
+            primary_initiative: "QSL Core".into(),
+            also_in: vec![
+                "QSL zeta".into(),
+                "QSL beta".into(),
+                "qsl alpha".into(),
+                "QSL Alpha".into(),
+            ],
+        };
+        let scoped_workspace = WorkspaceSnapshot {
+            projects: vec![project("Scoped", memberships.clone())],
+            issues: Vec::new(),
+            fetched_at: 0,
+        };
+        let scoped = build_roadmap(&initiatives, &scoped_workspace, Some(&file));
+        let scoped_project = scoped
+            .initiatives
+            .iter()
+            .find(|row| row.name == "QSL Core")
+            .unwrap()
+            .projects
+            .first()
+            .unwrap();
+        assert_eq!(
+            scoped_project.also_in,
+            ["QSL Alpha", "qsl alpha", "QSL beta", "QSL zeta"]
+        );
+
+        let unscoped_workspace = WorkspaceSnapshot {
+            projects: vec![project(
+                "Unscoped",
+                vec![
+                    core.clone(),
+                    zeta.clone(),
+                    beta.clone(),
+                    lower_alpha.clone(),
+                ],
+            )],
+            issues: Vec::new(),
+            fetched_at: 0,
+        };
+        let unscoped_initiatives = [core, zeta, beta, lower_alpha];
+        let unscoped = build_roadmap(&unscoped_initiatives, &unscoped_workspace, None);
+        let unscoped_project = unscoped
+            .initiatives
+            .iter()
+            .find(|row| row.name == "qsl alpha")
+            .unwrap()
+            .projects
+            .first()
+            .unwrap();
+        assert_eq!(unscoped_project.name, "Unscoped");
+        assert_eq!(
+            unscoped_project.also_in,
+            ["QSL beta", "QSL Core", "QSL zeta"]
         );
     }
 }
