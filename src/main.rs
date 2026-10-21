@@ -1876,6 +1876,7 @@ mod tests {
     }
 
     #[test]
+    /// Trace: FR-020-AC-6
     fn roadmap_reports_scope_coverage_and_initiative_membership_breaks() {
         let report = ProgramRoadmap {
             initiatives: Vec::new(),
