@@ -9,7 +9,7 @@ review_set: subset
 
 ## Summary
 
-The initial audit at head `8b83413bde585a7b483e355ed301eac0715f74a3` found no specification for the new commands. At head `459133268c1d3304d3ff92fe1bf8e51084d2deb4`, FR-019 and FR-020, US-008, and trace bindings now cover the new behavior; 50 untagged criteria and 24 untracked symbols remain unchanged from the PR parent.
+The initial audit at head `8b83413bde585a7b483e355ed301eac0715f74a3` found no specification for the new commands. At head `ddc9d45`, FR-019 and FR-020, US-008, and trace bindings still cover the new behavior; prior dispositions for the 50 unchanged untagged criteria and 24 unchanged untracked symbols remain in force.
 
 ## Verdict
 
@@ -54,3 +54,8 @@ availability.
 The `roadmap` command SHALL build a deterministic program view from one
 structured Linear workspace snapshot, with an optional program scope file.
 ```
+
+
+## Disposition pass 2 verification
+
+No gap-analysis findings were left pending a new disposition from the prior round. The prior outcomes remain current: FND-001 and FND-003 are accepted-no-change; FND-002 is fixed. The head change only synchronizes the timeout regression test and does not alter specifications, test trace tags, or the repository-wide coverage counts.
