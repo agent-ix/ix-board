@@ -1,0 +1,44 @@
+{
+  "projects": [
+    {
+      "id": "project-qsl",
+      "identifier": "QLS",
+      "name": "QSL Language Spec",
+      "updated_at": null,
+      "description": "",
+      "content": null,
+      "status": "Started",
+      "priority": 0,
+      "sort_order": 0.0,
+      "target_date": null,
+      "team_keys": ["QSL"],
+      "milestones": [],
+      "initiatives": [{"id": "initiative-qsl", "identifier": "I-1", "name": "QSL"}]
+    },
+    {
+      "id": "project-infra",
+      "identifier": "INF",
+      "name": "Infra",
+      "updated_at": null,
+      "description": "",
+      "content": null,
+      "status": "Started",
+      "priority": 0,
+      "sort_order": 1.0,
+      "target_date": null,
+      "team_keys": ["IR"],
+      "milestones": [],
+      "initiatives": [{"id": "initiative-tooling", "identifier": "I-2", "name": "Tooling"}]
+    }
+  ],
+  "issues": [
+    {"id":"qsl-11","identifier":"QSL-11","title":"QLS: Parser cleanup","description":null,"state":"Todo","state_name":"Todo","state_type":"unstarted","parent_id":null,"team_key":"QSL","assignee_id":null,"assignee_name":null,"project_id":null,"project_milestone_id":null,"priority":0.0,"sort_order":0.0,"blocked_by":[],"created_at":null,"updated_at":null,"attachment_urls":[],"attachments_complete":true},
+    {"id":"qsl-12","identifier":"QSL-12","title":"Review grammar example","description":null,"state":"Todo","state_name":"Todo","state_type":"unstarted","parent_id":null,"team_key":"QSL","assignee_id":null,"assignee_name":null,"project_id":null,"project_milestone_id":null,"priority":0.0,"sort_order":1.0,"blocked_by":[],"created_at":null,"updated_at":null,"attachment_urls":[],"attachments_complete":true},
+    {"id":"ir-21","identifier":"IR-21","title":"QLS: cross-team integration","description":null,"state":"Todo","state_name":"Todo","state_type":"unstarted","parent_id":null,"team_key":"IR","assignee_id":null,"assignee_name":null,"project_id":null,"project_milestone_id":null,"priority":0.0,"sort_order":0.0,"blocked_by":[],"created_at":null,"updated_at":null,"attachment_urls":[],"attachments_complete":true},
+    {"id":"ir-22","identifier":"IR-22","title":"QLS: shipped integration","description":null,"state":"Completed","state_name":"Completed","state_type":"completed","parent_id":null,"team_key":"IR","assignee_id":null,"assignee_name":null,"project_id":null,"project_milestone_id":null,"priority":0.0,"sort_order":1.0,"blocked_by":[],"created_at":null,"updated_at":null,"attachment_urls":[],"attachments_complete":true},
+    {"id":"qsl-13","identifier":"QSL-13","title":"Cancelled noise","description":null,"state":"Canceled","state_name":"Canceled","state_type":"canceled","parent_id":null,"team_key":"QSL","assignee_id":null,"assignee_name":null,"project_id":null,"project_milestone_id":null,"priority":0.0,"sort_order":2.0,"blocked_by":[],"created_at":null,"updated_at":null,"attachment_urls":[],"attachments_complete":true},
+    {"id":"qsl-14","identifier":"QSL-14","title":"Already filed","description":null,"state":"Todo","state_name":"Todo","state_type":"unstarted","parent_id":null,"team_key":"QSL","assignee_id":null,"assignee_name":null,"project_id":"project-qsl","project_milestone_id":null,"priority":0.0,"sort_order":3.0,"blocked_by":[],"created_at":null,"updated_at":null,"attachment_urls":[],"attachments_complete":true},
+    {"id":"qsl-15","identifier":"QSL-15","title":"Duplicate noise","description":null,"state":"Duplicate","state_name":"Duplicate","state_type":"duplicate","parent_id":null,"team_key":"QSL","assignee_id":null,"assignee_name":null,"project_id":null,"project_milestone_id":null,"priority":0.0,"sort_order":4.0,"blocked_by":[],"created_at":null,"updated_at":null,"attachment_urls":[],"attachments_complete":true}
+  ],
+  "fetched_at": 1792526400
+}

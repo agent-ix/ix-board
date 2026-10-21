@@ -9,6 +9,7 @@ use ix_board::agents::{
     render_text,
 };
 use ix_board::chain::{ChainReport, evaluate_chain, open_scope_issues, resolve_issue};
+use ix_board::orphans::{OrphansReport, find_orphans};
 use ix_board::program_review::{
     ProgramRoadmap, ProgramScope, ScopeCheckReport, build_roadmap, check_scope,
 };
@@ -145,6 +146,12 @@ enum Command {
         /// Program scope file; when issue is omitted, expands all open project tickets in it.
         #[arg(long, required_unless_present = "issue")]
         scope: Option<PathBuf>,
+    },
+    /// List unprojected open and completed tickets in the scope's project teams.
+    Orphans {
+        /// TOML program scope file that defines the projects and their teams.
+        #[arg(long, required = true)]
+        scope: PathBuf,
     },
 }
 
@@ -307,6 +314,7 @@ enum Output {
     ProgramRoadmap(ProgramRoadmap),
     Reconcile(ReconcileReport),
     Chain(ChainReport),
+    Orphans(OrphansReport),
 }
 
 fn parse_project_status(value: &str) -> Result<ProjectRunStatus, String> {
@@ -610,6 +618,16 @@ fn run(command: Command) -> Result<Output, Error> {
                 .map(Output::Chain)
                 .map_err(Error::from)
         }
+        Command::Orphans { scope } => {
+            let scope = ProgramScope::load(scope).map_err(|error| Error::ProgramReview {
+                message: error.to_string(),
+            })?;
+            let source = LinearGraphQlSource::from_env()?;
+            let workspace = source.fetch_workspace()?;
+            find_orphans(&scope, &workspace)
+                .map(Output::Orphans)
+                .map_err(Error::from)
+        }
         other => run_linear(other),
     }
 }
@@ -700,6 +718,9 @@ fn run_linear(command: Command) -> Result<Output, Error> {
         | Command::Roadmap { .. }
         | Command::Reconcile { .. }
         | Command::Chain { .. } => {
+            unreachable!("program review commands are handled before Linear dispatch")
+        }
+        Command::Orphans { .. } => {
             unreachable!("program review commands are handled before Linear dispatch")
         }
         Command::Next { team } => service.next(&team).map(Output::Queue),
@@ -943,6 +964,7 @@ fn render_human(output: &Output) -> String {
         Output::ProgramRoadmap(report) => render_roadmap(report),
         Output::Reconcile(report) => render_reconcile(report),
         Output::Chain(report) => render_chain(report),
+        Output::Orphans(report) => render_orphans(report),
         Output::ProjectStatusUpdated { project, status } => {
             format!("Project {project} status set to {status}")
         }
@@ -1120,6 +1142,44 @@ fn render_chain(report: &ChainReport) -> String {
     }
     for warning in &report.warnings {
         lines.push(format!("warning: {warning}"));
+    }
+    lines.join("\n")
+}
+
+fn render_orphans(report: &OrphansReport) -> String {
+    let mut lines = vec![format!("Unprojected tickets in {}", report.scope)];
+    for warning in &report.warnings {
+        lines.push(format!("warning: {warning}"));
+    }
+    for (heading, findings) in [("Open", &report.open), ("Done", &report.done)] {
+        lines.push(format!("{heading} ({}):", findings.len()));
+        if findings.is_empty() {
+            lines.push("  (none)".to_owned());
+        }
+        for finding in findings {
+            lines.push(format!(
+                "  {} [{}] team={} — {}",
+                finding.identifier, heading, finding.team, finding.title
+            ));
+            if finding.suggestions.is_empty() {
+                lines.push("    suggested project: none (no matching scoped project)".to_owned());
+            }
+            for suggestion in &finding.suggestions {
+                lines.push(format!(
+                    "    suggested project: {} ({}){}",
+                    suggestion.project,
+                    suggestion.reason,
+                    if suggestion.team_mismatch {
+                        format!(
+                            "; warning: ticket team {} is not associated with this project",
+                            finding.team
+                        )
+                    } else {
+                        String::new()
+                    }
+                ));
+            }
+        }
     }
     lines.join("\n")
 }
@@ -1568,7 +1628,7 @@ fn render_chunk(chunk: &ProjectChunk) -> String {
 mod tests {
     use super::{
         Cli, Command, FocusCommand, Output, ProgramScopeCommand, format_issue_ref,
-        format_snapshot_time_at, output_outcome, render_chain, render_focus_status,
+        format_snapshot_time_at, output_outcome, render_chain, render_focus_status, render_orphans,
         render_reconcile,
     };
     use clap::Parser;
@@ -1606,7 +1666,7 @@ mod tests {
         );
     }
 
-    /// Trace: FR-021-AC-3
+    /// Trace: FR-021-AC-3, FR-023-AC-1
     #[test]
     fn program_review_commands_accept_the_scope_file_option() {
         let scope = Cli::try_parse_from(["ix-board", "scope", "check", "--scope", "qsl.toml"])
@@ -1656,6 +1716,12 @@ mod tests {
             matches!(scoped_chain.command, Command::Chain { issue: None, scope: Some(scope) } if scope.to_str() == Some("program.toml"))
         );
         assert!(Cli::try_parse_from(["ix-board", "chain"]).is_err());
+        let orphans = Cli::try_parse_from(["ix-board", "orphans", "--scope", "program.toml"])
+            .expect("parse scoped orphans");
+        assert!(
+            matches!(orphans.command, Command::Orphans { scope } if scope.to_str() == Some("program.toml"))
+        );
+        assert!(Cli::try_parse_from(["ix-board", "orphans"]).is_err());
     }
 
     /// Trace: FR-021-AC-3
@@ -1743,6 +1809,39 @@ mod tests {
         assert_eq!(json["nodes"][0]["assignee_name"], "Quill Dev");
         assert_eq!(json["cycles"][0][1], "QSL-5");
         assert_eq!(json["unowned_root_blockers"][0], "IR-2");
+    }
+
+    /// Trace: FR-023-AC-3
+    #[test]
+    fn orphans_human_and_json_outputs_expose_both_groups_and_warnings() {
+        let report = ix_board::orphans::OrphansReport {
+            scope: "Review".to_owned(),
+            open: vec![ix_board::orphans::OrphanFinding {
+                identifier: "IR-21".to_owned(),
+                title: "QLS: integration".to_owned(),
+                team: "IR".to_owned(),
+                suggestions: vec![ix_board::orphans::ProjectSuggestion {
+                    project: "QSL Language Spec".to_owned(),
+                    reason: "title begins with project prefix \"QLS\"".to_owned(),
+                    team_mismatch: true,
+                }],
+            }],
+            done: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let human = render_orphans(&report);
+        for value in [
+            "Open (1)",
+            "Done (0)",
+            "QSL Language Spec",
+            "title begins",
+            "team IR is not associated",
+        ] {
+            assert!(human.contains(value), "human output should include {value}");
+        }
+        let json = serde_json::to_value(Output::Orphans(report)).unwrap();
+        assert_eq!(json["open"][0]["suggestions"][0]["team_mismatch"], true);
+        assert!(json["done"].is_array());
     }
 
     #[test]

@@ -23,7 +23,8 @@ SWM-4 reports evidence of work outside that queue and work that is active but
 not landing. SWM-102 adds program scope validation against live Linear and
 GitHub catalogs; SWM-103 adds a live program roadmap with derived project
 progress. SWM-104 adds read-only reconciliation between Linear project issue
-state and linked GitHub pull requests (FR-021). SWM-33 adds inline planner
+state and linked GitHub pull requests (FR-021). SWM-112 adds a read-only report
+of unprojected issues in a program scope (FR-023). SWM-33 adds inline planner
 focus inputs that expand initiatives, projects, and issues into Linear issue
 sets and blocker layers. SWM-34 adds focus status, blocker-state, and
 ready-queue reporting. SWM-35 adds a focus hygiene report and a comparison
@@ -55,6 +56,9 @@ with the last successful report for that focus.
 - `agents` reports a per-agent activity verdict (working, waiting-stuck, prompt,
   asking, idle, unknown) for the herdr workspaces of named teams on every
   machine, measured in minutes from transcripts, subagents and processes (FR-018).
+- `orphans` reports unprojected open and completed issues for the teams
+  associated with projects in a program scope, with read-only project
+  suggestions (FR-023).
 - `drift` reports per-lead scope and churn signals from structured Linear,
   GitHub, herdr, and OpenTelemetry records, with configurable thresholds,
   a stable JSON field contract, and one text line per lead. Its time-based
@@ -111,7 +115,8 @@ records through Linear GraphQL and caches read results locally.
 - Team leads use `focus plan-chunk` to hand off an ordered slice of open focus
   issues with their readiness and dependency context.
 - Program reviewers use `scope check` to validate a declared program boundary
-  and `roadmap` to report initiative and project progress from live records.
+  and `roadmap` to report initiative and project progress from live records;
+  `orphans` reports unprojected issues and scoped project suggestions.
 - Library consumers rely on the same deterministic read results and queue rules.
 
 ## Requirements Architecture
@@ -126,10 +131,12 @@ structured-source boundary in FR-005.
 US-006 traces to FR-010, FR-011, FR-012, and FR-014, composing focus
 membership, blocker layers, and readiness into an ordered handoff slice.
 US-007 traces to FR-016, which packages a canonical focus and status for
-shared clients without choosing a storage service. US-008 traces to FR-019
-and FR-020 for validating a declared program scope and building its live
-roadmap. US-001 also traces to FR-021, which reconciles a selected project's
-Linear issues and attachments with GitHub pull-request and branch evidence.
+shared clients without choosing a storage service. US-008 traces to FR-019,
+FR-020, and FR-023 for validating a declared program scope, building its live
+roadmap, and finding unprojected issues. US-001 also traces to FR-021, which
+reconciles a selected project's Linear issues and attachments with GitHub
+pull-request and branch evidence.
+FR-023 specifies the read-only orphan report over a declared program scope.
 Functional acceptance criteria include fixture checks for each drift signal,
 queue rules, and cache behavior; NFR-001 specifies a lightweight warm-cache
 fixture benchmark.

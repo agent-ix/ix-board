@@ -1,0 +1,9 @@
+program = "Review"
+
+[[projects]]
+name = "qsl language spec"
+primary_initiative = "QSL"
+
+[[projects]]
+name = "infra"
+primary_initiative = "Tooling"
