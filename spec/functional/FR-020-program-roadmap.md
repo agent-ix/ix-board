@@ -28,8 +28,9 @@ deterministic ordering.
 | FR-020-AC-1 | The roadmap groups projects under their initiative memberships, places a shared project exactly once under its declared primary initiative when scoped (or deterministic primary membership when unscoped), and reports remaining memberships as `also_in`. | Test |
 | FR-020-AC-2 | Given a workspace snapshot, project open, completed, canceled, progress percentage, and last activity values are derived from its live issue records; no persisted tally is used. | Test |
 | FR-020-AC-3 | Scoped output contains only scope-declared initiatives and projects; the roadmap reports declared initiatives without projects and projects in multiple initiatives, and an unscoped roadmap reports projects with no initiative membership as unplaced. | Test |
-| FR-020-AC-4 | Initiative, project, and diagnostic rows have deterministic case-insensitive name ordering for identical input records. | Test |
+| FR-020-AC-4 | Initiative, project, and diagnostic rows, including each `also_in` membership list, are ordered case-insensitively by name, with original spelling as a deterministic tie-breaker when names have the same case-folded value. | Test |
 | FR-020-AC-5 | The roadmap uses a structured Linear snapshot and performs no Linear or GitHub writes. | Inspection |
+| FR-020-AC-6 | A scoped roadmap reports scope-declared initiatives and projects absent from Linear in `missing_scope_initiatives` and `missing_scope_projects`; reports Linear projects assigned to a scope-declared initiative but absent from the scope file in `projects_missing_from_scope`; and reports each scope-listed project with differing declared and Linear initiative memberships, with declared memberships absent from Linear as `missing_from_linear` and Linear memberships absent from the scope file as `missing_from_scope`. | Test |
 
 ## Dependencies
 

@@ -349,6 +349,16 @@ fn same_name(left: &str, right: &str) -> bool {
     left.eq_ignore_ascii_case(right)
 }
 
+fn compare_names(left: &str, right: &str) -> std::cmp::Ordering {
+    left.to_lowercase()
+        .cmp(&right.to_lowercase())
+        .then_with(|| left.cmp(right))
+}
+
+fn sort_names(names: &mut [String]) {
+    names.sort_by(|left, right| compare_names(left, right));
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProgramRoadmap {
@@ -356,6 +366,18 @@ pub struct ProgramRoadmap {
     pub unplaced_projects: Vec<RoadmapUnplacedProject>,
     pub initiatives_without_projects: Vec<String>,
     pub projects_in_multiple_initiatives: Vec<String>,
+    pub projects_missing_from_scope: Vec<String>,
+    pub project_membership_mismatches: Vec<ProjectInitiativeMismatch>,
+    pub missing_scope_initiatives: Vec<String>,
+    pub missing_scope_projects: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectInitiativeMismatch {
+    pub project: String,
+    pub missing_from_linear: Vec<String>,
+    pub missing_from_scope: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -426,12 +448,59 @@ pub fn build_roadmap(
         }
         None => initiatives.iter().collect(),
     };
+    let selected_names = selected_initiatives
+        .iter()
+        .map(|initiative| initiative.name.clone())
+        .collect::<BTreeSet<_>>();
+    let mut missing_scope_initiatives = scope
+        .into_iter()
+        .flat_map(|scope| {
+            scope
+                .initiatives
+                .iter()
+                .map(|item| item.name.clone())
+                .chain(scope.projects.iter().flat_map(|placement| {
+                    std::iter::once(placement.primary_initiative.clone())
+                        .chain(placement.also_in.iter().cloned())
+                }))
+        })
+        .filter(|name| {
+            !initiatives
+                .iter()
+                .any(|initiative| same_name(&initiative.name, name))
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    sort_names(&mut missing_scope_initiatives);
+    let mut missing_scope_projects = scope
+        .into_iter()
+        .flat_map(|scope| {
+            scope
+                .projects
+                .iter()
+                .map(|placement| placement.name.clone())
+        })
+        .filter(|name| {
+            !workspace
+                .projects
+                .iter()
+                .any(|project| same_name(&project.name, name))
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    sort_names(&mut missing_scope_projects);
 
     let mut result = ProgramRoadmap {
         initiatives: Vec::new(),
         unplaced_projects: Vec::new(),
         initiatives_without_projects: Vec::new(),
         projects_in_multiple_initiatives: Vec::new(),
+        projects_missing_from_scope: Vec::new(),
+        project_membership_mismatches: Vec::new(),
+        missing_scope_initiatives,
+        missing_scope_projects,
     };
     let mut assigned = BTreeSet::<String>::new();
     for initiative in selected_initiatives {
@@ -454,7 +523,7 @@ pub fn build_roadmap(
                 .iter()
                 .filter_map(|item| initiative_by_id.get(&item.id).cloned())
                 .collect();
-            memberships.sort_by_key(|name| name.to_lowercase());
+            memberships.sort_by(|left, right| compare_names(left, right));
             memberships.dedup_by(|a, b| same_name(a, b));
             let primary = declared
                 .map(|item| item.primary_initiative.as_str())
@@ -463,7 +532,7 @@ pub fn build_roadmap(
                 assigned.remove(&project.id.0);
                 continue;
             }
-            let also_in = declared
+            let mut also_in = declared
                 .map(|item| item.also_in.clone())
                 .unwrap_or_else(|| {
                     memberships
@@ -472,6 +541,7 @@ pub fn build_roadmap(
                         .cloned()
                         .collect()
                 });
+            sort_names(&mut also_in);
             if memberships.len() > 1 {
                 result
                     .projects_in_multiple_initiatives
@@ -479,7 +549,7 @@ pub fn build_roadmap(
             }
             rows.push(roadmap_project(project, &workspace.issues, also_in));
         }
-        rows.sort_by_key(|item| item.name.to_lowercase());
+        rows.sort_by(|left, right| compare_names(&left.name, &right.name));
         if rows.is_empty() {
             result
                 .initiatives_without_projects
@@ -503,21 +573,72 @@ pub fn build_roadmap(
             result
                 .unplaced_projects
                 .push(roadmap_unplaced(project, &workspace.issues));
+        } else if scope.is_some()
+            && !included
+            && project.initiatives.iter().any(|membership| {
+                selected_names
+                    .iter()
+                    .any(|name| same_name(name, &membership.name))
+            })
+        {
+            result
+                .projects_missing_from_scope
+                .push(project.name.clone());
+        }
+    }
+    if let Some(scope) = scope {
+        for placement in &scope.projects {
+            let Some(project) = workspace
+                .projects
+                .iter()
+                .find(|project| same_name(&project.name, &placement.name))
+            else {
+                continue;
+            };
+            let expected = std::iter::once(placement.primary_initiative.as_str())
+                .chain(placement.also_in.iter().map(String::as_str))
+                .collect::<BTreeSet<_>>();
+            let actual = project
+                .initiatives
+                .iter()
+                .map(|initiative| initiative.name.as_str())
+                .collect::<BTreeSet<_>>();
+            let mut missing_from_linear = expected
+                .iter()
+                .filter(|name| !actual.iter().any(|actual| same_name(name, actual)))
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>();
+            let mut missing_from_scope = actual
+                .iter()
+                .filter(|name| !expected.iter().any(|expected| same_name(name, expected)))
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>();
+            sort_names(&mut missing_from_linear);
+            sort_names(&mut missing_from_scope);
+            if !missing_from_linear.is_empty() || !missing_from_scope.is_empty() {
+                result
+                    .project_membership_mismatches
+                    .push(ProjectInitiativeMismatch {
+                        project: project.name.clone(),
+                        missing_from_linear,
+                        missing_from_scope,
+                    });
+            }
         }
     }
     result
         .initiatives
-        .sort_by_key(|item| item.name.to_lowercase());
+        .sort_by(|left, right| compare_names(&left.name, &right.name));
     result
         .unplaced_projects
-        .sort_by_key(|item| item.name.to_lowercase());
-    result
-        .initiatives_without_projects
-        .sort_by_key(|item| item.to_lowercase());
-    result
-        .projects_in_multiple_initiatives
-        .sort_by_key(|item| item.to_lowercase());
+        .sort_by(|left, right| compare_names(&left.name, &right.name));
+    sort_names(&mut result.initiatives_without_projects);
+    sort_names(&mut result.projects_in_multiple_initiatives);
     result.projects_in_multiple_initiatives.dedup();
+    sort_names(&mut result.projects_missing_from_scope);
+    result
+        .project_membership_mismatches
+        .sort_by(|left, right| compare_names(&left.project, &right.project));
     result
 }
 
@@ -889,5 +1010,226 @@ owns = "program review"
         server.join().unwrap();
         assert!(diagnostic.contains("agent-ix/quire"));
         assert!(timed_out, "expected request timeout, got: {diagnostic}");
+    }
+
+    #[test]
+    /// Trace: FR-020-AC-6
+    fn scoped_roadmap_reports_projects_outside_scope_and_membership_mismatches() {
+        let core = initiative("QSL Core", "2");
+        let ecosystem = initiative("QSL Ecosystem", "4");
+        let compiler = project("Compiler", vec![ecosystem.clone()]);
+        let runtime = project("Runtime", vec![core.clone()]);
+        let workspace = WorkspaceSnapshot {
+            projects: vec![compiler, runtime],
+            issues: Vec::new(),
+            fetched_at: 0,
+        };
+
+        let report = build_roadmap(&[core], &workspace, Some(&scope()));
+
+        assert_eq!(report.projects_missing_from_scope, ["Runtime"]);
+        assert_eq!(report.project_membership_mismatches.len(), 1);
+        assert_eq!(
+            report.project_membership_mismatches[0],
+            ProjectInitiativeMismatch {
+                project: "Compiler".to_owned(),
+                missing_from_linear: vec!["QSL Core".to_owned()],
+                missing_from_scope: vec!["QSL Ecosystem".to_owned()],
+            }
+        );
+    }
+
+    #[test]
+    /// Trace: FR-020-AC-6
+    fn scoped_roadmap_reports_missing_scope_catalog_entries() {
+        let core = initiative("QSL Core", "2");
+        let workspace = WorkspaceSnapshot {
+            projects: vec![project("Compiler", vec![core.clone()])],
+            issues: Vec::new(),
+            fetched_at: 0,
+        };
+        let mut scope = scope();
+        scope.initiatives.push(NamedRef {
+            name: "Missing Initiative".to_owned(),
+        });
+        scope.projects.push(ProjectPlacement {
+            name: "Missing Project".to_owned(),
+            primary_initiative: "Missing Initiative".to_owned(),
+            also_in: Vec::new(),
+        });
+
+        let report = build_roadmap(&[core], &workspace, Some(&scope));
+
+        assert_eq!(report.missing_scope_initiatives, ["Missing Initiative"]);
+        assert_eq!(report.missing_scope_projects, ["Missing Project"]);
+    }
+
+    #[test]
+    /// Trace: FR-020-AC-4, FR-020-AC-6
+    fn scoped_roadmap_diagnostic_names_sort_case_insensitively_with_stable_ties() {
+        let core = initiative("QSL Core", "2");
+        let gamma = initiative("QSL Gamma", "3");
+        let epsilon = initiative("QSL epsilon", "4");
+        let mut file = scope();
+        file.initiatives.extend([
+            NamedRef {
+                name: "zeta Initiative".into(),
+            },
+            NamedRef {
+                name: "alpha Initiative".into(),
+            },
+        ]);
+        file.projects[0] = ProjectPlacement {
+            name: "zeta Compiler".into(),
+            primary_initiative: "QSL Omega".into(),
+            also_in: vec!["QSL beta".into(), "QSL Delta".into()],
+        };
+        file.projects.push(ProjectPlacement {
+            name: "Alpha Compiler".into(),
+            primary_initiative: "qsl alpha".into(),
+            also_in: Vec::new(),
+        });
+        for name in ["zeta Project", "alpha Project", "Alpha Project"] {
+            file.projects.push(ProjectPlacement {
+                name: name.into(),
+                primary_initiative: "QSL Core".into(),
+                also_in: Vec::new(),
+            });
+        }
+        let workspace = WorkspaceSnapshot {
+            projects: vec![
+                project("zeta Compiler", vec![gamma, epsilon]),
+                project("Alpha Compiler", vec![core.clone()]),
+                project("zeta Runtime", vec![core.clone()]),
+                project("alpha Runtime", vec![core.clone()]),
+                project("Alpha Runtime", vec![core.clone()]),
+            ],
+            issues: Vec::new(),
+            fetched_at: 0,
+        };
+
+        let report = build_roadmap(&[core], &workspace, Some(&file));
+
+        assert_eq!(
+            report.missing_scope_initiatives,
+            [
+                "alpha Initiative",
+                "qsl alpha",
+                "QSL beta",
+                "QSL Delta",
+                "QSL Omega",
+                "zeta Initiative"
+            ]
+        );
+        assert_eq!(
+            report.missing_scope_projects,
+            ["Alpha Project", "alpha Project", "zeta Project"]
+        );
+        assert_eq!(
+            report.projects_missing_from_scope,
+            ["Alpha Runtime", "alpha Runtime", "zeta Runtime"]
+        );
+        assert_eq!(
+            report
+                .project_membership_mismatches
+                .iter()
+                .map(|mismatch| mismatch.project.as_str())
+                .collect::<Vec<_>>(),
+            ["Alpha Compiler", "zeta Compiler"]
+        );
+        assert_eq!(
+            report.project_membership_mismatches[0].missing_from_linear,
+            ["qsl alpha"]
+        );
+        assert_eq!(
+            report.project_membership_mismatches[1].missing_from_linear,
+            ["QSL beta", "QSL Delta", "QSL Omega"]
+        );
+        assert_eq!(
+            report.project_membership_mismatches[1].missing_from_scope,
+            ["QSL epsilon", "QSL Gamma"]
+        );
+    }
+
+    #[test]
+    /// Trace: FR-020-AC-1, FR-020-AC-4
+    fn roadmap_also_in_names_sort_case_insensitively_in_scoped_and_unscoped_modes() {
+        let core = initiative("QSL Core", "2");
+        let upper_alpha = initiative("QSL Alpha", "3");
+        let lower_alpha = initiative("qsl alpha", "4");
+        let beta = initiative("QSL beta", "5");
+        let zeta = initiative("QSL zeta", "6");
+        let initiatives = [
+            core.clone(),
+            zeta.clone(),
+            beta.clone(),
+            lower_alpha.clone(),
+            upper_alpha.clone(),
+        ];
+        let memberships = vec![
+            core.clone(),
+            zeta.clone(),
+            beta.clone(),
+            lower_alpha.clone(),
+            upper_alpha.clone(),
+        ];
+        let mut file = scope();
+        file.projects[0] = ProjectPlacement {
+            name: "Scoped".into(),
+            primary_initiative: "QSL Core".into(),
+            also_in: vec![
+                "QSL zeta".into(),
+                "QSL beta".into(),
+                "qsl alpha".into(),
+                "QSL Alpha".into(),
+            ],
+        };
+        let scoped_workspace = WorkspaceSnapshot {
+            projects: vec![project("Scoped", memberships.clone())],
+            issues: Vec::new(),
+            fetched_at: 0,
+        };
+        let scoped = build_roadmap(&initiatives, &scoped_workspace, Some(&file));
+        let scoped_project = scoped
+            .initiatives
+            .iter()
+            .find(|row| row.name == "QSL Core")
+            .unwrap()
+            .projects
+            .first()
+            .unwrap();
+        assert_eq!(
+            scoped_project.also_in,
+            ["QSL Alpha", "qsl alpha", "QSL beta", "QSL zeta"]
+        );
+
+        let unscoped_workspace = WorkspaceSnapshot {
+            projects: vec![project(
+                "Unscoped",
+                vec![
+                    core.clone(),
+                    zeta.clone(),
+                    beta.clone(),
+                    lower_alpha.clone(),
+                ],
+            )],
+            issues: Vec::new(),
+            fetched_at: 0,
+        };
+        let unscoped_initiatives = [core, zeta, beta, lower_alpha];
+        let unscoped = build_roadmap(&unscoped_initiatives, &unscoped_workspace, None);
+        let unscoped_project = unscoped
+            .initiatives
+            .iter()
+            .find(|row| row.name == "qsl alpha")
+            .unwrap()
+            .projects
+            .first()
+            .unwrap();
+        assert_eq!(unscoped_project.name, "Unscoped");
+        assert_eq!(
+            unscoped_project.also_in,
+            ["QSL beta", "QSL Core", "QSL zeta"]
+        );
     }
 }

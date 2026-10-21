@@ -1012,6 +1012,37 @@ fn render_roadmap(report: &ProgramRoadmap) -> String {
     for project in &report.projects_in_multiple_initiatives {
         lines.push(format!("project in multiple initiatives: {project}"));
     }
+    for project in &report.projects_missing_from_scope {
+        lines.push(format!(
+            "project in a scoped initiative but missing from scope file: {project}"
+        ));
+    }
+    for initiative in &report.missing_scope_initiatives {
+        lines.push(format!(
+            "initiative listed in scope file but missing from Linear: {initiative}"
+        ));
+    }
+    for project in &report.missing_scope_projects {
+        lines.push(format!(
+            "project listed in scope file but missing from Linear: {project}"
+        ));
+    }
+    for mismatch in &report.project_membership_mismatches {
+        if !mismatch.missing_from_linear.is_empty() {
+            lines.push(format!(
+                "scope project missing Linear initiative membership: {} | {}",
+                mismatch.project,
+                mismatch.missing_from_linear.join(", ")
+            ));
+        }
+        if !mismatch.missing_from_scope.is_empty() {
+            lines.push(format!(
+                "Linear initiative membership missing from scope file: {} | {}",
+                mismatch.project,
+                mismatch.missing_from_scope.join(", ")
+            ));
+        }
+    }
     lines.join("\n")
 }
 
@@ -1627,9 +1658,9 @@ fn render_chunk(chunk: &ProjectChunk) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, FocusCommand, Output, ProgramScopeCommand, format_issue_ref,
+        Cli, Command, FocusCommand, Output, ProgramRoadmap, ProgramScopeCommand, format_issue_ref,
         format_snapshot_time_at, output_outcome, render_chain, render_focus_status, render_orphans,
-        render_reconcile,
+        render_reconcile, render_roadmap,
     };
     use clap::Parser;
     use ix_board::program_review::ScopeCheckReport;
@@ -1842,6 +1873,48 @@ mod tests {
         let json = serde_json::to_value(Output::Orphans(report)).unwrap();
         assert_eq!(json["open"][0]["suggestions"][0]["team_mismatch"], true);
         assert!(json["done"].is_array());
+    }
+
+    #[test]
+    /// Trace: FR-020-AC-6
+    fn roadmap_reports_scope_coverage_and_initiative_membership_breaks() {
+        let report = ProgramRoadmap {
+            initiatives: Vec::new(),
+            unplaced_projects: Vec::new(),
+            initiatives_without_projects: Vec::new(),
+            projects_in_multiple_initiatives: Vec::new(),
+            projects_missing_from_scope: vec!["Runtime".to_owned()],
+            project_membership_mismatches: vec![
+                ix_board::program_review::ProjectInitiativeMismatch {
+                    project: "Compiler".to_owned(),
+                    missing_from_linear: vec!["QSL Core".to_owned()],
+                    missing_from_scope: vec!["QSL Ecosystem".to_owned()],
+                },
+            ],
+            missing_scope_initiatives: vec!["Missing Initiative".to_owned()],
+            missing_scope_projects: vec!["Missing Project".to_owned()],
+        };
+        let human = render_roadmap(&report);
+        for message in [
+            "missing from scope file: Runtime",
+            "scope project missing Linear initiative membership: Compiler | QSL Core",
+            "Linear initiative membership missing from scope file: Compiler | QSL Ecosystem",
+            "initiative listed in scope file but missing from Linear: Missing Initiative",
+            "project listed in scope file but missing from Linear: Missing Project",
+        ] {
+            assert!(
+                human.contains(message),
+                "human output should include {message}"
+            );
+        }
+        let json = serde_json::to_value(Output::ProgramRoadmap(report)).unwrap();
+        assert_eq!(json["projects_missing_from_scope"][0], "Runtime");
+        assert_eq!(
+            json["project_membership_mismatches"][0]["project"],
+            "Compiler"
+        );
+        assert_eq!(json["missing_scope_initiatives"][0], "Missing Initiative");
+        assert_eq!(json["missing_scope_projects"][0], "Missing Project");
     }
 
     #[test]
