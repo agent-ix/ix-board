@@ -50,6 +50,13 @@ ix-board roadmap
 
 Projects appear once under their primary initiative. The report includes their other initiative memberships, current Linear issue-state counts, progress, and last activity. It also reports projects with no initiative and initiatives with no projects.
 
+Find unprojected open and completed tickets in the teams represented by scoped projects with `orphans`. Each row includes a project suggestion and its reason. A title-prefix suggestion can point to a project that does not include the ticket's team; the command warns because Linear will reject that move. The command is read-only:
+
+```bash
+ix-board orphans --scope qsl.toml
+ix-board --json orphans --scope qsl.toml
+```
+
 To compare a project's current Linear issue states with its linked pull requests and branches, run `reconcile`. Repositories from linked PR URLs are checked automatically; pass the program scope to search its repositories for matching branches when tickets have no linked PR. The stale threshold defaults to 14 days:
 
 ```bash

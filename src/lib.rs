@@ -10,6 +10,7 @@ mod drift;
 mod hygiene;
 mod linear;
 mod model;
+pub mod orphans;
 pub mod program_review;
 pub mod reconcile;
 mod scope;
