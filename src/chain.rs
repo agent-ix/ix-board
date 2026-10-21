@@ -147,6 +147,8 @@ pub fn evaluate_chain(
     let mut unresolved = BTreeSet::new();
     let mut queue: VecDeque<_> = starts.iter().cloned().collect();
     let mut warnings = Vec::new();
+    let mut traversal_steps = 0;
+    let mut traversal_limited = false;
     while let Some(issue_id) = queue.pop_front() {
         if !discovered.insert(issue_id.clone()) {
             continue;
@@ -156,6 +158,12 @@ pub fn evaluate_chain(
         };
         let mut blockers = Vec::new();
         for blocker_id in &issue.blocked_by {
+            if traversal_steps >= TRAVERSAL_STEP_LIMIT {
+                unresolved.insert(issue_id.clone());
+                traversal_limited = true;
+                break;
+            }
+            traversal_steps += 1;
             if by_id.contains_key(blocker_id) {
                 blockers.push(blocker_id.clone());
                 queue.push_back(blocker_id.clone());
@@ -170,6 +178,21 @@ pub fn evaluate_chain(
         blockers.sort_by(|left, right| by_id[left].identifier.cmp(&by_id[right].identifier));
         blockers.dedup();
         edges.insert(issue_id, blockers);
+        if traversal_limited {
+            break;
+        }
+    }
+    if traversal_limited {
+        // Preserve pending starts and discovered blocker nodes as incomplete rows, without
+        // inspecting their edges after the command-wide budget has been exhausted.
+        for pending in queue.drain(..).chain(starts.iter().cloned()) {
+            if let std::collections::btree_map::Entry::Vacant(entry) = edges.entry(pending.clone())
+            {
+                discovered.insert(pending.clone());
+                unresolved.insert(pending.clone());
+                entry.insert(Vec::new());
+            }
+        }
     }
 
     let mut root_ids = discovered
@@ -219,10 +242,11 @@ pub fn evaluate_chain(
 
     let mut path_ids = BTreeSet::<Vec<IssueId>>::new();
     let mut cycles_by_id = BTreeSet::<Vec<IssueId>>::new();
-    let mut traversal_steps = 0;
-    let mut traversal_limited = false;
     let mut cycles_limited = false;
     for start in &starts {
+        if traversal_limited {
+            break;
+        }
         let mut traversal = TraversalPath::default();
         let mut limits = TraversalLimits {
             steps: traversal_steps,
@@ -248,7 +272,7 @@ pub fn evaluate_chain(
     }
     if traversal_limited {
         warnings.push(format!(
-            "graph traversal limited to {TRAVERSAL_STEP_LIMIT} edge visits"
+            "graph traversal limited to {TRAVERSAL_STEP_LIMIT} dependency edge inspections; report may be incomplete"
         ));
     }
     if cycles_limited {
@@ -425,19 +449,39 @@ fn canonical_cycle(cycle: Vec<IssueId>) -> Vec<IssueId> {
     if body.is_empty() {
         return cycle;
     }
-    let mut best = body.to_vec();
-    for offset in 1..body.len() {
-        let rotated = body[offset..]
-            .iter()
-            .chain(body[..offset].iter())
-            .cloned()
-            .collect::<Vec<_>>();
-        if rotated < best {
-            best = rotated;
-        }
-    }
+    let start = least_rotation(body);
+    let mut best = body[start..]
+        .iter()
+        .chain(body[..start].iter())
+        .cloned()
+        .collect::<Vec<_>>();
     best.push(best[0].clone());
     best
+}
+
+fn least_rotation(items: &[IssueId]) -> usize {
+    let length = items.len();
+    let (mut left, mut right, mut offset) = (0, 1, 0);
+    while left < length && right < length && offset < length {
+        match items[(left + offset) % length].cmp(&items[(right + offset) % length]) {
+            std::cmp::Ordering::Equal => offset += 1,
+            std::cmp::Ordering::Greater => {
+                left += offset + 1;
+                if left <= right {
+                    left = right + 1;
+                }
+                offset = 0;
+            }
+            std::cmp::Ordering::Less => {
+                right += offset + 1;
+                if right <= left {
+                    right = left + 1;
+                }
+                offset = 0;
+            }
+        }
+    }
+    left.min(right)
 }
 
 fn is_terminal(state_type: WorkflowStateType) -> bool {
@@ -613,6 +657,129 @@ owns = "ECZ work"
             issues
                 .iter()
                 .all(|issue| issue.state_type != WorkflowStateType::Completed)
+        );
+    }
+
+    #[test]
+    /// Trace: FR-022-AC-1
+    fn scope_selection_starts_from_only_open_issues_in_listed_projects() {
+        let mut snapshot = snapshot();
+        let mut outside = snapshot.issues[0].clone();
+        outside.id = IssueId("issue-outside-scope".to_owned());
+        outside.identifier = "QSL-99".to_owned();
+        outside.project_id = Some(ProjectId("other-project".to_owned()));
+        snapshot.issues.push(outside);
+
+        let selected = open_scope_issues(&snapshot, &scope()).expect("resolve scoped starts");
+        let report = evaluate_chain(
+            &snapshot,
+            &selected
+                .iter()
+                .map(|issue| issue.id.clone())
+                .collect::<Vec<_>>(),
+            Some(&scope()),
+            now(),
+        )
+        .expect("evaluate all scoped starts");
+
+        assert_eq!(selected.len(), 5);
+        assert_eq!(report.starts, ["ECZ-3", "IR-2", "QSL-1", "QSL-4", "QSL-5"]);
+        assert!(
+            !report
+                .starts
+                .iter()
+                .any(|identifier| identifier == "QSL-99")
+        );
+    }
+
+    #[test]
+    /// Trace: FR-022-AC-4
+    fn closure_discovery_stops_at_the_command_edge_budget() {
+        let mut snapshot = snapshot();
+        let template = snapshot.issues[0].clone();
+        let mut root = template.clone();
+        root.id = IssueId("edge-budget-root".to_owned());
+        root.identifier = "NROOT".to_owned();
+        let within_budget = (0..TRAVERSAL_STEP_LIMIT)
+            .map(|index| {
+                let mut issue = template.clone();
+                issue.id = IssueId(format!("within-budget-{index}"));
+                issue.identifier = format!("N{index:06}");
+                issue.blocked_by.clear();
+                issue
+            })
+            .collect::<Vec<_>>();
+        let mut beyond_budget = template;
+        beyond_budget.id = IssueId("issue-after-budget".to_owned());
+        beyond_budget.identifier = "ZZZ-1".to_owned();
+        beyond_budget.blocked_by.clear();
+        root.blocked_by = within_budget
+            .iter()
+            .map(|issue| issue.id.clone())
+            .chain(std::iter::once(beyond_budget.id.clone()))
+            .collect();
+        snapshot.issues = std::iter::once(root)
+            .chain(within_budget)
+            .chain(std::iter::once(beyond_budget))
+            .collect();
+
+        let report = evaluate_chain(
+            &snapshot,
+            &[IssueId("edge-budget-root".to_owned())],
+            None,
+            now(),
+        )
+        .expect("evaluate graph within a bounded edge budget");
+
+        assert_eq!(report.nodes.len(), 1 + TRAVERSAL_STEP_LIMIT);
+        assert!(!report.nodes.iter().any(|node| node.identifier == "ZZZ-1"));
+        assert!(report.root_blockers.is_empty());
+        assert!(report.warnings.iter().any(|warning| {
+            warning.contains("100000 dependency edge inspections")
+                && warning.contains("may be incomplete")
+        }));
+    }
+
+    #[test]
+    /// Trace: FR-022-AC-2, FR-022-AC-4
+    fn long_cycle_is_canonicalized_without_quadratic_rotation_work() {
+        let mut snapshot = snapshot();
+        let template = snapshot.issues[0].clone();
+        let cycle_length = 50_000;
+        snapshot.issues = (0..cycle_length)
+            .map(|index| {
+                let mut issue = template.clone();
+                issue.id = IssueId(format!("cycle-{index}"));
+                issue.identifier = format!("CYC-{index:05}");
+                issue.blocked_by = vec![IssueId(format!("cycle-{}", (index + 1) % cycle_length))];
+                issue
+            })
+            .collect();
+
+        let report = evaluate_chain(&snapshot, &[IssueId("cycle-0".to_owned())], None, now())
+            .expect("evaluate long cycle");
+
+        assert_eq!(report.cycles.len(), 1);
+        assert_eq!(report.cycles[0].len(), cycle_length + 1);
+        assert_eq!(report.cycles[0][0], "CYC-00000");
+        assert_eq!(
+            report.cycles[0].last().map(String::as_str),
+            Some("CYC-00000")
+        );
+    }
+
+    #[test]
+    fn cycle_canonicalization_chooses_the_least_rotation() {
+        let cycle = vec![
+            IssueId("b".to_owned()),
+            IssueId("c".to_owned()),
+            IssueId("a".to_owned()),
+            IssueId("b".to_owned()),
+        ];
+
+        assert_eq!(
+            canonical_cycle(cycle),
+            ["a", "b", "c", "a"].map(|value| IssueId(value.to_owned()))
         );
     }
 
