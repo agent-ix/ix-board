@@ -1,0 +1,200 @@
+{
+  "data": {
+    "issues": {
+      "nodes": [
+        {
+          "id": "issue-over-50-attachments",
+          "identifier": "SWM-900",
+          "title": "In progress work with many linked PRs",
+          "description": null,
+          "priority": 0.0,
+          "sortOrder": 0.0,
+          "createdAt": "2026-09-01T00:00:00Z",
+          "updatedAt": "2026-09-01T00:00:00Z",
+          "state": {
+            "name": "Coding",
+            "type": "started"
+          },
+          "team": {
+            "key": "SWM"
+          },
+          "assignee": null,
+          "project": {
+            "id": "project-reconcile"
+          },
+          "projectMilestone": null,
+          "parent": null,
+          "relations": {
+            "nodes": [],
+            "pageInfo": {
+              "hasNextPage": false,
+              "endCursor": null
+            }
+          },
+          "attachments": {
+            "nodes": [
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/1"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/2"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/3"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/4"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/5"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/6"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/7"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/8"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/9"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/10"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/11"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/12"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/13"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/14"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/15"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/16"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/17"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/18"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/19"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/20"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/21"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/22"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/23"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/24"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/25"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/26"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/27"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/28"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/29"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/30"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/31"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/32"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/33"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/34"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/35"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/36"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/37"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/38"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/39"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/40"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/41"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/42"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/43"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/44"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/45"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/46"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/47"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/48"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/49"
+              },
+              {
+                "url": "https://github.com/agent-ix/reconcile-demo/pull/50"
+              }
+            ],
+            "pageInfo": {
+              "hasNextPage": true,
+              "endCursor": "attachment-50"
+            }
+          }
+        }
+      ],
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      }
+    }
+  }
+}

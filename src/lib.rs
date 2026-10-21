@@ -10,6 +10,7 @@ mod hygiene;
 mod linear;
 mod model;
 pub mod program_review;
+pub mod reconcile;
 mod scope;
 pub use scope::{ScopeSelection, ScopeSummary, select_scope};
 

@@ -21,6 +21,8 @@ relationships:
     type: traces_to
   - target: "ix://agent-ix/ix-board/FR-018"
     type: traces_to
+  - target: "ix://agent-ix/ix-board/FR-021"
+    type: traces_to
   - target: "ix://agent-ix/ix-board/NFR-001"
     type: traces_to
 ---
@@ -29,8 +31,9 @@ relationships:
 ## Story
 
 **As a** team leader coordinating work across a team and its projects
-**I want** a deterministic view of ready work, project context, and matching
-records, with controls for project run state and queue priority
+**I want** a deterministic view of ready work, project context, matching
+records, and project-to-pull-request reconciliation, with controls for project
+run state and queue priority
 **So that** I can decide what the team should work on using current Linear data.
 
 ## Context
