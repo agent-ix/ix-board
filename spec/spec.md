@@ -131,10 +131,11 @@ structured-source boundary in FR-005.
 US-006 traces to FR-010, FR-011, FR-012, and FR-014, composing focus
 membership, blocker layers, and readiness into an ordered handoff slice.
 US-007 traces to FR-016, which packages a canonical focus and status for
-shared clients without choosing a storage service. US-008 traces to FR-019
-and FR-020 for validating a declared program scope and building its live
-roadmap. US-001 also traces to FR-021, which reconciles a selected project's
-Linear issues and attachments with GitHub pull-request and branch evidence.
+shared clients without choosing a storage service. US-008 traces to FR-019,
+FR-020, and FR-023 for validating a declared program scope, building its live
+roadmap, and finding unprojected issues. US-001 also traces to FR-021, which
+reconciles a selected project's Linear issues and attachments with GitHub
+pull-request and branch evidence.
 FR-023 specifies the read-only orphan report over a declared program scope.
 Functional acceptance criteria include fixture checks for each drift signal,
 queue rules, and cache behavior; NFR-001 specifies a lightweight warm-cache

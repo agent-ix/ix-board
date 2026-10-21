@@ -7,6 +7,8 @@ relationships:
     type: traces_to
   - target: "ix://agent-ix/ix-board/FR-020"
     type: traces_to
+  - target: "ix://agent-ix/ix-board/FR-023"
+    type: traces_to
 provenance:
   source: SWM-102, SWM-103
 ---
@@ -35,3 +37,10 @@ scripts or stored tallies.
 - **When** I run `ix-board roadmap`
 - **Then** ix-board groups projects under initiatives and derives project
   progress from the snapshot's issue records
+
+### US-008-EX-3: Find unprojected issues
+
+- **Given** a program scope file and one Linear workspace snapshot
+- **When** I run `ix-board orphans --scope <file>`
+- **Then** ix-board reports unprojected open and completed issues for the
+  scoped projects' teams with read-only project suggestions

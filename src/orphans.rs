@@ -248,4 +248,22 @@ mod tests {
             Err(OrphansError::ProjectNotFound(name)) if name == "Missing"
         ));
     }
+
+    /// Trace: FR-023-AC-1
+    #[test]
+    fn ambiguous_scope_project_is_an_error() {
+        let mut snapshot: WorkspaceSnapshot =
+            serde_json::from_str(include_str!("../tests/fixtures/orphans/workspace.json"))
+                .expect("recorded Linear fixture");
+        snapshot.projects.push(snapshot.projects[0].clone());
+        let scope: ProgramScope = toml::from_str(
+            "program = 'Review'\n[[projects]]\nname = 'qsl language spec'\nprimary_initiative = 'Review'\n",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            find_orphans(&scope, &snapshot),
+            Err(OrphansError::ProjectAmbiguous(name)) if name == "qsl language spec"
+        ));
+    }
 }
