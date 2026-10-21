@@ -3073,6 +3073,7 @@ mod tests {
         ]);
         let mut active = ticket("qsl487", "QSL-487", "qsl-l2", "Coding", 1.0);
         active.team_key = "QSL".to_owned();
+        active.assignee_id = Some("worker-1".to_owned());
         active.project_identifier = Some("QSL L2 plan v2".to_owned());
         active.created_at = "2026-10-01T00:00:00Z".to_owned();
         active.state_entered_at = Some("2026-10-07T15:09:00Z".to_owned());
