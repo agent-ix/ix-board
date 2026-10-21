@@ -19,10 +19,9 @@ path = "src/main.rs"
 
 [dependencies]
 # Shared CLI foundation: exit taxonomy, stream discipline, canonical JSON,
-# version provenance, config precedence. Consumed by git-rev pin — one rev
-# string, no vendoring and no tag pin (see agent-ix/ix-cli-kit README,
-# "Consuming this crate").
-ix-cli-kit = { git = "https://github.com/agent-ix/ix-cli-kit", rev = "cc69a934f887966f955440bff8c356e3da449bee", features = ["secrets"] }
+# version provenance, config precedence. Follow main; Cargo.lock records the
+# resolved commit (see agent-ix/ix-cli-kit README, "Consuming this crate").
+ix-cli-kit = { git = "https://github.com/agent-ix/ix-cli-kit", branch = "main", features = ["secrets"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

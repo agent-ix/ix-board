@@ -1091,7 +1091,7 @@ dependencies = [
 [[package]]
 name = "ix-cli-kit"
 version = "0.1.0"
-source = "git+https://github.com/agent-ix/ix-cli-kit?rev=cc69a934f887966f955440bff8c356e3da449bee#cc69a934f887966f955440bff8c356e3da449bee"
+source = "git+https://github.com/agent-ix/ix-cli-kit?branch=main#be26cf02836e25f8ec7efa6de51e974d331a5816"
 dependencies = [
  "keyring",
  "serde",
