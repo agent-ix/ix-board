@@ -73,6 +73,10 @@ pub enum ProgramReviewError {
         repository: String,
         source: reqwest::Error,
     },
+    #[error(
+        "cannot verify GitHub repository {repository}: unauthenticated GitHub returned 404 (private or missing repository)"
+    )]
+    UnverifiableRepository { repository: String },
     #[error(transparent)]
     Linear(#[from] Error),
 }
@@ -185,10 +189,11 @@ pub fn check_scope(
             repository: "<client initialization>".to_owned(),
             source,
         })?;
-    let token = std::env::var("GITHUB_TOKEN")
-        .ok()
-        .or_else(|| std::env::var("GH_TOKEN").ok())
-        .or_else(github_cli_token);
+    let token = selected_github_token(
+        std::env::var("GITHUB_TOKEN").ok(),
+        std::env::var("GH_TOKEN").ok(),
+        github_cli_token,
+    );
     for repo in &scope.repos {
         let mut request = client.get(format!("https://api.github.com/repos/{}", repo.name));
         if let Some(token) = token.as_deref() {
@@ -200,20 +205,41 @@ pub fn check_scope(
                 repository: repo.name.clone(),
                 source,
             })?;
-        if response.status().as_u16() == 404 {
+        if repository_is_missing(response.status().as_u16(), token.is_some(), &repo.name)? {
             report.missing_repositories.push(repo.name.clone());
-        } else if !response.status().is_success() {
-            let status = response.status();
-            return Err(ProgramReviewError::Linear(Error::ProgramReview {
-                message: format!(
-                    "GitHub returned {status} while checking repository {}",
-                    repo.name
-                ),
-            }));
         }
     }
     report.missing_repositories.sort();
     Ok(report)
+}
+
+fn selected_github_token(
+    github_token: Option<String>,
+    gh_token: Option<String>,
+    gh_cli_token: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    github_token
+        .filter(|token| !token.trim().is_empty())
+        .or_else(|| gh_token.filter(|token| !token.trim().is_empty()))
+        .or_else(gh_cli_token)
+        .filter(|token| !token.trim().is_empty())
+}
+
+fn repository_is_missing(
+    status: u16,
+    authenticated: bool,
+    repository: &str,
+) -> Result<bool, ProgramReviewError> {
+    match status {
+        200..=299 => Ok(false),
+        404 if authenticated => Ok(true),
+        404 => Err(ProgramReviewError::UnverifiableRepository {
+            repository: repository.to_owned(),
+        }),
+        _ => Err(ProgramReviewError::InvalidScope(format!(
+            "GitHub returned HTTP {status} while checking repository {repository}"
+        ))),
+    }
 }
 
 fn github_cli_token() -> Option<String> {
@@ -557,6 +583,34 @@ owns = "program review"
 "#,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn empty_environment_token_falls_back_to_the_next_authenticated_source() {
+        assert_eq!(
+            selected_github_token(Some("  ".to_owned()), Some("gh-token".to_owned()), || {
+                panic!("GH_TOKEN should win before gh auth token")
+            })
+            .as_deref(),
+            Some("gh-token")
+        );
+        assert_eq!(
+            selected_github_token(Some(String::new()), Some(" ".to_owned()), || {
+                Some("gh-cli-token".to_owned())
+            })
+            .as_deref(),
+            Some("gh-cli-token")
+        );
+    }
+
+    #[test]
+    fn unauthenticated_not_found_is_unverifiable_and_names_the_repository() {
+        let error = repository_is_missing(404, false, "agent-ix/private-repo").unwrap_err();
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("agent-ix/private-repo"));
+        assert!(diagnostic.contains("private or missing"));
+        assert!(repository_is_missing(404, true, "agent-ix/private-repo").unwrap());
+        assert!(!repository_is_missing(200, false, "agent-ix/public-repo").unwrap());
     }
 
     fn initiative(name: &str, id: &str) -> Initiative {
