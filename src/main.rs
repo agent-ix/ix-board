@@ -383,7 +383,7 @@ fn main() -> std::process::ExitCode {
                 | Error::DriftInputRead { .. }
                 | Error::DriftInputDecode { .. }
                 | Error::Drift(_) => Outcome::Invalid,
-                Error::EmptyCredentialInput => Outcome::Invalid,
+                Error::EmptyCredentialInput | Error::InvalidCredentialSource => Outcome::Invalid,
                 _ => Outcome::Internal,
             })
         }
@@ -403,11 +403,10 @@ fn output_outcome(output: &Output) -> Outcome {
 
 fn format_cli_error(error: &Error) -> String {
     #[cfg(target_os = "macos")]
-    if matches!(
-        error,
-        Error::Credential(ix_cli_kit::secrets::SecretError::Unavailable)
-    ) {
-        return "Linear credential store unavailable or access denied for this binary; if another ix-board build works, grant this build access to the saved ix-board item in Keychain Access (see setup.md)".to_owned();
+    if let Error::Credential(cause) = error {
+        return format!(
+            "{cause}; use a consistently signed ix-board build and approve its saved Keychain item interactively (see setup.md), or explicitly select the configured Linear CLI with IX_BOARD_CREDENTIAL_SOURCE=linear-cli"
+        );
     }
     error.to_string()
 }

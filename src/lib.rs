@@ -101,6 +101,10 @@ pub enum Error {
     /// Neither an environment override nor a saved Linear credential exists.
     #[error("Linear API key is missing; run `ix-board auth login` or set LINEAR_API_KEY")]
     MissingApiKey,
+    /// The configured credential source selector is unsupported.
+    #[error("IX_BOARD_CREDENTIAL_SOURCE must be auto or linear-cli")]
+    InvalidCredentialSource,
+
     /// A requested work milestone did not match a milestone in the selected projects.
     #[error("work milestone {selector:?} not found in the selected focus projects")]
     WorkMilestoneNotFound { selector: String },

@@ -76,6 +76,21 @@ does not create a plaintext fallback file.
 
 Do not extract the saved key from Keychain to set `LINEAR_API_KEY` for a test.
 
+When the Linear CLI is already authenticated, explicitly select that integration:
+
+```bash
+IX_BOARD_CREDENTIAL_SOURCE=linear-cli ix-board auth status
+IX_BOARD_CREDENTIAL_SOURCE=linear-cli ix-board search "Alpha Feedback"
+```
+
+This source choice skips both `LINEAR_API_KEY` and the OS credential store.
+It invokes the configured `linear auth token` integration internally and never
+prints or saves the token. The default `IX_BOARD_CREDENTIAL_SOURCE=auto` keeps
+its environment → OS store → Linear CLI order and propagates OS-store access
+errors. It does not silently switch credentials after a denial. Unsupported
+source selections fail before credentials are read. Both `auth status` and
+live reads use the same source selection.
+
 Run reads with:
 
 ```bash

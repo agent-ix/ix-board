@@ -148,28 +148,15 @@ impl LinearGraphQlSource {
         })
     }
 
-    /// Resolves LINEAR_API_KEY, the saved OS credential, then the configured Linear CLI.
+    /// Resolves the explicitly selected source, or environment, OS store, then Linear CLI.
     pub fn from_env() -> Result<Self, Error> {
-        let scope = AppScope::try_from("ix-board")?;
-        let key = SecretKey::try_from("linear-api-key")?;
-        if let Some(resolved) =
-            SecretStore::system().resolve(None, Some("LINEAR_API_KEY"), &scope, &key)?
-        {
-            return Self::new(resolved.value.expose_secret());
-        }
-        Self::new(linear_cli_token().ok_or(Error::MissingApiKey)?)
+        let (value, _) = resolve_linear_auth()?.ok_or(Error::MissingApiKey)?;
+        Self::new(value.expose_secret())
     }
 
-    /// Reports which configured credential source is available without exposing its value.
+    /// Reports the selected source without displaying the credential.
     pub fn credential_source() -> Result<Option<String>, Error> {
-        let scope = AppScope::try_from("ix-board")?;
-        let key = SecretKey::try_from("linear-api-key")?;
-        if let Some(resolved) =
-            SecretStore::system().resolve(None, Some("LINEAR_API_KEY"), &scope, &key)?
-        {
-            return Ok(Some(resolved.source.as_str().to_owned()));
-        }
-        Ok(linear_cli_token().map(|_| "linear_cli".to_owned()))
+        Ok(resolve_linear_auth()?.map(|(_, source)| source.to_owned()))
     }
 
     /// Fetches every workspace initiative through Linear's paged initiatives connection.
@@ -1341,6 +1328,40 @@ fn canonical_issue_state(name: String, status_type: WorkflowStateType) -> String
     }
 }
 
+fn resolve_linear_auth() -> Result<Option<(SecretValue, &'static str)>, Error> {
+    let selection = match std::env::var("IX_BOARD_CREDENTIAL_SOURCE") {
+        Ok(selection) => selection,
+        Err(std::env::VarError::NotPresent) => "auto".to_owned(),
+        Err(std::env::VarError::NotUnicode(_)) => return Err(Error::InvalidCredentialSource),
+    };
+    resolve_linear_auth_with(
+        &selection,
+        || {
+            let scope = AppScope::try_from("ix-board")?;
+            let key = SecretKey::try_from("linear-api-key")?;
+            Ok(SecretStore::system()
+                .resolve(None, Some("LINEAR_API_KEY"), &scope, &key)?
+                .map(|resolved| (resolved.value, resolved.source.as_str())))
+        },
+        || linear_cli_token().map(|value| (SecretValue::new(value), "linear_cli")),
+    )
+}
+
+fn resolve_linear_auth_with(
+    selection: &str,
+    stored: impl FnOnce() -> Result<Option<(SecretValue, &'static str)>, Error>,
+    cli: impl FnOnce() -> Option<(SecretValue, &'static str)>,
+) -> Result<Option<(SecretValue, &'static str)>, Error> {
+    match selection {
+        "linear-cli" => Ok(cli()),
+        "auto" => match stored()? {
+            Some(value) => Ok(Some(value)),
+            None => Ok(cli()),
+        },
+        _ => Err(Error::InvalidCredentialSource),
+    }
+}
+
 fn linear_cli_token() -> Option<String> {
     let output = ProcessCommand::new("linear")
         .args(["auth", "token"])
@@ -2435,5 +2456,46 @@ mod tests {
                 Err(Error::MissingApiKey)
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod credential_selection_tests {
+    use super::resolve_linear_auth_with;
+    use crate::Error;
+    use ix_cli_kit::secrets::{SecretError, SecretValue};
+
+    /// Trace: FR-015-AC-4
+    #[test]
+    fn explicit_cli_selection_does_not_access_a_denied_store() {
+        let resolved = resolve_linear_auth_with(
+            "linear-cli",
+            || Err(Error::Credential(SecretError::Locked)),
+            || Some((SecretValue::new("fixture-key"), "linear_cli")),
+        )
+        .expect("explicit source works")
+        .expect("credential exists");
+        assert_eq!(resolved.1, "linear_cli");
+        assert_eq!(resolved.0.expose_secret(), "fixture-key");
+    }
+
+    /// Trace: FR-015-AC-5
+    #[test]
+    fn automatic_selection_preserves_denial_and_rejects_unknown_sources() {
+        let denied = resolve_linear_auth_with(
+            "auto",
+            || Err(Error::Credential(SecretError::Locked)),
+            || panic!("denied store must not silently fall back"),
+        );
+        assert!(matches!(
+            denied,
+            Err(Error::Credential(SecretError::Locked))
+        ));
+        let invalid = resolve_linear_auth_with(
+            "typo",
+            || panic!("invalid selection must not read credentials"),
+            || panic!("invalid selection must not read credentials"),
+        );
+        assert!(matches!(invalid, Err(Error::InvalidCredentialSource)));
     }
 }
