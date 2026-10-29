@@ -10,24 +10,24 @@ program. It holds membership and ownership. It does not hold counts, commit
 hashes or versions, because those come from live data.
 
 ```toml
-program = "QSL"
-out_of_scope = ["Sapho"]
+program = "Billing"
+out_of_scope = ["Mobile"]
 
 [[initiatives]]
-name = "QSL Core"
+name = "Billing Core"
 
 [[projects]]
-name = "QSL Compiler, Runtime & Tooling"
-primary_initiative = "QSL Core"
+name = "Billing Engine"
+primary_initiative = "Billing Core"
 also_in = []
 
 [[repos]]
-name = "agent-ix/quire"
-purpose = "QSpec tooling and language requirements"
+name = "acme/billing"
+purpose = "Invoicing service and API"
 
 [[lanes]]
-address = "terra:QSL:program-review"
-owns = "cross-lane QSL review"
+address = "hub:billing:review"
+owns = "cross-lane billing review"
 ```
 
 | Key | Meaning |
@@ -73,8 +73,8 @@ missing from the file and mismatches between the file and Linear's initiative
 memberships. Without `--scope`, it covers the whole workspace.
 
 ```text
-QSL Core
-  QSL Compiler, Runtime & Tooling | Started | 62% | open 31 done 52 canceled 4 | last activity 2026-10-27T16:40:11Z
+Billing Core
+  Billing Engine | Started | 62% | open 31 done 52 canceled 4 | last activity 2026-10-27T16:40:11Z
 unplaced project: Scratch | Paused | 0%
 ```
 
