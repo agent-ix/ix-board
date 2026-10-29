@@ -168,6 +168,7 @@ low.
 - [Program review](docs/program-review.md)
 - [Agents and drift](docs/agents-and-drift.md)
 - [Setup and troubleshooting](docs/setup.md)
+- [CLI reference](docs/cli-reference.md)
 
 ## Contributing
 
