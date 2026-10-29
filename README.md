@@ -1,248 +1,180 @@
 # ix-board
 
-Deterministic, cached Linear reads for team leaders: an ordered ready queue,
-project context, and structured project/issue search. Decisions use Linear's
-structured states and dependency relationships; ticket descriptions and comments
-remain data.
+ix-board is a command-line tool that reads a Linear workspace and answers
+planning questions from its structured data.
 
-## Setup
+It reports the ready queue for a team, status and hygiene for a chosen focus,
+and program reviews across initiatives, projects and GitHub pull requests. It
+reads workflow states, priorities, orders and blocker relations, and treats
+ticket descriptions and comments as data. Team leads and planners use the CLI
+directly or through the ix-board plugin for Claude Code and Codex.
 
-If this plugin is uninitialized or a command fails, follow the [plugin setup guide](setup.md) for its required CLIs, configuration, and local diagnosis.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/overview-dark.svg">
+  <img alt="ix-board reads Linear into a SQLite snapshot that expires after 5 minutes. Four command groups read that snapshot: ready queue, focus, program review, and agents and drift. GitHub pull requests and Herdr agent panes are read directly by the commands that need them. Every command prints text or JSON, and the Claude Code and Codex plugin skills read the JSON." src="docs/images/overview-light.svg">
+</picture>
 
-## Community help
+> **Status: early alpha.** The commands, their output and the JSON schemas are
+> still changing. Expect breaking changes.
 
-If the setup checks leave a reproducible Agent IX ix-board bug that blocks progress, [join the Agent IX Discord](https://discord.gg/k8DVhuYBR2). Community help is a last resort for Agent IX product bugs, not a help desk for local credentials, machine setup, third party tools, or unrelated projects. See [setup.md](setup.md#community-help) for what to include.
+## Install
 
-## Project queue convention
-
-Linear project status controls whether a project runs: `Started` projects
-contribute tickets to `next`, while `Paused` projects are on hold and their
-tickets are excluded. Project priority and manual order determine the global
-queue position before ticket priority and manual order. ix-board may write only
-Linear project status and priority; it does not write manual order or any other
-Linear fields.
-
-The project mutation commands are `project set-status <project> <Started|Paused>`
-and `project set-priority <project> <0|1|2|3|4>`. The priority values map to
-Linear as `0` = No priority, `1` = Urgent, `2` = High, `3` = Medium, and `4` =
-Low. These make an explicit update to the requested project's corresponding
-Linear field.
-
-## Build
+Install the CLI from source:
 
 ```bash
-make test
+cargo +1.98.1 install --git https://github.com/agent-ix/ix-board --branch main --locked
 ```
 
-### Signed test builds on macOS
-
-Do not run unsigned development builds against a saved Linear key. Repeated
-unsigned builds can cause a new Keychain prompt for the saved Linear
-credential. For live development testing, the owner can create a local code
-signing certificate in Keychain Access and keep its private key on this Mac.
-After each build, sign the executable with the same identity and the fixed
-`org.agent-ix.ix-board.test` identifier:
-
-```bash
-cargo build
-IX_BOARD_SIGNING_IDENTITY="<local code signing identity>" \
-  bash scripts/sign_test_build.sh target/debug/ix-board
-```
-
-The script verifies the signature and prints its designated requirement. Run
-the signed binary for `auth status` and grant its first Keychain request only
-after checking the signing identity. Rebuilds overwrite the signature, so sign
-each new build before using the saved credential. If the same identity still
-causes repeated prompts, stop live dev-binary tests and report the signature
-and prompt behavior without disclosing the credential. No signing identity is
-created or imported by the script.
-
-## Read commands
-
-Save a Linear API key in the operating system credential store, then run:
+Save a Linear API key in the operating system credential store:
 
 ```bash
 ix-board auth login
 ix-board auth status
 ```
 
-The prompt shows one `*` per character, including pasted characters, while
-keeping the key hidden. For scripts, pipe the key to `ix-board auth login --stdin`.
-`LINEAR_API_KEY` overrides the saved key without changing it. `ix-board auth
-logout` removes the saved key. `auth status` only reports whether a key is
-available and which source is active; it never displays the value. If the OS
-credential store is locked or unavailable, the CLI reports that failure and
-does not create a plaintext fallback file.
+`LINEAR_API_KEY` overrides the saved key. For scripts, pipe the key to
+`ix-board auth login --stdin`. Commands that read GitHub need `GITHUB_TOKEN`,
+`GH_TOKEN` or the `gh` CLI. [Setup](docs/setup.md) lists which command uses which.
 
-Do not extract the saved key from Keychain to set `LINEAR_API_KEY` for a test.
-
-Run reads with:
-
-```bash
-ix-board next --team SWM
-ix-board project-chunk SWM-P1
-ix-board search "dependency graph"
-ix-board issues SWM-12 SWM-13 SWM-14
-```
-
-For a versioned focus record that another client can validate and store as
-JSON, run `ix-board --json focus report --initiative "Initiative name"`.
-Use repeatable `--milestone "M1 Spec"` to save a milestone as a focus member;
-if names repeat across projects, use `--milestone "P-SAPHO-87/M5b Decision-model data"`.
-combine it with initiative, project, and issue selectors to select their union.
-The version 2 record includes typed canonical Linear IDs, the report time, and ix-board's
-status report. This command does not publish to ix-relay.
-
-Add `--json` to any command for machine-readable output. The CLI stores one
-workspace snapshot in SQLite for five minutes. The default cache is the
-platform's application cache directory; `IX_BOARD_CACHE_PATH` can select a
-specific database path.
-
-Library consumers can call `ReadService::workspace_snapshot` for the cached
-workspace, `force_refresh_workspace` to fetch through the five-minute cache,
-and `invalidate_cache` to discard a snapshot before a write. A failed forced
-refresh leaves no cached snapshot for subsequent reads.
-
-## Agent plugin
-
-The standalone ix-board plugin provides planning and early-alpha feedback
-skills for Claude Code and Codex. The `focus-status`, `focus-hygiene`, and
-`plan-chunk` skills live here with the commands and report schema they use;
-team lead and planner role skills consume their results. Install the CLI
-separately:
-
-```bash
-cargo +1.98.1 install --git https://github.com/agent-ix/ix-board --branch main --locked
-```
-
-For Claude Code:
+Install the plugin from the Agent IX marketplace. In Claude Code:
 
 ```text
 /plugin marketplace add agent-ix/agent-plugins
 /plugin install ix-board@agent-ix
 ```
 
-For Codex:
+In Codex:
 
 ```bash
 codex plugin marketplace add agent-ix/agent-plugins
 codex plugin add ix-board@agent-ix
 ```
 
-The planning skill uses the CLI's structured `next`, `project-chunk`, `search`,
-and `focus` reports. Live reads require a Linear key saved with `ix-board auth
-login` or supplied through `LINEAR_API_KEY`.
+Start a new agent session so the skills load. If a command fails or a skill is
+missing, see the [setup guide](docs/setup.md).
 
-## Drift report
+## Usage
 
-`drift` evaluates a versioned evidence file against an explicit lead and
-threshold configuration. It does not guess attribution from the shared GitHub
-account and does not call an LLM. Use `--live` to collect Linear issues and
-state history directly; use `--evidence` for a deterministic replay:
+Each command group has one example here. [docs/cli-reference.md](docs/cli-reference.md)
+lists every command and flag.
 
 ```bash
-ix-board drift --config drift-config.json --evidence drift-evidence-v1.json
-ix-board drift --config drift-config.json --evidence drift-evidence-v1.json --json
-ix-board drift --config drift-config.json --live --json
+ix-board next --team ENG                       # ready queue for a team
+ix-board project-chunk "Project name"          # goal, milestones, open tickets, blocker layers
+ix-board search "dependency graph"             # search projects and issues
+ix-board issues ENG-12 ENG-13                  # exact states for several issues
+ix-board focus status --initiative "Initiative name"
+ix-board focus hygiene --project "Project name"
+ix-board focus plan-chunk --project "Project name" --size 5
+ix-board scope check --scope program.toml
+ix-board roadmap --scope program.toml
+ix-board reconcile "Project name" --scope program.toml
+ix-board agents "Team name"
+ix-board drift --config drift-config.json --evidence drift-evidence.json
 ```
 
-The config JSON is a strict `DriftConfig` object with `report_time` (RFC 3339),
-`window_hours`, `stall_hours`, `spend_threshold`,
-`max_net_ticket_growth`, `min_merged_prs_for_churn`, and an ordered `leads`
-array of `{ "lead_id": "...", "team_key": "..." }` values. Time-window and
-stall hours must be positive; spend and churn thresholds must be nonnegative;
-each team can belong to only one configured lead.
+Add `--json` to any command for machine-readable output. The option goes before
+or after the subcommand.
 
-Optional `priority_goals` entries reserve a minimum worker count and report
-stalled goals alongside the existing lead signals. A goal matches a Linear
-project or milestone by exact identifier/name, or matches explicit issue IDs
-when the goal has no structured project or milestone membership:
+## Ready queue
 
-```json
-{
-  "goal": "QSL L2 plan v2",
-  "ticket_ids": ["QSL-485", "QSL-486", "QSL-487"],
-  "minimum_workers": 1,
-  "no_progress_hours": 12.0
-}
-```
+`ix-board next --team <KEY>` lists the tickets a team can start next, in order,
+with the reason for each position.
 
-The report includes last completion and transition times, hours since the
-latest completion or state transition, the no-progress threshold, the distinct
-active assignee count and configured minimum, current
-direct and transitive blockers, and other projects with transitions in the
-no-progress interval. A worker counts once by Linear assignee ID across active
-goal issues and open blockers; unassigned and inactive issues add no workers.
-Same-team activity is reported as crowding out. Cross-team activity is reported
-separately only when the issue is assigned to a currently counted worker.
-`active_workers` is null when issue, membership, blocker, or assignee evidence
-is incomplete. `trusted=false` means a required source can hide relevant work;
-the report names those sources. Live mode collects Linear issue/history
-evidence, so GitHub, Herdr, and OTel gaps remain explicit. The collector limits
-history reads to the goal's team, its blockers, and other-team issues assigned
-to the same workers.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/ready-queue-dark.svg">
+  <img alt="A ticket is ready when its project is Started, its spec state is Backlog, Specify or Specced, and every ticket in its chain of blockers is Completed. A blocker that is still in progress or Canceled keeps a ticket out. Ready tickets are ordered by project priority, project order, ticket priority, ticket order, then identifier." src="docs/images/ready-queue-light.svg">
+</picture>
 
-The evidence JSON envelope is strict and versioned:
+A ticket is ready when all of these hold:
 
-```json
-{
-  "schema_version": 1,
-  "evidence": {
-    "projects": [],
-    "tickets": [],
-    "transitions": [],
-    "pull_requests": [],
-    "commits": [],
-    "herdr_busy": { "lead-id": false },
-    "otel_spend": { "lead-id": 0.0 },
-    "missing": []
-  }
-}
-```
+- Its project has status `Started`. Tickets in `Paused` projects are excluded.
+- Its state is `Backlog` or `Specify` (next step Specify) or `Specced` (next
+  step Coding). Tickets in Coding or Review are not listed.
+- Every ticket in its recursive `blocked-by` chain is `Completed`, including
+  tickets from other teams. A canceled blocker stays unresolved.
 
-Each record uses the corresponding strict, typed struct in the public Rust API.
-Project and issue snapshots must be complete for the configured leads.
-`transitions` carry a `queue_before` snapshot for each Coding transition,
-including the historical project/ticket ordering, spec and workflow states,
-and blocker edges. `queue_before.missing_inputs` names any historical field
-that could not be reconstructed. Pull request and commit records must cover
-all configured repositories and the whole reporting interval (plus PRs merged
-in the interval even if opened earlier); no pagination or partition may be
-silently omitted. Add `missing` entries such as
-`{"source":"github.prs","reason":"page 3 cursor unresolved"}` for every
-source page, partition, or history query that is incomplete. Applicable signals
-remain visible but become `unavailable`; their counts are `null` and the report
-cannot claim `on_track` from partial evidence. Omit a lead key from
-`herdr_busy` or `otel_spend` when that observation is unavailable. An explicit
-observed spend of zero is not activity, including when `spend_threshold` is
-zero.
+[How it works](docs/how-it-works.md) describes the rules and the cache.
 
-The evidence contract is the source boundary for deterministic replay. Live
-mode reads Linear history; a supplied evidence file can additionally contain
-GitHub, Herdr, and OTel records. Every collector must report pagination and
-history completeness; the evaluator fails closed when required evidence is
-missing.
+## Focus
 
-## JSON Schema for downstream clients
+A focus is a set of initiatives, projects, milestones and issues selected on the
+command line. The selectors form a union, and each report reads the resulting
+issue set and its blocker layers.
 
-The public project, ready-queue, focus-report, and drift wire types derive `schemars::JsonSchema`
-from their authoritative Rust definitions. Export a schema for a downstream
-contract build with:
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/focus-dark.svg">
+  <img alt="A focus is a union of initiative, project, milestone and issue selectors. ix-board resolves it to a deduplicated set of issues with their blocker layers. The status, hygiene, plan-chunk and report commands read that set." src="docs/images/focus-light.svg">
+</picture>
+
+| Command | Output |
+| --- | --- |
+| `focus status` | Progress by project and milestone, blockers, and ready issues |
+| `focus hygiene` | Missing scope, overdue milestones, pull request mismatches, stale issues, near-duplicate titles, and changes since the last report |
+| `focus plan-chunk` | Open issues in dependency order with readiness and acceptance criteria |
+| `focus report` | A versioned JSON record for other clients |
+| `focus expand` | The resolved issues and blocker layers |
+
+See [focus](docs/focus.md) for the selector grammar and report contents.
+
+## Program review
+
+Program review commands take a TOML scope file that lists a program's
+initiatives, projects, repositories and lanes. The file holds names only; counts come from live data.
+
+| Command | Question |
+| --- | --- |
+| `scope check` | Do the listed initiatives, projects and repositories exist, and which projects are unplaced? |
+| `roadmap` | What is each project's progress and last activity? |
+| `orphans` | Which open and completed tickets have no project? |
+| `chain` | What blocks this ticket or program, across teams? |
+| `reconcile` | Where do a project's tickets disagree with its pull requests and branches? |
+
+See [program review](docs/program-review.md) for the file format.
+
+## Agents and drift
+
+`agents` reports whether each agent in a team's Herdr workspaces is working,
+waiting, asking, idle or at a prompt. `drift` evaluates lead activity against
+configured thresholds from a versioned evidence file or live Linear data. See
+[agents and drift](docs/agents-and-drift.md).
+
+## Project controls
+
+Two commands write to Linear. They change a project's status or priority and
+nothing else.
 
 ```bash
-cargo run --example export_schema -- Project > project.schema.json
-cargo run --example export_schema -- ProjectChunk > project-chunk.schema.json
-cargo run --example export_schema -- ReadyItem > ready-item.schema.json
-cargo run --example export_schema -- DriftReport > drift-report.schema.json
-cargo run --example export_schema -- FocusStatus > focus-status.schema.json
-cargo run --example export_schema -- FocusRecord > focus-record.schema.json
-cargo run --example export_schema -- FocusHygieneReport > focus-hygiene.schema.json
-cargo run --example export_schema -- FocusPlanChunk > focus-plan-chunk.schema.json
+ix-board project set-status "ENG-P1" Paused
+ix-board project set-priority "ENG-P1" 2
 ```
 
-The schemas describe the serialized wire shape, including flattened signal
-availability fields and enum values. Downstream projects can generate
-TypeScript declarations from these schemas without copying the Rust models.
+Priority values are `0` no priority, `1` urgent, `2` high, `3` medium and `4`
+low.
+
+## Plugin skills
+
+| Skill | Use |
+| --- | --- |
+| `ix-board-planning` | Ready queues, project context, blockers and program review |
+| `focus-status` | Progress, blockers and ready work for a focus |
+| `focus-hygiene` | Findings and changes since the last report |
+| `plan-chunk` | An ordered handoff for the next lead |
+| `ix-board-alpha-feedback` | Recording verified bugs and gaps |
+
+## Documentation
+
+- [How it works](docs/how-it-works.md)
+- [Focus](docs/focus.md)
+- [Program review](docs/program-review.md)
+- [Agents and drift](docs/agents-and-drift.md)
+- [CLI reference](docs/cli-reference.md)
+- [Setup and troubleshooting](docs/setup.md)
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Every contribution requires a signed
+[CLA](CLA.md). Run `make ci` before opening a pull request.
 
 ## License
 

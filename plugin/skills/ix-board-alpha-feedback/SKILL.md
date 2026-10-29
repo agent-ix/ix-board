@@ -6,7 +6,7 @@ compatibility: Requires the Linear CLI authenticated to the Agent IX workspace t
 
 # ix-board Alpha Feedback
 
-If this plugin is not initialized or an Agent IX command fails, read [the ix-board setup guide](https://github.com/agent-ix/ix-board/blob/main/setup.md) for its prerequisites and local diagnosis.
+If this plugin is not initialized or an Agent IX command fails, read [the ix-board setup guide](https://github.com/agent-ix/ix-board/blob/main/docs/setup.md) for its prerequisites and local diagnosis.
 
 ## Capture an observation
 

@@ -5,7 +5,7 @@ description: Use when asked "is Linear out of date?", "what changed since the la
 
 # Focus Hygiene
 
-If this plugin is not initialized or an Agent IX command fails, read [the ix-board setup guide](https://github.com/agent-ix/ix-board/blob/main/setup.md) for its prerequisites and local diagnosis.
+If this plugin is not initialized or an Agent IX command fails, read [the ix-board setup guide](https://github.com/agent-ix/ix-board/blob/main/docs/setup.md) for its prerequisites and local diagnosis.
 
 ## Run the check
 
