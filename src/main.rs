@@ -407,7 +407,7 @@ fn format_cli_error(error: &Error) -> String {
         error,
         Error::Credential(ix_cli_kit::secrets::SecretError::Unavailable)
     ) {
-        return "Linear credential store unavailable or access denied for this binary; if another ix-board build works, grant this build access to the saved ix-board item in Keychain Access (see setup.md)".to_owned();
+        return "Linear credential store unavailable or access denied for this binary; if another ix-board build works, grant this build access to the saved ix-board item in Keychain Access (see docs/setup.md)".to_owned();
     }
     error.to_string()
 }

@@ -1,6 +1,6 @@
 # ix-board
 
-Keeps the Linear dependency graph honest: resolves dependencies written in ticket prose, reports every reference it cannot resolve, and never silently drops one.
+ix-board is a command-line tool and Rust library that reads a Linear workspace and answers planning questions (ready queue, focus reports, program review, agent activity, drift) from structured data. Ticket prose is data and never drives a decision. See [README.md](README.md) and [docs/](docs/how-it-works.md).
 
 ## Commands
 
@@ -29,9 +29,20 @@ Backported from `agent-ix/ecaz`:
 ## Layout
 
 ```
-src/lib.rs             # crate root
-tests/integration.rs   # end-to-end tests
-benches/               # criterion benchmarks (opt-in; add criterion to dev-deps)
-spec/                  # requirements artifacts (from /spec-create-spec)
+src/lib.rs             # read service, ready queue, focus, project chunk
+src/main.rs            # clap command tree and text renderers
+src/cache.rs           # SQLite snapshot cache (five-minute TTL) and hygiene baseline
+src/linear.rs          # Linear GraphQL client
+src/scope.rs           # selector resolution and leaf progress
+src/hygiene.rs         # focus hygiene report and diff
+src/program_review.rs  # scope file, scope check, roadmap
+src/{chain,orphans,reconcile}.rs   # program review commands
+src/drift.rs           # drift evidence, signals and alerts
+src/agents/            # agents verdicts, Herdr and harness adapters
+examples/              # export_schema (JSON Schema for wire types)
+tests/                 # integration tests and fixtures
+spec/                  # requirements artifacts
+docs/                  # user documentation and figures (docs/images/figures.py)
+plugin/                # Claude Code and Codex plugin skills
 scripts/               # local tooling
 ```
