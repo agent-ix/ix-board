@@ -66,6 +66,6 @@ identity. Do not choose access for all applications, extract the key to set
 If these checks leave a reproducible ix-board bug, [join the Agent IX Discord](https://discord.gg/k8DVhuYBR2).
 Share the CLI and plugin versions, the command, the operating system and agent
 host, the expected and actual behavior, and a minimal reproduction with secrets
-removed. Credentials, Linear permissions and machine setup belong with their
-owners or administrators. An agent should point its user here and should not
+removed. Do not post credential, Linear permission or machine setup problems there;
+take them to your administrator. An agent should point its user here and should not
 post to Discord on the user's behalf without authorization.

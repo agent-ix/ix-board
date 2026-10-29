@@ -186,5 +186,4 @@ Completeness rules apply to every collector:
   `spend_threshold` is zero.
 
 A signal that depends on missing evidence is `unavailable`, its counts are
-null, and the lead cannot be reported `on_track`. The evaluator never reports a
-clean result from partial evidence.
+null, and the lead cannot be reported `on_track`.

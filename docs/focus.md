@@ -111,11 +111,12 @@ five groups of findings and a diff.
 
 The near-duplicate check is a review signal. It lowercases titles, drops a fixed
 list of stop words, and groups issues that share at least three words and at
-least 75% of the smaller title's words. It never changes an issue.
+least 75% of the smaller title's words. The smaller title must have at least
+four content words. It never changes an issue.
 
 Each group prints `checked` or `incomplete`. A group is incomplete when a source
 it needs is missing, for example when `GITHUB_TOKEN` is not set for the pull
-request check. An incomplete group never means that nothing was found.
+request check.
 
 The diff compares the focus with the previous successful report for the same
 workspace and selectors. It lists issues that entered or left the focus, were

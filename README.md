@@ -55,8 +55,7 @@ missing, see the [setup guide](docs/setup.md).
 
 ## Usage
 
-Each command group has one example here. [docs/cli-reference.md](docs/cli-reference.md)
-lists every command and flag.
+[CLI reference](docs/cli-reference.md) lists every command and flag.
 
 ```bash
 ix-board next --team ENG                       # ready queue for a team
@@ -168,8 +167,8 @@ low.
 - [Focus](docs/focus.md)
 - [Program review](docs/program-review.md)
 - [Agents and drift](docs/agents-and-drift.md)
-- [CLI reference](docs/cli-reference.md)
 - [Setup and troubleshooting](docs/setup.md)
+- [CLI reference](docs/cli-reference.md)
 
 ## Contributing
 

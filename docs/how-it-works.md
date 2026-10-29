@@ -4,7 +4,7 @@ ix-board loads one snapshot of a Linear workspace, caches it, and computes every
 report from that snapshot. This page describes the data boundary, the cache,
 the readiness rules and the commands that write.
 
-## Structured data only
+## Data sources
 
 Filtering, readiness, ordering and every other decision use Linear's structured
 fields: workflow states and their types, priorities, manual order, project
