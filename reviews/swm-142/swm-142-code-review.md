@@ -80,3 +80,18 @@ retro` (CARGO_TARGET_DIR=/private/tmp/claude-501/rv142-target): 40 passed,
 this head was wrong.
 
 ## Dispositions
+
+Disposition pass 1, at head 640f710. `cargo test --test retro`: 48 passed, 0 failed.
+
+| FND | Outcome | sha/reason |
+| --- | --- | --- |
+| FND-001 | fixed | 640f710: `union.extend(scope.path_ok()?...)`. The partial-expansion test now asserts `done_reopened` (and path_closed, net_closed_minus_new, path_closed_unverified) is unavailable. |
+| FND-002 | fixed | 640f710: `queue_names_for_address` returns an error for anything that is not `server:workspace:tab` or has no registration. The bare-name path is gone; the test covers `peter`, `luna:IR`, `a:b:c:d` and the empty string. |
+| FND-003 | fixed | 640f710: `LiveLinear::workspace(since)` reads `id updatedAt` of every issue updated since the window (or stale cutoff) and uses the cache only when `snapshot_is_current` finds the same raw update string for each one; otherwise `force_refresh_workspace`. Both queries return Linear's raw `updatedAt` string, so a completion after the cache fill changes the string and forces a refetch. `snapshot_is_current` is tested (see SR-6031 FND-008 for the untested wiring). |
+| FND-004 | fixed | 640f710: `head_updates = 1 + force-push totalCount`, with the FR-024 definition rewritten to the same lower bound, so the over-count is gone (see SR-6032 FND-003 on the new definition). |
+| FND-005 | fixed | 640f710: `stale_count` reads each attached PR with `pull_request(repo, number)` in any repository and state, and an unreadable one makes the metric unavailable; tested with a closed PR in another repo at 1 h and 200 h, and an unreadable one. |
+| FND-006 | fixed | 640f710: `AGENTS_IDLE_AFTER_SECS` is shared with the herdr read and recorded as `idle_after=20m` in both agent queries; tested. |
+| FND-007 | fixed | 640f710: `parse_redis_url` keeps `/db`, `redis()` passes `-n <db>`, and a non-numeric db is an error; tested. |
+| FND-008 | fixed | 640f710: `run_retro_snapshot` calls `store.check_writable()` before building the Linear reader or starting the herdr thread. |
+| FND-009 | fixed | 640f710: the GraphQL selection types and Record/Metric use `deny_unknown_fields`; the REST and relay types say why they do not. A test checks that an unknown field fails. |
+| FND-010 | fixed | 640f710: `span_secs` and `checked_mul` make an oversize threshold unavailable with "too large to measure"; tested with u64::MAX for three thresholds. |

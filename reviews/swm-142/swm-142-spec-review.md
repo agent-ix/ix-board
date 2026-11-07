@@ -36,3 +36,19 @@ covers the cached-snapshot consequence on the code side.
 | --- | --- | --- | --- |
 | FND-001 | medium | The FR-024 fix_rounds definition keys pull requests by `<repo>#<n>` with no owner, and it matches dispositions to reviewer markers by `id=` alone. SR ids are allocated per repository, so a disposition for SR-002 in another repository counts toward this team's PR whose reviewer marker is also SR-002. The definition should also require the disposition's `repo=` to match the reviewer marker's `repo=`. | spec/functional/FR-024-retro-snapshot.md:118 |
 | FND-002 | low | The `head_shas_per_pr_max` definition ("distinct head commits ... from that pull request's paginated timeline") does not say whether every commit counts or only the commits that were the head after a push, and the implementation counts every commit (SR-6030 FND-004). | spec/functional/FR-024-retro-snapshot.md:119 |
+
+## New findings (disposition pass 1)
+
+| ID | Severity | Summary | Refs |
+| --- | --- | --- | --- |
+| FND-003 | low | `head_shas_per_pr_max` now means one plus force-push events. Fix-round pushes that do not force-push are not counted, so in a normal-push workflow the value is 1 for nearly every PR and no longer shows rework. The id still says "head_shas". Spec and code agree, but whether the metric earns its place is an owner call. | spec/functional/FR-024-retro-snapshot.md:70 |
+| FND-004 | low | The `in_progress_stale` row is missing a comma: "`unavailable` when `in_progress_stale_hours` is absent an attachment list was not fully read". | spec/functional/FR-024-retro-snapshot.md:74 |
+
+## Dispositions
+
+Disposition pass 1, at head 640f710.
+
+| FND | Outcome | sha/reason |
+| --- | --- | --- |
+| FND-001 | fixed | 640f710: the fix_rounds definition and FR-024-AC-6 require `repo=` and `id=` to both match, and the reviewer marker's `repo=` to be in `repos` and to name the PR's repository; the code keys on (repo, id) and the test has a same-id disposition from agent-ix/y. |
+| FND-002 | fixed | 640f710: the definition now says exactly what is counted (one plus force-push events, a lower bound) and AC-7 names the one-push case. |

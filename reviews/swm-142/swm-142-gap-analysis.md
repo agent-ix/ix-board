@@ -48,3 +48,23 @@ US-009-EX-1 is covered by FR-024-AC-1 together with FR-025-AC-3.
 | FND-004 | low | The FR-024 main_red definition says a failing run with no earlier passing commit is not an incident and pending commits are skipped. No fixture starts with Fail or contains Pending, so neither rule is checked (it is not AC text; AC-15 passes). | tests/retro.rs:893-937, src/retro/metrics.rs:994-1022 |
 | FND-005 | low | FR-026-AC-2 builds the PR listing failure with `read_all_pages` in the test, which is the same as a plain GitHub error (FR-026-AC-1). The live early stop in `LiveGithub::list` (`reached_cutoff`) has no test. | tests/retro.rs:1538-1558, src/retro/live.rs:273-285 |
 | FND-006 | low | FR-024-AC-2's partial-expansion test checks only `path_remaining` and `intake_new`, not the other path-dependent metrics, which lets SR-6030 FND-001 (`done_reopened` computed from a partial path) pass. | tests/retro.rs:544-556 |
+
+## New findings (disposition pass 1)
+
+| ID | Severity | Summary | Refs |
+| --- | --- | --- | --- |
+| FND-007 | low | `head_moves_are_a_documented_lower_bound` is tagged FR-026-AC-4 (different window or threshold gives a different query), but it asserts the wording of one query. It belongs with FR-024-AC-7 (the head_shas definition). | tests/retro.rs:1473-1481 |
+| FND-008 | low | Only `snapshot_is_current` is tested. The wiring in `LiveLinear::workspace` (the `since` passed from `collect`, and the refetch when the check fails) has no test, so passing `frame.now` as `since` (an empty fresh read, so always current) would pass the suite. | src/retro/live.rs:102-118, src/retro/metrics.rs:60-66 |
+
+## Dispositions
+
+Disposition pass 1, at head 640f710.
+
+| FND | Outcome | sha/reason |
+| --- | --- | --- |
+| FND-001 | fixed | 640f710: `path_closed_ignores_a_completion_before_the_window` adds SWM-12 on the path, updated 2 h ago and completed 48 h ago; dropping `frame.contains` gives 3, not 2. |
+| FND-002 | fixed | 640f710: the listing now includes x#500, merged 90 h ago and updated 1 h ago with 50 head moves; with `relevant_prs` removed, fix_rounds_max becomes 40 and head_shas_per_pr_max becomes 50, so the test fails. |
+| FND-003 | fixed | 640f710: the rig filters whole bodies and returns first lines, so the real `marker_fields` sees an id-less marker and a marker line with trailing human text; a looser parser would count round 7. |
+| FND-004 | fixed | 640f710: `main_red_skips_unchecked_commits_and_ignores_a_leading_failing_run` (Fail, Fail, Pass, Pending, Fail, Pending, Pass gives 1 incident, 120 min) fails if pending commits are not skipped or a leading failure counts. |
+| FND-005 | fixed | 640f710: `pull_request_page` is now a pure function, tested for cutoff stop, continuing reads, no-cutoff, the source's last page and an unknown field. |
+| FND-006 | fixed | 640f710: the partial-expansion test asserts all five path-dependent metrics are unavailable. |
