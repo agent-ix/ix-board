@@ -1,4 +1,17 @@
-# Retro snapshot
+# Retro: snapshot, delta and backfill
+
+`ix-board retro` measures whether a team's work is converging on its gate tickets. `retro snapshot` takes a measurement, `retro delta` compares it with the previous one and a baseline, and `retro backfill` builds a baseline from history. The dev-team `team-retro` skill runs these on a schedule and scores the team's roles from the numbers.
+
+## Typical use
+
+```bash
+export TEAM_RETRO_HOME=~/.local/state/team-retro     # default; must be outside any git work tree
+ix-board retro backfill --config retro.json --since 2026-10-31 --until 2026-11-06   # once, for a baseline
+ix-board retro snapshot --config retro.json          # every few hours
+ix-board retro delta    --config retro.json          # after each snapshot
+```
+
+Use the same `--window` for every snapshot and any backfill; records taken with different windows or thresholds compare as `query_changed`. A snapshot takes about a minute, mostly waiting on Herdr when a machine is unreachable.
 
 `ix-board retro snapshot` reads Linear, GitHub, Herdr and a few local sources, computes a fixed
 catalog of metrics for one team, and appends one record to that team's store. It never writes to
@@ -21,7 +34,7 @@ file stops the command and names the file and field.
 | `main_check` | `{"repo": "owner/name", "branch": "main"}`; check-runs define main status. |
 | `local_paths` | Directories read for prunable worktrees and disk bytes. |
 | `slot_process`, `orphan_slot_hours` | Sibling top-level fields: process-name substring of build-slot wrappers, and the age in hours after which an orphaned wrapper counts. `orphan_slots` needs both. |
-| `gate_log` | Path to the gate JSONL log. |
+| `gate_log` | Path to the gate JSONL log. The dev-team `team-gate` wrapper writes it, one line per gate run and re-pin. |
 | `relay_leads`, `message_stale_minutes` | Sibling top-level fields: relay addresses (`server:workspace:tab`) and the age in minutes after which a pending message counts as undelivered. `messages_undelivered` needs both. |
 | `decision_label` | Linear label marking issues that wait on an owner decision. |
 | `baseline_taken_at` | UTC time naming the baseline record. |

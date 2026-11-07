@@ -506,6 +506,46 @@ The command exits zero when it appends a record, even if some metrics are unavai
 ids are listed on stderr. It exits non-zero and appends nothing when the configuration is
 invalid or the store path is refused.
 
+## ix-board retro delta
+
+Compares the latest snapshot with the previous one and the baseline, reading only the store. See
+[delta](retro.md#delta).
+
+```text
+ix-board retro delta [OPTIONS] --config <CONFIG>
+
+Options:
+      --config <CONFIG>              JSON retro configuration file
+      --json                         Emit machine-readable JSON on stdout instead of human-readable text
+      --diagnostics-format <FORMAT>  Diagnostic stream format on stderr [default: human]
+      --color <WHEN>                 Colorize human diagnostics on stderr: auto (TTY only), always, or never [default: auto]
+  -h, --help                         Print help
+```
+
+With fewer than two snapshots the command reports that no delta exists and exits zero. A
+`baseline_taken_at` that matches no record stops it with an error naming the value.
+
+## ix-board retro backfill
+
+Appends one record per UTC day from Linear and GitHub history. See [backfill](retro.md#backfill).
+
+```text
+ix-board retro backfill [OPTIONS] --config <CONFIG> --since <SINCE>
+
+Options:
+      --config <CONFIG>              JSON retro configuration file
+      --since <SINCE>                First UTC day, YYYY-MM-DD
+      --until <UNTIL>                Last UTC day, YYYY-MM-DD; defaults to the last complete UTC day
+      --window <WINDOW>              Trailing window for window metrics: seconds, minutes, hours or days (90s, 20m, 4h, 2d) [default: 24h]
+      --json                         Emit machine-readable JSON on stdout instead of human-readable text
+      --diagnostics-format <FORMAT>  Diagnostic stream format on stderr [default: human]
+      --color <WHEN>                 Colorize human diagnostics on stderr: auto (TTY only), always, or never [default: auto]
+  -h, --help                         Print help
+```
+
+The command refuses a range that contains a `snapshot` record, skips days it already wrote, and
+refuses a day that has not ended.
+
 ## JSON Schema export
 
 The public wire types derive JSON Schema from their Rust definitions. Export one
