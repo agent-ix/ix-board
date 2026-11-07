@@ -2190,7 +2190,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, month as u32, day as u32)
 }
 
-fn format_timestamp(epoch: f64) -> String {
+pub(crate) fn format_timestamp(epoch: f64) -> String {
     let whole_seconds = epoch.floor() as i64;
     let days = whole_seconds.div_euclid(86_400);
     let day_seconds = whole_seconds.rem_euclid(86_400);
