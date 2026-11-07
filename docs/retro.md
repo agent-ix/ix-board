@@ -47,7 +47,7 @@ metrics that depend on it unavailable rather than smaller.
 The ids are `path_remaining`, `path_closed`, `intake_new`, `net_closed_minus_new`,
 `gates_remaining`, `path_closed_unverified`, `prs_merged_per_hour`, `pr_cycle_median_hours`,
 `pr_cycle_p90_hours`, `prs_open`, `prs_idle`, `prs_oversize`, `prs_ready_unmerged`,
-`fix_rounds_max`, `fix_rounds_total`, `head_shas_per_pr_max`, `done_reopened`,
+`fix_rounds_max`, `fix_rounds_total`, `head_force_pushes_max`, `done_reopened`,
 `main_red_incidents`, `main_red_minutes`, `issues_without_project`, `issues_without_milestone`,
 `in_progress_stale`, `source_count_disagreement`, `agents_working_share`,
 `agents_idle_minutes_max`, `worktrees_prunable`, `disk_bytes`, `orphan_slots`, `full_gates_max`,
@@ -56,7 +56,7 @@ The ids are `path_remaining`, `path_closed`, `intake_new`, `net_closed_minus_new
 
 Boundaries: a pull request is idle at or beyond `pr_idle_hours`; oversize and orphan age are
 strictly above their limits. `fix_rounds_*` count only pull requests that are open or were merged
-inside the window, keyed by the marker's `pr=` value; a disposition counts only when its `repo=` and `id=` both match a `reviewer` marker whose `repo=` is in `repos`. `head_shas_per_pr_max` is one plus the pull request's force-push events, a lower bound, because ordinary pushes cannot be told from commits; no commit hash is stored. `in_progress_stale` reads each attached pull request from its own repository, in any state, and is unavailable if one cannot be read. A main-branch incident
+inside the window, keyed by the marker's `pr=` value; a disposition counts only when its `repo=` and `id=` both match a `reviewer` marker whose `repo=` is in `repos`. `head_force_pushes_max` is the largest number of force-push events on one pull request open or merged in the window; ordinary pushes are not counted and no commit hash is stored. A main-branch incident
 is a pass-to-fail transition between consecutive checked commits in the window; commits with
 pending or no check-runs are skipped, and minutes run from the first failing commit to the next
 passing one, or to the snapshot time. `agents_idle_minutes_max` is the largest time since an

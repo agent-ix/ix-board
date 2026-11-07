@@ -60,6 +60,22 @@ fn parallel_map<I: Sync, T: Send + Clone>(
         .collect()
 }
 
+/// Returns `cached` when a fresh read of the issues updated at or after `since` shows it is
+/// current, and a refetched snapshot otherwise. The cache may be up to five minutes old.
+pub fn current_workspace(
+    since: f64,
+    cached: WorkspaceSnapshot,
+    fresh_updates: impl FnOnce(f64) -> Result<Vec<(String, String)>, String>,
+    refetch: impl FnOnce() -> Result<WorkspaceSnapshot, String>,
+) -> Result<WorkspaceSnapshot, String> {
+    let fresh = fresh_updates(since)?;
+    if snapshot_is_current(&cached, &fresh) {
+        Ok(cached)
+    } else {
+        refetch()
+    }
+}
+
 /// True when every recently updated issue of `fresh` (id and update time) appears in `cached`
 /// with the same update time, so the cached snapshot still describes all of them.
 pub fn snapshot_is_current(cached: &WorkspaceSnapshot, fresh: &[(String, String)]) -> bool {
@@ -104,17 +120,18 @@ impl LinearSource for LiveLinear {
         let cached = service
             .workspace_snapshot()
             .map_err(|error| error.to_string())?;
-        // The cache may be up to five minutes old. It is current for every issue updated since
-        // `since` only if a fresh read of those issues shows the same update times.
-        let fresh = self.source.fetch_issue_updates(since)?;
-        let current = snapshot_is_current(&cached, &fresh);
-        if current {
-            Ok(cached)
-        } else {
-            service
-                .force_refresh_workspace()
-                .map_err(|error| error.to_string())
-        }
+        let service = std::cell::RefCell::new(service);
+        current_workspace(
+            since,
+            cached,
+            |since| self.source.fetch_issue_updates(since),
+            || {
+                service
+                    .borrow_mut()
+                    .force_refresh_workspace()
+                    .map_err(|error| error.to_string())
+            },
+        )
     }
 
     fn project_open_count(&self, project: &str) -> Result<usize, String> {
@@ -283,7 +300,7 @@ pub fn pull_request_page(
                 additions: pr.additions,
                 deletions: pr.deletions,
                 review_decision: pr.review_decision,
-                head_updates: Some(1 + pr.timeline.total_count),
+                force_pushes: Some(pr.timeline.total_count),
             })
         })
         .collect::<Result<Vec<_>, String>>()?;

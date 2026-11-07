@@ -120,10 +120,8 @@ pub struct PullRequest {
     pub deletions: u64,
     /// GitHub review decision, such as `APPROVED`.
     pub review_decision: Option<String>,
-    /// Lower bound on how often the head moved: one plus the force-push events of the paginated
-    /// timeline. Ordinary pushes cannot be told apart from commits, so they are not counted.
-    /// `None` when the timeline was incomplete.
-    pub head_updates: Option<u64>,
+    /// Force-push events in the pull request's timeline. Always read in full.
+    pub force_pushes: Option<u64>,
 }
 
 /// Check state of one commit.

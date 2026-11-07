@@ -72,6 +72,7 @@ struct Rig {
     bytes: Option<Result<u64, String>>,
     processes: Option<Result<Vec<ProcessRow>, String>>,
     calls: RefCell<Vec<String>>,
+    since: RefCell<Vec<f64>>,
 }
 
 impl Rig {
@@ -106,8 +107,9 @@ fn unset<T: Clone>(value: &Option<Result<T, String>>, what: &str) -> Result<T, S
 }
 
 impl LinearSource for Rig {
-    fn workspace(&self, _since: f64) -> Result<WorkspaceSnapshot, String> {
+    fn workspace(&self, since: f64) -> Result<WorkspaceSnapshot, String> {
         self.log("workspace");
+        self.since.borrow_mut().push(since);
         unset(&self.workspace, "workspace")
     }
     fn project_open_count(&self, project: &str) -> Result<usize, String> {
@@ -370,7 +372,7 @@ fn pr(number: u64, open: bool) -> PullRequest {
         additions: 10,
         deletions: 10,
         review_decision: None,
-        head_updates: Some(1),
+        force_pushes: Some(0),
     }
 }
 
@@ -391,7 +393,7 @@ fn default_prs() -> Vec<PullRequest> {
         merged_pr(104, 100.0, 2.0),
         PullRequest {
             review_decision: Some("APPROVED".to_owned()),
-            head_updates: Some(3),
+            force_pushes: Some(2),
             ..pr(11, true)
         },
     ]
@@ -698,7 +700,7 @@ fn fix_rounds_read_raw_comment_bodies_through_the_real_marker_parser() {
 
 /// Trace: FR-024-AC-7
 #[test]
-fn head_shas_reopened_and_main_red_follow_the_fixture() {
+fn force_pushes_reopened_and_main_red_follow_the_fixture() {
     let mut rig = base_rig();
     rig.commits = Some(Ok(vec![
         MainCommit {
@@ -720,7 +722,7 @@ fn head_shas_reopened_and_main_red_follow_the_fixture() {
         DAY,
     )
     .0;
-    assert_eq!(value(&record, "head_shas_per_pr_max"), Some(3.0));
+    assert_eq!(value(&record, "head_force_pushes_max"), Some(2.0));
     assert_eq!(value(&record, "done_reopened"), Some(1.0));
     assert_eq!(value(&record, "main_red_incidents"), Some(1.0));
     let record = snapshot(&base_rig());
@@ -1250,14 +1252,14 @@ fn json_exposes_every_metric_field_and_text_prints_one_line_each() {
 fn merged_before_window() -> PullRequest {
     PullRequest {
         updated_at: ago(1.0),
-        head_updates: Some(50),
+        force_pushes: Some(50),
         ..merged_pr(500, 1.0, 90.0)
     }
 }
 
 /// Trace: FR-024-AC-6
 #[test]
-fn fix_rounds_and_head_moves_exclude_pull_requests_outside_the_window() {
+fn fix_rounds_and_force_pushes_exclude_pull_requests_outside_the_window() {
     let mut rig = base_rig();
     let mut listing = default_prs();
     listing.push(merged_before_window());
@@ -1278,9 +1280,9 @@ fn fix_rounds_and_head_moves_exclude_pull_requests_outside_the_window() {
     assert_eq!(value(&record, "fix_rounds_max"), Some(2.0));
     assert_eq!(value(&record, "fix_rounds_total"), Some(2.0));
     assert_eq!(
-        value(&record, "head_shas_per_pr_max"),
-        Some(3.0),
-        "the 50-move pull request merged before the window is excluded"
+        value(&record, "head_force_pushes_max"),
+        Some(2.0),
+        "the 50-force-push pull request merged before the window is excluded"
     );
     rig.prs = Some(Err("down".to_owned()));
     let record = snapshot(&rig);
@@ -1470,15 +1472,17 @@ fn herdr_metric_queries_record_the_idle_threshold() {
     }
 }
 
-/// Trace: FR-026-AC-4
+/// Trace: FR-024-AC-7
 #[test]
-fn head_moves_are_a_documented_lower_bound() {
+fn force_push_metric_query_states_its_counting_rule() {
     let record = snapshot(&base_rig());
-    let query = &record.metrics["head_shas_per_pr_max"].query;
+    let query = &record.metrics["head_force_pushes_max"].query;
     assert!(
-        query.contains("lower bound") && query.contains("force-push"),
+        query.contains("force-push events") && !query.contains("lower bound"),
         "{query}"
     );
+    assert_eq!(record.metrics["head_force_pushes_max"].unit, "force_pushes");
+    assert!(!record.metrics.contains_key("head_shas_per_pr_max"));
 }
 
 /// Trace: FR-024-AC-18
@@ -1546,9 +1550,9 @@ fn the_live_listing_stops_at_the_cutoff_only_when_a_page_ends_before_it() {
     let parsed = pull_request_page(&old, "o/r", cutoff).unwrap();
     assert!(!parsed.has_next);
     assert_eq!(
-        parsed.items[0].head_updates,
-        Some(3),
-        "one plus the force-push events"
+        parsed.items[0].force_pushes,
+        Some(2),
+        "the force-push count"
     );
     // Still inside the window: keep reading.
     let recent = page(
@@ -1576,6 +1580,56 @@ fn the_live_listing_stops_at_the_cutoff_only_when_a_page_ends_before_it() {
         )
         .is_err()
     );
+}
+
+/// Trace: FR-024-AC-13
+#[test]
+fn the_freshness_check_covers_the_window_start_or_the_earlier_stale_cutoff() {
+    // Window 24h, stale threshold 48h: the earlier of the two is the stale cutoff.
+    let rig = base_rig();
+    snapshot_with(&rig, &config(), DAY);
+    assert_eq!(*rig.since.borrow(), [NOW - 48.0 * HOUR]);
+    // Stale threshold 6h, window 24h: the window start is earlier.
+    let rig = base_rig();
+    let narrow = config_with(
+        r#"{"thresholds": {"pr_idle_hours": 24, "pr_oversize_lines": 1000, "in_progress_stale_hours": 6}}"#,
+    );
+    snapshot_with(&rig, &narrow, DAY);
+    assert_eq!(*rig.since.borrow(), [NOW - DAY as f64]);
+}
+
+/// Trace: FR-024-AC-13
+#[test]
+fn a_cache_stale_only_inside_the_checked_range_is_refetched() {
+    use ix_board::retro::live::current_workspace;
+    let cached = rig_snapshot();
+    let id = cached.issues[0].id.0.clone();
+    let seen = RefCell::new(Vec::new());
+    // The issue changed after the cache fill, so the fresh read of the range reports a new time.
+    let fresh = |since: f64| {
+        seen.borrow_mut().push(since);
+        Ok(vec![(id.clone(), "2099-01-01T00:00:00Z".to_owned())])
+    };
+    let mut refreshed = rig_snapshot();
+    refreshed.fetched_at = 7;
+    let result = current_workspace(NOW - 48.0 * HOUR, cached.clone(), fresh, || {
+        Ok(refreshed.clone())
+    });
+    assert_eq!(result.unwrap().fetched_at, 7, "a stale cache is replaced");
+    assert_eq!(
+        *seen.borrow(),
+        [NOW - 48.0 * HOUR],
+        "the range given is the range read"
+    );
+    // A matching fresh read keeps the cache and does not refetch.
+    let same = cached.issues[0].updated_at.clone().unwrap();
+    let kept = current_workspace(
+        NOW,
+        cached.clone(),
+        |_| Ok(vec![(id.clone(), same.clone())]),
+        || Err("must not refetch".to_owned()),
+    );
+    assert_eq!(kept.unwrap(), cached);
 }
 
 // ---- FR-025 ----------------------------------------------------------------------------
@@ -1794,7 +1848,7 @@ fn a_failing_github_source_makes_flow_unavailable_and_leaves_progress_computed()
         "prs_idle",
         "prs_oversize",
         "prs_ready_unmerged",
-        "head_shas_per_pr_max",
+        "head_force_pushes_max",
     ] {
         assert!(reason(&record, id).contains("GitHub"), "{id}");
     }

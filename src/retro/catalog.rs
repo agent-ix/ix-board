@@ -78,7 +78,7 @@ pub const CATALOG: &[MetricDef] = &[
     def("prs_ready_unmerged", "flow", "pull_requests", Down),
     def("fix_rounds_max", "rework", "rounds", Down),
     def("fix_rounds_total", "rework", "rounds", Down),
-    def("head_shas_per_pr_max", "rework", "commits", Down),
+    def("head_force_pushes_max", "rework", "force_pushes", Down),
     def("done_reopened", "rework", "issues", Down),
     def("main_red_incidents", "stability", "incidents", Down),
     def("main_red_minutes", "stability", "minutes", Down),

@@ -189,7 +189,7 @@ impl Out<'_> {
             "prs_ready_unmerged" => ("github", "open non-draft pull requests with review decision APPROVED".to_owned()),
             "fix_rounds_max" => ("linear+github", format!("highest round= of reviewer-dispositions markers per pull request open or merged in the window, maximum; first-line markers only; {window}")),
             "fix_rounds_total" => ("linear+github", format!("highest round= of reviewer-dispositions markers per pull request open or merged in the window, summed; first-line markers only; {window}")),
-            "head_shas_per_pr_max" => ("github", format!("largest lower bound on head moves for one pull request open or merged in the window: 1 plus its force-push events; ordinary pushes are not distinguishable from commits and are not counted; {window}")),
+            "head_force_pushes_max" => ("github", format!("largest number of force-push events on one pull request that is open or was merged in the window; {window}")),
             "done_reopened" => ("linear", format!("issues with a state change from completed to a non-completed state in the window; {window}")),
             "main_red_incidents" => ("github", self.main_rule("passing-to-failing transitions of the main branch across commits in the window")),
             "main_red_minutes" => ("github", self.main_rule("minutes from each incident's first failing commit to the next passing commit, or to the snapshot time while failing")),
@@ -912,7 +912,7 @@ fn flow(out: &mut Out<'_>, prs: &Result<Vec<PullRequest>, String>) {
         "prs_idle",
         "prs_oversize",
         "prs_ready_unmerged",
-        "head_shas_per_pr_max",
+        "head_force_pushes_max",
     ];
     let frame = out.frame;
     let prs = match prs {
@@ -985,7 +985,7 @@ fn flow(out: &mut Out<'_>, prs: &Result<Vec<PullRequest>, String>) {
     let heads = relevant
         .iter()
         .map(|pr| {
-            pr.head_updates.ok_or_else(|| {
+            pr.force_pushes.ok_or_else(|| {
                 format!(
                     "GitHub unavailable: timeline of {}#{} was incomplete",
                     pr.repo, pr.number
@@ -1000,7 +1000,7 @@ fn flow(out: &mut Out<'_>, prs: &Result<Vec<PullRequest>, String>) {
                 .map(|max| max as f64)
                 .ok_or_else(|| EMPTY.to_owned())
         });
-    out.put("head_shas_per_pr_max", heads);
+    out.put("head_force_pushes_max", heads);
 }
 
 /// Incident count and minutes from the commits of the window, oldest first.
