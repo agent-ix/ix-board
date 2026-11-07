@@ -678,6 +678,8 @@ fn run_retro_snapshot(config_path: &std::path::Path, window: &str) -> Result<ret
     let config = retro::RetroConfig::load(config_path).map_err(retro::RetroError::from)?;
     let window_secs = retro::parse_window(window).map_err(retro::RetroError::from)?;
     let store = retro::Store::from_env(&config.team).map_err(retro::RetroError::from)?;
+    // A refused store path must cost no reads, so check it before any source is started.
+    store.check_writable().map_err(retro::RetroError::from)?;
     let linear = retro::live::linear_or_unreadable();
     let agents = retro::live::LiveAgents::start(config.herdr_teams.clone());
     let sources = retro::Sources {

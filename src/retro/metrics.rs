@@ -10,7 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::catalog::{CATALOG, Metric, Status, definition};
 use super::config::{RetroConfig, format_window};
-use super::sources::{CheckState, GateLine, MainCommit, PullRequest, Sources, StateChange};
+use super::sources::{
+    AGENTS_IDLE_AFTER_SECS, CheckState, GateLine, MainCommit, PullRequest, Sources, StateChange,
+};
 use crate::chain::evaluate_chain;
 use crate::model::issue_is_open;
 use crate::{Issue, IssueId, WorkflowStateType, WorkspaceSnapshot};
@@ -55,20 +57,24 @@ pub fn collect(
         frame,
         metrics: BTreeMap::new(),
     };
-    let workspace = sources.linear.workspace();
+    let stale_hours = config.thresholds.in_progress_stale_hours.unwrap_or(0);
+    // The stale rule looks back further than the window when its threshold is larger.
+    let since = frame
+        .start()
+        .min(frame.now - stale_hours as f64 * 3600.0)
+        .max(0.0);
+    let workspace = sources.linear.workspace(since);
     let mut history = History {
         source: sources.linear,
         cache: BTreeMap::new(),
     };
-    let stale_hours = config.thresholds.in_progress_stale_hours.unwrap_or(0);
-    let since = frame.start().min(frame.now - stale_hours as f64 * 3600.0);
-    let prs = list_pull_requests(config, sources, since);
+    let prs = list_pull_requests(config, sources, frame.start());
     match &workspace {
         Ok(snapshot) => {
             let scope = Scope::new(config, snapshot, frame);
-            progress(&mut out, &scope, &mut history, sources, &prs);
+            progress(&mut out, &scope, &mut history, sources);
             rework_issues(&mut out, &scope, &mut history);
-            issue_scope(&mut out, &scope, &mut history, &prs, sources);
+            issue_scope(&mut out, &scope, &mut history, sources);
         }
         Err(error) => {
             let reason = format!("Linear unavailable: {error}");
@@ -183,7 +189,7 @@ impl Out<'_> {
             "prs_ready_unmerged" => ("github", "open non-draft pull requests with review decision APPROVED".to_owned()),
             "fix_rounds_max" => ("linear+github", format!("highest round= of reviewer-dispositions markers per pull request open or merged in the window, maximum; first-line markers only; {window}")),
             "fix_rounds_total" => ("linear+github", format!("highest round= of reviewer-dispositions markers per pull request open or merged in the window, summed; first-line markers only; {window}")),
-            "head_shas_per_pr_max" => ("github", format!("most distinct head commits for one pull request open or merged in the window; {window}")),
+            "head_shas_per_pr_max" => ("github", format!("largest lower bound on head moves for one pull request open or merged in the window: 1 plus its force-push events; ordinary pushes are not distinguishable from commits and are not counted; {window}")),
             "done_reopened" => ("linear", format!("issues with a state change from completed to a non-completed state in the window; {window}")),
             "main_red_incidents" => ("github", self.main_rule("passing-to-failing transitions of the main branch across commits in the window")),
             "main_red_minutes" => ("github", self.main_rule("minutes from each incident's first failing commit to the next passing commit, or to the snapshot time while failing")),
@@ -191,8 +197,8 @@ impl Out<'_> {
             "issues_without_milestone" => ("linear", format!("open issues of linear_teams={} lacking a milestone", self.config.linear_teams.join(","))),
             "in_progress_stale" => ("linear+github", format!("started issues with no state change and no attached pull request update for in_progress_stale_hours={}", threshold(t.in_progress_stale_hours))),
             "source_count_disagreement" => ("linear", "absolute difference between the open-issue count of the configured projects from the issue snapshot and the project-chunk read".to_owned()),
-            "agents_working_share" => ("herdr", format!("agents with verdict WORKING over agents reported for herdr_teams={}", self.config.herdr_teams.join(","))),
-            "agents_idle_minutes_max" => ("herdr", format!("largest minutes since the last turn among agents of herdr_teams={}", self.config.herdr_teams.join(","))),
+            "agents_working_share" => ("herdr", format!("agents with verdict WORKING (idle_after={}m) over agents reported for herdr_teams={}", AGENTS_IDLE_AFTER_SECS / 60, self.config.herdr_teams.join(","))),
+            "agents_idle_minutes_max" => ("herdr", format!("largest minutes since the last turn among agents of herdr_teams={} (idle_after={}m)", self.config.herdr_teams.join(","), AGENTS_IDLE_AFTER_SECS / 60)),
             "worktrees_prunable" => ("local git", "prunable worktrees git reports for each directory of local_paths".to_owned()),
             "disk_bytes" => ("local disk", "total bytes below each directory of local_paths".to_owned()),
             "orphan_slots" => ("local processes", format!("processes whose command contains slot_process={:?}, whose parent exited, older than orphan_slot_hours={}", self.config.slot_process.clone().unwrap_or_default(), threshold(self.config.orphan_slot_hours))),
@@ -429,6 +435,14 @@ fn to_completed(change: &StateChange) -> bool {
     change.to == Some(WorkflowStateType::Completed)
 }
 
+/// `count * unit` seconds, or a reason when the product does not fit.
+fn span_secs(count: u64, unit: u64, what: &str) -> Result<f64, String> {
+    count
+        .checked_mul(unit)
+        .map(|seconds| seconds as f64)
+        .ok_or_else(|| format!("{what} is too large to measure"))
+}
+
 fn count(value: usize) -> f64 {
     value as f64
 }
@@ -438,7 +452,6 @@ fn progress(
     scope: &Scope<'_>,
     history: &mut History<'_>,
     sources: &Sources<'_>,
-    prs: &Result<Vec<PullRequest>, String>,
 ) {
     let frame = scope.frame;
     let mut wanted = scope.path_ok().unwrap_or_default().to_vec();
@@ -495,7 +508,7 @@ fn progress(
             .filter(|issue| done.contains(&issue.id))
             .copied()
             .collect::<Vec<_>>();
-        unverified_count(&candidates, sources, prs)
+        unverified_count(&candidates, sources)
     });
     out.put("path_closed_unverified", unverified);
 }
@@ -534,14 +547,7 @@ fn attached_pull_requests(issue: &Issue) -> Vec<(String, u64)> {
         .collect()
 }
 
-fn unverified_count(
-    candidates: &[&Issue],
-    sources: &Sources<'_>,
-    prs: &Result<Vec<PullRequest>, String>,
-) -> Outcome {
-    if let Err(error) = prs {
-        return Err(format!("GitHub unavailable: {error}"));
-    }
+fn unverified_count(candidates: &[&Issue], sources: &Sources<'_>) -> Outcome {
     let mut unverified = 0;
     for issue in candidates {
         if !issue.attachments_complete {
@@ -554,8 +560,9 @@ fn unverified_count(
         for (repo, number) in attached_pull_requests(issue) {
             merged |= sources
                 .github
-                .is_merged(&repo, number)
-                .map_err(|error| format!("GitHub unavailable: {repo}#{number}: {error}"))?;
+                .pull_request(&repo, number)
+                .map_err(|error| format!("GitHub unavailable: {repo}#{number}: {error}"))?
+                .merged;
         }
         unverified += usize::from(!merged);
     }
@@ -566,7 +573,7 @@ fn rework_issues(out: &mut Out<'_>, scope: &Scope<'_>, history: &mut History<'_>
     let frame = scope.frame;
     let reopened = (|| {
         let mut union = scope.projects_ok()?.to_vec();
-        union.extend(scope.path_ok().unwrap_or_default().iter().copied());
+        union.extend(scope.path_ok()?.iter().copied());
         union.sort_by(|left, right| left.id.cmp(&right.id));
         union.dedup_by(|left, right| left.id == right.id);
         let reopened = history.changed_in_window(&union, frame, |change| {
@@ -584,7 +591,6 @@ fn issue_scope(
     out: &mut Out<'_>,
     scope: &Scope<'_>,
     history: &mut History<'_>,
-    prs: &Result<Vec<PullRequest>, String>,
     sources: &Sources<'_>,
 ) {
     let config = scope.config;
@@ -639,7 +645,7 @@ fn issue_scope(
     out.put("source_count_disagreement", disagreement);
     let stale = match config.thresholds.in_progress_stale_hours {
         None => Err(NOT_CONFIGURED.to_owned()),
-        Some(hours) => stale_count(scope, history, prs, &open_in_teams, hours),
+        Some(hours) => stale_count(scope, history, sources, &open_in_teams, hours),
     };
     out.put("in_progress_stale", stale);
 }
@@ -647,14 +653,11 @@ fn issue_scope(
 fn stale_count(
     scope: &Scope<'_>,
     history: &mut History<'_>,
-    prs: &Result<Vec<PullRequest>, String>,
+    sources: &Sources<'_>,
     open_in_teams: &[&Issue],
     hours: u64,
 ) -> Outcome {
-    let prs = prs
-        .as_ref()
-        .map_err(|error| format!("GitHub unavailable: {error}"))?;
-    let cutoff = scope.frame.now - hours as f64 * 3600.0;
+    let cutoff = scope.frame.now - span_secs(hours, 3600, "in_progress_stale_hours")?;
     let mut stale = 0;
     let started = open_in_teams
         .iter()
@@ -692,13 +695,15 @@ fn stale_count(
                 issue.identifier
             ));
         }
-        let attached = attached_pull_requests(issue);
-        let recent = prs.iter().any(|pr| {
-            pr.updated_at > cutoff
-                && attached
-                    .iter()
-                    .any(|(repo, number)| *repo == pr.repo && *number == pr.number)
-        });
+        // Each attached pull request is read from its own repository, whatever its state.
+        let mut recent = false;
+        for (repo, number) in attached_pull_requests(issue) {
+            let info = sources
+                .github
+                .pull_request(&repo, number)
+                .map_err(|error| format!("GitHub unavailable: {repo}#{number}: {error}"))?;
+            recent |= info.updated_at > cutoff;
+        }
         stale += usize::from(!recent);
     }
     Ok(count(stale))
@@ -765,30 +770,38 @@ fn relevant_prs(prs: &[PullRequest], frame: Frame) -> Vec<&PullRequest> {
 }
 
 /// Per pull request (as `name#n`), the highest disposition round, from marker first lines,
-/// for the pull requests in `allowed` only.
-pub fn fix_rounds_by_pr(lines: &[String], allowed: &BTreeSet<String>) -> BTreeMap<String, u64> {
-    let mut prs_by_id: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-    let mut rounds: Vec<(&str, u64)> = Vec::new();
+/// for the pull requests in `allowed` only. A disposition counts toward a pull request when
+/// its `repo=` and `id=` both match a `reviewer` marker of that pull request, and that marker's
+/// `repo=` is one of `repos` and names the pull request's repository.
+pub fn fix_rounds_by_pr(
+    lines: &[String],
+    allowed: &BTreeSet<String>,
+    repos: &[String],
+) -> BTreeMap<String, u64> {
+    let mut prs_by_review: BTreeMap<(&str, &str), BTreeSet<&str>> = BTreeMap::new();
+    let mut rounds: Vec<((&str, &str), u64)> = Vec::new();
     for line in lines {
         let Some((kind, fields)) = marker_fields(line) else {
             continue;
         };
-        let Some(id) = fields.get("id") else {
+        let (Some(repo), Some(id)) = (fields.get("repo"), fields.get("id")) else {
             continue;
         };
         if kind == "reviewer" {
             if let Some(pr) = fields.get("pr")
                 && allowed.contains(*pr)
+                && repos.iter().any(|configured| configured == repo)
+                && repo.rsplit('/').next() == pr.split_once('#').map(|(name, _)| name)
             {
-                prs_by_id.entry(id).or_default().insert(pr);
+                prs_by_review.entry((repo, id)).or_default().insert(pr);
             }
         } else if let Some(round) = fields.get("round").and_then(|round| round.parse().ok()) {
-            rounds.push((id, round));
+            rounds.push(((repo, id), round));
         }
     }
     let mut highest = BTreeMap::new();
-    for (id, round) in rounds {
-        for pr in prs_by_id.get(id).into_iter().flatten() {
+    for (review, round) in rounds {
+        for pr in prs_by_review.get(&review).into_iter().flatten() {
             let entry = highest.entry((*pr).to_owned()).or_insert(0);
             *entry = round.max(*entry);
         }
@@ -822,7 +835,7 @@ fn fix_rounds(out: &mut Out<'_>, sources: &Sources<'_>, prs: &Result<Vec<PullReq
             out.unavailable("fix_rounds_total", reason);
         }
         Ok(lines) => {
-            let rounds = fix_rounds_by_pr(&lines, &allowed);
+            let rounds = fix_rounds_by_pr(&lines, &allowed, &out.config.repos);
             out.put(
                 "fix_rounds_max",
                 Ok(rounds.values().copied().max().unwrap_or(0) as f64),
@@ -942,7 +955,7 @@ fn flow(out: &mut Out<'_>, prs: &Result<Vec<PullRequest>, String>) {
         thresholds
             .pr_idle_hours
             .map_or(Err(NOT_CONFIGURED.to_owned()), |hours| {
-                let cutoff = frame.now - hours as f64 * 3600.0;
+                let cutoff = frame.now - span_secs(hours, 3600, "pr_idle_hours")?;
                 Ok(count(
                     open.iter().filter(|pr| pr.updated_at <= cutoff).count(),
                 ))
@@ -972,7 +985,7 @@ fn flow(out: &mut Out<'_>, prs: &Result<Vec<PullRequest>, String>) {
     let heads = relevant
         .iter()
         .map(|pr| {
-            pr.head_shas.ok_or_else(|| {
+            pr.head_updates.ok_or_else(|| {
                 format!(
                     "GitHub unavailable: timeline of {}#{} was incomplete",
                     pr.repo, pr.number
@@ -1113,8 +1126,8 @@ fn relay(out: &mut Out<'_>, sources: &Sources<'_>) {
         out.not_configured("messages_undelivered");
         return;
     };
-    let cutoff_ms = (out.frame.now - stale as f64 * 60.0) * 1000.0;
     let total = (|| {
+        let cutoff_ms = (out.frame.now - span_secs(stale, 60, "message_stale_minutes")?) * 1000.0;
         let mut total = 0;
         for lead in &leads {
             let sent = sources
@@ -1158,21 +1171,22 @@ fn resources(out: &mut Out<'_>, sources: &Sources<'_>) {
         out.not_configured("orphan_slots");
         return;
     };
-    let orphans = sources
-        .local
-        .processes()
-        .map(|rows| {
-            count(
-                rows.iter()
-                    .filter(|row| {
-                        row.command.contains(&name)
-                            && !row.parent_alive
-                            && row.age_secs > hours * 3600
-                    })
-                    .count(),
-            )
-        })
-        .map_err(|error| format!("local processes unavailable: {error}"));
+    let orphans = (|| {
+        let limit = hours
+            .checked_mul(3600)
+            .ok_or_else(|| "orphan_slot_hours is too large to measure".to_owned())?;
+        let rows = sources
+            .local
+            .processes()
+            .map_err(|error| format!("local processes unavailable: {error}"))?;
+        Ok(count(
+            rows.iter()
+                .filter(|row| {
+                    row.command.contains(&name) && !row.parent_alive && row.age_secs > limit
+                })
+                .count(),
+        ))
+    })();
     out.put("orphan_slots", orphans);
 }
 

@@ -56,20 +56,20 @@ The ids are `path_remaining`, `path_closed`, `intake_new`, `net_closed_minus_new
 
 Boundaries: a pull request is idle at or beyond `pr_idle_hours`; oversize and orphan age are
 strictly above their limits. `fix_rounds_*` count only pull requests that are open or were merged
-inside the window, keyed by the marker's `pr=` value and limited to `repos`. A main-branch incident
+inside the window, keyed by the marker's `pr=` value; a disposition counts only when its `repo=` and `id=` both match a `reviewer` marker whose `repo=` is in `repos`. `head_shas_per_pr_max` is one plus the pull request's force-push events, a lower bound, because ordinary pushes cannot be told from commits; no commit hash is stored. `in_progress_stale` reads each attached pull request from its own repository, in any state, and is unavailable if one cannot be read. A main-branch incident
 is a pass-to-fail transition between consecutive checked commits in the window; commits with
 pending or no check-runs are skipped, and minutes run from the first failing commit to the next
 passing one, or to the snapshot time. `agents_idle_minutes_max` is the largest time since an
 agent's last turn. `net_closed_minus_new` counts the union of project and path issues once.
 
-The ix-relay queues are keyed by registered session name, so each relay address is resolved
+A relay address must be `server:workspace:tab`; anything else, or an address with no registration, makes the metric unavailable. The ix-relay queues are keyed by registered session name, so each relay address is resolved
 read-only through the bus registry (`HGETALL <prefix>agents`) by machine, workspace and tab, and
 the inbox lists of every matching registration are read with `LRANGE`. The bus URL and prefix
 come from `IX_RELAY_URL` and `IX_RELAY_PREFIX`, then `~/.ix/relay/config.toml`, then the relay
 defaults (`redis://127.0.0.1:6379`, `ixr:v3:`). `redis-cli` must be installed; the password is
 passed in `REDISCLI_AUTH`, never on the command line.
 
-Speed: the Linear workspace comes from the shared read cache (five-minute TTL), issue histories
+Speed: the Linear workspace comes from the shared read cache (five-minute TTL) only when a fresh read of the recently updated issues proves it current, otherwise it is refetched; issue histories
 are read only for issues updated inside the window and concurrently, reviewer markers are read
 per pull request, and the herdr read runs alongside the others with a 25-second limit, after
 which the agent metrics are `unavailable`.

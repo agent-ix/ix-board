@@ -14,9 +14,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use serde::Deserialize;
 
 use super::sources::{
-    AgentSource, CheckState, GateLine, GateLogSource, GithubSource, LabeledIssue, LinearSource,
-    LocalSource, MainCommit, Page, ProcessRow, PullRequest, RelaySource, StateChange,
-    read_all_pages,
+    AGENTS_IDLE_AFTER_SECS, AgentSource, CheckState, GateLine, GateLogSource, GithubSource,
+    LabeledIssue, LinearSource, LocalSource, MainCommit, Page, ProcessRow, PullRequest,
+    PullRequestInfo, RelaySource, StateChange, read_all_pages,
 };
 use crate::agents::{AgentsReport, build_report, system_hosts};
 use crate::{LinearGraphQlSource, ReadService, WorkspaceSnapshot};
@@ -60,6 +60,19 @@ fn parallel_map<I: Sync, T: Send + Clone>(
         .collect()
 }
 
+/// True when every recently updated issue of `fresh` (id and update time) appears in `cached`
+/// with the same update time, so the cached snapshot still describes all of them.
+pub fn snapshot_is_current(cached: &WorkspaceSnapshot, fresh: &[(String, String)]) -> bool {
+    let by_id = cached
+        .issues
+        .iter()
+        .map(|issue| (issue.id.0.as_str(), issue.updated_at.as_deref()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    fresh
+        .iter()
+        .all(|(id, updated)| by_id.get(id.as_str()) == Some(&Some(updated.as_str())))
+}
+
 /// Linear through the GraphQL client. The workspace snapshot and the project-chunk read share
 /// one cached read service (FR-004), so a warm run fetches the workspace from the cache.
 pub struct LiveLinear {
@@ -86,10 +99,22 @@ impl LiveLinear {
 }
 
 impl LinearSource for LiveLinear {
-    fn workspace(&self) -> Result<WorkspaceSnapshot, String> {
-        self.service()?
+    fn workspace(&self, since: f64) -> Result<WorkspaceSnapshot, String> {
+        let mut service = self.service()?;
+        let cached = service
             .workspace_snapshot()
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        // The cache may be up to five minutes old. It is current for every issue updated since
+        // `since` only if a fresh read of those issues shows the same update times.
+        let fresh = self.source.fetch_issue_updates(since)?;
+        let current = snapshot_is_current(&cached, &fresh);
+        if current {
+            Ok(cached)
+        } else {
+            service
+                .force_refresh_workspace()
+                .map_err(|error| error.to_string())
+        }
     }
 
     fn project_open_count(&self, project: &str) -> Result<usize, String> {
@@ -154,37 +179,38 @@ const PULL_REQUEST_QUERY: &str = "query($owner: String!, $name: String!, $after:
                  orderBy: {field: UPDATED_AT, direction: DESC}) {
       nodes {
         number createdAt mergedAt updatedAt isDraft state additions deletions reviewDecision
-        timelineItems(first: 100, itemTypes: [PULL_REQUEST_COMMIT, HEAD_REF_FORCE_PUSHED_EVENT]) {
-          nodes {
-            __typename
-            ... on PullRequestCommit { commit { oid } }
-            ... on HeadRefForcePushedEvent { afterCommit { oid } }
-          }
-          pageInfo { hasNextPage }
-        }
+        timelineItems(first: 1, itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT]) { totalCount }
       }
       pageInfo { hasNextPage endCursor }
     }
   }
 }";
 
+// The GraphQL types below mirror the selection in `PULL_REQUEST_QUERY`, which this module
+// controls, so they refuse unknown fields. The REST types further down deliberately do not:
+// GitHub's REST objects carry many fields this reader does not select and adds more over time.
+
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GraphQlData {
     data: RepositoryData,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RepositoryData {
     repository: Option<PullRequestsData>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PullRequestsData {
     #[serde(rename = "pullRequests")]
     pull_requests: PullRequestConnection,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PullRequestConnection {
     nodes: Vec<RawPullRequest>,
     #[serde(rename = "pageInfo")]
@@ -192,6 +218,7 @@ struct PullRequestConnection {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawPageInfo {
     #[serde(rename = "hasNextPage")]
     has_next_page: bool,
@@ -200,6 +227,7 @@ struct RawPageInfo {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawPullRequest {
     number: u64,
     #[serde(rename = "createdAt")]
@@ -216,32 +244,59 @@ struct RawPullRequest {
     #[serde(rename = "reviewDecision")]
     review_decision: Option<String>,
     #[serde(rename = "timelineItems")]
-    timeline: Timeline,
+    timeline: ForcePushes,
 }
 
 #[derive(Deserialize)]
-struct Timeline {
-    nodes: Vec<TimelineNode>,
-    #[serde(rename = "pageInfo")]
-    page_info: TimelinePageInfo,
+#[serde(deny_unknown_fields)]
+struct ForcePushes {
+    #[serde(rename = "totalCount")]
+    total_count: u64,
 }
 
-#[derive(Deserialize)]
-struct TimelinePageInfo {
-    #[serde(rename = "hasNextPage")]
-    has_next_page: bool,
-}
-
-#[derive(Deserialize)]
-struct TimelineNode {
-    commit: Option<Oid>,
-    #[serde(rename = "afterCommit")]
-    after_commit: Option<Oid>,
-}
-
-#[derive(Deserialize)]
-struct Oid {
-    oid: String,
+/// Decodes one page of the pull-request listing. With a `since` cutoff the listing is ordered
+/// newest-updated first, so a page ending before the cutoff is the last page that matters; that
+/// is a complete read, not a truncated one.
+pub fn pull_request_page(
+    body: &str,
+    repo: &str,
+    since: Option<f64>,
+) -> Result<Page<PullRequest>, String> {
+    let body: GraphQlData = serde_json::from_str(body).map_err(|error| error.to_string())?;
+    let connection = body
+        .data
+        .repository
+        .ok_or_else(|| format!("repository {repo} not found"))?
+        .pull_requests;
+    let items = connection
+        .nodes
+        .into_iter()
+        .map(|pr| {
+            Ok(PullRequest {
+                repo: repo.to_owned(),
+                number: pr.number,
+                open: pr.state == "OPEN",
+                draft: pr.is_draft,
+                created_at: epoch(&pr.created_at)?,
+                merged_at: pr.merged_at.as_deref().map(epoch).transpose()?,
+                updated_at: epoch(&pr.updated_at)?,
+                additions: pr.additions,
+                deletions: pr.deletions,
+                review_decision: pr.review_decision,
+                head_updates: Some(1 + pr.timeline.total_count),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let reached_cutoff = since.is_some_and(|cutoff| {
+        items
+            .last()
+            .is_some_and(|pr: &PullRequest| pr.updated_at < cutoff)
+    });
+    Ok(Page {
+        items,
+        has_next: connection.page_info.has_next_page && !reached_cutoff,
+        cursor: connection.page_info.end_cursor,
+    })
 }
 
 impl LiveGithub {
@@ -255,7 +310,7 @@ impl LiveGithub {
             .split_once('/')
             .ok_or_else(|| format!("repository {repo:?} is not owner/name"))?;
         let query = PULL_REQUEST_QUERY.replace("__STATES__", states);
-        let raw = read_all_pages(|after| {
+        read_all_pages(|after| {
             let mut args = strings(&["api", "graphql", "-f"]);
             args.push(format!("query={query}"));
             args.extend(["-f".to_owned(), format!("owner={owner}")]);
@@ -263,54 +318,15 @@ impl LiveGithub {
             if let Some(cursor) = after {
                 args.extend(["-f".to_owned(), format!("after={cursor}")]);
             }
-            let body: GraphQlData =
-                serde_json::from_str(&run("gh", &args)?).map_err(|error| error.to_string())?;
-            let connection = body
-                .data
-                .repository
-                .ok_or_else(|| format!("repository {repo} not found"))?
-                .pull_requests;
-            // Newest-updated first: past the cutoff nothing older can matter.
-            let reached_cutoff = since.is_some_and(|cutoff| {
-                connection
-                    .nodes
-                    .last()
-                    .and_then(|pr| epoch(&pr.updated_at).ok())
-                    .is_some_and(|updated| updated < cutoff)
-            });
-            Ok(Page {
-                items: connection.nodes,
-                has_next: connection.page_info.has_next_page && !reached_cutoff,
-                cursor: connection.page_info.end_cursor,
-            })
-        })?;
-        raw.into_iter()
-            .map(|pr| {
-                let mut heads = std::collections::BTreeSet::new();
-                for node in &pr.timeline.nodes {
-                    heads.extend(
-                        node.commit
-                            .iter()
-                            .chain(&node.after_commit)
-                            .map(|c| c.oid.clone()),
-                    );
-                }
-                Ok(PullRequest {
-                    repo: repo.to_owned(),
-                    number: pr.number,
-                    open: pr.state == "OPEN",
-                    draft: pr.is_draft,
-                    created_at: epoch(&pr.created_at)?,
-                    merged_at: pr.merged_at.as_deref().map(epoch).transpose()?,
-                    updated_at: epoch(&pr.updated_at)?,
-                    additions: pr.additions,
-                    deletions: pr.deletions,
-                    review_decision: pr.review_decision,
-                    head_shas: (!pr.timeline.page_info.has_next_page).then_some(heads.len() as u64),
-                })
-            })
-            .collect()
+            pull_request_page(&run("gh", &args)?, repo, since)
+        })
     }
+}
+
+#[derive(Deserialize)]
+struct RestPullRequest {
+    merged_at: Option<String>,
+    updated_at: String,
 }
 
 #[derive(Deserialize)]
@@ -363,7 +379,7 @@ impl GithubSource for LiveGithub {
         Ok(all)
     }
 
-    fn is_merged(&self, repo: &str, number: u64) -> Result<bool, String> {
+    fn pull_request(&self, repo: &str, number: u64) -> Result<PullRequestInfo, String> {
         let text = run(
             "gh",
             &strings(&[
@@ -371,11 +387,13 @@ impl GithubSource for LiveGithub {
                 "--method",
                 "GET",
                 &format!("repos/{repo}/pulls/{number}"),
-                "--jq",
-                ".merged_at != null",
             ]),
         )?;
-        Ok(text.trim() == "true")
+        let pr: RestPullRequest = serde_json::from_str(&text).map_err(|error| error.to_string())?;
+        Ok(PullRequestInfo {
+            merged: pr.merged_at.is_some(),
+            updated_at: epoch(&pr.updated_at)?,
+        })
     }
 
     fn main_commits(
@@ -459,7 +477,7 @@ impl LiveAgents {
                 .map_err(|error| error.to_string())
                 .map(|hosts| {
                     let mut no_queue = |_: &str| Ok(None);
-                    build_report(&hosts, &teams, 20 * 60, &mut no_queue)
+                    build_report(&hosts, &teams, AGENTS_IDLE_AFTER_SECS, &mut no_queue)
                 });
             let _ = sender.send(report);
         });
@@ -587,6 +605,8 @@ pub struct RedisTarget {
     pub user: Option<String>,
     /// Password, when the URL carries one.
     pub password: Option<String>,
+    /// Database number from the URL path, when it names one.
+    pub db: Option<u32>,
 }
 
 /// Splits a Redis URL so the password can be passed in the environment, not on the command line.
@@ -594,7 +614,17 @@ pub fn parse_redis_url(url: &str) -> Result<RedisTarget, String> {
     let rest = url
         .strip_prefix("redis://")
         .ok_or_else(|| "relay URL must start with redis://".to_owned())?;
-    let rest = rest.split('/').next().unwrap_or(rest);
+    let (rest, db) = match rest.split_once('/') {
+        Some((rest, path)) if !path.is_empty() => (
+            rest,
+            Some(
+                path.parse::<u32>()
+                    .map_err(|_| "relay URL database is not a number".to_owned())?,
+            ),
+        ),
+        Some((rest, _)) => (rest, None),
+        None => (rest, None),
+    };
     let (credentials, host_port) = rest
         .rsplit_once('@')
         .map_or((None, rest), |(c, h)| (Some(c), h));
@@ -619,19 +649,25 @@ pub fn parse_redis_url(url: &str) -> Result<RedisTarget, String> {
         port,
         user,
         password,
+        db,
     })
 }
 
-/// The inbox names an address reads from. A lead address is `server:workspace:tab` and matches
-/// registrations by machine, workspace and tab; the bus queues are keyed by the registered
-/// session name, not by the address. Text without a colon is taken as the queue name itself.
+/// The inbox names an address reads from. A lead address is `server:workspace:tab`; it matches
+/// registrations by machine, workspace and tab, and the bus queues are keyed by the registered
+/// session name, not by the address. Anything else is not an address.
+///
+/// Registrations are read as JSON values by key: the registry record belongs to ix-relay, which
+/// adds fields over time, so unknown fields must not fail this read.
 pub fn queue_names_for_address(
     address: &str,
     registrations: &[(String, serde_json::Value)],
-) -> Vec<String> {
+) -> Result<Vec<String>, String> {
     let parts = address.split(':').collect::<Vec<_>>();
     let [server, workspace, tab] = parts.as_slice() else {
-        return vec![address.to_owned()];
+        return Err(format!(
+            "{address:?} is not a server:workspace:tab relay address"
+        ));
     };
     let matches = |value: &serde_json::Value, key: &str, wanted: &str| {
         value
@@ -639,7 +675,7 @@ pub fn queue_names_for_address(
             .and_then(serde_json::Value::as_str)
             .is_some_and(|got| got.eq_ignore_ascii_case(wanted))
     };
-    registrations
+    let names = registrations
         .iter()
         .filter(|(_, registration)| {
             let place = registration
@@ -650,7 +686,11 @@ pub fn queue_names_for_address(
                 && matches(place, "tab", tab)
         })
         .map(|(name, _)| name.clone())
-        .collect()
+        .collect::<Vec<_>>();
+    if names.is_empty() {
+        return Err(format!("no registered lead matches {address}"));
+    }
+    Ok(names)
 }
 
 /// The ix-relay inbox lists, read with `HGETALL` on the registry and `LRANGE` on the inbox
@@ -661,6 +701,8 @@ pub fn queue_names_for_address(
 /// `REDISCLI_AUTH`, never on the command line.
 pub struct RedisCliRelay;
 
+// Not `deny_unknown_fields`: the message belongs to ix-relay, which adds fields, and only the
+// send time is read.
 #[derive(Deserialize)]
 struct RelayMessage {
     sent_at_ms: i64,
@@ -676,6 +718,9 @@ fn redis(target: &RedisTarget, args: &[String]) -> Result<String, String> {
         "--no-auth-warning",
         "--raw",
     ]);
+    if let Some(db) = target.db {
+        command.args(["-n", &db.to_string()]);
+    }
     if let Some(user) = &target.user {
         command.args(["--user", user]);
     }
@@ -712,26 +757,18 @@ impl RelaySource for RedisCliRelay {
             config.as_deref(),
         );
         let target = parse_redis_url(&settings.url)?;
-        let names = if address.contains(':') {
-            let flat = redis(
-                &target,
-                &strings(&["HGETALL", &format!("{}agents", settings.prefix)]),
-            )?;
-            let mut rows = flat.lines();
-            let mut registrations = Vec::new();
-            while let (Some(name), Some(json)) = (rows.next(), rows.next()) {
-                if let Ok(value) = serde_json::from_str(json) {
-                    registrations.push((name.to_owned(), value));
-                }
+        let flat = redis(
+            &target,
+            &strings(&["HGETALL", &format!("{}agents", settings.prefix)]),
+        )?;
+        let mut rows = flat.lines();
+        let mut registrations = Vec::new();
+        while let (Some(name), Some(json)) = (rows.next(), rows.next()) {
+            if let Ok(value) = serde_json::from_str(json) {
+                registrations.push((name.to_owned(), value));
             }
-            let names = queue_names_for_address(address, &registrations);
-            if names.is_empty() {
-                return Err(format!("no registered lead matches {address}"));
-            }
-            names
-        } else {
-            vec![address.to_owned()]
-        };
+        }
+        let names = queue_names_for_address(address, &registrations)?;
         let mut sent = Vec::new();
         for name in names {
             let text = redis(
@@ -862,7 +899,7 @@ impl LocalSource for SystemLocal {
 struct UnreadableLinear(String);
 
 impl LinearSource for UnreadableLinear {
-    fn workspace(&self) -> Result<WorkspaceSnapshot, String> {
+    fn workspace(&self, _since: f64) -> Result<WorkspaceSnapshot, String> {
         Err(self.0.clone())
     }
 

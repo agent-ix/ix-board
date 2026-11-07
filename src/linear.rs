@@ -101,6 +101,14 @@ query MarkerComments($first: Int!, $after: String, $prefix: String!, $needle: St
   }
 }"#;
 
+const ISSUE_UPDATES_QUERY: &str = r#"
+query IssueUpdates($first: Int!, $after: String, $since: DateTimeOrDuration!) {
+  issues(first: $first, after: $after, filter: { updatedAt: { gte: $since } }) {
+    nodes { id updatedAt }
+    pageInfo { hasNextPage endCursor }
+  }
+}"#;
+
 const LABELED_ISSUES_QUERY: &str = r#"
 query LabeledIssues($first: Int!, $after: String, $label: String!) {
   issues(
@@ -676,6 +684,33 @@ impl LinearGraphQlSource {
         Ok(comments
             .iter()
             .map(|comment| crate::retro::metrics::first_line(&comment.body).to_owned())
+            .collect())
+    }
+
+    /// Reads the id and update time of every issue updated at or after `since` (Unix seconds),
+    /// to prove whether a cached workspace snapshot still describes them.
+    pub fn fetch_issue_updates(&self, since: f64) -> Result<Vec<(String, String)>, String> {
+        let since = crate::drift::format_timestamp(since.floor());
+        let nodes = crate::retro::sources::read_all_pages(|after| {
+            let data: IssueUpdateData = self
+                .request(
+                    ISSUE_UPDATES_QUERY,
+                    UpdateVariables {
+                        first: ISSUE_PAGE_SIZE,
+                        after: after.map(str::to_owned),
+                        since: since.clone(),
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(crate::retro::sources::Page {
+                items: data.issues.nodes,
+                has_next: data.issues.page_info.has_next_page,
+                cursor: data.issues.page_info.end_cursor,
+            })
+        })?;
+        Ok(nodes
+            .into_iter()
+            .map(|node| (node.id, node.updated_at))
             .collect())
     }
 
@@ -1395,6 +1430,27 @@ struct MarkerVariables {
     after: Option<String>,
     prefix: String,
     needle: String,
+}
+
+#[derive(Serialize)]
+struct UpdateVariables {
+    first: i32,
+    after: Option<String>,
+    since: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IssueUpdateData {
+    issues: Connection<RawIssueUpdate>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct RawIssueUpdate {
+    id: String,
+    updated_at: String,
 }
 
 #[derive(Serialize)]

@@ -106,6 +106,7 @@ pub fn definition(id: &str) -> Option<&'static MetricDef> {
 
 /// One metric as stored in a record (FR-026).
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Metric {
     /// Stable metric id.
     pub id: String,
@@ -138,6 +139,7 @@ pub enum RecordKind {
 
 /// One line of the store (FR-025).
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Record {
     /// Record schema version.
     pub schema_version: u32,

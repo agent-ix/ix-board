@@ -70,8 +70,10 @@ pub struct LabeledIssue {
 
 /// Linear reads.
 pub trait LinearSource {
-    /// The complete workspace snapshot, read in one paginated pass.
-    fn workspace(&self) -> Result<WorkspaceSnapshot, String>;
+    /// The complete workspace snapshot, read in one paginated pass. It is current for every
+    /// issue updated at or after `since` (Unix seconds): a cached snapshot is used only when a
+    /// fresh read of the recently updated issues proves it so.
+    fn workspace(&self, since: f64) -> Result<WorkspaceSnapshot, String>;
     /// The open ticket count the project-chunk read reports for a project name.
     fn project_open_count(&self, project: &str) -> Result<usize, String>;
     /// The complete state history of one issue.
@@ -118,8 +120,10 @@ pub struct PullRequest {
     pub deletions: u64,
     /// GitHub review decision, such as `APPROVED`.
     pub review_decision: Option<String>,
-    /// Distinct head commits from the paginated timeline; `None` when it was incomplete.
-    pub head_shas: Option<u64>,
+    /// Lower bound on how often the head moved: one plus the force-push events of the paginated
+    /// timeline. Ordinary pushes cannot be told apart from commits, so they are not counted.
+    /// `None` when the timeline was incomplete.
+    pub head_updates: Option<u64>,
 }
 
 /// Check state of one commit.
@@ -142,13 +146,26 @@ pub struct MainCommit {
     pub state: CheckState,
 }
 
+/// What one pull request currently looks like on GitHub, whatever its repository or state.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PullRequestInfo {
+    /// True when merged.
+    pub merged: bool,
+    /// Unix seconds of the last update.
+    pub updated_at: f64,
+}
+
+/// Idle threshold, in seconds, the agent verdicts use; recorded in the `query` of the metrics
+/// that depend on it.
+pub const AGENTS_IDLE_AFTER_SECS: u64 = 20 * 60;
+
 /// GitHub reads.
 pub trait GithubSource {
     /// Every open pull request of `repo`, plus merged ones updated at or after `since`,
     /// read in one paginated pass.
     fn pull_requests(&self, repo: &str, since: f64) -> Result<Vec<PullRequest>, String>;
-    /// Whether one pull request is merged.
-    fn is_merged(&self, repo: &str, number: u64) -> Result<bool, String>;
+    /// One pull request of any repository, open, merged or closed.
+    fn pull_request(&self, repo: &str, number: u64) -> Result<PullRequestInfo, String>;
     /// Check state of every commit on `branch` committed at or after `since`.
     fn main_commits(&self, repo: &str, branch: &str, since: f64)
     -> Result<Vec<MainCommit>, String>;

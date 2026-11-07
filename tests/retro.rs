@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use ix_board::agents::{AgentRow, AgentsReport, GitAges, Verdict};
 use ix_board::retro::sources::{
     AgentSource, CheckState, GateLine, GateLogSource, GithubSource, LabeledIssue, LinearSource,
-    LocalSource, MainCommit, Page, ProcessRow, PullRequest, RelaySource, Sources, StateChange,
-    read_all_pages,
+    LocalSource, MainCommit, Page, ProcessRow, PullRequest, PullRequestInfo, RelaySource, Sources,
+    StateChange, read_all_pages,
 };
 use ix_board::retro::{
     CATALOG, Record, RetroConfig, Status, Store, StoreError, parse_window, run_snapshot,
@@ -63,6 +63,7 @@ struct Rig {
     labeled: Option<Result<Vec<LabeledIssue>, String>>,
     prs: Option<Result<Vec<PullRequest>, String>>,
     merged: BTreeMap<(String, u64), bool>,
+    infos: BTreeMap<(String, u64), PullRequestInfo>,
     commits: Option<Result<Vec<MainCommit>, String>>,
     agents: Option<Result<AgentsReport, String>>,
     gate_lines: Option<Result<Vec<GateLine>, String>>,
@@ -105,7 +106,7 @@ fn unset<T: Clone>(value: &Option<Result<T, String>>, what: &str) -> Result<T, S
 }
 
 impl LinearSource for Rig {
-    fn workspace(&self) -> Result<WorkspaceSnapshot, String> {
+    fn workspace(&self, _since: f64) -> Result<WorkspaceSnapshot, String> {
         self.log("workspace");
         unset(&self.workspace, "workspace")
     }
@@ -131,7 +132,10 @@ impl LinearSource for Rig {
         self.log("marker_lines");
         Ok(unset(&self.markers, "markers")?
             .into_iter()
-            .filter(|line| line.starts_with(prefix) && line.contains(needle))
+            // The source filters whole comment bodies, as Linear does, and hands back only the
+            // first line of each comment that passes.
+            .filter(|body| body.starts_with(prefix) && body.contains(needle))
+            .map(|body| ix_board::retro::metrics::first_line(&body).to_owned())
             .collect())
     }
     fn open_issues_with_label(&self, _label: &str) -> Result<Vec<LabeledIssue>, String> {
@@ -145,13 +149,29 @@ impl GithubSource for Rig {
         self.log(format!("pull_requests:{repo}"));
         unset(&self.prs, "pull requests")
     }
-    fn is_merged(&self, repo: &str, number: u64) -> Result<bool, String> {
-        self.log("is_merged");
-        Ok(self
-            .merged
-            .get(&(repo.to_owned(), number))
-            .copied()
-            .unwrap_or(false))
+    fn pull_request(&self, repo: &str, number: u64) -> Result<PullRequestInfo, String> {
+        self.log(format!("pull_request:{repo}#{number}"));
+        let key = (repo.to_owned(), number);
+        if let Some(info) = self.infos.get(&key) {
+            return Ok(*info);
+        }
+        if let Some(Ok(listing)) = &self.prs
+            && let Some(pr) = listing
+                .iter()
+                .find(|pr| pr.repo == repo && pr.number == number)
+        {
+            return Ok(PullRequestInfo {
+                merged: pr.merged_at.is_some(),
+                updated_at: pr.updated_at,
+            });
+        }
+        match self.merged.get(&key) {
+            Some(merged) => Ok(PullRequestInfo {
+                merged: *merged,
+                updated_at: 0.0,
+            }),
+            None => Err("unknown pull request".to_owned()),
+        }
     }
     fn main_commits(
         &self,
@@ -350,7 +370,7 @@ fn pr(number: u64, open: bool) -> PullRequest {
         additions: 10,
         deletions: 10,
         review_decision: None,
-        head_shas: Some(1),
+        head_updates: Some(1),
     }
 }
 
@@ -371,7 +391,7 @@ fn default_prs() -> Vec<PullRequest> {
         merged_pr(104, 100.0, 2.0),
         PullRequest {
             review_decision: Some("APPROVED".to_owned()),
-            head_shas: Some(3),
+            head_updates: Some(3),
             ..pr(11, true)
         },
     ]
@@ -551,7 +571,15 @@ fn path_remaining_is_unavailable_when_the_blocker_expansion_is_partial() {
         .push(IssueId("id-missing".to_owned()));
     rig.workspace = Some(Ok(snapshot_data));
     let record = snapshot(&rig);
-    assert!(reason(&record, "path_remaining").contains("truncated or partial"));
+    for id in [
+        "path_remaining",
+        "path_closed",
+        "net_closed_minus_new",
+        "path_closed_unverified",
+        "done_reopened",
+    ] {
+        assert!(reason(&record, id).contains("truncated or partial"), "{id}");
+    }
     assert_eq!(value(&record, "intake_new"), Some(2.0));
 }
 
@@ -641,25 +669,28 @@ fn pull_request_state_metrics_straddle_each_threshold() {
 
 /// Trace: FR-024-AC-6
 #[test]
-fn fix_rounds_read_marker_first_lines_only() {
-    let marker = "<!-- reviewer repo=agent-ix/x id=SR-1 pr=x#11 -->";
+fn fix_rounds_read_raw_comment_bodies_through_the_real_marker_parser() {
+    let reviewer = "<!-- reviewer repo=agent-ix/x id=SR-1 pr=x#11 -->";
     let disposition = |round: u32, id: &str| {
         format!("<!-- reviewer-dispositions repo=agent-ix/x id={id} round={round} -->")
     };
-    // Bodies as Linear returns them; the reader keeps only each first line.
-    let bodies = [
-        format!("{marker}\nfindings"),
-        format!("{}\nbody", disposition(1, "SR-1")),
-        format!("see this quote\n{}", disposition(9, "SR-1")),
-        format!("human text {}", disposition(7, "SR-1")),
-        format!("{}\nbody", disposition(5, "SR-404")),
-    ];
-    let first_lines: Vec<String> = bodies
-        .iter()
-        .map(|body| ix_board::retro::metrics::first_line(body).to_owned())
-        .collect();
+    // Raw bodies that all pass the source's prefix and substring filter.
     let mut rig = base_rig();
-    rig.markers = Some(Ok(first_lines));
+    rig.markers = Some(Ok(vec![
+        format!("{reviewer}\nfindings"),
+        format!("{}\nbody", disposition(1, "SR-1")),
+        // The marker text is on a later line, the first line is another marker without an id.
+        format!(
+            "<!-- reviewer-dispositions notes -->\n{}",
+            disposition(9, "SR-1")
+        ),
+        // A human comment that starts with marker text and carries more text on the line.
+        format!("{} I disagree", disposition(7, "SR-1")),
+        // A disposition whose id matches no reviewer marker.
+        format!("{}\nbody", disposition(5, "SR-404")),
+        // A disposition of another repository with the same id.
+        "<!-- reviewer-dispositions repo=agent-ix/y id=SR-1 round=30 -->\nbody".to_owned(),
+    ]));
     let record = snapshot(&rig);
     assert_eq!(value(&record, "fix_rounds_max"), Some(1.0));
     assert_eq!(value(&record, "fix_rounds_total"), Some(1.0));
@@ -944,7 +975,7 @@ fn gates_remaining_and_unverified_completions() {
     // SWM-2 completed with merged PR #10; SWM-4 completed with no PR attached.
     assert_eq!(value(&record, "path_closed_unverified"), Some(1.0));
     let mut rig = base_rig();
-    rig.merged.clear();
+    rig.merged.insert(("agent-ix/x".to_owned(), 10), false);
     assert_eq!(value(&snapshot(&rig), "path_closed_unverified"), Some(2.0));
 }
 
@@ -1110,7 +1141,7 @@ fn a_snapshot_only_reads_and_leaves_a_repository_untouched() {
         "marker_lines",
         "open_issues_with_label",
         "pull_requests:agent-ix/x",
-        "is_merged",
+        "pull_request:agent-ix/x#10",
         "main_commits",
         "agents",
         "gate_log",
@@ -1122,7 +1153,8 @@ fn a_snapshot_only_reads_and_leaves_a_repository_untouched() {
         assert!(
             READS.contains(&call.as_str())
                 || call.starts_with("state_history:")
-                || call.starts_with("batch:"),
+                || call.starts_with("batch:")
+                || call.starts_with("pull_request:"),
             "unexpected call {call}"
         );
     }
@@ -1214,23 +1246,42 @@ fn json_exposes_every_metric_field_and_text_prints_one_line_each() {
     );
 }
 
+/// A pull request merged before the window but updated inside it, as the live listing returns.
+fn merged_before_window() -> PullRequest {
+    PullRequest {
+        updated_at: ago(1.0),
+        head_updates: Some(50),
+        ..merged_pr(500, 1.0, 90.0)
+    }
+}
+
 /// Trace: FR-024-AC-6
 #[test]
-fn fix_rounds_cover_only_pull_requests_open_or_merged_in_the_window() {
+fn fix_rounds_and_head_moves_exclude_pull_requests_outside_the_window() {
     let mut rig = base_rig();
+    let mut listing = default_prs();
+    listing.push(merged_before_window());
+    rig.prs = Some(Ok(listing));
     rig.markers = Some(Ok(vec![
         "<!-- reviewer repo=agent-ix/x id=SR-1 pr=x#11 -->".to_owned(),
         "<!-- reviewer-dispositions repo=agent-ix/x id=SR-1 round=2 -->".to_owned(),
-        // Merged before the window, so absent from the listing.
+        // Merged before the window: in the listing, but neither open nor merged inside it.
         "<!-- reviewer repo=agent-ix/x id=SR-2 pr=x#500 -->".to_owned(),
         "<!-- reviewer-dispositions repo=agent-ix/x id=SR-2 round=40 -->".to_owned(),
-        // Another repository.
+        // Another repository, and a repository that is not configured.
         "<!-- reviewer repo=agent-ix/y id=SR-3 pr=y#11 -->".to_owned(),
         "<!-- reviewer-dispositions repo=agent-ix/y id=SR-3 round=30 -->".to_owned(),
+        // Same id as this team's review, disposed in another repository.
+        "<!-- reviewer-dispositions repo=agent-ix/y id=SR-1 round=20 -->".to_owned(),
     ]));
     let record = snapshot(&rig);
     assert_eq!(value(&record, "fix_rounds_max"), Some(2.0));
     assert_eq!(value(&record, "fix_rounds_total"), Some(2.0));
+    assert_eq!(
+        value(&record, "head_shas_per_pr_max"),
+        Some(3.0),
+        "the 50-move pull request merged before the window is excluded"
+    );
     rig.prs = Some(Err("down".to_owned()));
     let record = snapshot(&rig);
     assert!(reason(&record, "fix_rounds_total").contains("GitHub"));
@@ -1277,11 +1328,16 @@ fn relay_addresses_resolve_to_registered_session_queues_and_settings_follow_prec
         ),
     ];
     assert_eq!(
-        queue_names_for_address("luna:IR:plan", &registrations),
+        queue_names_for_address("luna:IR:plan", &registrations).unwrap(),
         ["session/6c/aa", "session/6c/bb"]
     );
-    assert!(queue_names_for_address("luna:IR:code", &registrations).is_empty());
-    assert_eq!(queue_names_for_address("peter", &registrations), ["peter"]);
+    // An unregistered or malformed address is an error, never an empty queue.
+    for bad in ["luna:IR:code", "peter", "luna:IR", "a:b:c:d", ""] {
+        assert!(
+            queue_names_for_address(bad, &registrations).is_err(),
+            "{bad}"
+        );
+    }
 
     let file = "url = \"redis://u:pw@10.0.0.1:6380\"\nprefix = \"p:\"\n";
     assert_eq!(
@@ -1304,11 +1360,222 @@ fn relay_addresses_resolve_to_registered_session_queues_and_settings_follow_prec
             host: "10.99.0.1".to_owned(),
             port: 6380,
             user: Some("draco".to_owned()),
-            password: Some("secret".to_owned())
+            password: Some("secret".to_owned()),
+            db: None,
         }
     );
+    assert_eq!(parse_redis_url("redis://h:1/3").unwrap().db, Some(3));
+    assert!(parse_redis_url("redis://h/x").is_err());
     assert_eq!(parse_redis_url("redis://127.0.0.1").unwrap().port, 6379);
     assert!(parse_redis_url("http://x").is_err());
+}
+
+/// Trace: FR-024-AC-2
+#[test]
+fn path_closed_ignores_a_completion_before_the_window() {
+    let mut rig = base_rig();
+    let mut data = rig.workspace.clone().unwrap().unwrap();
+    data.issues[0]
+        .blocked_by
+        .push(IssueId("id-SWM-12".to_owned()));
+    // On the path, updated inside the window, but completed 48h ago.
+    data.issues
+        .push(issue("SWM-12", S::Completed, Some("p1"), 300.0, 2.0));
+    rig.workspace = Some(Ok(data));
+    rig.histories.insert(
+        "id-SWM-12".to_owned(),
+        Ok(vec![change(48.0, S::Started, S::Completed)]),
+    );
+    let record = snapshot(&rig);
+    assert_eq!(value(&record, "path_closed"), Some(2.0));
+    assert_eq!(value(&record, "path_remaining"), Some(1.0));
+}
+
+/// Trace: FR-024-AC-7
+#[test]
+fn main_red_skips_unchecked_commits_and_ignores_a_leading_failing_run() {
+    let cfg = config_with(r#"{"main_check": {"repo": "agent-ix/x", "branch": "main"}}"#);
+    let at = |hours: f64, state| MainCommit {
+        committed_at: ago(hours),
+        state,
+    };
+    let mut rig = base_rig();
+    rig.commits = Some(Ok(vec![
+        at(21.0, CheckState::Fail),
+        at(20.0, CheckState::Fail),
+        at(18.0, CheckState::Pass),
+        at(17.0, CheckState::Pending),
+        at(16.0, CheckState::Fail),
+        at(15.0, CheckState::Pending),
+        at(14.0, CheckState::Pass),
+    ]));
+    let record = snapshot_with(&rig, &cfg, DAY).0;
+    assert_eq!(value(&record, "main_red_incidents"), Some(1.0));
+    assert_eq!(value(&record, "main_red_minutes"), Some(120.0));
+    assert!(
+        record.metrics["main_red_incidents"]
+            .query
+            .contains("agent-ix/x@main")
+    );
+}
+
+/// Trace: FR-024-AC-8
+#[test]
+fn a_stale_issue_reads_its_attached_pull_request_from_that_pull_requests_repository() {
+    let attach = |rig: &mut Rig| {
+        let mut data = rig.workspace.clone().unwrap().unwrap();
+        let stale = data
+            .issues
+            .iter_mut()
+            .find(|i| i.identifier == "SWM-7")
+            .unwrap();
+        stale
+            .attachment_urls
+            .push("https://github.com/agent-ix/other/pull/5".to_owned());
+        rig.workspace = Some(Ok(data));
+    };
+    let mut rig = base_rig();
+    attach(&mut rig);
+    let key = ("agent-ix/other".to_owned(), 5);
+    // Another repository, closed without merging, updated an hour ago: not stale.
+    rig.infos.insert(
+        key.clone(),
+        PullRequestInfo {
+            merged: false,
+            updated_at: ago(1.0),
+        },
+    );
+    assert_eq!(value(&snapshot(&rig), "in_progress_stale"), Some(0.0));
+    // The same pull request untouched for 200h: stale.
+    rig.infos.insert(
+        key,
+        PullRequestInfo {
+            merged: false,
+            updated_at: ago(200.0),
+        },
+    );
+    assert_eq!(value(&snapshot(&rig), "in_progress_stale"), Some(1.0));
+    // A repository GitHub cannot read: unavailable, never a false stale.
+    rig.infos.clear();
+    let record = snapshot(&rig);
+    assert!(reason(&record, "in_progress_stale").contains("agent-ix/other#5"));
+}
+
+/// Trace: FR-024-AC-9
+#[test]
+fn herdr_metric_queries_record_the_idle_threshold() {
+    let record = snapshot(&base_rig());
+    for id in ["agents_working_share", "agents_idle_minutes_max"] {
+        assert!(record.metrics[id].query.contains("idle_after=20m"), "{id}");
+    }
+}
+
+/// Trace: FR-026-AC-4
+#[test]
+fn head_moves_are_a_documented_lower_bound() {
+    let record = snapshot(&base_rig());
+    let query = &record.metrics["head_shas_per_pr_max"].query;
+    assert!(
+        query.contains("lower bound") && query.contains("force-push"),
+        "{query}"
+    );
+}
+
+/// Trace: FR-024-AC-18
+#[test]
+fn a_threshold_too_large_to_measure_is_unavailable_with_a_reason() {
+    let mut rig = base_rig();
+    rig.processes = Some(Ok(Vec::new()));
+    let cfg = config_with(&format!(
+        r#"{{"slot_process":"s","orphan_slot_hours":{max},"thresholds":{{"pr_idle_hours":{max},"pr_oversize_lines":1,"in_progress_stale_hours":{max}}}}}"#,
+        max = u64::MAX
+    ));
+    let record = snapshot_with(&rig, &cfg, DAY).0;
+    for id in ["orphan_slots", "prs_idle", "in_progress_stale"] {
+        assert!(reason(&record, id).contains("too large"), "{id}");
+    }
+}
+
+/// Trace: FR-024-AC-13
+#[test]
+fn a_cached_snapshot_is_current_only_if_recent_updates_match() {
+    use ix_board::retro::live::snapshot_is_current;
+    let snap = rig_snapshot();
+    let updated = snap.issues[0].updated_at.clone().unwrap();
+    let id = snap.issues[0].id.0.clone();
+    assert!(snapshot_is_current(&snap, &[(id.clone(), updated)]));
+    assert!(snapshot_is_current(&snap, &[]));
+    assert!(!snapshot_is_current(
+        &snap,
+        &[(id, "2099-01-01T00:00:00Z".to_owned())]
+    ));
+    assert!(!snapshot_is_current(
+        &snap,
+        &[("new-issue".to_owned(), "2026-11-07T11:00:00Z".to_owned())]
+    ));
+}
+
+fn rig_snapshot() -> WorkspaceSnapshot {
+    base_rig().workspace.unwrap().unwrap()
+}
+
+/// Trace: FR-024-AC-13
+#[test]
+fn the_live_listing_stops_at_the_cutoff_only_when_a_page_ends_before_it() {
+    use ix_board::retro::live::pull_request_page;
+    let node = |number: u64, updated: &str, forced: u64| {
+        format!(
+            r#"{{"number":{number},"createdAt":"2026-11-01T00:00:00Z","mergedAt":null,"updatedAt":"{updated}","isDraft":false,"state":"MERGED","additions":1,"deletions":2,"reviewDecision":null,"timelineItems":{{"totalCount":{forced}}}}}"#
+        )
+    };
+    let page = |nodes: &[String], has_next: bool| {
+        format!(
+            r#"{{"data":{{"repository":{{"pullRequests":{{"nodes":[{}],"pageInfo":{{"hasNextPage":{has_next},"endCursor":"c"}}}}}}}}}}"#,
+            nodes.join(",")
+        )
+    };
+    let cutoff = Some(NOW - 24.0 * HOUR);
+    // The last node on the page is older than the cutoff: later pages cannot matter.
+    let old = page(
+        &[
+            node(1, "2026-11-07T11:00:00Z", 2),
+            node(2, "2026-10-01T00:00:00Z", 0),
+        ],
+        true,
+    );
+    let parsed = pull_request_page(&old, "o/r", cutoff).unwrap();
+    assert!(!parsed.has_next);
+    assert_eq!(
+        parsed.items[0].head_updates,
+        Some(3),
+        "one plus the force-push events"
+    );
+    // Still inside the window: keep reading.
+    let recent = page(
+        &[
+            node(1, "2026-11-07T11:00:00Z", 0),
+            node(2, "2026-11-07T10:00:00Z", 0),
+        ],
+        true,
+    );
+    assert!(pull_request_page(&recent, "o/r", cutoff).unwrap().has_next);
+    // No cutoff (the open listing) reads every page.
+    assert!(pull_request_page(&old, "o/r", None).unwrap().has_next);
+    // The source's own last page stays last.
+    assert!(
+        !pull_request_page(&recent.replace("true", "false"), "o/r", cutoff)
+            .unwrap()
+            .has_next
+    );
+    // An unknown field in the selection is a decoding error.
+    assert!(
+        pull_request_page(
+            &old.replace("\"number\"", "\"extra\":1,\"number\""),
+            "o/r",
+            None
+        )
+        .is_err()
+    );
 }
 
 // ---- FR-025 ----------------------------------------------------------------------------
