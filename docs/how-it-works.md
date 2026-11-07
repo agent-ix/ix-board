@@ -101,6 +101,12 @@ a write ix-board updates the cached snapshot with the new value. No
 other command writes to Linear or GitHub, and ix-board never writes manual
 order.
 
+## Retro store
+
+The `retro` commands append measurement records to a local store outside every git work tree
+(`$TEAM_RETRO_HOME`, default `~/.local/state/team-retro`). They write nothing to Linear, GitHub or
+any repository. See [retro](retro.md).
+
 ## Output and exit status
 
 Text output is for reading in a terminal. `--json` prints one JSON value on

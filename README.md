@@ -139,7 +139,7 @@ waiting, asking, idle or at a prompt. `drift` evaluates lead activity against
 configured thresholds from a versioned evidence file or live Linear data. See
 [agents and drift](docs/agents-and-drift.md).
 
-## Retro snapshots
+## Retro
 
 `retro snapshot --config retro.json [--window 24h]` measures whether a team's work is
 converging toward its gate tickets and appends one record of the metric catalog to
@@ -154,7 +154,7 @@ the baseline from the store alone, flags metrics that moved the wrong way twice 
 2026-11-01 [--until 2026-11-06]` appends one record per UTC day from pull-request and Linear
 history, so a baseline exists before the first snapshot; metrics that history cannot supply are
 `unavailable: not reconstructible`. See [delta](docs/retro.md#delta) and
-[backfill](docs/retro.md#backfill).
+[backfill](docs/retro.md#backfill). The dev-team `team-retro` skill runs these commands on a schedule.
 
 ## Project controls
 
@@ -185,7 +185,7 @@ low.
 - [Focus](docs/focus.md)
 - [Program review](docs/program-review.md)
 - [Agents and drift](docs/agents-and-drift.md)
-- [Retro snapshot](docs/retro.md)
+- [Retro: snapshot, delta and backfill](docs/retro.md)
 - [CLI reference](docs/cli-reference.md)
 - [Setup and troubleshooting](docs/setup.md)
 
