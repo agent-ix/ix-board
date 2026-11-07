@@ -169,6 +169,27 @@ enum RetroCommand {
         #[arg(long, default_value = retro::DEFAULT_WINDOW)]
         window: String,
     },
+    /// Compare the latest snapshot with the previous one and the baseline, reading only the store.
+    Delta {
+        /// JSON retro configuration file.
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Append one record per UTC day from Linear and GitHub history.
+    Backfill {
+        /// JSON retro configuration file.
+        #[arg(long)]
+        config: PathBuf,
+        /// First UTC day, YYYY-MM-DD.
+        #[arg(long)]
+        since: String,
+        /// Last UTC day, YYYY-MM-DD; defaults to the last complete UTC day.
+        #[arg(long)]
+        until: Option<String>,
+        /// Trailing window for window metrics: seconds, minutes, hours or days (90s, 20m, 4h, 2d).
+        #[arg(long, default_value = retro::DEFAULT_WINDOW)]
+        window: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -318,6 +339,8 @@ enum Output {
     Drift(DriftReport),
     Agents(AgentsReport),
     Retro(retro::Record),
+    RetroDelta(retro::DeltaReport),
+    RetroBackfill(retro::BackfillReport),
     ProjectStatusUpdated {
         project: String,
         status: String,
@@ -535,6 +558,19 @@ fn run(command: Command) -> Result<Output, Error> {
         Command::Retro {
             command: RetroCommand::Snapshot { config, window },
         } => run_retro_snapshot(&config, &window).map(Output::Retro),
+        Command::Retro {
+            command: RetroCommand::Delta { config },
+        } => run_retro_delta(&config).map(Output::RetroDelta),
+        Command::Retro {
+            command:
+                RetroCommand::Backfill {
+                    config,
+                    since,
+                    until,
+                    window,
+                },
+        } => run_retro_backfill(&config, &since, until.as_deref(), &window)
+            .map(Output::RetroBackfill),
         Command::Scope {
             command: ProgramScopeCommand::Check { scope },
         } => {
@@ -698,6 +734,39 @@ fn run_retro_snapshot(config_path: &std::path::Path, window: &str) -> Result<ret
         eprintln!("{notice}");
     }
     Ok(record)
+}
+
+fn run_retro_delta(config_path: &std::path::Path) -> Result<retro::DeltaReport, Error> {
+    let config = retro::RetroConfig::load(config_path).map_err(retro::RetroError::from)?;
+    let store = retro::Store::from_env(&config.team).map_err(retro::RetroError::from)?;
+    Ok(retro::run_delta(&config, &store)?)
+}
+
+fn run_retro_backfill(
+    config_path: &std::path::Path,
+    since: &str,
+    until: Option<&str>,
+    window: &str,
+) -> Result<retro::BackfillReport, Error> {
+    let config = retro::RetroConfig::load(config_path).map_err(retro::RetroError::from)?;
+    let window_secs = retro::parse_window(window).map_err(retro::RetroError::from)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |elapsed| elapsed.as_secs_f64());
+    let first = retro::parse_day(since)?;
+    let last = until.map(retro::parse_day).transpose()?;
+    let store = retro::Store::from_env(&config.team).map_err(retro::RetroError::from)?;
+    // A refused store path must cost no reads, so check it before any source is started.
+    store.check_writable().map_err(retro::RetroError::from)?;
+    let linear = retro::live::linear_or_unreadable();
+    Ok(retro::run_backfill(
+        &config,
+        window_secs,
+        (first, last),
+        now,
+        (linear.as_ref(), &retro::live::LiveGithub),
+        &store,
+    )?)
 }
 
 fn run_auth(command: AuthCommand) -> Result<Output, Error> {
@@ -981,6 +1050,8 @@ fn render_human(output: &Output) -> String {
         Output::Drift(report) => render_drift_text(report),
         Output::Agents(report) => render_text(report),
         Output::Retro(record) => retro::render_text(record),
+        Output::RetroDelta(report) => retro::render_delta_text(report),
+        Output::RetroBackfill(report) => retro::render_backfill_text(report),
         Output::ProgramScopeCheck(report) => {
             let mut lines = Vec::new();
             for name in &report.missing_initiatives {

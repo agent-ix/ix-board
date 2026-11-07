@@ -148,6 +148,14 @@ append-only and refuses any path inside a git work tree. A metric whose source c
 is incomplete or is not configured is `unavailable` with a reason, never zero. See
 [retro snapshot](docs/retro.md).
 
+`retro delta --config retro.json [--json]` compares the latest snapshot with the previous one and
+the baseline from the store alone, flags metrics that moved the wrong way twice in a row as
+`regressing`, and prints no combined score. `retro backfill --config retro.json --since
+2026-11-01 [--until 2026-11-06]` appends one record per UTC day from pull-request and Linear
+history, so a baseline exists before the first snapshot; metrics that history cannot supply are
+`unavailable: not reconstructible`. See [delta](docs/retro.md#delta) and
+[backfill](docs/retro.md#backfill).
+
 ## Project controls
 
 Two commands write to Linear. They change a project's status or priority and
