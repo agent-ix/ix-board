@@ -11,7 +11,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::catalog::{CATALOG, Metric, Status, definition};
 use super::config::{RetroConfig, format_window};
 use super::sources::{
-    AGENTS_IDLE_AFTER_SECS, CheckState, GateLine, MainCommit, PullRequest, Sources, StateChange,
+    AGENTS_IDLE_AFTER_SECS, CheckState, GateLine, GithubSource, LinearSource, MainCommit,
+    PullRequest, Sources, StateChange,
 };
 use crate::chain::evaluate_chain;
 use crate::model::issue_is_open;
@@ -68,7 +69,7 @@ pub fn collect(
         source: sources.linear,
         cache: BTreeMap::new(),
     };
-    let prs = list_pull_requests(config, sources, frame.start());
+    let prs = list_pull_requests(config, sources.github, frame.start());
     match &workspace {
         Ok(snapshot) => {
             let scope = Scope::new(config, snapshot, frame);
@@ -453,16 +454,46 @@ fn progress(
     history: &mut History<'_>,
     sources: &Sources<'_>,
 ) {
-    let frame = scope.frame;
-    let mut wanted = scope.path_ok().unwrap_or_default().to_vec();
-    wanted.extend(scope.projects_ok().unwrap_or_default().iter().copied());
-    history.prefetch(&wanted, frame.start());
+    let path_done = window_progress(out, scope, history);
     out.put(
         "path_remaining",
         scope
             .path_ok()
             .map(|path| count(path.iter().filter(|issue| issue_is_open(issue)).count())),
     );
+    let gates = gate_issues(scope).map(|gates| {
+        count(
+            gates
+                .iter()
+                .filter(|issue| issue.state_type != WorkflowStateType::Completed)
+                .count(),
+        )
+    });
+    out.put("gates_remaining", gates);
+    let unverified = path_done.and_then(|done| {
+        let candidates = scope
+            .path_ok()?
+            .iter()
+            .filter(|issue| done.contains(&issue.id))
+            .copied()
+            .collect::<Vec<_>>();
+        unverified_count(&candidates, sources)
+    });
+    out.put("path_closed_unverified", unverified);
+}
+
+/// `path_closed`, `intake_new` and `net_closed_minus_new`: the progress metrics that depend only
+/// on issue creation and state history inside the frame. Returns the path issues completed in
+/// the frame.
+fn window_progress(
+    out: &mut Out<'_>,
+    scope: &Scope<'_>,
+    history: &mut History<'_>,
+) -> Result<BTreeSet<IssueId>, String> {
+    let frame = scope.frame;
+    let mut wanted = scope.path_ok().unwrap_or_default().to_vec();
+    wanted.extend(scope.projects_ok().unwrap_or_default().iter().copied());
+    history.prefetch(&wanted, frame.start());
     let path_done = scope
         .path_ok()
         .and_then(|path| history.changed_in_window(path, frame, to_completed));
@@ -492,25 +523,7 @@ fn progress(
         Ok::<_, String>(count(closed.len()) - count(created.clone()?))
     })();
     out.put("net_closed_minus_new", net);
-    let gates = gate_issues(scope).map(|gates| {
-        count(
-            gates
-                .iter()
-                .filter(|issue| issue.state_type != WorkflowStateType::Completed)
-                .count(),
-        )
-    });
-    out.put("gates_remaining", gates);
-    let unverified = path_done.and_then(|done| {
-        let candidates = scope
-            .path_ok()?
-            .iter()
-            .filter(|issue| done.contains(&issue.id))
-            .copied()
-            .collect::<Vec<_>>();
-        unverified_count(&candidates, sources)
-    });
-    out.put("path_closed_unverified", unverified);
+    path_done
 }
 
 fn gate_issues<'a>(scope: &Scope<'a>) -> Result<Vec<&'a Issue>, String> {
@@ -882,14 +895,13 @@ fn marker_lines_for(
 
 fn list_pull_requests(
     config: &RetroConfig,
-    sources: &Sources<'_>,
+    github: &dyn GithubSource,
     since: f64,
 ) -> Result<Vec<PullRequest>, String> {
     let mut all = Vec::new();
     for repo in &config.repos {
         all.extend(
-            sources
-                .github
+            github
                 .pull_requests(repo, since)
                 .map_err(|error| format!("{repo}: {error}"))?,
         );
@@ -1231,4 +1243,72 @@ fn gate_log(out: &mut Out<'_>, sources: &Sources<'_>) {
             );
         }
     }
+}
+
+/// Reason of every metric a past day cannot reconstruct.
+pub const NOT_RECONSTRUCTIBLE: &str = "not reconstructible";
+
+/// The metrics a past day can be measured for from issue creation, state history and pull
+/// request timestamps (FR-028).
+pub const RECONSTRUCTIBLE: [&str; 7] = [
+    "prs_merged_per_hour",
+    "pr_cycle_median_hours",
+    "pr_cycle_p90_hours",
+    "path_closed",
+    "intake_new",
+    "net_closed_minus_new",
+    "done_reopened",
+];
+
+/// Measures the reconstructible metrics for each past frame, reusing the snapshot computations
+/// on historical frames. Linear and GitHub are each read once for the whole set of frames; a
+/// failed or incomplete read makes the metrics that depend on it unavailable for every frame.
+/// Every other catalog metric is `unavailable` with reason `not reconstructible`.
+pub fn collect_history(
+    config: &RetroConfig,
+    frames: &[Frame],
+    linear: &dyn LinearSource,
+    github: &dyn GithubSource,
+) -> Vec<BTreeMap<String, Metric>> {
+    let earliest = frames
+        .iter()
+        .map(|frame| frame.start())
+        .fold(f64::INFINITY, f64::min)
+        .max(0.0);
+    let workspace = linear.workspace(earliest);
+    let prs = list_pull_requests(config, github, earliest);
+    let mut history = History {
+        source: linear,
+        cache: BTreeMap::new(),
+    };
+    frames
+        .iter()
+        .map(|frame| {
+            let mut out = Out {
+                config,
+                frame: *frame,
+                metrics: BTreeMap::new(),
+            };
+            match &workspace {
+                Ok(snapshot) => {
+                    let scope = Scope::new(config, snapshot, *frame);
+                    let _ = window_progress(&mut out, &scope, &mut history);
+                    rework_issues(&mut out, &scope, &mut history);
+                }
+                Err(error) => {
+                    let reason = format!("Linear unavailable: {error}");
+                    for id in LINEAR_SNAPSHOT_IDS {
+                        out.unavailable(id, reason.clone());
+                    }
+                }
+            }
+            flow(&mut out, &prs);
+            for entry in CATALOG {
+                if !RECONSTRUCTIBLE.contains(&entry.id) {
+                    out.unavailable(entry.id, NOT_RECONSTRUCTIBLE.to_owned());
+                }
+            }
+            out.metrics
+        })
+        .collect()
 }

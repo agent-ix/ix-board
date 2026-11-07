@@ -73,3 +73,43 @@ Speed: the Linear workspace comes from the shared read cache (five-minute TTL) o
 are read only for issues updated inside the window and concurrently, reviewer markers are read
 per pull request, and the herdr read runs alongside the others with a 25-second limit, after
 which the agent metrics are `unavailable`.
+
+## Delta
+
+`ix-board retro delta --config retro.json [--json]` reads only the store; it makes no Linear,
+GitHub, Herdr or local request. The latest and previous records are the two `snapshot` records
+with the greatest `taken_at`. The baseline is the record whose `taken_at` equals
+`baseline_taken_at`, or the earliest record of either kind when that field is absent; a value that
+matches no record stops the command with an error naming it. Backfilled records serve only as
+baseline and history. With fewer than two snapshots the command prints that no delta exists and
+exits zero.
+
+For each metric of the latest record it prints the value, the change since the previous snapshot
+and the change since the baseline. A change is reported only when both sides are `ok` and their
+`query` strings are equal; when either side is `unavailable` the comparison is `unavailable`, and
+when the queries differ it is `query_changed` with both queries shown. `regressing` is set for a
+metric with direction `up` or `down` when the change moved against the direction in each of the
+latest two consecutive comparisons between snapshots (so it needs three snapshots with comparable
+queries); `neutral` metrics never regress. There is no combined score.
+
+## Backfill
+
+`ix-board retro backfill --config retro.json --since 2026-11-01 [--until 2026-11-06]
+[--window 24h] [--json]` appends one `backfill` record per UTC day with `taken_at` at
+`23:59:59Z` of that day, measuring window metrics over the trailing window ending there. `--until`
+defaults to the last complete UTC day; a day that has not ended is refused.
+
+Only these metrics are reconstructed: `prs_merged_per_hour`, `pr_cycle_median_hours` and
+`pr_cycle_p90_hours` from pull-request creation and merge timestamps, and `path_closed`,
+`intake_new`, `net_closed_minus_new` and `done_reopened` from Linear issue creation and state
+history. They use the same functions as `retro snapshot`, fed historical frames. Every other metric
+is `unavailable` with reason `not reconstructible`, including `path_remaining`: the blocker graph
+at a past time is not recorded. The path is the current set of transitive blockers of the gate
+tickets, so `path_closed` counts today's path issues that were completed on that day. Linear and
+GitHub are each read once per run; an incomplete read makes the metrics that depend on it
+unavailable for every day.
+
+A day that already has a backfill record is skipped and reported. A range containing the
+`taken_at` of any `snapshot` record is refused, naming that record, and nothing is appended. The
+store rules are those of the snapshot. Linear and GitHub only are read; Herdr, the relay and the
+local sources are not started.

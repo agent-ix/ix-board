@@ -10,14 +10,16 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use ix_board::agents::{AgentRow, AgentsReport, GitAges, Verdict};
+use ix_board::retro::catalog::{Metric, RecordKind, definition};
+use ix_board::retro::delta::{ChangeState, DeltaReport};
 use ix_board::retro::sources::{
     AgentSource, CheckState, GateLine, GateLogSource, GithubSource, LabeledIssue, LinearSource,
     LocalSource, MainCommit, Page, ProcessRow, PullRequest, PullRequestInfo, RelaySource, Sources,
     StateChange, read_all_pages,
 };
 use ix_board::retro::{
-    CATALOG, Record, RetroConfig, Status, Store, StoreError, parse_window, run_snapshot,
-    unavailable_notice,
+    CATALOG, Record, RetroConfig, RetroError, Status, Store, StoreError, parse_window,
+    run_backfill, run_delta, run_snapshot, unavailable_notice,
 };
 use ix_board::{
     Issue, IssueId, Project, ProjectId, TeamKey, WorkflowStateType as S, WorkspaceSnapshot,
@@ -1964,4 +1966,688 @@ fn window_text_parses_to_seconds() {
     for bad in ["", "h", "0h", "3w", "-1h", "1.5h", "24"] {
         assert!(parse_window(bad).is_err(), "{bad}");
     }
+}
+
+// ---- retro delta and backfill (FR-027, FR-028) -------------------------------------------
+
+const QUERY: &str = "rule; window=1d";
+
+/// A stored metric: `Some` is `ok` with that value, `None` is unavailable.
+fn stored(id: &str, value: Option<f64>, query: &str) -> Metric {
+    let entry = definition(id).unwrap();
+    Metric {
+        id: id.to_owned(),
+        status: if value.is_some() {
+            Status::Ok
+        } else {
+            Status::Unavailable
+        },
+        value,
+        unit: entry.unit.to_owned(),
+        direction: entry.direction,
+        source: "fixture".to_owned(),
+        query: query.to_owned(),
+        reason: value.is_none().then(|| "fixture".to_owned()),
+    }
+}
+
+fn record(kind: RecordKind, taken_at: &str, metrics: &[(&str, Option<f64>, &str)]) -> Record {
+    Record {
+        schema_version: 1,
+        kind,
+        taken_at: taken_at.to_owned(),
+        team: "SWM".to_owned(),
+        window: "1d".to_owned(),
+        metrics: metrics
+            .iter()
+            .map(|(id, value, query)| ((*id).to_owned(), stored(id, *value, query)))
+            .collect(),
+    }
+}
+
+fn snap(taken_at: &str, metrics: &[(&str, Option<f64>, &str)]) -> Record {
+    record(RecordKind::Snapshot, taken_at, metrics)
+}
+
+fn store_with(records: &[Record]) -> (TempDir, Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_in(&dir);
+    for record in records {
+        store.append(record).unwrap();
+    }
+    (dir, store)
+}
+
+fn delta(records: &[Record], extra: &str) -> Result<DeltaReport, RetroError> {
+    let (_dir, store) = store_with(records);
+    run_delta(&config_with(extra), &store)
+}
+
+fn one(report: &DeltaReport, id: &str) -> ix_board::retro::delta::MetricDelta {
+    report.metrics.iter().find(|m| m.id == id).unwrap().clone()
+}
+
+/// Three snapshots of `prs_idle` (down), `path_closed` (up) and `prs_open` (neutral).
+fn trio(idle: [f64; 3]) -> Vec<Record> {
+    let times = [
+        "2026-11-05T12:00:00Z",
+        "2026-11-06T12:00:00Z",
+        "2026-11-07T12:00:00Z",
+    ];
+    (0..3)
+        .map(|i| {
+            snap(
+                times[i],
+                &[
+                    ("prs_idle", Some(idle[i]), QUERY),
+                    ("path_closed", Some([2.0, 5.0, 9.0][i]), QUERY),
+                    ("prs_open", Some(idle[i]), QUERY),
+                ],
+            )
+        })
+        .collect()
+}
+
+/// Trace: FR-027-AC-1
+#[test]
+fn delta_reports_value_change_since_previous_and_since_the_earliest_record() {
+    // A backfill record earlier than every snapshot is the default baseline; a stored order
+    // that differs from time order must not matter.
+    let early = record(
+        RecordKind::Backfill,
+        "2026-11-04T23:59:59Z",
+        &[("path_closed", Some(1.0), QUERY)],
+    );
+    let mut records = trio([1.0, 1.0, 1.0]);
+    records.reverse();
+    records.push(early);
+    let report = delta(&records, "{}").unwrap();
+    assert_eq!(report.latest.as_deref(), Some("2026-11-07T12:00:00Z"));
+    assert_eq!(report.previous.as_deref(), Some("2026-11-06T12:00:00Z"));
+    assert_eq!(report.baseline.as_deref(), Some("2026-11-04T23:59:59Z"));
+    let closed = one(&report, "path_closed");
+    assert_eq!(closed.value, Some(9.0));
+    assert_eq!(closed.since_previous.change, Some(4.0));
+    assert_eq!(closed.since_baseline.change, Some(8.0));
+    // Without the early record the earliest snapshot is the baseline.
+    let report = delta(&trio([1.0, 1.0, 1.0]), "{}").unwrap();
+    assert_eq!(one(&report, "path_closed").since_baseline.change, Some(7.0));
+}
+
+/// Trace: FR-027-AC-2
+#[test]
+fn a_metric_moving_against_its_direction_twice_in_a_row_is_regressing() {
+    let report = delta(&trio([1.0, 2.0, 3.0]), "{}").unwrap();
+    assert!(one(&report, "prs_idle").regressing);
+    let report = delta(&trio([1.0, 3.0, 2.0]), "{}").unwrap();
+    assert!(!one(&report, "prs_idle").regressing);
+    let report = delta(&trio([3.0, 3.0, 4.0]), "{}").unwrap();
+    assert!(
+        !one(&report, "prs_idle").regressing,
+        "a flat step is not a move"
+    );
+    // An `up` metric regresses when it falls twice.
+    let falling: Vec<Record> = [5.0, 4.0, 3.0]
+        .iter()
+        .zip([
+            "2026-11-05T12:00:00Z",
+            "2026-11-06T12:00:00Z",
+            "2026-11-07T12:00:00Z",
+        ])
+        .map(|(v, t)| snap(t, &[("path_closed", Some(*v), QUERY)]))
+        .collect();
+    assert!(one(&delta(&falling, "{}").unwrap(), "path_closed").regressing);
+    // Two snapshots hold one comparison only.
+    let two = trio([1.0, 2.0, 3.0])[1..].to_vec();
+    assert!(!one(&delta(&two, "{}").unwrap(), "prs_idle").regressing);
+}
+
+/// Trace: FR-027-AC-3
+#[test]
+fn unavailable_and_query_changed_metrics_report_no_numeric_change() {
+    let records = vec![
+        snap(
+            "2026-11-05T12:00:00Z",
+            &[
+                ("prs_idle", Some(1.0), "old rule"),
+                ("path_closed", None, QUERY),
+                ("prs_open", Some(1.0), QUERY),
+            ],
+        ),
+        snap(
+            "2026-11-06T12:00:00Z",
+            &[
+                ("prs_idle", Some(2.0), "new rule"),
+                ("path_closed", Some(3.0), QUERY),
+                ("prs_open", None, QUERY),
+            ],
+        ),
+        snap(
+            "2026-11-07T12:00:00Z",
+            &[
+                ("prs_idle", Some(5.0), "new rule"),
+                ("path_closed", Some(6.0), QUERY),
+                ("prs_open", Some(4.0), QUERY),
+            ],
+        ),
+    ];
+    let report = delta(&records, "{}").unwrap();
+    let idle = one(&report, "prs_idle");
+    assert_eq!(idle.since_previous.state, ChangeState::Changed);
+    assert_eq!(idle.since_previous.change, Some(3.0));
+    assert_eq!(idle.since_baseline.state, ChangeState::QueryChanged);
+    assert_eq!(idle.since_baseline.change, None);
+    let queries = idle.since_baseline.queries.unwrap();
+    assert_eq!(
+        (queries.latest.as_str(), queries.reference.as_str()),
+        ("new rule", "old rule")
+    );
+    assert!(
+        !idle.regressing,
+        "an incomparable earlier step cannot regress"
+    );
+    // Unavailable on the baseline side.
+    let closed = one(&report, "path_closed");
+    assert_eq!(closed.since_baseline.state, ChangeState::Unavailable);
+    assert_eq!(closed.since_baseline.change, None);
+    // Unavailable on the previous side.
+    let open = one(&report, "prs_open");
+    assert_eq!(open.since_previous.state, ChangeState::Unavailable);
+    assert_eq!(open.since_previous.change, None);
+    // Unavailable on the latest side.
+    let mut latest_down = records.clone();
+    latest_down[2]
+        .metrics
+        .insert("path_closed".to_owned(), stored("path_closed", None, QUERY));
+    let closed = one(&delta(&latest_down, "{}").unwrap(), "path_closed");
+    assert_eq!(closed.status, Status::Unavailable);
+    assert_eq!(closed.since_previous.state, ChangeState::Unavailable);
+}
+
+/// Trace: FR-027-AC-4
+#[test]
+fn a_neutral_metric_shows_changes_and_is_never_regressing() {
+    for series in [[1.0, 2.0, 3.0], [3.0, 2.0, 1.0]] {
+        let open = one(&delta(&trio(series), "{}").unwrap(), "prs_open");
+        assert_eq!(open.direction, ix_board::retro::Direction::Neutral);
+        assert!(open.since_previous.change.is_some());
+        assert!(!open.regressing);
+    }
+}
+
+/// Trace: FR-027-AC-5
+#[test]
+fn one_snapshot_reports_no_delta_and_exits_zero_without_a_score() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_in(&dir);
+    store
+        .append(&snap(
+            "2026-11-07T12:00:00Z",
+            &[("prs_idle", Some(1.0), QUERY)],
+        ))
+        .unwrap();
+    let config = dir.path().join("config.json");
+    std::fs::write(&config, CONFIG).unwrap();
+    for json in [false, true] {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_ix-board"));
+        command.args(["retro", "delta", "--config"]).arg(&config);
+        if json {
+            command.arg("--json");
+        }
+        let output = command.env("TEAM_RETRO_HOME", dir.path()).output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains("no delta"), "{text}");
+        assert!(!text.to_lowercase().contains("score"), "{text}");
+    }
+    // A full delta carries no combined score either.
+    let report = delta(&trio([1.0, 2.0, 3.0]), "{}").unwrap();
+    let encoded = serde_json::to_string(&report).unwrap().to_lowercase();
+    assert!(!encoded.contains("score") && !encoded.contains("health"));
+    assert!(delta(&[], "{}").unwrap().message.is_some());
+}
+
+/// Trace: FR-027-AC-6
+#[test]
+fn delta_succeeds_from_the_store_alone_with_no_source_reachable() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_in(&dir);
+    for record in trio([1.0, 2.0, 3.0]) {
+        store.append(&record).unwrap();
+    }
+    let config = dir.path().join("config.json");
+    std::fs::write(&config, CONFIG).unwrap();
+    // No credentials, no PATH (so no gh, herdr, redis-cli) and no network-capable home.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ix-board"))
+        .args(["retro", "delta", "--json", "--config"])
+        .arg(&config)
+        .env_clear()
+        .env("TEAM_RETRO_HOME", dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["latest"], "2026-11-07T12:00:00Z");
+    let idle = report["metrics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "prs_idle")
+        .unwrap();
+    assert_eq!(idle["regressing"], true);
+}
+
+fn day(date: &str) -> f64 {
+    ix_board::retro::parse_day(date).unwrap()
+}
+
+fn backfill_range(
+    rig: &Rig,
+    store: &Store,
+    (since, until): (&str, &str),
+    window: u64,
+) -> Result<ix_board::retro::BackfillReport, RetroError> {
+    run_backfill(
+        &config(),
+        window,
+        (day(since), day(until)),
+        NOW,
+        (rig, rig),
+        store,
+    )
+}
+
+/// Trace: FR-027-AC-7
+#[test]
+fn a_backfill_after_a_snapshot_keeps_the_snapshot_latest_and_can_be_the_baseline() {
+    let (_dir, store) = store_with(&[
+        snap("2026-11-06T12:00:00Z", &[("path_closed", Some(1.0), QUERY)]),
+        snap("2026-11-07T12:00:00Z", &[("path_closed", Some(4.0), QUERY)]),
+    ]);
+    let rig = base_rig();
+    // Backfill days that fall before, and none of them inside, the snapshots.
+    let done = backfill_range(&rig, &store, ("2026-11-01", "2026-11-03"), DAY).unwrap();
+    assert_eq!(done.appended.len(), 3);
+    let report = run_delta(&config(), &store).unwrap();
+    assert_eq!(report.latest.as_deref(), Some("2026-11-07T12:00:00Z"));
+    assert_eq!(report.previous.as_deref(), Some("2026-11-06T12:00:00Z"));
+    assert_eq!(report.baseline.as_deref(), Some("2026-11-01T23:59:59Z"));
+    assert_eq!(report.baseline_kind, Some(RecordKind::Backfill));
+    // A backfill record named in the configuration is the baseline too.
+    let named = run_delta(
+        &config_with(r#"{"baseline_taken_at": "2026-11-03T23:59:59Z"}"#),
+        &store,
+    )
+    .unwrap();
+    assert_eq!(named.baseline.as_deref(), Some("2026-11-03T23:59:59Z"));
+    assert_eq!(named.baseline_kind, Some(RecordKind::Backfill));
+}
+
+/// Trace: FR-027-AC-8
+#[test]
+fn a_baseline_matching_no_record_stops_with_an_error_naming_it() {
+    let error = delta(
+        &trio([1.0, 2.0, 3.0]),
+        r#"{"baseline_taken_at": "2026-11-05T12:00:01Z"}"#,
+    )
+    .unwrap_err();
+    assert!(matches!(error, RetroError::BaselineNotFound(_)));
+    assert!(
+        error.to_string().contains("2026-11-05T12:00:01Z"),
+        "{error}"
+    );
+    // The exact time matches.
+    let report = delta(
+        &trio([1.0, 2.0, 3.0]),
+        r#"{"baseline_taken_at": "2026-11-05T12:00:00Z"}"#,
+    )
+    .unwrap();
+    assert_eq!(report.baseline.as_deref(), Some("2026-11-05T12:00:00Z"));
+}
+
+/// Trace: FR-028-AC-1
+#[test]
+fn a_three_day_range_appends_three_records_at_the_end_of_each_utc_day() {
+    let (_dir, store) = store_with(&[]);
+    let report = backfill_range(&base_rig(), &store, ("2026-11-02", "2026-11-04"), DAY).unwrap();
+    let stored = store.read_all().unwrap();
+    assert_eq!(report.appended.len(), 3);
+    assert_eq!(
+        stored
+            .iter()
+            .map(|r| r.taken_at.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "2026-11-02T23:59:59Z",
+            "2026-11-03T23:59:59Z",
+            "2026-11-04T23:59:59Z"
+        ]
+    );
+    assert!(
+        stored
+            .iter()
+            .all(|r| r.kind == RecordKind::Backfill && r.window == "1d")
+    );
+    // The default window is the snapshot default; a different window is recorded.
+    let other =
+        backfill_range(&base_rig(), &store, ("2026-11-05", "2026-11-05"), 6 * 3600).unwrap();
+    assert_eq!(other.appended[0].window, "6h");
+    // A range ending today is refused, since the day has not ended.
+    assert!(matches!(
+        backfill_range(&base_rig(), &store, ("2026-11-06", "2026-11-07"), DAY),
+        Err(RetroError::FutureDay(_))
+    ));
+    assert!(matches!(
+        backfill_range(&base_rig(), &store, ("2026-11-06", "2026-11-05"), DAY),
+        Err(RetroError::EmptyRange)
+    ));
+}
+
+/// Trace: FR-028-AC-2
+#[test]
+fn running_the_same_range_twice_appends_nothing_and_reports_each_skipped_day() {
+    let (_dir, store) = store_with(&[]);
+    let rig = base_rig();
+    backfill_range(&rig, &store, ("2026-11-02", "2026-11-04"), DAY).unwrap();
+    let before = lines(store.path());
+    let again = Rig {
+        // Sources that fail loudly if the second run reads them.
+        workspace: Some(Err("must not be read".to_owned())),
+        prs: Some(Err("must not be read".to_owned())),
+        ..Rig::default()
+    };
+    let second = backfill_range(&again, &store, ("2026-11-02", "2026-11-04"), DAY).unwrap();
+    assert!(second.appended.is_empty());
+    assert_eq!(
+        second.skipped,
+        [
+            "2026-11-02T23:59:59Z",
+            "2026-11-03T23:59:59Z",
+            "2026-11-04T23:59:59Z"
+        ]
+    );
+    assert_eq!(lines(store.path()), before);
+    assert!(again.calls.borrow().is_empty());
+    // A partly new range fills only the missing days.
+    let wider = backfill_range(&rig, &store, ("2026-11-03", "2026-11-05"), DAY).unwrap();
+    assert_eq!(wider.skipped.len(), 2);
+    assert_eq!(wider.appended.len(), 1);
+    assert_eq!(wider.appended[0].taken_at, "2026-11-05T23:59:59Z");
+}
+
+/// Trace: FR-028-AC-3
+#[test]
+fn live_state_metrics_are_not_reconstructible_in_every_backfill_record() {
+    let (_dir, store) = store_with(&[]);
+    let report = backfill_range(&base_rig(), &store, ("2026-11-02", "2026-11-04"), DAY).unwrap();
+    const KEPT: [&str; 7] = [
+        "prs_merged_per_hour",
+        "pr_cycle_median_hours",
+        "pr_cycle_p90_hours",
+        "path_closed",
+        "intake_new",
+        "net_closed_minus_new",
+        "done_reopened",
+    ];
+    for record in &report.appended {
+        assert_eq!(record.metrics.len(), CATALOG.len());
+        for entry in CATALOG.iter().filter(|e| !KEPT.contains(&e.id)) {
+            assert_eq!(
+                reason(record, entry.id),
+                "not reconstructible",
+                "{} on {}",
+                entry.id,
+                record.taken_at
+            );
+        }
+    }
+    for id in [
+        "path_remaining",
+        "agents_working_share",
+        "in_progress_stale",
+        "prs_open",
+    ] {
+        assert_eq!(reason(&report.appended[0], id), "not reconstructible");
+    }
+}
+
+/// Trace: FR-028-AC-4
+#[test]
+fn a_range_containing_a_snapshot_is_refused_naming_it_and_appends_nothing() {
+    let snapshot_at = "2026-11-03T12:00:00Z";
+    let (_dir, store) = store_with(&[snap(snapshot_at, &[("path_closed", Some(1.0), QUERY)])]);
+    let before = lines(store.path());
+    let rig = base_rig();
+    let error = backfill_range(&rig, &store, ("2026-11-02", "2026-11-04"), DAY).unwrap_err();
+    assert!(matches!(error, RetroError::SnapshotInRange(_)));
+    assert!(error.to_string().contains(snapshot_at), "{error}");
+    assert_eq!(lines(store.path()), before);
+    assert!(
+        rig.calls.borrow().is_empty(),
+        "no source read for a refused range"
+    );
+    // The days either side of the snapshot's day are fine.
+    assert!(backfill_range(&rig, &store, ("2026-11-02", "2026-11-02"), DAY).is_ok());
+    assert!(backfill_range(&rig, &store, ("2026-11-04", "2026-11-04"), DAY).is_ok());
+    // A snapshot exactly at the next midnight lies outside the last day.
+    let (_dir2, edge) = store_with(&[snap("2026-11-03T00:00:00Z", &[])]);
+    assert!(backfill_range(&rig, &edge, ("2026-11-02", "2026-11-02"), DAY).is_ok());
+}
+
+fn at(date: &str, hours_after_midnight: f64) -> f64 {
+    day(date) + hours_after_midnight * HOUR
+}
+
+fn merged_at(number: u64, merged: f64, cycle_hours: f64) -> PullRequest {
+    PullRequest {
+        merged_at: Some(merged),
+        created_at: merged - cycle_hours * HOUR,
+        updated_at: merged,
+        ..pr(number, false)
+    }
+}
+
+/// Issue created and last updated at absolute times.
+fn issue_at(id: &str, state: S, project: Option<&str>, created: f64, updated: f64) -> Issue {
+    let mut issue = issue(id, state, project, 0.0, 0.0);
+    issue.created_at = Some(iso(created));
+    issue.updated_at = Some(iso(updated));
+    issue
+}
+
+fn change_at(at: f64, from: S, to: S) -> StateChange {
+    StateChange {
+        at,
+        from: Some(from),
+        to: Some(to),
+    }
+}
+
+/// Trace: FR-028-AC-5
+#[test]
+fn pull_request_metrics_equal_the_known_values_of_the_trailing_window() {
+    let end = at("2026-11-03", 24.0) - 1.0;
+    let mut rig = base_rig();
+    rig.prs = Some(Ok(vec![
+        merged_at(1, end - 1.0 * HOUR, 1.0),
+        merged_at(2, end - 5.0 * HOUR, 3.0),
+        merged_at(3, end - 10.0 * HOUR, 5.0),
+        // First second of the day is inside; the last second of the day before is not.
+        merged_at(4, at("2026-11-03", 0.0), 10.0),
+        merged_at(5, at("2026-11-03", 0.0) - 2.0, 1000.0),
+        // The first second of the next day belongs to the next window.
+        merged_at(6, end + 1.0, 1000.0),
+        pr(7, true),
+    ]));
+    let (_dir, store) = store_with(&[]);
+    let report = backfill_range(&rig, &store, ("2026-11-03", "2026-11-03"), DAY).unwrap();
+    let record = &report.appended[0];
+    assert_eq!(value(record, "prs_merged_per_hour"), Some(4.0 / 24.0));
+    assert_eq!(value(record, "pr_cycle_median_hours"), Some(3.0));
+    assert_eq!(value(record, "pr_cycle_p90_hours"), Some(10.0));
+    // Pull requests are read once for the whole range, never open-ended.
+    assert_eq!(rig.count("pull_requests:agent-ix/x"), 1);
+}
+
+/// Trace: FR-028-AC-5
+#[test]
+fn issue_metrics_are_reconstructed_from_creation_and_state_history() {
+    let d = "2026-11-03";
+    let mut rig = base_rig();
+    let later = at("2026-11-06", 0.0);
+    rig.workspace = Some(Ok(WorkspaceSnapshot {
+        projects: vec![project("p1", "Alpha")],
+        issues: vec![
+            blocked_by(
+                issue_at(
+                    "SWM-1",
+                    S::Started,
+                    Some("p1"),
+                    at("2026-10-01", 0.0),
+                    later,
+                ),
+                &["SWM-2"],
+            ),
+            // path issue completed inside the day
+            issue_at(
+                "SWM-2",
+                S::Completed,
+                Some("p1"),
+                at("2026-10-01", 0.0),
+                later,
+            ),
+            // created inside the day, still open
+            issue_at("SWM-3", S::Started, Some("p1"), at(d, 3.0), later),
+            // completed inside the day, not on the path
+            issue_at(
+                "SWM-7",
+                S::Completed,
+                Some("p1"),
+                at("2026-10-02", 0.0),
+                later,
+            ),
+            // completed on the next day: outside
+            issue_at(
+                "SWM-4",
+                S::Completed,
+                Some("p1"),
+                at("2026-10-02", 0.0),
+                later,
+            ),
+            // created the day before: outside intake
+            issue_at(
+                "SWM-6",
+                S::Unstarted,
+                Some("p1"),
+                at("2026-11-02", 23.0),
+                later,
+            ),
+            // reopened inside the day
+            issue_at(
+                "SWM-5",
+                S::Started,
+                Some("p1"),
+                at("2026-10-02", 0.0),
+                later,
+            ),
+        ],
+        fetched_at: 0,
+    }));
+    rig.histories = BTreeMap::from([
+        (
+            "id-SWM-2",
+            vec![change_at(at(d, 5.0), S::Started, S::Completed)],
+        ),
+        (
+            "id-SWM-7",
+            vec![change_at(at(d, 9.0), S::Started, S::Completed)],
+        ),
+        (
+            "id-SWM-4",
+            vec![change_at(at("2026-11-04", 0.0), S::Started, S::Completed)],
+        ),
+        (
+            "id-SWM-5",
+            vec![change_at(at(d, 12.0), S::Completed, S::Started)],
+        ),
+    ])
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), Ok(v)))
+    .collect();
+    let (_dir, store) = store_with(&[]);
+    let report = backfill_range(&rig, &store, (d, d), DAY).unwrap();
+    let record = &report.appended[0];
+    assert_eq!(value(record, "path_closed"), Some(1.0));
+    assert_eq!(value(record, "intake_new"), Some(1.0));
+    assert_eq!(value(record, "net_closed_minus_new"), Some(1.0));
+    assert_eq!(value(record, "done_reopened"), Some(1.0));
+    // An unreadable history makes the dependent metrics unavailable, never smaller.
+    rig.histories
+        .insert("id-SWM-7".to_owned(), Err("page 3 failed".to_owned()));
+    let (_dir2, store2) = store_with(&[]);
+    let record = &backfill_range(&rig, &store2, (d, d), DAY).unwrap().appended[0];
+    assert!(reason(record, "net_closed_minus_new").contains("SWM-7"));
+    assert!(reason(record, "done_reopened").contains("SWM-7"));
+    assert_eq!(value(record, "path_closed"), Some(1.0));
+    // An incomplete pull-request read makes the flow metrics unavailable.
+    rig.prs = Some(Err("stopped before the last page (page 2)".to_owned()));
+    let (_dir3, store3) = store_with(&[]);
+    let record = &backfill_range(&rig, &store3, (d, d), DAY).unwrap().appended[0];
+    assert!(reason(record, "prs_merged_per_hour").contains("last page"));
+}
+
+/// Trace: FR-028-AC-6
+#[test]
+fn a_day_without_merged_pull_requests_has_a_zero_rate_and_empty_cycle_metrics() {
+    let mut rig = base_rig();
+    // Merges exist, but only on the neighbouring days.
+    rig.prs = Some(Ok(vec![
+        merged_at(1, at("2026-11-02", 23.0), 2.0),
+        merged_at(2, at("2026-11-04", 1.0), 2.0),
+        pr(3, true),
+    ]));
+    let (_dir, store) = store_with(&[]);
+    let report = backfill_range(&rig, &store, ("2026-11-03", "2026-11-03"), DAY).unwrap();
+    let record = &report.appended[0];
+    assert_eq!(value(record, "prs_merged_per_hour"), Some(0.0));
+    assert_eq!(reason(record, "pr_cycle_median_hours"), "empty population");
+    assert_eq!(reason(record, "pr_cycle_p90_hours"), "empty population");
+}
+
+/// Trace: FR-028-AC-7
+#[test]
+fn backfill_queries_carry_the_window_and_differ_from_a_snapshot_of_another_window() {
+    let (_dir, store) = store_with(&[]);
+    let rig = base_rig();
+    let backfilled = backfill_range(&rig, &store, ("2026-11-03", "2026-11-03"), 6 * 3600).unwrap();
+    for id in [
+        "prs_merged_per_hour",
+        "path_closed",
+        "intake_new",
+        "done_reopened",
+    ] {
+        assert!(
+            backfilled.appended[0].metrics[id]
+                .query
+                .contains("window=6h"),
+            "{id}"
+        );
+    }
+    for (index, now) in [NOW, NOW + HOUR].into_iter().enumerate() {
+        let record = run_snapshot(&config(), DAY, now, &rig.sources(), &store).unwrap();
+        assert!(
+            record.metrics["prs_merged_per_hour"]
+                .query
+                .contains("window=1d"),
+            "{index}"
+        );
+    }
+    let report = run_delta(&config(), &store).unwrap();
+    assert_eq!(report.baseline_kind, Some(RecordKind::Backfill));
+    let rate = one(&report, "prs_merged_per_hour");
+    assert_eq!(rate.since_baseline.state, ChangeState::QueryChanged);
+    assert_eq!(rate.since_baseline.change, None);
+    let queries = rate.since_baseline.queries.unwrap();
+    assert!(queries.reference.contains("window=6h") && queries.latest.contains("window=1d"));
+    assert_eq!(rate.since_previous.state, ChangeState::Changed);
 }
