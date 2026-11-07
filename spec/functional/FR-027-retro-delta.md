@@ -19,8 +19,10 @@ greatest `taken_at`. The baseline SHALL be the record named by
 when that field is absent. Backfilled records serve only as baseline and
 history. The command SHALL read no Linear or GitHub source.
 
-When `baseline_taken_at` matches no record, the command SHALL stop with an error
-naming the value. When fewer than two snapshot records exist, the command SHALL
+`baseline_taken_at` SHALL name the record whose `taken_at` is the same instant,
+fractional seconds included. When it matches no record, the command SHALL stop with
+an error naming the value, before it checks the number of snapshot records. When
+fewer than two snapshot records exist, the command SHALL
 report that no delta exists and exit zero.
 
 For a metric with direction `up` or `down`, the command SHALL set `regressing`

@@ -55,3 +55,14 @@ Author choices, judged:
 | FND-002 | low | FR-027-AC-6 asks for source readers that fail the test if invoked. The test runs the binary with `env_clear()`, which only makes reads fail quietly. A `retro delta` that spawns `gh` and ignores the error passes it. The library signature prevents reads today, so behavior is safe; the oracle is weaker than the AC. | tests/retro.rs:2212-2238, src/main.rs:739-743 |
 | FND-003 | low | The FR-028 statement does not define "end of that day" (23:59:59Z and the window (taken_at-window, taken_at]), the `--until` default (last complete UTC day), the refusal of a day that has not ended, the half-open snapshot range, or that path and project membership are today's. The code and docs decide all of these. | spec/functional/FR-028-retro-backfill.md:14-30, docs/retro.md:95-115 |
 | FND-004 | low | The FR-027 statement does not say that baseline_taken_at matches to the second, that the baseline error comes before the no-delta message, or that regressing uses snapshot records only and so needs three snapshots. The code and docs decide all of these. | spec/functional/FR-027-retro-delta.md:14-35, docs/retro.md:77-93 |
+
+## Dispositions
+
+Disposition pass 1, at head f6ac51d. Re-checked by mutation in a scratch copy, one `cargo test --test retro` per mutant.
+
+| FND | Outcome | sha/reason |
+| --- | --- | --- |
+| FND-001 | fixed | f6ac51d: `each_day_of_a_range_is_measured_over_its_own_trailing_window` checks per-day values over three days (merge rate, both cycle metrics, intake, path_closed, net). Measuring every day at the last day's frame now fails it. |
+| FND-002 | fixed | f6ac51d: the FR-027-AC-6 test now puts tripwire `gh`, `herdr`, `redis-cli`, `git`, `curl`, `linear`, `ps` and `du` on PATH, sets fake credentials, and points the proxy variables at a listener that records any connection. A delta that spawns `gh` or `curl`, or reads the live Linear workspace, now fails it. A raw `TcpStream` that bypasses the proxy still passes, but no reader in the crate opens raw sockets. |
+| FND-003 | fixed | f6ac51d: FR-028 now states taken_at 23:59:59Z, the half-open window ending at the next UTC midnight, the `--until` default and the refusal of an unended day, current path and project membership, and the snapshot range from 00:00:00 of the first day up to, but excluding, 00:00:00 after the last. All of this matches backfill.rs:48-60 and metrics.rs:44-50. |
+| FND-004 | still-open | f6ac51d added the regressing sentence (snapshot records only, three snapshots). FR-027 still does not state the two other rules: baseline_taken_at matches the record with the same instant (the code compares exact instants, fractions included, since this round), and that error comes before the no-delta message. Both are in docs/retro.md:83 only. One sentence in the FR-027 statement closes it. |

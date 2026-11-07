@@ -72,3 +72,20 @@ Author choices not yet in the spec are judged in SR-6034 FND-003 and FND-004.
 | FND-002 | low | docs/retro.md says Linear is read once per run, but no test checks it. Clearing the history cache per day, or re-reading the workspace for each day, passes the suite: every value test covers a single day, and only the GitHub read is counted. | src/retro/metrics.rs:1278-1295, tests/retro.rs:2468-2490, docs/retro.md:108 |
 | FND-003 | low | `epoch` narrows an f64 parsed from a persisted `taken_at` with a bare `as u64`. That truncates fractional seconds, so `...:00.9Z` matches a baseline of `...:00Z`, and it saturates pre-1970 times to 0. Rust style asks for a checked conversion at persistence boundaries. | src/retro/delta.rs:172-176 |
 | FND-004 | low | When `--until` is omitted and `--since` is today, the default `--until` (yesterday) falls before `--since` and the error says "--until is before --since", naming a flag the user did not pass. The real cause is that today has not ended. | src/main.rs:759, src/retro/mod.rs:47-48 |
+
+## New findings (disposition pass 1)
+
+| ID | Severity | Summary | Refs |
+| --- | --- | --- | --- |
+| FND-005 | low | The new `end_exclusive` flag picks the window semantics, but no snapshot test pins the snapshot side: switching `run_snapshot` to `end_exclusive: true` (half-open `[now - window, now)`) passes the whole suite. Reading the code confirms snapshots pass `false` and keep `(now - window, now]`, so behavior is unchanged; only the oracle is missing. | src/retro/mod.rs:69-73, src/retro/metrics.rs:44-50 |
+
+## Dispositions
+
+Disposition pass 1, at head f6ac51d. Re-checked by mutation in a scratch copy, one `cargo test --test retro` per mutant; the PR checkout passes 68 of 68.
+
+| FND | Outcome | sha/reason |
+| --- | --- | --- |
+| FND-001 | fixed | f6ac51d: a backfill frame now ends at the next UTC midnight with `end_exclusive: true`, so a day is `[midnight - window, midnight)`. The new PR fixture holds merges at end+0.5 s (inside) and at the day's start minus 0.5 s (outside). Making the start exclusive or the end inclusive each fails `pull_request_metrics_equal_the_known_values_of_the_trailing_window`. |
+| FND-002 | fixed | f6ac51d: `linear_and_github_are_read_once_per_backfill_run_however_many_days` counts one workspace read and one PR read over four days, with no issue history read twice. Clearing the history cache per day, re-reading the workspace per day, or re-reading PRs per day each fail it. |
+| FND-003 | fixed | f6ac51d: `epoch` now returns `Option<f64>` with no cast, and baselines match as exact instants. Flooring to the second fails `a_baseline_matching_no_record_stops_with_an_error_naming_it` (new `.900Z` case). |
+| FND-004 | fixed | f6ac51d: `--until` is now optional in `run_backfill`, and both ends of the range are checked against `now` first, so `--since` today with no `--until` reports FutureDay naming the next midnight. Checking only the last day, or defaulting `--until` to today, fails `a_three_day_range_appends_three_records_at_the_end_of_each_utc_day`. |

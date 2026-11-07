@@ -2812,3 +2812,22 @@ fn linear_and_github_are_read_once_per_backfill_run_however_many_days() {
     assert_eq!(rig.since.borrow().len(), 1);
     assert_eq!(rig.since.borrow()[0], day("2026-11-01"));
 }
+
+/// Trace: FR-024-AC-4
+#[test]
+fn the_snapshot_window_excludes_its_start_and_includes_the_snapshot_instant() {
+    let mut rig = base_rig();
+    let start = NOW - DAY as f64;
+    // Cycles differ so a window that moved by one boundary changes the median and p90.
+    rig.prs = Some(Ok(vec![
+        merged_at(1, NOW, 1.0),
+        merged_at(2, start + 0.5, 3.0),
+        merged_at(3, start, 100.0),
+        merged_at(4, start - 0.5, 100.0),
+        merged_at(5, NOW + 0.5, 100.0),
+    ]));
+    let record = snapshot(&rig);
+    assert_eq!(value(&record, "prs_merged_per_hour"), Some(2.0 / 24.0));
+    assert_eq!(value(&record, "pr_cycle_median_hours"), Some(1.0));
+    assert_eq!(value(&record, "pr_cycle_p90_hours"), Some(3.0));
+}
