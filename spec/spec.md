@@ -80,13 +80,22 @@ with the last successful report for that focus.
   request attachments with paginated GitHub pull-request and branch records;
   incomplete attachment data suppresses conclusions that require a complete
   attachment inventory (FR-021).
+- `retro snapshot`, `retro delta` and `retro backfill` measure a team's flow,
+  rework, scope growth and progress toward configured gate tickets, keep the
+  records in a schema-versioned append-only store outside every git work tree,
+  and compare them with the previous snapshot and a baseline. Unreadable
+  metrics are reported unavailable, never zero (FR-024 through FR-028).
 
 ### Out of Scope
 
 - Webhook-based cache refresh; SWM-2 uses polling.
 - LLM-based interpretation or actions based on ticket or comment prose.
 - Mutating Linear fields other than project status and priority, or mutating
-  GitHub data.
+  GitHub data. The retro store (FR-025) is local state outside every repository,
+  not Linear or GitHub data.
+- Combining retro metrics into a single health score, and scoring subjective
+  qualities such as brief clarity or role discipline; the retro commands report
+  structured measures only.
 - Reading or writing GitHub Issues as part of planner focus resolution.
 - Reading or writing GitHub Issues as part of focus hygiene; GitHub is queried
   only for pull requests linked by structured Linear attachments.
@@ -143,6 +152,11 @@ roadmap, and finding unprojected issues. US-001 also traces to FR-021, which
 reconciles a selected project's Linear issues and attachments with GitHub
 pull-request and branch evidence.
 FR-023 specifies the read-only orphan report over a declared program scope.
+US-009 traces to FR-024 through FR-028: FR-024 defines the metric catalog and
+snapshot, FR-025 the append-only store outside git, FR-026 the
+unavailable-not-zero rule with per-metric query provenance, FR-027 the delta
+against the previous snapshot and baseline, and FR-028 the baseline backfill.
+They reuse the readers behind FR-018, FR-021, FR-022 and FR-023.
 Functional acceptance criteria include fixture checks for each drift signal,
 queue rules, and cache behavior; NFR-001 specifies a lightweight warm-cache
 fixture benchmark.
@@ -152,4 +166,5 @@ fixture benchmark.
 - SWM-2, “ix-board: next, project-chunk and search with cache” (Linear).
 - SWM-4, “ix-board drift: out-of-scope and churn alerts” (Linear).
 - SWM-64, “Detect priority goal crowding and rebalance planner capacity” (Linear).
+- SWM-141, “Specify team-retro metric catalog, snapshot store and ix-board retro CLI contract” (Linear).
 - The ix-board README and source repository.
