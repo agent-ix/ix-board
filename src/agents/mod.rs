@@ -303,6 +303,22 @@ struct HostResult {
     errors: Vec<String>,
 }
 
+/// The local machine plus every enabled saved herdr machine.
+pub fn system_hosts() -> Result<Vec<Box<dyn Host>>, AgentsError> {
+    let local = SystemHost::local();
+    let machines = parse_machines(&local.herdr(&["machine", "list", "--json"])?)?;
+    let mut hosts: Vec<Box<dyn Host>> = vec![Box::new(local)];
+    hosts.extend(
+        machines
+            .into_iter()
+            .filter(|machine| machine.enabled)
+            .map(|machine| {
+                Box::new(SystemHost::remote(machine.label, machine.target)) as Box<dyn Host>
+            }),
+    );
+    Ok(hosts)
+}
+
 /// Reads every host in parallel and builds the report.
 pub fn build_report(
     hosts: &[Box<dyn Host>],

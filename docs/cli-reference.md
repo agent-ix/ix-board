@@ -488,6 +488,24 @@ Options:
   -h, --help                         Print help
 ```
 
+## ix-board retro snapshot
+
+Measures a team's convergence and appends one record to its retro store. See
+[retro snapshot](retro.md) for the configuration file and the metric catalog.
+
+```text
+ix-board retro snapshot [OPTIONS] --config <CONFIG>
+
+Options:
+      --config <CONFIG>  JSON retro configuration file
+      --window <WINDOW>  Trailing window: seconds, minutes, hours or days (90s, 20m, 4h, 2d) [default: 24h]
+      --json             Emit the stored record as JSON on stdout
+```
+
+The command exits zero when it appends a record, even if some metrics are unavailable; their
+ids are listed on stderr. It exits non-zero and appends nothing when the configuration is
+invalid or the store path is refused.
+
 ## JSON Schema export
 
 The public wire types derive JSON Schema from their Rust definitions. Export one

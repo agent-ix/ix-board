@@ -4,10 +4,7 @@
 //! Command-line interface for deterministic cached Linear reads.
 
 use clap::{Parser, Subcommand};
-use ix_board::agents::{
-    AgentsReport, Host, ReadyTicket, SystemHost, build_report, parse_duration, parse_machines,
-    render_text,
-};
+use ix_board::agents::{AgentsReport, ReadyTicket, build_report, parse_duration, render_text};
 use ix_board::chain::{ChainReport, evaluate_chain, open_scope_issues, resolve_issue};
 use ix_board::orphans::{OrphansReport, find_orphans};
 use ix_board::program_review::{
@@ -17,6 +14,7 @@ use ix_board::reconcile::{
     DEFAULT_STALE_DAYS, ReconcileReport, collect_github_evidence, evaluate_reconcile,
     repositories_for_scope, resolve_project,
 };
+use ix_board::retro;
 use ix_board::{
     DriftConfig, DriftError, DriftEvidenceFile, DriftReport, Error, FocusExpansion,
     FocusHygieneReport, FocusPlanChunk, FocusProjectMembership, FocusRecord, FocusSelection,
@@ -107,6 +105,11 @@ enum Command {
         #[arg(long, conflicts_with = "evidence")]
         live: bool,
     },
+    /// Measure whether a team's work is converging and keep the measurements.
+    Retro {
+        #[command(subcommand)]
+        command: RetroCommand,
+    },
     /// Resolve an inline Linear initiative/project/issue focus.
     Focus {
         #[command(subcommand)]
@@ -152,6 +155,19 @@ enum Command {
         /// TOML program scope file that defines the projects and their teams.
         #[arg(long, required = true)]
         scope: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum RetroCommand {
+    /// Append one record of the metric catalog to the team's retro store.
+    Snapshot {
+        /// JSON retro configuration file.
+        #[arg(long)]
+        config: PathBuf,
+        /// Trailing window for window metrics: seconds, minutes, hours or days (90s, 20m, 4h, 2d).
+        #[arg(long, default_value = retro::DEFAULT_WINDOW)]
+        window: String,
     },
 }
 
@@ -301,6 +317,7 @@ enum Output {
     Issues(IssueBatch),
     Drift(DriftReport),
     Agents(AgentsReport),
+    Retro(retro::Record),
     ProjectStatusUpdated {
         project: String,
         status: String,
@@ -382,7 +399,8 @@ fn main() -> std::process::ExitCode {
                 | Error::AmbiguousMilestone { .. }
                 | Error::DriftInputRead { .. }
                 | Error::DriftInputDecode { .. }
-                | Error::Drift(_) => Outcome::Invalid,
+                | Error::Drift(_)
+                | Error::Retro(_) => Outcome::Invalid,
                 Error::EmptyCredentialInput => Outcome::Invalid,
                 _ => Outcome::Internal,
             })
@@ -514,6 +532,9 @@ fn run(command: Command) -> Result<Output, Error> {
             live,
         } => run_drift(&config, evidence.as_ref(), live).map(Output::Drift),
         Command::Agents { teams, idle_after } => run_agents(&teams, idle_after).map(Output::Agents),
+        Command::Retro {
+            command: RetroCommand::Snapshot { config, window },
+        } => run_retro_snapshot(&config, &window).map(Output::Retro),
         Command::Scope {
             command: ProgramScopeCommand::Check { scope },
         } => {
@@ -633,17 +654,7 @@ fn run(command: Command) -> Result<Output, Error> {
 }
 
 fn run_agents(teams: &[String], idle_after: u64) -> Result<AgentsReport, Error> {
-    let local = SystemHost::local();
-    let machines = parse_machines(&local.herdr(&["machine", "list", "--json"])?)?;
-    let mut hosts: Vec<Box<dyn Host>> = vec![Box::new(local)];
-    hosts.extend(
-        machines
-            .into_iter()
-            .filter(|machine| machine.enabled)
-            .map(|machine| {
-                Box::new(SystemHost::remote(machine.label, machine.target)) as Box<dyn Host>
-            }),
-    );
+    let hosts = ix_board::agents::system_hosts()?;
     let mut service = None;
     let mut next_ready = |team: &str| -> Result<Option<ReadyTicket>, String> {
         if service.is_none() {
@@ -661,6 +672,32 @@ fn run_agents(teams: &[String], idle_after: u64) -> Result<AgentsReport, Error> 
         }))
     };
     Ok(build_report(&hosts, teams, idle_after, &mut next_ready))
+}
+
+fn run_retro_snapshot(config_path: &std::path::Path, window: &str) -> Result<retro::Record, Error> {
+    let config = retro::RetroConfig::load(config_path).map_err(retro::RetroError::from)?;
+    let window_secs = retro::parse_window(window).map_err(retro::RetroError::from)?;
+    let store = retro::Store::from_env(&config.team).map_err(retro::RetroError::from)?;
+    // A refused store path must cost no reads, so check it before any source is started.
+    store.check_writable().map_err(retro::RetroError::from)?;
+    let linear = retro::live::linear_or_unreadable();
+    let agents = retro::live::LiveAgents::start(config.herdr_teams.clone());
+    let sources = retro::Sources {
+        linear: linear.as_ref(),
+        github: &retro::live::LiveGithub,
+        agents: &agents,
+        gate_log: &retro::live::FileGateLog,
+        relay: &retro::live::RedisCliRelay,
+        local: &retro::live::SystemLocal,
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |elapsed| elapsed.as_secs_f64());
+    let record = retro::run_snapshot(&config, window_secs, now, &sources, &store)?;
+    if let Some(notice) = retro::unavailable_notice(&record) {
+        eprintln!("{notice}");
+    }
+    Ok(record)
 }
 
 fn run_auth(command: AuthCommand) -> Result<Output, Error> {
@@ -714,6 +751,7 @@ fn run_linear(command: Command) -> Result<Output, Error> {
     match command {
         Command::Auth { .. } => unreachable!("auth commands are handled before Linear dispatch"),
         Command::Agents { .. } => unreachable!("agents is handled before Linear dispatch"),
+        Command::Retro { .. } => unreachable!("retro is handled before Linear dispatch"),
         Command::Scope { .. }
         | Command::Roadmap { .. }
         | Command::Reconcile { .. }
@@ -942,6 +980,7 @@ fn render_human(output: &Output) -> String {
         }
         Output::Drift(report) => render_drift_text(report),
         Output::Agents(report) => render_text(report),
+        Output::Retro(record) => retro::render_text(record),
         Output::ProgramScopeCheck(report) => {
             let mut lines = Vec::new();
             for name in &report.missing_initiatives {

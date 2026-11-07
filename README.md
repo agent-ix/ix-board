@@ -139,6 +139,15 @@ waiting, asking, idle or at a prompt. `drift` evaluates lead activity against
 configured thresholds from a versioned evidence file or live Linear data. See
 [agents and drift](docs/agents-and-drift.md).
 
+## Retro snapshots
+
+`retro snapshot --config retro.json [--window 24h]` measures whether a team's work is
+converging toward its gate tickets and appends one record of the metric catalog to
+`$TEAM_RETRO_HOME/<team>/snapshots.jsonl` (default `~/.local/state/team-retro`). The store is
+append-only and refuses any path inside a git work tree. A metric whose source cannot be read,
+is incomplete or is not configured is `unavailable` with a reason, never zero. See
+[retro snapshot](docs/retro.md).
+
 ## Project controls
 
 Two commands write to Linear. They change a project's status or priority and
@@ -168,6 +177,7 @@ low.
 - [Focus](docs/focus.md)
 - [Program review](docs/program-review.md)
 - [Agents and drift](docs/agents-and-drift.md)
+- [Retro snapshot](docs/retro.md)
 - [CLI reference](docs/cli-reference.md)
 - [Setup and troubleshooting](docs/setup.md)
 

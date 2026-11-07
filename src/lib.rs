@@ -13,6 +13,7 @@ mod model;
 pub mod orphans;
 pub mod program_review;
 pub mod reconcile;
+pub mod retro;
 mod scope;
 pub use scope::{ScopeSelection, ScopeSummary, select_scope};
 
@@ -179,6 +180,9 @@ pub enum Error {
     /// Drift configuration or evaluation failed.
     #[error(transparent)]
     Drift(#[from] drift::DriftError),
+    /// A retro command failed.
+    #[error(transparent)]
+    Retro(#[from] retro::RetroError),
     /// Reading herdr or an agent machine failed.
     #[error(transparent)]
     Agents(#[from] agents::AgentsError),

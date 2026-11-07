@@ -89,6 +89,38 @@ query IssueHistory($id: String!, $first: Int!, $after: String) {
   }
 }"#;
 
+const MARKER_COMMENTS_QUERY: &str = r#"
+query MarkerComments($first: Int!, $after: String, $prefix: String!, $needle: String!) {
+  comments(
+    first: $first
+    after: $after
+    filter: { and: [{ body: { startsWith: $prefix } }, { body: { contains: $needle } }] }
+  ) {
+    nodes { body }
+    pageInfo { hasNextPage endCursor }
+  }
+}"#;
+
+const ISSUE_UPDATES_QUERY: &str = r#"
+query IssueUpdates($first: Int!, $after: String, $since: DateTimeOrDuration!) {
+  issues(first: $first, after: $after, filter: { updatedAt: { gte: $since } }) {
+    nodes { id updatedAt }
+    pageInfo { hasNextPage endCursor }
+  }
+}"#;
+
+const LABELED_ISSUES_QUERY: &str = r#"
+query LabeledIssues($first: Int!, $after: String, $label: String!) {
+  issues(
+    first: $first
+    after: $after
+    filter: { labels: { name: { eq: $label } }, state: { type: { nin: ["completed", "canceled"] } } }
+  ) {
+    nodes { identifier createdAt }
+    pageInfo { hasNextPage endCursor }
+  }
+}"#;
+
 const HISTORY_PAGE_SIZE: i32 = 100;
 
 const PROJECT_STATUSES_QUERY: &str = r#"
@@ -584,6 +616,137 @@ impl LinearGraphQlSource {
             },
         ]);
         Ok(evidence)
+    }
+
+    /// Reads one issue's complete state history for the retro commands; a history that stops
+    /// before its last page is an error.
+    pub fn fetch_state_changes(
+        &self,
+        issue_id: &str,
+    ) -> Result<Vec<crate::retro::sources::StateChange>, String> {
+        let events = crate::retro::sources::read_all_pages(|after| {
+            let data: IssueHistoryData = self
+                .request(
+                    ISSUE_HISTORY_QUERY,
+                    IssueHistoryVariables {
+                        id: issue_id.to_owned(),
+                        first: HISTORY_PAGE_SIZE,
+                        after: after.map(str::to_owned),
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            let history = data
+                .issue
+                .ok_or_else(|| format!("issue {issue_id} not found"))?
+                .history;
+            Ok(crate::retro::sources::Page {
+                items: history.nodes,
+                has_next: history.page_info.has_next_page,
+                cursor: history.page_info.end_cursor,
+            })
+        })?;
+        events
+            .into_iter()
+            .filter(|event| event.from_state.is_some() || event.to_state.is_some())
+            .map(|event| {
+                let at = crate::drift::timestamp_epoch(&event.created_at)
+                    .map_err(|error| error.to_string())?;
+                Ok(crate::retro::sources::StateChange {
+                    at,
+                    from: event.from_state.map(|state| state.status_type),
+                    to: event.to_state.map(|state| state.status_type),
+                })
+            })
+            .collect()
+    }
+
+    /// Reads the first line of every comment whose body starts with `prefix` and contains
+    /// `needle`. The rest of each comment is dropped.
+    pub fn fetch_marker_lines(&self, prefix: &str, needle: &str) -> Result<Vec<String>, String> {
+        let comments = crate::retro::sources::read_all_pages(|after| {
+            let data: CommentData = self
+                .request(
+                    MARKER_COMMENTS_QUERY,
+                    MarkerVariables {
+                        first: ISSUE_PAGE_SIZE,
+                        after: after.map(str::to_owned),
+                        prefix: prefix.to_owned(),
+                        needle: needle.to_owned(),
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(crate::retro::sources::Page {
+                items: data.comments.nodes,
+                has_next: data.comments.page_info.has_next_page,
+                cursor: data.comments.page_info.end_cursor,
+            })
+        })?;
+        Ok(comments
+            .iter()
+            .map(|comment| crate::retro::metrics::first_line(&comment.body).to_owned())
+            .collect())
+    }
+
+    /// Reads the id and update time of every issue updated at or after `since` (Unix seconds),
+    /// to prove whether a cached workspace snapshot still describes them.
+    pub fn fetch_issue_updates(&self, since: f64) -> Result<Vec<(String, String)>, String> {
+        let since = crate::drift::format_timestamp(since.floor());
+        let nodes = crate::retro::sources::read_all_pages(|after| {
+            let data: IssueUpdateData = self
+                .request(
+                    ISSUE_UPDATES_QUERY,
+                    UpdateVariables {
+                        first: ISSUE_PAGE_SIZE,
+                        after: after.map(str::to_owned),
+                        since: since.clone(),
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(crate::retro::sources::Page {
+                items: data.issues.nodes,
+                has_next: data.issues.page_info.has_next_page,
+                cursor: data.issues.page_info.end_cursor,
+            })
+        })?;
+        Ok(nodes
+            .into_iter()
+            .map(|node| (node.id, node.updated_at))
+            .collect())
+    }
+
+    /// Reads the open issues carrying one label.
+    pub fn fetch_open_issues_with_label(
+        &self,
+        label: &str,
+    ) -> Result<Vec<crate::retro::sources::LabeledIssue>, String> {
+        let issues = crate::retro::sources::read_all_pages(|after| {
+            let data: LabeledIssueData = self
+                .request(
+                    LABELED_ISSUES_QUERY,
+                    LabelVariables {
+                        first: ISSUE_PAGE_SIZE,
+                        after: after.map(str::to_owned),
+                        label: label.to_owned(),
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(crate::retro::sources::Page {
+                items: data.issues.nodes,
+                has_next: data.issues.page_info.has_next_page,
+                cursor: data.issues.page_info.end_cursor,
+            })
+        })?;
+        issues
+            .into_iter()
+            .map(|issue| {
+                let created_at = crate::drift::timestamp_epoch(&issue.created_at)
+                    .map_err(|error| error.to_string())?;
+                Ok(crate::retro::sources::LabeledIssue {
+                    identifier: issue.identifier,
+                    created_at,
+                })
+            })
+            .collect()
     }
 
     fn query<T: DeserializeOwned>(
@@ -1259,6 +1422,68 @@ struct RawMilestone {
     description: Option<String>,
     sort_order: f64,
     target_date: Option<String>,
+}
+
+#[derive(Serialize)]
+struct MarkerVariables {
+    first: i32,
+    after: Option<String>,
+    prefix: String,
+    needle: String,
+}
+
+#[derive(Serialize)]
+struct UpdateVariables {
+    first: i32,
+    after: Option<String>,
+    since: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IssueUpdateData {
+    issues: Connection<RawIssueUpdate>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct RawIssueUpdate {
+    id: String,
+    updated_at: String,
+}
+
+#[derive(Serialize)]
+struct LabelVariables {
+    first: i32,
+    after: Option<String>,
+    label: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommentData {
+    comments: Connection<RawComment>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawComment {
+    body: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LabeledIssueData {
+    issues: Connection<RawLabeledIssue>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct RawLabeledIssue {
+    identifier: String,
+    created_at: String,
 }
 
 #[derive(Deserialize)]
