@@ -1,6 +1,6 @@
 # Retro: snapshot, delta and backfill
 
-`ix-board retro` measures whether a team's work is converging on its gate tickets. `retro snapshot` takes a measurement, `retro delta` compares it with the previous one and a baseline, and `retro backfill` builds a baseline from history. The dev-team `team-retro` skill runs these on a schedule and scores the team's roles from the numbers.
+`ix-board retro` is a group of three commands that measure whether a team's work is converging on its gate tickets. `retro snapshot` takes a measurement, `retro delta` compares it with the previous one and a baseline, and `retro backfill` builds a baseline from history. The dev-team `team-retro` skill runs these on a schedule and scores the team's roles from the numbers.
 
 ## Typical use
 
@@ -11,7 +11,7 @@ ix-board retro snapshot --config retro.json          # every few hours
 ix-board retro delta    --config retro.json          # after each snapshot
 ```
 
-Use the same `--window` for every snapshot and any backfill; records taken with different windows or thresholds compare as `query_changed`. A snapshot takes about a minute, mostly waiting on Herdr when a machine is unreachable.
+Use the same `--window` for every snapshot and any backfill; records taken with different windows or thresholds compare as `query_changed`. A snapshot measured 15 to 60 seconds against a live workspace; most of the upper end is the 25-second wait on Herdr when a machine is unreachable.
 
 `ix-board retro snapshot` reads Linear, GitHub, Herdr and a few local sources, computes a fixed
 catalog of metrics for one team, and appends one record to that team's store. It never writes to

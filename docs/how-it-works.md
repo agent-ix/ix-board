@@ -70,10 +70,6 @@ Ready tickets are sorted by these keys, in order:
 
 1. Project priority. `No priority` sorts after Urgent, High, Medium and Low.
 2. Project manual order.
-
-The `retro` commands append measurement records to a local store outside every git work tree
-(`$TEAM_RETRO_HOME`, default `~/.local/state/team-retro`). They write nothing to Linear, GitHub or
-any repository. See [retro](retro.md).
 3. Ticket priority, with the same treatment of `No priority`.
 4. Ticket manual order.
 5. Project identifier, ticket identifier and ID, as tie-breakers.
@@ -104,6 +100,12 @@ Priority `0` is no priority, `1` urgent, `2` high, `3` medium and `4` low. After
 a write ix-board updates the cached snapshot with the new value. No
 other command writes to Linear or GitHub, and ix-board never writes manual
 order.
+
+## Retro store
+
+The `retro` commands append measurement records to a local store outside every git work tree
+(`$TEAM_RETRO_HOME`, default `~/.local/state/team-retro`). They write nothing to Linear, GitHub or
+any repository. See [retro](retro.md).
 
 ## Output and exit status
 
