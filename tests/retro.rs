@@ -116,6 +116,10 @@ impl LinearSource for Rig {
             .copied()
             .ok_or_else(|| "no chunk".to_owned())
     }
+    fn state_histories(&self, issue_ids: &[String]) -> Vec<Result<Vec<StateChange>, String>> {
+        self.log(format!("batch:{}", issue_ids.len()));
+        issue_ids.iter().map(|id| self.state_history(id)).collect()
+    }
     fn state_history(&self, issue_id: &str) -> Result<Vec<StateChange>, String> {
         self.log(format!("state_history:{issue_id}"));
         self.histories
@@ -123,9 +127,12 @@ impl LinearSource for Rig {
             .cloned()
             .unwrap_or(Ok(Vec::new()))
     }
-    fn reviewer_marker_lines(&self) -> Result<Vec<String>, String> {
-        self.log("reviewer_marker_lines");
-        unset(&self.markers, "markers")
+    fn marker_lines(&self, prefix: &str, needle: &str) -> Result<Vec<String>, String> {
+        self.log("marker_lines");
+        Ok(unset(&self.markers, "markers")?
+            .into_iter()
+            .filter(|line| line.starts_with(prefix) && line.contains(needle))
+            .collect())
     }
     fn open_issues_with_label(&self, _label: &str) -> Result<Vec<LabeledIssue>, String> {
         self.log("open_issues_with_label");
@@ -414,7 +421,7 @@ fn base_rig() -> Rig {
         project_counts: BTreeMap::from([("Alpha".to_owned(), 4)]),
         histories: histories(),
         markers: Some(Ok(vec![
-            "<!-- reviewer repo=agent-ix/x quoin=quoin 0.28.1 id=SR-1 method=code-review pr=x#10 -->".to_owned(),
+            "<!-- reviewer repo=agent-ix/x quoin=quoin 0.28.1 id=SR-1 method=code-review pr=x#101 -->".to_owned(),
             "<!-- reviewer repo=agent-ix/x id=SR-2 method=code-review pr=x#11 -->".to_owned(),
             "<!-- reviewer-dispositions repo=agent-ix/x id=SR-1 round=1 -->".to_owned(),
             "<!-- reviewer-dispositions repo=agent-ix/x id=SR-1 round=2 -->".to_owned(),
@@ -635,7 +642,7 @@ fn pull_request_state_metrics_straddle_each_threshold() {
 /// Trace: FR-024-AC-6
 #[test]
 fn fix_rounds_read_marker_first_lines_only() {
-    let marker = "<!-- reviewer repo=agent-ix/x id=SR-1 pr=x#10 -->";
+    let marker = "<!-- reviewer repo=agent-ix/x id=SR-1 pr=x#11 -->";
     let disposition = |round: u32, id: &str| {
         format!("<!-- reviewer-dispositions repo=agent-ix/x id={id} round={round} -->")
     };
@@ -993,6 +1000,66 @@ fn the_command_exits_non_zero_and_appends_nothing_on_a_bad_configuration() {
     assert!(!home.exists(), "nothing is created");
 }
 
+/// Trace: FR-024-AC-18
+#[test]
+fn absent_thresholds_and_half_of_a_pair_are_not_configured() {
+    let mut rig = base_rig();
+    rig.processes = Some(Ok(Vec::new()));
+    rig.relay.insert("a:b:c".to_owned(), Ok(Vec::new()));
+    let bare = RetroConfig::parse(
+        Path::new("retro.json"),
+        r#"{"team":"SWM","projects":["Alpha"],"gate_tickets":["SWM-1"],"repos":["agent-ix/x"],
+            "slot_process":"qsl-slot","relay_leads":["a:b:c"]}"#,
+    )
+    .unwrap();
+    let record = snapshot_with(&rig, &bare, DAY).0;
+    for id in [
+        "prs_idle",
+        "prs_oversize",
+        "in_progress_stale",
+        "orphan_slots",
+        "messages_undelivered",
+    ] {
+        assert_eq!(reason(&record, id), "not configured", "{id}");
+    }
+    assert_eq!(
+        value(&record, "prs_open"),
+        Some(1.0),
+        "metrics without a threshold still compute"
+    );
+    // Orphan age is strictly above the limit.
+    rig.processes = Some(Ok(vec![
+        ProcessRow {
+            command: "qsl-slot".to_owned(),
+            parent_alive: false,
+            age_secs: 7200,
+        },
+        ProcessRow {
+            command: "qsl-slot".to_owned(),
+            parent_alive: false,
+            age_secs: 7201,
+        },
+    ]));
+    let both = config_with(r#"{"slot_process":"qsl-slot","orphan_slot_hours":2}"#);
+    assert_eq!(
+        value(&snapshot_with(&rig, &both, DAY).0, "orphan_slots"),
+        Some(1.0)
+    );
+}
+
+/// Trace: FR-024-AC-11
+#[test]
+fn an_unregistered_relay_address_makes_the_metric_unavailable() {
+    let mut rig = base_rig();
+    rig.relay.insert(
+        "a:b:c".to_owned(),
+        Err("no registered lead matches a:b:c".to_owned()),
+    );
+    let cfg = config_with(r#"{"relay_leads":["a:b:c"],"message_stale_minutes":5}"#);
+    let record = snapshot_with(&rig, &cfg, DAY).0;
+    assert!(reason(&record, "messages_undelivered").contains("a:b:c"));
+}
+
 /// Trace: FR-024-AC-12
 #[test]
 fn a_snapshot_only_reads_and_leaves_a_repository_untouched() {
@@ -1040,7 +1107,7 @@ fn a_snapshot_only_reads_and_leaves_a_repository_untouched() {
     const READS: [&str; 12] = [
         "workspace",
         "project_open_count",
-        "reviewer_marker_lines",
+        "marker_lines",
         "open_issues_with_label",
         "pull_requests:agent-ix/x",
         "is_merged",
@@ -1053,7 +1120,9 @@ fn a_snapshot_only_reads_and_leaves_a_repository_untouched() {
     ];
     for call in rig.calls.borrow().iter() {
         assert!(
-            READS.contains(&call.as_str()) || call.starts_with("state_history:"),
+            READS.contains(&call.as_str())
+                || call.starts_with("state_history:")
+                || call.starts_with("batch:"),
             "unexpected call {call}"
         );
     }
@@ -1066,7 +1135,7 @@ fn each_source_is_read_once_per_run() {
     snapshot(&rig);
     assert_eq!(rig.count("workspace"), 1);
     assert_eq!(rig.count("pull_requests:agent-ix/x"), 1);
-    assert_eq!(rig.count("reviewer_marker_lines"), 1);
+    assert!(rig.count("marker_lines") >= 1);
     assert_eq!(rig.count("agents"), 1);
     let history: Vec<_> = rig
         .calls
@@ -1143,6 +1212,103 @@ fn json_exposes_every_metric_field_and_text_prints_one_line_each() {
         ix_board::retro::render_text(&record).lines().count(),
         CATALOG.len()
     );
+}
+
+/// Trace: FR-024-AC-6
+#[test]
+fn fix_rounds_cover_only_pull_requests_open_or_merged_in_the_window() {
+    let mut rig = base_rig();
+    rig.markers = Some(Ok(vec![
+        "<!-- reviewer repo=agent-ix/x id=SR-1 pr=x#11 -->".to_owned(),
+        "<!-- reviewer-dispositions repo=agent-ix/x id=SR-1 round=2 -->".to_owned(),
+        // Merged before the window, so absent from the listing.
+        "<!-- reviewer repo=agent-ix/x id=SR-2 pr=x#500 -->".to_owned(),
+        "<!-- reviewer-dispositions repo=agent-ix/x id=SR-2 round=40 -->".to_owned(),
+        // Another repository.
+        "<!-- reviewer repo=agent-ix/y id=SR-3 pr=y#11 -->".to_owned(),
+        "<!-- reviewer-dispositions repo=agent-ix/y id=SR-3 round=30 -->".to_owned(),
+    ]));
+    let record = snapshot(&rig);
+    assert_eq!(value(&record, "fix_rounds_max"), Some(2.0));
+    assert_eq!(value(&record, "fix_rounds_total"), Some(2.0));
+    rig.prs = Some(Err("down".to_owned()));
+    let record = snapshot(&rig);
+    assert!(reason(&record, "fix_rounds_total").contains("GitHub"));
+}
+
+/// Trace: FR-024-AC-13
+#[test]
+fn histories_are_read_in_one_batch_for_issues_updated_since_the_window_opened() {
+    let rig = base_rig();
+    snapshot(&rig);
+    let batches: Vec<_> = rig
+        .calls
+        .borrow()
+        .iter()
+        .filter(|c| c.starts_with("batch:"))
+        .cloned()
+        .collect();
+    assert!(batches.len() <= 2, "{batches:?}");
+    // SWM-8 and SWM-7 were last updated 100h ago, before the 24h window and the 48h cutoff.
+    for old in ["id-SWM-8", "id-SWM-7"] {
+        assert_eq!(rig.count(&format!("state_history:{old}")), 0, "{old}");
+    }
+}
+
+/// Trace: FR-024-AC-11
+#[test]
+fn relay_addresses_resolve_to_registered_session_queues_and_settings_follow_precedence() {
+    use ix_board::retro::live::{
+        RedisTarget, RelaySettings, parse_redis_url, queue_names_for_address, relay_settings,
+    };
+    let registration = |machine: &str, workspace: &str, tab: &str| serde_json::json!({"machine": machine, "place": {"workspace": workspace, "tab": tab}});
+    let registrations = vec![
+        (
+            "session/6c/aa".to_owned(),
+            registration("luna", "IR", "plan"),
+        ),
+        (
+            "session/6c/bb".to_owned(),
+            registration("luna", "IR", "plan"),
+        ),
+        (
+            "session/64/cc".to_owned(),
+            registration("draco", "IR", "plan"),
+        ),
+    ];
+    assert_eq!(
+        queue_names_for_address("luna:IR:plan", &registrations),
+        ["session/6c/aa", "session/6c/bb"]
+    );
+    assert!(queue_names_for_address("luna:IR:code", &registrations).is_empty());
+    assert_eq!(queue_names_for_address("peter", &registrations), ["peter"]);
+
+    let file = "url = \"redis://u:pw@10.0.0.1:6380\"\nprefix = \"p:\"\n";
+    assert_eq!(
+        relay_settings(None, None, Some(file)),
+        RelaySettings {
+            url: "redis://u:pw@10.0.0.1:6380".to_owned(),
+            prefix: "p:".to_owned()
+        }
+    );
+    let env = relay_settings(
+        Some("redis://h".to_owned()),
+        Some("e:".to_owned()),
+        Some(file),
+    );
+    assert_eq!((env.url.as_str(), env.prefix.as_str()), ("redis://h", "e:"));
+    assert_eq!(relay_settings(None, None, None).prefix, "ixr:v3:");
+    assert_eq!(
+        parse_redis_url("redis://draco:secret@10.99.0.1:6380").unwrap(),
+        RedisTarget {
+            host: "10.99.0.1".to_owned(),
+            port: 6380,
+            user: Some("draco".to_owned()),
+            password: Some("secret".to_owned())
+        }
+    );
+    assert_eq!(parse_redis_url("redis://127.0.0.1").unwrap().port, 6379);
+    assert!(parse_redis_url("http://x").is_err());
 }
 
 // ---- FR-025 ----------------------------------------------------------------------------

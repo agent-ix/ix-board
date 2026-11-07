@@ -89,9 +89,13 @@ query IssueHistory($id: String!, $first: Int!, $after: String) {
   }
 }"#;
 
-const REVIEWER_COMMENTS_QUERY: &str = r#"
-query ReviewerComments($first: Int!, $after: String) {
-  comments(first: $first, after: $after, filter: { body: { startsWith: "<!-- reviewer" } }) {
+const MARKER_COMMENTS_QUERY: &str = r#"
+query MarkerComments($first: Int!, $after: String, $prefix: String!, $needle: String!) {
+  comments(
+    first: $first
+    after: $after
+    filter: { and: [{ body: { startsWith: $prefix } }, { body: { contains: $needle } }] }
+  ) {
     nodes { body }
     pageInfo { hasNextPage endCursor }
   }
@@ -648,15 +652,18 @@ impl LinearGraphQlSource {
             .collect()
     }
 
-    /// Reads the first line of every comment that begins with a reviewer marker.
-    pub fn fetch_reviewer_marker_lines(&self) -> Result<Vec<String>, String> {
+    /// Reads the first line of every comment whose body starts with `prefix` and contains
+    /// `needle`. The rest of each comment is dropped.
+    pub fn fetch_marker_lines(&self, prefix: &str, needle: &str) -> Result<Vec<String>, String> {
         let comments = crate::retro::sources::read_all_pages(|after| {
             let data: CommentData = self
                 .request(
-                    REVIEWER_COMMENTS_QUERY,
-                    PageVariables {
+                    MARKER_COMMENTS_QUERY,
+                    MarkerVariables {
                         first: ISSUE_PAGE_SIZE,
                         after: after.map(str::to_owned),
+                        prefix: prefix.to_owned(),
+                        needle: needle.to_owned(),
                     },
                 )
                 .map_err(|error| error.to_string())?;
@@ -1380,6 +1387,14 @@ struct RawMilestone {
     description: Option<String>,
     sort_order: f64,
     target_date: Option<String>,
+}
+
+#[derive(Serialize)]
+struct MarkerVariables {
+    first: i32,
+    after: Option<String>,
+    prefix: String,
+    needle: String,
 }
 
 #[derive(Serialize)]

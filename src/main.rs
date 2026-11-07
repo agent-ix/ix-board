@@ -679,10 +679,11 @@ fn run_retro_snapshot(config_path: &std::path::Path, window: &str) -> Result<ret
     let window_secs = retro::parse_window(window).map_err(retro::RetroError::from)?;
     let store = retro::Store::from_env(&config.team).map_err(retro::RetroError::from)?;
     let linear = retro::live::linear_or_unreadable();
+    let agents = retro::live::LiveAgents::start(config.herdr_teams.clone());
     let sources = retro::Sources {
         linear: linear.as_ref(),
         github: &retro::live::LiveGithub,
-        agents: &retro::live::LiveAgents,
+        agents: &agents,
         gate_log: &retro::live::FileGateLog,
         relay: &retro::live::RedisCliRelay,
         local: &retro::live::SystemLocal,

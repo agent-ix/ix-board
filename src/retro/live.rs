@@ -8,6 +8,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::Deserialize;
 
@@ -17,11 +19,52 @@ use super::sources::{
     read_all_pages,
 };
 use crate::agents::{AgentsReport, build_report, system_hosts};
-use crate::{LinearGraphQlSource, ReadService, WorkspaceSnapshot, WorkspaceSource};
+use crate::{LinearGraphQlSource, ReadService, WorkspaceSnapshot};
 
-/// Linear through the GraphQL client.
+/// Most state-history reads in flight at once.
+const HISTORY_CONCURRENCY: usize = 6;
+
+/// Runs `read` over `inputs` with at most [`HISTORY_CONCURRENCY`] reads in flight, keeping the
+/// order of `inputs`. A read that never ran is an error, not a missing value.
+fn parallel_map<I: Sync, T: Send + Clone>(
+    inputs: &[I],
+    read: impl Fn(&I) -> Result<T, String> + Sync,
+) -> Vec<Result<T, String>> {
+    let next = AtomicUsize::new(0);
+    let slots = Mutex::new(vec![None; inputs.len()]);
+    std::thread::scope(|scope| {
+        for _ in 0..HISTORY_CONCURRENCY.min(inputs.len()) {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(input) = inputs.get(index) else {
+                        break;
+                    };
+                    let result = read(input);
+                    if let Ok(mut slots) = slots.lock() {
+                        slots[index] = Some(result);
+                    }
+                }
+            });
+        }
+    });
+    let slots = slots.into_inner().unwrap_or_default();
+    (0..inputs.len())
+        .map(|index| {
+            slots
+                .get(index)
+                .cloned()
+                .flatten()
+                .unwrap_or_else(|| Err("read did not complete".to_owned()))
+        })
+        .collect()
+}
+
+/// Linear through the GraphQL client. The workspace snapshot and the project-chunk read share
+/// one cached read service (FR-004), so a warm run fetches the workspace from the cache.
 pub struct LiveLinear {
     source: LinearGraphQlSource,
+    service: Mutex<ReadService<LinearGraphQlSource>>,
 }
 
 impl LiveLinear {
@@ -29,21 +72,28 @@ impl LiveLinear {
     pub fn from_env() -> Result<Self, crate::Error> {
         Ok(Self {
             source: LinearGraphQlSource::from_env()?,
+            service: Mutex::new(ReadService::open_default(LinearGraphQlSource::from_env()?)?),
         })
+    }
+
+    fn service(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, ReadService<LinearGraphQlSource>>, String> {
+        self.service
+            .lock()
+            .map_err(|_| "read service lock poisoned".to_owned())
     }
 }
 
 impl LinearSource for LiveLinear {
     fn workspace(&self) -> Result<WorkspaceSnapshot, String> {
-        self.source
-            .fetch_workspace()
+        self.service()?
+            .workspace_snapshot()
             .map_err(|error| error.to_string())
     }
 
     fn project_open_count(&self, project: &str) -> Result<usize, String> {
-        let source = LinearGraphQlSource::from_env().map_err(|error| error.to_string())?;
-        let mut service = ReadService::open_default(source).map_err(|error| error.to_string())?;
-        service
+        self.service()?
             .project_chunk(project)
             .map(|chunk| chunk.open_tickets.len())
             .map_err(|error| error.to_string())
@@ -53,8 +103,18 @@ impl LinearSource for LiveLinear {
         self.source.fetch_state_changes(issue_id)
     }
 
-    fn reviewer_marker_lines(&self) -> Result<Vec<String>, String> {
-        self.source.fetch_reviewer_marker_lines()
+    fn state_histories(&self, issue_ids: &[String]) -> Vec<Result<Vec<StateChange>, String>> {
+        parallel_map(issue_ids, |id| self.source.fetch_state_changes(id))
+    }
+
+    fn marker_lines(&self, prefix: &str, needle: &str) -> Result<Vec<String>, String> {
+        self.source.fetch_marker_lines(prefix, needle)
+    }
+
+    fn marker_lines_batch(&self, queries: &[(String, String)]) -> Vec<Result<Vec<String>, String>> {
+        parallel_map(queries, |(prefix, needle)| {
+            self.source.fetch_marker_lines(prefix, needle)
+        })
     }
 
     fn open_issues_with_label(&self, label: &str) -> Result<Vec<LabeledIssue>, String> {
@@ -372,14 +432,59 @@ impl GithubSource for LiveGithub {
     }
 }
 
-/// Herdr agent verdicts through the FR-018 detector.
-pub struct LiveAgents;
+/// Longest the herdr read may take before the agent metrics are unavailable. An unreachable
+/// machine otherwise holds the whole snapshot for the detector's two 60-second calls.
+const AGENTS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(25);
+
+type AgentsResult = Result<AgentsReport, String>;
+
+/// The herdr read, started in the background so it overlaps the other sources.
+pub struct LiveAgents {
+    receiver: Mutex<Option<std::sync::mpsc::Receiver<AgentsResult>>>,
+    started: std::time::Instant,
+}
+
+impl LiveAgents {
+    /// Starts reading the agents of `teams` now; [`AgentSource::report`] collects the result.
+    pub fn start(teams: Vec<String>) -> Self {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        if teams.is_empty() {
+            return Self {
+                receiver: Mutex::new(None),
+                started: std::time::Instant::now(),
+            };
+        }
+        std::thread::spawn(move || {
+            let report = system_hosts()
+                .map_err(|error| error.to_string())
+                .map(|hosts| {
+                    let mut no_queue = |_: &str| Ok(None);
+                    build_report(&hosts, &teams, 20 * 60, &mut no_queue)
+                });
+            let _ = sender.send(report);
+        });
+        Self {
+            receiver: Mutex::new(Some(receiver)),
+            started: std::time::Instant::now(),
+        }
+    }
+}
 
 impl AgentSource for LiveAgents {
-    fn report(&self, teams: &[String]) -> Result<AgentsReport, String> {
-        let hosts = system_hosts().map_err(|error| error.to_string())?;
-        let mut no_queue = |_: &str| Ok(None);
-        Ok(build_report(&hosts, teams, 20 * 60, &mut no_queue))
+    fn report(&self, _teams: &[String]) -> Result<AgentsReport, String> {
+        let receiver = self
+            .receiver
+            .lock()
+            .map_err(|_| "agents lock poisoned".to_owned())?
+            .take()
+            .ok_or_else(|| "the herdr read was already collected".to_owned())?;
+        let left = AGENTS_DEADLINE.saturating_sub(self.started.elapsed());
+        receiver.recv_timeout(left).map_err(|_| {
+            format!(
+                "the herdr read did not finish within {}s",
+                AGENTS_DEADLINE.as_secs()
+            )
+        })?
     }
 }
 
@@ -438,10 +543,122 @@ impl GateLogSource for FileGateLog {
     }
 }
 
-/// The ix-relay inbox lists, read with `LRANGE` so nothing is dequeued.
+/// Where the relay bus lives.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelaySettings {
+    /// Redis URL of the bus.
+    pub url: String,
+    /// Key prefix.
+    pub prefix: String,
+}
+
+/// Resolves the bus URL and prefix: the environment beats `~/.ix/relay/config.toml`, which beats
+/// the relay's own defaults.
+pub fn relay_settings(
+    env_url: Option<String>,
+    env_prefix: Option<String>,
+    config_text: Option<&str>,
+) -> RelaySettings {
+    let file: Option<toml::Table> = config_text.and_then(|text| text.parse().ok());
+    let from_file = |key: &str| {
+        file.as_ref()
+            .and_then(|table| table.get(key))
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned)
+    };
+    RelaySettings {
+        url: env_url
+            .or_else(|| from_file("url"))
+            .unwrap_or_else(|| "redis://127.0.0.1:6379".to_owned()),
+        prefix: env_prefix
+            .or_else(|| from_file("prefix"))
+            .unwrap_or_else(|| "ixr:v3:".to_owned()),
+    }
+}
+
+/// The parts of a `redis://[user[:password]@]host[:port][/db]` URL.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RedisTarget {
+    /// Host name.
+    pub host: String,
+    /// Port.
+    pub port: u16,
+    /// ACL user, when the URL names one.
+    pub user: Option<String>,
+    /// Password, when the URL carries one.
+    pub password: Option<String>,
+}
+
+/// Splits a Redis URL so the password can be passed in the environment, not on the command line.
+pub fn parse_redis_url(url: &str) -> Result<RedisTarget, String> {
+    let rest = url
+        .strip_prefix("redis://")
+        .ok_or_else(|| "relay URL must start with redis://".to_owned())?;
+    let rest = rest.split('/').next().unwrap_or(rest);
+    let (credentials, host_port) = rest
+        .rsplit_once('@')
+        .map_or((None, rest), |(c, h)| (Some(c), h));
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((host, port)) => (
+            host,
+            port.parse()
+                .map_err(|_| "relay URL port is not a number".to_owned())?,
+        ),
+        None => (host_port, 6379),
+    };
+    let (user, password) = match credentials.map(|c| c.split_once(':')) {
+        Some(Some((user, password))) => (
+            (!user.is_empty()).then(|| user.to_owned()),
+            Some(password.to_owned()),
+        ),
+        Some(None) => (None, credentials.map(str::to_owned)),
+        None => (None, None),
+    };
+    Ok(RedisTarget {
+        host: host.to_owned(),
+        port,
+        user,
+        password,
+    })
+}
+
+/// The inbox names an address reads from. A lead address is `server:workspace:tab` and matches
+/// registrations by machine, workspace and tab; the bus queues are keyed by the registered
+/// session name, not by the address. Text without a colon is taken as the queue name itself.
+pub fn queue_names_for_address(
+    address: &str,
+    registrations: &[(String, serde_json::Value)],
+) -> Vec<String> {
+    let parts = address.split(':').collect::<Vec<_>>();
+    let [server, workspace, tab] = parts.as_slice() else {
+        return vec![address.to_owned()];
+    };
+    let matches = |value: &serde_json::Value, key: &str, wanted: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|got| got.eq_ignore_ascii_case(wanted))
+    };
+    registrations
+        .iter()
+        .filter(|(_, registration)| {
+            let place = registration
+                .get("place")
+                .unwrap_or(&serde_json::Value::Null);
+            matches(registration, "machine", server)
+                && matches(place, "workspace", workspace)
+                && matches(place, "tab", tab)
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// The ix-relay inbox lists, read with `HGETALL` on the registry and `LRANGE` on the inbox
+/// lists, so nothing is dequeued or written.
 ///
-/// The Redis URL and key prefix come from `IX_RELAY_URL` and `IX_RELAY_PREFIX`, with the
-/// relay's own defaults; the inbox key is `<prefix>inbox:<address>`.
+/// The bus URL and prefix come from `IX_RELAY_URL` and `IX_RELAY_PREFIX`, then
+/// `~/.ix/relay/config.toml`, then the relay defaults. The password goes to `redis-cli` in
+/// `REDISCLI_AUTH`, never on the command line.
 pub struct RedisCliRelay;
 
 #[derive(Deserialize)]
@@ -449,31 +666,92 @@ struct RelayMessage {
     sent_at_ms: i64,
 }
 
+fn redis(target: &RedisTarget, args: &[String]) -> Result<String, String> {
+    let mut command = Command::new("redis-cli");
+    command.args([
+        "-h",
+        &target.host,
+        "-p",
+        &target.port.to_string(),
+        "--no-auth-warning",
+        "--raw",
+    ]);
+    if let Some(user) = &target.user {
+        command.args(["--user", user]);
+    }
+    if let Some(password) = &target.password {
+        command.env("REDISCLI_AUTH", password);
+    }
+    let output = command
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("redis-cli: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "redis-cli failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8(output.stdout).map_err(|error| error.to_string())?;
+    // redis-cli reports server errors on stdout with exit status zero.
+    if text.starts_with("ERR ") || text.starts_with("NOAUTH") || text.starts_with("WRONGPASS") {
+        return Err(format!("redis: {}", text.trim()));
+    }
+    Ok(text)
+}
+
 impl RelaySource for RedisCliRelay {
     fn pending_sent_at_ms(&self, address: &str) -> Result<Vec<i64>, String> {
-        let url =
-            std::env::var("IX_RELAY_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_owned());
-        let prefix = std::env::var("IX_RELAY_PREFIX").unwrap_or_else(|_| "ixr:v3:".to_owned());
-        let text = run(
-            "redis-cli",
-            &strings(&[
-                "-u",
-                &url,
-                "--raw",
-                "LRANGE",
-                &format!("{prefix}inbox:{address}"),
-                "0",
-                "-1",
-            ]),
-        )?;
-        text.lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| {
-                serde_json::from_str::<RelayMessage>(line)
-                    .map(|message| message.sent_at_ms)
-                    .map_err(|error| format!("queue entry does not parse: {error}"))
-            })
-            .collect()
+        let config = std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join(".ix/relay/config.toml"))
+            .and_then(|path| std::fs::read_to_string(path).ok());
+        let settings = relay_settings(
+            std::env::var("IX_RELAY_URL").ok(),
+            std::env::var("IX_RELAY_PREFIX").ok(),
+            config.as_deref(),
+        );
+        let target = parse_redis_url(&settings.url)?;
+        let names = if address.contains(':') {
+            let flat = redis(
+                &target,
+                &strings(&["HGETALL", &format!("{}agents", settings.prefix)]),
+            )?;
+            let mut rows = flat.lines();
+            let mut registrations = Vec::new();
+            while let (Some(name), Some(json)) = (rows.next(), rows.next()) {
+                if let Ok(value) = serde_json::from_str(json) {
+                    registrations.push((name.to_owned(), value));
+                }
+            }
+            let names = queue_names_for_address(address, &registrations);
+            if names.is_empty() {
+                return Err(format!("no registered lead matches {address}"));
+            }
+            names
+        } else {
+            vec![address.to_owned()]
+        };
+        let mut sent = Vec::new();
+        for name in names {
+            let text = redis(
+                &target,
+                &strings(&[
+                    "LRANGE",
+                    &format!("{}inbox:{name}", settings.prefix),
+                    "0",
+                    "-1",
+                ]),
+            )?;
+            for line in text.lines().filter(|line| !line.trim().is_empty()) {
+                sent.push(
+                    serde_json::from_str::<RelayMessage>(line)
+                        .map(|message| message.sent_at_ms)
+                        .map_err(|error| format!("queue entry does not parse: {error}"))?,
+                );
+            }
+        }
+        Ok(sent)
     }
 }
 
@@ -596,7 +874,7 @@ impl LinearSource for UnreadableLinear {
         Err(self.0.clone())
     }
 
-    fn reviewer_marker_lines(&self) -> Result<Vec<String>, String> {
+    fn marker_lines(&self, _prefix: &str, _needle: &str) -> Result<Vec<String>, String> {
         Err(self.0.clone())
     }
 

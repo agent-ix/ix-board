@@ -76,8 +76,21 @@ pub trait LinearSource {
     fn project_open_count(&self, project: &str) -> Result<usize, String>;
     /// The complete state history of one issue.
     fn state_history(&self, issue_id: &str) -> Result<Vec<StateChange>, String>;
-    /// First lines of the comments that begin with a `reviewer` marker.
-    fn reviewer_marker_lines(&self) -> Result<Vec<String>, String>;
+    /// The state histories of several issues, in the order asked. The default reads them one by
+    /// one; a live source may read them concurrently.
+    fn state_histories(&self, issue_ids: &[String]) -> Vec<Result<Vec<StateChange>, String>> {
+        issue_ids.iter().map(|id| self.state_history(id)).collect()
+    }
+    /// First lines of the comments whose body starts with `prefix` and contains `needle`.
+    fn marker_lines(&self, prefix: &str, needle: &str) -> Result<Vec<String>, String>;
+    /// Several `marker_lines` reads, in the order asked. The default reads them one by one; a
+    /// live source may read them concurrently.
+    fn marker_lines_batch(&self, queries: &[(String, String)]) -> Vec<Result<Vec<String>, String>> {
+        queries
+            .iter()
+            .map(|(prefix, needle)| self.marker_lines(prefix, needle))
+            .collect()
+    }
     /// Open issues carrying a label.
     fn open_issues_with_label(&self, label: &str) -> Result<Vec<LabeledIssue>, String>;
 }

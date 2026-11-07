@@ -17,12 +17,12 @@ file stops the command and names the file and field.
 | `gate_tickets` | Issue ids whose transitive blockers define the path. |
 | `repos` | `owner/name` repositories whose pull requests belong to the team. |
 | `herdr_teams` | Herdr workspace labels read for utilization metrics. |
-| `thresholds` | `pr_idle_hours`, `pr_oversize_lines`, `in_progress_stale_hours`. |
+| `thresholds` | `pr_idle_hours`, `pr_oversize_lines`, `in_progress_stale_hours`. Each is optional with no default; a metric whose threshold is absent is `unavailable: not configured`. |
 | `main_check` | `{"repo": "owner/name", "branch": "main"}`; check-runs define main status. |
 | `local_paths` | Directories read for prunable worktrees and disk bytes. |
-| `slot_process`, `orphan_slot_hours` | Process-name substring of build-slot wrappers, and the age after which an orphaned wrapper counts. |
+| `slot_process`, `orphan_slot_hours` | Sibling top-level fields: process-name substring of build-slot wrappers, and the age in hours after which an orphaned wrapper counts. `orphan_slots` needs both. |
 | `gate_log` | Path to the gate JSONL log. |
-| `relay_leads`, `message_stale_minutes` | Relay queue names and the age after which a pending message counts as undelivered. |
+| `relay_leads`, `message_stale_minutes` | Sibling top-level fields: relay addresses (`server:workspace:tab`) and the age in minutes after which a pending message counts as undelivered. `messages_undelivered` needs both. |
 | `decision_label` | Linear label marking issues that wait on an owner decision. |
 | `baseline_taken_at` | UTC time naming the baseline record. |
 
@@ -54,6 +54,22 @@ The ids are `path_remaining`, `path_closed`, `intake_new`, `net_closed_minus_new
 `repins_total`, `build_lock_wait_minutes`, `messages_undelivered`, `decisions_open` and
 `decision_oldest_hours`. The definitions are in the FR-024 requirement.
 
-The ix-relay queue is read with `redis-cli LRANGE` using `IX_RELAY_URL` and `IX_RELAY_PREFIX`
-(defaults `redis://127.0.0.1:6379` and `ixr:v3:`), so `redis-cli` must be installed for
-`messages_undelivered`.
+Boundaries: a pull request is idle at or beyond `pr_idle_hours`; oversize and orphan age are
+strictly above their limits. `fix_rounds_*` count only pull requests that are open or were merged
+inside the window, keyed by the marker's `pr=` value and limited to `repos`. A main-branch incident
+is a pass-to-fail transition between consecutive checked commits in the window; commits with
+pending or no check-runs are skipped, and minutes run from the first failing commit to the next
+passing one, or to the snapshot time. `agents_idle_minutes_max` is the largest time since an
+agent's last turn. `net_closed_minus_new` counts the union of project and path issues once.
+
+The ix-relay queues are keyed by registered session name, so each relay address is resolved
+read-only through the bus registry (`HGETALL <prefix>agents`) by machine, workspace and tab, and
+the inbox lists of every matching registration are read with `LRANGE`. The bus URL and prefix
+come from `IX_RELAY_URL` and `IX_RELAY_PREFIX`, then `~/.ix/relay/config.toml`, then the relay
+defaults (`redis://127.0.0.1:6379`, `ixr:v3:`). `redis-cli` must be installed; the password is
+passed in `REDISCLI_AUTH`, never on the command line.
+
+Speed: the Linear workspace comes from the shared read cache (five-minute TTL), issue histories
+are read only for issues updated inside the window and concurrently, reviewer markers are read
+per pull request, and the herdr read runs alongside the others with a 25-second limit, after
+which the agent metrics are `unavailable`.

@@ -14,7 +14,7 @@ The retro commands SHALL write each metric in a record with `status` (`ok` or `u
 (a number, or null when unavailable), `unit`, `direction`, `source` and `query`.
 
 If a source cannot be read, is incomplete, or is not named in the
-configuration, then the command SHALL set `status` to `unavailable`, set `value` to
+configuration (a metric that needs a threshold or a paired field counts as not named when it is absent), then the command SHALL set `status` to `unavailable`, set `value` to
 null, and record a `reason` naming the failed or missing source.
 
 The command SHALL NOT report zero or a partial count for an unavailable metric.

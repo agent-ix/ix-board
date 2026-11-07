@@ -78,7 +78,7 @@ pub fn collect(
         }
     }
     decisions(&mut out, sources);
-    fix_rounds(&mut out, sources);
+    fix_rounds(&mut out, sources, &prs);
     flow(&mut out, &prs);
     stability(&mut out, sources);
     utilization(&mut out, sources);
@@ -181,8 +181,8 @@ impl Out<'_> {
             "prs_idle" => ("github", format!("open pull requests with no update for pr_idle_hours={}", threshold(t.pr_idle_hours))),
             "prs_oversize" => ("github", format!("open pull requests with added plus deleted lines above pr_oversize_lines={}", threshold(t.pr_oversize_lines))),
             "prs_ready_unmerged" => ("github", "open non-draft pull requests with review decision APPROVED".to_owned()),
-            "fix_rounds_max" => ("linear", "highest round= of reviewer-dispositions markers per pull request, maximum; first-line markers only".to_owned()),
-            "fix_rounds_total" => ("linear", "highest round= of reviewer-dispositions markers per pull request, summed; first-line markers only".to_owned()),
+            "fix_rounds_max" => ("linear+github", format!("highest round= of reviewer-dispositions markers per pull request open or merged in the window, maximum; first-line markers only; {window}")),
+            "fix_rounds_total" => ("linear+github", format!("highest round= of reviewer-dispositions markers per pull request open or merged in the window, summed; first-line markers only; {window}")),
             "head_shas_per_pr_max" => ("github", format!("most distinct head commits for one pull request open or merged in the window; {window}")),
             "done_reopened" => ("linear", format!("issues with a state change from completed to a non-completed state in the window; {window}")),
             "main_red_incidents" => ("github", self.main_rule("passing-to-failing transitions of the main branch across commits in the window")),
@@ -354,6 +354,42 @@ impl History<'_> {
             .map_err(Clone::clone)
     }
 
+    /// Reads, in one bounded-concurrency batch, the histories of the issues updated at or
+    /// after `since`. An issue not updated since then cannot have changed state since, so its
+    /// history is not needed. Later `get` calls hit the cache.
+    fn prefetch(&mut self, issues: &[&Issue], since: f64) {
+        let mut wanted = issues
+            .iter()
+            .filter(|issue| !self.cache.contains_key(&issue.id))
+            .filter(|issue| {
+                !issue
+                    .updated_at
+                    .as_deref()
+                    .and_then(epoch)
+                    .is_some_and(|at| at < since)
+            })
+            .map(|issue| (*issue).clone())
+            .collect::<Vec<_>>();
+        wanted.sort_by(|left, right| left.id.cmp(&right.id));
+        wanted.dedup_by(|left, right| left.id == right.id);
+        let ids = wanted
+            .iter()
+            .map(|issue| issue.id.0.clone())
+            .collect::<Vec<_>>();
+        let results = self.source.state_histories(&ids);
+        for (issue, result) in wanted.into_iter().zip(results) {
+            self.cache.insert(
+                issue.id.clone(),
+                result.map_err(|error| {
+                    format!(
+                        "Linear unavailable: history of {}: {error}",
+                        issue.identifier
+                    )
+                }),
+            );
+        }
+    }
+
     /// Issues with a state change inside the window that satisfies `matches`. An issue not
     /// updated since the window opened cannot have changed state inside it, so its history is
     /// not read.
@@ -405,6 +441,9 @@ fn progress(
     prs: &Result<Vec<PullRequest>, String>,
 ) {
     let frame = scope.frame;
+    let mut wanted = scope.path_ok().unwrap_or_default().to_vec();
+    wanted.extend(scope.projects_ok().unwrap_or_default().iter().copied());
+    history.prefetch(&wanted, frame.start());
     out.put(
         "path_remaining",
         scope
@@ -617,15 +656,23 @@ fn stale_count(
         .map_err(|error| format!("GitHub unavailable: {error}"))?;
     let cutoff = scope.frame.now - hours as f64 * 3600.0;
     let mut stale = 0;
-    for issue in open_in_teams
+    let started = open_in_teams
         .iter()
         .filter(|issue| issue.state_type == WorkflowStateType::Started)
-    {
-        let last_change = history
-            .get(issue)?
-            .iter()
-            .map(|change| change.at)
-            .fold(f64::NEG_INFINITY, f64::max);
+        .copied()
+        .collect::<Vec<_>>();
+    history.prefetch(&started, cutoff);
+    for issue in started {
+        // An issue not updated since the cutoff cannot have changed state since it.
+        let updated = issue.updated_at.as_deref().and_then(epoch);
+        let last_change = match updated {
+            Some(at) if at <= cutoff => at,
+            _ => history
+                .get(issue)?
+                .iter()
+                .map(|change| change.at)
+                .fold(f64::NEG_INFINITY, f64::max),
+        };
         let last_change = if last_change.is_finite() {
             last_change
         } else {
@@ -701,12 +748,25 @@ fn marker_fields(line: &str) -> Option<(&str, BTreeMap<&str, &str>)> {
     Some((kind, fields))
 }
 
-/// Per pull request (as `repo#n`), the highest disposition round, from marker first lines.
-pub fn fix_rounds_by_pr(lines: &[String], repos: &[String]) -> BTreeMap<String, u64> {
-    let names = repos
-        .iter()
-        .map(|repo| repo.rsplit('/').next().unwrap_or(repo))
-        .collect::<BTreeSet<_>>();
+/// The `name#number` key a marker's `pr=` field uses for a pull request.
+fn marker_key(pr: &PullRequest) -> String {
+    format!(
+        "{}#{}",
+        pr.repo.rsplit('/').next().unwrap_or(&pr.repo),
+        pr.number
+    )
+}
+
+/// Pull requests that are open or were merged inside the window.
+fn relevant_prs(prs: &[PullRequest], frame: Frame) -> Vec<&PullRequest> {
+    prs.iter()
+        .filter(|pr| pr.open || pr.merged_at.is_some_and(|at| frame.contains(at)))
+        .collect()
+}
+
+/// Per pull request (as `name#n`), the highest disposition round, from marker first lines,
+/// for the pull requests in `allowed` only.
+pub fn fix_rounds_by_pr(lines: &[String], allowed: &BTreeSet<String>) -> BTreeMap<String, u64> {
     let mut prs_by_id: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     let mut rounds: Vec<(&str, u64)> = Vec::new();
     for line in lines {
@@ -718,9 +778,7 @@ pub fn fix_rounds_by_pr(lines: &[String], repos: &[String]) -> BTreeMap<String, 
         };
         if kind == "reviewer" {
             if let Some(pr) = fields.get("pr")
-                && pr
-                    .split_once('#')
-                    .is_some_and(|(name, _)| names.contains(name))
+                && allowed.contains(*pr)
             {
                 prs_by_id.entry(id).or_default().insert(pr);
             }
@@ -743,15 +801,28 @@ pub fn first_line(body: &str) -> &str {
     body.lines().next().unwrap_or("")
 }
 
-fn fix_rounds(out: &mut Out<'_>, sources: &Sources<'_>) {
-    match sources.linear.reviewer_marker_lines() {
+fn fix_rounds(out: &mut Out<'_>, sources: &Sources<'_>, prs: &Result<Vec<PullRequest>, String>) {
+    let frame = out.frame;
+    let allowed = match prs {
+        Ok(prs) => relevant_prs(prs, frame)
+            .into_iter()
+            .map(marker_key)
+            .collect::<BTreeSet<_>>(),
+        Err(error) => {
+            let reason = format!("GitHub unavailable: {error}");
+            out.unavailable("fix_rounds_max", reason.clone());
+            out.unavailable("fix_rounds_total", reason);
+            return;
+        }
+    };
+    match marker_lines_for(sources, &allowed) {
         Err(error) => {
             let reason = format!("Linear unavailable: reviewer markers: {error}");
             out.unavailable("fix_rounds_max", reason.clone());
             out.unavailable("fix_rounds_total", reason);
         }
         Ok(lines) => {
-            let rounds = fix_rounds_by_pr(&lines, &out.config.repos);
+            let rounds = fix_rounds_by_pr(&lines, &allowed);
             out.put(
                 "fix_rounds_max",
                 Ok(rounds.values().copied().max().unwrap_or(0) as f64),
@@ -759,6 +830,41 @@ fn fix_rounds(out: &mut Out<'_>, sources: &Sources<'_>) {
             out.put("fix_rounds_total", Ok(rounds.values().sum::<u64>() as f64));
         }
     }
+}
+
+/// Reads the `reviewer` markers of the allowed pull requests, then the dispositions of the
+/// review ids those markers carry; nothing else is read.
+fn marker_lines_for(
+    sources: &Sources<'_>,
+    allowed: &BTreeSet<String>,
+) -> Result<Vec<String>, String> {
+    let reviewer = allowed
+        .iter()
+        .map(|key| ("<!-- reviewer ".to_owned(), format!("pr={key} ")))
+        .collect::<Vec<_>>();
+    let mut lines = Vec::new();
+    for result in sources.linear.marker_lines_batch(&reviewer) {
+        lines.extend(result?);
+    }
+    let ids = lines
+        .iter()
+        .filter_map(|line| marker_fields(line))
+        .filter(|(kind, _)| *kind == "reviewer")
+        .filter_map(|(_, fields)| fields.get("id").map(|id| (*id).to_owned()))
+        .collect::<BTreeSet<_>>();
+    let dispositions = ids
+        .iter()
+        .map(|id| {
+            (
+                "<!-- reviewer-dispositions ".to_owned(),
+                format!("id={id} "),
+            )
+        })
+        .collect::<Vec<_>>();
+    for result in sources.linear.marker_lines_batch(&dispositions) {
+        lines.extend(result?);
+    }
+    Ok(lines)
 }
 
 fn list_pull_requests(
@@ -862,10 +968,7 @@ fn flow(out: &mut Out<'_>, prs: &Result<Vec<PullRequest>, String>) {
                 .count(),
         )),
     );
-    let relevant = prs
-        .iter()
-        .filter(|pr| pr.open || pr.merged_at.is_some_and(|at| frame.contains(at)))
-        .collect::<Vec<_>>();
+    let relevant = relevant_prs(prs, frame);
     let heads = relevant
         .iter()
         .map(|pr| {
