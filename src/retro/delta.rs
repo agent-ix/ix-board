@@ -169,10 +169,9 @@ pub fn run_delta(config: &RetroConfig, store: &Store) -> Result<DeltaReport, Ret
     })
 }
 
-fn epoch(text: &str) -> Option<u64> {
-    crate::drift::timestamp_epoch(text)
-        .ok()
-        .map(|value| value as u64)
+/// The instant a stored or configured UTC time names, with its fractional seconds.
+fn epoch(text: &str) -> Option<f64> {
+    crate::drift::timestamp_epoch(text).ok()
 }
 
 /// `metric` against the same metric of `reference`.

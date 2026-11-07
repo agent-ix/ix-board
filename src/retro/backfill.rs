@@ -33,27 +33,31 @@ pub fn parse_day(date: &str) -> Result<f64, RetroError> {
     Ok(epoch)
 }
 
-/// Appends a record for every UTC day in `since..=until` that has none, measured over the
-/// trailing `window_secs` ending at the last second of the day.
+/// Appends a record for every UTC day in `since..=until` that has none. A day's record has
+/// `taken_at` at `23:59:59Z` and measures the half-open window `[midnight - window, midnight)`
+/// ending at the next UTC midnight, so consecutive days are contiguous. `until` defaults to the
+/// last complete UTC day.
 pub fn run_backfill(
     config: &RetroConfig,
     window_secs: u64,
-    range: (f64, f64),
+    (first_day, until): (f64, Option<f64>),
     now: f64,
     (linear, github): (&dyn LinearSource, &dyn GithubSource),
     store: &Store,
 ) -> Result<BackfillReport, RetroError> {
-    let (first_day, last_day) = range;
+    let last_day = until.unwrap_or_else(|| (now / DAY_SECS).floor() * DAY_SECS - DAY_SECS);
+    for day in [first_day, last_day] {
+        if day + DAY_SECS > now {
+            return Err(RetroError::FutureDay(crate::drift::format_timestamp(
+                day + DAY_SECS,
+            )));
+        }
+    }
     if last_day < first_day {
         return Err(RetroError::EmptyRange);
     }
     store.check_writable()?;
     let end_of = |day: f64| day + DAY_SECS - 1.0;
-    if end_of(last_day) > now {
-        return Err(RetroError::FutureDay(crate::drift::format_timestamp(
-            end_of(last_day),
-        )));
-    }
     let stored = store.read_all()?;
     let in_range = |taken: &str| {
         crate::drift::timestamp_epoch(taken)
@@ -78,7 +82,7 @@ pub fn run_backfill(
         if exists {
             skipped.push(taken_at);
         } else {
-            pending.push((end_of(day), taken_at));
+            pending.push((day + DAY_SECS, taken_at));
         }
         day += DAY_SECS;
     }
@@ -93,6 +97,7 @@ pub fn run_backfill(
         .map(|(at, _)| Frame {
             now: *at,
             window_secs,
+            end_exclusive: true,
         })
         .collect::<Vec<_>>();
     let measured = collect_history(config, &frames, linear, github);

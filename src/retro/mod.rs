@@ -66,7 +66,11 @@ pub fn run_snapshot(
     store: &Store,
 ) -> Result<Record, RetroError> {
     store.check_writable()?;
-    let frame = Frame { now, window_secs };
+    let frame = Frame {
+        now,
+        window_secs,
+        end_exclusive: false,
+    };
     let record = Record {
         schema_version: SCHEMA_VERSION,
         kind: RecordKind::Snapshot,

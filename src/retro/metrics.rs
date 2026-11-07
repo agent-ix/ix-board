@@ -31,6 +31,9 @@ pub struct Frame {
     pub now: f64,
     /// Window length in seconds.
     pub window_secs: u64,
+    /// True for the half-open window `[now - window, now)` a backfilled day uses; false for the
+    /// snapshot window `(now - window, now]`.
+    pub end_exclusive: bool,
 }
 
 impl Frame {
@@ -39,7 +42,11 @@ impl Frame {
     }
 
     fn contains(self, at: f64) -> bool {
-        at > self.start() && at <= self.now
+        if self.end_exclusive {
+            at >= self.start() && at < self.now
+        } else {
+            at > self.start() && at <= self.now
+        }
     }
 
     fn hours(self) -> f64 {

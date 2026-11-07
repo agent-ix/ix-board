@@ -2209,7 +2209,8 @@ fn one_snapshot_reports_no_delta_and_exits_zero_without_a_score() {
 
 /// Trace: FR-027-AC-6
 #[test]
-fn delta_succeeds_from_the_store_alone_with_no_source_reachable() {
+fn delta_succeeds_from_the_store_alone_and_touches_no_source() {
+    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let store = store_in(&dir);
     for record in trio([1.0, 2.0, 3.0]) {
@@ -2217,15 +2218,58 @@ fn delta_succeeds_from_the_store_alone_with_no_source_reachable() {
     }
     let config = dir.path().join("config.json");
     std::fs::write(&config, CONFIG).unwrap();
-    // No credentials, no PATH (so no gh, herdr, redis-cli) and no network-capable home.
+    // Every source reader the snapshot uses fails the test if invoked: each external program is
+    // a tripwire that records its name, and the network proxy is a listener that records any
+    // connection. The real binary runs with credentials present, so a read would be attempted.
+    let tools = dir.path().join("tools");
+    std::fs::create_dir(&tools).unwrap();
+    let tripped = dir.path().join("tripped");
+    for name in [
+        "gh",
+        "herdr",
+        "redis-cli",
+        "git",
+        "curl",
+        "linear",
+        "ps",
+        "du",
+    ] {
+        let script = tools.join(name);
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho {name} >> {}\nexit 1\n", tripped.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let proxy = format!("http://{}", listener.local_addr().unwrap());
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_ix-board"))
         .args(["retro", "delta", "--json", "--config"])
         .arg(&config)
         .env_clear()
+        .env("PATH", &tools)
         .env("TEAM_RETRO_HOME", dir.path())
+        .env("HOME", dir.path())
+        .env("LINEAR_API_KEY", "lin_api_fake")
+        .env("GH_TOKEN", "fake")
+        .env("GITHUB_TOKEN", "fake")
+        .env("HTTPS_PROXY", &proxy)
+        .env("HTTP_PROXY", &proxy)
+        .env("ALL_PROXY", &proxy)
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
+    assert!(
+        !tripped.exists(),
+        "a source program ran: {:?}",
+        std::fs::read_to_string(&tripped)
+    );
+    assert!(
+        matches!(listener.accept(), Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "delta opened a network connection"
+    );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["latest"], "2026-11-07T12:00:00Z");
     let idle = report["metrics"]
@@ -2250,7 +2294,7 @@ fn backfill_range(
     run_backfill(
         &config(),
         window,
-        (day(since), day(until)),
+        (day(since), Some(day(until))),
         NOW,
         (rig, rig),
         store,
@@ -2296,6 +2340,13 @@ fn a_baseline_matching_no_record_stops_with_an_error_naming_it() {
         error.to_string().contains("2026-11-05T12:00:01Z"),
         "{error}"
     );
+    // A baseline is an exact instant: a fractional second does not match the whole second.
+    let error = delta(
+        &trio([1.0, 2.0, 3.0]),
+        r#"{"baseline_taken_at": "2026-11-05T12:00:00.900Z"}"#,
+    )
+    .unwrap_err();
+    assert!(matches!(error, RetroError::BaselineNotFound(_)), "{error}");
     // The exact time matches.
     let report = delta(
         &trio([1.0, 2.0, 3.0]),
@@ -2341,6 +2392,34 @@ fn a_three_day_range_appends_three_records_at_the_end_of_each_utc_day() {
         backfill_range(&base_rig(), &store, ("2026-11-06", "2026-11-05"), DAY),
         Err(RetroError::EmptyRange)
     ));
+    // With no --until and a --since that has not ended, the error names the unended day, not a
+    // range order the user never wrote.
+    let error = run_backfill(
+        &config(),
+        DAY,
+        (day("2026-11-07"), None),
+        NOW,
+        (&base_rig(), &base_rig()),
+        &store,
+    )
+    .unwrap_err();
+    assert!(matches!(error, RetroError::FutureDay(_)), "{error}");
+    assert!(
+        error.to_string().contains("2026-11-08T00:00:00Z"),
+        "{error}"
+    );
+    // The default --until is the last complete day.
+    let defaulted = run_backfill(
+        &config(),
+        DAY,
+        (day("2026-11-06"), None),
+        NOW,
+        (&base_rig(), &base_rig()),
+        &store,
+    )
+    .unwrap();
+    assert_eq!(defaulted.appended.len(), 1);
+    assert_eq!(defaulted.appended[0].taken_at, "2026-11-06T23:59:59Z");
 }
 
 /// Trace: FR-028-AC-2
@@ -2475,14 +2554,17 @@ fn pull_request_metrics_equal_the_known_values_of_the_trailing_window() {
         // First second of the day is inside; the last second of the day before is not.
         merged_at(4, at("2026-11-03", 0.0), 10.0),
         merged_at(5, at("2026-11-03", 0.0) - 2.0, 1000.0),
-        // The first second of the next day belongs to the next window.
+        // The last half second of the day is inside; the half second before it began is not.
+        merged_at(8, end + 0.5, 2.0),
+        merged_at(9, at("2026-11-03", 0.0) - 0.5, 1000.0),
+        // Midnight belongs to the next window.
         merged_at(6, end + 1.0, 1000.0),
         pr(7, true),
     ]));
     let (_dir, store) = store_with(&[]);
     let report = backfill_range(&rig, &store, ("2026-11-03", "2026-11-03"), DAY).unwrap();
     let record = &report.appended[0];
-    assert_eq!(value(record, "prs_merged_per_hour"), Some(4.0 / 24.0));
+    assert_eq!(value(record, "prs_merged_per_hour"), Some(5.0 / 24.0));
     assert_eq!(value(record, "pr_cycle_median_hours"), Some(3.0));
     assert_eq!(value(record, "pr_cycle_p90_hours"), Some(10.0));
     // Pull requests are read once for the whole range, never open-ended.
@@ -2650,4 +2732,83 @@ fn backfill_queries_carry_the_window_and_differ_from_a_snapshot_of_another_windo
     let queries = rate.since_baseline.queries.unwrap();
     assert!(queries.reference.contains("window=6h") && queries.latest.contains("window=1d"));
     assert_eq!(rate.since_previous.state, ChangeState::Changed);
+}
+
+/// Trace: FR-028-AC-1
+#[test]
+fn each_day_of_a_range_is_measured_over_its_own_trailing_window() {
+    let mut rig = base_rig();
+    rig.prs = Some(Ok(vec![
+        merged_at(1, at("2026-11-02", 10.0), 2.0),
+        merged_at(2, at("2026-11-03", 10.0), 4.0),
+        merged_at(3, at("2026-11-03", 20.0), 6.0),
+    ]));
+    let early = at("2026-10-01", 0.0);
+    let later = at("2026-11-06", 0.0);
+    rig.workspace = Some(Ok(WorkspaceSnapshot {
+        projects: vec![project("p1", "Alpha")],
+        issues: vec![
+            blocked_by(
+                issue_at("SWM-1", S::Started, Some("p1"), early, later),
+                &["SWM-2"],
+            ),
+            issue_at("SWM-2", S::Completed, Some("p1"), early, later),
+            issue_at(
+                "SWM-3",
+                S::Started,
+                Some("p1"),
+                at("2026-11-03", 3.0),
+                later,
+            ),
+        ],
+        fetched_at: 0,
+    }));
+    rig.histories = BTreeMap::from([(
+        "id-SWM-2".to_owned(),
+        Ok(vec![change_at(
+            at("2026-11-04", 5.0),
+            S::Started,
+            S::Completed,
+        )]),
+    )]);
+    let (_dir, store) = store_with(&[]);
+    let report = backfill_range(&rig, &store, ("2026-11-02", "2026-11-04"), DAY).unwrap();
+    let days = &report.appended;
+    let seen = |id: &str| days.iter().map(|r| value(r, id)).collect::<Vec<_>>();
+    assert_eq!(
+        seen("prs_merged_per_hour"),
+        [Some(1.0 / 24.0), Some(2.0 / 24.0), Some(0.0)]
+    );
+    assert_eq!(seen("pr_cycle_median_hours"), [Some(2.0), Some(4.0), None]);
+    assert_eq!(seen("pr_cycle_p90_hours"), [Some(2.0), Some(6.0), None]);
+    assert_eq!(seen("intake_new"), [Some(0.0), Some(1.0), Some(0.0)]);
+    assert_eq!(seen("path_closed"), [Some(0.0), Some(0.0), Some(1.0)]);
+    assert_eq!(
+        seen("net_closed_minus_new"),
+        [Some(0.0), Some(-1.0), Some(1.0)]
+    );
+}
+
+/// Trace: FR-028-AC-1
+#[test]
+fn linear_and_github_are_read_once_per_backfill_run_however_many_days() {
+    let rig = base_rig();
+    let (_dir, store) = store_with(&[]);
+    backfill_range(&rig, &store, ("2026-11-01", "2026-11-04"), DAY).unwrap();
+    assert_eq!(rig.count("workspace"), 1);
+    assert_eq!(rig.count("pull_requests:agent-ix/x"), 1);
+    let calls = rig.calls.borrow();
+    let mut histories = calls
+        .iter()
+        .filter(|c| c.starts_with("state_history:"))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(!histories.is_empty());
+    let total = histories.len();
+    histories.sort();
+    histories.dedup();
+    assert_eq!(histories.len(), total, "an issue history was read twice");
+    // The workspace is read back as far as the earliest day's window opens.
+    assert_eq!(rig.since.borrow().len(), 1);
+    assert_eq!(rig.since.borrow()[0], day("2026-11-01"));
 }

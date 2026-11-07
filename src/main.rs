@@ -754,10 +754,7 @@ fn run_retro_backfill(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |elapsed| elapsed.as_secs_f64());
     let first = retro::parse_day(since)?;
-    let last = match until {
-        Some(date) => retro::parse_day(date)?,
-        None => (now / 86_400.0).floor() * 86_400.0 - 86_400.0,
-    };
+    let last = until.map(retro::parse_day).transpose()?;
     let store = retro::Store::from_env(&config.team).map_err(retro::RetroError::from)?;
     // A refused store path must cost no reads, so check it before any source is started.
     store.check_writable().map_err(retro::RetroError::from)?;

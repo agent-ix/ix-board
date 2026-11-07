@@ -80,7 +80,7 @@ which the agent metrics are `unavailable`.
 GitHub, Herdr or local request. The latest and previous records are the two `snapshot` records
 with the greatest `taken_at`. The baseline is the record whose `taken_at` equals
 `baseline_taken_at`, or the earliest record of either kind when that field is absent; a value that
-matches no record stops the command with an error naming it. Backfilled records serve only as
+matches no record (compared as the same instant) stops the command with an error naming it, before any no-delta message. Backfilled records serve only as
 baseline and history. With fewer than two snapshots the command prints that no delta exists and
 exits zero.
 
@@ -96,8 +96,9 @@ queries); `neutral` metrics never regress. There is no combined score.
 
 `ix-board retro backfill --config retro.json --since 2026-11-01 [--until 2026-11-06]
 [--window 24h] [--json]` appends one `backfill` record per UTC day with `taken_at` at
-`23:59:59Z` of that day, measuring window metrics over the trailing window ending there. `--until`
-defaults to the last complete UTC day; a day that has not ended is refused.
+`23:59:59Z` of that day, measuring window metrics over the half-open window ending at the next UTC
+midnight (`[midnight - window, midnight)`), so consecutive 24h days are contiguous to the
+millisecond. `--until` defaults to the last complete UTC day; a day that has not ended is refused.
 
 Only these metrics are reconstructed: `prs_merged_per_hour`, `pr_cycle_median_hours` and
 `pr_cycle_p90_hours` from pull-request creation and merge timestamps, and `path_closed`,
@@ -105,11 +106,13 @@ Only these metrics are reconstructed: `prs_merged_per_hour`, `pr_cycle_median_ho
 history. They use the same functions as `retro snapshot`, fed historical frames. Every other metric
 is `unavailable` with reason `not reconstructible`, including `path_remaining`: the blocker graph
 at a past time is not recorded. The path is the current set of transitive blockers of the gate
-tickets, so `path_closed` counts today's path issues that were completed on that day. Linear and
+tickets and project membership is each issue's current project, so the four Linear metrics count
+today's path and today's project issues as they were on that day. Linear and
 GitHub are each read once per run; an incomplete read makes the metrics that depend on it
 unavailable for every day.
 
 A day that already has a backfill record is skipped and reported. A range containing the
-`taken_at` of any `snapshot` record is refused, naming that record, and nothing is appended. The
+`taken_at` of any `snapshot` record (from 00:00:00 of the first day up to, not including, 00:00:00
+after the last day) is refused, naming that record, and nothing is appended. The
 store rules are those of the snapshot. Linear and GitHub only are read; Herdr, the relay and the
 local sources are not started.
