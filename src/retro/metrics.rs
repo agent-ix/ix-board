@@ -205,7 +205,7 @@ impl Out<'_> {
             "issues_without_milestone" => ("linear", format!("open issues of linear_teams={} lacking a milestone", self.config.linear_teams.join(","))),
             "in_progress_stale" => ("linear+github", format!("started issues with no state change and no attached pull request update for in_progress_stale_hours={}", threshold(t.in_progress_stale_hours))),
             "source_count_disagreement" => ("linear", "absolute difference between the open-issue count of the configured projects from the issue snapshot and the project-chunk read".to_owned()),
-            "agents_working_share" => ("herdr", format!("agents with verdict WORKING (idle_after={}m) over agents reported for herdr_teams={}", AGENTS_IDLE_AFTER_SECS / 60, self.config.herdr_teams.join(","))),
+            "agents_working_share" => ("herdr", format!("lifecycle-v2: agents with verdict WORKING (idle_after={}m) over agents reported for herdr_teams={}", AGENTS_IDLE_AFTER_SECS / 60, self.config.herdr_teams.join(","))),
             "agents_idle_minutes_max" => ("herdr", format!("largest minutes since the last turn among agents of herdr_teams={} (idle_after={}m)", self.config.herdr_teams.join(","), AGENTS_IDLE_AFTER_SECS / 60)),
             "worktrees_prunable" => ("local git", "prunable worktrees git reports for each directory of local_paths".to_owned()),
             "disk_bytes" => ("local disk", "total bytes below each directory of local_paths".to_owned()),
@@ -1109,7 +1109,15 @@ fn utilization(out: &mut Out<'_>, sources: &Sources<'_>) {
                     .count();
                 out.put(
                     "agents_working_share",
-                    if total == 0 {
+                    if report.schema_version != crate::agents::AGENTS_SCHEMA_VERSION
+                        || !report.missing_teams.is_empty()
+                        || report
+                            .agents
+                            .iter()
+                            .any(|row| row.verdict == crate::agents::Verdict::Unknown)
+                    {
+                        Err("agent classification or population unresolved".into())
+                    } else if total == 0 {
                         Err(EMPTY.to_owned())
                     } else {
                         Ok(count(working) / count(total))

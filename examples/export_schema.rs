@@ -11,6 +11,8 @@ use ix_board::{
 fn main() {
     let name = std::env::args().nth(1).unwrap_or_default();
     let schema = match name.as_str() {
+        "AgentsReport" => schemars::schema_for!(ix_board::agents::AgentsReport),
+        "ProbeResponse" => schemars::schema_for!(ix_board::agents::ProbeResponse),
         "Project" => schemars::schema_for!(Project),
         "ProjectChunk" => schemars::schema_for!(ProjectChunk),
         "ReadyItem" => schemars::schema_for!(ReadyItem),
@@ -21,7 +23,7 @@ fn main() {
         "FocusPlanChunk" => schemars::schema_for!(FocusPlanChunk),
         _ => {
             eprintln!(
-                "usage: cargo run --example export_schema -- <Project|ProjectChunk|ReadyItem|DriftReport|FocusStatus|FocusRecord|FocusHygieneReport|FocusPlanChunk>"
+                "usage: cargo run --example export_schema -- <Project|ProjectChunk|ReadyItem|DriftReport|FocusStatus|FocusRecord|FocusHygieneReport|FocusPlanChunk|AgentsReport|ProbeResponse>"
             );
             std::process::exit(2);
         }

@@ -5,6 +5,7 @@
 //! fixture behind the traits in `ix_board::retro::sources`; no test touches Linear, GitHub,
 //! herdr or a relay. Stores live under the system temporary directory, outside any repository.
 
+use ix_trace_rs::trace;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -414,7 +415,15 @@ fn agent_row(verdict: Verdict, last_turn: Option<u64>) -> AgentRow {
         partial: false,
         last_turn_age_secs: last_turn,
         subagent_age_secs: None,
-        live_subagents: 0,
+        live_subagents: Some(0),
+        active_direct_workers: Some(0),
+        active_nested_workers: Some(0),
+        workers: Vec::new(),
+        availability: ix_board::agents::AgentAvailability::default(),
+        recent_activity_at: None,
+        host_now: 0,
+        collection_started_at: 0,
+        collection_finished_at: 0,
         processes: Vec::new(),
         git: GitAges::default(),
         excerpt: None,
@@ -426,6 +435,7 @@ fn agent_row(verdict: Verdict, last_turn: Option<u64>) -> AgentRow {
 
 fn agents_report(rows: Vec<AgentRow>) -> AgentsReport {
     AgentsReport {
+        schema_version: ix_board::agents::AGENTS_SCHEMA_VERSION,
         teams: vec!["SWM".to_owned()],
         idle_after_secs: 1200,
         agents: rows,
@@ -2830,4 +2840,42 @@ fn the_snapshot_window_excludes_its_start_and_includes_the_snapshot_instant() {
     assert_eq!(value(&record, "prs_merged_per_hour"), Some(2.0 / 24.0));
     assert_eq!(value(&record, "pr_cycle_median_hours"), Some(1.0));
     assert_eq!(value(&record, "pr_cycle_p90_hours"), Some(3.0));
+}
+
+#[trace("FR-018-AC-24")]
+#[test]
+fn lifecycle_working_share_excludes_waiting_recent_and_refuses_unresolved_population() {
+    let mut rig = base_rig();
+    rig.agents = Some(Ok(agents_report(vec![
+        agent_row(Verdict::Working, Some(0)),
+        agent_row(Verdict::Waiting, Some(0)),
+        agent_row(Verdict::Recent, Some(0)),
+    ])));
+    let record = snapshot(&rig);
+    assert_eq!(value(&record, "agents_working_share"), Some(1.0 / 3.0));
+    let query = &record.metrics["agents_working_share"].query;
+    assert!(query.starts_with("lifecycle-v2:"));
+    let mut old = record.clone();
+    old.taken_at = "2026-11-01T00:00:00Z".into();
+    old.metrics.get_mut("agents_working_share").unwrap().query = "old age-based definition".into();
+    let report = delta(&[old, record], "{}").unwrap();
+    assert_eq!(
+        one(&report, "agents_working_share").since_previous.state,
+        ChangeState::QueryChanged
+    );
+    for unknown in [false, true] {
+        let mut report = agents_report(vec![agent_row(
+            if unknown {
+                Verdict::Unknown
+            } else {
+                Verdict::Working
+            },
+            Some(0),
+        )]);
+        if !unknown {
+            report.missing_teams.push("missing".into());
+        }
+        rig.agents = Some(Ok(report));
+        assert_eq!(value(&snapshot(&rig), "agents_working_share"), None);
+    }
 }

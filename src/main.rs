@@ -57,6 +57,9 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Internal read-only lifecycle probe protocol.
+    #[command(name = "__agent-probe", hide = true)]
+    AgentProbe,
     /// Manage the Linear API key in the operating system credential store.
     Auth {
         #[command(subcommand)]
@@ -382,6 +385,24 @@ fn parse_positive_size(value: &str) -> Result<NonZeroUsize, String> {
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     let diagnostics = Diagnostics::resolved(cli.diagnostics_format, cli.color);
+    if matches!(&cli.command, Command::AgentProbe) {
+        let result = std::env::var_os("HOME")
+            .ok_or_else(|| "home_unavailable".to_owned())
+            .and_then(|home| {
+                ix_board::agents::serve_probe(std::io::stdin().lock(), &PathBuf::from(home))
+                    .map_err(|e| e.to_string())
+            });
+        return match result {
+            Ok(text) => {
+                emit_result(&text);
+                std::process::ExitCode::SUCCESS
+            }
+            Err(error) => {
+                emit_diagnostic(diagnostics, "error", &error);
+                std::process::ExitCode::from(Outcome::Invalid)
+            }
+        };
+    }
     if let Err(error) = validate_command(&cli.command) {
         emit_diagnostic(diagnostics, "error", &error.to_string());
         return std::process::ExitCode::from(Outcome::Invalid);
@@ -819,6 +840,7 @@ fn run_linear(command: Command) -> Result<Output, Error> {
     let mut service = ReadService::open_default(source)?;
     match command {
         Command::Auth { .. } => unreachable!("auth commands are handled before Linear dispatch"),
+        Command::AgentProbe => unreachable!("probe is handled before normal dispatch"),
         Command::Agents { .. } => unreachable!("agents is handled before Linear dispatch"),
         Command::Retro { .. } => unreachable!("retro is handled before Linear dispatch"),
         Command::Scope { .. }
