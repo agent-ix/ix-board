@@ -1097,3 +1097,34 @@ Ticket: SWM-158. Reviewed frozen spec-only PR ix-board#64 at 73367fee91adda8ef51
 No applicable AssuranceProfile exists under spec/. Direct subset review authorized by the dispatch. No enforced ix-flow run or human acceptance is claimed. Changed documents pass quire validation; full-repository validation has existing structural failures in FR-004, FR-016, FR-017 and roadmap/ears-campaign-stories.md. The computed matrix does not bind the existing Rust /// Trace comments under the installed grammar; draft Rust files in the shared worktree can appear in its diagnostics, so this is context only, not a frozen-code coverage verdict. No new lifecycle tests are implemented by this spec PR. No aggregate gate was run. Installed tools: quoin 0.36.7, quire 0.52.0 (engine 0.62.2), spec-artifacts-process@v0.29.2.
 
 Rust-review, React review and gap-analysis are skipped because no production code changes are committed. Criterion-strength is not selected; no calibrated Jev claim is made. Object review is not selected: no standalone domain-object artifact is added or edited; the existing command's lifecycle observation/output is assessed through integrity and boundary lenses. The approved nullable alias, observation provenance and WAITING/RECENT choices are binding user decisions.
+
+## Dispositions
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-001 | fixed | Fix bd4ce17e98e7a233ba90e4f0ad58eacefd709a4d updates both the output rule and AC-14: completeness plus absence of qualifying active workers permits zero, explicitly including empty, nonempty all-terminal and excluded-only graphs. No regression found in the fix-only diff. |
+
+## Disposition pass 1
+
+**PASS** — all findings resolved at bd4ce17e98e7a233ba90e4f0ad58eacefd709a4d. Original findings and review-pass verdict above are preserved as historical evidence. The change is limited to the exact-zero output rule and AC-14; nine original review artifacts were retained verbatim. No new defect was found. This is spec acceptance only; implementation tests and aggregate gate are not claimed.
+
+```yaml
+{
+  "dispositions": [
+    {
+      "fnd": "FND-001",
+      "outcome": "fixed",
+      "after_excerpt": "Ambiguous ancestry, conflicting duplicate identities, unknown role/state, missing discovered children and unsupported lifecycle formats yield explicit uncertainty/null in affected counts; complete evidence with no qualifying active workers yields exact zero, tested with empty, nonempty all-terminal (completed/stopped), and excluded-only graphs."
+    }
+  ],
+  "scope": [
+    {
+      "id": "FR-018-AC-14",
+      "path": "spec/functional/FR-018-agent-activity-verdicts.md",
+      "role": "examined",
+      "excerpt": "Ambiguous ancestry, conflicting duplicate identities, unknown role/state, missing discovered children and unsupported lifecycle formats yield explicit uncertainty/null in affected counts; complete evidence with no qualifying active workers yields exact zero, tested with empty, nonempty all-terminal (completed/stopped), and excluded-only graphs."
+    }
+  ],
+  "new_findings": []
+}
+```
