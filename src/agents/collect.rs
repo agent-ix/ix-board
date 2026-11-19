@@ -24,6 +24,8 @@ const MAX_RECORD: u64 = 1024 * 1024;
 const MAX_TRANSCRIPT: u64 = 64 * 1024 * 1024;
 /// Aggregate file-byte budget for a collection, including retries.
 const MAX_READ_BYTES: u64 = 256 * 1024 * 1024;
+/// Identity prepass is part of, and bounded separately within, the total budget.
+const MAX_IDENTITY_READ_BYTES: u64 = 16 * 1024 * 1024;
 /// Maximum discovered entries, pending directory paths and retained headers.
 const MAX_FILES: usize = 20_000;
 /// Maximum workers per requested graph.
@@ -89,17 +91,28 @@ fn read_bytes(path: &Path, limit: u64, budget: &mut Budget) -> Result<Vec<u8>, &
             return Err("file_size_limit");
         }
         budget.check()?;
+        let cap = (limit + 1).min(budget.remaining);
+        if cap == 0 || before.0 > cap {
+            return Err("collection_byte_limit");
+        }
         let mut bytes = Vec::new();
-        File::open(path)
+        let result = File::open(path)
             .map_err(|_| "file_unreadable")?
-            .take(limit + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| "file_unreadable")?;
-        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limit {
+            .take(cap)
+            .read_to_end(&mut bytes);
+        let read = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        budget.take(read)?;
+        if before != stamp(path)? {
+            return Ok(None);
+        }
+        result.map_err(|_| "file_unreadable")?;
+        if read > limit {
             return Err("file_size_limit");
         }
-        budget.take(u64::try_from(bytes.len()).unwrap_or(u64::MAX))?;
-        Ok((before == stamp(path)?).then_some(bytes))
+        if cap < limit + 1 && read == cap && before.0 == 0 {
+            return Err("collection_byte_limit");
+        }
+        Ok(Some(bytes))
     })
 }
 fn walk(root: &Path, availability: &mut Availability, budget: &Budget) -> Vec<PathBuf> {
@@ -160,17 +173,29 @@ fn first_record(path: &Path, budget: &mut Budget) -> Result<Value, &'static str>
     retry_sample(|| {
         let before = stamp(path)?;
         budget.check()?;
+        let cap = (MAX_RECORD + 1).min(budget.remaining);
+        if cap == 0 {
+            return Err("collection_byte_limit");
+        }
         let file = File::open(path).map_err(|_| "header_unreadable")?;
+        let mut reader = BufReader::new(file.take(cap));
         let mut bytes = Vec::new();
-        BufReader::new(file.take(MAX_RECORD + 1))
-            .read_until(b'\n', &mut bytes)
-            .map_err(|_| "header_unreadable")?;
+        let result = reader.read_until(b'\n', &mut bytes);
+        // Charge physical buffered reads, including bytes read past the newline.
+        let read = cap - reader.into_inner().limit();
+        budget.take(read)?;
+        if before != stamp(path)? {
+            return Ok(None);
+        }
+        result.map_err(|_| "header_unreadable")?;
         if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_RECORD {
             return Err("header_size_limit");
         }
-        budget.take(u64::try_from(bytes.len()).unwrap_or(u64::MAX))?;
+        if cap < MAX_RECORD + 1 && bytes.last() != Some(&b'\n') && before.0 > cap {
+            return Err("collection_byte_limit");
+        }
         let value = serde_json::from_slice(&bytes).map_err(|_| "header_malformed")?;
-        Ok((before == stamp(path)?).then_some(value))
+        Ok(Some(value))
     })
 }
 fn read_header(
@@ -213,30 +238,38 @@ fn read_transcript(
         }
         budget.take(before.0.saturating_add(1))?;
         let file = File::open(path).map_err(|_| "transcript_unreadable")?;
-        let mut reader = BufReader::new(file.take(MAX_TRANSCRIPT + 1));
-        let mut life = Lifecycle::default();
-        loop {
-            budget.check()?;
-            let mut bytes = Vec::new();
-            let n = reader
-                .by_ref()
-                .take(MAX_RECORD + 1)
-                .read_until(b'\n', &mut bytes)
-                .map_err(|_| "transcript_unreadable")?;
-            if n == 0 {
-                break;
+        // Read the sampled extent. Appended bytes belong to the retry, rather
+        // than consuming uncharged bytes or exposing a partial new record.
+        let mut reader = BufReader::new(file.take(before.0));
+        let result = (|| {
+            let mut life = Lifecycle::default();
+            loop {
+                budget.check()?;
+                let mut bytes = Vec::new();
+                let n = reader
+                    .by_ref()
+                    .take(MAX_RECORD + 1)
+                    .read_until(b'\n', &mut bytes)
+                    .map_err(|_| "transcript_unreadable")?;
+                if n == 0 {
+                    break;
+                }
+                if u64::try_from(n).unwrap_or(u64::MAX) > MAX_RECORD {
+                    return Err("record_size_limit");
+                }
+                if bytes.iter().all(u8::is_ascii_whitespace) {
+                    continue;
+                }
+                let value =
+                    serde_json::from_slice(&bytes).map_err(|_| "malformed_transcript_record")?;
+                adapter.observe_record(&value, &mut life);
             }
-            if u64::try_from(n).unwrap_or(u64::MAX) > MAX_RECORD {
-                return Err("record_size_limit");
-            }
-            if bytes.iter().all(u8::is_ascii_whitespace) {
-                continue;
-            }
-            let value =
-                serde_json::from_slice(&bytes).map_err(|_| "malformed_transcript_record")?;
-            adapter.observe_record(&value, &mut life);
+            Ok(life)
+        })();
+        if before != stamp(path)? {
+            return Ok(None);
         }
-        Ok((before == stamp(path)?).then_some(life))
+        result.map(Some)
     })
 }
 
@@ -498,14 +531,29 @@ fn collect_claude(
             (path, metadata)
         })
         .collect();
-    candidates.sort_by(|(a_path, a), (b_path, b)| {
+    let reserved = budget.remaining.min(MAX_IDENTITY_READ_BYTES);
+    let mut identity_budget = Budget {
+        remaining: reserved,
+        deadline: budget.deadline,
+    };
+    let mut candidates: Vec<_> = candidates
+        .drain(..)
+        .map(|(path, metadata)| {
+            let identity = claude_identity(&path, &mut identity_budget);
+            (path, metadata, identity)
+        })
+        .collect();
+    budget.remaining = budget
+        .remaining
+        .saturating_sub(reserved - identity_budget.remaining);
+    candidates.sort_by(|(a_path, a, _), (b_path, b, _)| {
         let terminal = |meta: &Result<ClaudeMetadata, &'static str>| {
             meta.as_ref()
                 .is_ok_and(|meta| meta.finished || meta.stopped)
         };
         (terminal(a), a_path).cmp(&(terminal(b), b_path))
     });
-    for (path, metadata) in candidates {
+    for (path, metadata, identity) in candidates {
         let Some(id) = path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -524,7 +572,7 @@ fn collect_claude(
                 transcript_complete = false;
                 // Small identity evidence remains useful even when historical replay
                 // cannot fit. It cannot prove the absence of later assignments.
-                let mut life = claude_identity(&path, budget).unwrap_or_default();
+                let mut life = identity.unwrap_or_default();
                 life.issue(reason);
                 life
             }
@@ -544,6 +592,9 @@ fn collect_claude(
         merge_parent_facts(files, &life);
         let mut worker = observation(AgentId(id.into()), &life, adapter);
         worker.descendants_complete = transcript_complete;
+        if !transcript_complete {
+            worker.provenance = vec!["identity_header".into()];
+        }
         if life
             .record_agent_id
             .as_ref()
@@ -1057,5 +1108,93 @@ mod tests {
                 .contains(&"descendant_references_incomplete".into())
         );
         assert!(budget.remaining > 0 && budget.remaining < limit);
+    }
+    #[test]
+    #[trace("FR-018-AC-20")]
+    fn header_reads_charge_buffered_bytes_and_stop_at_the_remaining_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("header.jsonl");
+        fs::write(
+            &path,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"header-only\"}}\n",
+        )
+        .unwrap();
+        let mut budget = Budget {
+            remaining: 8,
+            deadline: Instant::now() + Duration::from_secs(5),
+        };
+        assert_eq!(
+            first_record(&path, &mut budget).unwrap_err(),
+            "collection_byte_limit"
+        );
+        assert_eq!(budget.remaining, 0);
+        assert_eq!(
+            first_record(&path, &mut budget).unwrap_err(),
+            "collection_byte_limit"
+        );
+        assert_eq!(budget.remaining, 0);
+    }
+    struct ExpandingAdapter {
+        path: PathBuf,
+        expanded: std::sync::atomic::AtomicBool,
+        observed_unpaid_record: std::sync::atomic::AtomicBool,
+    }
+    impl Harness for ExpandingAdapter {
+        fn kind(&self) -> HarnessKind {
+            HarnessKind::Claude
+        }
+        fn evidence_source(&self) -> super::super::EvidenceSource {
+            super::super::EvidenceSource::Claude
+        }
+        fn observe_record(&self, value: &Value, life: &mut Lifecycle) {
+            use std::sync::atomic::Ordering::SeqCst;
+            adapter_for("claude").unwrap().observe_record(value, life);
+            if value.get("padding").is_some() {
+                self.observed_unpaid_record.store(true, SeqCst);
+            }
+            if value["type"] == "user" && !self.expanded.swap(true, SeqCst) {
+                use std::io::Write;
+                let mut file = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&self.path)
+                    .unwrap();
+                writeln!(
+                    file,
+                    "{}",
+                    serde_json::json!({"type":"system","padding":"x".repeat(20*1024)})
+                )
+                .unwrap();
+            }
+        }
+    }
+    #[test]
+    #[trace("FR-018-AC-20")]
+    fn an_append_cannot_feed_records_beyond_the_prepaid_transcript_extent() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("transcript.jsonl");
+        fs::write(
+            &path,
+            include_str!("../../tests/fixtures/agents/claude_done.jsonl"),
+        )
+        .unwrap();
+        let adapter = ExpandingAdapter {
+            path: path.clone(),
+            expanded: std::sync::atomic::AtomicBool::new(false),
+            observed_unpaid_record: std::sync::atomic::AtomicBool::new(false),
+        };
+        let mut budget = Budget {
+            remaining: 1024,
+            deadline: Instant::now() + Duration::from_secs(5),
+        };
+        assert_eq!(
+            read_transcript(&path, &adapter, &mut budget).unwrap_err(),
+            "collection_byte_limit"
+        );
+        assert!(
+            !adapter
+                .observed_unpaid_record
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert!(budget.remaining < 1024);
     }
 }

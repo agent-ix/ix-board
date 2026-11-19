@@ -103,6 +103,7 @@ limit exhaustion produce explicit unavailable evidence.
 Claude metadata prioritizes unfinished assignments before old terminal transcripts.
 Small identity records remain visible when full replay exceeds the budget.
 Unread transcript references keep descendant counts uncertain.
+The identity prepass uses at most 16 MiB of the existing read budget.
 
 ## Examples
 
