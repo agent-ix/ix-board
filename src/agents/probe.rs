@@ -5,16 +5,18 @@
 //! probe request and its output parser, and the system implementation that
 //! runs herdr locally and the probe script locally or over `ssh`.
 
-use super::{AgentsError, harness::HarnessKind};
+use super::{AgentsError, harness::HarnessKind, lifecycle::{Availability, Lifecycle, WorkerObservation}};
+use serde::{Serialize, Deserialize};
+use schemars::JsonSchema;
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-const PROBE_SCRIPT: &str = include_str!("probe.sh");
-
-/// Minutes of recent rollout files scanned for Codex child threads.
-const CHILD_WINDOW_MINUTES: u64 = 180;
+/// Current request/response protocol; incompatible peers are refused.
+pub const PROBE_VERSION: u32 = 2;
+/// Maximum encoded protocol input or output (16 MiB).
+pub const MAX_PROTOCOL_BYTES: usize = 16 * 1024 * 1024;
 
 /// A machine the detector can read: herdr state plus one batched file probe.
 pub trait Host: Sync {
@@ -29,7 +31,8 @@ pub trait Host: Sync {
 }
 
 /// One agent session to locate on a machine.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SessionQuery {
     /// Harness that owns the transcript layout.
     pub kind: HarnessKind,
@@ -38,7 +41,8 @@ pub struct SessionQuery {
 }
 
 /// Everything one probe reads.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ProbeRequest {
     /// Sessions whose transcripts to locate.
     pub sessions: Vec<SessionQuery>,
@@ -47,20 +51,30 @@ pub struct ProbeRequest {
 }
 
 impl ProbeRequest {
-    fn script_args(&self) -> Vec<String> {
-        let mut args = vec![CHILD_WINDOW_MINUTES.to_string()];
-        args.extend(
-            self.sessions
-                .iter()
-                .map(|query| format!("session|{}|{}", query.kind.as_str(), query.session_id)),
-        );
-        args.extend(self.cwds.iter().map(|cwd| format!("git|{cwd}")));
-        args
+    /// Refuses oversized or malformed requests before filesystem discovery.
+    pub fn validate(&self) -> Result<(), AgentsError> {
+        if self.sessions.len() > 128 || self.cwds.len() > 128
+            || self.sessions.iter().any(|s| s.session_id.is_empty() || s.session_id.len() > 512 || s.session_id.contains(['/', '\\', '\0']))
+            || self.cwds.iter().any(|p| p.len() > 4096 || p.contains('\0')) {
+            return Err(AgentsError::ProbeFormat("request_limit_or_invalid_path".into()));
+        }
+        Ok(())
     }
 }
 
+/// Versioned request for the hidden read-only probe.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProbeEnvelope {
+    /// Protocol identity.
+    pub protocol_version: u32,
+    /// Machine-local sources to collect.
+    pub request: ProbeRequest,
+}
+
 /// Files found for one session.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SessionFiles {
     /// Modification time (epoch seconds) of the main transcript.
     pub transcript_mtime: Option<u64>,
@@ -68,10 +82,19 @@ pub struct SessionFiles {
     pub tail: String,
     /// Modification times of subagent or child-thread transcripts.
     pub child_mtimes: Vec<u64>,
+    /// Shared streaming parent facts.
+    pub parent_lifecycle: Lifecycle,
+    /// Normalized descendants.
+    pub workers: Vec<WorkerObservation>,
+    /// Child discovery coverage.
+    pub lifecycle_availability: Availability,
+    /// Parent transcript coverage.
+    pub transcript_availability: Availability,
 }
 
 /// One process running inside a herdr pane.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PaneProcess {
     /// Executable name.
     pub comm: String,
@@ -80,7 +103,8 @@ pub struct PaneProcess {
 }
 
 /// Git timestamps (epoch seconds) for a working directory.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GitTimes {
     /// Committer time of HEAD.
     pub last_commit: Option<u64>,
@@ -89,10 +113,17 @@ pub struct GitTimes {
 }
 
 /// Parsed probe output.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Probe {
     /// The machine's clock, epoch seconds, when the probe ran.
     pub now: u64,
+    /// Collection start in this host's clock domain.
+    pub started_at: u64,
+    /// Collection end in this host's clock domain.
+    pub finished_at: u64,
+    /// Process-source coverage.
+    pub process_availability: Availability,
     /// Files per session id.
     pub sessions: BTreeMap<String, SessionFiles>,
     /// Processes per herdr pane id.
@@ -101,94 +132,48 @@ pub struct Probe {
     pub git: BTreeMap<String, GitTimes>,
 }
 
-enum Section {
-    None,
-    Session(String),
-    Tail(String),
-    Git(String),
+/// Versioned response from the shared Rust probe.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProbeResponse {
+    /// Protocol identity.
+    pub protocol_version: u32,
+    /// Observations and independent coverage results.
+    pub probe: Probe,
 }
 
-fn bad(line: &str) -> AgentsError {
-    AgentsError::ProbeFormat(line.chars().take(120).collect())
-}
-
-fn number(line: &str, text: &str) -> Result<u64, AgentsError> {
-    text.trim().parse().map_err(|_| bad(line))
-}
-
-/// Parses the line records emitted by the probe script.
+/// Decodes a bounded compatible JSON response; there is no heuristic fallback.
 pub fn parse_probe(text: &str) -> Result<Probe, AgentsError> {
-    let mut probe = Probe::default();
-    let mut section = Section::None;
-    for line in text.lines() {
-        if let Section::Tail(sid) = &section {
-            if line == "@@END" {
-                section = Section::None;
-            } else if let Some(files) = probe.sessions.get_mut(sid) {
-                files.tail.push_str(line);
-                files.tail.push('\n');
-            }
-            continue;
+    if text.len() > MAX_PROTOCOL_BYTES { return Err(AgentsError::ProbeFormat("response_size_limit".into())); }
+    let response: ProbeResponse = serde_json::from_str(text).map_err(|source| AgentsError::Decode { what: "probe response", source })?;
+    if response.protocol_version != PROBE_VERSION { return Err(AgentsError::ProbeFormat("incompatible_protocol_version".into())); }
+    response.probe.validate()?;
+    Ok(response.probe)
+}
+impl Probe {
+    /// Validates retained-state bounds even when the peer is independently installed.
+    pub fn validate(&self) -> Result<(), AgentsError> {
+        if self.sessions.len() > 128 || self.git.len() > 128 || self.processes.len() > 4096
+            || self.sessions.values().any(|s| s.workers.len() > 1024 || s.child_mtimes.len() > 1024 || s.parent_lifecycle.calls.len() > 1024 || s.parent_lifecycle.child_states.len() > 1024) {
+            return Err(AgentsError::ProbeFormat("response_state_limit".into()));
         }
-        let Some(record) = line.strip_prefix("@@") else {
-            continue;
-        };
-        let (tag, value) = record.split_once(' ').unwrap_or((record, ""));
-        match (tag, &section) {
-            ("NOW", _) => probe.now = number(line, value)?,
-            ("SESSION", _) => {
-                probe
-                    .sessions
-                    .insert(value.to_owned(), SessionFiles::default());
-                section = Section::Session(value.to_owned());
-            }
-            ("MTIME", Section::Session(sid)) => {
-                if let Some(files) = probe.sessions.get_mut(sid) {
-                    files.transcript_mtime = Some(number(line, value)?);
-                }
-            }
-            ("CHILD", Section::Session(sid)) => {
-                if let Some(files) = probe.sessions.get_mut(sid) {
-                    files.child_mtimes.push(number(line, value)?);
-                }
-            }
-            ("TAIL", Section::Session(sid)) => section = Section::Tail(sid.clone()),
-            ("GIT", _) => {
-                probe.git.insert(value.to_owned(), GitTimes::default());
-                section = Section::Git(value.to_owned());
-            }
-            ("COMMIT", Section::Git(cwd)) => {
-                if let Some(times) = probe.git.get_mut(cwd) {
-                    times.last_commit = Some(number(line, value)?);
-                }
-            }
-            ("DIRTY", Section::Git(cwd)) => {
-                if let Some(times) = probe.git.get_mut(cwd) {
-                    times.uncommitted = Some(number(line, value)?);
-                }
-            }
-            ("END", _) => section = Section::None,
-            ("P", _) => {
-                let mut fields = value.splitn(4, '\t');
-                let (Some(pid), Some(pane), Some(comm)) =
-                    (fields.next(), fields.next(), fields.next())
-                else {
-                    return Err(bad(line));
-                };
-                pid.parse::<u32>().map_err(|_| bad(line))?;
-                probe
-                    .processes
-                    .entry(pane.to_owned())
-                    .or_default()
-                    .push(PaneProcess {
-                        comm: comm.to_owned(),
-                        args: fields.next().unwrap_or("").trim().to_owned(),
-                    });
-            }
-            _ => return Err(bad(line)),
-        }
+        Ok(())
     }
-    Ok(probe)
+}
+
+/// Runs the hidden command's bounded stdin/stdout protocol without Linear access.
+pub fn serve_probe(input: impl Read, home: &std::path::Path) -> Result<String, AgentsError> {
+    let mut bytes = Vec::new();
+    input.take(u64::try_from(MAX_PROTOCOL_BYTES).unwrap_or(u64::MAX) + 1).read_to_end(&mut bytes)
+        .map_err(|source| AgentsError::Spawn { command: "read probe request".into(), source })?;
+    if bytes.len() > MAX_PROTOCOL_BYTES { return Err(AgentsError::ProbeFormat("request_size_limit".into())); }
+    let envelope: ProbeEnvelope = serde_json::from_slice(&bytes).map_err(|source| AgentsError::Decode { what: "probe request", source })?;
+    if envelope.protocol_version != PROBE_VERSION { return Err(AgentsError::ProbeFormat("incompatible_protocol_version".into())); }
+    envelope.request.validate()?;
+    let probe = super::collect::collect_probe(home, &envelope.request)?;
+    let text = serde_json::to_string(&ProbeResponse { protocol_version: PROBE_VERSION, probe }).map_err(|source| AgentsError::Decode { what: "encode probe", source })?;
+    if text.len() > MAX_PROTOCOL_BYTES { return Err(AgentsError::ProbeFormat("response_size_limit".into())); }
+    Ok(text)
 }
 
 /// A machine reached through the system `herdr`, `sh` and `ssh` binaries.
@@ -231,13 +216,14 @@ fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<V
     std::thread::spawn(move || {
         let mut bytes = Vec::new();
         if let Some(mut pipe) = pipe {
-            let _ = pipe.read_to_end(&mut bytes);
+            let _ = pipe.by_ref().take(u64::try_from(MAX_PROTOCOL_BYTES).unwrap_or(u64::MAX) + 1).read_to_end(&mut bytes);
+            let _ = std::io::copy(&mut pipe, &mut std::io::sink());
         }
         bytes
     })
 }
 
-fn run(
+pub(super) fn run(
     command: &mut Command,
     stdin: Option<&str>,
     timeout: Duration,
@@ -279,6 +265,7 @@ fn run(
     };
     let stdout = out_reader.join().unwrap_or_default();
     let stderr = err_reader.join().unwrap_or_default();
+    if stdout.len() > MAX_PROTOCOL_BYTES || stderr.len() > MAX_PROTOCOL_BYTES { return Err(AgentsError::ProbeFormat("command_output_limit".into())); }
     if !status.success() {
         return Err(AgentsError::CommandFailed {
             command: rendered,
@@ -287,11 +274,6 @@ fn run(
         });
     }
     Ok(String::from_utf8_lossy(&stdout).into_owned())
-}
-
-/// Quotes one word for a POSIX shell command line.
-fn shell_quote(word: &str) -> String {
-    format!("'{}'", word.replace('\'', r"'\''"))
 }
 
 impl Host for SystemHost {
@@ -308,26 +290,23 @@ impl Host for SystemHost {
     }
 
     fn probe(&self, request: &ProbeRequest) -> Result<Probe, AgentsError> {
-        let args = request.script_args();
-        let output = match &self.machine {
-            None => run(
-                Command::new("sh").args(["-s", "--"]).args(&args),
-                Some(PROBE_SCRIPT),
-                CALL_TIMEOUT,
-            )?,
-            Some(machine) => {
-                let quoted: Vec<String> = args.iter().map(|arg| shell_quote(arg)).collect();
-                let remote = format!("sh -s -- {}", quoted.join(" "));
-                run(
-                    Command::new("ssh")
-                        .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"])
-                        .arg(&machine.ssh_target)
-                        .arg(remote),
-                    Some(PROBE_SCRIPT),
-                    CALL_TIMEOUT,
-                )?
+        request.validate()?;
+        let input = serde_json::to_string(&ProbeEnvelope { protocol_version: PROBE_VERSION, request: request.clone() })
+            .map_err(|source| AgentsError::Decode { what: "encode probe request", source })?;
+        let mut command;
+        match &self.machine {
+            None => {
+                let executable = std::env::current_exe().map_err(|source| AgentsError::Spawn { command: "locate current ix-board".into(), source })?;
+                command = Command::new(executable);
+                command.arg("__agent-probe");
             }
-        };
+            Some(machine) => {
+                command = Command::new("ssh");
+                command.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--"])
+                    .arg(&machine.ssh_target).arg("ix-board __agent-probe");
+            }
+        }
+        let output = run(&mut command, Some(&input), CALL_TIMEOUT)?;
         parse_probe(&output)
     }
 }
@@ -336,10 +315,6 @@ impl Host for SystemHost {
 mod tests {
     use super::*;
 
-    #[test]
-    fn shell_quote_survives_single_quotes() {
-        assert_eq!(shell_quote("a'b c"), r"'a'\''b c'");
-    }
 
     #[test]
     fn a_hung_command_is_killed_and_reported_as_a_timeout() {

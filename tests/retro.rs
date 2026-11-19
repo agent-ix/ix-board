@@ -414,7 +414,15 @@ fn agent_row(verdict: Verdict, last_turn: Option<u64>) -> AgentRow {
         partial: false,
         last_turn_age_secs: last_turn,
         subagent_age_secs: None,
-        live_subagents: 0,
+        live_subagents: Some(0),
+        active_direct_workers: Some(0),
+        active_nested_workers: Some(0),
+        workers: Vec::new(),
+        availability: ix_board::agents::AgentAvailability::default(),
+        recent_activity_at: None,
+        host_now: 0,
+        collection_started_at: 0,
+        collection_finished_at: 0,
         processes: Vec::new(),
         git: GitAges::default(),
         excerpt: None,
@@ -426,6 +434,7 @@ fn agent_row(verdict: Verdict, last_turn: Option<u64>) -> AgentRow {
 
 fn agents_report(rows: Vec<AgentRow>) -> AgentsReport {
     AgentsReport {
+        schema_version: ix_board::agents::AGENTS_SCHEMA_VERSION,
         teams: vec!["SWM".to_owned()],
         idle_after_secs: 1200,
         agents: rows,

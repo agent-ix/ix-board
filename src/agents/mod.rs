@@ -9,6 +9,8 @@
 //! subagents, child processes, the pane tail and git ages, and decides one
 //! [`Verdict`] with [`decide`]. All machine access goes through [`Host`].
 
+mod collect;
+mod lifecycle;
 mod harness;
 mod herdr;
 mod probe;
@@ -23,12 +25,17 @@ pub use probe::{
     parse_probe,
 };
 
-use serde::Serialize;
+use serde::{Serialize, Deserialize};
+use schemars::JsonSchema;
+pub use lifecycle::{AgentId, WorkerState, WorkerRole, WorkerObservation, EvidenceSource, Availability, AgentAvailability, Lifecycle, WorkerCounts, count_workers};
+pub use collect::collect_probe;
+pub use probe::{ProbeEnvelope, ProbeResponse, PROBE_VERSION, MAX_PROTOCOL_BYTES, serve_probe};
+
+/// Lifecycle report schema.
+pub const AGENTS_SCHEMA_VERSION: u32 = 2;
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error as ThisError;
 
-/// A subagent written within this many seconds is live.
-const SUBAGENT_LIVE_SECS: u64 = 10 * 60;
 /// A background wait with no activity for this many seconds is stuck.
 const STUCK_AFTER_SECS: u64 = 15 * 60;
 /// Lines of pane tail read from herdr.
@@ -83,11 +90,17 @@ pub enum AgentsError {
 }
 
 /// What an agent is doing right now.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub enum Verdict {
     /// Active, or active recently enough not to need attention.
     #[serde(rename = "WORKING")]
     Working,
+    /// The lead awaits unfinished worker assignments.
+    #[serde(rename = "WAITING")]
+    Waiting,
+    /// Execution ended recently; no assigned workers remain.
+    #[serde(rename = "RECENT")]
+    Recent,
     /// Waiting for background agents that have gone quiet.
     #[serde(rename = "WAITING-STUCK")]
     WaitingStuck,
@@ -109,6 +122,8 @@ impl Verdict {
     fn label(self) -> &'static str {
         match self {
             Self::Working => "WORKING",
+            Self::Waiting => "WAITING",
+            Self::Recent => "RECENT",
             Self::WaitingStuck => "WAITING-STUCK",
             Self::Prompt => "PROMPT",
             Self::Asking => "ASKING",
@@ -118,75 +133,71 @@ impl Verdict {
     }
 }
 
-/// Facts the verdict is computed from.
-#[derive(Clone, Copy, Debug)]
+/// Normalized evidence consumed by the harness-independent classifier.
+#[derive(Clone, Debug)]
 pub struct Evidence<'a> {
-    /// herdr lifecycle state.
+    /// Current Herdr observation.
     pub herdr: HerdrState,
-    /// Pane tail; present for non-working panes.
+    /// Pane text, read even when Herdr reports working.
     pub tail: Option<&'a str>,
-    /// Seconds since the last turn, when a transcript was found.
-    pub last_turn_age: Option<u64>,
-    /// Seconds since the newest subagent write.
-    pub subagent_age: Option<u64>,
-    /// Build or gate processes running in the pane.
+    /// Shared parent lifecycle facts.
+    pub lifecycle: &'a Lifecycle,
+    /// Deduplicated worker graph and independent exact counts.
+    pub workers: &'a WorkerCounts,
+    /// Attributed executing build/gate commands.
     pub active_processes: usize,
-    /// Last assistant message in the transcript.
-    pub last_assistant: Option<&'a str>,
-    /// `--idle-after` in seconds.
+    /// Whether process absence is established.
+    pub processes_complete: bool,
+    /// Whether the parent transcript was fully understood.
+    pub transcript_complete: bool,
+    /// Host clock at observation.
+    pub now: u64,
+    /// Quiet threshold in seconds.
     pub idle_after: u64,
 }
 
-impl Evidence<'_> {
-    fn live_subagents_present(&self) -> bool {
-        self.subagent_age
-            .is_some_and(|age| age < SUBAGENT_LIVE_SECS)
-    }
-
-    fn newest_activity_age(&self) -> Option<u64> {
-        self.last_turn_age
-            .into_iter()
-            .chain(self.subagent_age)
-            .min()
-    }
-
-    fn tail_says_waiting_for_background_agents(&self) -> bool {
-        self.tail
-            .is_some_and(|tail| tail.to_lowercase().contains("waiting for background agent"))
-    }
-}
-
-/// Applies the FR-018 rule order; the first match wins.
-pub fn decide(evidence: &Evidence<'_>) -> Verdict {
-    if evidence.herdr == HerdrState::Blocked {
-        return Verdict::Prompt;
-    }
-    if evidence.herdr == HerdrState::Working
-        || evidence.live_subagents_present()
-        || evidence.active_processes > 0
-    {
-        return Verdict::Working;
-    }
-    if evidence.tail_says_waiting_for_background_agents()
-        && evidence
-            .newest_activity_age()
-            .is_none_or(|age| age >= STUCK_AFTER_SECS)
-    {
-        return Verdict::WaitingStuck;
-    }
-    if evidence.herdr == HerdrState::Unknown {
-        return Verdict::Unknown;
-    }
-    if evidence.last_assistant.is_some_and(asks_for_input) {
+/// Applies lifecycle verdict precedence, without using file ages as execution.
+pub fn decide(e: &Evidence<'_>) -> Verdict {
+    let life = e.lifecycle;
+    if e.herdr == HerdrState::Blocked { return Verdict::Prompt; }
+    let terminal = life.execution_ended_at.is_some();
+    let awaiting = life.state == WorkerState::Waiting || e.tail.is_some_and(|tail| tail.to_lowercase().contains("waiting for background agent"));
+    if life.assistant.as_deref().is_some_and(asks_for_input)
+        && (terminal || matches!(e.herdr, HerdrState::Idle | HerdrState::Done))
+        && e.active_processes == 0 {
         return Verdict::Asking;
     }
-    if evidence
-        .newest_activity_age()
-        .is_some_and(|age| age < evidence.idle_after)
-    {
-        return Verdict::Working;
+    let clock_bad = life.last_activity_at.is_some_and(|at| at > e.now)
+        || life.state_changed_at.is_some_and(|at| at > e.now);
+    if clock_bad || !life.issues.is_empty()
+        || (terminal && e.herdr == HerdrState::Working && !awaiting)
+        || (terminal && e.active_processes > 0) {
+        return Verdict::Unknown;
     }
-    Verdict::Idle
+    let any_workers = e.workers.workers.iter().any(|w| w.role == WorkerRole::Worker && w.state.is_active() && w.issues.is_empty());
+    let direct_active = e.workers.direct.is_some_and(|n| n > 0)
+        || e.workers.workers.iter().any(|w| w.role == WorkerRole::Worker && w.state.is_active() && w.issues.is_empty()
+            && w.parent_id.as_ref() == life.identity.as_ref().map(|(id,_)| id));
+    if awaiting {
+        if any_workers { return Verdict::Waiting; }
+        if e.workers.direct == Some(0) && e.workers.nested == Some(0) && e.processes_complete && e.active_processes == 0
+            && e.transcript_complete && life.state == WorkerState::Waiting
+            && life.state_changed_at.zip(life.last_activity_at).is_some_and(|(wait, activity)| e.now.saturating_sub(wait.max(activity)) >= STUCK_AFTER_SECS) {
+            return Verdict::WaitingStuck;
+        }
+        return Verdict::Unknown;
+    }
+    let current = e.herdr == HerdrState::Working || e.active_processes > 0;
+    if !current && direct_active { return Verdict::Waiting; }
+    // Reading pane evidence is necessary to rule out a pending explicit wait.
+    if current && e.tail.is_some() { return Verdict::Working; }
+    if e.herdr == HerdrState::Unknown || !e.transcript_complete || e.tail.is_none()
+        || e.workers.direct != Some(0) || e.workers.nested != Some(0) { return Verdict::Unknown; }
+    // An old open task is not proof of live execution or established quiet.
+    if terminal && let Some(age) = life.last_activity_at.and_then(|at| e.now.checked_sub(at)) {
+        return if age < e.idle_after { Verdict::Recent } else { Verdict::Idle };
+    }
+    Verdict::Unknown
 }
 
 /// Whether an assistant message ends by asking the human something.
@@ -219,7 +230,8 @@ pub fn asks_for_input(message: &str) -> bool {
 }
 
 /// The next ready ticket of a team.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReadyTicket {
     /// Linear issue identifier.
     pub identifier: String,
@@ -228,7 +240,8 @@ pub struct ReadyTicket {
 }
 
 /// Ages of a pane's git working directory, in seconds.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GitAges {
     /// Seconds since the last commit.
     pub last_commit_secs: Option<u64>,
@@ -237,7 +250,8 @@ pub struct GitAges {
 }
 
 /// One agent pane and its verdict.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AgentRow {
     /// Team (workspace label).
     pub team: String,
@@ -262,7 +276,23 @@ pub struct AgentRow {
     /// Seconds since the newest subagent write.
     pub subagent_age_secs: Option<u64>,
     /// Subagents written within the live window.
-    pub live_subagents: usize,
+    pub live_subagents: Option<usize>,
+    /// Active unfinished direct assignments; null means incomplete evidence.
+    pub active_direct_workers: Option<usize>,
+    /// Active unfinished descendants at depth two or greater.
+    pub active_nested_workers: Option<usize>,
+    /// Normalized observations, including excluded internal sessions.
+    pub workers: Vec<WorkerObservation>,
+    /// Independent source availability.
+    pub availability: AgentAvailability,
+    /// Last structured execution activity, independent of file writes.
+    pub recent_activity_at: Option<u64>,
+    /// Clock of the host holding this row's files.
+    pub host_now: u64,
+    /// Collection start and end in that host's clock domain.
+    pub collection_started_at: u64,
+    /// Collection end in that host's clock domain.
+    pub collection_finished_at: u64,
     /// Build or gate commands running in the pane.
     pub processes: Vec<String>,
     /// Git ages of the pane directory.
@@ -278,8 +308,11 @@ pub struct AgentRow {
 }
 
 /// Result of one `agents` invocation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AgentsReport {
+    /// Lifecycle schema identity.
+    pub schema_version: u32,
     /// Teams asked for.
     pub teams: Vec<String>,
     /// Idle threshold in seconds.
@@ -367,6 +400,7 @@ pub fn build_report(
         .cloned()
         .collect();
     AgentsReport {
+        schema_version: AGENTS_SCHEMA_VERSION,
         teams: teams.to_vec(),
         idle_after_secs,
         agents,
@@ -475,233 +509,55 @@ fn build_row(
 ) -> AgentRow {
     let mut notes = Vec::new();
     let state = agent.state();
-    let pane_tail = if state == HerdrState::Working {
-        None
-    } else {
-        match host.herdr(&["agent", "read", &agent.pane_id, "--lines", TAIL_LINES]) {
-            Ok(text) => Some(text.trim_end().to_owned()),
-            Err(error) => {
-                notes.push(format!("pane tail unreadable: {error}"));
-                None
-            }
-        }
+    let mut pane_availability = Availability::available();
+    let pane_tail = match host.herdr(&["agent", "read", &agent.pane_id, "--lines", TAIL_LINES]) {
+        Ok(text) => Some(last_chars(&text, 8192)),
+        Err(error) => { notes.push(format!("pane tail unreadable: {error}")); pane_availability.missing("pane_tail_unreadable"); None }
     };
-    let files = agent
-        .session_id()
-        .and_then(|sid| probe.sessions.get(sid))
-        .filter(|files| files.transcript_mtime.is_some());
-    let adapter = adapter_for(&agent.agent);
-    if adapter.is_none() {
-        notes.push(format!("no transcript adapter for {}", agent.agent));
-    } else if files.is_none() {
-        notes.push("transcript not found".to_owned());
+    let unavailable = SessionFiles::default();
+    let files = agent.session_id().and_then(|sid| probe.sessions.get(sid)).unwrap_or(&unavailable);
+    let mut lifecycle_availability = files.lifecycle_availability.clone();
+    let mut transcript_availability = files.transcript_availability.clone();
+    if adapter_for(&agent.agent).is_none() {
+        lifecycle_availability.missing("adapter_unsupported"); transcript_availability.missing("adapter_unsupported");
     }
-    let now = probe.now;
-    let age = |epoch: u64| now.saturating_sub(epoch);
-    let last_turn_age = adapter
-        .and(files)
-        .and_then(|files| files.transcript_mtime)
-        .map(age);
-    let child_ages: Vec<u64> = adapter
-        .and(files)
-        .map(|files| files.child_mtimes.iter().map(|&m| age(m)).collect())
-        .unwrap_or_default();
-    let subagent_age = child_ages.iter().copied().min();
-    let live_subagents = child_ages
-        .iter()
-        .filter(|&&a| a < SUBAGENT_LIVE_SECS)
-        .count();
-    let last_assistant = adapter
-        .zip(files)
-        .and_then(|(adapter, files)| adapter.last_assistant_message(&files.tail));
-    let mut processes: Vec<String> = Vec::new();
+    if files == &unavailable {
+        lifecycle_availability.missing("session_evidence_missing"); transcript_availability.missing("session_evidence_missing");
+    }
+    let mut life = files.parent_lifecycle.clone();
+    if life.identity.is_none() { life.identity = agent.session_id().map(|id| (AgentId(id.into()), None)); }
+    let timing_valid = probe.started_at <= probe.finished_at && probe.finished_at <= probe.now;
+    if !timing_valid { life.issue("inconsistent_host_collection_clock"); transcript_availability.missing("inconsistent_host_collection_clock"); }
+    let counts = count_workers(&AgentId(agent.session_id().unwrap_or("").into()), &files.workers, lifecycle_availability);
+    let age = |epoch| if timing_valid { probe.now.checked_sub(epoch) } else { None };
+    let last_turn_age = files.transcript_mtime.and_then(age);
+    let subagent_age = files.child_mtimes.iter().filter_map(|&m| age(m)).min();
+    let mut processes = Vec::new();
     for process in probe.processes.get(&agent.pane_id).into_iter().flatten() {
-        if is_work_command(process) && !processes.contains(&process.comm) {
-            processes.push(process.comm.clone());
-        }
+        if is_work_command(process) && !processes.contains(&process.comm) { processes.push(process.comm.clone()); }
     }
-    let verdict = decide(&Evidence {
-        herdr: state,
-        tail: pane_tail.as_deref(),
-        last_turn_age,
-        subagent_age,
-        active_processes: processes.len(),
-        last_assistant: last_assistant.as_deref(),
-        idle_after,
-    });
+    let verdict = decide(&Evidence { herdr: state, tail: pane_tail.as_deref(), lifecycle: &life, workers: &counts,
+        active_processes: processes.len(), processes_complete: probe.process_availability.complete,
+        transcript_complete: transcript_availability.complete, now: probe.now, idle_after });
+    let availability = AgentAvailability { lifecycle: counts.availability, transcript: transcript_availability,
+        processes: probe.process_availability.clone(), pane: pane_availability };
+    for source in [&availability.lifecycle, &availability.transcript, &availability.processes, &availability.pane] {
+        notes.extend(source.reasons.clone());
+    }
+    notes.extend(life.issues.clone());
     let excerpt = match verdict {
-        Verdict::Prompt => pane_tail
-            .as_deref()
-            .map(|tail| last_chars(tail, EXCERPT_CHARS)),
-        Verdict::Asking => last_assistant
-            .as_deref()
-            .map(|text| last_chars(text, EXCERPT_CHARS)),
-        Verdict::Unknown => Some(format!(
-            "herdr status {:?}; title {:?}; pane {}",
-            agent.agent_status, agent.terminal_title_stripped, agent.pane_id
-        )),
+        Verdict::Prompt => pane_tail.as_deref().map(|t| last_chars(t, EXCERPT_CHARS)),
+        Verdict::Asking => life.assistant.as_deref().map(|t| last_chars(t, EXCERPT_CHARS)),
+        Verdict::Unknown => Some(format!("herdr status {:?}; title {:?}; pane {}; {}", agent.agent_status,
+            agent.terminal_title_stripped, agent.pane_id, if notes.is_empty() { "classification_unresolved".into() } else { notes.join("; ") })),
         _ => None,
     };
-    let git = probe
-        .git
-        .get(&agent.cwd)
-        .map(|times| GitAges {
-            last_commit_secs: times.last_commit.map(age),
-            uncommitted_secs: times.uncommitted.map(age),
-        })
-        .unwrap_or_default();
-    AgentRow {
-        team,
-        machine: host.label().to_owned(),
-        pane_id: agent.pane_id.clone(),
-        agent: agent.agent.clone(),
-        title: agent.terminal_title_stripped.clone(),
-        cwd: agent.cwd.clone(),
-        herdr_status: agent.agent_status.clone(),
-        verdict,
-        partial: adapter.is_none() || files.is_none(),
-        last_turn_age_secs: last_turn_age,
-        subagent_age_secs: subagent_age,
-        live_subagents,
-        processes,
-        git,
-        excerpt,
-        pane_tail,
-        next_ready: None,
-        notes,
-    }
-}
-
-fn is_work_command(process: &PaneProcess) -> bool {
-    let runs_gate_wrapper = process
-        .args
-        .split_whitespace()
-        .take(2)
-        .any(|word| word.rsplit('/').next() == Some("locked-build.sh"));
-    WORK_COMMANDS.contains(&process.comm.as_str()) || runs_gate_wrapper
-}
-
-fn last_chars(text: &str, count: usize) -> String {
-    let start = text
-        .char_indices()
-        .rev()
-        .nth(count)
-        .map_or(0, |(index, _)| index);
-    text[start..].trim().to_owned()
-}
-
-/// Parses `--idle-after`: a number followed by `s`, `m` or `h`.
-pub fn parse_duration(text: &str) -> Result<u64, String> {
-    let text = text.trim();
-    let split = text
-        .find(|c: char| !c.is_ascii_digit())
-        .ok_or_else(|| format!("duration {text:?} needs a unit: s, m or h"))?;
-    let (digits, unit) = text.split_at(split);
-    let count: u64 = digits
-        .parse()
-        .map_err(|_| format!("duration {text:?} must start with a number"))?;
-    let scale = match unit {
-        "s" => 1,
-        "m" => 60,
-        "h" => 3600,
-        _ => return Err(format!("duration {text:?} unit must be s, m or h")),
-    };
-    count
-        .checked_mul(scale)
-        .ok_or_else(|| format!("duration {text:?} is too large"))
-}
-
-fn minutes(secs: Option<u64>) -> String {
-    match secs {
-        None => "-".to_owned(),
-        Some(secs) if secs < 3600 => format!("{}m", secs / 60),
-        Some(secs) => format!("{}h{:02}m", secs / 3600, secs % 3600 / 60),
-    }
-}
-
-/// Renders the report as a table with indented evidence lines.
-pub fn render_text(report: &AgentsReport) -> String {
-    let mut lines = vec![format!(
-        "{:<8} {:<8} {:<8} {:<7} {:<14} {:>7} {:>7}  NOTE",
-        "TEAM", "MACHINE", "PANE", "AGENT", "VERDICT", "TURN", "SUB"
-    )];
-    for row in &report.agents {
-        let mut flags = Vec::new();
-        if row.partial {
-            flags.push("partial".to_owned());
-        }
-        if row.live_subagents > 0 {
-            flags.push(format!("{} live subagents", row.live_subagents));
-        }
-        if !row.processes.is_empty() {
-            flags.push(row.processes.join("+"));
-        }
-        if let Some(age) = row.git.uncommitted_secs {
-            flags.push(format!("uncommitted {}", minutes(Some(age))));
-        }
-        lines.push(format!(
-            "{:<8} {:<8} {:<8} {:<7} {:<14} {:>7} {:>7}  {}{}",
-            row.team,
-            row.machine,
-            row.pane_id,
-            row.agent,
-            row.verdict.label(),
-            minutes(row.last_turn_age_secs),
-            minutes(row.subagent_age_secs),
-            row.title,
-            if flags.is_empty() {
-                String::new()
-            } else {
-                format!(" [{}]", flags.join(", "))
-            }
-        ));
-        if let Some(excerpt) = &row.excerpt {
-            lines.push(format!("    {}", excerpt.replace('\n', "\n    ")));
-        }
-        if let Some(ticket) = &row.next_ready {
-            lines.push(format!(
-                "    next ready: {} {}",
-                ticket.identifier, ticket.title
-            ));
-        }
-    }
-    if report.agents.is_empty() {
-        lines.push("(no agent panes found)".to_owned());
-    }
-    for team in &report.missing_teams {
-        lines.push(format!("Missing team: {team} matches no workspace"));
-    }
-    for error in &report.errors {
-        lines.push(format!("Error: {error}"));
-    }
-    if let Some(reason) = &report.ready_queue_error {
-        lines.push(format!("Ready queue unavailable: {reason}"));
-    }
-    lines.join("\n")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn duration_accepts_units_and_refuses_the_rest() {
-        assert_eq!(parse_duration("90s"), Ok(90));
-        assert_eq!(parse_duration("20m"), Ok(1200));
-        assert_eq!(parse_duration("2h"), Ok(7200));
-        assert!(parse_duration("20").is_err());
-        assert!(parse_duration("m").is_err());
-        assert!(parse_duration("5d").is_err());
-    }
-
-    #[test]
-    fn question_detection_reads_the_end_of_the_message() {
-        assert!(asks_for_input("Done.\n\nWhich option do you prefer?"));
-        assert!(asks_for_input("Plan ready. Want me to start coding?\n"));
-        assert!(asks_for_input("I can do A or B. Should I proceed with A."));
-        assert!(!asks_for_input(
-            "Is this ok? I checked it myself.\nPR opened."
-        ));
-        assert!(!asks_for_input("All gates are green and the PR is open."));
-    }
+    let git = probe.git.get(&agent.cwd).map(|t| GitAges { last_commit_secs: t.last_commit.and_then(age), uncommitted_secs: t.uncommitted.and_then(age) }).unwrap_or_default();
+    AgentRow { team, machine: host.label().into(), pane_id: agent.pane_id.clone(), agent: agent.agent.clone(),
+        title: agent.terminal_title_stripped.clone(), cwd: agent.cwd.clone(), herdr_status: agent.agent_status.clone(), verdict,
+        partial: [&availability.lifecycle, &availability.transcript, &availability.processes, &availability.pane].iter().any(|s| !s.complete),
+        last_turn_age_secs: last_turn_age, subagent_age_secs: subagent_age, live_subagents: counts.direct,
+        active_direct_workers: counts.direct, active_nested_workers: counts.nested, workers: counts.workers, availability,
+        recent_activity_at: life.last_activity_at, host_now: probe.now, collection_started_at: probe.started_at,
+        collection_finished_at: probe.finished_at, processes, git, excerpt, pane_tail, next_ready: None, notes }
 }
