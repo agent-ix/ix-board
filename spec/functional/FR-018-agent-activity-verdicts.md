@@ -66,7 +66,9 @@ with a reason, never synthesized from a file modification time.
 
 The deprecated `live_subagents` field SHALL equal `active_direct_workers`,
 including null. This specific nullable alias is retained for existing consumers.
-Exact zero requires a complete discovered lifecycle graph for the relevant count;
+Exact zero requires a complete discovered lifecycle graph for the relevant count
+and no qualifying active workers, including a nonempty graph containing only
+completed, stopped or excluded workers;
 missing evidence is null, never fabricated zero. Known observations remain visible
 when a count is null. Any relevant source unavailability makes the row `partial`;
 uncertainty in one count need not erase an independently complete count.
@@ -211,7 +213,7 @@ instead of treating a partial or failed command as a complete zero-worker report
 | FR-018-AC-11 | Claude fixtures reconcile finished/stoppedByUser/parentAgentId/spawnDepth: both terminal flags mean stopped, resume alone does not reopen finished work, parentUuid never supplies ancestry, missing transition timestamps stay null, and unorderable conflicting evidence yields uncertainty. | Test |
 | FR-018-AC-12 | Codex fixtures distinguish task/turn completion/interruption, successful follow-ups and reopening; list_agents snapshots require matching call_id, string/object statuses normalize without result text, and guardian_review/internal records remain visible but excluded. | Test |
 | FR-018-AC-13 | One active direct worker and one active depth-two worker produce separate counts of one each; internal/approval sessions add zero, and duplicate identical identities never increase either count. | Test |
-| FR-018-AC-14 | Ambiguous ancestry, conflicting duplicate identities, unknown role/state, missing discovered children and unsupported lifecycle formats yield explicit uncertainty/null in affected counts; a complete empty graph alone yields exact zero. | Test |
+| FR-018-AC-14 | Ambiguous ancestry, conflicting duplicate identities, unknown role/state, missing discovered children and unsupported lifecycle formats yield explicit uncertainty/null in affected counts; complete evidence with no qualifying active workers yields exact zero, tested with empty, nonempty all-terminal (completed/stopped), and excluded-only graphs. | Test |
 | FR-018-AC-15 | Normalized output includes identity, immediate parent, role/state, structured activity, transition/observation timestamps and provenance, including excluded records and unavailable timestamp reasons. | Test |
 | FR-018-AC-16 | A fake third harness adapter produces lifecycle observations and correct counts/verdicts using the unchanged shared classifier. | Test |
 | FR-018-AC-17 | WAITING is emitted for a lead awaiting active workers and for an inactive lead with active direct workers; neither state becomes WORKING merely because worker files are recent. | Test |
