@@ -15,7 +15,7 @@ Ticket SWM-158, frozen CODE PR ix-board#65, reviewed SHA d201872100e4fc8b6e8ebdf
 
 ## Verdict
 
-**FAIL** — fix all three findings in this PR, then return this reviewer for dispositions. No merge approval.
+**PASS after disposition round 1** for the reviewed code change at e946b85bdb011aa54508a04683a5b9f78c5d7cfa: all three original findings are fixed, with no new findings. Original review verdict was FAIL. Merge remains subject to the lead's final aggregate gate and exact-head platform evidence.
 
 ## Findings
 
@@ -209,4 +209,29 @@ Protocol, schema/example parity, null equality, independent counts, excluded int
   ]
 }
 ```
+
+
+## Dispositions
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-001 | fixed | Recompiled original reproduction now reports direct=Some(0), nested=Some(0) both before and after injected meta context. New collector regression covers completed and stopped workers, plus genuine later-assignment uncertainty. |
+| FND-002 | fixed | Recompiled original wait-return/tool-execution reproduction now yields Running without issues. Correlated completion, unrelated results, unresolved parallel waits and generation clearing are exercised. |
+| FND-003 | fixed | Recompiled original late waiting-end reproduction remains Completed in g1 and reports explicit uncertainty. Regression covers both waiting events after completion and cancellation, plus returned waits after completion. |
+
+## Disposition round 1 evidence
+
+Reviewed fix range d201872100e4fc8b6e8ebdf0bf5098d93cd01e3b..e946b85bdb011aa54508a04683a5b9f78c5d7cfa in the existing single worktree. No new findings. This artifact's custody path is reviews/swm-158/code/swm-158-code-review.md; the earlier spec-stage SR-6035 at reviews/swm-158/swm-158-code-review.md is preserved.
+
+Rust-language review is the rust-review lane folded into code-review, not a separate artifact. Original review marker has method=code-review lang=rust; this disposition marker preserves that method ledger. The fix diff changes no spec or plan artifacts, so no spec-review rerun applies.
+
+Boundedness review: aggregate limit remains 256 MiB; the 16 MiB identity prepass is charged within it. All small Claude metadata is collected before transcript replay, unfinished assignments are prioritized, metadata is reread after replay, and byte/read/race failures remain explicit. When full transcript replay is unavailable, descendants_complete=false forces nested uncertainty via descendant_references_incomplete. Known identities/terminal metadata remain visible without claiming a fully scanned graph. The test metadata_priority_preserves_current_workers_before_old_logs_exhaust_the_byte_budget proves current work survives prioritization and exact direct/nested counts remain null after incomplete historical replay. Header buffering charges physical read bytes and append races cannot parse beyond the prepaid extent. No cap was removed or increased.
+
+Schema review: WorkerObservation.descendants_complete and pending-call generation match generated report/probe schemas. The schema test compares both checked-in schemas against generated types. This is one unmerged protocol-v2 delivery; no published compatible-v2 peer is claimed.
+
+Verification rerun at frozen fix head: make fmt-check and make lint passed; 23 agents + 70 retro + 2 schema + 10 agent unit tests passed (105 total). Logs and rebuilt original reproductions are in /tmp/swm158-code-review-round1. Quoin matrix still binds AC-1 through AC-24; new AC-2/3 binder is both_harnesses_decode_all_eight_verdicts_thresholds_and_wait_precedence_from_records. No make ci, full aggregate gate, deployment, branch edit, push, new worktree or second target directory occurred.
+
+Supplied live fix-head projection reports Codex direct=Some(1), nested=Some(0), ten workers, no issues; historical Claude counts remain null with known direct active=3 and explicit byte-limit/collection-race reasons. Missing-identity and false metadata-order warnings are absent. Native Linux evidence on the prior candidate was reported by the lead; exact-fix-head refresh is the lead's independent work and is not claimed complete by this review.
+
+Original Findings rows above remain unchanged. Only latest outcomes here determine PR finding status; repository baseline remains visible.
 
