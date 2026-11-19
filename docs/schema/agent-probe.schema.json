@@ -288,7 +288,7 @@
       "type": "object",
       "properties": {
         "args": {
-          "description": "Full command line.",
+          "description": "Recognized gate-wrapper signal; collection strips other arguments.",
           "type": "string"
         },
         "comm": {

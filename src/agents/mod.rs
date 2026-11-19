@@ -5,8 +5,8 @@
 //! (FR-018).
 //!
 //! A team is a herdr workspace label. For every agent pane in a named team on
-//! every machine this module gathers herdr state, transcript ages, live
-//! subagents, child processes, the pane tail and git ages, and decides one
+//! every machine this module gathers herdr state, lifecycle assignments,
+//! file ages, child processes, pane text and git ages, and decides one
 //! [`Verdict`] with [`decide`]. All machine access goes through [`Host`].
 
 mod collect;
@@ -309,9 +309,9 @@ pub struct AgentRow {
     pub herdr_status: String,
     /// Computed verdict.
     pub verdict: Verdict,
-    /// True when no transcript could be read for this pane.
+    /// True when any relevant evidence source is unavailable or incomplete.
     pub partial: bool,
-    /// Seconds since the last turn.
+    /// Main transcript file-write age in seconds, measured on its owning host.
     pub last_turn_age_secs: Option<u64>,
     /// Seconds since the newest subagent write.
     pub subagent_age_secs: Option<u64>,

@@ -23,7 +23,7 @@ fn main() {
         "FocusPlanChunk" => schemars::schema_for!(FocusPlanChunk),
         _ => {
             eprintln!(
-                "usage: cargo run --example export_schema -- <Project|ProjectChunk|ReadyItem|DriftReport|FocusStatus|FocusRecord|FocusHygieneReport|FocusPlanChunk>"
+                "usage: cargo run --example export_schema -- <Project|ProjectChunk|ReadyItem|DriftReport|FocusStatus|FocusRecord|FocusHygieneReport|FocusPlanChunk|AgentsReport|ProbeResponse>"
             );
             std::process::exit(2);
         }

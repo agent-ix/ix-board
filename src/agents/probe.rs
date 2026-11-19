@@ -3,7 +3,7 @@
 
 //! Machine access for the detector (FR-018): the `Host` trait, the batched
 //! probe request and its output parser, and the system implementation that
-//! runs herdr locally and the probe script locally or over `ssh`.
+//! runs herdr locally and the shared Rust probe locally or over `ssh`.
 
 use super::{
     AgentsError,
@@ -108,7 +108,7 @@ pub struct SessionFiles {
 pub struct PaneProcess {
     /// Executable name.
     pub comm: String,
-    /// Full command line.
+    /// Recognized gate-wrapper signal; collection strips other arguments.
     pub args: String,
 }
 
@@ -245,7 +245,7 @@ impl Write for BoundedOutput {
     }
 }
 
-/// A machine reached through the system `herdr`, `sh` and `ssh` binaries.
+/// A machine reached through the system `herdr`, `ix-board` and `ssh` binaries.
 pub struct SystemHost {
     label: String,
     machine: Option<Machine>,

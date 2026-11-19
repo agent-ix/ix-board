@@ -168,7 +168,7 @@
           "minimum": 0
         },
         "last_turn_age_secs": {
-          "description": "Seconds since the last turn.",
+          "description": "Main transcript file-write age in seconds, measured on its owning host.",
           "type": [
             "integer",
             "null"
@@ -219,7 +219,7 @@
           ]
         },
         "partial": {
-          "description": "True when no transcript could be read for this pane.",
+          "description": "True when any relevant evidence source is unavailable or incomplete.",
           "type": "boolean"
         },
         "processes": {

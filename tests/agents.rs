@@ -874,3 +874,54 @@ fn conflicting_declared_depth_role_duplicates_and_unorderable_claude_metadata_ar
             .contains(&"metadata_assignment_order_unresolved".into())
     );
 }
+
+#[trace(
+    "FR-018-AC-4",
+    "FR-018-AC-7",
+    "FR-018-AC-8",
+    "FR-018-AC-19",
+    "FR-018-AC-20"
+)]
+#[test]
+fn verified_gate_survives_missing_transcripts_and_report_counts_alias_active_assignments() {
+    let mut m = machine();
+    m.harness = "unsupported";
+    m.probe.sessions.clear();
+    m.probe.processes.insert(
+        "w:p".into(),
+        vec![PaneProcess {
+            comm: "cargo".into(),
+            args: String::new(),
+        }],
+    );
+    let row = report(vec![m]).agents.remove(0);
+    assert_eq!(row.verdict, Verdict::Working);
+    assert!(row.partial);
+    assert_eq!(row.live_subagents, None);
+    let mut m = machine();
+    m.probe.sessions.get_mut("root").unwrap().workers = vec![
+        worker("a", "root", WorkerState::Running),
+        worker("b", "root", WorkerState::Waiting),
+    ];
+    let row = report(vec![m]).agents.remove(0);
+    assert_eq!(row.verdict, Verdict::Waiting);
+    assert_eq!(
+        (
+            row.active_direct_workers,
+            row.active_nested_workers,
+            row.live_subagents
+        ),
+        (Some(2), Some(0), Some(2))
+    );
+    let too_many: Vec<_> = (0..1025)
+        .map(|i| worker(&format!("child-{i}"), "root", WorkerState::Running))
+        .collect();
+    let c = counts(&too_many);
+    assert_eq!(c.direct, None);
+    assert_eq!(c.workers.len(), 1024);
+    assert!(
+        c.availability
+            .reasons
+            .contains(&"worker_state_limit".into())
+    );
+}
