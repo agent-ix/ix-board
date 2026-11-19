@@ -2840,3 +2840,41 @@ fn the_snapshot_window_excludes_its_start_and_includes_the_snapshot_instant() {
     assert_eq!(value(&record, "pr_cycle_median_hours"), Some(1.0));
     assert_eq!(value(&record, "pr_cycle_p90_hours"), Some(3.0));
 }
+
+/// Trace: FR-018-AC-24
+#[test]
+fn lifecycle_working_share_excludes_waiting_recent_and_refuses_unresolved_population() {
+    let mut rig = base_rig();
+    rig.agents = Some(Ok(agents_report(vec![
+        agent_row(Verdict::Working, Some(0)),
+        agent_row(Verdict::Waiting, Some(0)),
+        agent_row(Verdict::Recent, Some(0)),
+    ])));
+    let record = snapshot(&rig);
+    assert_eq!(value(&record, "agents_working_share"), Some(1.0 / 3.0));
+    let query = &record.metrics["agents_working_share"].query;
+    assert!(query.starts_with("lifecycle-v2:"));
+    let mut old = record.clone();
+    old.taken_at = "2026-11-01T00:00:00Z".into();
+    old.metrics.get_mut("agents_working_share").unwrap().query = "old age-based definition".into();
+    let report = delta(&[old, record], "{}").unwrap();
+    assert_eq!(
+        one(&report, "agents_working_share").since_previous.state,
+        ChangeState::QueryChanged
+    );
+    for unknown in [false, true] {
+        let mut report = agents_report(vec![agent_row(
+            if unknown {
+                Verdict::Unknown
+            } else {
+                Verdict::Working
+            },
+            Some(0),
+        )]);
+        if !unknown {
+            report.missing_teams.push("missing".into());
+        }
+        rig.agents = Some(Ok(report));
+        assert_eq!(value(&snapshot(&rig), "agents_working_share"), None);
+    }
+}

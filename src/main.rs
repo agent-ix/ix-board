@@ -386,11 +386,21 @@ fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     let diagnostics = Diagnostics::resolved(cli.diagnostics_format, cli.color);
     if matches!(&cli.command, Command::AgentProbe) {
-        let result = std::env::var_os("HOME").ok_or_else(|| "home_unavailable".to_owned())
-            .and_then(|home| ix_board::agents::serve_probe(std::io::stdin().lock(), &PathBuf::from(home)).map_err(|e| e.to_string()));
+        let result = std::env::var_os("HOME")
+            .ok_or_else(|| "home_unavailable".to_owned())
+            .and_then(|home| {
+                ix_board::agents::serve_probe(std::io::stdin().lock(), &PathBuf::from(home))
+                    .map_err(|e| e.to_string())
+            });
         return match result {
-            Ok(text) => { emit_result(&text); std::process::ExitCode::SUCCESS }
-            Err(error) => { emit_diagnostic(diagnostics, "error", &error); std::process::ExitCode::from(Outcome::Invalid) }
+            Ok(text) => {
+                emit_result(&text);
+                std::process::ExitCode::SUCCESS
+            }
+            Err(error) => {
+                emit_diagnostic(diagnostics, "error", &error);
+                std::process::ExitCode::from(Outcome::Invalid)
+            }
         };
     }
     if let Err(error) = validate_command(&cli.command) {

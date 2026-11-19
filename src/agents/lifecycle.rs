@@ -3,8 +3,8 @@
 
 //! Harness-independent worker identities, lifecycle evidence and exact counts (FR-018).
 
-use serde::{Deserialize, Serialize};
 use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Identity within one harness session's worker graph.
@@ -73,6 +73,8 @@ pub struct WorkerObservation {
     pub parent_id: Option<AgentId>,
     /// Harness path, when present, for matching parent lifecycle observations.
     pub agent_path: Option<String>,
+    /// Depth declared by the harness, reconciled against immutable parent links.
+    pub declared_depth: Option<u64>,
     /// Whether this thread is user work or internal machinery.
     pub role: WorkerRole,
     /// Latest established assignment state.
@@ -87,6 +89,8 @@ pub struct WorkerObservation {
     pub observed_at: u64,
     /// Provenance of these facts.
     pub source: EvidenceSource,
+    /// Bounded source locators, without transcript content.
+    pub provenance: Vec<String>,
     /// Reasons this observation is uncertain.
     pub issues: Vec<String>,
 }
@@ -104,7 +108,10 @@ pub struct Availability {
 impl Availability {
     /// A successfully collected source, including an empty one.
     pub fn available() -> Self {
-        Self { complete: true, reasons: Vec::new() }
+        Self {
+            complete: true,
+            reasons: Vec::new(),
+        }
     }
 
     /// Adds an availability failure without discarding observations.
@@ -129,6 +136,8 @@ pub struct AgentAvailability {
     pub processes: Availability,
     /// Pane tail used to distinguish approvals and pending waits.
     pub pane: Availability,
+    /// Git ages in the pane's working directory.
+    pub git: Availability,
 }
 
 /// Deduplicated observations and nullable exact counts.
@@ -138,6 +147,10 @@ pub struct WorkerCounts {
     pub direct: Option<usize>,
     /// Unfinished workers at depth two or greater.
     pub nested: Option<usize>,
+    /// Proven direct workers, even when the exact count is unknown.
+    pub known_direct_active: usize,
+    /// Proven nested workers, even when the exact count is unknown.
+    pub known_nested_active: usize,
     /// Deduplicated, identity-ordered observations including excluded internal threads.
     pub workers: Vec<WorkerObservation>,
     /// Full coverage of the worker graph.
@@ -151,11 +164,24 @@ pub fn count_workers(
     mut availability: Availability,
 ) -> WorkerCounts {
     let mut by_id = BTreeMap::<AgentId, WorkerObservation>::new();
-    for worker in observations {
+    if observations.len() > 1024 {
+        availability.missing("worker_state_limit");
+    }
+    for worker in observations.iter().take(1024) {
         if let Some(previous) = by_id.get_mut(&worker.id) {
-            if previous != worker {
+            let mut comparable = worker.clone();
+            comparable.observed_at = previous.observed_at;
+            if previous != &comparable {
+                if previous.role != worker.role || previous.source != worker.source {
+                    previous.role = WorkerRole::Unknown;
+                }
+                if previous.parent_id != worker.parent_id {
+                    previous.parent_id = None;
+                }
                 previous.state = WorkerState::Unknown;
-                previous.issues.push("conflicting_identity_observations".into());
+                previous
+                    .issues
+                    .push("conflicting_identity_observations".into());
             }
         } else {
             by_id.insert(worker.id.clone(), worker.clone());
@@ -169,8 +195,10 @@ pub fn count_workers(
         if worker.role == WorkerRole::Internal {
             continue;
         }
-        let uncertain = worker.role == WorkerRole::Unknown || worker.state == WorkerState::Unknown
-            || !worker.issues.is_empty() || &worker.id == root;
+        let mut uncertain = worker.role == WorkerRole::Unknown
+            || worker.state == WorkerState::Unknown
+            || !worker.issues.is_empty()
+            || &worker.id == root;
         let mut ancestors = BTreeSet::from([&worker.id]);
         let mut parent = worker.parent_id.as_ref();
         let mut depth = 1;
@@ -189,18 +217,38 @@ pub fn count_workers(
                 }
             }
         }
+        if worker
+            .declared_depth
+            .is_some_and(|declared| u64::try_from(depth).ok() != Some(declared))
+        {
+            availability.missing("declared_depth_conflict");
+            direct_complete = false;
+            nested_complete = false;
+            uncertain = true;
+        }
         if uncertain {
             availability.missing(format!("uncertain_worker:{}", worker.id.0));
-            if parent == Some(root) && depth == 1 { direct_complete = false; }
-            else if parent == Some(root) { nested_complete = false; }
-            else { direct_complete = false; nested_complete = false; }
+            if parent == Some(root) && depth == 1 {
+                direct_complete = false;
+            } else if parent == Some(root) {
+                nested_complete = false;
+            } else {
+                direct_complete = false;
+                nested_complete = false;
+            }
         } else if parent == Some(root) && worker.state.is_active() {
-            if depth == 1 { direct += 1; } else { nested += 1; }
+            if depth == 1 {
+                direct += 1;
+            } else {
+                nested += 1;
+            }
         }
     }
     WorkerCounts {
         direct: direct_complete.then_some(direct),
         nested: nested_complete.then_some(nested),
+        known_direct_active: direct,
+        known_nested_active: nested,
         workers: by_id.into_values().collect(),
         availability,
     }
@@ -220,16 +268,26 @@ pub struct Lifecycle {
     pub identity: Option<(AgentId, Option<AgentId>)>,
     /// Thread path reported by the harness.
     pub agent_path: Option<String>,
+    /// Harness-declared depth for cross-checking parent links.
+    pub declared_depth: Option<u64>,
     /// Worker versus internal thread classification.
     pub role: WorkerRole,
     /// Successfully launched child identities or paths from the parent.
     pub expected_children: BTreeSet<String>,
     /// Latest parent-side snapshots of children, keyed by identity or path.
     pub child_states: BTreeMap<String, (u64, WorkerState)>,
+    /// Immutable source thread for each correlated child snapshot.
+    pub child_owners: BTreeMap<String, AgentId>,
+    /// Claude record identity, checked against its discovered filename.
+    pub record_agent_id: Option<AgentId>,
+    /// Claude root ownership, checked against the selected lead.
+    pub root_session_id: Option<AgentId>,
     /// Unsupported or malformed lifecycle evidence.
     pub issues: Vec<String>,
     /// Last proven assignment generation, when supplied by the harness.
     pub generation: Option<String>,
+    /// Number of explicit assignments seen in a Claude child transcript.
+    pub assignment_starts: u32,
     /// Most recent assistant text, bounded and cleared by a later assignment/tool call.
     pub assistant: Option<String>,
     /// Time the assistant text was observed.
@@ -263,13 +321,19 @@ impl Lifecycle {
             self.issue("lifecycle_timestamp_missing");
             return;
         };
-        if self.state_changed_at == Some(at) && self.state != state {
-            self.issue("conflicting_transition_time");
-        } else if self.state_changed_at.is_none_or(|previous| at > previous) {
+        // Record order within one transcript is authoritative, including
+        // transitions that occur within the same second.
+        if self.state_changed_at.is_none_or(|previous| at >= previous) {
             self.state = state;
             self.state_changed_at = Some(at);
-            if state == WorkerState::Running { self.execution_ended_at = None; }
-            if matches!(state, WorkerState::Completed | WorkerState::Stopped) { self.execution_ended_at = Some(at); }
+            if state == WorkerState::Running {
+                self.execution_ended_at = None;
+            }
+            if matches!(state, WorkerState::Completed | WorkerState::Stopped) {
+                self.execution_ended_at = Some(at);
+            }
+        } else {
+            self.issue("out_of_order_transition");
         }
     }
 }

@@ -1,0 +1,25 @@
+{
+  "schema_version": 2,
+  "teams": ["Team"],
+  "idle_after_secs": 1200,
+  "agents": [{
+    "team": "Team", "machine": "local", "pane_id": "w:p", "agent": "codex",
+    "title": "lead", "cwd": "/work", "herdr_status": "done", "verdict": "UNKNOWN",
+    "partial": true, "last_turn_age_secs": 10, "subagent_age_secs": null,
+    "live_subagents": null, "active_direct_workers": null, "active_nested_workers": null,
+    "workers": [],
+    "availability": {
+      "lifecycle": {"complete": false, "reasons": ["referenced_child_missing_or_ambiguous"]},
+      "transcript": {"complete": true, "reasons": []},
+      "processes": {"complete": false, "reasons": ["process_collection_unsupported_platform"]},
+      "pane": {"complete": true, "reasons": []},
+      "git": {"complete": true, "reasons": []}
+    },
+    "recent_activity_at": 1799999990, "host_now": 1800000000,
+    "collection_started_at": 1800000000, "collection_finished_at": 1800000000,
+    "processes": [], "git": {"last_commit_secs": null, "uncommitted_secs": null},
+    "excerpt": "referenced_child_missing_or_ambiguous", "pane_tail": "❯", "next_ready": null,
+    "notes": ["referenced_child_missing_or_ambiguous", "process_collection_unsupported_platform"]
+  }],
+  "missing_teams": [], "errors": [], "ready_queue_error": null
+}

@@ -1109,8 +1109,13 @@ fn utilization(out: &mut Out<'_>, sources: &Sources<'_>) {
                     .count();
                 out.put(
                     "agents_working_share",
-                    if report.schema_version != crate::agents::AGENTS_SCHEMA_VERSION || !report.missing_teams.is_empty()
-                        || report.agents.iter().any(|row| row.verdict == crate::agents::Verdict::Unknown) {
+                    if report.schema_version != crate::agents::AGENTS_SCHEMA_VERSION
+                        || !report.missing_teams.is_empty()
+                        || report
+                            .agents
+                            .iter()
+                            .any(|row| row.verdict == crate::agents::Verdict::Unknown)
+                    {
                         Err("agent classification or population unresolved".into())
                     } else if total == 0 {
                         Err(EMPTY.to_owned())

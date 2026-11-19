@@ -1,0 +1,607 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ProbeResponse",
+  "description": "Versioned response from the shared Rust probe.",
+  "type": "object",
+  "properties": {
+    "probe": {
+      "description": "Observations and independent coverage results.",
+      "$ref": "#/$defs/Probe"
+    },
+    "protocol_version": {
+      "description": "Protocol identity.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "probe"
+  ],
+  "$defs": {
+    "AgentId": {
+      "description": "Identity within one harness session's worker graph.",
+      "type": "string"
+    },
+    "Availability": {
+      "description": "Availability of one independent source. Empty results can be complete.",
+      "type": "object",
+      "properties": {
+        "complete": {
+          "description": "Whether the source was completely collected and understood.",
+          "type": "boolean"
+        },
+        "reasons": {
+          "description": "Machine-readable diagnostic codes with bounded context, without transcript text.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "complete",
+        "reasons"
+      ]
+    },
+    "EvidenceSource": {
+      "description": "Which adapter established the lifecycle facts.",
+      "oneOf": [
+        {
+          "description": "Claude metadata reconciled with transcript transitions.",
+          "type": "string",
+          "const": "claude"
+        },
+        {
+          "description": "Codex structured session and task records.",
+          "type": "string",
+          "const": "codex"
+        },
+        {
+          "description": "An adapter supplied by a future harness.",
+          "type": "string",
+          "const": "adapter"
+        }
+      ]
+    },
+    "GitTimes": {
+      "description": "Git timestamps (epoch seconds) for a working directory.",
+      "type": "object",
+      "properties": {
+        "last_commit": {
+          "description": "Committer time of HEAD.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "uncommitted": {
+          "description": "Newest modification time among uncommitted files.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "Lifecycle": {
+      "description": "Streaming adapter state. It retains lifecycle facts, never full transcript messages.",
+      "type": "object",
+      "properties": {
+        "agent_path": {
+          "description": "Thread path reported by the harness.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "assignment_starts": {
+          "description": "Number of explicit assignments seen in a Claude child transcript.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "assistant": {
+          "description": "Most recent assistant text, bounded and cleared by a later assignment/tool call.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "assistant_at": {
+          "description": "Time the assistant text was observed.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "calls": {
+          "description": "Calls waiting for a correlated result; arguments/prompts are never retained.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/PendingCall"
+          }
+        },
+        "child_owners": {
+          "description": "Immutable source thread for each correlated child snapshot.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/AgentId"
+          }
+        },
+        "child_states": {
+          "description": "Latest parent-side snapshots of children, keyed by identity or path.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0
+              },
+              {
+                "$ref": "#/$defs/WorkerState"
+              }
+            ]
+          }
+        },
+        "declared_depth": {
+          "description": "Harness-declared depth for cross-checking parent links.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "execution_ended_at": {
+          "description": "Latest explicit end of lead execution, distinct from a worker's assignment.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "expected_children": {
+          "description": "Successfully launched child identities or paths from the parent.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "generation": {
+          "description": "Last proven assignment generation, when supplied by the harness.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "identity": {
+          "description": "Codex thread identity and ancestry from its header.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "$ref": "#/$defs/AgentId"
+            },
+            {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/AgentId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          ]
+        },
+        "issues": {
+          "description": "Unsupported or malformed lifecycle evidence.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "last_activity_at": {
+          "description": "Latest structured record timestamp.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "record_agent_id": {
+          "description": "Claude record identity, checked against its discovered filename.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "role": {
+          "description": "Worker versus internal thread classification.",
+          "$ref": "#/$defs/WorkerRole"
+        },
+        "root_session_id": {
+          "description": "Claude root ownership, checked against the selected lead.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state": {
+          "description": "Latest assignment state.",
+          "$ref": "#/$defs/WorkerState"
+        },
+        "state_changed_at": {
+          "description": "Timestamp of the latest transition.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "role",
+        "expected_children",
+        "child_states",
+        "child_owners",
+        "issues",
+        "assignment_starts",
+        "calls"
+      ]
+    },
+    "PaneProcess": {
+      "description": "One process running inside a herdr pane.",
+      "type": "object",
+      "properties": {
+        "args": {
+          "description": "Full command line.",
+          "type": "string"
+        },
+        "comm": {
+          "description": "Executable name.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "comm",
+        "args"
+      ]
+    },
+    "PendingCall": {
+      "description": "Bounded correlation metadata for one lifecycle tool call.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Tool name with namespace removed.",
+          "type": "string"
+        },
+        "target": {
+          "description": "Target path/identity, never the assigned message.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ]
+    },
+    "Probe": {
+      "description": "Parsed probe output.",
+      "type": "object",
+      "properties": {
+        "finished_at": {
+          "description": "Collection end in this host's clock domain.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "git": {
+          "description": "Git times per working directory.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/GitTimes"
+          }
+        },
+        "git_availability": {
+          "description": "Coverage for each requested git directory.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Availability"
+          }
+        },
+        "now": {
+          "description": "The machine's clock, epoch seconds, when the probe ran.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "process_availability": {
+          "description": "Process-source coverage.",
+          "$ref": "#/$defs/Availability"
+        },
+        "processes": {
+          "description": "Processes per herdr pane id.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/PaneProcess"
+            }
+          }
+        },
+        "sessions": {
+          "description": "Files per session id.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/SessionFiles"
+          }
+        },
+        "started_at": {
+          "description": "Collection start in this host's clock domain.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "now",
+        "started_at",
+        "finished_at",
+        "process_availability",
+        "sessions",
+        "processes",
+        "git",
+        "git_availability"
+      ]
+    },
+    "SessionFiles": {
+      "description": "Files found for one session.",
+      "type": "object",
+      "properties": {
+        "child_mtimes": {
+          "description": "Modification times of subagent or child-thread transcripts.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        },
+        "lifecycle_availability": {
+          "description": "Child discovery coverage.",
+          "$ref": "#/$defs/Availability"
+        },
+        "parent_lifecycle": {
+          "description": "Shared streaming parent facts.",
+          "$ref": "#/$defs/Lifecycle"
+        },
+        "transcript_availability": {
+          "description": "Parent transcript coverage.",
+          "$ref": "#/$defs/Availability"
+        },
+        "transcript_mtime": {
+          "description": "Modification time (epoch seconds) of the main transcript.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "workers": {
+          "description": "Normalized descendants.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WorkerObservation"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "child_mtimes",
+        "parent_lifecycle",
+        "workers",
+        "lifecycle_availability",
+        "transcript_availability"
+      ]
+    },
+    "WorkerObservation": {
+      "description": "One child's identity and lifecycle as of a machine-local observation.",
+      "type": "object",
+      "properties": {
+        "agent_path": {
+          "description": "Harness path, when present, for matching parent lifecycle observations.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "declared_depth": {
+          "description": "Depth declared by the harness, reconciled against immutable parent links.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "id": {
+          "description": "Stable child identity, never its nickname.",
+          "$ref": "#/$defs/AgentId"
+        },
+        "issues": {
+          "description": "Reasons this observation is uncertain.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "last_activity_at": {
+          "description": "Last structured activity timestamp, not a liveness deadline.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "observed_at": {
+          "description": "Machine-local sample time.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "parent_id": {
+          "description": "Immediate parent; absence means ancestry is unavailable.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "provenance": {
+          "description": "Bounded source locators, without transcript content.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "role": {
+          "description": "Whether this thread is user work or internal machinery.",
+          "$ref": "#/$defs/WorkerRole"
+        },
+        "source": {
+          "description": "Provenance of these facts.",
+          "$ref": "#/$defs/EvidenceSource"
+        },
+        "state": {
+          "description": "Latest established assignment state.",
+          "$ref": "#/$defs/WorkerState"
+        },
+        "state_changed_at": {
+          "description": "Last explicit lifecycle transition timestamp.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "timestamp_unavailable_reason": {
+          "description": "Why the transition has no timestamp (metadata does not supply one).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "role",
+        "state",
+        "observed_at",
+        "source",
+        "provenance",
+        "issues"
+      ]
+    },
+    "WorkerRole": {
+      "description": "Worker threads and internal harness machinery are reported separately.",
+      "oneOf": [
+        {
+          "description": "Delegated work on behalf of the lead.",
+          "type": "string",
+          "const": "worker"
+        },
+        {
+          "description": "Approval reviewers or other explicitly internal threads.",
+          "type": "string",
+          "const": "internal"
+        },
+        {
+          "description": "Unrecognized thread source or missing metadata.",
+          "type": "string",
+          "const": "unknown"
+        }
+      ]
+    },
+    "WorkerState": {
+      "description": "The latest established assignment state; activity alone never changes it.",
+      "oneOf": [
+        {
+          "description": "An assignment is executing.",
+          "type": "string",
+          "const": "running"
+        },
+        {
+          "description": "An unfinished assignment is waiting on delegated work.",
+          "type": "string",
+          "const": "waiting"
+        },
+        {
+          "description": "The thread is available but has no active assignment.",
+          "type": "string",
+          "const": "idle"
+        },
+        {
+          "description": "The latest assignment completed.",
+          "type": "string",
+          "const": "completed"
+        },
+        {
+          "description": "The assignment was interrupted or cancelled.",
+          "type": "string",
+          "const": "stopped"
+        },
+        {
+          "description": "Its state could not be established.",
+          "type": "string",
+          "const": "unknown"
+        }
+      ]
+    }
+  }
+}

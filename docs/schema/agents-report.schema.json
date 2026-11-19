@@ -1,0 +1,582 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentsReport",
+  "description": "Result of one `agents` invocation.",
+  "type": "object",
+  "properties": {
+    "agents": {
+      "description": "One row per agent pane.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AgentRow"
+      }
+    },
+    "errors": {
+      "description": "Machines or reads that failed.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "idle_after_secs": {
+      "description": "Idle threshold in seconds.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "missing_teams": {
+      "description": "Teams that matched no workspace on any machine.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "ready_queue_error": {
+      "description": "Why `IDLE` rows carry no next ticket, when the queue was unreadable.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "schema_version": {
+      "description": "Lifecycle schema identity.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "teams": {
+      "description": "Teams asked for.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "teams",
+    "idle_after_secs",
+    "agents",
+    "missing_teams",
+    "errors"
+  ],
+  "$defs": {
+    "AgentAvailability": {
+      "description": "Independent source coverage for one pane.",
+      "type": "object",
+      "properties": {
+        "git": {
+          "description": "Git ages in the pane's working directory.",
+          "$ref": "#/$defs/Availability"
+        },
+        "lifecycle": {
+          "description": "Child discovery, identity, ancestry and lifecycle evidence.",
+          "$ref": "#/$defs/Availability"
+        },
+        "pane": {
+          "description": "Pane tail used to distinguish approvals and pending waits.",
+          "$ref": "#/$defs/Availability"
+        },
+        "processes": {
+          "description": "Host process evidence; unsupported platforms are explicit.",
+          "$ref": "#/$defs/Availability"
+        },
+        "transcript": {
+          "description": "Parent transcript and lifecycle evidence.",
+          "$ref": "#/$defs/Availability"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "lifecycle",
+        "transcript",
+        "processes",
+        "pane",
+        "git"
+      ]
+    },
+    "AgentId": {
+      "description": "Identity within one harness session's worker graph.",
+      "type": "string"
+    },
+    "AgentRow": {
+      "description": "One agent pane and its verdict.",
+      "type": "object",
+      "properties": {
+        "active_direct_workers": {
+          "description": "Active unfinished direct assignments; null means incomplete evidence.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "active_nested_workers": {
+          "description": "Active unfinished descendants at depth two or greater.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "agent": {
+          "description": "Harness name herdr reported.",
+          "type": "string"
+        },
+        "availability": {
+          "description": "Independent source availability.",
+          "$ref": "#/$defs/AgentAvailability"
+        },
+        "collection_finished_at": {
+          "description": "Collection end in that host's clock domain.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "collection_started_at": {
+          "description": "Collection start and end in that host's clock domain.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "cwd": {
+          "description": "Pane working directory.",
+          "type": "string"
+        },
+        "excerpt": {
+          "description": "Evidence text for `PROMPT`, `ASKING` and `UNKNOWN`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "git": {
+          "description": "Git ages of the pane directory.",
+          "$ref": "#/$defs/GitAges"
+        },
+        "herdr_status": {
+          "description": "Raw herdr status string.",
+          "type": "string"
+        },
+        "host_now": {
+          "description": "Clock of the host holding this row's files.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "last_turn_age_secs": {
+          "description": "Seconds since the last turn.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "live_subagents": {
+          "description": "Deprecated nullable alias of active_direct_workers.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "machine": {
+          "description": "Machine label.",
+          "type": "string"
+        },
+        "next_ready": {
+          "description": "The team's next ready ticket, on `IDLE` rows.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReadyTicket"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "notes": {
+          "description": "Degradations that affected this row.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "pane_id": {
+          "description": "Pane id within the machine's herdr server.",
+          "type": "string"
+        },
+        "pane_tail": {
+          "description": "Last lines of the pane, read for every state.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "partial": {
+          "description": "True when no transcript could be read for this pane.",
+          "type": "boolean"
+        },
+        "processes": {
+          "description": "Build or gate commands running in the pane.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "recent_activity_at": {
+          "description": "Last structured execution activity, independent of file writes.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "subagent_age_secs": {
+          "description": "Seconds since the newest subagent write.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "team": {
+          "description": "Team (workspace label).",
+          "type": "string"
+        },
+        "title": {
+          "description": "Terminal title, which usually names the agent.",
+          "type": "string"
+        },
+        "verdict": {
+          "description": "Computed verdict.",
+          "$ref": "#/$defs/Verdict"
+        },
+        "workers": {
+          "description": "Normalized observations, including excluded internal sessions.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WorkerObservation"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "team",
+        "machine",
+        "pane_id",
+        "agent",
+        "title",
+        "cwd",
+        "herdr_status",
+        "verdict",
+        "partial",
+        "workers",
+        "availability",
+        "host_now",
+        "collection_started_at",
+        "collection_finished_at",
+        "processes",
+        "git",
+        "notes"
+      ]
+    },
+    "Availability": {
+      "description": "Availability of one independent source. Empty results can be complete.",
+      "type": "object",
+      "properties": {
+        "complete": {
+          "description": "Whether the source was completely collected and understood.",
+          "type": "boolean"
+        },
+        "reasons": {
+          "description": "Machine-readable diagnostic codes with bounded context, without transcript text.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "complete",
+        "reasons"
+      ]
+    },
+    "EvidenceSource": {
+      "description": "Which adapter established the lifecycle facts.",
+      "oneOf": [
+        {
+          "description": "Claude metadata reconciled with transcript transitions.",
+          "type": "string",
+          "const": "claude"
+        },
+        {
+          "description": "Codex structured session and task records.",
+          "type": "string",
+          "const": "codex"
+        },
+        {
+          "description": "An adapter supplied by a future harness.",
+          "type": "string",
+          "const": "adapter"
+        }
+      ]
+    },
+    "GitAges": {
+      "description": "Ages of a pane's git working directory, in seconds.",
+      "type": "object",
+      "properties": {
+        "last_commit_secs": {
+          "description": "Seconds since the last commit.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "uncommitted_secs": {
+          "description": "Seconds since the newest uncommitted file changed.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "ReadyTicket": {
+      "description": "The next ready ticket of a team.",
+      "type": "object",
+      "properties": {
+        "identifier": {
+          "description": "Linear issue identifier.",
+          "type": "string"
+        },
+        "title": {
+          "description": "Issue title.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "identifier",
+        "title"
+      ]
+    },
+    "Verdict": {
+      "description": "What an agent is doing right now.",
+      "oneOf": [
+        {
+          "description": "Positive current lead execution.",
+          "type": "string",
+          "const": "WORKING"
+        },
+        {
+          "description": "The lead awaits unfinished worker assignments.",
+          "type": "string",
+          "const": "WAITING"
+        },
+        {
+          "description": "Execution ended recently; no assigned workers remain.",
+          "type": "string",
+          "const": "RECENT"
+        },
+        {
+          "description": "Confirmed pending wait with complete evidence of no viable work.",
+          "type": "string",
+          "const": "WAITING-STUCK"
+        },
+        {
+          "description": "Stopped at an approval or question dialog.",
+          "type": "string",
+          "const": "PROMPT"
+        },
+        {
+          "description": "Finished a turn by asking a question or for permission.",
+          "type": "string",
+          "const": "ASKING"
+        },
+        {
+          "description": "Ready for input and quiet past the idle threshold.",
+          "type": "string",
+          "const": "IDLE"
+        },
+        {
+          "description": "herdr could not classify the agent.",
+          "type": "string",
+          "const": "UNKNOWN"
+        }
+      ]
+    },
+    "WorkerObservation": {
+      "description": "One child's identity and lifecycle as of a machine-local observation.",
+      "type": "object",
+      "properties": {
+        "agent_path": {
+          "description": "Harness path, when present, for matching parent lifecycle observations.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "declared_depth": {
+          "description": "Depth declared by the harness, reconciled against immutable parent links.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "id": {
+          "description": "Stable child identity, never its nickname.",
+          "$ref": "#/$defs/AgentId"
+        },
+        "issues": {
+          "description": "Reasons this observation is uncertain.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "last_activity_at": {
+          "description": "Last structured activity timestamp, not a liveness deadline.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "observed_at": {
+          "description": "Machine-local sample time.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "parent_id": {
+          "description": "Immediate parent; absence means ancestry is unavailable.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "provenance": {
+          "description": "Bounded source locators, without transcript content.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "role": {
+          "description": "Whether this thread is user work or internal machinery.",
+          "$ref": "#/$defs/WorkerRole"
+        },
+        "source": {
+          "description": "Provenance of these facts.",
+          "$ref": "#/$defs/EvidenceSource"
+        },
+        "state": {
+          "description": "Latest established assignment state.",
+          "$ref": "#/$defs/WorkerState"
+        },
+        "state_changed_at": {
+          "description": "Last explicit lifecycle transition timestamp.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "timestamp_unavailable_reason": {
+          "description": "Why the transition has no timestamp (metadata does not supply one).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "role",
+        "state",
+        "observed_at",
+        "source",
+        "provenance",
+        "issues"
+      ]
+    },
+    "WorkerRole": {
+      "description": "Worker threads and internal harness machinery are reported separately.",
+      "oneOf": [
+        {
+          "description": "Delegated work on behalf of the lead.",
+          "type": "string",
+          "const": "worker"
+        },
+        {
+          "description": "Approval reviewers or other explicitly internal threads.",
+          "type": "string",
+          "const": "internal"
+        },
+        {
+          "description": "Unrecognized thread source or missing metadata.",
+          "type": "string",
+          "const": "unknown"
+        }
+      ]
+    },
+    "WorkerState": {
+      "description": "The latest established assignment state; activity alone never changes it.",
+      "oneOf": [
+        {
+          "description": "An assignment is executing.",
+          "type": "string",
+          "const": "running"
+        },
+        {
+          "description": "An unfinished assignment is waiting on delegated work.",
+          "type": "string",
+          "const": "waiting"
+        },
+        {
+          "description": "The thread is available but has no active assignment.",
+          "type": "string",
+          "const": "idle"
+        },
+        {
+          "description": "The latest assignment completed.",
+          "type": "string",
+          "const": "completed"
+        },
+        {
+          "description": "The assignment was interrupted or cancelled.",
+          "type": "string",
+          "const": "stopped"
+        },
+        {
+          "description": "Its state could not be established.",
+          "type": "string",
+          "const": "unknown"
+        }
+      ]
+    }
+  }
+}

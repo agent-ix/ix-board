@@ -1,10 +1,13 @@
+---
+type: reference
+---
 # Agents and drift
 
 `agents` tells whether each coding agent in a team's Herdr workspaces is working.
 `drift` checks whether each configured lead is working on the right tickets and
 delivering. Both are read-only.
 
-## agents
+## Usage: agents
 
 ```bash
 ix-board agents "Team name" "Other team"
@@ -20,51 +23,92 @@ still printed. The command then exits non-zero.
 
 ### Verdicts
 
-Each row has one verdict. ix-board evaluates these rules in order and uses the
-first that matches.
+Each row distinguishes execution, unfinished worker assignments and ended activity.
+The first established rule determines its verdict.
 
-| Verdict | Rule |
+| Verdict | Evidence |
 | --- | --- |
-| `PROMPT` | Herdr reports the pane as blocked. The row carries the dialog text. |
-| `WORKING` | Herdr reports the pane as working. |
-| `WORKING` | A subagent transcript was written in the last 10 minutes, or a build or gate process is running under the pane. |
-| `WAITING-STUCK` | The pane says it is waiting for background agents, and neither the last turn nor any subagent write is under 15 minutes old. |
-| `UNKNOWN` | Herdr reports the state as unknown. The row carries the raw fields. |
-| `ASKING` | Herdr reports the pane as idle or done, and the last assistant message ends with a question or asks for permission. The row carries an excerpt. |
-| `WORKING` | The last turn or subagent write is younger than `--idle-after`. |
-| `IDLE` | None of the above. |
+| `PROMPT` | Outstanding approval dialog. |
+| `ASKING` | Latest assistant response asks for input. |
+| `UNKNOWN` | Contradictory or insufficient evidence prevents classification. |
+| `WAITING` | Lead awaits active workers, or inactive lead has active direct workers. |
+| `WAITING-STUCK` | Confirmed wait, complete evidence, no viable work or progress for 15 minutes. |
+| `WORKING` | Positive current lead execution without unresolved contradiction or pending wait. |
+| `RECENT` | Execution ended within the idle threshold; no active workers remain. |
+| `IDLE` | Established quiet reaches the idle threshold. |
 
-`--idle-after` takes seconds, minutes or hours, such as `90s`, `20m` or `2h`. The
-default is `20m`. An `IDLE` row also shows the team's next ready ticket, reading
-the team name as a Linear team key. If the queue cannot be read, the verdicts are
-unchanged and the failure is reported once.
+`--idle-after` accepts positive seconds, minutes or hours, such as `90s`, `20m`
+or `2h`. It defaults to `20m`. `IDLE` rows show the team's next ready ticket.
+Queue failures appear once and leave verdicts unchanged.
 
-### Signals
+### Worker counts and coverage
 
-- **Herdr state** from `herdr agent list`: working, idle, done, blocked or
-  unknown.
-- **Last turn** from the modification time of the harness transcript, found
-  through Herdr's session id. Claude Code transcripts are read from
-  `~/.claude/projects` and Codex transcripts from `~/.codex/sessions`.
-- **Subagents** from their transcripts, counted as live when written in the last
-  10 minutes.
-- **Child processes** of the pane that are build or gate tools such as `cargo`,
-  `make`, `gh`, `pytest` and `npm`.
-- **Pane tail** from `herdr agent read`, used for panes that are not working.
-- **Git** age of the last commit and of the newest uncommitted file in the pane's
-  working directory.
+`active_direct_workers` counts unfinished assigned workers whose immediate
+parent is the pane's lead. `active_nested_workers` counts active descendants at
+depth two or greater. Running and waiting assignments count as active.
+Completed, stopped and internal approval sessions remain visible in `workers`.
 
-Remote machines are read with one batched `ssh` per machine. Ages are measured
-against the clock of the machine that holds the files. A pane whose harness has no
-adapter, or whose transcript cannot be found, still gets its Herdr state, tail
-and processes. It is marked `partial` and has no turn ages.
+Each count is nullable. Missing children, ambiguous ancestry, unsupported records
+and conflicting observations make the affected count unknown. Complete graphs
+with no active workers yield zero. `live_subagents` is a deprecated nullable alias
+of `active_direct_workers`.
 
-```text
-TEAM     MACHINE  PANE     AGENT   VERDICT           TURN     SUB  NOTE
-Alpha    local    1-2      claude  WORKING             3m      1m  lead [1 live subagents]
-Alpha    local    1-3      codex   IDLE               42m       -  coder
-    next ready: ALP-31 Parse config
+`availability` reports lifecycle, transcript, process, pane and git coverage separately.
+Any unavailable source makes the row `partial`. Known evidence remains visible,
+and independent positive execution can still establish `WORKING`.
+
+### Signals and clocks
+
+Claude companion metadata and structured Codex task records establish assignment
+state. Completion and cancellation immediately remove workers from active counts.
+A quiet running assignment remains active. Resume or inspection preserves a
+terminal assignment until a new assignment or task start is established.
+
+`last_turn_age_secs`, `subagent_age_secs` and git ages describe file or commit
+ages. `recent_activity_at` describes structured execution activity. Each row
+carries `host_now` and collection start/end timestamps in the owning host's clock
+domain. Missing lifecycle timestamps remain null with a reason.
+
+Pane tails are read for every state, including `working`, to detect approvals and
+pending waits. Linux process collection attributes supported build/gate commands
+through `HERDR_PANE_ID`. Unsupported platforms and permission failures have
+explicit availability reasons.
+
+### Probe protocol
+
+Local and remote reads use the same read-only Rust probe. Remote hosts need a
+compatible installed `ix-board`; failures preserve healthy rows and produce a
+nonzero command exit. A machine has a 60-second read budget.
+
+The hidden command `ix-board __agent-probe` accepts a JSON request on stdin:
+
+```json
+{"protocol_version":2,"request":{"sessions":[],"cwds":[]}}
 ```
+
+Its JSON response contains `protocol_version: 2` and `probe`. Public agents
+reports carry `schema_version: 2`. Schemas are available through:
+
+```bash
+cargo run --example export_schema -- AgentsReport
+cargo run --example export_schema -- ProbeResponse
+```
+
+Requests allow 128 sessions and 128 working directories. Collection limits are
+20,000 filesystem entries, 1 MiB per record/header, 64 MiB per transcript,
+256 MiB of aggregate file reads, 1,024 retained workers across the request and 16 MiB of protocol
+input/output. Collection retries a changing file once. Repeated changes and
+limit exhaustion produce explicit unavailable evidence.
+
+## Examples
+
+```bash
+ix-board agents "Team name" --json
+```
+
+The [agents example](examples/agents-v2.json) shows nullable worker counts and
+source availability. [JSON Schema](schema/agents-report.schema.json) describes
+the complete report contract.
 
 ## drift
 

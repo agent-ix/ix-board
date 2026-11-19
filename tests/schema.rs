@@ -32,3 +32,33 @@ fn public_api_models_have_structural_json_schemas() {
     assert!(focus_hygiene["properties"]["issue_refs"].is_object());
     assert!(focus_chunk["properties"]["issues"].is_object());
 }
+
+/// Trace: FR-018-AC-7, FR-018-AC-23
+#[test]
+fn lifecycle_schema_and_documented_example_preserve_nullable_counts_and_versions() {
+    let report: ix_board::agents::AgentsReport =
+        serde_json::from_str(include_str!("../docs/examples/agents-v2.json")).unwrap();
+    assert_eq!(
+        report.schema_version,
+        ix_board::agents::AGENTS_SCHEMA_VERSION
+    );
+    let row = &report.agents[0];
+    assert_eq!(row.live_subagents, row.active_direct_workers);
+    assert_eq!(row.active_direct_workers, None);
+    let schema =
+        serde_json::to_value(schemars::schema_for!(ix_board::agents::AgentsReport)).unwrap();
+    let fields = &schema["$defs"]["AgentRow"]["properties"];
+    assert_eq!(
+        fields["active_direct_workers"]["type"],
+        serde_json::json!(["integer", "null"])
+    );
+    assert!(fields["workers"].is_object());
+    assert!(fields["availability"].is_object());
+    assert_eq!(
+        schema,
+        serde_json::from_str::<serde_json::Value>(include_str!(
+            "../docs/schema/agents-report.schema.json"
+        ))
+        .unwrap()
+    );
+}

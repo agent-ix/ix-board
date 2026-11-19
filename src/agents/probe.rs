@@ -5,9 +5,13 @@
 //! probe request and its output parser, and the system implementation that
 //! runs herdr locally and the probe script locally or over `ssh`.
 
-use super::{AgentsError, harness::HarnessKind, lifecycle::{Availability, Lifecycle, WorkerObservation}};
-use serde::{Serialize, Deserialize};
+use super::{
+    AgentsError,
+    harness::HarnessKind,
+    lifecycle::{Availability, Lifecycle, WorkerObservation},
+};
 use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
@@ -53,10 +57,18 @@ pub struct ProbeRequest {
 impl ProbeRequest {
     /// Refuses oversized or malformed requests before filesystem discovery.
     pub fn validate(&self) -> Result<(), AgentsError> {
-        if self.sessions.len() > 128 || self.cwds.len() > 128
-            || self.sessions.iter().any(|s| s.session_id.is_empty() || s.session_id.len() > 512 || s.session_id.contains(['/', '\\', '\0']))
-            || self.cwds.iter().any(|p| p.len() > 4096 || p.contains('\0')) {
-            return Err(AgentsError::ProbeFormat("request_limit_or_invalid_path".into()));
+        if self.sessions.len() > 128
+            || self.cwds.len() > 128
+            || self.sessions.iter().any(|s| {
+                s.session_id.is_empty()
+                    || s.session_id.len() > 512
+                    || s.session_id.contains(['/', '\\', '\0'])
+            })
+            || self.cwds.iter().any(|p| p.len() > 4096 || p.contains('\0'))
+        {
+            return Err(AgentsError::ProbeFormat(
+                "request_limit_or_invalid_path".into(),
+            ));
         }
         Ok(())
     }
@@ -78,8 +90,6 @@ pub struct ProbeEnvelope {
 pub struct SessionFiles {
     /// Modification time (epoch seconds) of the main transcript.
     pub transcript_mtime: Option<u64>,
-    /// Last bytes of the main transcript.
-    pub tail: String,
     /// Modification times of subagent or child-thread transcripts.
     pub child_mtimes: Vec<u64>,
     /// Shared streaming parent facts.
@@ -130,6 +140,8 @@ pub struct Probe {
     pub processes: BTreeMap<String, Vec<PaneProcess>>,
     /// Git times per working directory.
     pub git: BTreeMap<String, GitTimes>,
+    /// Coverage for each requested git directory.
+    pub git_availability: BTreeMap<String, Availability>,
 }
 
 /// Versioned response from the shared Rust probe.
@@ -144,17 +156,35 @@ pub struct ProbeResponse {
 
 /// Decodes a bounded compatible JSON response; there is no heuristic fallback.
 pub fn parse_probe(text: &str) -> Result<Probe, AgentsError> {
-    if text.len() > MAX_PROTOCOL_BYTES { return Err(AgentsError::ProbeFormat("response_size_limit".into())); }
-    let response: ProbeResponse = serde_json::from_str(text).map_err(|source| AgentsError::Decode { what: "probe response", source })?;
-    if response.protocol_version != PROBE_VERSION { return Err(AgentsError::ProbeFormat("incompatible_protocol_version".into())); }
+    if text.len() > MAX_PROTOCOL_BYTES {
+        return Err(AgentsError::ProbeFormat("response_size_limit".into()));
+    }
+    let response: ProbeResponse =
+        serde_json::from_str(text).map_err(|source| AgentsError::Decode {
+            what: "probe response",
+            source,
+        })?;
+    if response.protocol_version != PROBE_VERSION {
+        return Err(AgentsError::ProbeFormat(
+            "incompatible_protocol_version".into(),
+        ));
+    }
     response.probe.validate()?;
     Ok(response.probe)
 }
 impl Probe {
     /// Validates retained-state bounds even when the peer is independently installed.
     pub fn validate(&self) -> Result<(), AgentsError> {
-        if self.sessions.len() > 128 || self.git.len() > 128 || self.processes.len() > 4096
-            || self.sessions.values().any(|s| s.workers.len() > 1024 || s.child_mtimes.len() > 1024 || s.parent_lifecycle.calls.len() > 1024 || s.parent_lifecycle.child_states.len() > 1024) {
+        if self.sessions.len() > 128
+            || self.git.len() > 128
+            || self.processes.len() > 4096
+            || self.sessions.values().any(|s| {
+                s.workers.len() > 1024
+                    || s.child_mtimes.len() > 1024
+                    || s.parent_lifecycle.calls.len() > 1024
+                    || s.parent_lifecycle.child_states.len() > 1024
+            })
+        {
             return Err(AgentsError::ProbeFormat("response_state_limit".into()));
         }
         Ok(())
@@ -164,22 +194,62 @@ impl Probe {
 /// Runs the hidden command's bounded stdin/stdout protocol without Linear access.
 pub fn serve_probe(input: impl Read, home: &std::path::Path) -> Result<String, AgentsError> {
     let mut bytes = Vec::new();
-    input.take(u64::try_from(MAX_PROTOCOL_BYTES).unwrap_or(u64::MAX) + 1).read_to_end(&mut bytes)
-        .map_err(|source| AgentsError::Spawn { command: "read probe request".into(), source })?;
-    if bytes.len() > MAX_PROTOCOL_BYTES { return Err(AgentsError::ProbeFormat("request_size_limit".into())); }
-    let envelope: ProbeEnvelope = serde_json::from_slice(&bytes).map_err(|source| AgentsError::Decode { what: "probe request", source })?;
-    if envelope.protocol_version != PROBE_VERSION { return Err(AgentsError::ProbeFormat("incompatible_protocol_version".into())); }
+    input
+        .take(u64::try_from(MAX_PROTOCOL_BYTES).unwrap_or(u64::MAX) + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| AgentsError::Spawn {
+            command: "read probe request".into(),
+            source,
+        })?;
+    if bytes.len() > MAX_PROTOCOL_BYTES {
+        return Err(AgentsError::ProbeFormat("request_size_limit".into()));
+    }
+    let envelope: ProbeEnvelope =
+        serde_json::from_slice(&bytes).map_err(|source| AgentsError::Decode {
+            what: "probe request",
+            source,
+        })?;
+    if envelope.protocol_version != PROBE_VERSION {
+        return Err(AgentsError::ProbeFormat(
+            "incompatible_protocol_version".into(),
+        ));
+    }
     envelope.request.validate()?;
     let probe = super::collect::collect_probe(home, &envelope.request)?;
-    let text = serde_json::to_string(&ProbeResponse { protocol_version: PROBE_VERSION, probe }).map_err(|source| AgentsError::Decode { what: "encode probe", source })?;
-    if text.len() > MAX_PROTOCOL_BYTES { return Err(AgentsError::ProbeFormat("response_size_limit".into())); }
-    Ok(text)
+    let mut writer = BoundedOutput(Vec::new());
+    serde_json::to_writer(
+        &mut writer,
+        &ProbeResponse {
+            protocol_version: PROBE_VERSION,
+            probe,
+        },
+    )
+    .map_err(|source| AgentsError::Decode {
+        what: "encode probe",
+        source,
+    })?;
+    String::from_utf8(writer.0).map_err(|_| AgentsError::ProbeFormat("response_encoding".into()))
+}
+
+struct BoundedOutput(Vec<u8>);
+impl Write for BoundedOutput {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > MAX_PROTOCOL_BYTES.saturating_sub(self.0.len()) {
+            return Err(std::io::Error::other("response_size_limit"));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// A machine reached through the system `herdr`, `sh` and `ssh` binaries.
 pub struct SystemHost {
     label: String,
     machine: Option<Machine>,
+    deadline: Instant,
 }
 
 struct Machine {
@@ -193,6 +263,7 @@ impl SystemHost {
         Self {
             label: "local".to_owned(),
             machine: None,
+            deadline: Instant::now() + CALL_TIMEOUT,
         }
     }
 
@@ -205,6 +276,7 @@ impl SystemHost {
                 ssh_target: ssh_target.into(),
             }),
             label,
+            deadline: Instant::now() + CALL_TIMEOUT,
         }
     }
 }
@@ -216,7 +288,10 @@ fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<V
     std::thread::spawn(move || {
         let mut bytes = Vec::new();
         if let Some(mut pipe) = pipe {
-            let _ = pipe.by_ref().take(u64::try_from(MAX_PROTOCOL_BYTES).unwrap_or(u64::MAX) + 1).read_to_end(&mut bytes);
+            let _ = pipe
+                .by_ref()
+                .take(u64::try_from(MAX_PROTOCOL_BYTES).unwrap_or(u64::MAX) + 1)
+                .read_to_end(&mut bytes);
             let _ = std::io::copy(&mut pipe, &mut std::io::sink());
         }
         bytes
@@ -265,7 +340,9 @@ pub(super) fn run(
     };
     let stdout = out_reader.join().unwrap_or_default();
     let stderr = err_reader.join().unwrap_or_default();
-    if stdout.len() > MAX_PROTOCOL_BYTES || stderr.len() > MAX_PROTOCOL_BYTES { return Err(AgentsError::ProbeFormat("command_output_limit".into())); }
+    if stdout.len() > MAX_PROTOCOL_BYTES || stderr.len() > MAX_PROTOCOL_BYTES {
+        return Err(AgentsError::ProbeFormat("command_output_limit".into()));
+    }
     if !status.success() {
         return Err(AgentsError::CommandFailed {
             command: rendered,
@@ -286,27 +363,46 @@ impl Host for SystemHost {
         if let Some(machine) = &self.machine {
             command.args(["--machine", &machine.herdr_label]);
         }
-        run(command.args(args), None, CALL_TIMEOUT)
+        run(
+            command.args(args),
+            None,
+            self.deadline.saturating_duration_since(Instant::now()),
+        )
     }
 
     fn probe(&self, request: &ProbeRequest) -> Result<Probe, AgentsError> {
         request.validate()?;
-        let input = serde_json::to_string(&ProbeEnvelope { protocol_version: PROBE_VERSION, request: request.clone() })
-            .map_err(|source| AgentsError::Decode { what: "encode probe request", source })?;
+        let input = serde_json::to_string(&ProbeEnvelope {
+            protocol_version: PROBE_VERSION,
+            request: request.clone(),
+        })
+        .map_err(|source| AgentsError::Decode {
+            what: "encode probe request",
+            source,
+        })?;
         let mut command;
         match &self.machine {
             None => {
-                let executable = std::env::current_exe().map_err(|source| AgentsError::Spawn { command: "locate current ix-board".into(), source })?;
+                let executable = std::env::current_exe().map_err(|source| AgentsError::Spawn {
+                    command: "locate current ix-board".into(),
+                    source,
+                })?;
                 command = Command::new(executable);
                 command.arg("__agent-probe");
             }
             Some(machine) => {
                 command = Command::new("ssh");
-                command.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--"])
-                    .arg(&machine.ssh_target).arg("ix-board __agent-probe");
+                command
+                    .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--"])
+                    .arg(&machine.ssh_target)
+                    .arg("ix-board __agent-probe");
             }
         }
-        let output = run(&mut command, Some(&input), CALL_TIMEOUT)?;
+        let output = run(
+            &mut command,
+            Some(&input),
+            self.deadline.saturating_duration_since(Instant::now()),
+        )?;
         parse_probe(&output)
     }
 }
@@ -314,7 +410,6 @@ impl Host for SystemHost {
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     #[test]
     fn a_hung_command_is_killed_and_reported_as_a_timeout() {
