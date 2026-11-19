@@ -5,6 +5,7 @@ use ix_board::{
     DriftReport, FocusHygieneReport, FocusPlanChunk, FocusRecord, FocusStatus, PrScopeSignal,
     Project, ReadyItem,
 };
+use ix_trace_rs::trace;
 
 #[test]
 fn public_api_models_have_structural_json_schemas() {
@@ -33,7 +34,7 @@ fn public_api_models_have_structural_json_schemas() {
     assert!(focus_chunk["properties"]["issues"].is_object());
 }
 
-/// Trace: FR-018-AC-7, FR-018-AC-23
+#[trace("FR-018-AC-7", "FR-018-AC-23")]
 #[test]
 fn lifecycle_schema_and_documented_example_preserve_nullable_counts_and_versions() {
     let report: ix_board::agents::AgentsReport =

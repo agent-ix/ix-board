@@ -94,10 +94,10 @@ cargo run --example export_schema -- AgentsReport
 cargo run --example export_schema -- ProbeResponse
 ```
 
-Requests allow 128 sessions and 128 working directories. Collection limits are
-20,000 filesystem entries, 1 MiB per record/header, 64 MiB per transcript,
-256 MiB of aggregate file reads, 1,024 retained workers across the request and 16 MiB of protocol
-input/output. Collection retries a changing file once. Repeated changes and
+Requests allow 128 sessions and 128 working directories. File discovery stops
+after 20,000 entries. Each record/header is limited to 1 MiB, and each transcript
+to 64 MiB. Aggregate file reads stop at 256 MiB. The request retains at most
+1,024 workers and accepts/emits at most 16 MiB of protocol data. Collection retries a changing file once. Repeated changes and
 limit exhaustion produce explicit unavailable evidence.
 
 ## Examples

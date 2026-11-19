@@ -103,6 +103,14 @@ fn read_bytes(path: &Path, limit: u64, budget: &mut Budget) -> Result<Vec<u8>, &
     })
 }
 fn walk(root: &Path, availability: &mut Availability, budget: &Budget) -> Vec<PathBuf> {
+    walk_limited(root, availability, budget, MAX_FILES)
+}
+fn walk_limited(
+    root: &Path,
+    availability: &mut Availability,
+    budget: &Budget,
+    max_entries: usize,
+) -> Vec<PathBuf> {
     let mut stack = vec![(root.to_owned(), 0)];
     let mut files = Vec::new();
     let mut count = 0usize;
@@ -124,7 +132,7 @@ fn walk(root: &Path, availability: &mut Availability, budget: &Budget) -> Vec<Pa
         };
         for entry in entries {
             count += 1;
-            if count > MAX_FILES || stack.len() >= MAX_FILES {
+            if count > max_entries || stack.len() >= max_entries {
                 availability.missing("discovery_limit");
                 return files;
             }
@@ -715,6 +723,10 @@ fn reconcile(files: &mut SessionFiles, start: u64) {
                 worker.state = state;
                 worker.state_changed_at = Some(at);
                 worker.timestamp_unavailable_reason = None;
+                worker.provenance.push(format!(
+                    "correlated_parent_snapshot:{}",
+                    owner.map_or("unknown", |id| id.0.as_str())
+                ));
             } else if worker.state_changed_at == Some(at) && worker.state != state {
                 worker.issues.push("child_snapshot_conflict".into());
             }
@@ -812,7 +824,8 @@ fn collect_processes(probe: &mut Probe, budget: &mut Budget) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// Trace: FR-018-AC-20
+    use ix_trace_rs::trace;
+    #[trace("FR-018-AC-20")]
     #[test]
     fn changing_sample_retries_once_then_reports_uncertainty() {
         let mut n = 0;
@@ -833,5 +846,80 @@ mod tests {
             Err("file_changed_during_collection")
         );
         assert_eq!(n, 2);
+    }
+    #[test]
+    #[trace("FR-018-AC-20")]
+    fn file_enumeration_has_a_configured_finite_entry_budget() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["a.jsonl", "b.jsonl", "c.jsonl"] {
+            fs::write(root.path().join(name), "{}").unwrap();
+        }
+        let budget = Budget {
+            remaining: MAX_READ_BYTES,
+            deadline: Instant::now() + Duration::from_secs(5),
+        };
+        let mut coverage = Availability::available();
+        let paths = walk_limited(root.path(), &mut coverage, &budget, 2);
+        assert_eq!(paths.len(), 2);
+        assert!(!coverage.complete);
+        assert!(coverage.reasons.contains(&"discovery_limit".into()));
+    }
+    struct ChangingAdapter {
+        path: PathBuf,
+        changes: std::sync::atomic::AtomicUsize,
+        limit: usize,
+    }
+    impl Harness for ChangingAdapter {
+        fn kind(&self) -> HarnessKind {
+            HarnessKind::Claude
+        }
+        fn evidence_source(&self) -> super::super::EvidenceSource {
+            super::super::EvidenceSource::Claude
+        }
+        fn observe_record(&self, value: &Value, life: &mut Lifecycle) {
+            adapter_for("claude").unwrap().observe_record(value, life);
+            if value["type"] == "user"
+                && self
+                    .changes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    < self.limit
+            {
+                use std::io::Write;
+                let mut file = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&self.path)
+                    .unwrap();
+                writeln!(file, "{{\"type\":\"system\"}}").unwrap();
+            }
+        }
+    }
+    #[test]
+    #[trace("FR-018-AC-20")]
+    fn actual_transcript_changes_retry_once_then_become_unavailable() {
+        for limit in [1, 2] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("session.jsonl");
+            fs::write(
+                &path,
+                include_str!("../../tests/fixtures/agents/claude_done.jsonl"),
+            )
+            .unwrap();
+            let adapter = ChangingAdapter {
+                path: path.clone(),
+                changes: std::sync::atomic::AtomicUsize::new(0),
+                limit,
+            };
+            let mut budget = Budget {
+                remaining: MAX_READ_BYTES,
+                deadline: Instant::now() + Duration::from_secs(5),
+            };
+            let result = read_transcript(&path, &adapter, &mut budget);
+            assert_eq!(adapter.changes.load(std::sync::atomic::Ordering::SeqCst), 2);
+            if limit == 1 {
+                assert!(result.unwrap().execution_ended_at.is_some());
+            } else {
+                assert_eq!(result.unwrap_err(), "file_changed_during_collection");
+            }
+        }
     }
 }

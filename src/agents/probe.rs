@@ -409,9 +409,21 @@ impl Host for SystemHost {
 
 #[cfg(test)]
 mod tests {
+    use ix_trace_rs::trace;
+
+    #[test]
+    #[trace("FR-018-AC-20")]
+    fn response_limit_is_enforced_before_extending_the_output_buffer() {
+        let mut output = BoundedOutput(vec![b'x'; MAX_PROTOCOL_BYTES - 1]);
+        assert!(output.write_all(b"xx").is_err());
+        assert_eq!(output.0.len(), MAX_PROTOCOL_BYTES - 1);
+        output.write_all(b"x").unwrap();
+        assert_eq!(output.0.len(), MAX_PROTOCOL_BYTES);
+    }
     use super::*;
 
     #[test]
+    #[trace("FR-018-AC-21")]
     fn a_hung_command_is_killed_and_reported_as_a_timeout() {
         let started = Instant::now();
         let result = run(

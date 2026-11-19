@@ -3,6 +3,7 @@
 
 //! Lifecycle collection, reduction, protocol and report acceptance tests.
 use ix_board::agents::*;
+use ix_trace_rs::trace;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
@@ -61,7 +62,7 @@ fn verdict(life: &Lifecycle, workers: &WorkerCounts, herdr: HerdrState, now: u64
     })
 }
 
-/// Trace: FR-018-AC-8, FR-018-AC-9, FR-018-AC-13, FR-018-AC-14
+#[trace("FR-018-AC-8", "FR-018-AC-9", "FR-018-AC-13", "FR-018-AC-14")]
 #[test]
 fn eight_file_topology_counts_assignments_and_terminal_graphs_have_exact_zero() {
     let workers = vec![
@@ -89,7 +90,7 @@ fn eight_file_topology_counts_assignments_and_terminal_graphs_have_exact_zero() 
         (Some(2), Some(1))
     );
 }
-/// Trace: FR-018-AC-13, FR-018-AC-14
+#[trace("FR-018-AC-13", "FR-018-AC-14")]
 #[test]
 fn uncertainty_is_scoped_to_proven_depth_and_conflicting_duplicates_are_not_chosen() {
     let mut unknown = worker("nested", "direct", WorkerState::Unknown);
@@ -116,7 +117,13 @@ fn uncertainty_is_scoped_to_proven_depth_and_conflicting_duplicates_are_not_chos
         (None, Some(0))
     );
 }
-/// Trace: FR-018-AC-2, FR-018-AC-3, FR-018-AC-17, FR-018-AC-18, FR-018-AC-19
+#[trace(
+    "FR-018-AC-2",
+    "FR-018-AC-3",
+    "FR-018-AC-17",
+    "FR-018-AC-18",
+    "FR-018-AC-19"
+)]
 #[test]
 fn all_eight_verdicts_thresholds_and_pending_wait_precedence() {
     for harness in ["claude", "codex"] {
@@ -205,7 +212,7 @@ fn all_eight_verdicts_thresholds_and_pending_wait_precedence() {
         );
     }
 }
-/// Trace: FR-018-AC-10, FR-018-AC-12, FR-018-AC-19
+#[trace("FR-018-AC-10", "FR-018-AC-12", "FR-018-AC-19")]
 #[test]
 fn codex_generations_and_correlated_snapshots_reject_incidental_outputs() {
     let adapter = adapter_for("codex").unwrap();
@@ -274,7 +281,14 @@ fn claude_child(home: &Path, id: &str, metadata: Value) {
         &metadata.to_string(),
     );
 }
-/// Trace: FR-018-AC-8, FR-018-AC-9, FR-018-AC-10, FR-018-AC-11, FR-018-AC-15, FR-018-AC-20
+#[trace(
+    "FR-018-AC-8",
+    "FR-018-AC-9",
+    "FR-018-AC-10",
+    "FR-018-AC-11",
+    "FR-018-AC-15",
+    "FR-018-AC-20"
+)]
 #[test]
 fn claude_files_reconcile_metadata_without_using_fresh_write_ages() {
     let home = tempfile::tempdir().unwrap();
@@ -338,7 +352,7 @@ fn claude_files_reconcile_metadata_without_using_fresh_write_ages() {
         WorkerState::Stopped
     );
 }
-/// Trace: FR-018-AC-11, FR-018-AC-14, FR-018-AC-20
+#[trace("FR-018-AC-11", "FR-018-AC-14", "FR-018-AC-20")]
 #[test]
 fn missing_metadata_parent_uuid_and_oversized_metadata_preserve_unknown() {
     let home = tempfile::tempdir().unwrap();
@@ -372,7 +386,7 @@ fn codex_file(home: &Path, id: &str, header: Value, events: &str) {
         &format!("{header}\n{events}"),
     );
 }
-/// Trace: FR-018-AC-3, FR-018-AC-12, FR-018-AC-13, FR-018-AC-14
+#[trace("FR-018-AC-3", "FR-018-AC-12", "FR-018-AC-13", "FR-018-AC-14")]
 #[test]
 fn codex_discovers_quiet_nested_and_internal_threads_and_missing_referenced_children() {
     let home = tempfile::tempdir().unwrap();
@@ -429,7 +443,7 @@ fn codex_discovers_quiet_nested_and_internal_threads_and_missing_referenced_chil
             .complete
     );
 }
-/// Trace: FR-018-AC-12, FR-018-AC-14, FR-018-AC-19
+#[trace("FR-018-AC-12", "FR-018-AC-14", "FR-018-AC-19")]
 #[test]
 fn header_parent_disagreement_unknown_events_and_unconfirmed_followups_are_explicit() {
     let adapter = adapter_for("codex").unwrap();
@@ -532,7 +546,15 @@ fn report(machines: Vec<Machine>) -> AgentsReport {
         },
     )
 }
-/// Trace: FR-018-AC-1, FR-018-AC-5, FR-018-AC-6, FR-018-AC-7, FR-018-AC-21, FR-018-AC-22, FR-018-AC-23
+#[trace(
+    "FR-018-AC-1",
+    "FR-018-AC-5",
+    "FR-018-AC-6",
+    "FR-018-AC-7",
+    "FR-018-AC-21",
+    "FR-018-AC-22",
+    "FR-018-AC-23"
+)]
 #[test]
 fn healthy_rows_survive_machine_failure_and_report_host_clock_counts_schema_and_queue() {
     let mut remote = machine();
@@ -572,7 +594,7 @@ fn healthy_rows_survive_machine_failure_and_report_host_clock_counts_schema_and_
     assert_eq!(row.verdict, Verdict::Unknown);
     assert_eq!(row.last_turn_age_secs, None);
 }
-/// Trace: FR-018-AC-4, FR-018-AC-7, FR-018-AC-19, FR-018-AC-23
+#[trace("FR-018-AC-4", "FR-018-AC-7", "FR-018-AC-19", "FR-018-AC-23")]
 #[test]
 fn unavailable_sources_are_partial_nullable_and_do_not_fabricate_zero() {
     let mut m = machine();
@@ -588,7 +610,7 @@ fn unavailable_sources_are_partial_nullable_and_do_not_fabricate_zero() {
     m.tail = Err("pane_permission_denied");
     assert_eq!(report(vec![m]).agents[0].verdict, Verdict::Unknown);
 }
-/// Trace: FR-018-AC-6
+#[trace("FR-018-AC-6")]
 #[test]
 fn unreadable_queue_is_reported_once_and_does_not_change_idle() {
     let hosts: Vec<Box<dyn Host>> = vec![Box::new(machine()), Box::new(machine())];
@@ -601,7 +623,7 @@ fn unreadable_queue_is_reported_once_and_does_not_change_idle() {
     assert_eq!(r.ready_queue_error.as_deref(), Some("denied"));
     assert!(r.agents.iter().all(|r| r.verdict == Verdict::Idle));
 }
-/// Trace: FR-018-AC-5, FR-018-AC-20, FR-018-AC-21, FR-018-AC-23
+#[trace("FR-018-AC-5", "FR-018-AC-20", "FR-018-AC-21", "FR-018-AC-23")]
 #[test]
 fn hidden_probe_round_trip_refuses_version_truncation_unknown_fields_and_input_limits() {
     let home = tempfile::tempdir().unwrap();
@@ -663,7 +685,7 @@ impl Harness for Third {
         s.last_activity_at = Some(NOW);
     }
 }
-/// Trace: FR-018-AC-16, FR-018-AC-17
+#[trace("FR-018-AC-16", "FR-018-AC-17")]
 #[test]
 fn third_adapter_uses_unchanged_classifier_and_counts() {
     let mut s = Lifecycle::default();
@@ -672,7 +694,7 @@ fn third_adapter_uses_unchanged_classifier_and_counts() {
     assert_eq!(verdict(&s, &c, HerdrState::Working, NOW), Verdict::Waiting);
 }
 
-/// Trace: FR-018-AC-10, FR-018-AC-12
+#[trace("FR-018-AC-10", "FR-018-AC-12")]
 #[test]
 fn real_followup_interaction_receipt_needs_new_child_generation_to_restart() {
     // Sanitized projection of the 2026-11-19 rollout: result text is absent.
@@ -699,7 +721,7 @@ fn real_followup_interaction_receipt_needs_new_child_generation_to_restart() {
     assert_eq!(child.state, WorkerState::Stopped);
     assert!(child.issues.contains(&"reused_terminal_generation".into()));
 }
-/// Trace: FR-018-AC-20, FR-018-AC-21
+#[trace("FR-018-AC-20", "FR-018-AC-21")]
 #[test]
 fn oversized_records_and_permission_sources_never_become_complete_empty_graphs() {
     let home = tempfile::tempdir().unwrap();
@@ -730,7 +752,7 @@ fn oversized_records_and_permission_sources_never_become_complete_empty_graphs()
             .contains(&"source_directory_missing".into())
     );
 }
-/// Trace: FR-018-AC-19, FR-018-AC-22
+#[trace("FR-018-AC-19", "FR-018-AC-22")]
 #[test]
 fn writes_do_not_prove_execution_and_active_worker_waits_do_not_become_stuck() {
     let mut m = machine();
@@ -747,7 +769,7 @@ fn writes_do_not_prove_execution_and_active_worker_waits_do_not_become_stuck() {
     assert_eq!(report(vec![m]).agents[0].verdict, Verdict::Waiting);
 }
 
-/// Trace: FR-018-AC-10, FR-018-AC-12, FR-018-AC-15
+#[trace("FR-018-AC-10", "FR-018-AC-12", "FR-018-AC-15")]
 #[test]
 fn owned_parent_snapshots_confirm_completion_but_do_not_resurrect_terminal_children() {
     let home = tempfile::tempdir().unwrap();
@@ -818,7 +840,7 @@ fn owned_parent_snapshots_confirm_completion_but_do_not_resurrect_terminal_child
     );
     assert_eq!(collected().direct, Some(1));
 }
-/// Trace: FR-018-AC-11, FR-018-AC-14
+#[trace("FR-018-AC-11", "FR-018-AC-14")]
 #[test]
 fn conflicting_declared_depth_role_duplicates_and_unorderable_claude_metadata_are_uncertain() {
     let mut a = worker("a", "root", WorkerState::Running);

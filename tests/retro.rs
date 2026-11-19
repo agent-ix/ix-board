@@ -5,6 +5,7 @@
 //! fixture behind the traits in `ix_board::retro::sources`; no test touches Linear, GitHub,
 //! herdr or a relay. Stores live under the system temporary directory, outside any repository.
 
+use ix_trace_rs::trace;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -2841,7 +2842,7 @@ fn the_snapshot_window_excludes_its_start_and_includes_the_snapshot_instant() {
     assert_eq!(value(&record, "pr_cycle_p90_hours"), Some(3.0));
 }
 
-/// Trace: FR-018-AC-24
+#[trace("FR-018-AC-24")]
 #[test]
 fn lifecycle_working_share_excludes_waiting_recent_and_refuses_unresolved_population() {
     let mut rig = base_rig();
