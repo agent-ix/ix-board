@@ -55,9 +55,10 @@ with the last successful report for that focus.
   acceptance excerpts (FR-014).
 - A versioned JSON focus record with canonical selectors and status facts for
   clients that choose their own storage or transport (FR-016).
-- `agents` reports a per-agent activity verdict (working, waiting-stuck, prompt,
-  asking, idle, unknown) for the herdr workspaces of named teams on every
-  machine, measured in minutes from transcripts, subagents and processes (FR-018).
+- `agents` reports lifecycle activity verdicts (working, waiting, waiting-stuck,
+  recent, prompt, asking, idle, unknown), nullable direct/nested active-worker
+  counts and source uncertainty for named herdr workspaces on every machine
+  ([FR-018](./functional/FR-018-agent-activity-verdicts.md), SWM-158).
 - `orphans` reports unprojected open and completed issues for the teams
   associated with projects in a program scope, with read-only project
   suggestions (FR-023).
@@ -99,7 +100,9 @@ with the last successful report for that focus.
 - Reading or writing GitHub Issues as part of planner focus resolution.
 - Reading or writing GitHub Issues as part of focus hygiene; GitHub is queried
   only for pull requests linked by structured Linear attachments.
-- Compatibility layers, legacy readers, or migration shims.
+- Compatibility layers, legacy readers, or migration shims, except the explicitly
+  retained deprecated nullable `live_subagents` alias in
+  [FR-018](./functional/FR-018-agent-activity-verdicts.md).
 - Copying or vendoring artifacts from another repository.
 
 ## System Overview
