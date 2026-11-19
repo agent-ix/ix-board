@@ -62,4 +62,13 @@ fn lifecycle_schema_and_documented_example_preserve_nullable_counts_and_versions
         ))
         .unwrap()
     );
+    let probe_schema =
+        serde_json::to_value(schemars::schema_for!(ix_board::agents::ProbeResponse)).unwrap();
+    assert_eq!(
+        probe_schema,
+        serde_json::from_str::<serde_json::Value>(include_str!(
+            "../docs/schema/agent-probe.schema.json"
+        ))
+        .unwrap()
+    );
 }
