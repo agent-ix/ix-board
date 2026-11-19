@@ -142,7 +142,11 @@ impl Harness for Claude {
                 if text.starts_with("[Request interrupted by user") {
                     state.transition(WorkerState::Stopped, at);
                     activity(state, at);
-                } else if !text.contains("<agent-message") && !text.contains("<task-notification") {
+                } else if record["isMeta"] != true
+                    && record["isCompactSummary"] != true
+                    && !text.contains("<agent-message")
+                    && !text.contains("<task-notification")
+                {
                     state.assignment_starts = state.assignment_starts.saturating_add(1);
                     state.transition(WorkerState::Running, at);
                     activity(state, at);
@@ -213,7 +217,11 @@ impl Harness for Codex {
                 }
                 clear_assistant(state);
                 activity(state, at);
-                state.generation = bounded_string(&p["turn_id"]);
+                let generation = bounded_string(&p["turn_id"]);
+                if generation != state.generation {
+                    state.calls.clear();
+                }
+                state.generation = generation;
                 if state.generation.is_none() {
                     state.issue("assignment_generation_missing");
                 }
@@ -248,11 +256,11 @@ impl Harness for Codex {
             }
             (Some("event_msg"), Some("collab_waiting_begin")) => {
                 activity(state, at);
-                state.transition(WorkerState::Waiting, at);
+                execution_transition(state, WorkerState::Waiting, at, p["turn_id"].as_str());
             }
             (Some("event_msg"), Some("collab_waiting_end")) => {
                 activity(state, at);
-                state.transition(WorkerState::Running, at);
+                execution_transition(state, WorkerState::Running, at, p["turn_id"].as_str());
             }
             (Some("response_item"), Some("message")) if p["role"] == "assistant" => {
                 activity(state, at);
@@ -289,6 +297,34 @@ impl Harness for Codex {
 }
 fn bounded_string(v: &Value) -> Option<String> {
     v.as_str().filter(|s| s.len() <= 512).map(str::to_owned)
+}
+
+// Execution within an assignment cannot create a new assignment generation.
+fn execution_transition(
+    state: &mut Lifecycle,
+    next: WorkerState,
+    at: Option<u64>,
+    generation: Option<&str>,
+) {
+    if generation
+        .zip(state.generation.as_deref())
+        .is_some_and(|(a, b)| a != b)
+    {
+        state.issue("execution_generation_conflict");
+    } else if matches!(state.state, WorkerState::Completed | WorkerState::Stopped) {
+        state.issue("execution_after_terminal_without_assignment");
+    } else if state.state.is_active() {
+        state.transition(next, at);
+    } else {
+        state.issue("execution_without_active_assignment");
+    }
+}
+
+fn pending_wait(state: &Lifecycle) -> bool {
+    state
+        .calls
+        .values()
+        .any(|call| matches!(call.name.as_str(), "wait_agent" | "wait"))
 }
 fn header(p: &Value, state: &mut Lifecycle) {
     let nested = &p["source"]["subagent"]["thread_spawn"];
@@ -336,14 +372,16 @@ fn call(p: &Value, state: &mut Lifecycle, at: Option<u64>) {
     let Some(name) = p["name"].as_str().and_then(|s| s.rsplit('.').next()) else {
         return;
     };
+    if matches!(name, "wait_agent" | "wait") {
+        execution_transition(state, WorkerState::Waiting, at, p["turn_id"].as_str());
+    } else if !state.state.is_active() || !pending_wait(state) {
+        execution_transition(state, WorkerState::Running, at, p["turn_id"].as_str());
+    }
     if !matches!(
         name,
         "list_agents" | "spawn_agent" | "followup_task" | "wait_agent" | "wait"
     ) {
         return;
-    }
-    if matches!(name, "wait_agent" | "wait") {
-        state.transition(WorkerState::Waiting, at);
     }
     let Some(id) = bounded_string(&p["call_id"]) else {
         state.issue("call_identity_missing");
@@ -362,6 +400,7 @@ fn call(p: &Value, state: &mut Lifecycle, at: Option<u64>) {
         PendingCall {
             name: name.into(),
             target,
+            generation: state.generation.clone(),
         },
     );
 }
@@ -369,6 +408,15 @@ fn result(p: &Value, state: &mut Lifecycle, at: Option<u64>) {
     let Some(call) = p["call_id"].as_str().and_then(|id| state.calls.remove(id)) else {
         return;
     };
+    if matches!(call.name.as_str(), "wait_agent" | "wait") {
+        activity(state, at);
+        if call.generation != state.generation {
+            state.issue("wait_result_generation_conflict");
+        } else if !pending_wait(state) {
+            execution_transition(state, WorkerState::Running, at, call.generation.as_deref());
+        }
+        return;
+    }
     if call.name == "followup_task" {
         // Real successful follow-ups have empty output. A child task_started
         // with a new generation establishes execution; the output cannot.

@@ -100,6 +100,10 @@ to 64 MiB. Aggregate file reads stop at 256 MiB. The request retains at most
 1,024 workers and accepts/emits at most 16 MiB of protocol data. Collection retries a changing file once. Repeated changes and
 limit exhaustion produce explicit unavailable evidence.
 
+Claude metadata prioritizes unfinished assignments before old terminal transcripts.
+Small identity records remain visible when full replay exceeds the budget.
+Unread transcript references keep descendant counts uncertain.
+
 ## Examples
 
 ```bash

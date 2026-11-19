@@ -156,11 +156,7 @@ fn walk_limited(
     files.sort();
     files
 }
-fn read_header(
-    path: &Path,
-    adapter: &dyn Harness,
-    budget: &mut Budget,
-) -> Result<Lifecycle, &'static str> {
+fn first_record(path: &Path, budget: &mut Budget) -> Result<Value, &'static str> {
     retry_sample(|| {
         let before = stamp(path)?;
         budget.check()?;
@@ -173,14 +169,36 @@ fn read_header(
             return Err("header_size_limit");
         }
         budget.take(u64::try_from(bytes.len()).unwrap_or(u64::MAX))?;
-        let value: Value = serde_json::from_slice(&bytes).map_err(|_| "header_malformed")?;
-        if value["type"] != "session_meta" {
-            return Err("unsupported_header");
-        }
-        let mut life = Lifecycle::default();
-        adapter.observe_record(&value, &mut life);
-        // Full headers, instructions and prompts are dropped here.
-        Ok((before == stamp(path)?).then_some(life))
+        let value = serde_json::from_slice(&bytes).map_err(|_| "header_malformed")?;
+        Ok((before == stamp(path)?).then_some(value))
+    })
+}
+fn read_header(
+    path: &Path,
+    adapter: &dyn Harness,
+    budget: &mut Budget,
+) -> Result<Lifecycle, &'static str> {
+    let value = first_record(path, budget)?;
+    if value["type"] != "session_meta" {
+        return Err("unsupported_header");
+    }
+    let mut life = Lifecycle::default();
+    adapter.observe_record(&value, &mut life);
+    // Full headers, instructions and prompts are dropped here.
+    Ok(life)
+}
+fn claude_identity(path: &Path, budget: &mut Budget) -> Result<Lifecycle, &'static str> {
+    let value = first_record(path, budget)?;
+    let id = |key: &str| {
+        value[key]
+            .as_str()
+            .filter(|id| id.len() <= 512)
+            .map(|id| AgentId(id.into()))
+    };
+    Ok(Lifecycle {
+        record_agent_id: id("agentId"),
+        root_session_id: id("sessionId"),
+        ..Lifecycle::default()
     })
 }
 fn read_transcript(
@@ -442,6 +460,7 @@ fn observation(id: AgentId, life: &Lifecycle, adapter: &dyn Harness) -> WorkerOb
         observed_at: epoch_now(),
         source: adapter.evidence_source(),
         provenance: vec!["structured_transcript".into()],
+        descendants_complete: true,
         issues: life.issues.clone(),
     }
 }
@@ -463,12 +482,30 @@ fn collect_claude(
         }
         Ok(_) => {}
     }
-    let paths = walk(&dir, &mut files.lifecycle_availability, budget);
-    for path in paths {
-        if files.workers.len() >= MAX_WORKERS {
-            files.lifecycle_availability.missing("worker_limit");
-            break;
-        }
+    let mut paths = walk(&dir, &mut files.lifecycle_availability, budget);
+    if paths.len() > MAX_WORKERS {
+        files.lifecycle_availability.missing("worker_limit");
+        paths.truncate(MAX_WORKERS);
+    }
+    let mut candidates: Vec<_> = paths
+        .into_iter()
+        .map(|path| {
+            let metadata =
+                read_bytes(&path.with_extension("meta.json"), 65536, budget).and_then(|bytes| {
+                    serde_json::from_slice::<ClaudeMetadata>(&bytes)
+                        .map_err(|_| "metadata_unsupported")
+                });
+            (path, metadata)
+        })
+        .collect();
+    candidates.sort_by(|(a_path, a), (b_path, b)| {
+        let terminal = |meta: &Result<ClaudeMetadata, &'static str>| {
+            meta.as_ref()
+                .is_ok_and(|meta| meta.finished || meta.stopped)
+        };
+        (terminal(a), a_path).cmp(&(terminal(b), b_path))
+    });
+    for (path, metadata) in candidates {
         let Some(id) = path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -480,16 +517,33 @@ fn collect_claude(
             files.lifecycle_availability.missing("identity_size_limit");
             continue;
         }
+        let mut transcript_complete = true;
         let mut life = match read_transcript(&path, adapter, budget) {
             Ok(life) => life,
             Err(reason) => {
-                let mut life = Lifecycle::default();
+                transcript_complete = false;
+                // Small identity evidence remains useful even when historical replay
+                // cannot fit. It cannot prove the absence of later assignments.
+                let mut life = claude_identity(&path, budget).unwrap_or_default();
                 life.issue(reason);
                 life
             }
         };
+        // The prepass only orders work. Re-read authoritative metadata after
+        // the transcript so a completion during collection is not missed.
+        let metadata =
+            match read_bytes(&path.with_extension("meta.json"), 65536, budget).and_then(|bytes| {
+                serde_json::from_slice::<ClaudeMetadata>(&bytes).map_err(|_| "metadata_unsupported")
+            }) {
+                Ok(fresh) => Ok(fresh),
+                Err(reason) => {
+                    life.issue(reason);
+                    metadata
+                }
+            };
         merge_parent_facts(files, &life);
         let mut worker = observation(AgentId(id.into()), &life, adapter);
+        worker.descendants_complete = transcript_complete;
         if life
             .record_agent_id
             .as_ref()
@@ -503,9 +557,7 @@ fn collect_claude(
                 .issues
                 .push("claude_child_identity_missing_or_conflicting".into());
         }
-        match read_bytes(&path.with_extension("meta.json"), 65536, budget).and_then(|bytes| {
-            serde_json::from_slice::<ClaudeMetadata>(&bytes).map_err(|_| "metadata_unsupported")
-        }) {
+        match metadata {
             Ok(meta) => {
                 worker.declared_depth = meta.spawn_depth;
                 worker.role = match meta.agent_type.as_deref() {
@@ -625,9 +677,11 @@ fn collect_codex(
             files.lifecycle_availability.missing("worker_limit");
             break;
         }
+        let mut transcript_complete = true;
         let mut life = match read_transcript(path, adapter, budget) {
             Ok(life) => life,
             Err(reason) => {
+                transcript_complete = false;
                 let mut life = header.clone();
                 life.issue(reason);
                 life
@@ -640,7 +694,9 @@ fn collect_codex(
         if let Some(time) = mtime(path) {
             files.child_mtimes.push(time);
         }
-        files.workers.push(observation(id.clone(), &life, adapter));
+        let mut worker = observation(id.clone(), &life, adapter);
+        worker.descendants_complete = transcript_complete;
+        files.workers.push(worker);
     }
 }
 fn reconcile(files: &mut SessionFiles, start: u64) {
@@ -921,5 +977,85 @@ mod tests {
                 assert_eq!(result.unwrap_err(), "file_changed_during_collection");
             }
         }
+    }
+    #[test]
+    #[trace("FR-018-AC-9", "FR-018-AC-14", "FR-018-AC-20")]
+    fn metadata_priority_preserves_current_workers_before_old_logs_exhaust_the_byte_budget() {
+        let home = tempfile::tempdir().unwrap();
+        let parent = home.path().join(".claude/projects/test/root.jsonl");
+        let dir = parent.with_extension("").join("subagents");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            &parent,
+            include_str!("../../tests/fixtures/agents/claude_done.jsonl"),
+        )
+        .unwrap();
+        for (id, terminal, padding) in [
+            ("a-old", true, 70 * 1024),
+            ("b-old", true, 70 * 1024),
+            ("z-current", false, 40 * 1024),
+        ] {
+            let assignment = serde_json::json!({"type":"user","agentId":id,"sessionId":"root","isMeta":false,"timestamp":"2026-10-18T10:00:00Z","message":{"content":"Assigned checks."}});
+            let injected = serde_json::json!({"type":"user","agentId":id,"sessionId":"root","isMeta":true,"timestamp":"2026-10-18T10:00:01Z","message":{"content":"x".repeat(padding)}});
+            fs::write(
+                dir.join(format!("agent-{id}.jsonl")),
+                format!("{assignment}\n{injected}\n"),
+            )
+            .unwrap();
+            fs::write(dir.join(format!("agent-{id}.meta.json")),serde_json::json!({"agentType":"general-purpose","spawnDepth":1,"finished":terminal}).to_string()).unwrap();
+        }
+        let limit = 100 * 1024;
+        let mut budget = Budget {
+            remaining: limit,
+            deadline: Instant::now() + Duration::from_secs(5),
+        };
+        let mut files = SessionFiles {
+            lifecycle_availability: Availability::available(),
+            ..SessionFiles::default()
+        };
+        collect_claude(
+            &parent,
+            "root",
+            adapter_for("claude").unwrap(),
+            &mut files,
+            &mut budget,
+        );
+        let current = files
+            .workers
+            .iter()
+            .find(|w| w.id.0 == "z-current")
+            .unwrap();
+        assert_eq!(current.state, WorkerState::Running);
+        assert!(current.issues.is_empty(), "{current:?}");
+        assert!(current.descendants_complete);
+        let terminal: Vec<_> = files
+            .workers
+            .iter()
+            .filter(|w| w.id.0 != "z-current")
+            .collect();
+        assert_eq!(terminal.len(), 2);
+        for w in terminal {
+            assert_eq!(w.state, WorkerState::Completed);
+            assert!(!w.descendants_complete);
+            assert!(w.issues.contains(&"collection_byte_limit".into()));
+            assert!(
+                !w.issues
+                    .contains(&"claude_child_identity_missing_or_conflicting".into())
+            );
+        }
+        let count = super::super::count_workers(
+            &AgentId("root".into()),
+            &files.workers,
+            files.lifecycle_availability,
+        );
+        assert_eq!(count.known_direct_active, 1);
+        assert_eq!((count.direct, count.nested), (None, None));
+        assert!(
+            count
+                .availability
+                .reasons
+                .contains(&"descendant_references_incomplete".into())
+        );
+        assert!(budget.remaining > 0 && budget.remaining < limit);
     }
 }

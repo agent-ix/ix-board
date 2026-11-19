@@ -1,0 +1,2 @@
+{"type":"user","sessionId":"root","isMeta":false,"message":{"role":"user","content":"Run the assigned checks."},"timestamp":"2026-10-18T10:00:00.000Z"}
+{"type":"assistant","sessionId":"root","message":{"role":"assistant","content":[{"type":"tool_use","id":"wait-child","name":"TaskOutput","input":{"task_id":"child","block":true,"timeout":30000}}]},"timestamp":"2026-10-18T10:00:02.000Z"}

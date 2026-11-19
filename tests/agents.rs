@@ -33,6 +33,7 @@ fn worker(id: &str, parent: &str, state: WorkerState) -> WorkerObservation {
         observed_at: NOW,
         source: EvidenceSource::Adapter,
         provenance: vec!["fixture".into()],
+        descendants_complete: true,
         issues: vec![],
     }
 }
@@ -117,15 +118,9 @@ fn uncertainty_is_scoped_to_proven_depth_and_conflicting_duplicates_are_not_chos
         (None, Some(0))
     );
 }
-#[trace(
-    "FR-018-AC-2",
-    "FR-018-AC-3",
-    "FR-018-AC-17",
-    "FR-018-AC-18",
-    "FR-018-AC-19"
-)]
+#[trace("FR-018-AC-17", "FR-018-AC-18", "FR-018-AC-19")]
 #[test]
-fn all_eight_verdicts_thresholds_and_pending_wait_precedence() {
+fn shared_classifier_thresholds_and_pending_wait_precedence() {
     for harness in ["claude", "codex"] {
         let records = match harness {
             "claude" => include_str!("fixtures/agents/claude_done.jsonl"),
@@ -699,7 +694,7 @@ fn third_adapter_uses_unchanged_classifier_and_counts() {
 fn real_followup_interaction_receipt_needs_new_child_generation_to_restart() {
     // Sanitized projection of the 2026-11-19 rollout: result text is absent.
     let adapter = adapter_for("codex").unwrap();
-    let mut parent = Lifecycle::default();
+    let mut parent = life("codex", include_str!("fixtures/agents/codex_running.jsonl"));
     for record in [
         json!({"type":"response_item","timestamp":"2026-11-19T21:34:01.295Z","payload":{"type":"function_call","name":"followup_task","call_id":"call-followup","arguments":"{\"target\":\"research\"}"}}),
         json!({"type":"event_msg","timestamp":"2026-11-19T21:34:01.466Z","payload":{"type":"item_completed","item":{"id":"call-followup","type":"SubAgentActivity","kind":"interacted","agent_path":"/root/research","agent_thread_id":"child"}}}),
@@ -923,5 +918,315 @@ fn verified_gate_survives_missing_transcripts_and_report_counts_alias_active_ass
         c.availability
             .reasons
             .contains(&"worker_state_limit".into())
+    );
+}
+
+#[derive(Clone, Copy)]
+enum FixtureChildren {
+    Empty,
+    Running,
+    Completed,
+    MissingMetadata,
+}
+fn collected_scenario(harness: &str, mode: &str, children: FixtureChildren) -> Machine {
+    let home = tempfile::tempdir().unwrap();
+    let (kind, records) = match (harness, mode) {
+        ("claude", "running") => (
+            HarnessKind::Claude,
+            include_str!("fixtures/agents/claude_running.jsonl"),
+        ),
+        ("claude", "waiting") => (
+            HarnessKind::Claude,
+            include_str!("fixtures/agents/claude_waiting.jsonl"),
+        ),
+        ("claude", "asking") => (
+            HarnessKind::Claude,
+            include_str!("fixtures/agents/claude_asking.jsonl"),
+        ),
+        ("claude", "done") => (
+            HarnessKind::Claude,
+            include_str!("fixtures/agents/claude_done.jsonl"),
+        ),
+        ("codex", "running") => (
+            HarnessKind::Codex,
+            include_str!("fixtures/agents/codex_running.jsonl"),
+        ),
+        ("codex", "waiting") => (
+            HarnessKind::Codex,
+            include_str!("fixtures/agents/codex_waiting.jsonl"),
+        ),
+        ("codex", "returned_wait") => (
+            HarnessKind::Codex,
+            include_str!("fixtures/agents/codex_wait_returned.jsonl"),
+        ),
+        ("codex", "asking") => (
+            HarnessKind::Codex,
+            include_str!("fixtures/agents/codex_asking.jsonl"),
+        ),
+        ("codex", "done") => (
+            HarnessKind::Codex,
+            include_str!("fixtures/agents/codex_done.jsonl"),
+        ),
+        _ => panic!("unknown fixture {harness}/{mode}"),
+    };
+    if kind == HarnessKind::Claude {
+        write(home.path(), ".claude/projects/test/root.jsonl", records);
+        if !matches!(children, FixtureChildren::Empty) {
+            claude_child(
+                home.path(),
+                "child",
+                json!({"agentType":"general-purpose","spawnDepth":1,"finished":matches!(children,FixtureChildren::Completed)}),
+            );
+            if matches!(children, FixtureChildren::MissingMetadata) {
+                fs::remove_file(
+                    home.path()
+                        .join(".claude/projects/test/root/subagents/agent-child.meta.json"),
+                )
+                .unwrap();
+            }
+        }
+    } else {
+        codex_file(
+            home.path(),
+            "root",
+            codex_header("root", None, "/root"),
+            &records.lines().skip(1).collect::<Vec<_>>().join("\n"),
+        );
+        if !matches!(children, FixtureChildren::Empty) {
+            let start = json!({"type":"event_msg","timestamp":"2026-10-18T10:00:00Z","payload":{"type":"task_started","turn_id":"child-turn"}});
+            let terminal = if matches!(children, FixtureChildren::Completed) {
+                format!(
+                    "\n{}",
+                    json!({"type":"event_msg","timestamp":"2026-10-18T10:00:01Z","payload":{"type":"task_complete","turn_id":"child-turn"}})
+                )
+            } else {
+                String::new()
+            };
+            codex_file(
+                home.path(),
+                "child",
+                codex_header("child", Some("root"), "/root/child"),
+                &format!("{start}{terminal}"),
+            );
+            if matches!(children, FixtureChildren::MissingMetadata) {
+                fs::remove_file(home.path().join(".codex/sessions/rollout-test-child.jsonl"))
+                    .unwrap();
+                let mut parent = records.lines().skip(1).collect::<Vec<_>>().join("\n");
+                parent.push_str(&format!("\n{}\n{}",json!({"type":"response_item","timestamp":"2026-10-18T10:00:01Z","payload":{"type":"function_call","name":"spawn_agent","call_id":"spawn","arguments":"{}"}}),json!({"type":"response_item","timestamp":"2026-10-18T10:00:01Z","payload":{"type":"function_call_output","call_id":"spawn","output":"{\"task_name\":\"/root/child\"}"}})));
+                codex_file(
+                    home.path(),
+                    "root",
+                    codex_header("root", None, "/root"),
+                    &parent,
+                );
+            }
+        }
+    }
+    let mut host = machine();
+    host.harness = if kind == HarnessKind::Claude {
+        "claude"
+    } else {
+        "codex"
+    };
+    host.probe = collect_probe(home.path(), &request(kind)).unwrap();
+    // Replay the real filesystem collection with an injected complete process
+    // sample; the adapter-derived assignment/state facts remain unchanged.
+    host.probe.processes.clear();
+    host.probe.process_availability = Availability::available();
+    host
+}
+fn host_age(host: &mut Machine, age: u64) {
+    let at = host.probe.sessions["root"]
+        .parent_lifecycle
+        .last_activity_at
+        .unwrap();
+    host.probe.now = at + age;
+    host.probe.started_at = at + age;
+    host.probe.finished_at = at + age;
+    let files = host.probe.sessions.get_mut("root").unwrap();
+    // File age is deliberately fresh even for ended and quiet fixtures.
+    files.transcript_mtime = Some(at + age);
+    for worker in &mut files.workers {
+        worker.observed_at = at + age;
+    }
+}
+
+#[trace(
+    "FR-018-AC-2",
+    "FR-018-AC-3",
+    "FR-018-AC-17",
+    "FR-018-AC-18",
+    "FR-018-AC-19"
+)]
+#[test]
+fn both_harnesses_decode_all_eight_verdicts_thresholds_and_wait_precedence_from_records() {
+    use FixtureChildren::{Completed, Empty, MissingMetadata, Running};
+    let cases = [
+        ("running", Empty, "working", 1, Verdict::Working),
+        ("waiting", Running, "blocked", 3600, Verdict::Prompt),
+        ("asking", Empty, "done", 1, Verdict::Asking),
+        ("done", Empty, "working", 1, Verdict::Unknown),
+        ("done", Running, "done", 3600, Verdict::Waiting),
+        ("waiting", Running, "working", 3600, Verdict::Waiting),
+        ("waiting", Completed, "working", 899, Verdict::Unknown),
+        ("waiting", Completed, "working", 900, Verdict::WaitingStuck),
+        ("waiting", MissingMetadata, "working", 900, Verdict::Unknown),
+        ("done", Empty, "done", 1199, Verdict::Recent),
+        ("done", Empty, "done", 1200, Verdict::Idle),
+        ("running", Empty, "done", 3600, Verdict::Unknown),
+    ];
+    for harness in ["claude", "codex"] {
+        let mut seen = Vec::new();
+        for (mode, children, status, age, expected) in cases {
+            let mut host = collected_scenario(harness, mode, children);
+            if mode == "waiting" {
+                assert_eq!(
+                    host.probe.sessions["root"].parent_lifecycle.state,
+                    WorkerState::Waiting,
+                    "{harness}: decoder must establish pending wait"
+                );
+            }
+            if mode == "running" {
+                assert_eq!(
+                    host.probe.sessions["root"].parent_lifecycle.state,
+                    WorkerState::Running,
+                    "{harness}: decoder must establish assignment"
+                );
+            }
+            host_age(&mut host, age);
+            host.status = status;
+            let row = report(vec![host]).agents.remove(0);
+            assert_eq!(
+                row.verdict, expected,
+                "{harness}/{mode}/{status}/{age}: {row:?}"
+            );
+            if !seen.contains(&row.verdict) {
+                seen.push(row.verdict);
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            8,
+            "{harness} fixtures must exercise every verdict"
+        );
+    }
+}
+
+#[trace("FR-018-AC-10", "FR-018-AC-11", "FR-018-AC-14")]
+#[test]
+fn claude_injected_user_context_preserves_terminal_metadata_but_real_assignments_remain_uncertain()
+{
+    for stopped in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        claude_root(home.path());
+        claude_child(
+            home.path(),
+            "child",
+            json!({"agentType":"general-purpose","spawnDepth":1,"finished":true,"stoppedByUser":stopped}),
+        );
+        let path = home
+            .path()
+            .join(".claude/projects/test/root/subagents/agent-child.jsonl");
+        let original = fs::read_to_string(&path).unwrap();
+        let injected = json!({"type":"user","agentId":"child","sessionId":"root","isMeta":true,"timestamp":"2026-10-18T10:00:11Z","message":{"content":"<system-reminder>Base directory for this skill: /sanitized/skill</system-reminder>"}});
+        fs::write(&path, format!("{original}\n{injected}\n")).unwrap();
+        let p = collect_probe(home.path(), &request(HarnessKind::Claude)).unwrap();
+        let f = &p.sessions["root"];
+        let c = count_workers(
+            &AgentId("root".into()),
+            &f.workers,
+            f.lifecycle_availability.clone(),
+        );
+        assert_eq!(
+            (c.direct, c.nested),
+            (Some(0), Some(0)),
+            "meta context is not an assignment: {c:?}"
+        );
+        assert_eq!(
+            c.workers[0].state,
+            if stopped {
+                WorkerState::Stopped
+            } else {
+                WorkerState::Completed
+            }
+        );
+        assert!(c.workers[0].issues.is_empty());
+        assert_eq!(
+            life("claude", &fs::read_to_string(&path).unwrap()).assignment_starts,
+            1
+        );
+        let assignment = json!({"type":"user","agentId":"child","sessionId":"root","isMeta":false,"timestamp":"2026-10-18T10:00:12Z","message":{"content":"A real new assignment."}});
+        fs::write(&path, format!("{original}\n{injected}\n{assignment}\n")).unwrap();
+        let p = collect_probe(home.path(), &request(HarnessKind::Claude)).unwrap();
+        let f = &p.sessions["root"];
+        let c = count_workers(
+            &AgentId("root".into()),
+            &f.workers,
+            f.lifecycle_availability.clone(),
+        );
+        assert_eq!(c.direct, None);
+        assert!(
+            c.workers[0]
+                .issues
+                .contains(&"metadata_assignment_order_unresolved".into())
+        );
+    }
+}
+
+#[trace("FR-018-AC-3", "FR-018-AC-12", "FR-018-AC-17", "FR-018-AC-19")]
+#[test]
+fn codex_correlated_wait_return_resumes_execution_while_unresolved_waits_remain_pending() {
+    let mut host = collected_scenario("codex", "returned_wait", FixtureChildren::Running);
+    host_age(&mut host, 1);
+    host.status = "working";
+    let state = &host.probe.sessions["root"].parent_lifecycle;
+    assert_eq!(state.state, WorkerState::Running);
+    assert!(state.issues.is_empty(), "{state:?}");
+    assert_eq!(report(vec![host]).agents[0].verdict, Verdict::Working);
+    let adapter = adapter_for("codex").unwrap();
+    let mut state = life("codex", include_str!("fixtures/agents/codex_waiting.jsonl"));
+    adapter.observe_record(&json!({"type":"response_item","timestamp":"2026-10-18T10:00:03Z","payload":{"type":"function_call","name":"functions.exec","call_id":"parallel-exec","arguments":"{}"}}),&mut state);
+    assert_eq!(
+        state.state,
+        WorkerState::Waiting,
+        "ordinary calls do not discard an unresolved correlated wait"
+    );
+    assert!(state.calls.contains_key("wait1"));
+    adapter.observe_record(&json!({"type":"response_item","timestamp":"2026-10-18T10:00:04Z","payload":{"type":"function_call_output","call_id":"unrelated","output":"{}"}}),&mut state);
+    assert_eq!(state.state, WorkerState::Waiting);
+    adapter.observe_record(&json!({"type":"response_item","timestamp":"2026-10-18T10:00:05Z","payload":{"type":"function_call_output","call_id":"wait1","output":"{\"message\":\"No updates\",\"timed_out\":true}"}}),&mut state);
+    assert_eq!(state.state, WorkerState::Running);
+    assert!(!state.calls.contains_key("wait1"));
+}
+
+#[trace("FR-018-AC-10", "FR-018-AC-12", "FR-018-AC-19")]
+#[test]
+fn codex_late_wait_events_cannot_reopen_completed_or_stopped_generations() {
+    let adapter = adapter_for("codex").unwrap();
+    for terminal in ["task_complete", "turn_aborted"] {
+        for event in ["collab_waiting_begin", "collab_waiting_end"] {
+            let mut state = life("codex", include_str!("fixtures/agents/codex_running.jsonl"));
+            adapter.observe_record(&json!({"type":"event_msg","timestamp":"2026-10-18T10:00:03Z","payload":{"type":terminal,"turn_id":"g1"}}),&mut state);
+            let expected = state.state;
+            let ended = state.execution_ended_at;
+            adapter.observe_record(&json!({"type":"event_msg","timestamp":"2026-10-18T10:00:04Z","payload":{"type":event,"turn_id":"g1"}}),&mut state);
+            assert_eq!(state.state, expected, "{terminal}/{event}");
+            assert_eq!(state.execution_ended_at, ended);
+            assert!(
+                state
+                    .issues
+                    .contains(&"execution_after_terminal_without_assignment".into())
+            );
+        }
+    }
+    let mut state = life("codex", include_str!("fixtures/agents/codex_waiting.jsonl"));
+    adapter.observe_record(&json!({"type":"event_msg","timestamp":"2026-10-18T10:00:03Z","payload":{"type":"task_complete","turn_id":"g1"}}),&mut state);
+    adapter.observe_record(&json!({"type":"response_item","timestamp":"2026-10-18T10:00:04Z","payload":{"type":"function_call_output","call_id":"wait1","output":"{}"}}),&mut state);
+    assert_eq!(state.state, WorkerState::Completed);
+    assert!(state.execution_ended_at.is_some());
+    assert!(
+        state
+            .issues
+            .contains(&"execution_after_terminal_without_assignment".into())
     );
 }

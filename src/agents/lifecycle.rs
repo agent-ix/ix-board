@@ -91,6 +91,8 @@ pub struct WorkerObservation {
     pub source: EvidenceSource,
     /// Bounded source locators, without transcript content.
     pub provenance: Vec<String>,
+    /// Whether this transcript's references to further children were fully read.
+    pub descendants_complete: bool,
     /// Reasons this observation is uncertain.
     pub issues: Vec<String>,
 }
@@ -169,6 +171,7 @@ pub fn count_workers(
     }
     for worker in observations.iter().take(1024) {
         if let Some(previous) = by_id.get_mut(&worker.id) {
+            previous.descendants_complete &= worker.descendants_complete;
             let mut comparable = worker.clone();
             comparable.observed_at = previous.observed_at;
             if previous != &comparable {
@@ -194,6 +197,10 @@ pub fn count_workers(
     for worker in by_id.values() {
         if worker.role == WorkerRole::Internal {
             continue;
+        }
+        if !worker.descendants_complete {
+            nested_complete = false;
+            availability.missing("descendant_references_incomplete");
         }
         let mut uncertain = worker.role == WorkerRole::Unknown
             || worker.state == WorkerState::Unknown
@@ -306,6 +313,8 @@ pub struct PendingCall {
     pub name: String,
     /// Target path/identity, never the assigned message.
     pub target: Option<String>,
+    /// Assignment generation that issued the call.
+    pub generation: Option<String>,
 }
 
 impl Lifecycle {

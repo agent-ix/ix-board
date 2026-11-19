@@ -439,6 +439,10 @@
           "format": "uint64",
           "minimum": 0
         },
+        "descendants_complete": {
+          "description": "Whether this transcript's references to further children were fully read.",
+          "type": "boolean"
+        },
         "id": {
           "description": "Stable child identity, never its nickname.",
           "$ref": "#/$defs/AgentId"
@@ -520,6 +524,7 @@
         "observed_at",
         "source",
         "provenance",
+        "descendants_complete",
         "issues"
       ]
     },

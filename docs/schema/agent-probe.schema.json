@@ -306,6 +306,13 @@
       "description": "Bounded correlation metadata for one lifecycle tool call.",
       "type": "object",
       "properties": {
+        "generation": {
+          "description": "Assignment generation that issued the call.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "name": {
           "description": "Tool name with namespace removed.",
           "type": "string"
@@ -464,6 +471,10 @@
           "format": "uint64",
           "minimum": 0
         },
+        "descendants_complete": {
+          "description": "Whether this transcript's references to further children were fully read.",
+          "type": "boolean"
+        },
         "id": {
           "description": "Stable child identity, never its nickname.",
           "$ref": "#/$defs/AgentId"
@@ -545,6 +556,7 @@
         "observed_at",
         "source",
         "provenance",
+        "descendants_complete",
         "issues"
       ]
     },
