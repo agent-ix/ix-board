@@ -41,8 +41,9 @@ pub use model::{
     FocusMilestone, FocusMilestoneStatus, FocusPlanChunk, FocusPlanIssue, FocusProgress,
     FocusProject, FocusProjectMembership, FocusProjectStatus, FocusRecord, FocusSelection,
     FocusStateCount, FocusStatus, FocusUnmilestonedStatus, Initiative, Issue, IssueBatch, IssueId,
-    Milestone, NextStep, Project, ProjectChunk, ProjectId, ProjectPriority, ProjectRunStatus,
-    ReadyItem, SearchKind, SearchResult, TeamKey, WorkflowStateType, WorkspaceSnapshot,
+    Milestone, NextStep, Project, ProjectChunk, ProjectCompletion, ProjectId, ProjectPriority,
+    ProjectRunStatus, ProjectStatusCategory, ReadyItem, SearchKind, SearchResult, TeamKey,
+    WorkflowStateType, WorkspaceSnapshot,
 };
 
 use model::{compare_f64, issue_is_open};

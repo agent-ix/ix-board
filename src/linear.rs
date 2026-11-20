@@ -8,8 +8,8 @@ use ix_cli_kit::secrets::{AppScope, CredentialBackend, SecretKey, SecretStore, S
 use crate::{
     Clock, DriftConfig, DriftEvidence, DriftTicket, Error, HistoricalProject, Initiative, Issue,
     IssueId, IssueTransition, Milestone, Project, ProjectId, ProjectMutationSource,
-    ProjectPriority, ProjectRunStatus, SystemClock, TeamKey, WorkflowStateType, WorkspaceSnapshot,
-    WorkspaceSource, issue_is_open,
+    ProjectPriority, ProjectRunStatus, ProjectStatusCategory, SystemClock, TeamKey,
+    WorkflowStateType, WorkspaceSnapshot, WorkspaceSource, issue_is_open,
 };
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -27,8 +27,8 @@ const INITIATIVE_PAGE_SIZE: i32 = 50;
 const RELATION_PAGE_SIZE: i32 = 50;
 const INITIAL_RELATION_PAGE_SIZE: i32 = 10;
 const PAGE_LIMIT: usize = 1_000;
-// Invalidate snapshots predating complete incoming and outgoing relation reads.
-const CACHE_MODEL_VERSION: &str = "v12";
+// Isolate snapshots carrying native project-status category and display name from older readers.
+const CACHE_MODEL_VERSION: &str = "v13";
 const ENDPOINT: &str = "https://api.linear.app/graphql";
 
 const PROJECT_QUERY: &str = r#"
@@ -1070,6 +1070,8 @@ impl WorkspaceSource for LinearGraphQlSource {
                         resource: format!("project {} initiatives", raw.id),
                     });
                 }
+                let status_category = raw.status.status_type;
+                let status_name = raw.status.name.clone();
                 projects.push(Project {
                     initiatives: raw.initiatives.nodes,
                     id: ProjectId(raw.id),
@@ -1078,7 +1080,9 @@ impl WorkspaceSource for LinearGraphQlSource {
                     updated_at: raw.updated_at,
                     description: raw.description,
                     content: raw.content,
-                    status: canonical_project_status(raw.status.name, raw.status.status_type),
+                    status: canonical_project_status(raw.status.name, status_category),
+                    status_name: Some(status_name),
+                    status_category,
                     priority: raw.priority,
                     sort_order: raw.sort_order,
                     target_date: raw.target_date,
@@ -1343,7 +1347,7 @@ fn resolve_project_status_id(
         .iter()
         .filter(|status| status.team.as_ref().map(|team| team.id.as_str()) == team_id)
         .filter(|status| match requested {
-            ProjectRunStatus::Started => status.status_type == LinearProjectStatusType::Started,
+            ProjectRunStatus::Started => status.status_type == ProjectStatusCategory::Started,
             ProjectRunStatus::Paused => status.name == "Paused",
         })
         .collect::<Vec<_>>();
@@ -1358,10 +1362,10 @@ fn resolve_project_status_id(
     }
 }
 
-fn canonical_project_status(name: String, status_type: LinearProjectStatusType) -> String {
+fn canonical_project_status(name: String, status_type: ProjectStatusCategory) -> String {
     if name == ProjectRunStatus::Paused.as_str() {
         ProjectRunStatus::Paused.as_str().to_owned()
-    } else if status_type == LinearProjectStatusType::Started {
+    } else if status_type == ProjectStatusCategory::Started {
         ProjectRunStatus::Started.as_str().to_owned()
     } else {
         name
@@ -1601,19 +1605,8 @@ struct RawProject {
 #[serde(deny_unknown_fields)]
 struct RawProjectStatus {
     name: String,
-    #[serde(rename = "type")]
-    status_type: LinearProjectStatusType,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "lowercase")]
-enum LinearProjectStatusType {
-    Backlog,
-    Planned,
-    Started,
-    Paused,
-    Completed,
-    Canceled,
+    #[serde(rename = "type", default)]
+    status_type: ProjectStatusCategory,
 }
 
 #[derive(Clone, Deserialize)]
@@ -1623,7 +1616,7 @@ struct RawProjectStatusOption {
     id: String,
     name: String,
     #[serde(rename = "type")]
-    status_type: LinearProjectStatusType,
+    status_type: ProjectStatusCategory,
     team: Option<RawStatusTeam>,
 }
 
@@ -1860,14 +1853,15 @@ struct RawRelationIssue {
 mod tests {
     use super::{
         CACHE_MODEL_VERSION, INITIATIVE_PAGE_SIZE, ISSUE_PAGE_SIZE, IssueData, LinearGraphQlSource,
-        LinearProjectStatusType, PROJECT_PAGE_SIZE, PROJECT_UPDATE_MUTATION, ProjectData,
-        ProjectUpdateInput, RawProjectStatusOption, canonical_project_status, collect_blocked_by,
+        PROJECT_PAGE_SIZE, PROJECT_UPDATE_MUTATION, ProjectData, ProjectUpdateInput,
+        RawProjectStatusOption, canonical_project_status, collect_blocked_by,
         resolve_project_status_id, should_fetch_issue_history,
     };
     use crate::Error;
     use crate::{
-        Issue, IssueId, Project, ProjectId, ProjectMutationSource, ProjectPriority,
-        ProjectRunStatus, ReadService, TeamKey, WorkspaceSnapshot, WorkspaceSource,
+        Issue, IssueId, Project, ProjectCompletion, ProjectId, ProjectMutationSource,
+        ProjectPriority, ProjectRunStatus, ProjectStatusCategory, ReadService, TeamKey,
+        WorkspaceSnapshot, WorkspaceSource,
     };
     use ix_trace_rs::trace;
     use serde_json::Value;
@@ -2602,6 +2596,8 @@ mod tests {
                 description: "Goal".to_owned(),
                 content: None,
                 status: "Started".to_owned(),
+                status_name: None,
+                status_category: ProjectStatusCategory::Unknown,
                 priority: 2,
                 sort_order: 1.0,
                 target_date: None,
@@ -2948,7 +2944,7 @@ mod tests {
         assert_eq!(project.projects.nodes[0].status.name, "In Progress");
         assert_eq!(
             project.projects.nodes[0].status.status_type,
-            LinearProjectStatusType::Started
+            ProjectStatusCategory::Started
         );
         assert_eq!(
             project.projects.nodes[0].project_milestones.nodes[0].name,
@@ -3017,19 +3013,19 @@ mod tests {
             RawProjectStatusOption {
                 id: "started-id".to_owned(),
                 name: "In Progress".to_owned(),
-                status_type: LinearProjectStatusType::Started,
+                status_type: ProjectStatusCategory::Started,
                 team: None,
             },
             RawProjectStatusOption {
                 id: "paused-id".to_owned(),
                 name: "Paused".to_owned(),
-                status_type: LinearProjectStatusType::Planned,
+                status_type: ProjectStatusCategory::Planned,
                 team: None,
             },
             RawProjectStatusOption {
                 id: "team-started-id".to_owned(),
                 name: "Team Started".to_owned(),
-                status_type: LinearProjectStatusType::Started,
+                status_type: ProjectStatusCategory::Started,
                 team: Some(super::RawStatusTeam {
                     id: "team-id".to_owned(),
                 }),
@@ -3058,7 +3054,7 @@ mod tests {
         let status = RawProjectStatusOption {
             id: "started-id".to_owned(),
             name: "Started".to_owned(),
-            status_type: LinearProjectStatusType::Started,
+            status_type: ProjectStatusCategory::Started,
             team: None,
         };
         assert!(matches!(
@@ -3074,17 +3070,246 @@ mod tests {
     #[test]
     fn project_statuses_canonicalize_started_by_type_and_preserve_paused_by_name() {
         assert_eq!(
-            canonical_project_status("In Progress".to_owned(), LinearProjectStatusType::Started),
+            canonical_project_status("In Progress".to_owned(), ProjectStatusCategory::Started),
             "Started"
         );
         assert_eq!(
-            canonical_project_status("Paused".to_owned(), LinearProjectStatusType::Planned),
+            canonical_project_status("Paused".to_owned(), ProjectStatusCategory::Planned),
             "Paused"
         );
         assert_eq!(
-            canonical_project_status("Completed".to_owned(), LinearProjectStatusType::Completed),
+            canonical_project_status("Completed".to_owned(), ProjectStatusCategory::Completed),
             "Completed"
         );
+    }
+
+    fn status_project(id: &str, status_name: &str, status_type: &str) -> Value {
+        serde_json::json!({
+            "id": id, "identifier": null, "name": id, "description": "Goal",
+            "content": null, "priority": 2, "sortOrder": 1.0,
+            "status": {"name": status_name, "type": status_type},
+            "teams": connection(serde_json::json!([{"key": "SWM"}])),
+            "initiatives": connection(serde_json::json!([])),
+            "projectMilestones": connection(serde_json::json!([]))
+        })
+    }
+
+    fn cached_payload(path: &std::path::Path, key: &str) -> Option<Vec<u8>> {
+        rusqlite::Connection::open(path)
+            .expect("open cache for inspection")
+            .query_row(
+                "SELECT payload FROM workspace_snapshot WHERE cache_key = ?1",
+                [key],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .ok()
+    }
+
+    #[test]
+    fn native_project_status_category_and_name_survive_normalization() {
+        let done_issue = serde_json::json!({
+            "id": "done-issue", "identifier": "SWM-9", "title": "Finished work",
+            "description": null, "priority": 2.0, "sortOrder": 1.0,
+            "state": {"name": "Done", "type": "completed"}, "team": {"key": "SWM"},
+            "project": {"id": "misleading-done"},
+            "inverseRelations": connection(serde_json::json!([])),
+            "relations": connection(serde_json::json!([]))
+        });
+        let (endpoint, server) = mock_linear(vec![
+            serde_json::json!({"data": {"projects": connection(serde_json::json!([
+                status_project("shipped", "Shipped", "completed"),
+                status_project("dropped", "Dropped", "canceled"),
+                status_project("misleading-done", "Done", "started"),
+                status_project("misleading-canceled", "Canceled", "planned"),
+                status_project("custom-started", "Building", "started"),
+                status_project("paused", "Paused", "paused"),
+                status_project("future", "Archived", "archived")
+            ]))}}),
+            serde_json::json!({"data": {"issues": connection(serde_json::json!([done_issue]))}}),
+        ]);
+        let source = LinearGraphQlSource::with_endpoint("test-key", endpoint.clone())
+            .expect("source with local endpoint");
+        let snapshot = source.fetch_workspace().expect("normalized workspace");
+        satisfy_unused_mock_requests(&endpoint, 2);
+        server.join().expect("mock server");
+
+        let observed = snapshot
+            .projects
+            .iter()
+            .map(|project| {
+                (
+                    project.id.0.as_str(),
+                    project.status.as_str(),
+                    project.status_name.as_deref(),
+                    project.status_category,
+                    project.completion(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            observed,
+            [
+                (
+                    "shipped",
+                    "Shipped",
+                    Some("Shipped"),
+                    ProjectStatusCategory::Completed,
+                    ProjectCompletion::Terminal
+                ),
+                (
+                    "dropped",
+                    "Dropped",
+                    Some("Dropped"),
+                    ProjectStatusCategory::Canceled,
+                    ProjectCompletion::Terminal
+                ),
+                (
+                    "misleading-done",
+                    "Started",
+                    Some("Done"),
+                    ProjectStatusCategory::Started,
+                    ProjectCompletion::Nonterminal
+                ),
+                (
+                    "misleading-canceled",
+                    "Canceled",
+                    Some("Canceled"),
+                    ProjectStatusCategory::Planned,
+                    ProjectCompletion::Nonterminal
+                ),
+                (
+                    "custom-started",
+                    "Started",
+                    Some("Building"),
+                    ProjectStatusCategory::Started,
+                    ProjectCompletion::Nonterminal
+                ),
+                (
+                    "paused",
+                    "Paused",
+                    Some("Paused"),
+                    ProjectStatusCategory::Paused,
+                    ProjectCompletion::Nonterminal
+                ),
+                (
+                    "future",
+                    "Archived",
+                    Some("Archived"),
+                    ProjectStatusCategory::Unknown,
+                    ProjectCompletion::Unknown
+                ),
+            ]
+        );
+
+        let encoded = serde_json::to_vec(&snapshot).expect("encode snapshot");
+        let decoded: WorkspaceSnapshot = serde_json::from_slice(&encoded).expect("decode snapshot");
+        assert_eq!(decoded, snapshot);
+    }
+
+    #[test]
+    fn status_categories_default_to_unknown_when_absent_or_unsupported() {
+        for value in [serde_json::json!("archived"), serde_json::json!("")] {
+            assert_eq!(
+                serde_json::from_value::<ProjectStatusCategory>(value).expect("tolerant decode"),
+                ProjectStatusCategory::Unknown
+            );
+        }
+        assert_eq!(
+            ProjectStatusCategory::default().completion(),
+            ProjectCompletion::Unknown
+        );
+    }
+
+    #[test]
+    fn missing_native_status_type_normalizes_to_unknown_category() {
+        let mut missing_type = status_project("no-type", "Completed", "completed");
+        missing_type["status"] = serde_json::json!({"name": "Completed"});
+        let (endpoint, server) = mock_linear(vec![
+            serde_json::json!({"data": {"projects": connection(serde_json::json!([missing_type]))}}),
+            serde_json::json!({"data": {"issues": connection(serde_json::json!([]))}}),
+        ]);
+        let source = LinearGraphQlSource::with_endpoint("test-key", endpoint.clone())
+            .expect("source with local endpoint");
+        let result = source.fetch_workspace();
+        satisfy_unused_mock_requests(&endpoint, 2);
+        server.join().expect("mock server");
+
+        let snapshot = result.expect("missing native type decodes as Unknown");
+        let project = &snapshot.projects[0];
+        assert_eq!(project.status_name.as_deref(), Some("Completed"));
+        assert_eq!(project.status_category, ProjectStatusCategory::Unknown);
+        assert_eq!(project.completion(), ProjectCompletion::Unknown);
+    }
+
+    #[test]
+    fn status_category_snapshots_coexist_with_prior_model_cache_entries() {
+        let cache_path = std::env::temp_dir().join(format!(
+            "ix-board-status-category-cache-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&cache_path);
+        let old_namespace = format!(
+            "linear:v12:sha256:{:x}",
+            Sha256::digest("test-key".as_bytes())
+        );
+        let old_payload = serde_json::to_vec(&serde_json::json!({
+            "fetched_at": 1,
+            "projects": [{
+                "id": "old-project", "identifier": null, "name": "Old", "updated_at": null,
+                "description": "Goal", "content": null, "status": "Completed", "priority": 2,
+                "sort_order": 1.0, "target_date": null, "team_keys": ["SWM"],
+                "milestones": [], "initiatives": []
+            }],
+            "issues": []
+        }))
+        .expect("encode prior-model payload");
+        crate::cache::SnapshotCache::open(&cache_path, &old_namespace).expect("create cache");
+        rusqlite::Connection::open(&cache_path)
+            .expect("open cache for seeding")
+            .execute(
+                "INSERT INTO workspace_snapshot(cache_key, fetched_at, payload) VALUES (?1, 1, ?2)",
+                rusqlite::params![old_namespace, old_payload],
+            )
+            .expect("seed prior-model entry");
+
+        let (endpoint, server) = mock_linear(vec![
+            serde_json::json!({"data": {"projects": connection(serde_json::json!([
+                status_project("shipped", "Shipped", "completed")
+            ]))}}),
+            serde_json::json!({"data": {"issues": connection(serde_json::json!([]))}}),
+        ]);
+        let source = LinearGraphQlSource::with_endpoint("test-key", endpoint.clone())
+            .expect("source with local endpoint");
+        let new_namespace = source.cache_namespace();
+        let mut service = ReadService::open(source, &cache_path).expect("open current service");
+        service.next("SWM").expect("refresh into current namespace");
+        drop(service);
+        satisfy_unused_mock_requests(&endpoint, 2);
+        server.join().expect("mock server");
+
+        assert_ne!(new_namespace, old_namespace);
+        assert!(new_namespace.starts_with("linear:v13:"));
+        let old_row = cached_payload(&cache_path, &old_namespace).expect("prior entry remains");
+        assert_eq!(old_row, old_payload);
+        let old_value: Value = serde_json::from_slice(&old_row).expect("prior payload");
+        assert!(old_value["projects"][0].get("status_category").is_none());
+        assert!(old_value["projects"][0].get("status_name").is_none());
+
+        let new_row = cached_payload(&cache_path, &new_namespace).expect("current entry");
+        let new_value: Value = serde_json::from_slice(&new_row).expect("current payload");
+        assert_eq!(new_value["projects"][0]["status_category"], "completed");
+        assert_eq!(new_value["projects"][0]["status_name"], "Shipped");
+
+        let legacy: WorkspaceSnapshot =
+            serde_json::from_slice(&old_row).expect("new reader decodes prior record");
+        let _ = std::fs::remove_file(cache_path);
+        assert_eq!(legacy.projects[0].status, "Completed");
+        assert_eq!(legacy.projects[0].status_name, None);
+        assert_eq!(
+            legacy.projects[0].status_category,
+            ProjectStatusCategory::Unknown
+        );
+        assert_eq!(legacy.projects[0].completion(), ProjectCompletion::Unknown);
     }
 
     #[test]

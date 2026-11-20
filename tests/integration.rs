@@ -144,6 +144,8 @@ fn project(id: &str, identifier: &str, status: &str, priority: i32, sort_order: 
         description: format!("Goal {identifier}"),
         content: Some("Project context".to_owned()),
         status: status.to_owned(),
+        status_name: None,
+        status_category: Default::default(),
         priority,
         sort_order,
         target_date: None,

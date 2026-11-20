@@ -133,6 +133,53 @@ impl FromStr for ProjectPriority {
     }
 }
 
+/// Linear's native project-status category, independent of the status display name.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectStatusCategory {
+    /// Not yet planned.
+    Backlog,
+    /// Planned but not started.
+    Planned,
+    /// In progress.
+    Started,
+    /// On hold.
+    Paused,
+    /// Finished.
+    Completed,
+    /// Abandoned.
+    Canceled,
+    /// Absent or unsupported evidence, including records cached before categories were kept.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl ProjectStatusCategory {
+    /// Classifies completion from the category alone, never from names or task counts.
+    pub fn completion(self) -> ProjectCompletion {
+        match self {
+            Self::Completed | Self::Canceled => ProjectCompletion::Terminal,
+            Self::Backlog | Self::Planned | Self::Started | Self::Paused => {
+                ProjectCompletion::Nonterminal
+            }
+            Self::Unknown => ProjectCompletion::Unknown,
+        }
+    }
+}
+
+/// Whether a project's native status category ends its lifecycle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectCompletion {
+    /// Completed or canceled.
+    Terminal,
+    /// Backlog, planned, started or paused.
+    Nonterminal,
+    /// The category is absent or unsupported.
+    Unknown,
+}
+
 /// Stable structured project record fetched from Linear.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -151,6 +198,14 @@ pub struct Project {
     pub content: Option<String>,
     /// Canonical run state (`Started`) or the Linear display name for other statuses.
     pub status: String,
+    /// Exact native status display name, including custom names; absent on records cached
+    /// before it was kept.
+    #[serde(default)]
+    pub status_name: Option<String>,
+    /// Native status category; `Unknown` when the record predates it or Linear sent an
+    /// unsupported value.
+    #[serde(default)]
+    pub status_category: ProjectStatusCategory,
     /// Linear project priority; zero means unprioritized, while lower nonzero values rank higher.
     pub priority: i32,
     /// Linear manual project order.
@@ -163,6 +218,13 @@ pub struct Project {
     pub milestones: Vec<Milestone>,
     /// Initiatives containing this project.
     pub initiatives: Vec<Initiative>,
+}
+
+impl Project {
+    /// Completion classification from the native status category.
+    pub fn completion(&self) -> ProjectCompletion {
+        self.status_category.completion()
+    }
 }
 
 /// A project milestone record.
