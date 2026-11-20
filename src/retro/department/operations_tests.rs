@@ -50,7 +50,10 @@ fn operations() -> OperationalConfig {
         ..Default::default()
     }
 }
-fn row(id: &str, entity: &str, time: f64, fact: OperationFact) -> Observation {
+fn row(id: &str, entity: &str, time: f64, mut fact: OperationFact) -> Observation {
+    if let OperationFact::Order(order) = &mut fact {
+        order.send_id = id.into();
+    }
     Observation {
         event_id: id.into(),
         entity_id: entity.into(),
@@ -169,6 +172,7 @@ fn relay(id: &str, transition: RelayKind) -> OperationFact {
 }
 fn order(id: &str, previous: Option<&str>, direction: &str, revision: &str) -> OperationFact {
     OperationFact::Order(OrderFact {
+        send_id: id.into(),
         order_id: id.into(),
         lane: LANE.into(),
         action_key: Some("build-admission".into()),
@@ -561,6 +565,7 @@ fn attributed_messages_deduplicate_redelivery_and_unknown_semantics_do_not_becom
     let message = |id: &str, correction, status| {
         OperationFact::Message(MessageFact {
             message_id: id.into(),
+            sent_at: at(if id == "m1" { -100.0 } else { -50.0 }),
             sender: LANE.into(),
             correction,
             status_only: status,
@@ -612,6 +617,7 @@ fn unknown_message_population_never_claims_classification_coverage_or_rate() {
         0.0,
         OperationFact::Message(MessageFact {
             message_id: "m".into(),
+            sent_at: at(0.0),
             sender: LANE.into(),
             correction: Some(false),
             status_only: Some(false),

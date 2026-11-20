@@ -364,6 +364,8 @@ wire! {
     MessageFact {
         /// Stable original message identity; redelivery preserves it.
         message_id: String,
+        /// Original send UTC time, preserved by every redelivery or classification export.
+        sent_at: String,
         /// Canonical sender address.
         sender: String,
         /// Explicit correction classification; absence is unclassified.
@@ -400,6 +402,8 @@ wire! {
 wire! {
     /// Attributed order relation; no semantic reversal is inferred from prose.
     OrderFact {
+        /// Native send identity; redelivery preserves it, a resend gets a new identity.
+        send_id: String,
         /// Stable order identity.
         order_id: String,
         /// Canonical target lane.
@@ -1149,7 +1153,16 @@ impl<'a> Calculator<'a> {
                     return Err("future source observation timestamp".into());
                 }
                 oldest = oldest.max(seconds.max(0.0));
-                refs.extend(batch.observations.iter().map(|r| r.event_id.clone()));
+                refs.extend(
+                    batch
+                        .observations
+                        .iter()
+                        .filter(|r| {
+                            matches!(&r.fact,
+                    Fact::Operation(f) if f.selected(&self.config.scope,r))
+                        })
+                        .map(|r| r.event_id.clone()),
+                );
             }
             values.insert(source.clone(), oldest / 3600.0);
             age = age.max(oldest);
@@ -1223,7 +1236,7 @@ impl<'a> Calculator<'a> {
             let OperationFact::Message(f) = fact else {
                 continue;
             };
-            if !self.contains(event_time(row)?) || !seen.insert(&f.message_id) {
+            if !self.contains(epoch(&f.sent_at)?) || !seen.insert(&f.message_id) {
                 continue;
             }
             let sender = canonical_sender(&f.sender)?;
@@ -1269,7 +1282,7 @@ impl<'a> Calculator<'a> {
             let OperationFact::Message(f) = fact else {
                 continue;
             };
-            if !self.contains(event_time(row)?) || !seen.insert(&f.message_id) {
+            if !self.contains(epoch(&f.sent_at)?) || !seen.insert(&f.message_id) {
                 continue;
             }
             canonical_sender(&f.sender)?;
@@ -1378,6 +1391,7 @@ impl<'a> Calculator<'a> {
         start: Option<f64>,
     ) -> Result<Vec<(&'a Observation, &'a OperationFact)>, String> {
         let mut rows = Vec::new();
+        let mut sends = BTreeMap::new();
         for &(row, fact) in &p.rows {
             let at = event_time(row)?;
             if at > self.frame.now || start.is_some_and(|s| at <= s) {
@@ -1387,6 +1401,15 @@ impl<'a> Calculator<'a> {
             let OperationFact::Order(f) = fact else {
                 continue;
             };
+            if f.send_id.is_empty() {
+                return Err("missing native order send identity".into());
+            }
+            if let Some(previous) = sends.insert(f.send_id.as_str(), f) {
+                if previous != f {
+                    return Err("conflicting redelivery order provenance".into());
+                }
+                continue;
+            }
             if f.action_key.as_ref().is_none_or(String::is_empty)
                 || f.direction.as_ref().is_none_or(String::is_empty)
                 || f.evidence_revision.as_ref().is_none_or(String::is_empty)
@@ -1663,6 +1686,24 @@ pub fn read_operational_files(
                 }),
         );
     }
+    if !operations.scheduler_files.is_empty() {
+        for host in &config.scope.hosts {
+            if !operations.scheduler_files.contains_key(&host.id) {
+                batches.push(Evidence {
+                    source: format!("scheduler:{}", host.id),
+                    reasons: ["host", "scheduler_request"]
+                        .map(|f| {
+                            (
+                                f.into(),
+                                format!("host {} telemetry export not configured", host.id),
+                            )
+                        })
+                        .into(),
+                    ..Default::default()
+                });
+            }
+        }
+    }
     batches
 }
 fn normalize_export(
@@ -1688,10 +1729,12 @@ fn normalize_export(
             .ok_or("missing operational source timestamp")?,
     )?;
     for row in &evidence.observations {
-        let Fact::Operation(f) = &row.fact else {
-            return Err("operational export contains a non-operational fact".into());
+        let family = match &row.fact {
+            Fact::Operation(f) => f.family(),
+            Fact::Lifecycle(_) => "lifecycle",
+            _ => return Err("operational export contains an unauthorized fact family".into()),
         };
-        if !input.families.contains(f.family()) {
+        if !input.families.contains(family) {
             return Err("operational export contains unconfigured capability".into());
         }
         if row.event_id.is_empty() || row.entity_id.is_empty() || row.source_ref.is_empty() {
@@ -1710,7 +1753,7 @@ fn normalize_export(
         let expected: BTreeSet<_> = selectors.iter().map(|s| s.id.as_str()).collect();
         let from = if matches!(
             family.as_str(),
-            "host" | "lane_signal" | "reconciliation" | "instruction" | "decision"
+            "host" | "lane_signal" | "reconciliation" | "instruction" | "decision" | "lifecycle"
         ) {
             frame.now
         } else {
@@ -1750,6 +1793,7 @@ const OPERATIONAL_FAMILIES: &[&str] = &[
     "host",
     "scheduler_request",
     "scheduler_event",
+    "lifecycle",
     "lane_signal",
     "relay_event",
     "denial",
