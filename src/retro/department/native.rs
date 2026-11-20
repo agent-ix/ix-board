@@ -52,6 +52,10 @@ pub fn enrich_merged_attachments(
     batches: &mut [Evidence],
     github: &dyn GithubSource,
 ) {
+    let github_observed_at = batches
+        .iter()
+        .find(|b| b.source == "github")
+        .and_then(|b| b.observed_at.clone());
     for batch in batches {
         for row in &mut batch.observations {
             let Fact::Issue(issue) = &mut row.fact else {
@@ -83,8 +87,8 @@ pub fn enrich_merged_attachments(
             issue.provenance.insert(
                 "merged_pr".into(),
                 SourceStamp {
-                    source: batch.source.clone(),
-                    observed_at: batch.observed_at.clone(),
+                    source: "github".into(),
+                    observed_at: github_observed_at.clone(),
                     complete: result.is_ok(),
                     reason: result.err(),
                     evidence_refs: issue.attachment_urls.clone(),

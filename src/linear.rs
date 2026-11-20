@@ -702,6 +702,9 @@ impl LinearGraphQlSource {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct History {
+            #[serde(rename = "createdAt")]
+            created_at: Option<String>,
+            state: State,
             history: Connection<Event>,
         }
         #[derive(Deserialize)]
@@ -709,6 +712,7 @@ impl LinearGraphQlSource {
         struct Event {
             id: String,
             created_at: String,
+            from_state: Option<State>,
             to_state: Option<State>,
         }
         #[derive(Deserialize)]
@@ -716,7 +720,8 @@ impl LinearGraphQlSource {
         struct State {
             id: String,
         }
-        let query = "query IssueHistory($id: String!, $first: Int!, $after: String) { issue(id: $id) { history(first: $first, after: $after) { nodes { id createdAt toState { id } } pageInfo { hasNextPage endCursor } } } }";
+        let query = "query IssueHistory($id: String!, $first: Int!, $after: String) { issue(id: $id) { createdAt state { id } history(first: $first, after: $after) { nodes { id createdAt fromState { id } toState { id } } pageInfo { hasNextPage endCursor } } } }";
+        let mut origin: Option<(String, String)> = None;
         let events = crate::retro::sources::read_all_pages(|after| {
             let data: Data = self
                 .request(
@@ -728,14 +733,54 @@ impl LinearGraphQlSource {
                     },
                 )
                 .map_err(|e| e.to_string())?;
-            let history = data.issue.ok_or("missing issue history")?.history;
+            let issue = data.issue.ok_or("missing issue history")?;
+            let created = issue
+                .created_at
+                .ok_or("missing native issue creation timestamp")?;
+            let metadata = (created, issue.state.id);
+            if origin.as_ref().is_some_and(|old| old != &metadata) {
+                return Err("native issue state changed during history pagination".into());
+            }
+            origin = Some(metadata);
+            let history = issue.history;
             Ok(crate::retro::sources::Page {
                 items: history.nodes,
                 has_next: history.page_info.has_next_page,
                 cursor: history.page_info.end_cursor,
             })
         })?;
-        Ok(events
+        let (created, current_state) = origin.ok_or("missing native issue origin")?;
+        let created_epoch = crate::drift::timestamp_epoch(&created).map_err(|e| e.to_string())?;
+        let earliest = events
+            .iter()
+            .filter(|event| event.to_state.is_some())
+            .map(|event| {
+                Ok((
+                    crate::drift::timestamp_epoch(&event.created_at).map_err(|e| e.to_string())?,
+                    event,
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let first = earliest.iter().min_by(|(a, _), (b, _)| a.total_cmp(b));
+        let initial_state = match first {
+            None => Some(current_state),
+            Some((at, event)) if *at > created_epoch => {
+                if earliest.iter().filter(|(time, _)| time == at).count() != 1 {
+                    return Err("ambiguous initial native state history".into());
+                }
+                Some(
+                    event
+                        .from_state
+                        .as_ref()
+                        .ok_or("missing initial native state history")?
+                        .id
+                        .clone(),
+                )
+            }
+            Some((at, _)) if *at == created_epoch => None,
+            _ => return Err("native state event precedes issue creation".into()),
+        };
+        let mut observations: Vec<Observation> = events
             .into_iter()
             .filter_map(|event| {
                 let state = event.to_state?;
@@ -752,7 +797,22 @@ impl LinearGraphQlSource {
                     fact: Fact::State(StateFact { state: state.id }),
                 })
             })
-            .collect())
+            .collect();
+        if let Some(state) = initial_state {
+            observations.push(Observation {
+                event_id: format!("linear:issue:{issue_id}:created"),
+                entity_id: issue_id.into(),
+                event_at: Some(created),
+                observed_at: Some(observed_at.into()),
+                sequence: None,
+                scope: scope.clone(),
+                complete: true,
+                source_ref: format!("linear:issue:{issue_id}"),
+                attribution: None,
+                fact: Fact::State(StateFact { state }),
+            });
+        }
+        Ok(observations)
     }
 
     /// Reads the first line of every comment whose body starts with `prefix` and contains
@@ -1885,6 +1945,55 @@ mod tests {
     }
 
     type MockResponse = (u16, Vec<(&'static str, String)>, Value);
+
+    #[trace("FR-029-AC-4", "FR-029-AC-8", "FR-029-AC-9")]
+    #[test]
+    fn department_native_state_http_pages_retain_real_creation_context_and_refuse_partial_history()
+    {
+        let created = "2027-01-15T07:58:10Z";
+        let page = |nodes: Value, next: bool| serde_json::json!({"data":{"issue":{"createdAt":created,"state":{"id":"A"},"history":{"nodes":nodes,"pageInfo":{"hasNextPage":next,"endCursor":if next{Some("next")}else{None}}}}}});
+        let first = page(
+            serde_json::json!([{"id":"b1","createdAt":"2027-01-15T07:58:30Z","fromState":{"id":"A"},"toState":{"id":"B"}}]),
+            true,
+        );
+        let last = page(
+            serde_json::json!([{"id":"a1","createdAt":"2027-01-15T07:58:40Z","fromState":{"id":"B"},"toState":{"id":"A"}},{"id":"b2","createdAt":"2027-01-15T07:58:50Z","fromState":{"id":"A"},"toState":{"id":"B"}},{"id":"a2","createdAt":"2027-01-15T07:59:00Z","fromState":{"id":"B"},"toState":{"id":"A"}}]),
+            false,
+        );
+        let scope = crate::retro::department::Scope::default();
+        let (endpoint, server) =
+            mock_linear_http(vec![(200, vec![], first.clone()), (200, vec![], last)]);
+        let source = LinearGraphQlSource::with_endpoint("fixture-only", endpoint).unwrap();
+        let rows = source
+            .fetch_department_state_events("issue-a", &scope, "2027-01-15T08:00:00Z")
+            .unwrap();
+        assert_eq!(server.join().unwrap().len(), 2);
+        assert_eq!(rows.len(), 5);
+        let context = rows
+            .iter()
+            .find(|row| row.event_id == "linear:issue:issue-a:created")
+            .unwrap();
+        assert_eq!(context.event_at.as_deref(), Some(created));
+        assert_eq!(
+            context.fact,
+            crate::retro::department::Fact::State(crate::retro::department::StateFact {
+                state: "A".into()
+            })
+        );
+        assert_eq!(context.sequence, None);
+        let (endpoint, server) = mock_linear_http(vec![
+            (200, vec![], first),
+            (200, vec![], serde_json::json!({"data":{"issue":null}})),
+        ]);
+        let source = LinearGraphQlSource::with_endpoint("fixture-only", endpoint).unwrap();
+        assert!(
+            source
+                .fetch_department_state_events("issue-a", &scope, "2027-01-15T08:00:00Z")
+                .unwrap_err()
+                .contains("last page")
+        );
+        assert_eq!(server.join().unwrap().len(), 2);
+    }
 
     fn mock_linear_http(responses: Vec<MockResponse>) -> (String, JoinHandle<Vec<Value>>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Linear endpoint");

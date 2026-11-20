@@ -141,7 +141,7 @@ classified observations. Configure their paths under `department.parameters`:
     {
       "path": "/var/lib/team-retro/build-audit.json",
       "source": "build-audit",
-      "kinds": ["movement", "gates"]
+      "kinds": ["movement"]
     }
   ]
 }

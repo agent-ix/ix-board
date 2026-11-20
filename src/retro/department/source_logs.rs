@@ -288,6 +288,14 @@ fn decode(
     if age < -(config.clock_tolerance_seconds as f64) {
         return Err("source export future clock skew".into());
     }
+    let observed = epoch(&log.observed_at)?;
+    for interval in &log.coverage {
+        let from = epoch(&interval.from)?;
+        let until = epoch(&interval.until)?;
+        if from > until || until > observed + config.clock_tolerance_seconds as f64 {
+            return Err("invalid source coverage interval or future watermark".into());
+        }
+    }
     let mut ids: BTreeMap<String, LogEvent> = BTreeMap::new();
     for event in log.events.drain(..) {
         if event.event_id.is_empty() || event.entity_id.is_empty() || event.source_ref.is_empty() {
@@ -298,6 +306,9 @@ fn decode(
         }
         if epoch(&event.event_at)? > frame.now + config.clock_tolerance_seconds as f64 {
             return Err("source export event future clock skew".into());
+        }
+        if epoch(&event.event_at)? > observed + config.clock_tolerance_seconds as f64 {
+            return Err("event follows source observation watermark".into());
         }
         if let Some(prior) = ids.insert(event.event_id.clone(), event.clone())
             && prior != event
@@ -337,10 +348,12 @@ fn coverage<'a>(
 }
 fn stamp(row: &mut Observation, field: &str, source: SourceStamp) {
     match &mut row.fact {
-        Fact::Issue(i) => {
+        Fact::Issue(i)
+            if ["claim_at", "movement", "blocked_at", "obligations"].contains(&field) =>
+        {
             i.provenance.insert(field.into(), source);
         }
-        Fact::PullRequest(p) => {
+        Fact::PullRequest(p) if ["full_gates", "repin_only"].contains(&field) => {
             p.provenance.insert(field.into(), source);
         }
         _ => {}

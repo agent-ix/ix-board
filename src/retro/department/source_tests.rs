@@ -371,3 +371,129 @@ fn configured_source_exports_reject_overlapping_owners_and_normalize_input_order
     );
     let _ = BTreeSet::<String>::new();
 }
+
+#[trace("FR-029-AC-4", "FR-029-AC-9")]
+#[test]
+fn source_export_conflicts_and_impossible_watermarks_are_not_overrides() {
+    let c = config();
+    let original: serde_json::Value = serde_json::from_str(EXPORT).unwrap();
+    let mut conflict = original.clone();
+    conflict["events"][11]["record"]["repin_only"] = false.into();
+    let r = report(&c, &conflict.to_string(), &native_pr());
+    assert!(
+        r.measurements["repin_only_prs"]
+            .reason
+            .as_ref()
+            .unwrap()
+            .contains("conflicting native/exported")
+    );
+    assert_eq!(scalar(&r, "merged_open"), 1.0);
+    let mut watermark = original;
+    watermark["observed_at"] = at(-30.0).into();
+    let r = report(&c, &watermark.to_string(), &native_pr());
+    assert_eq!(
+        r.measurements["claims_without_movement"].status,
+        Status::Unavailable
+    );
+    assert_eq!(scalar(&r, "wip_active"), 1.0);
+}
+
+#[trace("FR-029-AC-4")]
+#[test]
+fn complete_reviewer_markers_join_repository_identity_and_incomplete_rows_remain_unknown() {
+    let c = config();
+    let mut other = native_pr();
+    other.repo = "second/repo".into();
+    let mut batches = native_batches(&c, &native_pr());
+    batches[1]
+        .observations
+        .push(collect_pull_request(&c, &other, &at(0.0), http));
+    let lines = vec![
+        "<!-- reviewer repo=fixture/repo id=SR-1 pr=repo#1 -->".into(),
+        "<!-- reviewer-dispositions repo=fixture/repo id=SR-1 round=2 -->".into(),
+        "<!-- reviewer repo=second/repo id=SR-1 pr=repo#1 -->".into(),
+        "<!-- reviewer-dispositions repo=second/repo id=SR-1 round=1 -->".into(),
+    ];
+    enrich_reviewer_rounds(
+        &mut batches,
+        &lines,
+        &["fixture/repo".into(), "second/repo".into()],
+    );
+    for (row, expected) in batches[1].observations.iter().zip([Some(2), Some(1)]) {
+        let Fact::PullRequest(p) = &row.fact else {
+            panic!("PR")
+        };
+        assert_eq!(p.fix_rounds, expected);
+    }
+    let mut incomplete = lines;
+    incomplete[1] = "<!-- reviewer-dispositions repo=fixture/repo id=SR-1 -->".into();
+    enrich_reviewer_rounds(
+        &mut batches,
+        &incomplete,
+        &["fixture/repo".into(), "second/repo".into()],
+    );
+    let Fact::PullRequest(p) = &batches[1].observations[0].fact else {
+        panic!("PR")
+    };
+    assert_eq!(p.fix_rounds, None);
+    let Fact::PullRequest(p) = &batches[1].observations[1].fact else {
+        panic!("PR")
+    };
+    assert_eq!(p.fix_rounds, Some(1));
+}
+
+#[trace("FR-029-AC-3", "FR-029-AC-4")]
+#[test]
+fn documented_source_input_is_read_by_the_production_file_normalizer() {
+    let doc = include_str!("../../../docs/retro.md");
+    let examples: Vec<&str> = doc
+        .split("```json\n")
+        .skip(1)
+        .filter_map(|block| block.split_once("```").map(|(body, _)| body))
+        .collect();
+    let parameters: Parameters = examples
+        .iter()
+        .filter_map(|body| serde_json::from_str::<Parameters>(body).ok())
+        .find(|p| !p.event_logs.is_empty())
+        .expect("documented event-log parameters");
+    let body = examples
+        .iter()
+        .find(|body| serde_json::from_str::<SourceLog>(body).is_ok())
+        .expect("documented source export");
+    let mut c = config();
+    c.parameters.event_logs = parameters.event_logs;
+    c.freshness_seconds.insert("build-audit".into(), 60);
+    let mut batches = native_batches(&c, &native_pr());
+    batches[0].observations[0].entity_id = "issue-uuid".into();
+    let history = [crate::retro::sources::StateChange {
+        at: END - 7200.0,
+        from: Some(crate::WorkflowStateType::Unstarted),
+        to: Some(crate::WorkflowStateType::Started),
+    }];
+    enrich_claim_history(
+        &mut batches[0].observations[0],
+        Ok(&history),
+        Some(&at(0.0)),
+    );
+    read_source_logs(
+        &c,
+        Frame {
+            now: END,
+            window_secs: 86400,
+            end_exclusive: false,
+        },
+        &mut batches,
+        |_| Ok((*body).into()),
+    );
+    let r = collect(
+        &c,
+        Frame {
+            now: END,
+            window_secs: 86400,
+            end_exclusive: false,
+        },
+        &batches,
+        &BTreeMap::new(),
+    );
+    assert_eq!(scalar(&r, "claims_without_movement"), 1.0);
+}
