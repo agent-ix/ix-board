@@ -24,6 +24,10 @@
           },
           "projectMilestone": null,
           "parent": null,
+          "inverseRelations": {
+            "nodes": [],
+            "pageInfo": {"hasNextPage": false, "endCursor": null}
+          },
           "relations": {
             "nodes": [],
             "pageInfo": {
