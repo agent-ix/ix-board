@@ -183,6 +183,397 @@ fn order(id: &str, previous: Option<&str>, direction: &str, revision: &str) -> O
     })
 }
 
+fn exported_report(
+    c: &Config,
+    export: &OperationalExport,
+    families: &[&str],
+) -> crate::retro::department::Report {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("export.json");
+    std::fs::write(&path, serde_json::to_vec(export).unwrap()).unwrap();
+    let mut op = operations();
+    op.evidence_files.push(OperationalInput {
+        path,
+        source: "fixture".into(),
+        families: families.iter().map(|f| (*f).into()).collect(),
+    });
+    let mut c = c.clone();
+    c.operations = Some(op.clone());
+    let frame = Frame {
+        now: END,
+        window_secs: 3600,
+        end_exclusive: false,
+    };
+    crate::retro::department::collect(
+        &c,
+        frame,
+        &read_operational_files(&op, &c, frame),
+        &BTreeMap::new(),
+    )
+}
+fn coverage(family: &str, entities: &[&str]) -> OperationalCoverage {
+    OperationalCoverage {
+        family: family.into(),
+        entities: entities.iter().map(|s| (*s).into()).collect(),
+        from: at(-7200.0),
+        until: at(0.0),
+        complete: true,
+        full_history: true,
+    }
+}
+
+#[trace("FR-029-AC-2", "FR-029-AC-8")]
+#[test]
+fn review_round1_redelivery_event_names_never_replace_original_order_context() {
+    let original = row("z-original", "o1", -300.0, order("o1", None, "go", "e1"));
+    let second = row(
+        "b-second",
+        "o2",
+        -200.0,
+        order("o2", Some("o1"), "stop", "e1"),
+    );
+    let third = row("c-third", "o3", -100.0, order("o3", Some("o2"), "go", "e1"));
+    let expected = collect(
+        &config(),
+        &[batch(vec![original.clone(), second.clone(), third.clone()])],
+    )
+    .1;
+    assert_eq!(expected.findings.len(), 1);
+    let mut redelivery = original.clone();
+    redelivery.event_id = "a-redelivery".into();
+    redelivery.event_at = Some(at(-20.0));
+    redelivery.sequence = Some(99);
+    let rows = vec![
+        redelivery.clone(),
+        third.clone(),
+        original.clone(),
+        second.clone(),
+    ];
+    assert_eq!(collect(&config(), &[batch(rows.clone())]).1, expected);
+    assert_eq!(
+        collect(&config(), &[batch(rows.into_iter().rev().collect())]).1,
+        expected
+    );
+    redelivery.attribution.as_mut().unwrap().actor = "conflicting-order-actor".into();
+    assert_eq!(
+        collect(
+            &config(),
+            &[batch(vec![original, second, third, redelivery])]
+        )
+        .1
+        .status,
+        Status::Unavailable
+    );
+}
+
+#[trace("FR-029-AC-8")]
+#[test]
+fn review_round1_flip_lookback_retains_predecessor_and_counts_only_inside_reversals() {
+    let rows = vec![
+        row("old", "o1", -4000.0, order("o1", None, "go", "e1")),
+        row(
+            "first-reversal",
+            "o2",
+            -3000.0,
+            order("o2", Some("o1"), "stop", "e1"),
+        ),
+        row(
+            "second-reversal",
+            "o3",
+            -2000.0,
+            order("o3", Some("o2"), "go", "e1"),
+        ),
+    ];
+    let report = collect(&config(), &[batch(rows.clone())]).1;
+    assert_eq!(report.findings.len(), 1);
+    assert_eq!(
+        report.findings[0].event_ids,
+        ["old", "first-reversal", "second-reversal"]
+    );
+    assert_eq!(report.findings[0].start, at(-4000.0));
+    let mut boundary = rows;
+    boundary[1].event_at = Some(at(-3600.0));
+    assert!(
+        collect(&config(), &[batch(boundary)]).1.findings.is_empty(),
+        "reversal at the open boundary is context, not a counted event"
+    );
+}
+
+#[trace("FR-029-AC-2", "FR-029-AC-4")]
+#[test]
+fn review_round1_later_attributed_message_labels_merge_without_changing_send_identity() {
+    let mut raw = row(
+        "a-raw",
+        "message",
+        -100.0,
+        OperationFact::Message(MessageFact {
+            message_id: "message".into(),
+            sent_at: at(-100.0),
+            sender: LANE.into(),
+            correction: None,
+            status_only: None,
+        }),
+    );
+    raw.attribution = None;
+    let mut classified = raw.clone();
+    classified.event_id = "z-classified".into();
+    classified.event_at = Some(at(-20.0));
+    classified.attribution = row("a", "b", 0.0, host()).attribution;
+    if let Fact::Operation(OperationFact::Message(f)) = &mut classified.fact {
+        f.correction = Some(true);
+        f.status_only = Some(false);
+    }
+    let metrics = measure(vec![raw.clone(), classified.clone()]);
+    assert_eq!(scalar(&metrics, "correction_rate"), 1.0);
+    assert_eq!(keyed(&metrics, "messages_per_sender", LANE), 1.0);
+    assert_eq!(scalar(&metrics, "status_only_messages"), 0.0);
+    assert_eq!(
+        metrics["correction_rate"].classification_coverage,
+        Some(ClassificationCoverage {
+            classified: 1,
+            total: 1,
+            basis: CoverageBasis::CompletePopulation
+        })
+    );
+    assert_eq!(metrics, measure(vec![classified.clone(), raw.clone()]));
+    let mut conflict = classified.clone();
+    conflict.event_id = "conflict".into();
+    if let Fact::Operation(OperationFact::Message(f)) = &mut conflict.fact {
+        f.correction = Some(false);
+    }
+    assert_eq!(
+        measure(vec![raw.clone(), classified.clone(), conflict])["correction_rate"].value,
+        None
+    );
+    if let Fact::Operation(OperationFact::Message(f)) = &mut classified.fact {
+        f.sent_at = at(-99.0);
+    }
+    assert_eq!(
+        measure(vec![raw, classified])["messages_per_sender"].value,
+        None,
+        "classification must not replace original send time"
+    );
+}
+
+#[trace("FR-029-AC-3", "FR-029-AC-9")]
+#[test]
+fn review_round1_gauge_watermarks_follow_source_observation_and_configured_freshness() {
+    let mut observation = row("host", "host", -10.0, host());
+    observation.observed_at = Some(at(-10.0));
+    let mut evidence = batch(vec![observation]);
+    evidence.observed_at = Some(at(-10.0));
+    let mut cov = coverage("host", &["host"]);
+    cov.until = at(-10.0);
+    let mut export = OperationalExport {
+        version: 1,
+        evidence,
+        coverage: vec![cov],
+    };
+    let report = exported_report(&config(), &export, &["host"]);
+    assert_eq!(keyed(&report.measurements, "host_slots_used", "host"), 4.0);
+    assert_eq!(
+        report.measurements["host_slots_used"].source_age_seconds,
+        Some(10.0)
+    );
+    export.evidence.observed_at = Some(at(-61.0));
+    export.evidence.observations[0].observed_at = Some(at(-61.0));
+    export.evidence.observations[0].event_at = Some(at(-61.0));
+    export.coverage[0].until = at(-61.0);
+    assert_eq!(
+        exported_report(&config(), &export, &["host"]).measurements["host_slots_used"].value,
+        None
+    );
+    let mut event_export = OperationalExport {
+        version: 1,
+        evidence: batch(Vec::new()),
+        coverage: vec![coverage("message", &[LANE])],
+    };
+    event_export.evidence.observed_at = Some(at(-10.0));
+    event_export.coverage[0].until = at(-10.0);
+    assert_eq!(
+        exported_report(&config(), &event_export, &["message"]).measurements["messages_per_sender"]
+            .value,
+        None,
+        "event populations still require the complete window end"
+    );
+}
+
+#[trace("FR-029-AC-3", "FR-029-AC-9")]
+#[test]
+fn review_round1_malformed_family_keeps_independent_valid_facts_and_source_reasons() {
+    let mut instruction = row(
+        "instruction",
+        LANE,
+        0.0,
+        OperationFact::Instruction(InstructionFact {
+            lane: LANE.into(),
+            component: "coder".into(),
+            claimed: Some("v1".into()),
+            actual: Some("v2".into()),
+        }),
+    );
+    instruction.event_at = Some("malformed-timestamp".into());
+    let mut export = OperationalExport {
+        version: 1,
+        evidence: batch(vec![row("host", "host", 0.0, host()), instruction]),
+        coverage: vec![
+            coverage("host", &["host"]),
+            coverage("instruction", &[LANE]),
+        ],
+    };
+    let report = exported_report(&config(), &export, &["host", "instruction"]);
+    assert_eq!(keyed(&report.measurements, "host_slots_used", "host"), 4.0);
+    assert_eq!(
+        report.measurements["instruction_version_mismatches"].value,
+        None
+    );
+    assert!(
+        report.measurements["instruction_version_mismatches"]
+            .reason
+            .is_some()
+    );
+    assert!(report.observations.iter().any(|r| r.event_id == "host"));
+    export.evidence.observations.pop();
+    export.coverage[1].until = "bad-watermark".into();
+    assert_eq!(
+        keyed(
+            &exported_report(&config(), &export, &["host", "instruction"]).measurements,
+            "host_slots_used",
+            "host"
+        ),
+        4.0
+    );
+}
+
+#[trace("FR-029-AC-2", "FR-029-AC-3", "FR-029-AC-4")]
+#[test]
+fn review_round1_decision_waiters_have_nonzero_scoped_deduplicated_native_oracles() {
+    let decision = |open, classification, ruling: &[&str], spec: &[&str]| {
+        OperationFact::Decision(DecisionFact {
+            open,
+            decision: classification,
+            opened_at: Some(at(-7200.0)),
+            ruling_waiters: ruling.iter().map(|s| (*s).into()).collect(),
+            spec_waiters: spec.iter().map(|s| (*s).into()).collect(),
+        })
+    };
+    let mut closed = row(
+        "closed",
+        "closed",
+        0.0,
+        decision(false, None, &["closed-ruling"], &["closed-spec"]),
+    );
+    closed.attribution = None;
+    let mut outside = row(
+        "outside",
+        "outside",
+        0.0,
+        decision(true, Some(true), &["outside-ruling"], &["outside-spec"]),
+    );
+    outside.scope.teams[0].id = "other-team".into();
+    outside.scope.lanes.clear();
+    let a = row(
+        "owner-a",
+        "a",
+        0.0,
+        decision(
+            true,
+            Some(true),
+            &["wait-a", "wait-b"],
+            &["wait-b", "wait-c"],
+        ),
+    );
+    let mut export = OperationalExport {
+        version: 1,
+        evidence: batch(vec![
+            a.clone(),
+            a,
+            row(
+                "owner-b",
+                "b",
+                0.0,
+                decision(
+                    true,
+                    Some(true),
+                    &["wait-b", "wait-c"],
+                    &["wait-c", "wait-d"],
+                ),
+            ),
+            row(
+                "spec-owner",
+                "spec",
+                0.0,
+                decision(true, Some(false), &["not-a-ruling"], &["wait-d"]),
+            ),
+            closed,
+            outside,
+        ]),
+        coverage: vec![coverage("decision", &["independent-team"])],
+    };
+    let report = exported_report(&config(), &export, &["decision"]);
+    assert_eq!(scalar(&report.measurements, "ruling_waiting_issues"), 3.0);
+    assert_eq!(
+        scalar(&report.measurements, "spec_merge_waiting_issues"),
+        3.0
+    );
+    export.coverage[0].complete = false;
+    assert_eq!(
+        exported_report(&config(), &export, &["decision"]).measurements["ruling_waiting_issues"]
+            .value,
+        None
+    );
+    export.coverage[0].complete = true;
+    export.evidence.observations[0].attribution = None;
+    assert_eq!(exported_report(&config(),&export,&["decision"]).measurements["spec_merge_waiting_issues"].value,None);
+    export.evidence.observations.remove(0);
+    if let Fact::Operation(OperationFact::Decision(f)) = &mut export.evidence.observations[0].fact {
+        f.decision = None;
+    }
+    assert_eq!(
+        exported_report(&config(), &export, &["decision"]).measurements["ruling_waiting_issues"]
+            .value,
+        None
+    );
+    let legacy: BTreeMap<_, _> = [
+        ("decisions_open", 7.0, "issues"),
+        ("decision_oldest_hours", 11.0, "hours"),
+    ]
+    .into_iter()
+    .map(|(id, value, unit)| {
+        (
+            id.into(),
+            crate::retro::Metric {
+                id: id.into(),
+                status: Status::Ok,
+                value: Some(value),
+                unit: unit.into(),
+                direction: Direction::Down,
+                source: "legacy".into(),
+                query: "unchanged legacy formula".into(),
+                reason: None,
+            },
+        )
+    })
+    .collect();
+    let mut c = config();
+    c.operations = Some(operations());
+    let preserved = crate::retro::department::collect(
+        &c,
+        Frame {
+            now: END,
+            window_secs: 3600,
+            end_exclusive: false,
+        },
+        &[],
+        &legacy,
+    );
+    assert_eq!(scalar(&preserved.measurements, "decisions_open"), 7.0);
+    assert_eq!(
+        scalar(&preserved.measurements, "decision_oldest_hours"),
+        11.0
+    );
+}
+
 #[trace("FR-029-AC-2", "FR-029-AC-9")]
 #[test]
 fn capacity_load_and_signed_disk_headroom_use_configured_native_hosts() {
