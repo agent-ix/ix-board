@@ -1024,6 +1024,7 @@ fn attributed_messages_deduplicate_redelivery_and_unknown_semantics_do_not_becom
         })
     );
     assert_eq!(scalar(&metrics, "status_only_messages"), 1.0);
+    rows.pop();
     rows[0].attribution = None;
     let metrics = measure(rows);
     assert_eq!(scalar(&metrics, "correction_rate"), 0.0);

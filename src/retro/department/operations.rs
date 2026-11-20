@@ -513,6 +513,26 @@ struct Outcome {
     refs: Vec<String>,
 }
 
+struct MessageSend {
+    sender: String,
+    sent_at: f64,
+    correction: Result<Option<bool>, String>,
+    status_only: Result<Option<bool>, String>,
+}
+
+fn merge_message_label(label: &mut Result<Option<bool>, String>, incoming: Option<bool>) {
+    let Some(incoming) = incoming else {
+        return;
+    };
+    match label {
+        Ok(Some(previous)) if *previous != incoming => {
+            *label = Err("conflicting attributed message classification".into())
+        }
+        Ok(value) => *value = Some(incoming),
+        Err(_) => {}
+    }
+}
+
 impl<'a> Calculator<'a> {
     fn contains(&self, at: f64) -> bool {
         at > self.frame.now - self.frame.window_secs as f64 && at <= self.frame.now
@@ -1213,10 +1233,10 @@ impl<'a> Calculator<'a> {
             let OperationFact::Decision(f) = fact else {
                 continue;
             };
-            attributed(row)?;
             if !f.open {
                 continue;
             }
+            attributed(row)?;
             let decision = f
                 .decision
                 .ok_or("decision/ruling classification unavailable")?;
@@ -1252,38 +1272,27 @@ impl<'a> Calculator<'a> {
     }
     fn messages(&self, id: &str) -> Result<Outcome, String> {
         let p = self.population("message")?;
-        let mut seen = BTreeSet::new();
         let mut senders: BTreeMap<String, f64> = BTreeMap::new();
         let mut total = 0_u64;
         let mut corrections = 0_u64;
         let mut classified = 0_u64;
         let mut statuses = 0_u64;
-        for &(row, fact) in &p.rows {
-            let OperationFact::Message(f) = fact else {
-                continue;
-            };
-            let sent = epoch(&f.sent_at)?;
-            if sent > self.frame.now + self.config.clock_tolerance_seconds as f64 {
-                return Err("future original message send timestamp".into());
-            }
-            if !self.contains(sent) || !seen.insert(&f.message_id) {
+        for message in self.message_sends(&p)?.into_values() {
+            if !self.contains(message.sent_at) {
                 continue;
             }
-            let sender = canonical_sender(&f.sender)?;
             total += 1;
-            *senders.entry(sender).or_default() += 1.0;
+            *senders.entry(message.sender).or_default() += 1.0;
             if id == "correction_rate"
-                && let Some(correction) = f.correction.filter(|_| attributed(row).is_ok())
+                && let Some(correction) = message.correction?
             {
                 classified += 1;
                 corrections += u64::from(correction);
             }
             if id == "status_only_messages" {
-                attributed(row)?;
-            }
-            if id == "status_only_messages" {
                 statuses += u64::from(
-                    f.status_only
+                    message
+                        .status_only?
                         .ok_or("incomplete status-only classification")?,
                 );
             }
@@ -1305,23 +1314,14 @@ impl<'a> Calculator<'a> {
     }
     fn correction_coverage(&self) -> Result<ClassificationCoverage, String> {
         let p = self.population("message")?;
-        let mut seen = BTreeSet::new();
         let mut total = 0_u64;
         let mut classified = 0_u64;
-        for &(row, fact) in &p.rows {
-            let OperationFact::Message(f) = fact else {
-                continue;
-            };
-            let sent = epoch(&f.sent_at)?;
-            if sent > self.frame.now + self.config.clock_tolerance_seconds as f64 {
-                return Err("future original message send timestamp".into());
-            }
-            if !self.contains(sent) || !seen.insert(&f.message_id) {
+        for message in self.message_sends(&p)?.into_values() {
+            if !self.contains(message.sent_at) {
                 continue;
             }
-            canonical_sender(&f.sender)?;
             total += 1;
-            if f.correction.is_some() && attributed(row).is_ok() {
+            if message.correction?.is_some() {
                 classified += 1;
             }
         }
@@ -1334,6 +1334,33 @@ impl<'a> Calculator<'a> {
                 CoverageBasis::LabeledSubset
             },
         })
+    }
+    fn message_sends(&self, p: &Population<'a>) -> Result<BTreeMap<&'a str, MessageSend>, String> {
+        let mut sends: BTreeMap<&str, MessageSend> = BTreeMap::new();
+        for &(row, fact) in &p.rows {
+            let OperationFact::Message(f) = fact else {
+                continue;
+            };
+            let sent_at = epoch(&f.sent_at)?;
+            if sent_at > self.frame.now + self.config.clock_tolerance_seconds as f64 {
+                return Err("future original message send timestamp".into());
+            }
+            let sender = canonical_sender(&f.sender)?;
+            let send = sends.entry(&f.message_id).or_insert_with(|| MessageSend {
+                sender: sender.clone(),
+                sent_at,
+                correction: Ok(None),
+                status_only: Ok(None),
+            });
+            if send.sender != sender || send.sent_at != sent_at {
+                return Err("conflicting original message sender/time provenance".into());
+            }
+            if attributed(row).is_ok() {
+                merge_message_label(&mut send.correction, f.correction);
+                merge_message_label(&mut send.status_only, f.status_only);
+            }
+        }
+        Ok(sends)
     }
     fn assignments(&self, id: &str) -> Result<Outcome, String> {
         let p = self.population("assignment")?;
@@ -1403,7 +1430,7 @@ impl<'a> Calculator<'a> {
         let p = self.population("order")?;
         let mut revisions: BTreeMap<(&str, &str), &str> = BTreeMap::new();
         let mut repeated = 0_u64;
-        for (row, fact) in self.ordered_orders(&p, None)? {
+        for (row, fact) in self.ordered_orders(&p)? {
             let OperationFact::Order(f) = fact else {
                 continue;
             };
@@ -1422,42 +1449,62 @@ impl<'a> Calculator<'a> {
     fn ordered_orders(
         &self,
         p: &Population<'a>,
-        start: Option<f64>,
     ) -> Result<Vec<(&'a Observation, &'a OperationFact)>, String> {
-        let mut rows = Vec::new();
-        let mut sends = BTreeMap::new();
+        let mut candidates = Vec::new();
         for &(row, fact) in &p.rows {
             let at = event_time(row)?;
-            if at > self.frame.now || start.is_some_and(|s| at <= s) {
+            if at > self.frame.now {
                 continue;
             }
-            attributed(row)?;
+            candidates.push((row, fact));
+        }
+        candidates.sort_by(|a, b| {
+            event_time(a.0)
+                .unwrap_or(0.0)
+                .total_cmp(&event_time(b.0).unwrap_or(0.0))
+                .then(a.0.sequence.cmp(&b.0.sequence))
+        });
+        let mut rows = Vec::new();
+        let mut sends: BTreeMap<(&str, &str), (&Observation, &OrderFact)> = BTreeMap::new();
+        for (row, fact) in candidates {
             let OperationFact::Order(f) = fact else {
                 continue;
             };
             if f.send_id.is_empty() {
                 return Err("missing native order send identity".into());
             }
-            if let Some(previous) = sends.insert((f.lane.as_str(), f.send_id.as_str()), f) {
-                if previous != f {
+            let key = (f.lane.as_str(), f.send_id.as_str());
+            if let Some((original, previous)) = sends.get(&key) {
+                if *previous != f
+                    || original.entity_id != row.entity_id
+                    || row
+                        .attribution
+                        .as_ref()
+                        .zip(original.attribution.as_ref())
+                        .is_some_and(|(a, b)| a != b)
+                {
                     return Err("conflicting redelivery order provenance".into());
+                }
+                if event_time(original)? == event_time(row)?
+                    && original
+                        .sequence
+                        .zip(row.sequence)
+                        .is_none_or(|(a, b)| a == b)
+                {
+                    return Err("missing original-send source sequence".into());
                 }
                 continue;
             }
+            attributed(row)?;
             if f.action_key.as_ref().is_none_or(String::is_empty)
                 || f.direction.as_ref().is_none_or(String::is_empty)
                 || f.evidence_revision.as_ref().is_none_or(String::is_empty)
             {
                 return Err("missing order action/direction/evidence classification".into());
             }
+            sends.insert(key, (row, f));
             rows.push((row, fact));
         }
-        rows.sort_by(|a, b| {
-            event_time(a.0)
-                .unwrap_or(0.0)
-                .total_cmp(&event_time(b.0).unwrap_or(0.0))
-                .then(a.0.sequence.cmp(&b.0.sequence))
-        });
         for pair in rows.windows(2) {
             if event_time(pair[0].0)? == event_time(pair[1].0)?
                 && pair[0]
@@ -1486,7 +1533,7 @@ impl<'a> Calculator<'a> {
             .ok_or("missing positive loop_repeat_count")?;
         let mut previous: BTreeMap<(&str, &str), (&Observation, &OrderFact)> = BTreeMap::new();
         let mut groups: BTreeMap<(&str, &str), (u64, Vec<&Observation>)> = BTreeMap::new();
-        for (row, fact) in self.ordered_orders(&p, Some(self.frame.now - lookback as f64))? {
+        for (row, fact) in self.ordered_orders(&p)? {
             let OperationFact::Order(f) = fact else {
                 continue;
             };
@@ -1495,6 +1542,7 @@ impl<'a> Calculator<'a> {
                 f.action_key.as_deref().ok_or("missing action key")?,
             );
             if let Some((old_row, old)) = previous.get(&key)
+                && event_time(row)? > self.frame.now - lookback as f64
                 && f.supersedes_order_id.as_deref() == Some(&old.order_id)
                 && f.reverses_order_id.as_deref() == Some(&old.order_id)
                 && f.direction != old.direction
@@ -1761,7 +1809,9 @@ fn normalize_export(
             .as_deref()
             .ok_or("missing operational source timestamp")?,
     )?;
-    for row in &evidence.observations {
+    let mut errors: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut rows = Vec::new();
+    for row in std::mem::take(&mut evidence.observations) {
         let family = match &row.fact {
             Fact::Operation(f) => f.family(),
             Fact::Lifecycle(_) => "lifecycle",
@@ -1770,13 +1820,26 @@ fn normalize_export(
         if !input.families.contains(family) {
             return Err("operational export contains unconfigured capability".into());
         }
-        if row.event_id.is_empty() || row.entity_id.is_empty() || row.source_ref.is_empty() {
-            return Err("operational export lacks native event/entity/reference".into());
-        }
-        if event_time(row)? > observed + config.clock_tolerance_seconds as f64 {
-            return Err("operational event follows source observation watermark".into());
+        let validation = (|| -> Result<(), String> {
+            if row.event_id.is_empty() || row.entity_id.is_empty() || row.source_ref.is_empty() {
+                return Err("operational export lacks native event/entity/reference".into());
+            }
+            if event_time(&row)? > observed + config.clock_tolerance_seconds as f64 {
+                return Err("operational event follows source observation watermark".into());
+            }
+            Ok(())
+        })();
+        match validation {
+            Ok(()) => rows.push(row),
+            Err(reason) => {
+                errors
+                    .entry(family.into())
+                    .or_default()
+                    .insert(format!("{}: {reason}", row.event_id));
+            }
         }
     }
+    evidence.observations = rows;
     for family in &input.families {
         let selectors = match family.as_str() {
             "host" | "scheduler_request" | "scheduler_event" => &config.scope.hosts,
@@ -1784,40 +1847,53 @@ fn normalize_export(
             _ => &config.scope.lanes,
         };
         let expected: BTreeSet<_> = selectors.iter().map(|s| s.id.as_str()).collect();
-        let from = if matches!(
+        let gauge = matches!(
             family.as_str(),
             "host" | "lane_signal" | "reconciliation" | "instruction" | "decision" | "lifecycle"
-        ) {
-            frame.now
+        );
+        let required_until = if gauge { observed } else { frame.now };
+        let from = if gauge {
+            observed
         } else {
             frame.now - frame.window_secs as f64
         };
         let origin = matches!(family.as_str(), "order" | "denial" | "relay_event");
-        let mut covered = BTreeSet::new();
-        for coverage in export.coverage.iter().filter(|c| &c.family == family) {
-            let beginning = epoch(&coverage.from)?;
-            let until = epoch(&coverage.until)?;
-            if beginning > until || until > observed + config.clock_tolerance_seconds as f64 {
-                return Err("invalid operational coverage interval/watermark".into());
+        let validation = (|| -> Result<(), String> {
+            let mut covered = BTreeSet::new();
+            for coverage in export.coverage.iter().filter(|c| &c.family == family) {
+                let beginning = epoch(&coverage.from)?;
+                let until = epoch(&coverage.until)?;
+                if beginning > until || until > observed + config.clock_tolerance_seconds as f64 {
+                    return Err("invalid operational coverage interval/watermark".into());
+                }
+                if coverage.complete
+                    && (!origin || coverage.full_history)
+                    && beginning <= from
+                    && until >= required_until
+                {
+                    covered.extend(coverage.entities.iter().map(String::as_str));
+                }
             }
-            if coverage.complete
-                && (!origin || coverage.full_history)
-                && beginning <= from
-                && until >= frame.now
-            {
-                covered.extend(coverage.entities.iter().map(String::as_str));
-            }
-        }
-        let missing: Vec<_> = expected.difference(&covered).copied().collect();
-        if expected.is_empty() || !missing.is_empty() || !evidence.complete.contains(family) {
-            evidence.complete.remove(family);
-            evidence.reasons.insert(
-                family.clone(),
-                format!(
+            let missing: Vec<_> = expected.difference(&covered).copied().collect();
+            if expected.is_empty() || !missing.is_empty() || !evidence.complete.contains(family) {
+                return Err(format!(
                     "missing complete {family} coverage for configured native subjects {missing:?}"
-                ),
-            );
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(reason) = validation {
+            errors.entry(family.clone()).or_default().insert(reason);
         }
+    }
+    for (family, mut reasons) in errors {
+        evidence.complete.remove(&family);
+        if let Some(previous) = evidence.reasons.remove(&family) {
+            reasons.insert(previous);
+        }
+        evidence
+            .reasons
+            .insert(family, reasons.into_iter().collect::<Vec<_>>().join("; "));
     }
     evidence.complete.retain(|f| input.families.contains(f));
     Ok(evidence)
