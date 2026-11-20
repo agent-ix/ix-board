@@ -3172,7 +3172,7 @@ fn categorical_lifecycle_keeps_partial_source_counts_and_provenance_without_tran
             window_secs: DAY,
             end_exclusive: false,
         },
-        &[evidence],
+        std::slice::from_ref(&evidence),
         &BTreeMap::new(),
     );
     let Value::SourceObservation(values) = report.measurements["lane_execution_state"]
@@ -3201,6 +3201,42 @@ fn categorical_lifecycle_keeps_partial_source_counts_and_provenance_without_tran
         serde_json::from_str::<ix_board::retro::department::Report>(&json).unwrap(),
         report
     );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("verified-lifecycle.json");
+    let export = ix_board::retro::department::OperationalExport {
+        version: 1,
+        evidence,
+        coverage: vec![ix_board::retro::department::OperationalCoverage {
+            family: "lifecycle".into(),
+            entities: ["remote:team:code".into()].into(),
+            from: iso(NOW),
+            until: iso(NOW),
+            complete: true,
+            full_history: false,
+        }],
+    };
+    std::fs::write(&path, serde_json::to_vec(&export).unwrap()).unwrap();
+    let op = ix_board::retro::department::OperationalConfig {
+        evidence_files: vec![ix_board::retro::department::OperationalInput {
+            path,
+            source: "lifecycle".into(),
+            families: ["lifecycle".into()].into(),
+        }],
+        ..Default::default()
+    };
+    c.operations = Some(op.clone());
+    let frame = ix_board::retro::Frame {
+        now: NOW,
+        window_secs: DAY,
+        end_exclusive: false,
+    };
+    let loaded = ix_board::retro::department::read_operational_files(&op, &c, frame);
+    let from_export = ix_board::retro::department::collect(&c, frame, &loaded, &BTreeMap::new());
+    assert_eq!(
+        from_export.measurements["lane_execution_state"].value,
+        report.measurements["lane_execution_state"].value
+    );
+    assert_eq!(from_export.observations, report.observations);
 }
 
 struct DepartmentFixtureGithub;

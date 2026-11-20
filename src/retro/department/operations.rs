@@ -72,11 +72,13 @@ impl OperationalConfig {
     pub(super) fn validate(&self, scope: &Scope) -> Result<(), String> {
         let mut owners = BTreeSet::new();
         let mut sources = BTreeSet::new();
+        let mut paths = BTreeSet::new();
         for input in &self.evidence_files {
             if input.path.as_os_str().is_empty()
                 || input.source.is_empty()
                 || input.families.is_empty()
                 || !sources.insert(&input.source)
+                || !paths.insert(&input.path)
             {
                 return Err("department.operations.evidence_files: empty/duplicate path, source or families".into());
             }
@@ -642,6 +644,15 @@ impl<'a> Calculator<'a> {
             refs: p.rows.iter().map(|(r, _)| r.event_id.clone()).collect(),
         })
     }
+    fn freshness_limit(&self, row: &Observation) -> Result<u64, String> {
+        self.batches
+            .iter()
+            .filter(|b| b.observations.iter().any(|r| r.event_id == row.event_id))
+            .filter_map(|b| self.config.freshness_seconds.get(&b.source))
+            .copied()
+            .min()
+            .ok_or_else(|| "missing source freshness policy".into())
+    }
     fn scalar(&self, p: &Population<'a>, value: f64) -> Result<Outcome, String> {
         self.finish(p, Value::Scalar(value), None)
     }
@@ -1007,6 +1018,11 @@ impl<'a> Calculator<'a> {
                 .map(epoch)
                 .transpose()?
                 .unwrap_or(self.frame.now);
+            if start > self.frame.now + self.config.clock_tolerance_seconds as f64
+                || end > self.frame.now + self.config.clock_tolerance_seconds as f64
+            {
+                return Err("future denial/resolution timestamp".into());
+            }
             if end < start {
                 return Err("denial resolution precedes denial".into());
             }
@@ -1052,7 +1068,8 @@ impl<'a> Calculator<'a> {
         let mut paired = 0_u64;
         let mut matching = 0_u64;
         let mut unpaired = 0_u64;
-        for (_, fact) in self.latest(&p)? {
+        let mut pair_age = p.age;
+        for (row, fact) in self.latest(&p)? {
             let OperationFact::Reconciliation(f) = fact else {
                 continue;
             };
@@ -1074,6 +1091,11 @@ impl<'a> Calculator<'a> {
                     if a.max(b) > self.frame.now + self.config.clock_tolerance_seconds as f64 {
                         return Err("future reconciliation timestamp".into());
                     }
+                    let age = (self.frame.now - a.min(b)).max(0.0);
+                    if age > self.freshness_limit(row)? as f64 {
+                        return Err("stale reconciliation observation".into());
+                    }
+                    pair_age = pair_age.max(age);
                     paired += 1;
                     matching += u64::from(tool == truth);
                 }
@@ -1086,11 +1108,13 @@ impl<'a> Calculator<'a> {
         if paired == 0 {
             return Err("no complete paired reconciliation denominator".into());
         }
-        self.finish(
+        let mut outcome = self.finish(
             &p,
             Value::Scalar(matching as f64 / paired as f64),
             Some(paired),
-        )
+        )?;
+        outcome.age = pair_age;
+        Ok(outcome)
     }
     fn instructions(&self) -> Result<Outcome, String> {
         let p = self.population("instruction")?;
@@ -1100,6 +1124,9 @@ impl<'a> Calculator<'a> {
             let OperationFact::Instruction(f) = fact else {
                 continue;
             };
+            if f.component.is_empty() {
+                return Err("missing native instruction component identity".into());
+            }
             lanes.insert(f.lane.as_str());
             let claimed = f
                 .claimed
@@ -1235,7 +1262,11 @@ impl<'a> Calculator<'a> {
             let OperationFact::Message(f) = fact else {
                 continue;
             };
-            if !self.contains(epoch(&f.sent_at)?) || !seen.insert(&f.message_id) {
+            let sent = epoch(&f.sent_at)?;
+            if sent > self.frame.now + self.config.clock_tolerance_seconds as f64 {
+                return Err("future original message send timestamp".into());
+            }
+            if !self.contains(sent) || !seen.insert(&f.message_id) {
                 continue;
             }
             let sender = canonical_sender(&f.sender)?;
@@ -1281,7 +1312,11 @@ impl<'a> Calculator<'a> {
             let OperationFact::Message(f) = fact else {
                 continue;
             };
-            if !self.contains(epoch(&f.sent_at)?) || !seen.insert(&f.message_id) {
+            let sent = epoch(&f.sent_at)?;
+            if sent > self.frame.now + self.config.clock_tolerance_seconds as f64 {
+                return Err("future original message send timestamp".into());
+            }
+            if !self.contains(sent) || !seen.insert(&f.message_id) {
                 continue;
             }
             canonical_sender(&f.sender)?;

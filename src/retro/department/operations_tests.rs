@@ -559,6 +559,45 @@ fn installed_instruction_drift_and_unknown_release_are_distinct() {
     );
 }
 
+#[trace("FR-029-AC-3", "FR-029-AC-9")]
+#[test]
+fn stale_inner_observation_times_and_future_semantic_timestamps_remain_unknown() {
+    let pair = OperationFact::Reconciliation(ReconciliationFact {
+        tool_value: Some("working".into()),
+        truth_value: Some("working".into()),
+        tool_at: Some(at(-61.0)),
+        truth_at: Some(at(-61.0)),
+    });
+    assert!(
+        measure(vec![row("pair", "entity", 0.0, pair)])["reconciliation_agreement_ratio"]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("stale")
+    );
+    let denial = OperationFact::Denial(DenialFact {
+        lane: LANE.into(),
+        order_id: "order".into(),
+        denied_at: at(-60.0),
+        resolved_at: Some(at(3.0)),
+    });
+    assert_eq!(
+        measure(vec![row("denial", "order", 0.0, denial)])["frozen_denial_hours"].value,
+        None
+    );
+    let message = OperationFact::Message(MessageFact {
+        message_id: "message".into(),
+        sent_at: at(3.0),
+        sender: LANE.into(),
+        correction: Some(false),
+        status_only: Some(false),
+    });
+    assert_eq!(
+        measure(vec![row("message", "message", 0.0, message)])["correction_rate"].value,
+        None
+    );
+}
+
 #[trace("FR-029-AC-2", "FR-029-AC-4")]
 #[test]
 fn attributed_messages_deduplicate_redelivery_and_unknown_semantics_do_not_become_healthy() {
