@@ -3,6 +3,21 @@
 
 //! Source-native evidence. Missing capabilities are isolated per fact family (FR-029).
 use super::Scope;
+wire! {
+    /// Independent provenance of one enriched field, preserving its native snapshot row.
+    SourceStamp {
+        /// Configured source identity.
+        source: String,
+        /// Actual source observation UTC time.
+        observed_at: Option<String>,
+        /// Explicit coverage validation result.
+        complete: bool,
+        /// Missing coverage or source reason.
+        reason: Option<String>,
+        /// Native event or exported record references.
+        evidence_refs: Vec<String>
+    }
+}
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -130,6 +145,12 @@ impl LifecycleFact {
 wire! {
     /// Current issue with capability-specific absence explicit.
     IssueFact {
+        /// Independent enrichment source availability by field.
+        #[serde(default)] provenance: BTreeMap<String, SourceStamp>,
+        /// Native attached URLs for exact merge joins.
+        #[serde(default)] attachment_urls: Vec<String>,
+        /// Whether every native attachment was read.
+        #[serde(default)] attachments_complete: bool,
         /// Source-native team key.
         team: String,
         /// Native project identity.
@@ -170,6 +191,8 @@ wire! {
 wire! {
     /// Review/diff/check attributes for a pull request.
     PrFact {
+        /// Independent enrichment source availability by field.
+        #[serde(default)] provenance: BTreeMap<String, SourceStamp>,
         /// Source-native repository.
         repo: String,
         /// Open at the observed head.
@@ -268,6 +291,9 @@ pub fn workspace_evidence(snapshot: &crate::WorkspaceSnapshot, scope: &Scope) ->
             source_ref: format!("linear:issue:{}", issue.id.0),
             attribution: None,
             fact: Fact::Issue(IssueFact {
+                provenance: BTreeMap::new(),
+                attachment_urls: issue.attachment_urls.clone(),
+                attachments_complete: issue.attachments_complete,
                 team: issue.team_key.0.clone(),
                 project: issue.project_id.as_ref().map(|id| id.0.clone()),
                 state: issue.state_name.clone(),

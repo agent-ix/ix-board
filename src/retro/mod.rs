@@ -76,14 +76,15 @@ pub fn run_snapshot(
     };
     let metrics = metrics::collect(config, frame, sources);
     let department = config.department.as_ref().map(|department| {
-        let mut batches = [
+        let mut batches = vec![
             sources
                 .linear
                 .department_evidence(&department.scope, frame.now - window_secs as f64),
             sources
                 .github
-                .department_evidence(&department.scope, frame.now - window_secs as f64),
+                .department_evidence(department, frame.now - window_secs as f64),
         ];
+        department::enrich_merged_attachments(department, &mut batches, sources.github);
         let repositories: Vec<_> = department
             .scope
             .repositories
@@ -114,6 +115,9 @@ pub fn run_snapshot(
                 }
             }
         }
+        department::read_source_logs(department, frame, &mut batches, |path| {
+            std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))
+        });
         let mut report = department::collect(department, frame, &batches, &metrics);
         let previous = stored
             .iter()

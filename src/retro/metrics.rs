@@ -550,7 +550,7 @@ fn gate_issues<'a>(scope: &Scope<'a>) -> Result<Vec<&'a Issue>, String> {
 }
 
 /// Splits a GitHub pull request URL into repository and number.
-fn pull_request_ref(url: &str) -> Option<(String, u64)> {
+pub(crate) fn pull_request_ref(url: &str) -> Option<(String, u64)> {
     let rest = url.split("github.com/").nth(1)?;
     let mut parts = rest.split('/');
     let (owner, name, kind, number) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);

@@ -35,10 +35,21 @@ mod assess;
 mod collect;
 mod evidence;
 mod github;
+mod native;
+mod pull_requests;
+mod source_logs;
 pub use assess::*;
 pub use collect::{LoopFinding, LoopReport, collect};
 pub use evidence::*;
 pub use github::collect_pins;
+pub use native::{enrich_claim_history, enrich_merged_attachments};
+pub use pull_requests::{
+    DIFF_CLASSIFIER, PR_DETAILS, PR_FILES, PR_REVIEWS, PR_TIMELINE, RAW_CONTENT,
+    collect_pull_request,
+};
+pub use source_logs::{
+    Coverage, LogEvent, LogInput, LogKind, MovementKind, NativeRecord, SourceLog, read_source_logs,
+};
 #[cfg(test)]
 mod tests;
 
@@ -71,6 +82,10 @@ wire! {
     /// Configured metric parameters, never inferred from host process counts.
     #[derive(Default)]
     Parameters {
+        /// Explicit read-only authoritative history/classification exports.
+        #[serde(default)] event_logs: Vec<LogInput>,
+        /// Native dependency identities selected for tag/repin event populations.
+        #[serde(default)] dependencies: BTreeSet<String>,
         /// Work capacity per lane, distinct from host build capacity.
         #[serde(default)] lane_capacity: BTreeMap<String, u64>,
         /// Issue UUID to owning lane.
@@ -89,6 +104,8 @@ wire! {
         #[serde(default)] diff_classifier: Option<String>,
         /// Authorized review round limit.
         #[serde(default)] review_round_limit: Option<u64>,
+        /// Native submitted-review states qualifying for reviewer-age exclusion.
+        #[serde(default)] qualifying_review_states: BTreeSet<String>,
         /// Loop lookback interval.
         #[serde(default)] loop_lookback_seconds: Option<u64>,
         /// Minimum distinct repeats.
@@ -492,6 +509,26 @@ impl Config {
         if self.parameters.loop_repeat_count == Some(0) {
             return Err("department.parameters.loop_repeat_count: must be positive".into());
         }
+        let mut sources = BTreeSet::new();
+        let mut capabilities = BTreeSet::new();
+        for input in &self.parameters.event_logs {
+            if input.source.is_empty()
+                || input.path.as_os_str().is_empty()
+                || input.kinds.is_empty()
+                || !sources.insert(&input.source)
+            {
+                return Err(
+                    "department.parameters.event_logs: empty or duplicate source/path/kinds".into(),
+                );
+            }
+            for kind in &input.kinds {
+                if !capabilities.insert(kind) {
+                    return Err(
+                        "department.parameters.event_logs.kinds: duplicate capability owner".into(),
+                    );
+                }
+            }
+        }
         Ok(())
     }
     /// Canonical serialized identity; selector and policy ordering is immaterial.
@@ -513,6 +550,10 @@ impl Config {
             .policies
             .sort_by(|a, b| a.metric_id.cmp(&b.metric_id));
         normalized.classes.sort_by(|a, b| a.id.cmp(&b.id));
+        normalized
+            .parameters
+            .event_logs
+            .sort_by(|a, b| a.source.cmp(&b.source));
         digest(&normalized)
     }
     /// Identity for one metric, excluding unrelated assessment membership and routes.

@@ -78,7 +78,24 @@ pub trait LinearSource {
         since: f64,
     ) -> super::department::Evidence {
         match self.workspace(since) {
-            Ok(snapshot) => super::department::workspace_evidence(&snapshot, scope),
+            Ok(snapshot) => {
+                let mut evidence = super::department::workspace_evidence(&snapshot, scope);
+                let observed_at = evidence.observed_at.clone();
+                for row in &mut evidence.observations {
+                    if let super::department::Fact::Issue(issue) = &row.fact
+                        && (scope.teams.is_empty()
+                            || scope.teams.iter().any(|s| s.id == issue.team))
+                    {
+                        let history = self.state_history(&row.entity_id);
+                        super::department::enrich_claim_history(
+                            row,
+                            history.as_deref().map_err(Clone::clone),
+                            observed_at.as_deref(),
+                        );
+                    }
+                }
+                evidence
+            }
             Err(reason) => super::department::Evidence {
                 source: "linear".into(),
                 reasons: [("issue".into(), reason)].into(),
@@ -178,7 +195,7 @@ pub trait GithubSource {
     /// Normalized dependency, review and check evidence with independent capability coverage.
     fn department_evidence(
         &self,
-        _scope: &super::department::Scope,
+        _config: &super::department::Config,
         _since: f64,
     ) -> super::department::Evidence {
         super::department::Evidence {

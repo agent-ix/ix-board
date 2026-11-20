@@ -51,6 +51,7 @@ fn config() -> Config {
             review_round_limit: Some(1),
             loop_lookback_seconds: Some(86400),
             loop_repeat_count: Some(2),
+            ..Default::default()
         },
         policies: Vec::new(),
         classes: Vec::new(),
@@ -58,6 +59,9 @@ fn config() -> Config {
 }
 fn issue(started: bool) -> IssueFact {
     IssueFact {
+        provenance: BTreeMap::new(),
+        attachment_urls: Vec::new(),
+        attachments_complete: true,
         team: "QSL".into(),
         project: None,
         state: "started".into(),
@@ -336,6 +340,7 @@ fn completion_review_ready_diff_attribution_and_round_policy_use_explicit_eviden
     i.merged_pr = Some(true);
     i.obligations = Some(["accepted".into()].into());
     let pr = PrFact {
+        provenance: BTreeMap::new(),
         repo: "fixture/repo".into(),
         open: true,
         draft: false,
@@ -912,6 +917,7 @@ fn revision_divergence_checks_and_gate_scope_use_native_attributed_populations()
         "fixture/repo#1",
         0.0,
         Fact::PullRequest(PrFact {
+            provenance: BTreeMap::new(),
             repo: "fixture/repo".into(),
             open: false,
             draft: false,

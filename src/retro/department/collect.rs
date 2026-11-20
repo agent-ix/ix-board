@@ -100,6 +100,24 @@ impl<'a> Calculator<'a> {
         at > self.frame.now - self.frame.window_secs as f64 && at <= self.frame.now
     }
     fn capability(&self, family: &str) -> Result<f64, String> {
+        for row in self
+            .rows
+            .iter()
+            .filter(|row| self::family(&row.fact) == family)
+        {
+            if self.batches.iter().any(|batch| {
+                batch
+                    .observations
+                    .iter()
+                    .any(|candidate| std::ptr::eq(candidate, *row))
+                    && !batch.complete.contains(family)
+            }) {
+                return Err(format!(
+                    "{family} incomplete source pass for {}",
+                    row.entity_id
+                ));
+            }
+        }
         let batches: Vec<_> = self
             .batches
             .iter()
@@ -231,6 +249,43 @@ impl<'a> Calculator<'a> {
         }
         Ok(())
     }
+    fn field_age(&self, row: &Observation, fields: &[&str], mut age: f64) -> Result<f64, String> {
+        let provenance = match &row.fact {
+            Fact::Issue(i) => &i.provenance,
+            Fact::PullRequest(p) => &p.provenance,
+            _ => return Ok(age),
+        };
+        for field in fields {
+            if let Some(stamp) = provenance.get(*field) {
+                if !stamp.complete {
+                    return Err(stamp
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| format!("incomplete {field} source")));
+                }
+                let observed = epoch(
+                    stamp
+                        .observed_at
+                        .as_deref()
+                        .ok_or_else(|| format!("missing {field} source timestamp"))?,
+                )?;
+                let source_age = self.frame.now - observed;
+                let limit = self
+                    .config
+                    .freshness_seconds
+                    .get(&stamp.source)
+                    .ok_or_else(|| format!("missing freshness_seconds.{}", stamp.source))?;
+                if source_age > *limit as f64 {
+                    return Err(format!("stale {field} source {}", stamp.source));
+                }
+                if source_age < -(self.config.clock_tolerance_seconds as f64) {
+                    return Err(format!("future {field} source clock skew"));
+                }
+                age = age.max(source_age.max(0.0));
+            }
+        }
+        Ok(age)
+    }
     fn calculate(&self, id: &str) -> Result<(Value, f64, Option<u64>), String> {
         let issue_count = |n: usize| u64::try_from(n).map_err(|_| "population overflow".to_owned());
         let scalar = |v, age, n| Ok((Value::Scalar(v), age, n));
@@ -246,12 +301,6 @@ impl<'a> Calculator<'a> {
                         let category = category
                             .as_str()
                             .ok_or("lifecycle verdict is not categorical")?;
-                        if lifecycle.verdict == crate::agents::Verdict::Unknown {
-                            return Err(format!(
-                                "unavailable lifecycle category {}: {:?}",
-                                observation.entity_id, lifecycle.notes
-                            ));
-                        }
                         values.insert(
                             observation.entity_id.clone(),
                             super::SourceObservation {
@@ -279,7 +328,7 @@ impl<'a> Calculator<'a> {
             | "claims_without_movement"
             | "merged_open"
             | "oldest_gated_hours" => {
-                let age = self.capability("issue")?;
+                let mut age = self.capability("issue")?;
                 let issues = self.issues();
                 let started: Vec<_> = issues
                     .iter()
@@ -318,7 +367,8 @@ impl<'a> Calculator<'a> {
                     "claims_without_movement" => {
                         let stale = parameters.stale_seconds.ok_or("missing stale_seconds")? as f64;
                         let mut n = 0.0;
-                        for (_, i) in started {
+                        for (observation, i) in started {
+                            age = self.field_age(observation, &["claim_at", "movement"], age)?;
                             let claim = epoch(
                                 i.claim_at
                                     .as_deref()
@@ -345,10 +395,12 @@ impl<'a> Calculator<'a> {
                             .filter(|r| !r.is_empty())
                             .ok_or("missing completion_obligations")?;
                         let mut n = 0.0;
-                        for (_, i) in issues.iter().filter(|(_, i)| !i.terminal) {
+                        for (observation, i) in issues.iter().filter(|(_, i)| !i.terminal) {
+                            age = self.field_age(observation, &["merged_pr"], age)?;
                             let merged =
                                 i.merged_pr.ok_or("incomplete merged attachment evidence")?;
                             if merged {
+                                age = self.field_age(observation, &["obligations"], age)?;
                                 let met = i
                                     .obligations
                                     .as_ref()
@@ -363,12 +415,13 @@ impl<'a> Calculator<'a> {
                     "oldest_gated_hours" => {
                         let graph = self.graph()?;
                         let mut max: Option<f64> = None;
-                        for (_, i) in issues.iter().filter(|(o, i)| {
+                        for (observation, i) in issues.iter().filter(|(o, i)| {
                             !i.terminal
                                 && graph
                                     .get(&o.entity_id)
                                     .is_some_and(|edges| !edges.is_empty())
                         }) {
+                            age = self.field_age(observation, &["blocked_at"], age)?;
                             let at = epoch(
                                 i.blocked_at
                                     .as_deref()
@@ -378,7 +431,7 @@ impl<'a> Calculator<'a> {
                         }
                         scalar(
                             max.ok_or("empty gated duration population")?,
-                            age,
+                            age.max(self.dependency_age()?),
                             Some(count),
                         )
                     }
@@ -386,7 +439,7 @@ impl<'a> Calculator<'a> {
                 }
             }
             "open_chain_length" | "lane_fanin" => {
-                let age = self.capability("issue")?;
+                let age = self.dependency_age()?;
                 let graph = self.graph()?;
                 if id == "open_chain_length" {
                     if parameters.gates.is_empty() {
@@ -497,7 +550,7 @@ impl<'a> Calculator<'a> {
             | "repin_only_prs"
             | "review_round_policy_excess"
             | "gates_per_pr" => {
-                let age = self.capability("pull_request")?;
+                let mut age = self.capability("pull_request")?;
                 let prs: BTreeMap<_, _> = self
                     .rows
                     .iter()
@@ -539,6 +592,7 @@ impl<'a> Calculator<'a> {
                             }
                         }
                         "repin_only_prs" => {
+                            age = self.field_age(o, &["repin_only"], age)?;
                             let classifier = parameters
                                 .diff_classifier
                                 .as_deref()
@@ -568,7 +622,10 @@ impl<'a> Calculator<'a> {
                                 .transpose()?
                                 .is_some_and(|t| self.contains(t)) =>
                         {
-                            self.attributed(o, None)?;
+                            age = self.field_age(o, &["full_gates"], age)?;
+                            if p.full_gates != Some(0) {
+                                self.attributed(o, None)?;
+                            }
                             values.insert(
                                 (*key).clone(),
                                 p.full_gates
@@ -650,7 +707,7 @@ impl<'a> Calculator<'a> {
         }
     }
     fn graph(&self) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
-        self.capability("issue")?;
+        self.dependency_age()?;
         // Retain external blockers for reachability, but never count terminal/canceled nodes.
         let all: BTreeMap<_, _> = self
             .batches
@@ -697,6 +754,46 @@ impl<'a> Calculator<'a> {
         }
         chain_lengths(&graph)?;
         Ok(graph)
+    }
+    fn dependency_rows(&self) -> Vec<&'a Observation> {
+        let all: BTreeMap<&str, &Observation> = self
+            .batches
+            .iter()
+            .flat_map(|b| &b.observations)
+            .filter(|o| matches!(o.fact, Fact::Issue(_)))
+            .map(|o| (o.entity_id.as_str(), o))
+            .collect();
+        let mut pending: Vec<&str> = self
+            .issues()
+            .iter()
+            .map(|(o, _)| o.entity_id.as_str())
+            .chain(self.config.parameters.gates.iter().map(String::as_str))
+            .collect();
+        let mut reached = BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if !reached.insert(id) {
+                continue;
+            }
+            if let Some(observation) = all.get(id)
+                && let Fact::Issue(issue) = &observation.fact
+            {
+                pending.extend(issue.blockers.iter().map(String::as_str));
+            }
+        }
+        reached
+            .into_iter()
+            .filter_map(|id| all.get(id).copied())
+            .collect()
+    }
+    fn dependency_age(&self) -> Result<f64, String> {
+        let rows = self.dependency_rows();
+        Self {
+            config: self.config,
+            frame: self.frame,
+            batches: self.batches,
+            rows,
+        }
+        .capability("issue")
     }
     fn ordered(&self, selected: &str, cutoff: Option<f64>) -> Result<Vec<&'a Observation>, String> {
         self.capability(selected)?;
@@ -802,12 +899,19 @@ impl<'a> Calculator<'a> {
                 }
             }
             "state_bounce_loop" => {
-                let rows = self.ordered("state", Some(self.frame.now - lookback as f64))?;
+                let rows = self.ordered("state", None)?;
                 let mut entities: BTreeMap<&str, Vec<&Observation>> = BTreeMap::new();
                 for row in rows {
                     entities.entry(&row.entity_id).or_default().push(row);
                 }
-                for (entity, rows) in entities {
+                for (entity, mut rows) in entities {
+                    let cutoff = self.frame.now - lookback as f64;
+                    let first_inside = rows
+                        .iter()
+                        .position(|row| event_time(row).is_ok_and(|at| at > cutoff))
+                        .unwrap_or(rows.len());
+                    let keep_from = first_inside.saturating_sub(1);
+                    rows.drain(..keep_from);
                     let mut previous: Option<&str> = None;
                     let mut visits: BTreeMap<&str, Vec<&Observation>> = BTreeMap::new();
                     for o in rows {
@@ -820,7 +924,12 @@ impl<'a> Calculator<'a> {
                         }
                     }
                     for (state, visits) in visits {
-                        if visits.len() as u64 > repeat {
+                        if visits.len() as u64 > repeat
+                            && visits
+                                .iter()
+                                .skip(1)
+                                .all(|row| event_time(row).is_ok_and(|at| at > cutoff))
+                        {
                             matches.insert(format!("{entity}/{state}"), visits);
                         }
                     }
@@ -953,7 +1062,30 @@ pub fn collect(
                 }
             }
         };
-        let evidence_refs = calc.rows.iter().map(|o| o.event_id.clone()).collect();
+        let dependency_metric = matches!(
+            d.id,
+            "open_chain_length" | "oldest_gated_hours" | "lane_fanin"
+        );
+        let relevant = if dependency_metric {
+            calc.dependency_rows()
+        } else {
+            calc.rows.clone()
+        };
+        let mut evidence_refs: Vec<String> = relevant.iter().map(|o| o.event_id.clone()).collect();
+        for row in &relevant {
+            let stamps = match &row.fact {
+                Fact::Issue(i) => Some(&i.provenance),
+                Fact::PullRequest(p) => Some(&p.provenance),
+                _ => None,
+            };
+            if let Some(stamps) = stamps {
+                for stamp in stamps.values() {
+                    evidence_refs.extend(stamp.evidence_refs.iter().cloned());
+                }
+            }
+        }
+        evidence_refs.sort();
+        evidence_refs.dedup();
         measurements.insert(
             d.id.into(),
             Measurement {
@@ -1004,7 +1136,15 @@ pub fn collect(
             )
         })
         .collect();
-    let mut observations: Vec<_> = calc.rows.into_iter().cloned().collect();
+    let mut seen = BTreeSet::new();
+    let mut observations: Vec<_> = calc
+        .rows
+        .iter()
+        .copied()
+        .chain(calc.dependency_rows())
+        .filter(|row| seen.insert(row.event_id.clone()))
+        .cloned()
+        .collect();
     observations.sort_by(|a, b| a.event_id.cmp(&b.event_id));
     let mut report = Report {
         version: 1,

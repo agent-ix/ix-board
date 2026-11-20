@@ -161,6 +161,18 @@ impl LinearSource for LiveLinear {
             evidence.complete.insert("state".into());
             evidence.reasons.remove("state");
         }
+        for row in &mut evidence.observations {
+            if matches!(row.fact, super::department::Fact::Issue(_))
+                && issues.iter().any(|issue| issue.id.0 == row.entity_id)
+            {
+                let history = self.source.fetch_state_changes(&row.entity_id);
+                super::department::enrich_claim_history(
+                    row,
+                    history.as_deref().map_err(Clone::clone),
+                    Some(&observed),
+                );
+            }
+        }
         evidence
     }
     fn workspace(&self, since: f64) -> Result<WorkspaceSnapshot, String> {
@@ -440,9 +452,10 @@ fn check_state(runs: &[CheckRun]) -> CheckState {
 impl GithubSource for LiveGithub {
     fn department_evidence(
         &self,
-        scope: &super::department::Scope,
+        config: &super::department::Config,
         since: f64,
     ) -> super::department::Evidence {
+        let scope = &config.scope;
         let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
             Ok(now) => crate::drift::format_timestamp(now.as_secs_f64()),
             Err(error) => {
@@ -465,36 +478,25 @@ impl GithubSource for LiveGithub {
             match self.pull_requests(&repo.id, since) {
                 Ok(prs) => {
                     for pr in prs {
-                        let entity_id = format!("{}#{}", pr.repo, pr.number);
-                        evidence.observations.push(super::department::Observation {
-                            event_id: format!(
-                                "github:pull:{entity_id}:{}",
-                                crate::drift::format_timestamp(pr.updated_at)
-                            ),
-                            entity_id,
-                            event_at: Some(crate::drift::format_timestamp(pr.updated_at)),
-                            observed_at: Some(now.clone()),
-                            sequence: None,
-                            scope: scope.clone(),
-                            complete: true,
-                            source_ref: format!(
-                                "https://github.com/{}/pull/{}",
-                                pr.repo, pr.number
-                            ),
-                            attribution: None,
-                            fact: super::department::Fact::PullRequest(super::department::PrFact {
-                                repo: pr.repo,
-                                open: pr.open,
-                                draft: pr.draft,
-                                merged_at: pr.merged_at.map(crate::drift::format_timestamp),
-                                review_ready_at: None,
-                                assigned_reviewers: None,
-                                qualifying_reviews: None,
-                                repin_only: None,
-                                fix_rounds: None,
-                                full_gates: None,
-                            }),
-                        });
+                        evidence
+                            .observations
+                            .push(super::department::collect_pull_request(
+                                config,
+                                &pr,
+                                &now,
+                                |endpoint, projection| {
+                                    let mut args = strings(&["api", "--method", "GET", endpoint]);
+                                    if projection == super::department::RAW_CONTENT {
+                                        args.extend(strings(&[
+                                            "-H",
+                                            "Accept: application/vnd.github.raw+json",
+                                        ]));
+                                    } else {
+                                        args.extend(strings(&["--jq", projection]));
+                                    }
+                                    run("gh", &args)
+                                },
+                            ));
                     }
                 }
                 Err(reason) => {
