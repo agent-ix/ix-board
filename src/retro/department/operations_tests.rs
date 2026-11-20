@@ -255,6 +255,42 @@ fn unknown_message_population_never_claims_classification_coverage_or_rate() {
     assert_eq!(metrics["correction_rate"].classification_coverage,None);
 }
 
+#[trace("FR-029-AC-2", "FR-029-AC-5", "FR-029-AC-6")]
+#[test]
+fn independent_teams_assess_native_host_rows_as_healthy_or_overcommitted_without_combined_score() {
+    use crate::retro::department::{Basis,Comparator,KeyReduction,Policy,Severity,Statistic,assess_metric};
+    let policy = Policy { metric_id: "host_overcommit_units".into(),statistic: Statistic::Value,
+        unit: "units".into(),comparator: Comparator::Gte,amber: 1.0,red: 2.0,basis: Basis::Current,
+        window_seconds: 3600,freshness_seconds: 60,expected_keys: ["host".into()].into(),
+        key_reduction: Some(KeyReduction::WorstSeverity) };
+    for (team,capacity,used,severity) in [("team-alpha",5,2,Severity::Green),("team-beta",2,4,Severity::Red)] {
+        let mut c = config(); c.scope.teams[0].id = team.into();
+        let mut f = host();
+        if let OperationFact::Host(f) = &mut f { f.capacity_units = Some(capacity); f.used_units = Some(used); }
+        let metrics = collect(&c,&[batch(vec![row("h","host",0.0,f)])]).0;
+        let assessment = assess_metric(Some(&metrics["host_overcommit_units"]),Some(&policy),None);
+        assert_eq!(assessment.summary.severity,severity);
+        assert!(assessment.summary.complete);
+    }
+    let mut c = config();
+    c.scope.hosts.push(Selector { id: "remote".into(),label: "Remote".into() });
+    let metrics = collect(&c,&[batch(vec![row("h","host",0.0,host())])]).0;
+    let assessment = assess_metric(Some(&metrics["host_overcommit_units"]),Some(&policy),None);
+    assert_eq!(assessment.summary.severity,Severity::Unknown);
+    assert!(!assessment.summary.complete);
+}
+
+#[trace("FR-029-AC-2", "FR-029-AC-9")]
+#[test]
+fn unrelated_host_source_does_not_contaminate_configured_host_population() {
+    let mut unrelated = host();
+    if let OperationFact::Host(f) = &mut unrelated { f.host = "unselected".into(); }
+    let mut stale = batch(vec![row("remote","unselected",0.0,unrelated)]);
+    stale.observed_at = None;
+    let metrics = collect(&config(),&[batch(vec![row("local","host",0.0,host())]),stale]).0;
+    assert_eq!(keyed(&metrics,"host_slots_used","host"),4.0);
+}
+
 #[trace("FR-029-AC-4", "FR-029-AC-8")]
 #[test]
 fn explicit_order_reversals_have_exact_evidence_and_changed_authority_suppresses_pairs() {

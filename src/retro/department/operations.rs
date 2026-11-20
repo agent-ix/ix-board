@@ -365,8 +365,11 @@ impl<'a> Calculator<'a> {
         let mut rows = BTreeMap::new();
         let mut age: f64 = 0.0;
         for batch in self.batches {
+            let has_family_rows = batch.observations.iter().any(|r| matches!(&r.fact,
+                Fact::Operation(f) if f.family() == family));
             let relevant = batch.observations.iter().any(|r| matches!(&r.fact,
                 Fact::Operation(f) if f.family() == family && f.selected(&self.config.scope, r)));
+            if has_family_rows && !relevant { continue; }
             if let Some(reason) = batch.reasons.get(family) {
                 return Err(format!("{}: {reason}", batch.source));
             }
