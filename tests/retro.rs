@@ -2900,7 +2900,7 @@ fn read_only_collection_uses_operational_exports_and_writer_appends_exactly_once
     let rig = base_rig();
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("host-export.json");
-    let stamp = ix_board::drift::format_timestamp(NOW);
+    let stamp = "2026-11-07T12:00:00Z";
     let export = serde_json::json!({"version":1,"coverage":[{"family":"host","entities":["host"],
         "from":stamp,"until":stamp,"complete":true,"full_history":false}],
         "evidence":{"source":"operational-host","observed_at":stamp,"complete":["host"],"reasons":{},
