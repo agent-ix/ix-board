@@ -304,6 +304,10 @@ wire! {
         population: Option<u64>,
         /// Ratio denominator, when applicable.
         denominator: Option<u64>,
+        /// Native-key denominators for keyed ratios; counts retain their population separately.
+        denominators: BTreeMap<String, u64>,
+        /// Explicit configured counting parameters, persisted alongside their identity.
+        query_parameters: Parameters,
         /// Resolving evidence/source references.
         evidence_refs: Vec<String>
     }

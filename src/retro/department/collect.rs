@@ -135,6 +135,43 @@ impl<'a> Calculator<'a> {
                 return Err(format!("{} stale source", b.source));
             }
             age = age.max(source_age.max(0.0));
+            for row in b.observations.iter().filter(|row| {
+                self::family(&row.fact) == family
+                    && self
+                        .rows
+                        .iter()
+                        .any(|selected| selected.event_id == row.event_id)
+            }) {
+                let at = epoch(
+                    row.observed_at
+                        .as_deref()
+                        .ok_or("missing row observation timestamp")?,
+                )?;
+                let row_age = self.frame.now - at;
+                if row_age > *limit as f64 {
+                    return Err(format!("{} stale row observation", b.source));
+                }
+                age = age.max(row_age.max(0.0));
+            }
+        }
+        let mut native_events: BTreeMap<&str, &Observation> = BTreeMap::new();
+        for row in self
+            .batches
+            .iter()
+            .flat_map(|b| &b.observations)
+            .filter(|o| self::family(&o.fact) == family)
+        {
+            if let Some(prior) = native_events.insert(&row.event_id, row)
+                && (prior.entity_id != row.entity_id
+                    || prior.event_at != row.event_at
+                    || prior.sequence != row.sequence
+                    || prior.fact != row.fact)
+            {
+                return Err(format!(
+                    "conflicting duplicate native event {}",
+                    row.event_id
+                ));
+            }
         }
         for row in self.rows.iter().filter(|o| family == self::family(&o.fact)) {
             if !row.complete && family != "lifecycle" {
@@ -152,6 +189,22 @@ impl<'a> Calculator<'a> {
                 && epoch(at)? > self.frame.now + self.config.clock_tolerance_seconds as f64
             {
                 return Err("excessive future event skew".into());
+            }
+            let timestamps: Vec<&str> = match &row.fact {
+                Fact::Issue(issue) => [&issue.claim_at, &issue.movement_at, &issue.blocked_at]
+                    .into_iter()
+                    .filter_map(|at| at.as_deref())
+                    .collect(),
+                Fact::PullRequest(pr) => [&pr.merged_at, &pr.review_ready_at]
+                    .into_iter()
+                    .filter_map(|at| at.as_deref())
+                    .collect(),
+                _ => Vec::new(),
+            };
+            for at in timestamps {
+                if epoch(at)? > self.frame.now + self.config.clock_tolerance_seconds as f64 {
+                    return Err("excessive future source fact skew".into());
+                }
             }
         }
         Ok(age)
@@ -862,11 +915,6 @@ pub fn collect(
             }
         };
         let evidence_refs = calc.rows.iter().map(|o| o.event_id.clone()).collect();
-        let denominator = if d.id == "wip_capacity_ratio" {
-            None
-        } else {
-            population
-        };
         measurements.insert(
             d.id.into(),
             Measurement {
@@ -888,7 +936,13 @@ pub fn collect(
                 window_seconds: frame.window_secs,
                 source_age_seconds: age,
                 population,
-                denominator,
+                denominator: None,
+                denominators: if d.id == "wip_capacity_ratio" {
+                    config.parameters.lane_capacity.clone()
+                } else {
+                    BTreeMap::new()
+                },
+                query_parameters: config.parameters.clone(),
                 evidence_refs,
             },
         );

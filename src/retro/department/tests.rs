@@ -573,6 +573,11 @@ fn normalized_configuration_identity_ignores_order_but_detects_semantic_changes(
         original,
         reordered.measurement_identity("wip_active", 86400)
     );
+    reordered.scope.teams[0].label = "Renamed display label".into();
+    assert_eq!(
+        original,
+        reordered.measurement_identity("wip_active", 86400)
+    );
     for changed in [
         {
             let mut v = c.clone();
@@ -836,4 +841,104 @@ fn injected_http_lock_and_reachability_boundary_keeps_unrelated_revision_counts_
     let r = collect_rows(&c, &missing);
     assert_eq!(r.measurements["crate_revision_count"].status, Status::Ok);
     assert_eq!(r.measurements["pins_off_main"].status, Status::Unavailable);
+}
+
+#[trace("FR-029-AC-4", "FR-029-AC-9")]
+#[test]
+fn revision_divergence_checks_and_gate_scope_use_native_attributed_populations() {
+    let mut c = config();
+    c.scope.repositories.push(Selector {
+        id: "second/repo".into(),
+        label: "Second".into(),
+    });
+    let mut rows = Vec::new();
+    for (id, repo, revision, on_main) in [
+        ("pin-1", "fixture/repo", "sha-one", Some(true)),
+        ("pin-2", "second/repo", "sha-two", Some(false)),
+    ] {
+        rows.push(row(
+            id,
+            id,
+            -1.0,
+            Fact::Pin(PinFact {
+                repo: repo.into(),
+                dependency: "shared-crate".into(),
+                revision: revision.into(),
+                on_main,
+            }),
+        ));
+    }
+    for (id, offset, scope) in [
+        ("focused", 0.0, CheckScope::Focused),
+        ("workspace", -1.0, CheckScope::Workspace),
+        ("excluded", -86400.0, CheckScope::Workspace),
+    ] {
+        let mut o = row(
+            id,
+            "check",
+            offset,
+            Fact::Check(CheckFact {
+                scope,
+                pr: Some("fixture/repo#1".into()),
+            }),
+        );
+        o.attribution = Some(Attribution {
+            actor: "fixture-runner".into(),
+            classifier_version: "check-scope-v1".into(),
+            offset_start: 0,
+            offset_end: 1,
+        });
+        rows.push(o);
+    }
+    let mut pr = row(
+        "merged-pr",
+        "fixture/repo#1",
+        0.0,
+        Fact::PullRequest(PrFact {
+            repo: "fixture/repo".into(),
+            open: false,
+            draft: false,
+            merged_at: Some(at(0.0)),
+            review_ready_at: None,
+            assigned_reviewers: None,
+            qualifying_reviews: None,
+            repin_only: None,
+            fix_rounds: None,
+            full_gates: Some(2),
+        }),
+    );
+    pr.attribution = Some(Attribution {
+        actor: "gate-runner".into(),
+        classifier_version: "gate-v1".into(),
+        offset_start: 0,
+        offset_end: 2,
+    });
+    rows.push(pr);
+    let b = batch(rows);
+    let r = collect_rows(&c, &b);
+    assert_eq!(
+        r.measurements["crate_revision_count"].value,
+        Some(Value::Keyed([("shared-crate".into(), 2.0)].into()))
+    );
+    assert_eq!(scalar(&r, "pins_off_main"), 1.0);
+    assert_eq!(scalar(&r, "focused_check_runs"), 1.0);
+    assert_eq!(scalar(&r, "workspace_check_runs"), 1.0);
+    assert_eq!(
+        r.measurements["gates_per_pr"].value,
+        Some(Value::Keyed([("fixture/repo#1".into(), 2.0)].into()))
+    );
+    let mut missing = b.clone();
+    missing.observations[2].attribution = None;
+    let r = collect_rows(&c, &missing);
+    assert_eq!(
+        r.measurements["focused_check_runs"].status,
+        Status::Unavailable
+    );
+    assert_eq!(r.measurements["crate_revision_count"].status, Status::Ok);
+    let empty = collect_rows(&c, &batch(Vec::new()));
+    assert_eq!(
+        empty.measurements["crate_revision_count"].value,
+        Some(Value::Keyed(BTreeMap::new()))
+    );
+    assert_eq!(scalar(&empty, "pins_off_main"), 0.0);
 }
