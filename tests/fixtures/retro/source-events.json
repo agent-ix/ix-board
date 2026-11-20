@@ -1,0 +1,286 @@
+{
+  "version": 1,
+  "source": "fixture-export",
+  "observed_at": "2027-01-15T08:00:00Z",
+  "coverage": [
+    {
+      "kind": "claims",
+      "entities": [
+        "issue-a"
+      ],
+      "from": "2027-01-14T04:13:20Z",
+      "until": "2027-01-15T08:00:00Z",
+      "complete": true,
+      "full_history": true,
+      "movement_sources": []
+    },
+    {
+      "kind": "movement",
+      "entities": [
+        "issue-a"
+      ],
+      "from": "2027-01-14T04:13:20Z",
+      "until": "2027-01-15T08:00:00Z",
+      "complete": true,
+      "full_history": false,
+      "movement_sources": [
+        "pr_head",
+        "commit",
+        "worktree"
+      ]
+    },
+    {
+      "kind": "blocked",
+      "entities": [
+        "issue-a"
+      ],
+      "from": "2027-01-14T04:13:20Z",
+      "until": "2027-01-15T08:00:00Z",
+      "complete": true,
+      "full_history": true,
+      "movement_sources": []
+    },
+    {
+      "kind": "completion",
+      "entities": [
+        "issue-a"
+      ],
+      "from": "2027-01-14T04:13:20Z",
+      "until": "2027-01-15T08:00:00Z",
+      "complete": true,
+      "full_history": true,
+      "movement_sources": []
+    },
+    {
+      "kind": "lanes",
+      "entities": [
+        "host:workspace:code"
+      ],
+      "from": "2027-01-14T04:13:20Z",
+      "until": "2027-01-15T08:00:00Z",
+      "complete": true,
+      "full_history": false,
+      "movement_sources": []
+    },
+    {
+      "kind": "pin_events",
+      "entities": [
+        "dep"
+      ],
+      "from": "2027-01-14T04:13:20Z",
+      "until": "2027-01-15T08:00:00Z",
+      "complete": true,
+      "full_history": false,
+      "movement_sources": []
+    },
+    {
+      "kind": "checks",
+      "entities": [
+        "fixture/repo"
+      ],
+      "from": "2027-01-14T04:13:20Z",
+      "until": "2027-01-15T08:00:00Z",
+      "complete": true,
+      "full_history": false,
+      "movement_sources": []
+    },
+    {
+      "kind": "gates",
+      "entities": [
+        "fixture/repo#1"
+      ],
+      "from": "2027-01-14T04:13:20Z",
+      "until": "2027-01-15T08:00:00Z",
+      "complete": true,
+      "full_history": true,
+      "movement_sources": []
+    },
+    {
+      "kind": "diffs",
+      "entities": [
+        "fixture/repo#1"
+      ],
+      "from": "2027-01-14T04:13:20Z",
+      "until": "2027-01-15T08:00:00Z",
+      "complete": true,
+      "full_history": false,
+      "movement_sources": []
+    }
+  ],
+  "events": [
+    {
+      "event_id": "claim",
+      "entity_id": "issue-a",
+      "event_at": "2027-01-15T06:00:00Z",
+      "sequence": 1,
+      "source_ref": "native-export:claim",
+      "attribution": null,
+      "record": {
+        "kind": "claim"
+      }
+    },
+    {
+      "event_id": "blocked",
+      "entity_id": "issue-a",
+      "event_at": "2027-01-15T07:00:00Z",
+      "sequence": 2,
+      "source_ref": "native-export:blocked",
+      "attribution": null,
+      "record": {
+        "kind": "blocked",
+        "blocked": true
+      }
+    },
+    {
+      "event_id": "accepted",
+      "entity_id": "issue-a",
+      "event_at": "2027-01-15T07:58:20Z",
+      "sequence": 3,
+      "source_ref": "native-export:accepted",
+      "attribution": null,
+      "record": {
+        "kind": "obligation",
+        "name": "accepted",
+        "met": true
+      }
+    },
+    {
+      "event_id": "lane",
+      "entity_id": "host:workspace:code",
+      "event_at": "2027-01-15T07:59:59Z",
+      "sequence": 4,
+      "source_ref": "native-export:lane",
+      "attribution": null,
+      "record": {
+        "kind": "lane",
+        "idle": true,
+        "ready_issue_ids": [
+          "issue-b"
+        ]
+      }
+    },
+    {
+      "event_id": "tag-1",
+      "entity_id": "dep",
+      "event_at": "2027-01-15T07:56:40Z",
+      "sequence": 5,
+      "source_ref": "native-export:tag-1",
+      "attribution": null,
+      "record": {
+        "kind": "tag",
+        "dependency": "dep"
+      }
+    },
+    {
+      "event_id": "repin-1",
+      "entity_id": "fixture/repo",
+      "event_at": "2027-01-15T07:57:30Z",
+      "sequence": 6,
+      "source_ref": "native-export:repin-1",
+      "attribution": null,
+      "record": {
+        "kind": "repin",
+        "dependency": "dep",
+        "repository": "fixture/repo"
+      }
+    },
+    {
+      "event_id": "tag-2",
+      "entity_id": "dep",
+      "event_at": "2027-01-15T07:58:20Z",
+      "sequence": 7,
+      "source_ref": "native-export:tag-2",
+      "attribution": null,
+      "record": {
+        "kind": "tag",
+        "dependency": "dep"
+      }
+    },
+    {
+      "event_id": "repin-2",
+      "entity_id": "fixture/repo",
+      "event_at": "2027-01-15T07:59:10Z",
+      "sequence": 8,
+      "source_ref": "native-export:repin-2",
+      "attribution": null,
+      "record": {
+        "kind": "repin",
+        "dependency": "dep",
+        "repository": "fixture/repo"
+      }
+    },
+    {
+      "event_id": "focused",
+      "entity_id": "fixture/repo",
+      "event_at": "2027-01-15T07:59:40Z",
+      "sequence": 9,
+      "source_ref": "native-export:focused",
+      "attribution": {
+        "actor": "fixture-source-recorder",
+        "classifier_version": "check-scope-v1",
+        "offset_start": 0,
+        "offset_end": 1
+      },
+      "record": {
+        "kind": "check",
+        "repository": "fixture/repo",
+        "pr": "fixture/repo#1",
+        "scope": "focused"
+      }
+    },
+    {
+      "event_id": "workspace",
+      "entity_id": "fixture/repo",
+      "event_at": "2027-01-15T07:59:50Z",
+      "sequence": 10,
+      "source_ref": "native-export:workspace",
+      "attribution": {
+        "actor": "fixture-source-recorder",
+        "classifier_version": "check-scope-v1",
+        "offset_start": 0,
+        "offset_end": 1
+      },
+      "record": {
+        "kind": "check",
+        "repository": "fixture/repo",
+        "pr": "fixture/repo#1",
+        "scope": "workspace"
+      }
+    },
+    {
+      "event_id": "gate",
+      "entity_id": "fixture/repo#1",
+      "event_at": "2027-01-15T07:59:50Z",
+      "sequence": 11,
+      "source_ref": "native-export:gate",
+      "attribution": {
+        "actor": "fixture-source-recorder",
+        "classifier_version": "aggregate-gate-v1",
+        "offset_start": 0,
+        "offset_end": 1
+      },
+      "record": {
+        "kind": "gate",
+        "pr": "fixture/repo#1"
+      }
+    },
+    {
+      "event_id": "diff",
+      "entity_id": "fixture/repo#1",
+      "event_at": "2027-01-15T07:59:55Z",
+      "sequence": 12,
+      "source_ref": "native-export:diff",
+      "attribution": {
+        "actor": "fixture-source-recorder",
+        "classifier_version": "cargo-revisions-v1",
+        "offset_start": 0,
+        "offset_end": 1
+      },
+      "record": {
+        "kind": "diff",
+        "pr": "fixture/repo#1",
+        "repin_only": true
+      }
+    }
+  ]
+}

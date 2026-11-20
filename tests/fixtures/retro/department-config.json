@@ -1,0 +1,81 @@
+{
+  "version": 1,
+  "policy_id": "fixture-policy",
+  "scope": {
+    "teams": [
+      {
+        "id": "QSL",
+        "label": "Fixture"
+      }
+    ],
+    "repositories": [
+      {
+        "id": "fixture/repo",
+        "label": "Repository"
+      }
+    ],
+    "lanes": [
+      {
+        "id": "host:workspace:code",
+        "label": "Code"
+      }
+    ]
+  },
+  "freshness_seconds": {
+    "linear": 60,
+    "github": 60,
+    "fixture-export": 60
+  },
+  "clock_tolerance_seconds": 2,
+  "parameters": {
+    "lane_capacity": {
+      "host:workspace:code": 2
+    },
+    "issue_lanes": {
+      "issue-a": "host:workspace:code",
+      "issue-b": "host:workspace:code"
+    },
+    "completion_obligations": [
+      "accepted"
+    ],
+    "states": [
+      "started",
+      "review"
+    ],
+    "gates": [
+      "issue-a"
+    ],
+    "stale_seconds": 3600,
+    "repin_seconds": 120,
+    "diff_classifier": "cargo-revisions-v1",
+    "review_round_limit": 1,
+    "loop_lookback_seconds": 86400,
+    "loop_repeat_count": 2,
+    "dependencies": [
+      "dep"
+    ],
+    "qualifying_review_states": [
+      "APPROVED",
+      "CHANGES_REQUESTED"
+    ],
+    "event_logs": [
+      {
+        "path": "source-events.json",
+        "source": "fixture-export",
+        "kinds": [
+          "claims",
+          "movement",
+          "blocked",
+          "completion",
+          "lanes",
+          "pin_events",
+          "checks",
+          "gates",
+          "diffs"
+        ]
+      }
+    ]
+  },
+  "policies": [],
+  "classes": []
+}

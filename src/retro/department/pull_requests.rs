@@ -238,7 +238,7 @@ fn classify_diff(
 fn strip_dependency_tables(value: &mut toml::Value) {
     for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
         if let Some(dependencies) = value.get_mut(key).and_then(toml::Value::as_table_mut) {
-            for dependency in dependencies.values_mut() {
+            for (_, dependency) in dependencies.iter_mut() {
                 if let Some(table) = dependency.as_table_mut() {
                     for field in ["rev", "branch", "tag", "version"] {
                         table.remove(field);
@@ -256,7 +256,7 @@ fn strip_manifest_revisions(value: &mut toml::Value) {
         strip_dependency_tables(workspace);
     }
     if let Some(targets) = value.get_mut("target").and_then(toml::Value::as_table_mut) {
-        for target in targets.values_mut() {
+        for (_, target) in targets.iter_mut() {
             strip_dependency_tables(target);
         }
     }
