@@ -233,11 +233,26 @@ fn attributed_messages_deduplicate_redelivery_and_unknown_semantics_do_not_becom
     assert_eq!(keyed(&metrics,"messages_per_sender",LANE),2.0);
     assert_eq!(scalar(&metrics,"correction_rate"),0.5);
     assert_eq!(metrics["correction_rate"].denominator,Some(2));
+    assert_eq!(metrics["correction_rate"].classification_coverage,Some(ClassificationCoverage {
+        classified: 2,total: 2,basis: CoverageBasis::CompletePopulation }));
     assert_eq!(scalar(&metrics,"status_only_messages"),1.0);
     rows[0].attribution = None;
     let metrics = measure(rows);
-    assert_eq!(metrics["correction_rate"].value,None);
+    assert_eq!(scalar(&metrics,"correction_rate"),0.0);
+    assert_eq!(metrics["correction_rate"].classification_coverage,Some(ClassificationCoverage {
+        classified: 1,total: 2,basis: CoverageBasis::LabeledSubset }));
     assert_eq!(keyed(&metrics,"messages_per_sender",LANE),2.0);
+}
+
+#[trace("FR-029-AC-3", "FR-029-AC-9")]
+#[test]
+fn unknown_message_population_never_claims_classification_coverage_or_rate() {
+    let mut evidence = batch(vec![row("m","m",0.0,OperationFact::Message(MessageFact {
+        message_id: "m".into(),sender: LANE.into(),correction: Some(false),status_only: Some(false) }))]);
+    evidence.complete.remove("message");
+    let metrics = collect(&config(),&[evidence]).0;
+    assert_eq!(metrics["correction_rate"].value,None);
+    assert_eq!(metrics["correction_rate"].classification_coverage,None);
 }
 
 #[trace("FR-029-AC-4", "FR-029-AC-8")]

@@ -26,6 +26,27 @@ wire! {
     }
 }
 
+wire! {
+    /// Explicit classification coverage for rates over an attributable message subset.
+    ClassificationCoverage {
+        /// Messages with a usable attributed classification.
+        classified: u64,
+        /// All distinct sends in the complete source population and window.
+        total: u64,
+        /// Whether the rate describes a labeled subset or the complete population.
+        basis: CoverageBasis
+    }
+}
+/// The population described by a classification-dependent rate.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoverageBasis {
+    /// Only the explicitly attributed classified sends are in the denominator.
+    LabeledSubset,
+    /// Every send in the complete read has a usable attributed classification.
+    CompletePopulation,
+}
+
 /// Operational facts preserve explicit source classifications and native identities.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case", deny_unknown_fields)]
@@ -280,7 +301,7 @@ impl OperationFact {
     }
     fn selected(&self, scope: &Scope, row: &Observation) -> bool {
         let host = |host: &str| scope.hosts.iter().any(|s| s.id == host);
-        let lane = |lane: &str| scope.lanes.iter().any(|s| s.id == lane);
+        let lane = |lane: &str| scope.lanes.iter().any(|s| s.id.eq_ignore_ascii_case(lane));
         match self {
             Self::Host(f) => host(&f.host), Self::Request(f) => host(&f.host),
             Self::LaneSignal(f) => lane(&f.lane), Self::Relay(f) => lane(&f.lane),
@@ -384,7 +405,7 @@ impl<'a> Calculator<'a> {
         if !found { return Err(format!("{family} source unavailable or not configured")); }
         Ok(Population { rows: rows.into_values().collect(), age })
     }
-    fn latest<'b>(&self, p: &'b Population<'a>) -> Result<Vec<(&'a Observation, &'a OperationFact)>, String> {
+    fn latest(&self, p: &Population<'a>) -> Result<Vec<(&'a Observation, &'a OperationFact)>, String> {
         let mut entities: BTreeMap<&str, (&Observation, &OperationFact)> = BTreeMap::new();
         for &(row, fact) in &p.rows {
             if event_time(row)? > self.frame.now { continue; }
@@ -508,6 +529,22 @@ impl<'a> Calculator<'a> {
             let ended = f.ended_at.as_deref().map(epoch).transpose()?;
             if started.is_some_and(|s| s < enqueued) || ended.zip(started).is_some_and(|(e,s)| e < s) {
                 return Err("inverted scheduler timestamps".into());
+            }
+            if enqueued > self.frame.now + self.config.clock_tolerance_seconds as f64
+                || started.is_some_and(|s| s > self.frame.now + self.config.clock_tolerance_seconds as f64)
+                || ended.is_some_and(|e| e > self.frame.now + self.config.clock_tolerance_seconds as f64) {
+                return Err("future scheduler request timestamp".into());
+            }
+            let valid_phase = match f.phase {
+                RequestPhase::Queued => started.is_none() && ended.is_none(),
+                RequestPhase::Running => started.is_some() && ended.is_none(),
+                RequestPhase::Cancelled => ended.is_some(),
+                RequestPhase::Succeeded | RequestPhase::Failed | RequestPhase::TimedOut =>
+                    started.is_some() && ended.is_some(),
+            };
+            if !valid_phase || !f.wait_seconds.is_finite() || f.wait_seconds < 0.0
+                || f.hold_seconds.is_some_and(|s| !s.is_finite() || s < 0.0) {
+                return Err("inconsistent scheduler phase/timing evidence".into());
             }
             let observation = epoch(row.observed_at.as_deref().ok_or("missing request observation")?)?;
             let (label, seconds) = if id == "queue_wait_minutes" {
@@ -739,6 +776,7 @@ impl<'a> Calculator<'a> {
         let mut senders: BTreeMap<String, f64> = BTreeMap::new();
         let mut total = 0_u64;
         let mut corrections = 0_u64;
+        let mut classified = 0_u64;
         let mut statuses = 0_u64;
         for &(row, fact) in &p.rows {
             let OperationFact::Message(f) = fact else { continue; };
@@ -746,16 +784,40 @@ impl<'a> Calculator<'a> {
             let sender = canonical_sender(&f.sender)?;
             total += 1;
             *senders.entry(sender).or_default() += 1.0;
-            if id != "messages_per_sender" { attributed(row)?; }
-            if id == "correction_rate" { corrections += u64::from(f.correction.ok_or("incomplete correction classification; population rate unavailable")?); }
+            if id == "correction_rate" {
+                if let Some(correction) = f.correction.filter(|_| attributed(row).is_ok()) {
+                    classified += 1;
+                    corrections += u64::from(correction);
+                }
+            }
+            if id == "status_only_messages" { attributed(row)?; }
             if id == "status_only_messages" { statuses += u64::from(f.status_only.ok_or("incomplete status-only classification")?); }
         }
         match id {
             "messages_per_sender" => self.finish(&p, Value::Keyed(senders), None),
             "status_only_messages" => self.scalar(&p, statuses as f64),
-            _ if total == 0 => Err("zero classifiable message denominator".into()),
-            _ => self.finish(&p, Value::Scalar(corrections as f64 / total as f64), Some(total)),
+            _ if classified == 0 => Err("zero attributable classified message denominator".into()),
+            _ => {
+                let mut outcome = self.finish(&p, Value::Scalar(corrections as f64 / classified as f64), Some(classified))?;
+                outcome.population = total;
+                Ok(outcome)
+            }
         }
+    }
+    fn correction_coverage(&self) -> Result<ClassificationCoverage,String> {
+        let p = self.population("message")?;
+        let mut seen = BTreeSet::new();
+        let mut total = 0_u64;
+        let mut classified = 0_u64;
+        for &(row,fact) in &p.rows {
+            let OperationFact::Message(f) = fact else { continue; };
+            if !self.contains(event_time(row)?) || !seen.insert(&f.message_id) { continue; }
+            canonical_sender(&f.sender)?;
+            total += 1;
+            if f.correction.is_some() && attributed(row).is_ok() { classified += 1; }
+        }
+        Ok(ClassificationCoverage { classified,total,
+            basis: if classified == total { CoverageBasis::CompletePopulation } else { CoverageBasis::LabeledSubset } })
     }
     fn assignments(&self, id: &str) -> Result<Outcome, String> {
         let p = self.population("assignment")?;
@@ -794,14 +856,13 @@ impl<'a> Calculator<'a> {
     }
     fn repeated_orders(&self) -> Result<Outcome, String> {
         let p = self.population("order")?;
-        let mut sends: BTreeMap<(&str,&str),u64> = BTreeMap::new();
+        let mut revisions: BTreeMap<&str,&str> = BTreeMap::new();
         let mut repeated = 0_u64;
         for (row,fact) in self.ordered_orders(&p, None)? {
             let OperationFact::Order(f) = fact else { continue; };
             let revision = f.evidence_revision.as_deref().ok_or("missing order evidence/authority revision")?;
-            let count = sends.entry((&f.order_id,revision)).or_default();
-            if *count > 0 && self.contains(event_time(row)?) { repeated += 1; }
-            *count += 1;
+            if revisions.insert(&f.order_id,revision) == Some(revision)
+                && self.contains(event_time(row)?) { repeated += 1; }
         }
         self.scalar(&p,repeated as f64)
     }
@@ -891,6 +952,7 @@ pub fn collect_operations(config: &Config, operations: &OperationalConfig, frame
             window_start: crate::drift::format_timestamp(frame.now-frame.window_secs as f64),
             window_end: crate::drift::format_timestamp(frame.now), window_seconds: frame.window_secs,
             source_age_seconds: age,population,denominator,evidence_refs: refs,
+            classification_coverage: if *id == "correction_rate" { calc.correction_coverage().ok() } else { None },
         });
     }
     let (status,reason,findings) = match calc.order_flips() {
