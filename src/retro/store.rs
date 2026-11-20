@@ -157,6 +157,16 @@ impl Store {
                     found,
                 });
             }
+            if let Some(found) = value
+                .get("department")
+                .and_then(|d| d.get("version"))
+                .and_then(serde_json::Value::as_u64)
+                && found != 1
+            {
+                return Err(line_error(format!(
+                    "unsupported department.version {found}"
+                )));
+            }
             let record: Record =
                 serde_json::from_value(value).map_err(|error| line_error(error.to_string()))?;
             validate_record(&record).map_err(line_error)?;

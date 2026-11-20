@@ -7,7 +7,7 @@ use super::{
     Observation, PinEventKind, Report, Scope, Severity, Summary, Value,
 };
 use crate::retro::{Direction, Frame, Metric, Status};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 wire! {
     /// One repeat detector finding, with stable ordered source event IDs.
@@ -393,8 +393,9 @@ impl<'a> Calculator<'a> {
                         return Err("missing dependency gate selection".into());
                     }
                     let mut max = 0;
+                    let lengths = chain_lengths(&graph)?;
                     for gate in &parameters.gates {
-                        max = max.max(depth(gate, &graph, &mut BTreeSet::new())?);
+                        max = max.max(*lengths.get(gate).ok_or("partial gate reachability")?);
                     }
                     scalar(max as f64, age, Some(issue_count(graph.len())?))
                 } else {
@@ -470,7 +471,8 @@ impl<'a> Calculator<'a> {
                     .iter()
                     .map(|s| (s.clone(), Vec::new()))
                     .collect();
-                for rows in groups.values() {
+                for rows in groups.values_mut() {
+                    rows.dedup_by(|a,b| matches!((&a.fact,&b.fact), (Fact::State(a),Fact::State(b)) if a.state == b.state));
                     for pair in rows.windows(2) {
                         if let Fact::State(state) = &pair[0].fact
                             && let Some(values) = samples.get_mut(&state.state)
@@ -693,9 +695,7 @@ impl<'a> Calculator<'a> {
             }
             graph.insert(id, blockers);
         }
-        for id in graph.keys() {
-            depth(id, &graph, &mut BTreeSet::new())?;
-        }
+        chain_lengths(&graph)?;
         Ok(graph)
     }
     fn ordered(&self, selected: &str, cutoff: Option<f64>) -> Result<Vec<&'a Observation>, String> {
@@ -709,12 +709,15 @@ impl<'a> Calculator<'a> {
             .collect::<Result<Vec<_>, String>>()?;
         rows.retain(|(at, _)| *at <= self.frame.now && cutoff.is_none_or(|c| *at > c));
         rows.sort_by(|(a, x), (b, y)| {
-            a.total_cmp(b)
+            ordering_key(x)
+                .cmp(ordering_key(y))
+                .then(a.total_cmp(b))
                 .then(x.sequence.cmp(&y.sequence))
                 .then(x.event_id.cmp(&y.event_id))
         });
         for pair in rows.windows(2) {
-            if pair[0].0 == pair[1].0
+            if ordering_key(pair[0].1) == ordering_key(pair[1].1)
+                && pair[0].0 == pair[1].0
                 && (pair[0].1.sequence.is_none()
                     || pair[1].1.sequence.is_none()
                     || pair[0].1.sequence == pair[1].1.sequence)
@@ -869,27 +872,63 @@ fn selected_issue(scope: &Scope, i: &IssueFact) -> bool {
                 .as_ref()
                 .is_some_and(|id| scope.projects.iter().any(|s| &s.id == id)))
 }
-fn depth(
-    id: &str,
+fn ordering_key(observation: &Observation) -> &str {
+    match &observation.fact {
+        Fact::PinEvent(pin) => &pin.dependency,
+        _ => &observation.entity_id,
+    }
+}
+fn chain_lengths(
     graph: &BTreeMap<String, BTreeSet<String>>,
-    visiting: &mut BTreeSet<String>,
-) -> Result<u64, String> {
-    if !visiting.insert(id.into()) {
-        return Err(format!("dependency graph cycle at {id}"));
+) -> Result<BTreeMap<String, u64>, String> {
+    let mut remaining: BTreeMap<&str, usize> = graph
+        .iter()
+        .map(|(id, edges)| (id.as_str(), edges.len()))
+        .collect();
+    let mut dependents: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (id, blockers) in graph {
+        for blocker in blockers {
+            if !graph.contains_key(blocker) {
+                return Err(format!("partial dependency graph: unresolved {blocker}"));
+            }
+            dependents.entry(blocker).or_default().push(id);
+        }
     }
-    let edges = graph
-        .get(id)
-        .ok_or_else(|| format!("partial dependency graph: unresolved {id}"))?;
-    let mut length = 0;
-    for blocker in edges {
-        length = length.max(
-            depth(blocker, graph, visiting)?
-                .checked_add(1)
-                .ok_or("dependency chain overflow")?,
-        );
+    let mut ready: VecDeque<&str> = remaining
+        .iter()
+        .filter(|(_, n)| **n == 0)
+        .map(|(id, _)| *id)
+        .collect();
+    let mut lengths: BTreeMap<String, u64> = graph.keys().map(|id| (id.clone(), 0)).collect();
+    let mut visited = 0;
+    while let Some(id) = ready.pop_front() {
+        visited += 1;
+        let next = lengths
+            .get(id)
+            .copied()
+            .ok_or("partial dependency length")?
+            .checked_add(1)
+            .ok_or("dependency chain overflow")?;
+        for dependent in dependents.get(id).into_iter().flatten() {
+            let length = lengths
+                .get_mut(*dependent)
+                .ok_or("partial dependent length")?;
+            *length = (*length).max(next);
+            let n = remaining
+                .get_mut(*dependent)
+                .ok_or("partial dependent reachability")?;
+            *n = n
+                .checked_sub(1)
+                .ok_or("inconsistent dependency edge population")?;
+            if *n == 0 {
+                ready.push_back(dependent);
+            }
+        }
     }
-    visiting.remove(id);
-    Ok(length)
+    if visited != graph.len() {
+        return Err("dependency graph cycle".into());
+    }
+    Ok(lengths)
 }
 
 /// Computes the complete catalog from admitted normalized source passes and unchanged old metrics.

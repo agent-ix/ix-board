@@ -959,3 +959,61 @@ fn revision_divergence_checks_and_gate_scope_use_native_attributed_populations()
     );
     assert_eq!(scalar(&empty, "pins_off_main"), 0.0);
 }
+
+#[trace("FR-029-AC-4", "FR-029-AC-8")]
+#[test]
+fn independent_same_time_entities_need_no_cross_entity_order_and_same_state_updates_do_not_exit() {
+    let c = config();
+    let b = batch(vec![
+        row("issue", "issue-a", 0.0, Fact::Issue(issue(true))),
+        row(
+            "entry",
+            "issue-a",
+            -25200.0,
+            Fact::State(StateFact {
+                state: "started".into(),
+            }),
+        ),
+        row(
+            "same",
+            "issue-a",
+            -20000.0,
+            Fact::State(StateFact {
+                state: "started".into(),
+            }),
+        ),
+        row(
+            "exit",
+            "issue-a",
+            0.0,
+            Fact::State(StateFact {
+                state: "review".into(),
+            }),
+        ),
+        row("other-issue", "issue-b", 0.0, Fact::Issue(issue(false))),
+        row(
+            "unrelated-state",
+            "issue-b",
+            0.0,
+            Fact::State(StateFact {
+                state: "review".into(),
+            }),
+        ),
+    ]);
+    let report = collect_rows(&c, &b);
+    assert_eq!(
+        report.measurements["state_cycle_hours"].value,
+        Some(Value::Durations(
+            [(
+                "started".into(),
+                Distribution {
+                    count: 1,
+                    median: 7.0,
+                    p90: 7.0
+                }
+            )]
+            .into()
+        ))
+    );
+    assert_eq!(report.loops["state_bounce_loop"].status, Status::Ok);
+}

@@ -160,6 +160,31 @@ impl RetroConfig {
                 });
             }
         }
+        if let Some(policies) = value
+            .get("department")
+            .and_then(|d| d.get("policies"))
+            .and_then(serde_json::Value::as_array)
+        {
+            for policy in policies {
+                for (field, variants) in [
+                    ("comparator", &["gt", "gte", "lt", "lte"][..]),
+                    ("statistic", &["value", "count", "median", "p90"][..]),
+                    (
+                        "basis",
+                        &["current", "since_previous", "since_baseline"][..],
+                    ),
+                    ("key_reduction", &["worst_severity"][..]),
+                ] {
+                    if let Some(selected) = policy.get(field).filter(|v| !v.is_null())
+                        && !selected.as_str().is_some_and(|s| variants.contains(&s))
+                    {
+                        return Err(invalid(format!(
+                            "department.policies.{field}: invalid selection {selected}"
+                        )));
+                    }
+                }
+            }
+        }
         let mut config: Self =
             serde_json::from_value(value).map_err(|error| invalid(error.to_string()))?;
         if config.team.trim().is_empty() {
