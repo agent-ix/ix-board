@@ -91,3 +91,23 @@ On the current macOS workspace, resolved executable /Users/peter/.nvm/versions/n
 
 Expected bound claims from relation regressions; actual matrix reports status=untagged, binders=[] and unbacked_claims.reason=unmarked-trace-id. Coverage reports src/linear.rs:1930, :1990 and :2057 as trace-id-outside-marker: a comment never binds; write #[trace(...)] on the test instead. Retain doc prose if useful, but add the canonical attributes to tests that actually assert these units. Existing baseline comment-only tags are affected too and are not silently counted as coverage.
 
+
+## Dispositions
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-001 | fixed | Round 1: FR-011-AC-3 now has test_function binders at src/linear.rs:1933 and :2060 through canonical trace attributes. |
+| FND-002 | fixed | Round 1: FR-011-AC-5 now has test_function binders at src/linear.rs:1933, :1993 and :2060 through canonical trace attributes. |
+| FND-003 | fixed | Round 1: FR-011-AC-6 now has test_function binders at src/linear.rs:1933 and :2060 through canonical trace attributes. |
+| FND-004 | fixed | Round 1: FR-004-AC-8 now has a test_function binder at src/linear.rs:1933 through the canonical trace attribute. |
+
+## Disposition round 1 evidence
+
+Fix head ce2bee607a957dab38ca0305fd8b56e925cd0927 was independently inspected against original frozen head 2e3d4f9e6fcb8b75a3001bcd412f7d1a8c62e030. Production code and assertions are unchanged. The source diff imports existing ix_trace_rs::trace and converts exactly the three newly added comment-only trace claims to attributes; no dependency, pin, version or schema changes were made. SR-6046 and original SR-6047 were copied into reviews/ without changing their findings.
+
+Independent quire matrix and coverage commands at the fix head both exited 0. All four examined rows now have status=tagged and nonempty test_function binders. The new relation tests have zero coverage diagnostics. Other existing comment-only trace claims still appear as unbacked_claims on these rows; they do not erase the new valid binders and are unchanged baseline context. No fallback, whole-repository PASS, execution-evidence coverage claim or optional semantic audit was used.
+
+The cached Linear test binary ran independently: 22 tests passed, exit 0. No compilation was run. Author format/lint/client-test logs were read as supplied evidence; the lead retains final aggregate gate ownership. No credential-backed CLI reads, retries or key injection occurred.
+
+Current bounded verdict: PASS; all four original findings are fixed, no new findings. Original Summary, Verdict and Findings above remain historical and unedited; these latest dispositions determine current status. SR-6046 remains clean and requires no duplicate disposition comment. GitHub reported the fix head MERGEABLE. Source remained frozen and the worktree clean.
+
