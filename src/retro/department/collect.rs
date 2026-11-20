@@ -137,7 +137,7 @@ impl<'a> Calculator<'a> {
             age = age.max(source_age.max(0.0));
         }
         for row in self.rows.iter().filter(|o| family == self::family(&o.fact)) {
-            if !row.complete {
+            if !row.complete && family != "lifecycle" {
                 return Err(format!("{family} partial source row {}", row.event_id));
             }
             let observed = epoch(
@@ -183,6 +183,44 @@ impl<'a> Calculator<'a> {
         let scalar = |v, age, n| Ok((Value::Scalar(v), age, n));
         let parameters = &self.config.parameters;
         match id {
+            "lane_execution_state" => {
+                let age = self.capability("lifecycle")?;
+                let mut values = BTreeMap::new();
+                for observation in &self.rows {
+                    if let Fact::Lifecycle(lifecycle) = &observation.fact {
+                        let category =
+                            serde_json::to_value(lifecycle.verdict).map_err(|e| e.to_string())?;
+                        let category = category
+                            .as_str()
+                            .ok_or("lifecycle verdict is not categorical")?;
+                        if lifecycle.verdict == crate::agents::Verdict::Unknown {
+                            return Err(format!(
+                                "unavailable lifecycle category {}: {:?}",
+                                observation.entity_id, lifecycle.notes
+                            ));
+                        }
+                        values.insert(
+                            observation.entity_id.clone(),
+                            super::SourceObservation {
+                                category: category.into(),
+                                source_schema_version: lifecycle.source_schema_version.clone(),
+                                observation_ref: observation.event_id.clone(),
+                            },
+                        );
+                    }
+                }
+                if self.config.scope.lanes.is_empty()
+                    || self
+                        .config
+                        .scope
+                        .lanes
+                        .iter()
+                        .any(|s| !values.contains_key(&s.id))
+                {
+                    return Err("missing configured lane lifecycle source row".into());
+                }
+                Ok((Value::SourceObservation(values), age, None))
+            }
             "wip_active"
             | "wip_capacity_ratio"
             | "claims_without_movement"
@@ -270,12 +308,14 @@ impl<'a> Calculator<'a> {
                         scalar(n, age, Some(count))
                     }
                     "oldest_gated_hours" => {
-                        self.graph()?;
+                        let graph = self.graph()?;
                         let mut max: Option<f64> = None;
-                        for (_, i) in issues
-                            .iter()
-                            .filter(|(_, i)| !i.terminal && !i.blockers.is_empty())
-                        {
+                        for (_, i) in issues.iter().filter(|(o, i)| {
+                            !i.terminal
+                                && graph
+                                    .get(&o.entity_id)
+                                    .is_some_and(|edges| !edges.is_empty())
+                        }) {
                             let at = epoch(
                                 i.blocked_at
                                     .as_deref()
@@ -503,25 +543,14 @@ impl<'a> Calculator<'a> {
                 let age = self.capability("pin")?;
                 let mut crates: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
                 let mut n = 0.0;
-                let mut repos = BTreeSet::new();
                 for o in &self.rows {
                     if let Fact::Pin(pin) = &o.fact {
-                        repos.insert(pin.repo.as_str());
                         crates
                             .entry(pin.dependency.clone())
                             .or_default()
                             .insert(pin.revision.clone());
                         if id == "pins_off_main" && !pin.on_main.ok_or("missing dependency/default-head reachability or force-pushed-away revision")? { n += 1.0; }
                     }
-                }
-                if self
-                    .config
-                    .scope
-                    .repositories
-                    .iter()
-                    .any(|r| !repos.contains(r.id.as_str()))
-                {
-                    return Err("missing configured repository dependency resolution".into());
                 }
                 if id == "pins_off_main" {
                     scalar(n, age, None)

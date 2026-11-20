@@ -370,11 +370,19 @@ pub fn compare(current: &Measurement, reference: Option<&Measurement>) -> Compar
         return result;
     }
     if let (Value::SourceObservation(a), Value::SourceObservation(b)) = (a, b) {
-        if a.source_schema_version != b.source_schema_version {
+        if a.keys().ne(b.keys()) {
+            result.reason = Some("missing categorical native key".into());
+        } else if a.iter().any(|(key, row)| {
+            b.get(key)
+                .is_some_and(|old| old.source_schema_version != row.source_schema_version)
+        }) {
             result.state = ComparisonState::QueryChanged;
             result.reason = Some("source schema changed".into());
         } else {
-            result.state = if a.category == b.category {
+            result.state = if a
+                .iter()
+                .all(|(key, row)| b.get(key).is_some_and(|old| old.category == row.category))
+            {
                 ComparisonState::Same
             } else {
                 ComparisonState::Changed

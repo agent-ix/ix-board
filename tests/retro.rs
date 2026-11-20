@@ -2997,3 +2997,79 @@ fn department_backfill_keeps_current_gauges_unavailable_without_invented_history
     );
     assert!(department.observations.is_empty());
 }
+
+#[trace("FR-029-AC-12")]
+#[test]
+fn categorical_lifecycle_keeps_partial_source_counts_and_provenance_without_transcript_text() {
+    use ix_board::retro::department::{
+        Evidence, Fact, LifecycleFact, Observation, Selector, Value,
+    };
+    let mut c = department_config().department.unwrap();
+    c.scope.lanes = vec![Selector {
+        id: "remote:team:code".into(),
+        label: "Code".into(),
+    }];
+    c.freshness_seconds.insert("lifecycle".into(), 60);
+    let mut source = agent_row(Verdict::Waiting, Some(7));
+    source.partial = true;
+    source.active_direct_workers = None;
+    source.excerpt = Some("private transcript body".into());
+    source.pane_tail = Some("private pane body".into());
+    source.processes = vec!["secret command line".into()];
+    let lifecycle = LifecycleFact::from_agent_row("agents-1", &source);
+    let row = Observation {
+        event_id: "native-lifecycle-row".into(),
+        entity_id: "remote:team:code".into(),
+        event_at: Some(iso(NOW)),
+        observed_at: Some(iso(NOW)),
+        sequence: None,
+        scope: c.scope.clone(),
+        complete: false,
+        source_ref: "herdr:remote:pane-id".into(),
+        attribution: None,
+        fact: Fact::Lifecycle(lifecycle.clone()),
+    };
+    let evidence = Evidence {
+        source: "lifecycle".into(),
+        observed_at: Some(iso(NOW)),
+        complete: ["lifecycle".into()].into(),
+        reasons: BTreeMap::new(),
+        observations: vec![row],
+    };
+    let report = ix_board::retro::department::collect(
+        &c,
+        ix_board::retro::Frame {
+            now: NOW,
+            window_secs: DAY,
+            end_exclusive: false,
+        },
+        &[evidence],
+        &BTreeMap::new(),
+    );
+    let Value::SourceObservation(values) = report.measurements["lane_execution_state"]
+        .value
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected categorical evidence")
+    };
+    assert_eq!(values["remote:team:code"].category, "WAITING");
+    assert_eq!(
+        values["remote:team:code"].observation_ref,
+        "native-lifecycle-row"
+    );
+    let Fact::Lifecycle(persisted) = &report.observations[0].fact else {
+        panic!("expected preserved lifecycle source")
+    };
+    assert_eq!(persisted, &lifecycle);
+    assert!(persisted.partial);
+    assert_eq!(persisted.active_direct_workers, None);
+    let json = serde_json::to_string(&report).unwrap();
+    assert!(!json.contains("private transcript body"));
+    assert!(!json.contains("private pane body"));
+    assert!(!json.contains("secret command line"));
+    assert_eq!(
+        serde_json::from_str::<ix_board::retro::department::Report>(&json).unwrap(),
+        report
+    );
+}

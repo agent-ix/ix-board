@@ -149,7 +149,7 @@ impl Store {
             if let Some(found) = value
                 .get("schema_version")
                 .and_then(serde_json::Value::as_u64)
-                && !(1..=u64::from(MAX_SCHEMA_VERSION)).contains(&found)
+                && found > u64::from(MAX_SCHEMA_VERSION)
             {
                 return Err(StoreError::NewerSchema {
                     path: self.path.clone(),
@@ -227,7 +227,7 @@ impl Store {
 }
 
 fn validate_record(record: &Record) -> Result<(), String> {
-    if !(1..=MAX_SCHEMA_VERSION).contains(&record.schema_version) {
+    if record.schema_version > MAX_SCHEMA_VERSION {
         return Err(format!(
             "unsupported schema_version {}",
             record.schema_version
@@ -238,7 +238,7 @@ fn validate_record(record: &Record) -> Result<(), String> {
         (Some(report), _) if report.version != 1 => {
             Err(format!("unsupported department.version {}", report.version))
         }
-        (None, 1) => Ok(()),
+        (None, 0 | 1) => Ok(()),
         _ => Err(
             "schema_version 2 requires department version 1; schema_version 1 must omit department"
                 .into(),

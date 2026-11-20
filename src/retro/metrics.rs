@@ -867,7 +867,7 @@ fn fix_rounds(out: &mut Out<'_>, sources: &Sources<'_>, prs: &Result<Vec<PullReq
 
 /// Reads the `reviewer` markers of the allowed pull requests, then the dispositions of the
 /// review ids those markers carry; nothing else is read.
-fn marker_lines_for(
+pub(crate) fn marker_lines_for(
     sources: &Sources<'_>,
     allowed: &BTreeSet<String>,
 ) -> Result<Vec<String>, String> {

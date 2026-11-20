@@ -441,7 +441,7 @@ impl GithubSource for LiveGithub {
     fn department_evidence(
         &self,
         scope: &super::department::Scope,
-        _since: f64,
+        since: f64,
     ) -> super::department::Evidence {
         let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
             Ok(now) => crate::drift::format_timestamp(now.as_secs_f64()),
@@ -453,13 +453,60 @@ impl GithubSource for LiveGithub {
                 };
             }
         };
-        super::department::collect_pins(scope, &now, |endpoint, raw| {
+        let mut evidence = super::department::collect_pins(scope, &now, |endpoint, raw| {
             let mut args = strings(&["api", "--method", "GET", endpoint]);
             if raw {
                 args.extend(strings(&["-H", "Accept: application/vnd.github.raw+json"]));
             }
             run("gh", &args)
-        })
+        });
+        let mut complete = !scope.repositories.is_empty();
+        for repo in &scope.repositories {
+            match self.pull_requests(&repo.id, since) {
+                Ok(prs) => {
+                    for pr in prs {
+                        let entity_id = format!("{}#{}", pr.repo, pr.number);
+                        evidence.observations.push(super::department::Observation {
+                            event_id: format!(
+                                "github:pull:{entity_id}:{}",
+                                crate::drift::format_timestamp(pr.updated_at)
+                            ),
+                            entity_id,
+                            event_at: Some(crate::drift::format_timestamp(pr.updated_at)),
+                            observed_at: Some(now.clone()),
+                            sequence: None,
+                            scope: scope.clone(),
+                            complete: true,
+                            source_ref: format!(
+                                "https://github.com/{}/pull/{}",
+                                pr.repo, pr.number
+                            ),
+                            attribution: None,
+                            fact: super::department::Fact::PullRequest(super::department::PrFact {
+                                repo: pr.repo,
+                                open: pr.open,
+                                draft: pr.draft,
+                                merged_at: pr.merged_at.map(crate::drift::format_timestamp),
+                                review_ready_at: None,
+                                assigned_reviewers: None,
+                                qualifying_reviews: None,
+                                repin_only: None,
+                                fix_rounds: None,
+                                full_gates: None,
+                            }),
+                        });
+                    }
+                }
+                Err(reason) => {
+                    complete = false;
+                    evidence.reasons.insert("pull_request".into(), reason);
+                }
+            }
+        }
+        if complete {
+            evidence.complete.insert("pull_request".into());
+        }
+        evidence
     }
     fn pull_requests(&self, repo: &str, since: f64) -> Result<Vec<PullRequest>, String> {
         let mut all = self.list(repo, "[OPEN]", None)?;

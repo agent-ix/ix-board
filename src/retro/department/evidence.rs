@@ -68,7 +68,64 @@ pub enum Fact {
     /// Attributed invocation with explicit scope.
     Check(CheckFact),
     /// Original lifecycle report, preserved without reclassification.
-    Lifecycle(crate::agents::AgentsReport),
+    Lifecycle(LifecycleFact),
+}
+wire! {
+    /// Lifecycle evidence preserving FR-018 uncertainty without private pane/transcript text.
+    LifecycleFact {
+        /// Original lifecycle schema version.
+        source_schema_version: String,
+        /// Original source verdict; never reclassified by department metrics.
+        verdict: crate::agents::Verdict,
+        /// Original partial evidence flag.
+        partial: bool,
+        /// Native worker lifecycle observations and provenance.
+        workers: Vec<crate::agents::WorkerObservation>,
+        /// Per-source availability and reasons.
+        availability: crate::agents::AgentAvailability,
+        /// Unfinished direct assignments, or unknown.
+        active_direct_workers: Option<usize>,
+        /// Unfinished descendants, or unknown.
+        active_nested_workers: Option<usize>,
+        /// Legacy nullable source alias, without deriving a count.
+        live_subagents: Option<usize>,
+        /// Source-provided latest lead write age.
+        last_turn_age_secs: Option<u64>,
+        /// Source-provided latest worker write age.
+        subagent_age_secs: Option<u64>,
+        /// Source-provided structured activity time.
+        recent_activity_at: Option<u64>,
+        /// Owning host source clock.
+        host_now: u64,
+        /// Collection interval beginning.
+        collection_started_at: u64,
+        /// Collection interval end.
+        collection_finished_at: u64,
+        /// Source reasons explaining nullable evidence and uncertainty.
+        notes: Vec<String>
+    }
+}
+impl LifecycleFact {
+    /// Copies lifecycle evidence only; private transcripts, pane text and command lines stay out.
+    pub fn from_agent_row(source_schema_version: &str, row: &crate::agents::AgentRow) -> Self {
+        Self {
+            source_schema_version: source_schema_version.into(),
+            verdict: row.verdict,
+            partial: row.partial,
+            workers: row.workers.clone(),
+            availability: row.availability.clone(),
+            active_direct_workers: row.active_direct_workers,
+            active_nested_workers: row.active_nested_workers,
+            live_subagents: row.live_subagents,
+            last_turn_age_secs: row.last_turn_age_secs,
+            subagent_age_secs: row.subagent_age_secs,
+            recent_activity_at: row.recent_activity_at,
+            host_now: row.host_now,
+            collection_started_at: row.collection_started_at,
+            collection_finished_at: row.collection_finished_at,
+            notes: row.notes.clone(),
+        }
+    }
 }
 wire! {
     /// Current issue with capability-specific absence explicit.

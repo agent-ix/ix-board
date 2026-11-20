@@ -760,11 +760,17 @@ fn categorical_roundtrip_is_unassessed_and_compares_equality_without_numeric_tre
     let mut m = r.measurements["lane_execution_state"].clone();
     m.status = Status::Ok;
     m.reason = None;
-    m.value = Some(Value::SourceObservation(SourceObservation {
-        category: "WORKING".into(),
-        source_schema_version: "agents-1".into(),
-        observation_ref: "lifecycle-row".into(),
-    }));
+    m.value = Some(Value::SourceObservation(
+        [(
+            "lane".into(),
+            SourceObservation {
+                category: "WORKING".into(),
+                source_schema_version: "agents-1".into(),
+                observation_ref: "lifecycle-row".into(),
+            },
+        )]
+        .into(),
+    ));
     let encoded = serde_json::to_string(&m).unwrap();
     let decoded: Measurement = serde_json::from_str(&encoded).unwrap();
     assert_eq!(m, decoded);
@@ -774,13 +780,13 @@ fn categorical_roundtrip_is_unassessed_and_compares_equality_without_numeric_tre
     assert_eq!(compare(&m, Some(&decoded)).state, ComparisonState::Same);
     let mut changed = decoded.clone();
     if let Some(Value::SourceObservation(s)) = &mut changed.value {
-        s.category = "IDLE".into();
+        s.get_mut("lane").unwrap().category = "IDLE".into();
     }
     let comparison = compare(&changed, Some(&decoded));
     assert_eq!(comparison.state, ComparisonState::Changed);
     assert!(comparison.changes.is_empty());
     if let Some(Value::SourceObservation(s)) = &mut changed.value {
-        s.source_schema_version = "agents-2".into();
+        s.get_mut("lane").unwrap().source_schema_version = "agents-2".into();
     }
     assert_eq!(
         compare(&changed, Some(&decoded)).state,

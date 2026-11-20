@@ -76,7 +76,7 @@ pub fn run_snapshot(
     };
     let metrics = metrics::collect(config, frame, sources);
     let department = config.department.as_ref().map(|department| {
-        let batches = [
+        let mut batches = [
             sources
                 .linear
                 .department_evidence(&department.scope, frame.now - window_secs as f64),
@@ -84,6 +84,36 @@ pub fn run_snapshot(
                 .github
                 .department_evidence(&department.scope, frame.now - window_secs as f64),
         ];
+        let repositories: Vec<_> = department
+            .scope
+            .repositories
+            .iter()
+            .map(|s| s.id.clone())
+            .collect();
+        let allowed = batches
+            .iter()
+            .flat_map(|b| &b.observations)
+            .filter_map(|o| match &o.fact {
+                department::Fact::PullRequest(_) => {
+                    o.entity_id.rsplit_once('/').map(|(_, key)| key.to_owned())
+                }
+                _ => None,
+            })
+            .collect();
+        if let Ok(lines) = metrics::marker_lines_for(sources, &allowed) {
+            let rounds = metrics::fix_rounds_by_pr(&lines, &allowed, &repositories);
+            for batch in &mut batches {
+                for observation in &mut batch.observations {
+                    if let department::Fact::PullRequest(pr) = &mut observation.fact {
+                        pr.fix_rounds = observation
+                            .entity_id
+                            .rsplit_once('/')
+                            .and_then(|(_, key)| rounds.get(key))
+                            .copied();
+                    }
+                }
+            }
+        }
         let mut report = department::collect(department, frame, &batches, &metrics);
         let previous = stored
             .iter()

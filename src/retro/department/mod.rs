@@ -225,7 +225,7 @@ pub enum Value {
     /// Duration rows by native key.
     Durations(BTreeMap<String, Distribution>),
     /// Original categorical source observation.
-    SourceObservation(SourceObservation),
+    SourceObservation(BTreeMap<String, SourceObservation>),
 }
 wire! {
     /// A duration population; empty populations never construct this value.
@@ -501,6 +501,9 @@ impl Config {
             &mut normalized.scope.hosts,
         ] {
             selectors.sort_by(|a, b| a.id.cmp(&b.id));
+            for selector in selectors {
+                selector.label.clear();
+            }
         }
         normalized
             .policies
