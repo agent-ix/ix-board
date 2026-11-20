@@ -3073,3 +3073,143 @@ fn categorical_lifecycle_keeps_partial_source_counts_and_provenance_without_tran
         report
     );
 }
+
+struct DepartmentFixtureGithub;
+impl DepartmentFixtureGithub {
+    fn pr(&self) -> PullRequest {
+        PullRequest {
+            repo: "fixture/repo".into(),
+            number: 1,
+            open: false,
+            draft: false,
+            created_at: 1_800_000_000.0 - 100000.0,
+            merged_at: Some(1_800_000_000.0),
+            updated_at: 1_800_000_000.0,
+            additions: 1,
+            deletions: 1,
+            review_decision: None,
+            force_pushes: Some(0),
+        }
+    }
+}
+impl GithubSource for DepartmentFixtureGithub {
+    fn department_evidence(
+        &self,
+        c: &ix_board::retro::department::Config,
+        _: f64,
+    ) -> ix_board::retro::department::Evidence {
+        use ix_board::retro::department::{
+            Evidence, PR_DETAILS, PR_FILES, PR_REVIEWS, PR_TIMELINE, RAW_CONTENT,
+            collect_pull_request,
+        };
+        let at = iso(1_800_000_000.0);
+        let observation = collect_pull_request(c, &self.pr(), &at, |endpoint, projection| {
+            match projection {
+            PR_DETAILS=>Ok(serde_json::json!({"base_sha":"a".repeat(40),"head_sha":"b".repeat(40),"requested_reviewers":0,"requested_teams":0}).to_string()),
+            PR_REVIEWS=>Ok("[]".into()),PR_TIMELINE=>Ok(serde_json::json!([{"id":1,"event":"ready_for_review","created_at":iso(1_800_000_000.0-25200.0)}]).to_string()),
+            PR_FILES=>Ok("[{\"filename\":\"Cargo.toml\",\"status\":\"modified\"}]".into()),
+            RAW_CONTENT=>Ok(format!("[dependencies]\ndep={{git='https://github.com/fixture/dependency',rev='{}'}}\n",if endpoint.contains(&"a".repeat(40)){"a".repeat(40)}else{"b".repeat(40)})),
+            _=>Err("unexpected source projection".into()),
+        }
+        });
+        Evidence {
+            source: "github".into(),
+            observed_at: Some(at),
+            complete: ["pull_request".into()].into(),
+            observations: vec![observation],
+            ..Default::default()
+        }
+    }
+    fn pull_requests(&self, _: &str, _: f64) -> Result<Vec<PullRequest>, String> {
+        Ok(vec![self.pr()])
+    }
+    fn pull_request(&self, repo: &str, number: u64) -> Result<PullRequestInfo, String> {
+        assert_eq!((repo, number), ("fixture/repo", 1));
+        Ok(PullRequestInfo {
+            merged: true,
+            updated_at: 1_800_000_000.0,
+        })
+    }
+    fn main_commits(&self, _: &str, _: &str, _: f64) -> Result<Vec<MainCommit>, String> {
+        Err("fixture has no main-check source".into())
+    }
+}
+
+#[trace("FR-029-AC-1", "FR-029-AC-3", "FR-029-AC-4", "FR-029-AC-8")]
+#[test]
+fn configured_native_http_and_export_file_flow_through_snapshot_store_and_missing_file_is_isolated()
+{
+    use ix_board::retro::department::{Config, Value};
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("source-events.json");
+    std::fs::write(&path, include_str!("fixtures/retro/source-events.json")).unwrap();
+    let mut department: Config =
+        serde_json::from_str(include_str!("fixtures/retro/department-config.json")).unwrap();
+    department.parameters.event_logs[0].path = path.clone();
+    let config_path = root.path().join("retro.json");
+    std::fs::write(&config_path,serde_json::json!({"team":"QSL","projects":[],"gate_tickets":[],"repos":["fixture/repo"],"department":department}).to_string()).unwrap();
+    let c = RetroConfig::load(&config_path).unwrap();
+    let mut rig = Rig {
+        workspace: Some(Ok(serde_json::from_str(include_str!(
+            "fixtures/retro/native-workspace.json"
+        ))
+        .unwrap())),
+        markers: Some(Ok(Vec::new())),
+        ..Default::default()
+    };
+    rig.histories.insert(
+        "issue-a".into(),
+        Ok(vec![StateChange {
+            at: 1_800_000_000.0 - 7200.0,
+            from: Some(S::Unstarted),
+            to: Some(S::Started),
+        }]),
+    );
+    rig.histories.insert("issue-b".into(), Ok(Vec::new()));
+    let github = DepartmentFixtureGithub;
+    let sources = Sources {
+        github: &github,
+        ..rig.sources()
+    };
+    let store = Store::resolve("QSL", Some(root.path().join("store").into()), None).unwrap();
+    let record = run_snapshot(&c, DAY, 1_800_000_000.0, &sources, &store).unwrap();
+    assert_eq!(record.schema_version, 2);
+    let report = record.department.as_ref().unwrap();
+    for (id, n) in [
+        ("claims_without_movement", 1.0),
+        ("merged_open", 1.0),
+        ("oldest_gated_hours", 1.0),
+        ("idle_with_ready", 1.0),
+        ("repin_only_prs", 1.0),
+        ("tag_repin_events", 2.0),
+        ("focused_check_runs", 1.0),
+        ("workspace_check_runs", 1.0),
+        ("review_round_policy_excess", 0.0),
+    ] {
+        assert_eq!(
+            report.measurements[id].value,
+            Some(Value::Scalar(n)),
+            "{id}: {:?}",
+            report.measurements[id]
+        );
+    }
+    assert_eq!(
+        report.measurements["gates_per_pr"].value,
+        Some(Value::Keyed([("fixture/repo#1".into(), 1.0)].into()))
+    );
+    assert_eq!(report.loops["tag_repin_loop"].findings.len(), 1);
+    assert_eq!(store.read_all().unwrap(), vec![record.clone()]);
+    std::fs::remove_file(path).unwrap();
+    let unavailable = run_snapshot(&c, DAY, 1_800_000_000.0, &sources, &store)
+        .unwrap()
+        .department
+        .unwrap();
+    assert_eq!(
+        unavailable.measurements["claims_without_movement"].status,
+        Status::Unavailable
+    );
+    assert_eq!(
+        unavailable.measurements["wip_active"].value,
+        Some(Value::Scalar(1.0))
+    );
+}

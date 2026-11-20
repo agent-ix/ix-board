@@ -123,18 +123,18 @@ pub fn enrich_reviewer_rounds(batches: &mut [Evidence], lines: &[String], reposi
             if fields.get("repo").is_some_and(|repo| *repo != repository) {
                 continue;
             }
-            if kind == "reviewer" {
-                if let Some(pr) = fields.get("pr").filter(|pr| allowed.contains(**pr)) {
-                    match (fields.get("repo"), fields.get("id")) {
-                        (Some(_), Some(id)) => {
-                            reviews
-                                .entry((*id).into())
-                                .or_default()
-                                .insert((*pr).into());
-                        }
-                        _ => {
-                            missing.insert((*pr).into());
-                        }
+            if kind == "reviewer"
+                && let Some(pr) = fields.get("pr").filter(|pr| allowed.contains(**pr))
+            {
+                match (fields.get("repo"), fields.get("id")) {
+                    (Some(_), Some(id)) => {
+                        reviews
+                            .entry((*id).into())
+                            .or_default()
+                            .insert((*pr).into());
+                    }
+                    _ => {
+                        missing.insert((*pr).into());
                     }
                 }
             }
@@ -150,7 +150,7 @@ pub fn enrich_reviewer_rounds(batches: &mut [Evidence], lines: &[String], reposi
             }
             if let Some(id) = fields.get("id")
                 && let Some(prs) = reviews.get(*id)
-                && (fields.get("repo").is_none()
+                && (!fields.contains_key("repo")
                     || fields
                         .get("round")
                         .and_then(|r| r.parse::<u64>().ok())
