@@ -372,3 +372,34 @@ Each excerpt is a verbatim prefix up to 600 characters of its named unit. All li
   ]
 }
 ```
+
+
+## Dispositions
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-001 | fixed | Round 1: A real normalized export now exercises DecisionFact and asserts both distinct nonzero waiter counts equal 3. Fixture branches cover duplicate native IDs, closed and out-of-scope owners, non-ruling spec owner, partial coverage, missing semantic evidence and preservation of legacy decisions_open/decision_oldest_hours. The author's recorded zero-waiter mutation failed 0 versus 3; reviewer independently inspected the oracle and ran the full retro suites. |
+
+## Disposition pass 1 verification and current verdict
+
+Frozen disposition head: 56312d49a35302635443d3fcd7b38fb6300d6bd8; fixes 4630029, 4692952, 56312d4. Every original finding in this artifact had no prior outcome and was checked in round 1. Original finding rows, scope and historical verdict are preserved byte-for-byte above; this appended section records the current outcome. No new findings. Exact reviewer model ID unavailable; run E4493D4F-DAA3-4B22-9E54-D57BACEDE46A.
+
+Reviewer-run checks: make fmt-check exit 0; make lint exit 0 (all targets, -D warnings); cargo test --lib retro:: exit 0 (59 passed); cargo test --test retro exit 0 (77 passed, 0 filtered). Original five independent Rust probes recompiled against the frozen shared library, compile exit 0 and execution exit 0: redelivery leaves the finding intact, preceding context yields the expected loop, classification merges to rate 1/coverage 1 of 1, fresh gauge succeeds, malformed instruction preserves host occupancy. Logs: code-disposition1/{fmt.log,lint.log,retro-lib.log,retro-integration.log,probes-compile.log,probes.log}. No aggregate gate repeated; root owns final make ci. Shared saved-reader/collect_snapshot source APIs and version rules are unchanged; their integration tests passed again. No spec/plan changes or additional review method applies. Prior computed matrix limitations remain unchanged: 180 legacy untagged criteria, no bound run evidence, full legacy reverse audit INCOMPLETE; no redundant matrix scan or whole-repository PASS claim. Plan completion: not assessed.
+
+All six original findings across SR-6058/SR-6059 are fixed; this scoped review is clear for the lead's final exact-head gate and merge. Overall repository assurance remains INCOMPLETE for the recorded legacy baseline. No source changes, push, new worktree, credentials/live collection, host/scheduler calls or cache deletion. All own compiler/test processes completed: QUIESCENT; sole target retained.
+
+```json
+{
+  "dispositions": [
+    {
+      "after_excerpt": "    assert_eq!(scalar(&report.measurements, \"ruling_waiting_issues\"), 3.0);\n    assert_eq!(\n        scalar(&report.measurements, \"spec_merge_waiting_issues\"),\n        3.0\n    );",
+      "artifact_id": "FR-002-AC-1",
+      "fnd": "FND-001",
+      "original_finding": "The new ruling_waiting_issues and spec_merge_waiting_issues calculators have no nonzero exact fixture oracle. No test constructs DecisionFact anywhere in src/tests, so deleting both waiter extensions or returning zero for both metrics leaves the submitted suite green. Add production-path fixtures for native waiter deduplication, open/closed decision and spec owners, decision attribution/unknowns, and scoped/partial dependency evidence, while preserving the existing decisions_open/decision_oldest_hours formulas.",
+      "outcome": "fixed",
+      "path": "src/retro/department/operations.rs",
+      "verification": "A real normalized export now exercises DecisionFact and asserts both distinct nonzero waiter counts equal 3. Fixture branches cover duplicate native IDs, closed and out-of-scope owners, non-ruling spec owner, partial coverage, missing semantic evidence and preservation of legacy decisions_open/decision_oldest_hours. The author's recorded zero-waiter mutation failed 0 versus 3; reviewer independently inspected the oracle and ran the full retro suites."
+    }
+  ]
+}
+```

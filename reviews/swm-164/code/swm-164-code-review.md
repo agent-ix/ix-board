@@ -426,3 +426,74 @@ Each excerpt is a verbatim prefix up to 600 characters of its named unit. All li
   ]
 }
 ```
+
+
+## Dispositions
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-001 | fixed | Round 1: Chronological ordering now precedes send deduplication, preserving the earliest original event and refusing conflicting fact/entity/classifier provenance. Original independent probe remains one finding with redelivery; the new fixture also checks reversed input order and conflicting actor refusal. |
+| FND-002 | fixed | Round 1: All prior orders remain context; only reversal endpoints after the open lookback boundary increment the count. The original two in-window reversals now yield one finding, and the boundary fixture excludes a reversal exactly at the start. |
+| FND-003 | fixed | Round 1: Native message identity now merges attributable correction/status labels while original canonical sender and sent_at remain immutable. The original raw-then-classified probe returns correction_rate=1, classified=1/total=1; the new fixture checks order independence, label conflict and send-time conflict. |
+| FND-004 | fixed | Round 1: Gauge coverage is evaluated at source observation while configured batch/row freshness remains enforced. The original 10-second snapshot is now available under its 60-second limit; the new fixture still refuses a 61-second stale snapshot and short event-window coverage. |
+| FND-005 | fixed | Round 1: Malformed rows and coverage intervals are recorded against their known family and independently valid observations are retained. Original malformed-instruction probe now preserves host_slots_used; the fixture also covers malformed instruction coverage without losing valid host data. |
+
+## Disposition pass 1 verification and current verdict
+
+Frozen disposition head: 56312d49a35302635443d3fcd7b38fb6300d6bd8; fixes 4630029, 4692952, 56312d4. Every original finding in this artifact had no prior outcome and was checked in round 1. Original finding rows, scope and historical verdict are preserved byte-for-byte above; this appended section records the current outcome. No new findings. Exact reviewer model ID unavailable; run E4493D4F-DAA3-4B22-9E54-D57BACEDE46A.
+
+Reviewer-run checks: make fmt-check exit 0; make lint exit 0 (all targets, -D warnings); cargo test --lib retro:: exit 0 (59 passed); cargo test --test retro exit 0 (77 passed, 0 filtered). Original five independent Rust probes recompiled against the frozen shared library, compile exit 0 and execution exit 0: redelivery leaves the finding intact, preceding context yields the expected loop, classification merges to rate 1/coverage 1 of 1, fresh gauge succeeds, malformed instruction preserves host occupancy. Logs: code-disposition1/{fmt.log,lint.log,retro-lib.log,retro-integration.log,probes-compile.log,probes.log}. No aggregate gate repeated; root owns final make ci. Shared saved-reader/collect_snapshot source APIs and version rules are unchanged; their integration tests passed again. No spec/plan changes or additional review method applies. Prior computed matrix limitations remain unchanged: 180 legacy untagged criteria, no bound run evidence, full legacy reverse audit INCOMPLETE; no redundant matrix scan or whole-repository PASS claim. Plan completion: not assessed.
+
+All six original findings across SR-6058/SR-6059 are fixed; this scoped review is clear for the lead's final exact-head gate and merge. Overall repository assurance remains INCOMPLETE for the recorded legacy baseline. No source changes, push, new worktree, credentials/live collection, host/scheduler calls or cache deletion. All own compiler/test processes completed: QUIESCENT; sole target retained.
+
+```json
+{
+  "dispositions": [
+    {
+      "after_excerpt": "        candidates.sort_by(|a, b| {\n            event_time(a.0)\n                .unwrap_or(0.0)\n                .total_cmp(&event_time(b.0).unwrap_or(0.0))\n                .then(a.0.sequence.cmp(&b.0.sequence))\n        });\n        let mut rows = Vec::new();",
+      "artifact_id": "FR-029-AC-8",
+      "fnd": "FND-001",
+      "original_finding": "Deduplicating orders before chronological sorting retains the lexicographically first event ID rather than the original send. For the same send_id, adding a later redelivery named a-redelivery ahead of z-original changes a valid two-reversal chain from one finding to an ok empty result. Select the original/earliest send and preserve its attribution/order context before deduplication; reject conflicting original-send provenance.",
+      "outcome": "fixed",
+      "path": "src/retro/department/operations.rs",
+      "verification": "Chronological ordering now precedes send deduplication, preserving the earliest original event and refusing conflicting fact/entity/classifier provenance. Original independent probe remains one finding with redelivery; the new fixture also checks reversed input order and conflicting actor refusal."
+    },
+    {
+      "after_excerpt": "            if let Some((old_row, old)) = previous.get(&key)\n                && event_time(row)? > self.frame.now - lookback as f64\n                && f.supersedes_order_id.as_deref() == Some(&old.order_id)\n                && f.reverses_order_id.as_deref() == Some(&old.order_id)\n                && f.direction != old.direction\n                && f.evidence_revision == old.evidence_revision",
+      "artifact_id": "FR-029-AC-8",
+      "fnd": "FND-002",
+      "original_finding": "order_flip_loop discards the predecessor outside lookback before evaluating in-window reversals. With o1 at -4000s, o2 reversing o1 at -3000s, o3 reversing o2 at -2000s, lookback=3600s and repeat=2, both reversal events are in the lookback but the detector returns ok with no finding. Retain the preceding order as context and count only qualifying reversal events inside lookback.",
+      "outcome": "fixed",
+      "path": "src/retro/department/operations.rs",
+      "verification": "All prior orders remain context; only reversal endpoints after the open lookback boundary increment the count. The original two in-window reversals now yield one finding, and the boundary fixture excludes a reversal exactly at the start."
+    },
+    {
+      "after_excerpt": "            if send.sender != sender || send.sent_at != sent_at {\n                return Err(\"conflicting original message sender/time provenance\".into());\n            }\n            if attributed(row).is_ok() {\n                merge_message_label(&mut send.correction, f.correction);\n                merge_message_label(&mut send.status_only, f.status_only);\n            }",
+      "artifact_id": "FR-029-AC-4",
+      "fnd": "FND-003",
+      "original_finding": "Message deduplication discards a later authoritative classification for an already observed original message. An a-raw row with correction=null followed by z-classified with correction=true and valid attribution for the same message_id yields unavailable correction_rate and classified=0/total=1. The advertised classification-export input must merge usable attributed labels by native send identity, preserve the original sender/time, and reject conflicts; event-ID lexical order must not choose the classification.",
+      "outcome": "fixed",
+      "path": "src/retro/department/operations.rs",
+      "verification": "Native message identity now merges attributable correction/status labels while original canonical sender and sent_at remain immutable. The original raw-then-classified probe returns correction_rate=1, classified=1/total=1; the new fixture checks order independence, label conflict and send-time conflict."
+    },
+    {
+      "after_excerpt": "        let required_until = if gauge { observed } else { frame.now };\n        let from = if gauge {\n            observed\n        } else {\n            frame.now - frame.window_secs as f64\n        };\n        let origin = matches!(family.as_str(), \"order\" | \"denial\" | \"relay_event\");",
+      "artifact_id": "FR-029-AC-9",
+      "fnd": "FND-004",
+      "original_finding": "Point-in-time operational coverage must extend through frame.now even when the export is within its configured freshness limit. A host export observed 10 seconds ago with complete coverage through its observation, a 60-second freshness limit and 2-second clock tolerance is rejected as missing host coverage. This effectively caps point-in-time export freshness at clock tolerance and makes normal saved lifecycle/host/instruction snapshots unavailable. Validate gauge coverage at its observation and apply the configured age policy; retain end-of-window completeness for event populations.",
+      "outcome": "fixed",
+      "path": "src/retro/department/operations.rs",
+      "verification": "Gauge coverage is evaluated at source observation while configured batch/row freshness remains enforced. The original 10-second snapshot is now available under its 60-second limit; the new fixture still refuses a 61-second stale snapshot and short event-window coverage."
+    },
+    {
+      "after_excerpt": "        match validation {\n            Ok(()) => rows.push(row),\n            Err(reason) => {\n                errors\n                    .entry(family.into())\n                    .or_default()\n                    .insert(format!(\"{}: {reason}\", row.event_id));\n            }\n        }\n    }\n    evidence.observations = rows;",
+      "artifact_id": "FR-029-AC-3",
+      "fnd": "FND-005",
+      "original_finding": "A malformed event timestamp in one configured operational family discards every observation and marks every family unavailable. A single export with a valid host row and malformed instruction event timestamp loses host_slots_used=1 and returns the instruction timestamp error for that host metric. Retain validated independent facts and scope normalization errors to their dependent capability instead of replacing the whole multi-family Evidence batch.",
+      "outcome": "fixed",
+      "path": "src/retro/department/operations.rs",
+      "verification": "Malformed rows and coverage intervals are recorded against their known family and independently valid observations are retained. Original malformed-instruction probe now preserves host_slots_used; the fixture also covers malformed instruction coverage without losing valid host data."
+    }
+  ]
+}
+```
