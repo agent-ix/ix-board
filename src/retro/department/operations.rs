@@ -1603,7 +1603,7 @@ pub fn collect_operations(
             continue;
         };
         let outcome = calc.calculate(id);
-        let (value, reason, age, population, denominator, refs) = match outcome {
+        let (value, reason, age, population, denominator, mut refs) = match outcome {
             Ok(o) => (
                 Some(o.value),
                 None,
@@ -1626,6 +1626,8 @@ pub fn collect_operations(
                     .collect(),
             ),
         };
+        refs.sort();
+        refs.dedup();
         measurements.insert(
             (*id).into(),
             Measurement {
