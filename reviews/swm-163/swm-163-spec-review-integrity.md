@@ -243,3 +243,115 @@ Targeted FR-029: quire 0.52.0 (engine 0.62.2), exit 0, 1/1 grammar-clean and no 
 ## Verdict
 
 CHANGES REQUIRED: one medium-severity assessment-policy ambiguity.
+
+## Disposition Pass 1 Review
+
+Current frozen candidate: 09931ee2fc9f07a6f4e451fdd26eb607efe64221. Original review candidate: 9b46543eca0b508edc6a7513296a9bf859d13e25. Inspected actual fix diff and full FR-029, all 12 criteria, each original finding and all eight committed original SRs; originals match persistent review-pass files verbatim and have no previous dispositions. Canonical contract ownership, legacy behavior and lifecycle unknowns remain preserved. Exact model ID remains unavailable; no invented provenance. No new high, medium or low findings.
+
+Actual Inputs now requires selected statistic/component unit, expected native key set and worst_severity reduction; missing keys remain unknown with completeness=false, unselected keys are diagnostic only, and statistic/key/reducer changes affect comparison identity. AC-11 supplies the exact p90-vs-median/missing-C/unselected-D oracle and invalid configuration cases.
+
+Evidence lens: the original installed advisor run matched Test for AC-1..10. AC-11/12 were inspected as exact fixture and serialization assertions; no new advisor run is claimed in this bounded focused-Quire/diff disposition.
+
+Focused command `quire validate --scope . spec/functional/FR-029-department-retro-contract.md 'reviews/swm-163/*.md' --summary` exits 0: 9/9 docs grammar-clean, zero findings; 4/12 ACs property-extractable. `git diff --check 9b46543..09931ee` exits 0. Latest persistent SRs are separately validated at their explicit paths. Whole legacy scan was intentionally not repeated; initial historical limitations remain in this document. No build/test/aggregate gate/auth/collector invocation. Spec-only aggregate gate SKIP; changed artifacts are not embedded by existing tests. The inspected worktree remains clean at 09931ee2fc9f07a6f4e451fdd26eb607efe64221.
+
+## Dispositions
+
+| FND | outcome | reason |
+|---|---|---|
+| FND-001 | fixed | Round 1: Actual Inputs now requires selected statistic/component unit, expected native key set and worst_severity reduction; missing keys remain unknown with completeness=false, unselected keys are diagnostic only, and statistic/key/reducer changes affect comparison identity. AC-11 supplies the exact p90-vs-median/missing-C/unselected-D oracle and invalid configuration cases. |
+
+### Round 1 fixed excerpt
+
+```text
+A scalar policy selects `value`; a duration policy explicitly selects `count`,
+`median` or `p90`. The policy unit matches the selected component, rather than
+treating a population count as a duration. A keyed policy declares a nonempty
+set of expected native keys and `key_reduction: worst_severity`. The engine
+SHALL assess the selected statistic separately for every expected key and retain
+each key's value, severity and unavailable/unassessed reason.
+```
+
+## Current Verdict (Disposition Pass 1)
+
+PASS for this method at 09931ee. All original findings now have latest outcome fixed. Mergeable as a specification-only change after the lead commits the latest SR custody files; historical findings and original verdict above are retained unchanged.
+
+### Scope examined in round 1
+
+```yaml
+{
+  "scope": [
+    {
+      "id": "FR-029-AC-1",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "With department absent, existing snapshot/delta/backfill fixtures retain their metric IDs, values, queries and selection behavior. A department snapshot retains the legacy map and appends one version-2 line with the version-1 envelope; prior store bytes remain identical."
+    },
+    {
+      "id": "FR-029-AC-2",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "Two independent fixture teams with changed IDs/capacities serialize their configured scopes, observations, keyed measurements and evidence references; overlapping project membership counts native entities once. Replaying identical inputs/clock yields identical department payloads."
+    },
+    {
+      "id": "FR-029-AC-3",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "Missing policy, source timestamp, complete history, completion obligations, reviewer-ready time, lane capacity or dependency reachability produces the affected unavailable/unassessed reason while unrelated measurements remain available. A partial blocker graph or cycle never yields an arbitrarily finite successful chain length."
+    },
+    {
+      "id": "FR-029-AC-4",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "The locally registered metrics match canonical fixture oracles for fresh/restarted/stale claims, state exits on window boundaries, merged issues with unmet obligations, reviewer age, fan-in, pin reachability and attributed diff/check classification. Missing attribution yields unavailable; all old metric oracles remain unchanged."
+    },
+    {
+      "id": "FR-029-AC-5",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "Exact threshold boundary fixtures exercise all four comparators and three comparison bases. Reversed thresholds, wrong units, duplicate IDs, unknown IDs and unsupported department versions fail naming the field, with no source read and no appended line. Missing optional policy/owner produces unassessed/unrouted rather than a fabricated threshold/owner."
+    },
+    {
+      "id": "FR-029-AC-6",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "All ten classes remain in the report with later collectors absent. Red+unknown yields red/incomplete, amber+unknown amber/incomplete, green+unknown unknown/incomplete, all green green/complete and an empty required set unknown/incomplete; optional metrics change neither severity nor completeness. Department rollup uses the same rules."
+    },
+    {
+      "id": "FR-029-AC-7",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "Changed scope, formula/catalog identity, parameter, window or applicable assessment policy produces query_changed without numeric trend; reordered equivalent config does not. Missing department evidence in a version-1 baseline yields unavailable for new measurements while compatible old metrics still compare. Delta invokes no source reader."
+    },
+    {
+      "id": "FR-029-AC-8",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "Duplicate events and equal timestamps with known source sequence produce exact canonical tag-repin/state-bounce findings once with ordered IDs and deduplication keys. Missing ordering history produces unavailable, not an empty successful finding set."
+    },
+    {
+      "id": "FR-029-AC-9",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "Empty duration populations are unavailable. For the singleton [7 hours], count=1, median=7 hours and p90=7 hours. Zero denominators are unavailable, and partial pages, stale sources and excessive future skew invalidate dependent measurements without turning a class green."
+    },
+    {
+      "id": "FR-029-AC-10",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "Version-1 history remains byte-identical when read; unsupported record/envelope versions fail naming the version and leave the store unchanged. Shared JSON round trips preserve keyed values, evidence, comparison states, class completeness and owner/action routing without requiring a live source."
+    },
+    {
+      "id": "FR-029-AC-11",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "For expected state keys A/B/C, fixture A has median=1h/p90=10h, B median=1h/p90=2h, and C is missing. With gte amber=3h/red=5h and p90 selected, key severities are red/green/unknown and the metric is red/incomplete with C's missing-key reason. Selecting median yields green/green/unknown and unknown/incomplete; adding C median=1h/p90=1h yields green/complete for the median policy. Unselected key D with p90=100h changes neither result. Missing statistic/key reduction, empty expected key set, invalid component/unit or numeric policy on categorical evidence fails configuration validation. Changing"
+    },
+    {
+      "id": "FR-029-AC-12",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "An offline lane_execution_state round trip preserves an FR-018 WORKING row and an UNKNOWN/partial row including null timestamp/count reasons, lifecycle provenance and source availability. No numeric state code or invented timestamp appears. Categories remain unassessed with categorical-evidence reason; a required categorical input makes its class unknown/incomplete. Compatible WORKING-to-WORKING and WORKING-to-UNKNOWN observations produce same and changed equality respectively without numeric trend; unavailable evidence produces unavailable and a changed source schema produces query_changed."
+    }
+  ]
+}
+```
