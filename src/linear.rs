@@ -3,7 +3,7 @@
 
 //! Linear GraphQL transport for selected reads and project status/priority writes.
 
-use ix_cli_kit::secrets::{AppScope, SecretKey, SecretStore, SecretValue};
+use ix_cli_kit::secrets::{AppScope, CredentialBackend, SecretKey, SecretStore, SecretValue};
 
 use crate::{
     Clock, DriftConfig, DriftEvidence, DriftTicket, Error, HistoricalProject, Initiative, Issue,
@@ -15,6 +15,7 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ffi::OsString;
 use std::process::Command as ProcessCommand;
 
 // Keep the project query below Linear's complexity limit while retaining nested page coverage.
@@ -170,6 +171,7 @@ mutation ProjectUpdate($id: String!, $input: ProjectUpdateInput!) {
 }"#;
 
 /// Linear GraphQL client for structured project/issue reads and scoped project updates.
+#[derive(Clone)]
 pub struct LinearGraphQlSource {
     client: Client,
     api_key: SecretValue,
@@ -187,46 +189,67 @@ impl LinearGraphQlSource {
         api_key: impl Into<String>,
         endpoint: impl Into<String>,
     ) -> Result<Self, Error> {
-        let api_key = api_key.into();
-        if api_key.trim().is_empty() {
+        Self::with_secret(SecretValue::new(api_key), endpoint.into())
+    }
+
+    fn with_secret(api_key: SecretValue, endpoint: String) -> Result<Self, Error> {
+        if api_key.expose_secret().trim().is_empty() {
             return Err(Error::MissingApiKey);
         }
         let cache_namespace = format!(
             "linear:{CACHE_MODEL_VERSION}:sha256:{:x}",
-            Sha256::digest(api_key.as_bytes())
+            Sha256::digest(api_key.expose_secret().as_bytes())
         );
         Ok(Self {
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()?,
-            api_key: SecretValue::new(api_key),
-            endpoint: endpoint.into(),
+            api_key,
+            endpoint,
             cache_namespace,
         })
     }
 
     /// Resolves LINEAR_API_KEY, the saved OS credential, then the configured Linear CLI.
     pub fn from_env() -> Result<Self, Error> {
-        let scope = AppScope::try_from("ix-board")?;
-        let key = SecretKey::try_from("linear-api-key")?;
-        if let Some(resolved) =
-            SecretStore::system().resolve(None, Some("LINEAR_API_KEY"), &scope, &key)?
-        {
-            return Self::new(resolved.value.expose_secret());
-        }
-        Self::new(linear_cli_token().ok_or(Error::MissingApiKey)?)
+        Self::from_credential_store(
+            &SecretStore::system(),
+            std::env::var_os("LINEAR_API_KEY"),
+            linear_cli_token,
+            ENDPOINT,
+        )
+    }
+
+    /// Builds a source with a controlled credential provider and HTTP endpoint.
+    ///
+    /// `environment_override` is a snapshot of `LINEAR_API_KEY`; `None` means
+    /// no override and never reads the process environment. Resolution uses
+    /// ix-cli-kit's environment-then-store precedence for the `ix-board` /
+    /// `linear-api-key` identity. `cli_fallback` runs only when both are absent;
+    /// invalid overrides and store access failures propagate without fallback.
+    ///
+    /// `endpoint` is the GraphQL URL, normally `https://api.linear.app/graphql`.
+    /// Supplying these dependencies lets library consumers use the same startup
+    /// path with their credential provider and an isolated HTTP service.
+    pub fn from_credential_store<B: CredentialBackend>(
+        store: &SecretStore<B>,
+        environment_override: Option<OsString>,
+        cli_fallback: impl FnOnce() -> Option<String>,
+        endpoint: &str,
+    ) -> Result<Self, Error> {
+        let (value, _) = resolve_credentials(store, environment_override, cli_fallback)?
+            .ok_or(Error::MissingApiKey)?;
+        Self::with_secret(value, endpoint.to_owned())
     }
 
     /// Reports which configured credential source is available without exposing its value.
     pub fn credential_source() -> Result<Option<String>, Error> {
-        let scope = AppScope::try_from("ix-board")?;
-        let key = SecretKey::try_from("linear-api-key")?;
-        if let Some(resolved) =
-            SecretStore::system().resolve(None, Some("LINEAR_API_KEY"), &scope, &key)?
-        {
-            return Ok(Some(resolved.source.as_str().to_owned()));
-        }
-        Ok(linear_cli_token().map(|_| "linear_cli".to_owned()))
+        Ok(resolve_credentials(
+            &SecretStore::system(),
+            std::env::var_os("LINEAR_API_KEY"),
+            linear_cli_token,
+        )?
+        .map(|(_, source)| source.to_owned()))
     }
 
     /// Fetches every workspace initiative through Linear's paged initiatives connection.
@@ -1781,6 +1804,20 @@ fn canonical_issue_state(name: String, status_type: WorkflowStateType) -> String
         | WorkflowStateType::Unstarted
         | WorkflowStateType::Started => name,
     }
+}
+
+fn resolve_credentials<B: CredentialBackend>(
+    store: &SecretStore<B>,
+    environment_override: Option<OsString>,
+    cli_fallback: impl FnOnce() -> Option<String>,
+) -> Result<Option<(SecretValue, &'static str)>, Error> {
+    let scope = AppScope::try_from("ix-board")?;
+    let key = SecretKey::try_from("linear-api-key")?;
+    let environment = environment_override.map(|value| ("LINEAR_API_KEY", value));
+    if let Some(resolved) = store.resolve_from(None, environment, &scope, &key)? {
+        return Ok(Some((resolved.value, resolved.source.as_str())));
+    }
+    Ok(cli_fallback().map(|value| (SecretValue::new(value), "linear_cli")))
 }
 
 fn linear_cli_token() -> Option<String> {
