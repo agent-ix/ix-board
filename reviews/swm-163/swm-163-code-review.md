@@ -1,303 +1,339 @@
 ---
-id: SR-6056
-title: "SWM-163 code-review of department implementation"
+id: SR-6048
+title: "SWM-163 code-review review"
 type: SpecReview
 analysis: code-review
-scope: "agent-ix/ix-board; SWM-163; src/linear.rs, src/retro/, tests/retro.rs; FR-029 and FR-024..028 compatibility"
+scope: "agent-ix/ix-board; spec/functional/FR-029-department-retro-contract.md; SWM-163"
 review_set: subset
-relationships:
-  - {target: ix://agent-ix/ix-board/FR-029, type: references}
 ---
 
 ## Summary
 
-Ticket: SWM-163. Independent review of the frozen implementation; exact model ID unavailable. Findings require the original coder's fix round. Artifact custody remains external until the lead/coder retains this exact file in reviews/.
+PASS: no implementation changes or duplicate metric engine.
 
-## Verdict
-
-**FAIL** — new behavioral or completion gaps remain. Repository-wide assurance remains INCOMPLETE for the recorded baseline limits.
+Ticket: SWM-163. Frozen candidate 9b46543eca0b508edc6a7513296a9bf859d13e25; base ba904671d92abf90082a74dffb1860afca9034fd. One existing ticket worktree. No source edits, builds, tests, gate, merge, alternate tree or credential-backed ix-board invocation. Exact model ID unavailable in harness; model=unavailable records this provenance limitation. The accepted canonical contract is context, not reopened scope. No AssuranceProfile exists in the repository spec tree; no enforced review policy applies. Dispatch explicitly authorized direct proportional subset review.
 
 ## Findings
 
 | ID | Severity | Summary | Refs |
-| --- | --- | --- | --- |
-| FND-001 | high | Dependency traversal trusts excluded partial/stale blocker rows and emits a finite successful depth. Calculator::capability validates only selected rows, but graph reads all batch issue rows. A scoped gate blocked by an OTHER-team row with complete=false returns ok, open_chain_length=1, reason=null. Validate every reachable dependency row and preserve its resolving evidence before claiming a complete graph. | src/retro/department/collect.rs:652-698 |
-| FND-002 | medium | State-bounce detection discards the state preceding the lookback and misses a return inside the window. With A at -110s, B -90s, A -80s, B -70s, A -60s, lookback=100s and repeat=2, there are two returns to A inside lookback, but the detector reports ok with no findings. Retain the immediately preceding state as context, then count only return events inside the window. | src/retro/department/collect.rs:808-825 |
-| FND-003 | high | The categorical collector rejects an explicitly observed UNKNOWN verdict, preventing the required WORKING-to-UNKNOWN equality comparison and dropping other known lane categories from the measurement. UNKNOWN/partial is a persisted lifecycle category with reasons under AC-12; it is distinct from absent source evidence. The offline probe returns unavailable/null for a complete lifecycle batch containing that observed category. The tagged categorical test fabricates the measurement and changes it to IDLE, so it bypasses this production failure. | src/retro/department/collect.rs:248-254 |
+|---|---|---|---|
+| FND-001 | low | No findings (placeholder) | - |
 
-## Coverage
+## Method Evidence
 
-Methods: code-review with rust-review/rust-style lane. No spec diff, so no new spec-review analyses. Scope: all 17 changed paths in origin/main...HEAD at 0d84806d858a2c4f65ce70f286f857652d383e4d, plus relevant source callers and canonical counting design in dev-team. Fresh origin/main metadata fetched; main/base af46c903783c4b2118046301a1cbad609ceed600. AGENTS.md/CLAUDE.md and Rust API/implementation/testing/wire/safety/Tokio guidance applied. No applicable AssuranceProfile found. Cargo/Makefile/workflow gates unchanged. No copied canonical specifications or second metric engine found.
+Reviewed sole new FR against legacy config/catalog/record/delta source and canonical contract for duplication, vendoring, deleted gates, tracking ceremony and code-test claims. The local envelope and policy boundary are genuine missing interfaces. The immutable design link is a source citation, not a file-tracking system; pin metrics are requested domain behavior. Rust lane and production gap analysis do not apply because no Cargo.toml or .rs changed. Spec defects are recorded once by their owning lenses.
 
-Focused checks: make fmt-check exit 0; cargo test --lib retro::department exit 0 (16 passed); cargo test --test retro exit 0 (74 passed). Private CARGO_TARGET_DIR is the sole ticket target. Standalone Rust probes compile exit 0 and execute exit 0 against the frozen library; probes.log records the three wrong results. No branch edits or mutations occurred. Aggregated make ci, clippy and deny not rerun: root explicitly owns one final aggregate gate and admitted focused checks only. Coder-reported lint is context, not reviewer-run evidence.
+## Validation
 
-Legacy absent-department compatibility, v0/v1 read behavior, unsupported version refusal, all-ten-class precedence, key/statistic selection, offline comparison, sanitization of pane/transcript/command fields and native pin HTTP boundary were examined. Lifecycle UNKNOWN and external graph input edges fail as recorded. No live collectors, Keychain, SecretStore, auth environment injection or credential-backed ix-board invocation used.
+Targeted FR-029: quire 0.52.0 (engine 0.62.2), exit 0, 1/1 grammar-clean and no findings; git diff --check exit 0. Full-tree quire validate --scope . spec/**/*.md --summary exits 3: unchanged FR-004 AC-5/6 grammar errors, FR-016/017 missing Dependencies and roadmap/ears-campaign-stories missing type. Existing FR-012/014/016/017 warnings also appear. These are unchanged from base, not PR findings. Actual resolved quoin executable /Users/peter/.nvm/versions/node/v24.15.0/bin/quoin version 0.36.7; quire is in the same directory. Targeted validation expected/passed; whole-tree pass unavailable due to those precise legacy defects. No changed artifact is embedded by existing tests. Spec-only aggregate gate SKIP. Untagged new ACs are future implementation obligations, not implementation findings.
 
-## Examined scope and bindings
+## Reviewed Scope
 
-All FR-029 AC-1..12 examined; FR-024..028 and external dev-team FR-001/FR-002 read as context only. Each correct binding means the real test exercises part of the AC, not that every obligation is satisfied; FNDs identify missing edges.
-
-```json
+```yaml
 {
-  "bindings": [
-    {
-      "ac_id": "FR-029-AC-1",
-      "test_id": "department_snapshot_appends_v2_preserves_v1_bytes_and_delta_reads_no_collectors",
-      "trace": "correct"
-    },
-    {
-      "ac_id": "FR-029-AC-1",
-      "test_id": "department_backfill_keeps_current_gauges_unavailable_without_invented_history",
-      "trace": "correct"
-    },
-    {
-      "ac_id": "FR-029-AC-2",
-      "test_id": "native_identity_deduplicates_populations_and_replays_two_independent_teams",
-      "trace": "correct"
-    },
-    {
-      "ac_id": "FR-029-AC-3",
-      "test_id": "fresh_restarted_and_moved_claims_are_excluded_and_unknown_history_is_isolated",
-      "trace": "correct"
-    },
-    {
-      "ac_id": "FR-029-AC-3",
-      "test_id": "dependency_depth_fanin_cancelled_partial_and_cyclic_graphs_are_exact",
-      "trace": "correct"
-    },
-    {
-      "ac_id": "FR-029-AC-3",
-      "test_id": "department_backfill_keeps_current_gauges_unavailable_without_invented_history",
-      "trace": "correct"
-    },
-    {
-      "ac_id": "FR-029-AC-4",
-      "test_id": "fresh_restarted_and_moved_claims_are_excluded_and_unknown_history_is_isolated",
-      "trace": "correct"
-    },
-    {
-      "ac_id": "FR-029-AC-4",
-      "test_id": "dependency_depth_fanin_cancelled_partial_and_cyclic_graphs_are_exact",
-      "trace": "correct"
-    },
-    {
-      "ac_id": "FR-029-AC-4",
-      "test_id": "state_exit_boundaries_and_singleton_seven_hour_distributions_match_oracles",
-      "trace": "correct"
-    },
-    {
-      "ac_id": "FR-029-AC-4",
-      "test_id": "completion_review_ready_diff_attribution_and_round_policy_use_explicit_evidence",
-      "trace": "correct"
-    },
-    {
-      "ac_id": "FR-029-AC-4",
-      "test_id": "injected_http_lock_and_reachability_boundary_keeps_unrelated_revision_counts_available",
-      "trace": "correct"
-    },
-    {
-      "ac_id": "FR-029-AC-4",
-      "test_id": "revision_divergence_checks_and_gate_scope_use_native_attributed_populations",
-      "trace": "correct"
-    },
-    {
-      "ac_id": "FR-029-AC-4",
-      "test_id": "independent_same_time_entities_need_no_cross_entity_order_and_same_state_updates_do_not_exit",
-      "trace": "correct"
-    },
-    {
-      "ac_id": "FR-029-AC-5",
-      "test_id": "four_comparators_and_three_bases_respect_exact_threshold_boundaries",
-      "trace": "correct"
-    },
-    {
-      "ac_id": "FR-029-AC-5",
-      "test_id": "malformed_versions_units_statistics_keys_and_duplicates_name_policy_field",
-      "trace": "correct"
-    },
-    {
-      "ac_id": "FR-029-AC-5",
-      "test_id": "invalid_department_config_or_store_versions_refuse_before_reads_and_appends",
-      "trace": "correct"
-    },
-    {
-      "ac_id": "FR-029-AC-6",
-      "test_id": "class_and_department_severity_preserve_breaches_and_independent_completeness",
-      "trace": "correct"
-    },
-    {
-      "ac_id": "FR-029-AC-7",
-      "test_id": "normalized_configuration_identity_ignores_order_but_detects_semantic_changes",
-      "trace": "correct"
-    },
-    {
-      "ac_id": "FR-029-AC-7",
-      "test_id": "department_snapshot_appends_v2_preserves_v1_bytes_and_delta_reads_no_collectors",
-      "trace": "correct"
-    },
-    {
-      "ac_id": "FR-029-AC-8",
-      "test_id": "tag_repin_and_state_bounce_deduplicate_ordered_native_events_and_refuse_unknown_order",
-      "trace": "correct"
-    },
-    {
-      "ac_id": "FR-029-AC-8",
-      "test_id": "independent_same_time_entities_need_no_cross_entity_order_and_same_state_updates_do_not_exit",
-      "trace": "correct"
-    },
-    {
-      "ac_id": "FR-029-AC-9",
-      "test_id": "state_exit_boundaries_and_singleton_seven_hour_distributions_match_oracles",
-      "trace": "correct"
-    },
-    {
-      "ac_id": "FR-029-AC-9",
-      "test_id": "partial_pages_missing_timestamps_staleness_skew_and_zero_capacity_never_become_green",
-      "trace": "correct"
-    },
-    {
-      "ac_id": "FR-029-AC-9",
-      "test_id": "revision_divergence_checks_and_gate_scope_use_native_attributed_populations",
-      "trace": "correct"
-    },
-    {
-      "ac_id": "FR-029-AC-10",
-      "test_id": "categorical_roundtrip_is_unassessed_and_compares_equality_without_numeric_trends",
-      "trace": "correct"
-    },
-    {
-      "ac_id": "FR-029-AC-10",
-      "test_id": "department_snapshot_appends_v2_preserves_v1_bytes_and_delta_reads_no_collectors",
-      "trace": "correct"
-    },
-    {
-      "ac_id": "FR-029-AC-10",
-      "test_id": "invalid_department_config_or_store_versions_refuse_before_reads_and_appends",
-      "trace": "correct"
-    },
-    {
-      "ac_id": "FR-029-AC-11",
-      "test_id": "malformed_versions_units_statistics_keys_and_duplicates_name_policy_field",
-      "trace": "correct"
-    },
-    {
-      "ac_id": "FR-029-AC-11",
-      "test_id": "keyed_policy_selects_count_median_or_p90_per_expected_key_without_averaging",
-      "trace": "correct"
-    },
-    {
-      "ac_id": "FR-029-AC-12",
-      "test_id": "categorical_roundtrip_is_unassessed_and_compares_equality_without_numeric_trends",
-      "trace": "correct"
-    },
-    {
-      "ac_id": "FR-029-AC-12",
-      "test_id": "categorical_lifecycle_keeps_partial_source_counts_and_provenance_without_transcript_text",
-      "trace": "correct"
-    }
-  ],
   "scope": [
     {
-      "excerpt": "With department absent, existing snapshot/delta/backfill fixtures retain their metric IDs, values, queries and selection behavior. A department snapshot retains the legacy map and appends one version-2 line with the version-1 envelope; prior store bytes remain identical.",
+      "id": "FR-029",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "Where department monitoring is configured, the retro commands SHALL expose a\nversioned department envelope alongside the existing metric map, using the\ncanonical [evidence contract](ix://agent-ix/dev-team/FR-001),\n[deterministic metrics contract](ix://agent-ix/dev-team/FR-002) and\n[counting design](https://github.com/agent-ix/dev-team/blob/174dc0c31537d03c548401cae069111340a6714b/docs/department-monitoring.md).\nThose artifacts own formulas, time boundaries, unknown semantics and class\naggregation; this requirement defines their local configuration and wire boundary."
+    },
+    {
+      "id": "FR-029",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "The existing retro JSON configuration gains an optional `department` object.\nIts `version` is `1`. It contains explicit team/project/repository/lane/host\nselectors, a `policy_id`, source freshness limits and clock tolerance, catalog\nmetric parameters, class required/optional metric IDs and owner/action routes.\nSelectors use source-native identities; display labels accompany identities\nrather than replacing them. Parameters include lane work capacity, completion\nobligations, state/lane mappings, dependency selection, diff-classifier version,\nloop lookback/repeat count and the intervals required"
+    },
+    {
+      "id": "FR-029",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "Each metric assessment policy names the metric ID, unit, comparator (`gt`, `gte`,\n`lt` or `lte`), amber/red thresholds and comparison basis (`current`,\n`since_previous` or `since_baseline`). Freshness and measurement-window policies\nare explicit. Each class names its required and optional metrics and optional\nowner/action route. No lane capacity is interpreted as a host build-slot limit."
+    },
+    {
+      "id": "FR-029",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "The class keys are `flow_wip`, `serial_dependency`, `pin_version_churn`,\n`capacity_resources`, `liveness`, `authority_policy`, `signal_integrity`,\n`review_rework`, `decision_latency` and `comms_overhead`, matching the ten design\nclasses in order. These keys are stable across collectors and consumers."
+    },
+    {
+      "id": "FR-029",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "The shared Rust report model and JSON serialization SHALL expose these fields\nunder `department`, with `version: 1`:"
+    },
+    {
+      "id": "FR-029",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "| `catalog_version`, `policy_id`, `config_identity`, `scope` | Definition release, assessment policy and normalized measurement selectors/parameters; no credential values. |"
+    },
+    {
+      "id": "FR-029",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "| `observations` | Stable event ID, source-native entity ID, event/observed UTC time, scope, completeness and source reference; attributed classifications also carry actor/tool, classifier version and source offsets. |"
+    },
+    {
+      "id": "FR-029",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "| `measurements` | Stable metric ID and catalog version, `status`, nullable value, reason, unit/direction, scope, query/config identity, window start/end, source age, population/denominator and evidence references. |"
+    },
+    {
+      "id": "FR-029",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "| `loops` | Detector ID, availability/reason and findings with ordered evidence event IDs, time range, participants and deduplication key. |"
+    },
+    {
+      "id": "FR-029",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "| `classes` | All ten canonical class IDs, required/optional metric IDs, severity, independent completeness, missing metric IDs/reasons, applied policy/thresholds, source age, comparisons and route (`routed` with configured owner/action, or `unrouted`). |"
+    },
+    {
+      "id": "FR-029",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "| `rollup` | Canonical department severity and completeness with per-class missing-evidence diagnostics; no numeric combined health score. |"
+    },
+    {
+      "id": "FR-029",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "Scalar measurements use a numeric value. A keyed measurement uses rows keyed by\nnative entity/state/host/lane identity; duration rows expose count, median and\nnearest-rank p90, and gauge/count rows expose their scalar value. Unavailable\nmeasurements have null value and a reason, rather than an empty successful row\nset. An available empty count population may be zero only after a complete read.\nReferences resolve within the envelope or to a source-native record; credentials\nand private transcript bodies are excluded."
+    },
+    {
+      "id": "FR-029",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "- Where `department` is configured, `retro snapshot` SHALL append the department\n  envelope with its existing snapshot record in the store of\n  [FR-025](./FR-025-retro-store.md).\n- Where `department` is absent, retro SHALL retain the existing configuration,\n  metric/query and output behavior of [FR-024](./FR-024-retro-snapshot.md).\n- The local catalog SHALL register the canonical flow/WIP, dependency,\n  pin/version-churn and review/rework metrics and tag-repin/state-bounce loop\n  detectors with their canonical definitions, units and direction.\n- The collector SHALL preserve every existing cata"
+    },
+    {
+      "id": "FR-029",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "The snapshot record containing this envelope uses `schema_version: 2`.\nThe reader SHALL accept existing version-1 records without rewriting or\nsynthesizing department evidence. The reader SHALL reject unsupported record or\nenvelope versions naming the version before appending. This is an explicit\nschema evolution under [FR-025](./FR-025-retro-store.md), not a migration layer."
+    },
+    {
+      "id": "FR-029",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "`retro delta --json` SHALL expose department current/previous/baseline comparisons\nusing the record selection rules of [FR-027](./FR-027-retro-delta.md).\nFor new measurements, comparison identity comprises metric definition/catalog,\nnormalized scope, query parameters, window duration and applicable policy\nidentity; observation times advance normally and are not identity changes.\nWhen an identity differs, delta SHALL emit `query_changed` with both identities\nand no numeric trend. When a side lacks department evidence or is unavailable,\ndelta SHALL emit `unavailable` with a reason. Configuration"
+    },
+    {
       "id": "FR-029-AC-1",
       "path": "spec/functional/FR-029-department-retro-contract.md",
-      "role": "examined"
+      "role": "examined",
+      "excerpt": "With department absent, existing snapshot/delta/backfill fixtures retain their metric IDs, values, queries and selection behavior. A department snapshot retains the legacy map and appends one version-2 line with the version-1 envelope; prior store bytes remain identical."
     },
     {
-      "excerpt": "Two independent fixture teams with changed IDs/capacities serialize their configured scopes, observations, keyed measurements and evidence references; overlapping project membership counts native entities once. Replaying identical inputs/clock yields identical department payloads.",
       "id": "FR-029-AC-2",
       "path": "spec/functional/FR-029-department-retro-contract.md",
-      "role": "examined"
+      "role": "examined",
+      "excerpt": "Two independent fixture teams with changed IDs/capacities serialize their configured scopes, observations, keyed measurements and evidence references; overlapping project membership counts native entities once. Replaying identical inputs/clock yields identical department payloads."
     },
     {
-      "excerpt": "Missing policy, source timestamp, complete history, completion obligations, reviewer-ready time, lane capacity or dependency reachability produces the affected unavailable/unassessed reason while unrelated measurements remain available. A partial blocker graph or cycle never yields an arbitrarily finite successful chain length.",
       "id": "FR-029-AC-3",
       "path": "spec/functional/FR-029-department-retro-contract.md",
-      "role": "examined"
+      "role": "examined",
+      "excerpt": "Missing policy, source timestamp, complete history, completion obligations, reviewer-ready time, lane capacity or dependency reachability produces the affected unavailable/unassessed reason while unrelated measurements remain available. A partial blocker graph or cycle never yields an arbitrarily finite successful chain length."
     },
     {
-      "excerpt": "The locally registered metrics match canonical fixture oracles for fresh/restarted/stale claims, state exits on window boundaries, merged issues with unmet obligations, reviewer age, fan-in, pin reachability and attributed diff/check classification. Missing attribution yields unavailable; all old metric oracles remain unchanged.",
       "id": "FR-029-AC-4",
       "path": "spec/functional/FR-029-department-retro-contract.md",
-      "role": "examined"
+      "role": "examined",
+      "excerpt": "The locally registered metrics match canonical fixture oracles for fresh/restarted/stale claims, state exits on window boundaries, merged issues with unmet obligations, reviewer age, fan-in, pin reachability and attributed diff/check classification. Missing attribution yields unavailable; all old metric oracles remain unchanged."
     },
     {
-      "excerpt": "Exact threshold boundary fixtures exercise all four comparators and three comparison bases. Reversed thresholds, wrong units, duplicate IDs, unknown IDs and unsupported department versions fail naming the field, with no source read and no appended line. Missing optional policy/owner produces unassessed/unrouted rather than a fabricated threshold/owner.",
       "id": "FR-029-AC-5",
       "path": "spec/functional/FR-029-department-retro-contract.md",
-      "role": "examined"
+      "role": "examined",
+      "excerpt": "Exact threshold boundary fixtures exercise all four comparators and three comparison bases. Reversed thresholds, wrong units, duplicate IDs, unknown IDs and unsupported department versions fail naming the field, with no source read and no appended line. Missing optional policy/owner produces unassessed/unrouted rather than a fabricated threshold/owner."
     },
     {
-      "excerpt": "All ten classes remain in the report with later collectors absent. Red+unknown yields red/incomplete, amber+unknown amber/incomplete, green+unknown unknown/incomplete, all green green/complete and an empty required set unknown/incomplete; optional metrics change neither severity nor completeness. Department rollup uses the same rules.",
       "id": "FR-029-AC-6",
       "path": "spec/functional/FR-029-department-retro-contract.md",
-      "role": "examined"
+      "role": "examined",
+      "excerpt": "All ten classes remain in the report with later collectors absent. Red+unknown yields red/incomplete, amber+unknown amber/incomplete, green+unknown unknown/incomplete, all green green/complete and an empty required set unknown/incomplete; optional metrics change neither severity nor completeness. Department rollup uses the same rules."
     },
     {
-      "excerpt": "Changed scope, formula/catalog identity, parameter, window or applicable assessment policy produces query_changed without numeric trend; reordered equivalent config does not. Missing department evidence in a version-1 baseline yields unavailable for new measurements while compatible old metrics still compare. Delta invokes no source reader.",
       "id": "FR-029-AC-7",
       "path": "spec/functional/FR-029-department-retro-contract.md",
-      "role": "examined"
+      "role": "examined",
+      "excerpt": "Changed scope, formula/catalog identity, parameter, window or applicable assessment policy produces query_changed without numeric trend; reordered equivalent config does not. Missing department evidence in a version-1 baseline yields unavailable for new measurements while compatible old metrics still compare. Delta invokes no source reader."
     },
     {
-      "excerpt": "Duplicate events and equal timestamps with known source sequence produce exact canonical tag-repin/state-bounce findings once with ordered IDs and deduplication keys. Missing ordering history produces unavailable, not an empty successful finding set.",
       "id": "FR-029-AC-8",
       "path": "spec/functional/FR-029-department-retro-contract.md",
-      "role": "examined"
+      "role": "examined",
+      "excerpt": "Duplicate events and equal timestamps with known source sequence produce exact canonical tag-repin/state-bounce findings once with ordered IDs and deduplication keys. Missing ordering history produces unavailable, not an empty successful finding set."
     },
     {
-      "excerpt": "Empty duration populations are unavailable. For the singleton [7 hours], count=1, median=7 hours and p90=7 hours. Zero denominators are unavailable, and partial pages, stale sources and excessive future skew invalidate dependent measurements without turning a class green.",
       "id": "FR-029-AC-9",
       "path": "spec/functional/FR-029-department-retro-contract.md",
-      "role": "examined"
+      "role": "examined",
+      "excerpt": "Empty duration populations are unavailable, singleton count/median/p90 agree, zero denominators are unavailable, and partial pages, stale sources and excessive future skew invalidate dependent measurements without turning a class green."
     },
     {
-      "excerpt": "Version-1 history remains byte-identical when read; unsupported record/envelope versions fail naming the version and leave the store unchanged. Shared JSON round trips preserve keyed values, evidence, comparison states, class completeness and owner/action routing without requiring a live source.",
       "id": "FR-029-AC-10",
       "path": "spec/functional/FR-029-department-retro-contract.md",
-      "role": "examined"
+      "role": "examined",
+      "excerpt": "Version-1 history remains byte-identical when read; unsupported record/envelope versions fail naming the version and leave the store unchanged. Shared JSON round trips preserve keyed values, evidence, comparison states, class completeness and owner/action routing without requiring a live source."
     },
     {
-      "excerpt": "For expected state keys A/B/C, fixture A has median=1h/p90=10h, B median=1h/p90=2h, and C is missing. With gte amber=3h/red=5h and p90 selected, key severities are red/green/unknown and the metric is red/incomplete with C's missing-key reason. Selecting median yields green/green/unknown and unknown/incomplete; adding C median=1h/p90=1h yields green/complete for the median policy. Unselected key D with p90=100h changes neither result. Missing statistic/key reduction, empty expected key set, invalid component/unit or numeric policy on categorical evidence fails configuration validation. Changing",
-      "id": "FR-029-AC-11",
+      "id": "FR-029",
       "path": "spec/functional/FR-029-department-retro-contract.md",
-      "role": "examined"
+      "role": "examined",
+      "excerpt": "- [US-009](../usecase/US-009-review-work-convergence.md), existing retro intent.\n- [FR-024](./FR-024-retro-snapshot.md) through\n  [FR-028](./FR-028-retro-backfill.md), existing catalog/store/history behavior.\n- [FR-018](./FR-018-agent-activity-verdicts.md), lifecycle evidence remains owned\n  by its existing collector; this requirement does not redefine execution state.\n- [FR-001](ix://agent-ix/dev-team/FR-001) and\n  [FR-002](ix://agent-ix/dev-team/FR-002) are cross-repository contracts, not the\n  unrelated local ready-queue and project-chunk requirements with the same IDs.\n- SWM-163 implements"
     },
     {
-      "excerpt": "An offline lane_execution_state round trip preserves an FR-018 WORKING row and an UNKNOWN/partial row including null timestamp/count reasons, lifecycle provenance and source availability. No numeric state code or invented timestamp appears. Categories remain unassessed with categorical-evidence reason; a required categorical input makes its class unknown/incomplete. Compatible WORKING-to-WORKING and WORKING-to-UNKNOWN observations produce same and changed equality respectively without numeric trend; unavailable evidence produces unavailable and a changed source schema produces query_changed.",
-      "id": "FR-029-AC-12",
-      "path": "spec/functional/FR-029-department-retro-contract.md",
-      "role": "examined"
-    },
-    {
-      "excerpt": "`ix-board retro snapshot --config <file> [--window <duration>] [--json]` SHALL\nread the structured Linear, GitHub and herdr sources named in the retro\nconfiguration, compute the metric catalog below for the configured team, and\nappend one record to the store defined by [FR-025](./FR-025-retro-store.md).\n`--window` takes seconds, minutes, hours or days (`90s`, `20m`, `4h`, `2d`) and\ndefaults to `24h`. The command SHALL measure window metrics over the trailing window\nending at the snapshot time, and state metrics at the snapshot time. The command SHALL NOT mutate Linear, GitHub or any repository",
       "id": "FR-024",
       "path": "spec/functional/FR-024-retro-snapshot.md",
-      "role": "context_only"
+      "role": "context_only",
+      "excerpt": "`ix-board retro snapshot --config <file> [--window <duration>] [--json]` SHALL\nread the structured Linear, GitHub and herdr sources named in the retro\nconfiguration, compute the metric catalog below for the configured team, and\nappend one record to the store defined by [FR-025](./FR-025-retro-store.md).\n`--window` takes seconds, minutes, hours or days (`90s`, `20m`, `4h`, `2d`) and\ndefaults to `24h`. The command SHALL measure window metrics over the trailing window\nending at the snapshot time, and state metrics at the snapshot time. The command SHALL NOT mutate Linear, GitHub or any repository"
     },
     {
-      "excerpt": "The retro commands SHALL keep their records in one append-only JSONL file per\nteam at `$TEAM_RETRO_HOME/<team>/snapshots.jsonl`, defaulting `TEAM_RETRO_HOME`\nto `~/.local/state/team-retro`. Each line SHALL be one record carrying\n`schema_version`, `kind` (`snapshot` or `backfill`), `taken_at` (UTC), `team`,\n`window`, and the metric map of [FR-024](./FR-024-retro-snapshot.md).\n\nWhen a retro command appends, it SHALL write the whole line with a single write to a\nfile opened in append mode, and SHALL create the directory when absent. The retro\ncommand SHALL NOT rewrite or truncate an existing line",
       "id": "FR-025",
       "path": "spec/functional/FR-025-retro-store.md",
-      "role": "context_only"
+      "role": "context_only",
+      "excerpt": "The retro commands SHALL keep their records in one append-only JSONL file per\nteam at `$TEAM_RETRO_HOME/<team>/snapshots.jsonl`, defaulting `TEAM_RETRO_HOME`\nto `~/.local/state/team-retro`. Each line SHALL be one record carrying\n`schema_version`, `kind` (`snapshot` or `backfill`), `taken_at` (UTC), `team`,\n`window`, and the metric map of [FR-024](./FR-024-retro-snapshot.md)."
     },
     {
-      "excerpt": "The retro commands SHALL write each metric in a record with `status` (`ok` or `unavailable`), `value`\n(a number, or null when unavailable), `unit`, `direction`, `source` and `query`.\n\nIf a source cannot be read, is incomplete, or is not named in the\nconfiguration (a metric that needs a threshold or a paired field counts as not named when it is absent), then the command SHALL set `status` to `unavailable`, set `value` to\nnull, and record a `reason` naming the failed or missing source.\n\nThe command SHALL NOT report zero or a partial count for an unavailable metric.\n\nIf a paginated\nread ends befo",
       "id": "FR-026",
       "path": "spec/functional/FR-026-retro-unavailable-not-zero.md",
-      "role": "context_only"
+      "role": "context_only",
+      "excerpt": "The retro commands SHALL write each metric in a record with `status` (`ok` or `unavailable`), `value`\n(a number, or null when unavailable), `unit`, `direction`, `source` and `query`."
     },
     {
-      "excerpt": "`ix-board retro delta --config <file> [--json]` SHALL read the store of the\nconfigured team and, for each metric of the latest record, report the value, the\nchange since the previous record, and the change since the baseline. The latest\nand previous records SHALL be the two records of kind `snapshot` with the\ngreatest `taken_at`. The baseline SHALL be the record named by\n`baseline_taken_at` in the configuration, or the earliest record of either kind\nwhen that field is absent. Backfilled records serve only as baseline and\nhistory. The command SHALL read no Linear or GitHub source.\n\n`baseline_ta",
       "id": "FR-027",
       "path": "spec/functional/FR-027-retro-delta.md",
-      "role": "context_only"
+      "role": "context_only",
+      "excerpt": "`ix-board retro delta --config <file> [--json]` SHALL read the store of the\nconfigured team and, for each metric of the latest record, report the value, the\nchange since the previous record, and the change since the baseline. The latest\nand previous records SHALL be the two records of kind `snapshot` with the\ngreatest `taken_at`. The baseline SHALL be the record named by\n`baseline_taken_at` in the configuration, or the earliest record of either kind\nwhen that field is absent. Backfilled records serve only as baseline and\nhistory. The command SHALL read no Linear or GitHub source."
     },
     {
-      "excerpt": "`ix-board retro backfill --config <file> --since <date> [--until <date>]\n[--window <duration>] [--json]` (default window `24h`, as for snapshot) SHALL append one record of kind `backfill` per\nUTC day in the range, each with `taken_at` at `23:59:59Z` of that day, using the\nsame sources as [FR-024](./FR-024-retro-snapshot.md). For each record, the command SHALL measure window\nmetrics over the half-open trailing window that ends at the next UTC midnight, so that\nconsecutive days are contiguous. `--until` SHALL default to the last complete UTC day, and\nthe command SHALL refuse a day that has not e",
       "id": "FR-028",
       "path": "spec/functional/FR-028-retro-backfill.md",
-      "role": "context_only"
+      "role": "context_only",
+      "excerpt": "`ix-board retro backfill --config <file> --since <date> [--until <date>]\n[--window <duration>] [--json]` (default window `24h`, as for snapshot) SHALL append one record of kind `backfill` per\nUTC day in the range, each with `taken_at` at `23:59:59Z` of that day, using the\nsame sources as [FR-024](./FR-024-retro-snapshot.md). For each record, the command SHALL measure window\nmetrics over the half-open trailing window that ends at the next UTC midnight, so that\nconsecutive days are contiguous. `--until` SHALL default to the last complete UTC day, and\nthe command SHALL refuse a day that has not e"
+    },
+    {
+      "id": "FR-018",
+      "path": "spec/functional/FR-018-agent-activity-verdicts.md",
+      "role": "context_only",
+      "excerpt": "The `ix-board agents <team>... [--idle-after <duration>]` command SHALL report\ncurrent execution, unfinished worker assignments, recent ended activity and\nuncertainty separately so a team leader can decide whether intervention is needed.\nTranscript modification time is an age observation, never proof of a live worker."
+    },
+    {
+      "id": "FR-001",
+      "path": "agent-ix/dev-team/spec/functional/FR-001-evidence-contract.md",
+      "role": "context_only",
+      "excerpt": "The monitoring collector SHALL emit scoped evidence records using the common\nenvelope in [the design](../../docs/department-monitoring.md#evidence-and-comparison-contract)."
+    },
+    {
+      "id": "FR-002",
+      "path": "agent-ix/dev-team/spec/functional/FR-002-deterministic-metrics.md",
+      "role": "context_only",
+      "excerpt": "The ix-board retro collector SHALL compute each measure in the\n[metric catalog](../../docs/department-monitoring.md#metric-catalog) from normalized evidence."
+    }
+  ]
+}
+```
+
+## Verdict
+
+PASS: no implementation changes or duplicate metric engine.
+
+## Disposition Pass 1 Review
+
+Current frozen candidate: 09931ee2fc9f07a6f4e451fdd26eb607efe64221. Original review candidate: 9b46543eca0b508edc6a7513296a9bf859d13e25. Inspected actual fix diff and full FR-029, all 12 criteria, each original finding and all eight committed original SRs; originals match persistent review-pass files verbatim and have no previous dispositions. Canonical contract ownership, legacy behavior and lifecycle unknowns remain preserved. Exact model ID remains unavailable; no invented provenance. No new high, medium or low findings.
+
+No original defects in this method; original placeholder is not a finding. Rechecked changes through this method's scope with no regression found.
+
+Evidence lens: the original installed advisor run matched Test for AC-1..10. AC-11/12 were inspected as exact fixture and serialization assertions; no new advisor run is claimed in this bounded focused-Quire/diff disposition.
+
+Focused command `quire validate --scope . spec/functional/FR-029-department-retro-contract.md 'reviews/swm-163/*.md' --summary` exits 0: 9/9 docs grammar-clean, zero findings; 4/12 ACs property-extractable. `git diff --check 9b46543..09931ee` exits 0. Latest persistent SRs are separately validated at their explicit paths. Whole legacy scan was intentionally not repeated; initial historical limitations remain in this document. No build/test/aggregate gate/auth/collector invocation. Spec-only aggregate gate SKIP; changed artifacts are not embedded by existing tests. The inspected worktree remains clean at 09931ee2fc9f07a6f4e451fdd26eb607efe64221.
+
+## Current Verdict (Disposition Pass 1)
+
+PASS for this method at 09931ee. No original or new findings. Mergeable as a specification-only change after the lead commits the latest SR custody files; historical findings and original verdict above are retained unchanged.
+
+### Scope examined in round 1
+
+```yaml
+{
+  "scope": [
+    {
+      "id": "FR-029-AC-1",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "With department absent, existing snapshot/delta/backfill fixtures retain their metric IDs, values, queries and selection behavior. A department snapshot retains the legacy map and appends one version-2 line with the version-1 envelope; prior store bytes remain identical."
+    },
+    {
+      "id": "FR-029-AC-2",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "Two independent fixture teams with changed IDs/capacities serialize their configured scopes, observations, keyed measurements and evidence references; overlapping project membership counts native entities once. Replaying identical inputs/clock yields identical department payloads."
+    },
+    {
+      "id": "FR-029-AC-3",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "Missing policy, source timestamp, complete history, completion obligations, reviewer-ready time, lane capacity or dependency reachability produces the affected unavailable/unassessed reason while unrelated measurements remain available. A partial blocker graph or cycle never yields an arbitrarily finite successful chain length."
+    },
+    {
+      "id": "FR-029-AC-4",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "The locally registered metrics match canonical fixture oracles for fresh/restarted/stale claims, state exits on window boundaries, merged issues with unmet obligations, reviewer age, fan-in, pin reachability and attributed diff/check classification. Missing attribution yields unavailable; all old metric oracles remain unchanged."
+    },
+    {
+      "id": "FR-029-AC-5",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "Exact threshold boundary fixtures exercise all four comparators and three comparison bases. Reversed thresholds, wrong units, duplicate IDs, unknown IDs and unsupported department versions fail naming the field, with no source read and no appended line. Missing optional policy/owner produces unassessed/unrouted rather than a fabricated threshold/owner."
+    },
+    {
+      "id": "FR-029-AC-6",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "All ten classes remain in the report with later collectors absent. Red+unknown yields red/incomplete, amber+unknown amber/incomplete, green+unknown unknown/incomplete, all green green/complete and an empty required set unknown/incomplete; optional metrics change neither severity nor completeness. Department rollup uses the same rules."
+    },
+    {
+      "id": "FR-029-AC-7",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "Changed scope, formula/catalog identity, parameter, window or applicable assessment policy produces query_changed without numeric trend; reordered equivalent config does not. Missing department evidence in a version-1 baseline yields unavailable for new measurements while compatible old metrics still compare. Delta invokes no source reader."
+    },
+    {
+      "id": "FR-029-AC-8",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "Duplicate events and equal timestamps with known source sequence produce exact canonical tag-repin/state-bounce findings once with ordered IDs and deduplication keys. Missing ordering history produces unavailable, not an empty successful finding set."
+    },
+    {
+      "id": "FR-029-AC-9",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "Empty duration populations are unavailable. For the singleton [7 hours], count=1, median=7 hours and p90=7 hours. Zero denominators are unavailable, and partial pages, stale sources and excessive future skew invalidate dependent measurements without turning a class green."
+    },
+    {
+      "id": "FR-029-AC-10",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "Version-1 history remains byte-identical when read; unsupported record/envelope versions fail naming the version and leave the store unchanged. Shared JSON round trips preserve keyed values, evidence, comparison states, class completeness and owner/action routing without requiring a live source."
+    },
+    {
+      "id": "FR-029-AC-11",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "For expected state keys A/B/C, fixture A has median=1h/p90=10h, B median=1h/p90=2h, and C is missing. With gte amber=3h/red=5h and p90 selected, key severities are red/green/unknown and the metric is red/incomplete with C's missing-key reason. Selecting median yields green/green/unknown and unknown/incomplete; adding C median=1h/p90=1h yields green/complete for the median policy. Unselected key D with p90=100h changes neither result. Missing statistic/key reduction, empty expected key set, invalid component/unit or numeric policy on categorical evidence fails configuration validation. Changing"
+    },
+    {
+      "id": "FR-029-AC-12",
+      "path": "spec/functional/FR-029-department-retro-contract.md",
+      "role": "examined",
+      "excerpt": "An offline lane_execution_state round trip preserves an FR-018 WORKING row and an UNKNOWN/partial row including null timestamp/count reasons, lifecycle provenance and source availability. No numeric state code or invented timestamp appears. Categories remain unassessed with categorical-evidence reason; a required categorical input makes its class unknown/incomplete. Compatible WORKING-to-WORKING and WORKING-to-UNKNOWN observations produce same and changed equality respectively without numeric trend; unavailable evidence produces unavailable and a changed source schema produces query_changed."
     }
   ]
 }
