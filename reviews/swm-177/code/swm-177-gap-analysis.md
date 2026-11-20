@@ -49,3 +49,10 @@ scope:
 | FND | outcome | reason |
 | --- | --- | --- |
 | FND-001 | accepted-no-change | Round1 standing dispatch authority explicitly excludes the accepted prior177 legacy trace gaps from this bounded normalization repair. Retain repository FAIL/INCOMPLETE; no broad repair or duplicate functional gate. |
+
+## Disposition pass 1 source-fix recheck
+
+Frozen head0216d32efbad4712f6caec866d4ee6bb79091f68 adds the missing-type regression and serde default reviewed under SR-6064. That finding is now fixed, with an intended RED failure followed by27 passing Linear tests. No new source gap or stub was identified in this bounded delta. The original matrix and candidate counts above retain their original6a43edb provenance; they were not recomputed for this pass. One additional untagged test does not create or close a criterion and does not establish new engine coverage.
+
+The repository assurance verdict remains **FAIL/INCOMPLETE**, with the unchanged177-criterion baseline accepted-no-change as already posted in SR-6065 round1. No duplicate disposition was posted. Current artifact destination: reviews/swm-177/code/swm-177-gap-analysis.md. The scope is clear for the lead's single final aggregate gate after committing the latest cumulative artifacts; full repository assurance is not claimed. BUILDQUIESCENT.
+

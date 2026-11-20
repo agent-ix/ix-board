@@ -49,3 +49,27 @@ scope:
   - {id: FR-004, path: spec/functional/FR-004-cache-polling.md, role: context_only, excerpt: "The ix-board read library SHALL use SQLite to cache structured Linear read data."}
   - {id: FR-005, path: spec/functional/FR-005-structured-data-boundary.md, role: context_only, excerpt: "The ix-board read commands SHALL base filtering, readiness, ordering, and other command decisions on structured Linear fields."}
 ```
+
+## Dispositions
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-001 | fixed | Round1 at 0216d32efbad4712f6caec866d4ee6bb79091f68 adds serde(default) to RawProjectStatus.type; the real fake-HTTP regression proves omitted evidence retains the exact Completed name with Unknown category/completion. RED94d40e5 fails for missing field type; GOOD passes all27 Linear unit tests. |
+
+## Disposition pass 1
+
+Current scoped code-review verdict: **PASS**. FND-001 is fixed; no new findings. Reviewed frozen head0216d32efbad4712f6caec866d4ee6bb79091f68, RED94d40e554a32b6c24babd61e671c99306f9c3f40, and the complete delta from the original reviewed6a43edb. Production delta is solely the absent-field default; the additional test uses the existing loopback seam and production fetch_workspace, removing type from the actual JSON and asserting exact native display name, Unknown category and Unknown completion. No alternate category inference, API/cache shape change or new caller behavior was introduced.
+
+Exact fixed excerpt:
+
+```rust
+    #[serde(rename = "type", default)]
+    status_type: ProjectStatusCategory,
+```
+
+The original Summary, Verdict, Findings and Coverage above remain historical and unmodified. The two committed review copies were byte-identical to the original scratch artifacts before this append. Current artifact destination: reviews/swm-177/code/swm-177-code-review.md.
+
+Inspected lead-run logs ../swm177-missing-type-red.log (exit101, one intended failure with missing field type at the missing-evidence assertion), ../swm177-fix-lint.log (make -j1 fmt-check lint exit0; existing stable-rustfmt configuration warnings remain visible), ../swm177-fix-linear-tests.log (27 passed including the added regression; exit0). The negative control establishes that the new assertion reaches the production decoder and detects the original defect. These logs are actual lead-run evidence, not new reviewer executions.
+
+No new check is requested. Review is clear for the lead's single final aggregate gate and latest artifact custody. SR-6065's unchanged177-criterion legacy FAIL/INCOMPLETE remains accepted outside scope. No compiler, source edit, new worktree/target, branch mutation, live ix-board call, auth, credential access, config/signing/install change or aggregate gate occurred during disposition. BUILDQUIESCENT. Run DD03AC1A-8D60-4BF5-B86A-A994EB5AEFFC; exact runtime model identity unavailable.
+
