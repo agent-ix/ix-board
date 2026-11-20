@@ -16,6 +16,8 @@ fn project(id: &str, name: &str) -> Project {
         description: String::new(),
         content: None,
         status: "Started".into(),
+        status_name: None,
+        status_category: Default::default(),
         priority: 2,
         sort_order: 0.0,
         target_date: None,

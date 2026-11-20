@@ -513,6 +513,8 @@ mod tests {
             content: None,
             updated_at: None,
             status: "Started".to_owned(),
+            status_name: None,
+            status_category: Default::default(),
             priority: 0,
             sort_order: 0.0,
             target_date: None,

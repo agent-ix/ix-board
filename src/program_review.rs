@@ -781,6 +781,8 @@ owns = "program review"
             content: None,
             updated_at: Some("2026-10-20T00:00:00Z".into()),
             status: "Started".into(),
+            status_name: None,
+            status_category: Default::default(),
             priority: 0,
             sort_order: 0.0,
             target_date: None,
