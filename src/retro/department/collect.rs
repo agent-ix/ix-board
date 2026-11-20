@@ -1069,6 +1069,14 @@ pub fn collect(
             calc.rows.clone()
         };
         let mut evidence_refs: Vec<String> = relevant.iter().map(|o| o.event_id.clone()).collect();
+        let fields: &[&str] = match d.id {
+            "claims_without_movement" => &["claim_at", "movement"],
+            "merged_open" => &["merged_pr", "obligations"],
+            "oldest_gated_hours" => &["blocked_at"],
+            "gates_per_pr" => &["full_gates"],
+            "repin_only_prs" => &["repin_only"],
+            _ => &[],
+        };
         for row in &relevant {
             let stamps = match &row.fact {
                 Fact::Issue(i) => Some(&i.provenance),
@@ -1076,7 +1084,10 @@ pub fn collect(
                 _ => None,
             };
             if let Some(stamps) = stamps {
-                for stamp in stamps.values() {
+                for (_, stamp) in stamps
+                    .iter()
+                    .filter(|(field, _)| fields.contains(&field.as_str()))
+                {
                     evidence_refs.extend(stamp.evidence_refs.iter().cloned());
                 }
             }

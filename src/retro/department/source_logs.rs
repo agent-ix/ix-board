@@ -232,10 +232,7 @@ pub fn read_source_logs(
                                         observed_at: None,
                                         complete: false,
                                         reason: Some(reason.clone()),
-                                        evidence_refs: vec![format!(
-                                            "file:{}",
-                                            input.path.display()
-                                        )],
+                                        evidence_refs: Vec::new(),
                                     },
                                 );
                             }
@@ -528,10 +525,17 @@ fn apply(
                     }
                 }
                 let mut source = make_stamp(log, events, check);
-                source.evidence_refs.push(format!(
-                    "file:{}#coverage:{selected:?}:{entity}",
-                    input.path.display()
-                ));
+                if let Some(index) = log.coverage.iter().position(|coverage| {
+                    coverage.kind == *selected && coverage.entities.contains(&entity)
+                }) {
+                    source
+                        .evidence_refs
+                        .push(format!("file:{}#/coverage/{index}", input.path.display()));
+                } else {
+                    source
+                        .evidence_refs
+                        .push(format!("file:{}", input.path.display()));
+                }
                 if let Some(reason) = conflict {
                     source.complete = false;
                     source.reason = Some(reason);
