@@ -1605,7 +1605,7 @@ struct RawProject {
 #[serde(deny_unknown_fields)]
 struct RawProjectStatus {
     name: String,
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     status_type: ProjectStatusCategory,
 }
 
