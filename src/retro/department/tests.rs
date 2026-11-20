@@ -1161,3 +1161,57 @@ fn review_regression_observed_unknown_preserves_other_lanes_and_compares_categor
         after
     );
 }
+
+#[trace("FR-029-AC-8")]
+#[test]
+fn review_round2_state_bounce_retains_per_state_pre_window_context() {
+    let mut c = config();
+    c.parameters.loop_lookback_seconds = Some(100);
+    let mut rows = vec![row("issue", "issue-a", 0.0, Fact::Issue(issue(true)))];
+    for (id, time, state) in [
+        ("a0", -120.0, "A"),
+        ("b1", -110.0, "B"),
+        ("a1", -90.0, "A"),
+        ("b2", -80.0, "B"),
+        ("a2", -70.0, "A"),
+    ] {
+        rows.push(row(
+            id,
+            "issue-a",
+            time,
+            Fact::State(StateFact {
+                state: state.into(),
+            }),
+        ));
+    }
+    let report = collect_rows(&c, &batch(rows));
+    assert_eq!(report.loops["state_bounce_loop"].status, Status::Ok);
+    assert_eq!(report.loops["state_bounce_loop"].findings.len(), 1);
+    assert_eq!(
+        report.loops["state_bounce_loop"].findings[0].event_ids,
+        ["a0", "a1", "a2"]
+    );
+    let mut rows = vec![row("issue", "issue-a", 0.0, Fact::Issue(issue(true)))];
+    for (id, time, state) in [
+        ("a-old", -200.0, "A"),
+        ("b-old", -190.0, "B"),
+        ("a-context", -120.0, "A"),
+        ("b-context", -110.0, "B"),
+        ("a1", -90.0, "A"),
+    ] {
+        rows.push(row(
+            id,
+            "issue-a",
+            time,
+            Fact::State(StateFact {
+                state: state.into(),
+            }),
+        ));
+    }
+    assert!(
+        collect_rows(&c, &batch(rows)).loops["state_bounce_loop"]
+            .findings
+            .is_empty(),
+        "pre-window returns must not count toward the repeat threshold"
+    );
+}

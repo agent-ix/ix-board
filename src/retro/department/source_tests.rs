@@ -497,3 +497,276 @@ fn documented_source_input_is_read_by_the_production_file_normalizer() {
     );
     assert_eq!(scalar(&r, "claims_without_movement"), 1.0);
 }
+
+#[trace("FR-029-AC-3", "FR-029-AC-7", "FR-029-AC-9")]
+#[test]
+fn review_round2_claims_normalize_before_movement_in_any_input_or_name_order() {
+    for (movement_path, claims_path, movement_source, claims_source) in [
+        ("a-movement.json", "z-claims.json", "z-movement", "a-claims"),
+        ("z-movement.json", "a-claims.json", "a-movement", "z-claims"),
+    ] {
+        let mut c = config();
+        c.parameters.event_logs = vec![
+            LogInput {
+                path: movement_path.into(),
+                source: movement_source.into(),
+                kinds: [LogKind::Movement].into(),
+            },
+            LogInput {
+                path: claims_path.into(),
+                source: claims_source.into(),
+                kinds: [LogKind::Claims].into(),
+            },
+        ];
+        c.freshness_seconds.insert(movement_source.into(), 60);
+        c.freshness_seconds.insert(claims_source.into(), 60);
+        let claims = SourceLog {
+            version: 1,
+            source: claims_source.into(),
+            observed_at: at(0.0),
+            coverage: vec![Coverage {
+                kind: LogKind::Claims,
+                entities: ["issue-a".into()].into(),
+                from: at(-300000.0),
+                until: at(0.0),
+                complete: true,
+                full_history: true,
+                movement_sources: Default::default(),
+            }],
+            events: vec![LogEvent {
+                event_id: "claim-48h".into(),
+                entity_id: "issue-a".into(),
+                event_at: at(-172800.0),
+                sequence: Some(1),
+                source_ref: "native:claim-48h".into(),
+                attribution: None,
+                record: NativeRecord::Claim,
+            }],
+        };
+        let mut movement = SourceLog {
+            version: 1,
+            source: movement_source.into(),
+            observed_at: at(0.0),
+            coverage: vec![Coverage {
+                kind: LogKind::Movement,
+                entities: ["issue-a".into()].into(),
+                from: at(-86400.0),
+                until: at(0.0),
+                complete: true,
+                full_history: false,
+                movement_sources: [
+                    MovementKind::PrHead,
+                    MovementKind::Commit,
+                    MovementKind::Worktree,
+                ]
+                .into(),
+            }],
+            events: Vec::new(),
+        };
+        let identity = c.identity();
+        for complete_interval in [false, true] {
+            if complete_interval {
+                movement.coverage[0].from = at(-300000.0);
+            }
+            for reverse in [false, true] {
+                let mut selected = c.clone();
+                if reverse {
+                    selected.parameters.event_logs.reverse();
+                }
+                assert_eq!(selected.identity(), identity);
+                assert_eq!(selected.validate(), Ok(()));
+                let mut workspace: crate::WorkspaceSnapshot = serde_json::from_str(include_str!(
+                    "../../../tests/fixtures/retro/native-workspace.json"
+                ))
+                .unwrap();
+                workspace.issues[0].created_at = Some(at(-300000.0));
+                let mut batches = vec![workspace_evidence(&workspace, &selected.scope)];
+                read_source_logs(
+                    &selected,
+                    Frame {
+                        now: END,
+                        window_secs: 86400,
+                        end_exclusive: false,
+                    },
+                    &mut batches,
+                    |path| {
+                        Ok(
+                            serde_json::to_string(if path == std::path::Path::new(movement_path) {
+                                &movement
+                            } else {
+                                &claims
+                            })
+                            .unwrap(),
+                        )
+                    },
+                );
+                let report = collect(
+                    &selected,
+                    Frame {
+                        now: END,
+                        window_secs: 86400,
+                        end_exclusive: false,
+                    },
+                    &batches,
+                    &BTreeMap::new(),
+                );
+                if complete_interval {
+                    assert_eq!(scalar(&report, "claims_without_movement"), 1.0);
+                } else {
+                    assert_eq!(
+                        report.measurements["claims_without_movement"].status,
+                        Status::Unavailable,
+                        "{movement_path}/{claims_path}/reverse={reverse}"
+                    );
+                }
+                let Fact::Issue(issue) = &batches[0].observations[0].fact else {
+                    panic!("native issue")
+                };
+                assert_eq!(issue.claim_at.as_deref(), Some(at(-172800.0).as_str()));
+                assert_eq!(issue.movement_complete, complete_interval);
+                assert_eq!(scalar(&report, "wip_active"), 1.0);
+            }
+        }
+    }
+}
+
+#[trace("FR-029-AC-3", "FR-029-AC-4", "FR-029-AC-10")]
+#[test]
+fn review_round2_gate_and_diff_exports_preserve_independent_field_attribution() {
+    let mut c = config();
+    c.parameters.event_logs[0].kinds = [LogKind::Gates].into();
+    let mut gates: SourceLog = serde_json::from_str(EXPORT).unwrap();
+    gates
+        .events
+        .retain(|e| matches!(e.record, NativeRecord::Gate { .. }));
+    gates
+        .coverage
+        .retain(|coverage| coverage.kind == LogKind::Gates);
+    let mut batches = native_batches(&c, &native_pr());
+    let native_attribution = batches[1].observations[0].attribution.clone();
+    assert_eq!(
+        scalar(
+            &collect(
+                &c,
+                Frame {
+                    now: END,
+                    window_secs: 86400,
+                    end_exclusive: false
+                },
+                &batches,
+                &BTreeMap::new()
+            ),
+            "repin_only_prs"
+        ),
+        1.0
+    );
+    read_source_logs(
+        &c,
+        Frame {
+            now: END,
+            window_secs: 86400,
+            end_exclusive: false,
+        },
+        &mut batches,
+        |_| Ok(serde_json::to_string(&gates).unwrap()),
+    );
+    let report = collect(
+        &c,
+        Frame {
+            now: END,
+            window_secs: 86400,
+            end_exclusive: false,
+        },
+        &batches,
+        &BTreeMap::new(),
+    );
+    assert_eq!(scalar(&report, "repin_only_prs"), 1.0);
+    assert_eq!(
+        report.measurements["gates_per_pr"].value,
+        Some(Value::Keyed([("fixture/repo#1".into(), 1.0)].into()))
+    );
+    assert_eq!(batches[1].observations[0].attribution, native_attribution);
+    for reverse in [false, true] {
+        let mut selected = c.clone();
+        selected.parameters.event_logs = vec![
+            LogInput {
+                source: "gate-source".into(),
+                path: "gate.json".into(),
+                kinds: [LogKind::Gates].into(),
+            },
+            LogInput {
+                source: "diff-source".into(),
+                path: "diff.json".into(),
+                kinds: [LogKind::Diffs].into(),
+            },
+        ];
+        if reverse {
+            selected.parameters.event_logs.reverse();
+        }
+        selected.freshness_seconds.insert("gate-source".into(), 60);
+        selected.freshness_seconds.insert("diff-source".into(), 60);
+        let mut gate_log = gates.clone();
+        gate_log.source = "gate-source".into();
+        gate_log.events[0].attribution.as_mut().unwrap().actor = "gate-recorder".into();
+        let mut diffs: SourceLog = serde_json::from_str(EXPORT).unwrap();
+        diffs.source = "diff-source".into();
+        diffs
+            .events
+            .retain(|event| matches!(event.record, NativeRecord::Diff { .. }));
+        diffs
+            .coverage
+            .retain(|coverage| coverage.kind == LogKind::Diffs);
+        diffs.events[0].attribution.as_mut().unwrap().actor = "diff-recorder".into();
+        let mut batches = native_batches(&selected, &native_pr());
+        read_source_logs(
+            &selected,
+            Frame {
+                now: END,
+                window_secs: 86400,
+                end_exclusive: false,
+            },
+            &mut batches,
+            |path| {
+                Ok(
+                    serde_json::to_string(if path == std::path::Path::new("gate.json") {
+                        &gate_log
+                    } else {
+                        &diffs
+                    })
+                    .unwrap(),
+                )
+            },
+        );
+        let report = collect(
+            &selected,
+            Frame {
+                now: END,
+                window_secs: 86400,
+                end_exclusive: false,
+            },
+            &batches,
+            &BTreeMap::new(),
+        );
+        assert_eq!(scalar(&report, "repin_only_prs"), 1.0);
+        assert_eq!(
+            report.measurements["gates_per_pr"].value,
+            Some(Value::Keyed([("fixture/repo#1".into(), 1.0)].into()))
+        );
+        let Fact::PullRequest(pr) = &batches[1].observations[0].fact else {
+            panic!("PR")
+        };
+        let json = serde_json::to_value(pr).unwrap();
+        assert_eq!(
+            json["provenance"]["repin_only"]["attribution"]["actor"],
+            "diff-recorder"
+        );
+        assert_eq!(
+            json["provenance"]["full_gates"]["attribution"]["actor"],
+            "gate-recorder"
+        );
+        assert_eq!(
+            serde_json::from_str::<Report>(&serde_json::to_string(&report).unwrap()).unwrap(),
+            report
+        );
+    }
+}
