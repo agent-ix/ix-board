@@ -14,6 +14,7 @@ pub mod delta;
 pub mod department;
 pub mod live;
 pub mod metrics;
+mod saved;
 pub mod sources;
 pub mod store;
 
@@ -26,6 +27,7 @@ pub use catalog::{
 pub use config::{ConfigError, DEFAULT_WINDOW, RetroConfig, format_window, parse_window};
 pub use delta::{DeltaReport, render_delta_text, run_delta};
 pub use metrics::Frame;
+pub use saved::{SavedReport, SavedReportError, decode_saved_report, read_saved_report};
 pub use sources::Sources;
 pub use store::{Store, StoreError};
 
@@ -74,6 +76,34 @@ pub fn run_snapshot(
         window_secs,
         end_exclusive: false,
     };
+    let previous = stored
+        .iter()
+        .rev()
+        .find(|r| r.kind == RecordKind::Snapshot)
+        .and_then(|r| r.department.as_ref());
+    let baseline = config
+        .baseline_taken_at
+        .as_ref()
+        .and_then(|at| stored.iter().find(|r| &r.taken_at == at))
+        .or_else(|| stored.first())
+        .and_then(|r| r.department.as_ref());
+    let record = collect_snapshot(config, frame, sources, previous, baseline)?;
+    store.append(&record)?;
+    Ok(record)
+}
+
+/// Collects the same snapshot as the writer without reading or writing a store.
+/// Optional comparison envelopes must already be loaded by the caller.
+pub fn collect_snapshot(
+    config: &RetroConfig,
+    frame: Frame,
+    sources: &Sources<'_>,
+    previous: Option<&department::Report>,
+    baseline: Option<&department::Report>,
+) -> Result<Record, RetroError> {
+    config.validate_department()?;
+    let window_secs = frame.window_secs;
+    let now = frame.now;
     let metrics = metrics::collect(config, frame, sources);
     let department = config.department.as_ref().map(|department| {
         let mut batches = vec![
@@ -107,18 +137,12 @@ pub fn run_snapshot(
         department::read_source_logs(department, frame, &mut batches, |path| {
             std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))
         });
+        if let Some(operations) = &department.operations {
+            batches.extend(department::read_operational_files(
+                operations, department, frame,
+            ));
+        }
         let mut report = department::collect(department, frame, &batches, &metrics);
-        let previous = stored
-            .iter()
-            .rev()
-            .find(|r| r.kind == RecordKind::Snapshot)
-            .and_then(|r| r.department.as_ref());
-        let baseline = config
-            .baseline_taken_at
-            .as_ref()
-            .and_then(|at| stored.iter().find(|r| &r.taken_at == at))
-            .or_else(|| stored.first())
-            .and_then(|r| r.department.as_ref());
         department::assess(&mut report, department, previous, baseline);
         report
     });
@@ -135,7 +159,6 @@ pub fn run_snapshot(
         metrics,
         department,
     };
-    store.append(&record)?;
     Ok(record)
 }
 

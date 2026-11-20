@@ -53,6 +53,7 @@ fn config() -> Config {
             loop_repeat_count: Some(2),
             ..Default::default()
         },
+        operations: None,
         policies: Vec::new(),
         classes: Vec::new(),
     }

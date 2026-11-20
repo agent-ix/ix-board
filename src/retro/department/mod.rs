@@ -36,6 +36,7 @@ mod collect;
 mod evidence;
 mod github;
 mod native;
+mod operations;
 mod pull_requests;
 mod source_logs;
 pub use assess::*;
@@ -43,6 +44,7 @@ pub use collect::{LoopFinding, LoopReport, collect};
 pub use evidence::*;
 pub use github::collect_pins;
 pub use native::{enrich_claim_history, enrich_merged_attachments, enrich_reviewer_rounds};
+pub use operations::*;
 pub use pull_requests::{
     DIFF_CLASSIFIER, PR_DETAILS, PR_FILES, PR_REVIEWS, PR_TIMELINE, RAW_CONTENT,
     collect_pull_request,
@@ -129,6 +131,8 @@ wire! {
         clock_tolerance_seconds: u64,
         /// Counting parameters.
         #[serde(default)] parameters: Parameters,
+        /// Explicit credential-free operational source exports and resource policy.
+        #[serde(default, skip_serializing_if = "Option::is_none")] operations: Option<OperationalConfig>,
         /// Metric policies, identified by metric ID.
         #[serde(default)] policies: Vec<Policy>,
         /// Class required/optional membership and routes.
@@ -328,7 +332,14 @@ wire! {
         /// Explicit configured counting parameters, persisted alongside their identity.
         query_parameters: Parameters,
         /// Resolving evidence/source references.
-        evidence_refs: Vec<String>
+        evidence_refs: Vec<String>,
+        /// Classified-subset denominator and complete send-population coverage.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        classification_coverage: Option<ClassificationCoverage>
+        ,
+        /// Operational source selectors and configured resource policy used by this measurement.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operational_parameters: Option<OperationalConfig>
     }
 }
 wire! {
@@ -511,6 +522,9 @@ impl Config {
         if self.parameters.loop_repeat_count == Some(0) {
             return Err("department.parameters.loop_repeat_count: must be positive".into());
         }
+        if let Some(operations) = &self.operations {
+            operations.validate(&self.scope)?;
+        }
         let mut sources = BTreeSet::new();
         let mut capabilities = BTreeSet::new();
         for input in &self.parameters.event_logs {
@@ -556,6 +570,11 @@ impl Config {
             .parameters
             .event_logs
             .sort_by(|a, b| a.source.cmp(&b.source));
+        if let Some(operations) = &mut normalized.operations {
+            operations
+                .evidence_files
+                .sort_by(|a, b| a.source.cmp(&b.source));
+        }
         digest(&normalized)
     }
     /// Identity for one metric, excluding unrelated assessment membership and routes.
