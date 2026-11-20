@@ -99,9 +99,24 @@ pub struct LiveLinear {
 impl LiveLinear {
     /// Builds the reader from the saved or environment credential.
     pub fn from_env() -> Result<Self, crate::Error> {
+        Self::with_source(
+            LinearGraphQlSource::from_env()?,
+            &crate::default_cache_path()?,
+        )
+    }
+
+    /// Builds the real Linear reader with a configured source and explicit cache.
+    ///
+    /// The cached workspace reader and history requests share the source's HTTP
+    /// client and resolved credential. Construction does not resolve credentials
+    /// again or select a platform cache path.
+    pub fn with_source(
+        source: LinearGraphQlSource,
+        cache_path: &Path,
+    ) -> Result<Self, crate::Error> {
         Ok(Self {
-            source: LinearGraphQlSource::from_env()?,
-            service: Mutex::new(ReadService::open_default(LinearGraphQlSource::from_env()?)?),
+            source: source.clone(),
+            service: Mutex::new(ReadService::open(source, cache_path)?),
         })
     }
 
