@@ -80,6 +80,12 @@ Local and remote reads use the same read-only Rust probe. Remote hosts need a
 compatible installed `ix-board`; failures preserve healthy rows and produce a
 nonzero command exit. A machine has a 60-second read budget.
 
+For the remote probe process, launch appends `$HOME/.local/bin` and
+`$HOME/.cargo/bin` to the existing PATH, preserving its preference order.
+This supports ordinary user installations without loading shell profiles or
+changing the host's global PATH. Install a matching protocol binary on each
+remote host; an incompatible binary is refused even when found on PATH.
+
 The hidden command `ix-board __agent-probe` accepts a JSON request on stdin:
 
 ```json

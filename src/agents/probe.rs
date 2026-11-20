@@ -395,7 +395,7 @@ impl Host for SystemHost {
                 command
                     .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--"])
                     .arg(&machine.ssh_target)
-                    .arg("ix-board __agent-probe");
+                    .arg(r#"exec env PATH="$PATH:$HOME/.local/bin:$HOME/.cargo/bin" ix-board __agent-probe"#);
             }
         }
         let output = run(
