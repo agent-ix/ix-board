@@ -102,18 +102,7 @@ pub fn run_snapshot(
             })
             .collect();
         if let Ok(lines) = metrics::marker_lines_for(sources, &allowed) {
-            let rounds = metrics::fix_rounds_by_pr(&lines, &allowed, &repositories);
-            for batch in &mut batches {
-                for observation in &mut batch.observations {
-                    if let department::Fact::PullRequest(pr) = &mut observation.fact {
-                        pr.fix_rounds = observation
-                            .entity_id
-                            .rsplit_once('/')
-                            .and_then(|(_, key)| rounds.get(key))
-                            .copied();
-                    }
-                }
-            }
+            department::enrich_reviewer_rounds(&mut batches, &lines, &repositories);
         }
         department::read_source_logs(department, frame, &mut batches, |path| {
             std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))

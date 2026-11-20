@@ -93,3 +93,80 @@ pub fn enrich_merged_attachments(
         }
     }
 }
+
+/// Reuses reviewer marker counting with full repository identity and complete-empty semantics.
+/// Malformed attributed rows remain unknown for their possible PRs; old metric formulas stay intact.
+pub fn enrich_reviewer_rounds(batches: &mut [Evidence], lines: &[String], repositories: &[String]) {
+    use std::collections::{BTreeMap, BTreeSet};
+    for repository in repositories {
+        let allowed: BTreeSet<String> = batches
+            .iter()
+            .flat_map(|b| &b.observations)
+            .filter_map(|o| match &o.fact {
+                Fact::PullRequest(p) if &p.repo == repository => {
+                    o.entity_id.rsplit_once('/').map(|(_, key)| key.into())
+                }
+                _ => None,
+            })
+            .collect();
+        let rounds = crate::retro::metrics::fix_rounds_by_pr(
+            lines,
+            &allowed,
+            std::slice::from_ref(repository),
+        );
+        let mut missing: BTreeSet<String> = BTreeSet::new();
+        let mut reviews: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for line in lines {
+            let Some((kind, fields)) = crate::retro::metrics::marker_fields(line) else {
+                continue;
+            };
+            if fields.get("repo").is_some_and(|repo| *repo != repository) {
+                continue;
+            }
+            if kind == "reviewer" {
+                if let Some(pr) = fields.get("pr").filter(|pr| allowed.contains(**pr)) {
+                    match (fields.get("repo"), fields.get("id")) {
+                        (Some(_), Some(id)) => {
+                            reviews
+                                .entry((*id).into())
+                                .or_default()
+                                .insert((*pr).into());
+                        }
+                        _ => {
+                            missing.insert((*pr).into());
+                        }
+                    }
+                }
+            }
+        }
+        for line in lines {
+            let Some((kind, fields)) = crate::retro::metrics::marker_fields(line) else {
+                continue;
+            };
+            if kind != "reviewer-dispositions"
+                || fields.get("repo").is_some_and(|repo| *repo != repository)
+            {
+                continue;
+            }
+            if let Some(id) = fields.get("id")
+                && let Some(prs) = reviews.get(*id)
+                && (fields.get("repo").is_none()
+                    || fields
+                        .get("round")
+                        .and_then(|r| r.parse::<u64>().ok())
+                        .is_none())
+            {
+                missing.extend(prs.iter().cloned());
+            }
+        }
+        for row in batches.iter_mut().flat_map(|b| &mut b.observations) {
+            if let Fact::PullRequest(p) = &mut row.fact
+                && &p.repo == repository
+                && let Some((_, key)) = row.entity_id.rsplit_once('/')
+            {
+                p.fix_rounds =
+                    (!missing.contains(key)).then(|| rounds.get(key).copied().unwrap_or(0));
+            }
+        }
+    }
+}

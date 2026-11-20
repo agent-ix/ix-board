@@ -83,6 +83,14 @@ pub fn collect_pull_request(
     }
     if let Ok(reviews) = pages::<Review>(&format!("{endpoint}/reviews"), PR_REVIEWS, &mut get)
         && !config.parameters.qualifying_review_states.is_empty()
+        && reviews.iter().all(|review| {
+            review.submitted_at.as_deref().is_none_or(valid_timestamp)
+                && (!config
+                    .parameters
+                    .qualifying_review_states
+                    .contains(&review.state)
+                    || review.submitted_at.is_some())
+        })
     {
         let mut seen = std::collections::BTreeSet::new();
         fact.qualifying_reviews = u64::try_from(
@@ -105,6 +113,12 @@ pub fn collect_pull_request(
         PR_TIMELINE,
         &mut get,
     ) {
+        let complete = events
+            .iter()
+            .filter(|event| event.event.as_deref() == Some("ready_for_review"))
+            .all(|event| {
+                event.id.is_some() && event.created_at.as_deref().is_some_and(valid_timestamp)
+            });
         let mut ready: Option<(f64, String)> = None;
         for event in events {
             if event.id.is_some()
@@ -116,7 +130,9 @@ pub fn collect_pull_request(
                 ready = Some((epoch, at));
             }
         }
-        fact.review_ready_at = ready.map(|(_, at)| at);
+        if complete {
+            fact.review_ready_at = ready.map(|(_, at)| at);
+        }
     }
     let mut attribution = None;
     if config.parameters.diff_classifier.as_deref() == Some(DIFF_CLASSIFIER)

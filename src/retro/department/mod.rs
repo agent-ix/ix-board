@@ -42,7 +42,7 @@ pub use assess::*;
 pub use collect::{LoopFinding, LoopReport, collect};
 pub use evidence::*;
 pub use github::collect_pins;
-pub use native::{enrich_claim_history, enrich_merged_attachments};
+pub use native::{enrich_claim_history, enrich_merged_attachments, enrich_reviewer_rounds};
 pub use pull_requests::{
     DIFF_CLASSIFIER, PR_DETAILS, PR_FILES, PR_REVIEWS, PR_TIMELINE, RAW_CONTENT,
     collect_pull_request,
@@ -50,6 +50,8 @@ pub use pull_requests::{
 pub use source_logs::{
     Coverage, LogEvent, LogInput, LogKind, MovementKind, NativeRecord, SourceLog, read_source_logs,
 };
+#[cfg(test)]
+mod source_tests;
 #[cfg(test)]
 mod tests;
 

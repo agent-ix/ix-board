@@ -760,7 +760,7 @@ fn decisions(out: &mut Out<'_>, sources: &Sources<'_>) {
 }
 
 /// Fields of a `<!-- reviewer ... -->` first line, or `None` for any other line.
-fn marker_fields(line: &str) -> Option<(&str, BTreeMap<&str, &str>)> {
+pub(crate) fn marker_fields(line: &str) -> Option<(&str, BTreeMap<&str, &str>)> {
     let inner = line
         .trim()
         .strip_prefix("<!--")?

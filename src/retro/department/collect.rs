@@ -208,22 +208,6 @@ impl<'a> Calculator<'a> {
             {
                 return Err("excessive future event skew".into());
             }
-            let timestamps: Vec<&str> = match &row.fact {
-                Fact::Issue(issue) => [&issue.claim_at, &issue.movement_at, &issue.blocked_at]
-                    .into_iter()
-                    .filter_map(|at| at.as_deref())
-                    .collect(),
-                Fact::PullRequest(pr) => [&pr.merged_at, &pr.review_ready_at]
-                    .into_iter()
-                    .filter_map(|at| at.as_deref())
-                    .collect(),
-                _ => Vec::new(),
-            };
-            for at in timestamps {
-                if epoch(at)? > self.frame.now + self.config.clock_tolerance_seconds as f64 {
-                    return Err("excessive future source fact skew".into());
-                }
-            }
         }
         Ok(age)
     }
@@ -256,6 +240,18 @@ impl<'a> Calculator<'a> {
             _ => return Ok(age),
         };
         for field in fields {
+            let event_at = match (&row.fact, *field) {
+                (Fact::Issue(i), "claim_at") => i.claim_at.as_deref(),
+                (Fact::Issue(i), "movement") => i.movement_at.as_deref(),
+                (Fact::Issue(i), "blocked_at") => i.blocked_at.as_deref(),
+                (Fact::PullRequest(p), "review_ready_at") => p.review_ready_at.as_deref(),
+                _ => None,
+            };
+            if let Some(at) = event_at
+                && epoch(at)? > self.frame.now + self.config.clock_tolerance_seconds as f64
+            {
+                return Err(format!("future {field} source event skew"));
+            }
             if let Some(stamp) = provenance.get(*field) {
                 if !stamp.complete {
                     return Err(stamp
@@ -576,6 +572,7 @@ impl<'a> Calculator<'a> {
                     }
                     match id {
                         "pr_without_reviewer_age_hours" if p.open && !p.draft => {
+                            age = self.field_age(o, &["review_ready_at"], age)?;
                             let reviewers = p
                                 .assigned_reviewers
                                 .ok_or("missing assigned reviewer history")?;

@@ -438,11 +438,21 @@ fn apply(
                     Ok(())
                 });
                 let success = check.is_ok();
+                let mut conflict = None;
                 let events = events.as_mut().map(|e| e.as_slice()).unwrap_or(&[]);
                 if success {
                     match (&mut row.fact, *selected) {
                         (Fact::Issue(i), LogKind::Claims) => {
-                            i.claim_at = events.last().map(|e| e.event_at.clone());
+                            if let Some(event) = events.last()
+                                && i.claim_at
+                                    .as_deref()
+                                    .and_then(|at| epoch(at).ok())
+                                    .is_none_or(|old| {
+                                        epoch(&event.event_at).is_ok_and(|new| new > old)
+                                    })
+                            {
+                                i.claim_at = Some(event.event_at.clone());
+                            }
                         }
                         (Fact::Issue(i), LogKind::Movement) => {
                             i.movement_complete = true;
@@ -493,14 +503,26 @@ fn apply(
                                 && let NativeRecord::Diff { pr, repin_only } = &event.record
                                 && pr == &entity
                             {
-                                p.repin_only = Some(*repin_only);
-                                row.attribution = event.attribution.clone();
+                                if p.repin_only.is_some_and(|native| native != *repin_only) {
+                                    conflict=Some("conflicting native/exported substantive diff classifications".into());
+                                } else {
+                                    p.repin_only = Some(*repin_only);
+                                    row.attribution = event.attribution.clone();
+                                }
                             }
                         }
                         _ => {}
                     }
                 }
                 let mut source = make_stamp(log, events, check);
+                source.evidence_refs.push(format!(
+                    "file:{}#coverage:{selected:?}:{entity}",
+                    input.path.display()
+                ));
+                if let Some(reason) = conflict {
+                    source.complete = false;
+                    source.reason = Some(reason);
+                }
                 if *selected == LogKind::Gates
                     && success
                     && events.iter().any(|e| !valid_attribution(e))
