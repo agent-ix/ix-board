@@ -43,7 +43,8 @@ fn measure(rows: Vec<Observation>) -> BTreeMap<String,Measurement> {
 }
 fn host() -> OperationFact {
     OperationFact::Host(HostFact { host: "host".into(),capacity_units: Some(3),used_units: Some(4),
-        load_one: Some(6.0),disk_available_bytes: Some(800),filesystem: Some("fs-native-id".into()),source_error: None })
+        load_one: Some(6.0),disk_available_bytes: Some(800),filesystem: Some("fs-native-id".into()),source_error: None,
+        sample_observed_at: Some(at(0.0)) })
 }
 fn scalar(metrics: &BTreeMap<String,Measurement>,id: &str) -> f64 {
     match metrics[id].value.as_ref().expect(id) { Value::Scalar(n) => *n,other => panic!("{id}: {other:?}") }
@@ -296,4 +297,48 @@ fn operational_file_adapter_reads_actual_normalized_exports_and_retains_read_err
     assert_eq!(keyed(&collect(&config(),&evidence).0,"host_slots_used","host"),4.0);
     op.evidence_files.push(directory.path().join("missing.json"));
     assert_eq!(collect(&config(),&read_operational_files(&op,&config().scope)).0["host_slots_used"].value,None);
+}
+
+#[trace("FR-029-AC-4", "FR-029-AC-9", "FR-029-AC-10")]
+#[test]
+fn released_scheduler_status_export_is_consumed_without_reading_private_state_or_running_a_command() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("scheduler-status.json");
+    let mut export = serde_json::json!({
+        "schema_version":1,"store_id":"store-a","host":"host","observed_at_ms":1800000000000_u64,
+        "capacity_units":3,"used_units":1,"free_units":2,"overcommit_units":0,
+        "sample":{"host":"host","observed_at_ms":1800000000000_u64,"memory_available_bytes":10000,
+            "disk_available_bytes":3000,"load_one":1.5},
+        "source_error":null,"pruned_events":0,"next_event_sequence":3,
+        "requests":[{"request_id":"store-a:r1","owner":LANE,"ticket":"ticket-native-id","state":"running",
+            "units":1,"priority":0,"enqueued_at_ms":1799999280000_u64,"started_at_ms":1799999400000_u64,
+            "ended_at_ms":null,"wait_ms":120000,"hold_ms":600000,"suspect":false,"reason":null,"exit_code":null,"signal":null}],
+        "events":[{"schema_version":1,"event_id":"store-a:e1","request_id":"store-a:r1","host":"host",
+            "owner":LANE,"ticket":"ticket-native-id","observed_at_ms":1799999280000_u64,"state":"queued",
+            "units":1,"priority":0,"capacity_units":3,"free_units":3,"wait_ms":0,"hold_ms":null,"reason":null},
+            {"schema_version":1,"event_id":"store-a:e2","request_id":"store-a:r1","host":"host",
+            "owner":LANE,"ticket":"ticket-native-id","observed_at_ms":1799999400000_u64,"state":"running",
+            "units":1,"priority":0,"capacity_units":3,"free_units":2,"wait_ms":120000,"hold_ms":0,"reason":null}]
+    });
+    std::fs::write(&path,serde_json::to_vec(&export).unwrap()).unwrap();
+    let mut op = operations(); op.scheduler_files.insert("host".into(),path.clone());
+    let run = || collect_operations(&config(),&op,Frame { now: END,window_secs: 3600,end_exclusive: false },
+        &read_operational_files(&op,&config().scope)).0;
+    let metrics = run();
+    assert_eq!(keyed(&metrics,"host_slots_used","host"),1.0);
+    assert_eq!(keyed(&metrics,"host_load_per_slot","host"),0.5);
+    assert_eq!(keyed(&metrics,"disk_headroom_bytes","host"),2000.0);
+    assert_eq!(duration(&metrics,"queue_wait_minutes","host/started_wait").median,2.0);
+    assert_eq!(duration(&metrics,"lock_hold_minutes","host/running_age").median,10.0);
+    export["sample"]["observed_at_ms"] = serde_json::json!(1799999939000_u64);
+    std::fs::write(&path,serde_json::to_vec(&export).unwrap()).unwrap();
+    let metrics = run();
+    assert_eq!(metrics["host_load_per_slot"].status,Status::Unavailable);
+    assert_eq!(keyed(&metrics,"host_slots_used","host"),1.0);
+    export["pruned_events"] = serde_json::json!(1);
+    std::fs::write(&path,serde_json::to_vec(&export).unwrap()).unwrap();
+    assert_eq!(run()["queue_wait_minutes"].status,Status::Unavailable);
+    export["schema_version"] = serde_json::json!(2);
+    std::fs::write(&path,serde_json::to_vec(&export).unwrap()).unwrap();
+    assert!(run()["host_slots_used"].reason.as_deref().unwrap().contains("schema_version"));
 }

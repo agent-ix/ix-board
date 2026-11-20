@@ -70,7 +70,9 @@ wire! {
         /// Native filesystem identity for the sample.
         filesystem: Option<String>,
         /// Resource collection failure retained independently from scheduler occupancy.
-        source_error: Option<String>
+        source_error: Option<String>,
+        /// Actual resource observation timestamp, independent from lease-state observation.
+        sample_observed_at: Option<String>
     }
 }
 wire! {
@@ -429,6 +431,7 @@ impl<'a> Calculator<'a> {
             "prompt_timeout_unconfirmed" | "order_unacked_age_minutes" => self.relay(id),
             "refusals_by_lane" | "frozen_denial_hours" => self.denials(id),
             "reconciliation_agreement_ratio" | "reconciliation_unpaired" => self.reconcile(id),
+            "source_age_hours" => self.source_ages(),
             "instruction_version_mismatches" => self.instructions(),
             "decisions_open" | "decision_oldest_hours" | "ruling_waiting_issues" |
             "spec_merge_waiting_issues" => self.decisions(id),
@@ -444,12 +447,24 @@ impl<'a> Calculator<'a> {
         if self.config.scope.hosts.is_empty() { return Err("missing explicit host selectors".into()); }
         let latest = self.latest(&p)?;
         let mut values = BTreeMap::new();
+        let mut required_age = p.age;
         for selector in &self.config.scope.hosts {
-            let f = latest.iter().find_map(|(_, f)| match f {
-                OperationFact::Host(f) if f.host == selector.id => Some(f), _ => None,
+            let (row,f) = latest.iter().find_map(|(row, f)| match f {
+                OperationFact::Host(f) if f.host == selector.id => Some((*row,f)), _ => None,
             }).ok_or_else(|| format!("host {} telemetry unavailable", selector.id))?;
             let capacity = || f.capacity_units.ok_or("host capacity unavailable");
             let used = || f.used_units.ok_or("host occupied units unavailable");
+            if matches!(id,"host_load_per_slot"|"disk_headroom_bytes"|"disk_available_bytes") {
+                let at = epoch(f.sample_observed_at.as_deref().ok_or("missing host resource sample timestamp")?)?;
+                let age = self.frame.now - at;
+                let limit = self.batches.iter().filter(|b| b.observations.iter().any(|r| r.event_id == row.event_id))
+                    .filter_map(|b| self.config.freshness_seconds.get(&b.source)).min()
+                    .ok_or("missing host resource sample freshness policy")?;
+                if age > *limit as f64 || age < -(self.config.clock_tolerance_seconds as f64) {
+                    return Err("stale or clock-skewed host resource sample".into());
+                }
+                required_age = required_age.max(age.max(0.0));
+            }
             let disk = || -> Result<u64, String> {
                 if let Some(reason) = &f.source_error { return Err(reason.clone()); }
                 if f.filesystem.as_ref().is_none_or(String::is_empty) {
@@ -479,7 +494,9 @@ impl<'a> Calculator<'a> {
             };
             values.insert(f.host.clone(), value);
         }
-        self.finish(&p, Value::Keyed(values), None)
+        let mut outcome = self.finish(&p, Value::Keyed(values), None)?;
+        outcome.age = required_age;
+        Ok(outcome)
     }
     fn requests(&self, id: &str) -> Result<Outcome, String> {
         let p = self.population("scheduler_request")?;
@@ -653,13 +670,41 @@ impl<'a> Calculator<'a> {
     fn instructions(&self) -> Result<Outcome, String> {
         let p = self.population("instruction")?;
         let mut count = 0_u64;
+        let mut lanes = BTreeSet::new();
         for (_, fact) in self.latest(&p)? {
             let OperationFact::Instruction(f) = fact else { continue; };
+            lanes.insert(f.lane.as_str());
             let claimed = f.claimed.as_ref().filter(|s| !s.is_empty()).ok_or("instruction claim unavailable")?;
             let actual = f.actual.as_ref().filter(|s| !s.is_empty()).ok_or("resolved installed instruction version unavailable")?;
             count += u64::from(claimed != actual);
         }
+        for lane in &self.config.scope.lanes {
+            if !lanes.contains(lane.id.as_str()) { return Err(format!("lane {} installed instruction evidence unavailable",lane.id)); }
+        }
         self.scalar(&p, count as f64)
+    }
+    fn source_ages(&self) -> Result<Outcome,String> {
+        let mut values = BTreeMap::new();
+        let mut refs = BTreeSet::new();
+        let mut age: f64 = 0.0;
+        for source in self.config.freshness_seconds.keys() {
+            let batches: Vec<_> = self.batches.iter().filter(|b| b.source == *source).collect();
+            if batches.is_empty() { return Err(format!("source {source} unavailable")); }
+            let mut oldest: f64 = 0.0;
+            for batch in batches {
+                if !batch.reasons.is_empty() { return Err(format!("source {source} incomplete: {:?}",batch.reasons)); }
+                let observed = epoch(batch.observed_at.as_deref().ok_or("missing source observation timestamp")?)?;
+                let seconds = self.frame.now - observed;
+                if seconds < -(self.config.clock_tolerance_seconds as f64) { return Err("future source observation timestamp".into()); }
+                oldest = oldest.max(seconds.max(0.0));
+                refs.extend(batch.observations.iter().map(|r| r.event_id.clone()));
+            }
+            values.insert(source.clone(),oldest/3600.0);
+            age = age.max(oldest);
+        }
+        if values.is_empty() { return Err("missing configured source population".into()); }
+        Ok(Outcome { population: u64::try_from(values.len()).map_err(|_| "source population overflow")?,
+            value: Value::Keyed(values),age,denominator: None,refs: refs.into_iter().collect() })
     }
     fn decisions(&self, id: &str) -> Result<Outcome, String> {
         let p = self.population("decision")?;
@@ -789,7 +834,7 @@ impl<'a> Calculator<'a> {
         let lookback = self.config.parameters.loop_lookback_seconds.ok_or("missing loop_lookback_seconds")?;
         let repeat = self.config.parameters.loop_repeat_count.filter(|n| *n > 0).ok_or("missing positive loop_repeat_count")?;
         let mut previous: BTreeMap<(&str,&str),(&Observation,&OrderFact)> = BTreeMap::new();
-        let mut groups: BTreeMap<(&str,&str),Vec<&Observation>> = BTreeMap::new();
+        let mut groups: BTreeMap<(&str,&str),(u64,Vec<&Observation>)> = BTreeMap::new();
         for (row,fact) in self.ordered_orders(&p,Some(self.frame.now-lookback as f64))? {
             let OperationFact::Order(f) = fact else { continue; };
             let key = (f.lane.as_str(),f.action_key.as_deref().ok_or("missing action key")?);
@@ -797,7 +842,8 @@ impl<'a> Calculator<'a> {
                 if f.supersedes_order_id.as_deref() == Some(&old.order_id)
                     && f.reverses_order_id.as_deref() == Some(&old.order_id)
                     && f.direction != old.direction && f.evidence_revision == old.evidence_revision {
-                    let rows = groups.entry(key).or_default();
+                    let (flips,rows) = groups.entry(key).or_default();
+                    *flips += 1;
                     if rows.last().is_none_or(|r| r.event_id != old_row.event_id) { rows.push(old_row); }
                     rows.push(row);
                 }
@@ -805,8 +851,8 @@ impl<'a> Calculator<'a> {
             previous.insert(key,(row,f));
         }
         let mut findings = Vec::new();
-        for ((lane,action),rows) in groups {
-            if rows.len().saturating_sub(1) < usize::try_from(repeat).map_err(|_| "repeat count overflow")? { continue; }
+        for ((lane,action),(flips,rows)) in groups {
+            if flips < repeat { continue; }
             if let (Some(first),Some(last)) = (rows.first(),rows.last()) {
                 let event_ids: Vec<_> = rows.iter().map(|r| r.event_id.clone()).collect();
                 findings.push(LoopFinding {
@@ -859,7 +905,7 @@ const OPERATIONAL_METRICS: &[&str] = &[
     "lock_hold_minutes","host_load_per_slot","disk_headroom_bytes","disk_available_bytes",
     "login_blocked_lanes","order_unacked_age_minutes","lane_no_movement_hours",
     "refusals_by_lane","frozen_denial_hours","repeated_orders","reconciliation_agreement_ratio",
-    "reconciliation_unpaired","instruction_version_mismatches","relay_queued","relay_delivered",
+    "reconciliation_unpaired","source_age_hours","instruction_version_mismatches","relay_queued","relay_delivered",
     "relay_acknowledged","prompt_timeout_unconfirmed","ruling_waiting_issues",
     "spec_merge_waiting_issues","messages_per_sender","correction_rate","status_only_messages",
     "planner_ad_hoc_assignments","planner_scope_violations","planner_unbatched_sends",
@@ -912,12 +958,14 @@ struct SchedulerReport {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[expect(dead_code, reason = "Decode the complete redacted upstream wire contract, including display-only fields.")]
 struct HostSample {
     host: String, observed_at_ms: u64, memory_available_bytes: u64,
     disk_available_bytes: u64, load_one: f64,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[expect(dead_code, reason = "Decode the complete redacted upstream wire contract, including display-only fields.")]
 struct SchedulerRequest {
     request_id: String, owner: String, ticket: String, state: RequestPhase, units: u32,
     priority: u32, enqueued_at_ms: u64, started_at_ms: Option<u64>, ended_at_ms: Option<u64>,
@@ -926,6 +974,7 @@ struct SchedulerRequest {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[expect(dead_code, reason = "Decode the complete redacted upstream wire contract, including display-only fields.")]
 struct SchedulerEvent {
     schema_version: u32, event_id: String, request_id: String, host: String, owner: String,
     ticket: String, observed_at_ms: u64, state: RequestPhase, units: u32, priority: u32,
@@ -948,19 +997,19 @@ fn scheduler_evidence(report: SchedulerReport, expected_host: &str, path: &std::
     let mut evidence = Evidence { source: format!("scheduler:{expected_host}"),observed_at: Some(observed.clone()),
         complete: ["host".into(),"scheduler_request".into()].into(),..Default::default() };
     let source = format!("file:{}",path.display());
-    let host_time = report.sample.as_ref().map_or(report.observed_at_ms,|s| s.observed_at_ms);
     if report.sample.as_ref().is_some_and(|s| s.host != expected_host) {
         return Err("scheduler host sample identity mismatch".into());
     }
     evidence.observations.push(Observation {
         event_id: format!("{}:host:{}",report.store_id,report.observed_at_ms),entity_id: expected_host.into(),
-        event_at: Some(milliseconds(host_time)),observed_at: Some(milliseconds(host_time)),sequence: None,
+        event_at: Some(observed.clone()),observed_at: Some(observed.clone()),sequence: None,
         scope: scope.clone(),complete: true,source_ref: source.clone(),attribution: None,
         fact: Fact::Operation(OperationFact::Host(HostFact { host: expected_host.into(),
             capacity_units: Some(u64::from(report.capacity_units)),used_units: Some(u64::from(report.used_units)),
             load_one: report.sample.as_ref().map(|s| s.load_one),
             disk_available_bytes: report.sample.as_ref().map(|s| s.disk_available_bytes),
-            filesystem: config.filesystems.get(expected_host).cloned(),source_error: report.source_error })),
+            filesystem: config.filesystems.get(expected_host).cloned(),source_error: report.source_error,
+            sample_observed_at: report.sample.as_ref().map(|s| milliseconds(s.observed_at_ms)) })),
     });
     let mut seen = BTreeSet::new();
     for request in report.requests {
