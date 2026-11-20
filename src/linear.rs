@@ -1702,6 +1702,7 @@ mod tests {
         Issue, IssueId, Project, ProjectId, ProjectMutationSource, ProjectPriority,
         ProjectRunStatus, ReadService, TeamKey, WorkspaceSnapshot, WorkspaceSource,
     };
+    use ix_trace_rs::trace;
     use serde_json::Value;
     use sha2::{Digest, Sha256};
     use std::io::{Read, Write};
@@ -1927,7 +1928,7 @@ mod tests {
         responses
     }
 
-    /// Trace: FR-011-AC-3, FR-011-AC-5, FR-011-AC-6, FR-004-AC-8
+    #[trace("FR-011-AC-3", "FR-011-AC-5", "FR-011-AC-6", "FR-004-AC-8")]
     #[test]
     fn workspace_relations_paginate_both_directions_and_deduplicate_stable_endpoints() {
         let mut issue = relation_issue("hub");
@@ -1987,7 +1988,7 @@ mod tests {
         );
     }
 
-    /// Trace: FR-011-AC-5, FR-004-AC-3
+    #[trace("FR-011-AC-5", "FR-004-AC-3")]
     #[test]
     fn workspace_relations_refuse_incomplete_pages_without_caching_partial_snapshots() {
         for incoming in [false, true] {
@@ -2054,7 +2055,7 @@ mod tests {
         }
     }
 
-    /// Trace: FR-011-AC-3, FR-011-AC-5, FR-011-AC-6
+    #[trace("FR-011-AC-3", "FR-011-AC-5", "FR-011-AC-6")]
     #[test]
     fn paginated_relations_preserve_transitive_focus_blocker_order() {
         let mut hub = relation_issue("hub");
