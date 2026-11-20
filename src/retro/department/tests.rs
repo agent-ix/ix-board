@@ -1017,3 +1017,141 @@ fn independent_same_time_entities_need_no_cross_entity_order_and_same_state_upda
     );
     assert_eq!(report.loops["state_bounce_loop"].status, Status::Ok);
 }
+
+#[trace("FR-029-AC-3", "FR-029-AC-4")]
+#[test]
+fn review_regression_reachable_external_blockers_require_valid_evidence_and_are_persisted() {
+    let c = config();
+    let mut gate = issue(true);
+    gate.blockers = ["external".into()].into();
+    let mut external = issue(false);
+    external.team = "OTHER".into();
+    let mut b = batch(vec![
+        row("gate", "issue-a", 0.0, Fact::Issue(gate)),
+        row("external-event", "external", 0.0, Fact::Issue(external)),
+    ]);
+    b.observations[1].complete = false;
+    assert_eq!(
+        collect_rows(&c, &b).measurements["open_chain_length"].status,
+        Status::Unavailable
+    );
+    b.observations[1].complete = true;
+    b.observations[1].observed_at = Some(at(-61.0));
+    assert_eq!(
+        collect_rows(&c, &b).measurements["open_chain_length"].status,
+        Status::Unavailable
+    );
+    b.observations[1].observed_at = Some(at(0.0));
+    let report = collect_rows(&c, &b);
+    assert_eq!(scalar(&report, "open_chain_length"), 1.0);
+    assert!(
+        report
+            .observations
+            .iter()
+            .any(|o| o.event_id == "external-event")
+    );
+    assert!(
+        report.measurements["open_chain_length"]
+            .evidence_refs
+            .contains(&"external-event".into())
+    );
+    assert_eq!(scalar(&report, "wip_active"), 1.0);
+}
+
+#[trace("FR-029-AC-8")]
+#[test]
+fn review_regression_state_bounce_retains_boundary_context_and_counts_inside_returns() {
+    let mut c = config();
+    c.parameters.loop_lookback_seconds = Some(100);
+    let mut rows = vec![row("issue", "issue-a", 0.0, Fact::Issue(issue(true)))];
+    for (id, time, state) in [
+        ("context-a", -110.0, "A"),
+        ("b1", -90.0, "B"),
+        ("a1", -80.0, "A"),
+        ("b2", -70.0, "B"),
+        ("a2", -60.0, "A"),
+    ] {
+        rows.push(row(
+            id,
+            "issue-a",
+            time,
+            Fact::State(StateFact {
+                state: state.into(),
+            }),
+        ));
+    }
+    let report = collect_rows(&c, &batch(rows));
+    assert_eq!(report.loops["state_bounce_loop"].status, Status::Ok);
+    assert_eq!(report.loops["state_bounce_loop"].findings.len(), 1);
+    assert_eq!(
+        report.loops["state_bounce_loop"].findings[0].event_ids,
+        ["context-a", "a1", "a2"]
+    );
+}
+
+#[trace("FR-029-AC-12")]
+#[test]
+fn review_regression_observed_unknown_preserves_other_lanes_and_compares_categorically() {
+    let mut c = config();
+    c.scope.lanes.push(Selector {
+        id: "second:team:code".into(),
+        label: "Second".into(),
+    });
+    let lifecycle = LifecycleFact {
+        source_schema_version: "agents-1".into(),
+        verdict: crate::agents::Verdict::Working,
+        partial: false,
+        workers: Vec::new(),
+        availability: crate::agents::AgentAvailability::default(),
+        active_direct_workers: Some(0),
+        active_nested_workers: Some(0),
+        live_subagents: Some(0),
+        last_turn_age_secs: None,
+        subagent_age_secs: None,
+        recent_activity_at: None,
+        host_now: 0,
+        collection_started_at: 0,
+        collection_finished_at: 0,
+        notes: vec!["native timestamp unavailable".into()],
+    };
+    let mut b = batch(vec![
+        row(
+            "first",
+            "host:workspace:code",
+            0.0,
+            Fact::Lifecycle(lifecycle.clone()),
+        ),
+        row(
+            "second",
+            "second:team:code",
+            0.0,
+            Fact::Lifecycle(lifecycle),
+        ),
+    ]);
+    b.complete.insert("lifecycle".into());
+    let before = collect_rows(&c, &b);
+    if let Fact::Lifecycle(l) = &mut b.observations[1].fact {
+        l.verdict = crate::agents::Verdict::Unknown;
+        l.partial = true;
+        l.active_direct_workers = None;
+        l.notes.push("worker lifecycle source unavailable".into());
+    }
+    let after = collect_rows(&c, &b);
+    let Some(Value::SourceObservation(values)) =
+        after.measurements["lane_execution_state"].value.as_ref()
+    else {
+        panic!("explicitly observed UNKNOWN remains categorical evidence")
+    };
+    assert_eq!(values["host:workspace:code"].category, "WORKING");
+    assert_eq!(values["second:team:code"].category, "UNKNOWN");
+    let result = compare(
+        &after.measurements["lane_execution_state"],
+        before.measurements.get("lane_execution_state"),
+    );
+    assert_eq!(result.state, ComparisonState::Changed);
+    assert!(result.changes.is_empty());
+    assert_eq!(
+        serde_json::from_str::<Report>(&serde_json::to_string(&after).unwrap()).unwrap(),
+        after
+    );
+}
