@@ -115,6 +115,66 @@ impl LiveLinear {
 }
 
 impl LinearSource for LiveLinear {
+    fn department_evidence(
+        &self,
+        scope: &super::department::Scope,
+        since: f64,
+    ) -> super::department::Evidence {
+        let snapshot = match self.workspace(since) {
+            Ok(snapshot) => snapshot,
+            Err(reason) => {
+                return super::department::Evidence {
+                    source: "linear".into(),
+                    reasons: [("issue".into(), reason)].into(),
+                    ..Default::default()
+                };
+            }
+        };
+        let mut evidence = super::department::workspace_evidence(&snapshot, scope);
+        let observed = evidence.observed_at.clone().unwrap_or_default();
+        let issues: Vec<_> = snapshot
+            .issues
+            .iter()
+            .filter(|i| {
+                (scope.teams.is_empty() || scope.teams.iter().any(|s| s.id == i.team_key.0))
+                    && (scope.projects.is_empty()
+                        || i.project_id
+                            .as_ref()
+                            .is_some_and(|id| scope.projects.iter().any(|s| s.id == id.0)))
+            })
+            .collect();
+        let histories = parallel_map(&issues, |issue| {
+            self.source
+                .fetch_department_state_events(&issue.id.0, scope, &observed)
+        });
+        let mut complete = true;
+        for history in histories {
+            match history {
+                Ok(rows) => evidence.observations.extend(rows),
+                Err(reason) => {
+                    complete = false;
+                    evidence.reasons.insert("state".into(), reason);
+                }
+            }
+        }
+        if complete {
+            evidence.complete.insert("state".into());
+            evidence.reasons.remove("state");
+        }
+        for row in &mut evidence.observations {
+            if matches!(row.fact, super::department::Fact::Issue(_))
+                && issues.iter().any(|issue| issue.id.0 == row.entity_id)
+            {
+                let history = self.source.fetch_state_changes(&row.entity_id);
+                super::department::enrich_claim_history(
+                    row,
+                    history.as_deref().map_err(Clone::clone),
+                    Some(&observed),
+                );
+            }
+        }
+        evidence
+    }
     fn workspace(&self, since: f64) -> Result<WorkspaceSnapshot, String> {
         let mut service = self.service()?;
         let cached = service
@@ -390,6 +450,66 @@ fn check_state(runs: &[CheckRun]) -> CheckState {
 }
 
 impl GithubSource for LiveGithub {
+    fn department_evidence(
+        &self,
+        config: &super::department::Config,
+        since: f64,
+    ) -> super::department::Evidence {
+        let scope = &config.scope;
+        let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(now) => crate::drift::format_timestamp(now.as_secs_f64()),
+            Err(error) => {
+                return super::department::Evidence {
+                    source: "github".into(),
+                    reasons: [("pin".into(), error.to_string())].into(),
+                    ..Default::default()
+                };
+            }
+        };
+        let mut evidence = super::department::collect_pins(scope, &now, |endpoint, raw| {
+            let mut args = strings(&["api", "--method", "GET", endpoint]);
+            if raw {
+                args.extend(strings(&["-H", "Accept: application/vnd.github.raw+json"]));
+            }
+            run("gh", &args)
+        });
+        let mut complete = !scope.repositories.is_empty();
+        for repo in &scope.repositories {
+            match self.pull_requests(&repo.id, since) {
+                Ok(prs) => {
+                    for pr in prs {
+                        evidence
+                            .observations
+                            .push(super::department::collect_pull_request(
+                                config,
+                                &pr,
+                                &now,
+                                |endpoint, projection| {
+                                    let mut args = strings(&["api", "--method", "GET", endpoint]);
+                                    if projection == super::department::RAW_CONTENT {
+                                        args.extend(strings(&[
+                                            "-H",
+                                            "Accept: application/vnd.github.raw+json",
+                                        ]));
+                                    } else {
+                                        args.extend(strings(&["--jq", projection]));
+                                    }
+                                    run("gh", &args)
+                                },
+                            ));
+                    }
+                }
+                Err(reason) => {
+                    complete = false;
+                    evidence.reasons.insert("pull_request".into(), reason);
+                }
+            }
+        }
+        if complete {
+            evidence.complete.insert("pull_request".into());
+        }
+        evidence
+    }
     fn pull_requests(&self, repo: &str, since: f64) -> Result<Vec<PullRequest>, String> {
         let mut all = self.list(repo, "[OPEN]", None)?;
         all.extend(self.list(repo, "[MERGED]", Some(since))?);

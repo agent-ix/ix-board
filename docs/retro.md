@@ -1,3 +1,6 @@
+---
+type: reference
+---
 # Retro: snapshot, delta and backfill
 
 `ix-board retro` is a group of three commands that measure whether a team's work is converging on its gate tickets. `retro snapshot` takes a measurement, `retro delta` compares it with the previous one and a baseline, and `retro backfill` builds a baseline from history. The dev-team `team-retro` skill runs these on a schedule and scores the team's roles from the numbers.
@@ -129,3 +132,103 @@ A day that already has a backfill record is skipped and reported. A range contai
 after the last day) is refused, naming that record, and nothing is appended. The
 store rules are those of the snapshot. Linear and GitHub only are read; Herdr, the relay and the
 local sources are not started.
+
+## Department source files
+
+Department source files are read-only exports of authoritative event history and
+classified observations. Configure their paths under `department.parameters`:
+
+```json
+{
+  "event_logs": [
+    {
+      "path": "/var/lib/team-retro/build-audit.json",
+      "source": "build-audit",
+      "kinds": ["movement"]
+    }
+  ]
+}
+```
+
+Add a freshness limit for `build-audit` to `department.freshness_seconds`.
+Relative paths resolve from the command's working directory. Each capability
+has one configured source owner. Missing files, stale observations, denied
+reads and incomplete coverage make dependent measurements unavailable.
+
+An export has `version`, `source`, `observed_at`, `coverage` and `events`.
+The producer records its actual observation time and confirms complete coverage
+through an explicit watermark. This movement export records a complete interval
+with no observed movement:
+
+```json
+{
+  "version": 1,
+  "source": "build-audit",
+  "observed_at": "2027-01-15T08:00:00Z",
+  "coverage": [
+    {
+      "kind": "movement",
+      "entities": ["issue-uuid"],
+      "from": "2027-01-14T08:00:00Z",
+      "until": "2027-01-15T08:00:00Z",
+      "complete": true,
+      "movement_sources": ["pr_head", "commit", "worktree"]
+    }
+  ],
+  "events": []
+}
+```
+
+An empty event list establishes absence only with complete coverage. Movement
+coverage must include all three channels from the latest claim through the
+snapshot time. Claims, blocked-condition history, completion obligations and
+gate histories additionally require `full_history: true`, confirming coverage
+from the subject's origin.
+
+Coverage `kind` selects one of `claims`, `movement`, `blocked`, `completion`,
+`lanes`, `pin_events`, `checks`, `gates` or `diffs`. Coverage `entities` names
+native issue UUIDs for claims/movement/blocked/completion, explicit lane identities
+for lanes, dependency identities for pin events, repository identities for checks,
+and full `owner/repository#number` identities for gates/diffs.
+
+Each event carries `event_id`, `entity_id`, `event_at`, nullable `sequence`,
+`source_ref`, nullable `attribution` and a typed `record`. Equal timestamps require
+native sequence evidence. The record kinds and their additional fields are:
+
+- `claim`: a genuine claim or start event.
+- `movement`: `channel`, one of `pr_head`, `commit` or `worktree`.
+- `blocked`: the observed `blocked` boolean after a condition transition.
+- `obligation`: the obligation `name` and its observed `met` boolean.
+- `lane`: verified `idle` and structured `ready_issue_ids` assigned to that lane.
+- `tag`: the selected native `dependency` and actual tag publication time.
+- `repin`: `dependency` and `repository` for an actual committed resolution change.
+- `check`: `repository`, nullable full `pr`, and explicit `scope`, either
+  `focused` or `workspace`.
+- `gate`: full `pr` for a completed aggregate gate invocation.
+- `diff`: full `pr` and the classified `repin_only` boolean.
+
+Diff, check and gate records require attribution with `actor`,
+`classifier_version`, `offset_start` and `offset_end`. Producers supply these
+facts from their own instrumented records or audited exports. Legacy gate logs
+provide PR numbers, invocation kinds and timestamps; richer classifications
+require an attributed export with explicit identities and coverage.
+
+Set `department.parameters.dependencies` to the native dependencies covered by
+pin-event exports. Their coverage must include the configured loop lookback and
+the snapshot window plus the tag-to-repin interval. Actual publication events
+establish tag time; target commit timestamps alone leave publication unknown.
+
+GitHub collection reads assigned review requests, submitted reviews and explicit
+ready-for-review timeline events. Configure `qualifying_review_states` with the
+native review states that count, such as `APPROVED` and `CHANGES_REQUESTED`.
+Missing readiness events or incomplete pages leave reviewer age unavailable.
+
+The built-in `cargo-revisions-v1` diff classifier compares exact base/head file
+contents. It accepts dependency revision selectors and lock resolution changes,
+retains workspace package versions as substantive changes, and ignores TOML
+formatting. Configure it through `department.parameters.diff_classifier`.
+
+Native tracker history supplies genuine Started entries. Structured attachments
+supply exact PR merge joins. Completion obligation records supply their separate
+satisfaction evidence. Enrichment retains each field's source age and references;
+conflicting classifications remain unavailable.

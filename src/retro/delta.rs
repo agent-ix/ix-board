@@ -74,6 +74,9 @@ pub struct MetricDelta {
 /// The delta report. There is deliberately no combined score.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct DeltaReport {
+    /// Offline department comparisons when the latest record has an envelope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub department: Option<super::department::Delta>,
     /// Team of the store.
     pub team: String,
     /// Set when no delta exists.
@@ -97,6 +100,7 @@ pub struct DeltaReport {
 
 /// Compares the stored records of the configured team. Reads no source.
 pub fn run_delta(config: &RetroConfig, store: &Store) -> Result<DeltaReport, RetroError> {
+    config.validate_department()?;
     let records = store.read_all()?;
     let baseline = match &config.baseline_taken_at {
         Some(wanted) => {
@@ -116,6 +120,7 @@ pub fn run_delta(config: &RetroConfig, store: &Store) -> Result<DeltaReport, Ret
         .collect::<Vec<_>>();
     let [.., previous, latest] = snapshots.as_slice() else {
         return Ok(DeltaReport {
+            department: None,
             team: config.team.clone(),
             message: Some(format!(
                 "no delta: {} snapshot record(s) in the store, two are needed",
@@ -159,6 +164,13 @@ pub fn run_delta(config: &RetroConfig, store: &Store) -> Result<DeltaReport, Ret
         })
         .collect();
     Ok(DeltaReport {
+        department: latest.department.as_ref().map(|report| {
+            super::department::delta(
+                report,
+                previous.department.as_ref(),
+                baseline.department.as_ref(),
+            )
+        }),
         team: config.team.clone(),
         message: None,
         latest: Some(latest.taken_at.clone()),
@@ -265,5 +277,13 @@ pub fn render_delta_text(report: &DeltaReport) -> String {
             }
         )
     }));
+    if let Some(department) = &report.department {
+        for (id, class) in &department.current.classes {
+            lines.push(format!(
+                "{id}: {:?}; complete={}; route={:?}; missing={:?}",
+                class.summary.severity, class.summary.complete, class.route, class.summary.missing
+            ));
+        }
+    }
     lines.join("\n")
 }

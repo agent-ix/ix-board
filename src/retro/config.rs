@@ -82,6 +82,9 @@ pub struct MainCheck {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetroConfig {
+    /// Optional versioned department evidence and assessment configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub department: Option<super::department::Config>,
     /// Store directory name and default Linear team key.
     pub team: String,
     /// Linear team keys whose open issues count toward scope metrics; defaults to `team`.
@@ -157,6 +160,31 @@ impl RetroConfig {
                 });
             }
         }
+        if let Some(policies) = value
+            .get("department")
+            .and_then(|d| d.get("policies"))
+            .and_then(serde_json::Value::as_array)
+        {
+            for policy in policies {
+                for (field, variants) in [
+                    ("comparator", &["gt", "gte", "lt", "lte"][..]),
+                    ("statistic", &["value", "count", "median", "p90"][..]),
+                    (
+                        "basis",
+                        &["current", "since_previous", "since_baseline"][..],
+                    ),
+                    ("key_reduction", &["worst_severity"][..]),
+                ] {
+                    if let Some(selected) = policy.get(field).filter(|v| !v.is_null())
+                        && !selected.as_str().is_some_and(|s| variants.contains(&s))
+                    {
+                        return Err(invalid(format!(
+                            "department.policies.{field}: invalid selection {selected}"
+                        )));
+                    }
+                }
+            }
+        }
         let mut config: Self =
             serde_json::from_value(value).map_err(|error| invalid(error.to_string()))?;
         if config.team.trim().is_empty() {
@@ -178,7 +206,22 @@ impl RetroConfig {
                 message: format!("{baseline:?} is not a UTC timestamp"),
             });
         }
+        config.validate_department()?;
         Ok(config)
+    }
+
+    /// Validates department configuration before any source or store operation.
+    pub fn validate_department(&self) -> Result<(), ConfigError> {
+        if let Some(department) = &self.department {
+            department
+                .validate()
+                .map_err(|message| ConfigError::BadValue {
+                    path: PathBuf::from("<department>"),
+                    field: "department",
+                    message,
+                })?;
+        }
+        Ok(())
     }
 }
 

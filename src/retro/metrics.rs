@@ -550,7 +550,7 @@ fn gate_issues<'a>(scope: &Scope<'a>) -> Result<Vec<&'a Issue>, String> {
 }
 
 /// Splits a GitHub pull request URL into repository and number.
-fn pull_request_ref(url: &str) -> Option<(String, u64)> {
+pub(crate) fn pull_request_ref(url: &str) -> Option<(String, u64)> {
     let rest = url.split("github.com/").nth(1)?;
     let mut parts = rest.split('/');
     let (owner, name, kind, number) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
@@ -760,7 +760,7 @@ fn decisions(out: &mut Out<'_>, sources: &Sources<'_>) {
 }
 
 /// Fields of a `<!-- reviewer ... -->` first line, or `None` for any other line.
-fn marker_fields(line: &str) -> Option<(&str, BTreeMap<&str, &str>)> {
+pub(crate) fn marker_fields(line: &str) -> Option<(&str, BTreeMap<&str, &str>)> {
     let inner = line
         .trim()
         .strip_prefix("<!--")?
@@ -867,7 +867,7 @@ fn fix_rounds(out: &mut Out<'_>, sources: &Sources<'_>, prs: &Result<Vec<PullReq
 
 /// Reads the `reviewer` markers of the allowed pull requests, then the dispositions of the
 /// review ids those markers carry; nothing else is read.
-fn marker_lines_for(
+pub(crate) fn marker_lines_for(
     sources: &Sources<'_>,
     allowed: &BTreeSet<String>,
 ) -> Result<Vec<String>, String> {

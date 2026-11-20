@@ -2003,6 +2003,7 @@ fn stored(id: &str, value: Option<f64>, query: &str) -> Metric {
 
 fn record(kind: RecordKind, taken_at: &str, metrics: &[(&str, Option<f64>, &str)]) -> Record {
     Record {
+        department: None,
         schema_version: 1,
         kind,
         taken_at: taken_at.to_owned(),
@@ -2878,4 +2879,337 @@ fn lifecycle_working_share_excludes_waiting_recent_and_refuses_unresolved_popula
         rig.agents = Some(Ok(report));
         assert_eq!(value(&snapshot(&rig), "agents_working_share"), None);
     }
+}
+
+fn department_config() -> RetroConfig {
+    let mut c = config();
+    c.department = Some(serde_json::from_value(serde_json::json!({
+        "version": 1, "policy_id": "fixture-policy", "scope": { "teams": [{"id":"SWM", "label":"Team"}] },
+        "freshness_seconds": {"linear": 60}, "clock_tolerance_seconds": 2,
+        "classes": [{"id":"flow_wip", "required":["wip_active"], "route":{"owner":"fixture:team:lead", "action":"assign ready work"}}],
+        "policies": [{"metric_id":"wip_active", "statistic":"value", "unit":"issues", "comparator":"gt", "amber":1, "red":2, "basis":"current", "window_seconds":86400, "freshness_seconds":60}]
+    })).unwrap());
+    c
+}
+
+#[trace("FR-029-AC-1", "FR-029-AC-7", "FR-029-AC-10")]
+#[test]
+fn department_snapshot_appends_v2_preserves_v1_bytes_and_delta_reads_no_collectors() {
+    let rig = base_rig();
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_in(&dir);
+    let legacy = run_snapshot(&config(), DAY, NOW, &rig.sources(), &store).unwrap();
+    let original = std::fs::read(store.path()).unwrap();
+    assert!(
+        !serde_json::to_value(&legacy)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("department")
+    );
+    let config = department_config();
+    let current = run_snapshot(&config, DAY, NOW + 1.0, &rig.sources(), &store).unwrap();
+    assert_eq!(legacy.metrics, current.metrics);
+    assert_eq!(current.schema_version, 2);
+    assert_eq!(current.department.as_ref().unwrap().version, 1);
+    assert!(std::fs::read(store.path()).unwrap().starts_with(&original));
+    rig.calls.borrow_mut().clear();
+    let delta = run_delta(&config, &store).unwrap();
+    let department = delta.department.unwrap();
+    assert_eq!(
+        department.measurements["wip_active"].since_baseline.state,
+        ix_board::retro::department::ComparisonState::Unavailable
+    );
+    assert!(rig.calls.borrow().is_empty());
+    assert_eq!(
+        serde_json::from_str::<Record>(&serde_json::to_string(&current).unwrap()).unwrap(),
+        current
+    );
+    assert!(
+        ix_board::retro::render_text(&current).contains("unrouted")
+            || ix_board::retro::render_text(&current).contains("Unrouted")
+    );
+}
+
+#[trace("FR-029-AC-5", "FR-029-AC-10")]
+#[test]
+fn invalid_department_config_or_store_versions_refuse_before_reads_and_appends() {
+    let rig = base_rig();
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_in(&dir);
+    let mut c = department_config();
+    c.department.as_mut().unwrap().version = 99;
+    let error = run_snapshot(&c, DAY, NOW, &rig.sources(), &store).unwrap_err();
+    assert!(error.to_string().contains("department.version"));
+    assert!(rig.calls.borrow().is_empty());
+    assert!(!store.path().exists());
+    let valid = run_snapshot(&config(), DAY, NOW, &rig.sources(), &store).unwrap();
+    let before = std::fs::read(store.path()).unwrap();
+    let mut invalid = valid.clone();
+    invalid.schema_version = 99;
+    assert!(
+        store
+            .append(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("schema_version")
+    );
+    assert_eq!(std::fs::read(store.path()).unwrap(), before);
+    invalid = valid;
+    invalid.schema_version = 2;
+    let mut report = ix_board::retro::department::collect(
+        c.department.as_ref().unwrap(),
+        ix_board::retro::Frame {
+            now: NOW,
+            window_secs: DAY,
+            end_exclusive: false,
+        },
+        &[],
+        &BTreeMap::new(),
+    );
+    report.version = 99;
+    invalid.department = Some(report);
+    assert!(
+        store
+            .append(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("department.version")
+    );
+    assert_eq!(std::fs::read(store.path()).unwrap(), before);
+}
+
+#[trace("FR-029-AC-1", "FR-029-AC-3")]
+#[test]
+fn department_backfill_keeps_current_gauges_unavailable_without_invented_history() {
+    let rig = base_rig();
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_in(&dir);
+    let c = department_config();
+    let day = ix_board::retro::parse_day("2026-11-05").unwrap();
+    let report = run_backfill(&c, DAY, (day, Some(day)), NOW, (&rig, &rig), &store).unwrap();
+    assert_eq!(report.appended.len(), 1);
+    assert_eq!(report.appended[0].schema_version, 2);
+    let department = report.appended[0].department.as_ref().unwrap();
+    assert_eq!(
+        department.measurements["wip_active"].status,
+        Status::Unavailable
+    );
+    assert!(department.observations.is_empty());
+}
+
+#[trace("FR-029-AC-12")]
+#[test]
+fn categorical_lifecycle_keeps_partial_source_counts_and_provenance_without_transcript_text() {
+    use ix_board::retro::department::{
+        Evidence, Fact, LifecycleFact, Observation, Selector, Value,
+    };
+    let mut c = department_config().department.unwrap();
+    c.scope.lanes = vec![Selector {
+        id: "remote:team:code".into(),
+        label: "Code".into(),
+    }];
+    c.freshness_seconds.insert("lifecycle".into(), 60);
+    let mut source = agent_row(Verdict::Waiting, Some(7));
+    source.partial = true;
+    source.active_direct_workers = None;
+    source.excerpt = Some("private transcript body".into());
+    source.pane_tail = Some("private pane body".into());
+    source.processes = vec!["secret command line".into()];
+    let lifecycle = LifecycleFact::from_agent_row("agents-1", &source);
+    let row = Observation {
+        event_id: "native-lifecycle-row".into(),
+        entity_id: "remote:team:code".into(),
+        event_at: Some(iso(NOW)),
+        observed_at: Some(iso(NOW)),
+        sequence: None,
+        scope: c.scope.clone(),
+        complete: false,
+        source_ref: "herdr:remote:pane-id".into(),
+        attribution: None,
+        fact: Fact::Lifecycle(lifecycle.clone()),
+    };
+    let evidence = Evidence {
+        source: "lifecycle".into(),
+        observed_at: Some(iso(NOW)),
+        complete: ["lifecycle".into()].into(),
+        reasons: BTreeMap::new(),
+        observations: vec![row],
+    };
+    let report = ix_board::retro::department::collect(
+        &c,
+        ix_board::retro::Frame {
+            now: NOW,
+            window_secs: DAY,
+            end_exclusive: false,
+        },
+        &[evidence],
+        &BTreeMap::new(),
+    );
+    let Value::SourceObservation(values) = report.measurements["lane_execution_state"]
+        .value
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected categorical evidence")
+    };
+    assert_eq!(values["remote:team:code"].category, "WAITING");
+    assert_eq!(
+        values["remote:team:code"].observation_ref,
+        "native-lifecycle-row"
+    );
+    let Fact::Lifecycle(persisted) = &report.observations[0].fact else {
+        panic!("expected preserved lifecycle source")
+    };
+    assert_eq!(persisted, &lifecycle);
+    assert!(persisted.partial);
+    assert_eq!(persisted.active_direct_workers, None);
+    let json = serde_json::to_string(&report).unwrap();
+    assert!(!json.contains("private transcript body"));
+    assert!(!json.contains("private pane body"));
+    assert!(!json.contains("secret command line"));
+    assert_eq!(
+        serde_json::from_str::<ix_board::retro::department::Report>(&json).unwrap(),
+        report
+    );
+}
+
+struct DepartmentFixtureGithub;
+impl DepartmentFixtureGithub {
+    fn pr(&self) -> PullRequest {
+        PullRequest {
+            repo: "fixture/repo".into(),
+            number: 1,
+            open: false,
+            draft: false,
+            created_at: 1_800_000_000.0 - 100000.0,
+            merged_at: Some(1_800_000_000.0),
+            updated_at: 1_800_000_000.0,
+            additions: 1,
+            deletions: 1,
+            review_decision: None,
+            force_pushes: Some(0),
+        }
+    }
+}
+impl GithubSource for DepartmentFixtureGithub {
+    fn department_evidence(
+        &self,
+        c: &ix_board::retro::department::Config,
+        _: f64,
+    ) -> ix_board::retro::department::Evidence {
+        use ix_board::retro::department::{
+            Evidence, PR_DETAILS, PR_FILES, PR_REVIEWS, PR_TIMELINE, RAW_CONTENT,
+            collect_pull_request,
+        };
+        let at = iso(1_800_000_000.0);
+        let observation = collect_pull_request(c, &self.pr(), &at, |endpoint, projection| {
+            match projection {
+            PR_DETAILS=>Ok(serde_json::json!({"base_sha":"a".repeat(40),"head_sha":"b".repeat(40),"requested_reviewers":0,"requested_teams":0}).to_string()),
+            PR_REVIEWS=>Ok("[]".into()),PR_TIMELINE=>Ok(serde_json::json!([{"id":1,"event":"ready_for_review","created_at":iso(1_800_000_000.0-25200.0)}]).to_string()),
+            PR_FILES=>Ok("[{\"filename\":\"Cargo.toml\",\"status\":\"modified\"}]".into()),
+            RAW_CONTENT=>Ok(format!("[dependencies]\ndep={{git='https://github.com/fixture/dependency',rev='{}'}}\n",if endpoint.contains(&"a".repeat(40)){"a".repeat(40)}else{"b".repeat(40)})),
+            _=>Err("unexpected source projection".into()),
+        }
+        });
+        Evidence {
+            source: "github".into(),
+            observed_at: Some(at),
+            complete: ["pull_request".into()].into(),
+            observations: vec![observation],
+            ..Default::default()
+        }
+    }
+    fn pull_requests(&self, _: &str, _: f64) -> Result<Vec<PullRequest>, String> {
+        Ok(vec![self.pr()])
+    }
+    fn pull_request(&self, repo: &str, number: u64) -> Result<PullRequestInfo, String> {
+        assert_eq!((repo, number), ("fixture/repo", 1));
+        Ok(PullRequestInfo {
+            merged: true,
+            updated_at: 1_800_000_000.0,
+        })
+    }
+    fn main_commits(&self, _: &str, _: &str, _: f64) -> Result<Vec<MainCommit>, String> {
+        Err("fixture has no main-check source".into())
+    }
+}
+
+#[trace("FR-029-AC-1", "FR-029-AC-3", "FR-029-AC-4", "FR-029-AC-8")]
+#[test]
+fn configured_native_http_and_export_file_flow_through_snapshot_store_and_missing_file_is_isolated()
+{
+    use ix_board::retro::department::{Config, Value};
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("source-events.json");
+    std::fs::write(&path, include_str!("fixtures/retro/source-events.json")).unwrap();
+    let mut department: Config =
+        serde_json::from_str(include_str!("fixtures/retro/department-config.json")).unwrap();
+    department.parameters.event_logs[0].path = path.clone();
+    let config_path = root.path().join("retro.json");
+    std::fs::write(&config_path,serde_json::json!({"team":"QSL","projects":[],"gate_tickets":[],"repos":["fixture/repo"],"department":department}).to_string()).unwrap();
+    let c = RetroConfig::load(&config_path).unwrap();
+    let mut rig = Rig {
+        workspace: Some(Ok(serde_json::from_str(include_str!(
+            "fixtures/retro/native-workspace.json"
+        ))
+        .unwrap())),
+        markers: Some(Ok(Vec::new())),
+        ..Default::default()
+    };
+    rig.histories.insert(
+        "issue-a".into(),
+        Ok(vec![StateChange {
+            at: 1_800_000_000.0 - 7200.0,
+            from: Some(S::Unstarted),
+            to: Some(S::Started),
+        }]),
+    );
+    rig.histories.insert("issue-b".into(), Ok(Vec::new()));
+    let github = DepartmentFixtureGithub;
+    let sources = Sources {
+        github: &github,
+        ..rig.sources()
+    };
+    let store = Store::resolve("QSL", Some(root.path().join("store").into()), None).unwrap();
+    let record = run_snapshot(&c, DAY, 1_800_000_000.0, &sources, &store).unwrap();
+    assert_eq!(record.schema_version, 2);
+    let report = record.department.as_ref().unwrap();
+    for (id, n) in [
+        ("claims_without_movement", 1.0),
+        ("merged_open", 1.0),
+        ("oldest_gated_hours", 1.0),
+        ("idle_with_ready", 1.0),
+        ("repin_only_prs", 1.0),
+        ("tag_repin_events", 2.0),
+        ("focused_check_runs", 1.0),
+        ("workspace_check_runs", 1.0),
+        ("review_round_policy_excess", 0.0),
+    ] {
+        assert_eq!(
+            report.measurements[id].value,
+            Some(Value::Scalar(n)),
+            "{id}: {:?}",
+            report.measurements[id]
+        );
+    }
+    assert_eq!(
+        report.measurements["gates_per_pr"].value,
+        Some(Value::Keyed([("fixture/repo#1".into(), 1.0)].into()))
+    );
+    assert_eq!(report.loops["tag_repin_loop"].findings.len(), 1);
+    assert_eq!(store.read_all().unwrap(), vec![record.clone()]);
+    std::fs::remove_file(path).unwrap();
+    let unavailable = run_snapshot(&c, DAY, 1_800_000_000.0, &sources, &store)
+        .unwrap()
+        .department
+        .unwrap();
+    assert_eq!(
+        unavailable.measurements["claims_without_movement"].status,
+        Status::Unavailable
+    );
+    assert_eq!(
+        unavailable.measurements["wip_active"].value,
+        Some(Value::Scalar(1.0))
+    );
 }
