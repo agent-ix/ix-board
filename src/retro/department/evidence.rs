@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Agent-IX
 
 //! Source-native evidence. Missing capabilities are isolated per fact family (FR-029).
-use super::{Scope, wire};
+use super::Scope;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 

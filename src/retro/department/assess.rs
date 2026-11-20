@@ -4,7 +4,7 @@
 //! Deterministic policy assessment and persisted-only comparisons (FR-029).
 use super::{
     Basis, CLASSES, ClassConfig, Comparator, Config, Measurement, OwnerAction, Policy, Report,
-    Statistic, Value, wire,
+    Statistic, Value,
 };
 use crate::retro::Status;
 use serde::{Deserialize, Serialize};

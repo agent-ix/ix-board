@@ -27,17 +27,16 @@ pub const CLASSES: [&str; 10] = [
 // Each field documents the shared wire contract as well as generating strict decoders.
 macro_rules! wire {
     ($(#[$meta:meta])* $name:ident { $($(#[$field_meta:meta])* $field:ident : $ty:ty),* $(,)? }) => {
-        $(#[$meta])* #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+        $(#[$meta])* #[derive(Clone, Debug, serde::Deserialize, PartialEq, serde::Serialize)]
         #[serde(deny_unknown_fields)] pub struct $name { $($(#[$field_meta])* pub $field: $ty),* }
     };
 }
-pub(crate) use wire;
 mod assess;
 mod collect;
 mod evidence;
 mod github;
 pub use assess::*;
-pub use collect::collect;
+pub use collect::{LoopFinding, LoopReport, collect};
 pub use evidence::*;
 pub use github::collect_pins;
 #[cfg(test)]

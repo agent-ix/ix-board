@@ -4,7 +4,7 @@
 //! Canonical deterministic department calculations, isolated by source capability (FR-029).
 use super::{
     CATALOG, CATALOG_VERSION, Config, Distribution, Evidence, Fact, IssueFact, Measurement,
-    Observation, PinEventKind, Report, Scope, Severity, Summary, Value, wire,
+    Observation, PinEventKind, Report, Scope, Severity, Summary, Value,
 };
 use crate::retro::{Direction, Frame, Metric, Status};
 use std::collections::{BTreeMap, BTreeSet};
