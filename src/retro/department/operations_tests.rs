@@ -733,6 +733,36 @@ fn repeated_order_counts_sends_after_first_only_for_unchanged_evidence() {
     assert_eq!(scalar(&metrics, "repeated_orders"), 1.0);
 }
 
+#[trace("FR-029-AC-4", "FR-029-AC-8")]
+#[test]
+fn redelivered_orders_keep_send_identity_and_messages_keep_original_send_window() {
+    let first = row("original", "o1", -100.0, order("o1", None, "go", "e1"));
+    let mut redelivery = first.clone();
+    redelivery.event_id = "redelivery".into();
+    redelivery.event_at = Some(at(-50.0));
+    assert_eq!(
+        scalar(&measure(vec![first, redelivery]), "repeated_orders"),
+        0.0
+    );
+    let message = OperationFact::Message(MessageFact {
+        message_id: "old".into(),
+        sent_at: at(-3600.0),
+        sender: LANE.into(),
+        correction: Some(true),
+        status_only: Some(false),
+    });
+    let metrics = measure(vec![row("redelivered", "old", -100.0, message)]);
+    assert_eq!(
+        metrics["correction_rate"].classification_coverage,
+        Some(ClassificationCoverage {
+            classified: 0,
+            total: 0,
+            basis: CoverageBasis::CompletePopulation
+        })
+    );
+    assert_eq!(metrics["correction_rate"].value, None);
+}
+
 #[trace("FR-029-AC-4")]
 #[test]
 fn planner_plan_scope_and_tick_audits_count_only_attributed_actionable_sends() {

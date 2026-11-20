@@ -582,10 +582,10 @@ impl<'a> Calculator<'a> {
                 if event_time(row)? > self.frame.now + self.config.clock_tolerance_seconds as f64 {
                     return Err(format!("future event {}", row.event_id));
                 }
-                if let Some((old, _)) = rows.insert(row.event_id.as_str(), (row, fact)) {
-                    if old != row {
-                        return Err(format!("conflicting duplicate event {}", row.event_id));
-                    }
+                if let Some((old, _)) = rows.insert(row.event_id.as_str(), (row, fact))
+                    && old != row
+                {
+                    return Err(format!("conflicting duplicate event {}", row.event_id));
                 }
             }
         }
@@ -932,10 +932,10 @@ impl<'a> Calculator<'a> {
                 continue;
             }
             let chain = chains.entry(&f.message_id).or_default();
-            if let Some(previous) = chain.get(&f.transition) {
-                if event_time(previous)? <= event_time(row)? {
-                    continue;
-                }
+            if let Some(previous) = chain.get(&f.transition)
+                && event_time(previous)? <= event_time(row)?
+            {
+                continue;
             }
             chain.insert(f.transition, row);
         }
@@ -953,13 +953,12 @@ impl<'a> Calculator<'a> {
                     count += u64::from(self.contains(event_time(row)?));
                 }
             } else if id == "prompt_timeout_unconfirmed" {
-                if let Some(row) = chain.get(&RelayKind::PromptTimeout) {
-                    if self.contains(event_time(row)?)
-                        && !chain.contains_key(&RelayKind::Delivered)
-                        && !chain.contains_key(&RelayKind::Acknowledged)
-                    {
-                        count += 1;
-                    }
+                if let Some(row) = chain.get(&RelayKind::PromptTimeout)
+                    && self.contains(event_time(row)?)
+                    && !chain.contains_key(&RelayKind::Delivered)
+                    && !chain.contains_key(&RelayKind::Acknowledged)
+                {
+                    count += 1;
                 }
             } else if !chain.contains_key(&RelayKind::Acknowledged) {
                 let (row, label) = if let Some(row) = chain.get(&RelayKind::Delivered) {
@@ -1242,11 +1241,11 @@ impl<'a> Calculator<'a> {
             let sender = canonical_sender(&f.sender)?;
             total += 1;
             *senders.entry(sender).or_default() += 1.0;
-            if id == "correction_rate" {
-                if let Some(correction) = f.correction.filter(|_| attributed(row).is_ok()) {
-                    classified += 1;
-                    corrections += u64::from(correction);
-                }
+            if id == "correction_rate"
+                && let Some(correction) = f.correction.filter(|_| attributed(row).is_ok())
+            {
+                classified += 1;
+                corrections += u64::from(correction);
             }
             if id == "status_only_messages" {
                 attributed(row)?;
@@ -1460,19 +1459,18 @@ impl<'a> Calculator<'a> {
                 f.lane.as_str(),
                 f.action_key.as_deref().ok_or("missing action key")?,
             );
-            if let Some((old_row, old)) = previous.get(&key) {
-                if f.supersedes_order_id.as_deref() == Some(&old.order_id)
-                    && f.reverses_order_id.as_deref() == Some(&old.order_id)
-                    && f.direction != old.direction
-                    && f.evidence_revision == old.evidence_revision
-                {
-                    let (flips, rows) = groups.entry(key).or_default();
-                    *flips += 1;
-                    if rows.last().is_none_or(|r| r.event_id != old_row.event_id) {
-                        rows.push(old_row);
-                    }
-                    rows.push(row);
+            if let Some((old_row, old)) = previous.get(&key)
+                && f.supersedes_order_id.as_deref() == Some(&old.order_id)
+                && f.reverses_order_id.as_deref() == Some(&old.order_id)
+                && f.direction != old.direction
+                && f.evidence_revision == old.evidence_revision
+            {
+                let (flips, rows) = groups.entry(key).or_default();
+                *flips += 1;
+                if rows.last().is_none_or(|r| r.event_id != old_row.event_id) {
+                    rows.push(old_row);
                 }
+                rows.push(row);
             }
             previous.insert(key, (row, f));
         }
