@@ -148,10 +148,10 @@ impl<'a> Calculator<'a> {
             if observed > self.frame.now + self.config.clock_tolerance_seconds as f64 {
                 return Err("excessive future row observation skew".into());
             }
-            if let Some(at) = &row.event_at {
-                if epoch(at)? > self.frame.now + self.config.clock_tolerance_seconds as f64 {
-                    return Err("excessive future event skew".into());
-                }
+            if let Some(at) = &row.event_at
+                && epoch(at)? > self.frame.now + self.config.clock_tolerance_seconds as f64
+            {
+                return Err("excessive future event skew".into());
             }
         }
         Ok(age)
@@ -379,12 +379,12 @@ impl<'a> Calculator<'a> {
                     .collect();
                 for rows in groups.values() {
                     for pair in rows.windows(2) {
-                        if let Fact::State(state) = &pair[0].fact {
-                            if let Some(values) = samples.get_mut(&state.state) {
-                                let exit = event_time(pair[1])?;
-                                if self.contains(exit) {
-                                    values.push((exit - event_time(pair[0])?) / 3600.0);
-                                }
+                        if let Fact::State(state) = &pair[0].fact
+                            && let Some(values) = samples.get_mut(&state.state)
+                        {
+                            let exit = event_time(pair[1])?;
+                            if self.contains(exit) {
+                                values.push((exit - event_time(pair[0])?) / 3600.0);
                             }
                         }
                     }
@@ -547,16 +547,16 @@ impl<'a> Calculator<'a> {
                 let age = self.capability("check")?;
                 let mut n = 0.0;
                 for o in &self.rows {
-                    if let Fact::Check(check) = &o.fact {
-                        if self.contains(event_time(o)?) {
-                            self.attributed(o, None)?;
-                            let selected = match check.scope {
-                                super::CheckScope::Focused => id == "focused_check_runs",
-                                super::CheckScope::Workspace => id == "workspace_check_runs",
-                            };
-                            if selected {
-                                n += 1.0;
-                            }
+                    if let Fact::Check(check) = &o.fact
+                        && self.contains(event_time(o)?)
+                    {
+                        self.attributed(o, None)?;
+                        let selected = match check.scope {
+                            super::CheckScope::Focused => id == "focused_check_runs",
+                            super::CheckScope::Workspace => id == "workspace_check_runs",
+                        };
+                        if selected {
+                            n += 1.0;
                         }
                     }
                 }
@@ -754,27 +754,27 @@ impl<'a> Calculator<'a> {
             } else {
                 rows.len() - 1
             };
-            if count as u64 >= repeat {
-                if let (Some(first), Some(last)) = (rows.first(), rows.last()) {
-                    let event_ids: Vec<_> = rows.iter().map(|o| o.event_id.clone()).collect();
-                    findings.push(LoopFinding {
-                        deduplication_key: super::digest(&(id, &entity, &event_ids)),
-                        event_ids,
-                        start: first
-                            .event_at
-                            .clone()
-                            .ok_or("missing first event timestamp")?,
-                        end: last
-                            .event_at
-                            .clone()
-                            .ok_or("missing last event timestamp")?,
-                        participants: rows
-                            .iter()
-                            .map(|o| o.entity_id.clone())
-                            .chain([entity])
-                            .collect(),
-                    });
-                }
+            if count as u64 >= repeat
+                && let (Some(first), Some(last)) = (rows.first(), rows.last())
+            {
+                let event_ids: Vec<_> = rows.iter().map(|o| o.event_id.clone()).collect();
+                findings.push(LoopFinding {
+                    deduplication_key: super::digest(&(id, &entity, &event_ids)),
+                    event_ids,
+                    start: first
+                        .event_at
+                        .clone()
+                        .ok_or("missing first event timestamp")?,
+                    end: last
+                        .event_at
+                        .clone()
+                        .ok_or("missing last event timestamp")?,
+                    participants: rows
+                        .iter()
+                        .map(|o| o.entity_id.clone())
+                        .chain([entity])
+                        .collect(),
+                });
             }
         }
         Ok(findings)

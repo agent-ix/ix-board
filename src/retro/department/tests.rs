@@ -466,7 +466,8 @@ fn malformed_versions_units_statistics_keys_and_duplicates_name_policy_field() {
     let mut c = config();
     c.policies = vec![policy("wip_active")];
     assert_eq!(c.validate(), Ok(()));
-    let mutations: Vec<(&str, Box<dyn Fn(&mut Config)>)> = vec![
+    type ConfigMutation = (&'static str, Box<dyn Fn(&mut Config)>);
+    let mutations: Vec<ConfigMutation> = vec![
         ("version", Box::new(|c| c.version = 99)),
         (
             "duplicate",
