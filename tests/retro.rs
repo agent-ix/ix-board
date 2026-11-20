@@ -2880,3 +2880,120 @@ fn lifecycle_working_share_excludes_waiting_recent_and_refuses_unresolved_popula
         assert_eq!(value(&snapshot(&rig), "agents_working_share"), None);
     }
 }
+
+fn department_config() -> RetroConfig {
+    let mut c = config();
+    c.department = Some(serde_json::from_value(serde_json::json!({
+        "version": 1, "policy_id": "fixture-policy", "scope": { "teams": [{"id":"SWM", "label":"Team"}] },
+        "freshness_seconds": {"linear": 60}, "clock_tolerance_seconds": 2,
+        "classes": [{"id":"flow_wip", "required":["wip_active"], "route":{"owner":"fixture:team:lead", "action":"assign ready work"}}],
+        "policies": [{"metric_id":"wip_active", "statistic":"value", "unit":"issues", "comparator":"gt", "amber":1, "red":2, "basis":"current", "window_seconds":86400, "freshness_seconds":60}]
+    })).unwrap());
+    c
+}
+
+#[trace("FR-029-AC-1", "FR-029-AC-7", "FR-029-AC-10")]
+#[test]
+fn department_snapshot_appends_v2_preserves_v1_bytes_and_delta_reads_no_collectors() {
+    let rig = base_rig();
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_in(&dir);
+    let legacy = run_snapshot(&config(), DAY, NOW, &rig.sources(), &store).unwrap();
+    let original = std::fs::read(store.path()).unwrap();
+    assert!(
+        !serde_json::to_value(&legacy)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("department")
+    );
+    let config = department_config();
+    let current = run_snapshot(&config, DAY, NOW + 1.0, &rig.sources(), &store).unwrap();
+    assert_eq!(legacy.metrics, current.metrics);
+    assert_eq!(current.schema_version, 2);
+    assert_eq!(current.department.as_ref().unwrap().version, 1);
+    assert!(std::fs::read(store.path()).unwrap().starts_with(&original));
+    rig.calls.borrow_mut().clear();
+    let delta = run_delta(&config, &store).unwrap();
+    let department = delta.department.unwrap();
+    assert_eq!(
+        department.measurements["wip_active"].since_baseline.state,
+        ix_board::retro::department::ComparisonState::Unavailable
+    );
+    assert!(rig.calls.borrow().is_empty());
+    assert_eq!(
+        serde_json::from_str::<Record>(&serde_json::to_string(&current).unwrap()).unwrap(),
+        current
+    );
+    assert!(
+        ix_board::retro::render_text(&current).contains("unrouted")
+            || ix_board::retro::render_text(&current).contains("Unrouted")
+    );
+}
+
+#[trace("FR-029-AC-5", "FR-029-AC-10")]
+#[test]
+fn invalid_department_config_or_store_versions_refuse_before_reads_and_appends() {
+    let rig = base_rig();
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_in(&dir);
+    let mut c = department_config();
+    c.department.as_mut().unwrap().version = 99;
+    let error = run_snapshot(&c, DAY, NOW, &rig.sources(), &store).unwrap_err();
+    assert!(error.to_string().contains("department.version"));
+    assert!(rig.calls.borrow().is_empty());
+    assert!(!store.path().exists());
+    let valid = run_snapshot(&config(), DAY, NOW, &rig.sources(), &store).unwrap();
+    let before = std::fs::read(store.path()).unwrap();
+    let mut invalid = valid.clone();
+    invalid.schema_version = 99;
+    assert!(
+        store
+            .append(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("schema_version")
+    );
+    assert_eq!(std::fs::read(store.path()).unwrap(), before);
+    invalid = valid;
+    invalid.schema_version = 2;
+    let mut report = ix_board::retro::department::collect(
+        c.department.as_ref().unwrap(),
+        ix_board::retro::Frame {
+            now: NOW,
+            window_secs: DAY,
+            end_exclusive: false,
+        },
+        &[],
+        &BTreeMap::new(),
+    );
+    report.version = 99;
+    invalid.department = Some(report);
+    assert!(
+        store
+            .append(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("department.version")
+    );
+    assert_eq!(std::fs::read(store.path()).unwrap(), before);
+}
+
+#[trace("FR-029-AC-1", "FR-029-AC-3")]
+#[test]
+fn department_backfill_keeps_current_gauges_unavailable_without_invented_history() {
+    let rig = base_rig();
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_in(&dir);
+    let c = department_config();
+    let day = ix_board::retro::parse_day("2026-11-05").unwrap();
+    let report = run_backfill(&c, DAY, (day, Some(day)), NOW, (&rig, &rig), &store).unwrap();
+    assert_eq!(report.appended.len(), 1);
+    assert_eq!(report.appended[0].schema_version, 2);
+    let department = report.appended[0].department.as_ref().unwrap();
+    assert_eq!(
+        department.measurements["wip_active"].status,
+        Status::Unavailable
+    );
+    assert!(department.observations.is_empty());
+}
