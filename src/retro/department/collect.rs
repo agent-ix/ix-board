@@ -221,10 +221,24 @@ impl<'a> Calculator<'a> {
         entities.into_values().collect()
     }
     fn attributed(&self, o: &Observation, classifier: Option<&str>) -> Result<(), String> {
-        let a = o
-            .attribution
-            .as_ref()
-            .ok_or_else(|| format!("missing attribution for {}", o.event_id))?;
+        self.attributed_field(o, None, classifier)
+    }
+    fn attributed_field(
+        &self,
+        o: &Observation,
+        field: Option<&str>,
+        classifier: Option<&str>,
+    ) -> Result<(), String> {
+        let stamp = field.and_then(|field| match &o.fact {
+            Fact::Issue(i) => i.provenance.get(field),
+            Fact::PullRequest(p) => p.provenance.get(field),
+            _ => None,
+        });
+        let attribution = match stamp {
+            Some(stamp) => stamp.attribution.as_ref(),
+            None => o.attribution.as_ref(),
+        };
+        let a = attribution.ok_or_else(|| format!("missing attribution for {}", o.event_id))?;
         if a.actor.is_empty() || a.classifier_version.is_empty() || a.offset_end < a.offset_start {
             return Err("incomplete classification attribution".into());
         }
@@ -594,7 +608,7 @@ impl<'a> Calculator<'a> {
                                 .diff_classifier
                                 .as_deref()
                                 .ok_or("missing diff_classifier version")?;
-                            self.attributed(o, Some(classifier))?;
+                            self.attributed_field(o, Some("repin_only"), Some(classifier))?;
                             if p.repin_only
                                 .ok_or("missing substantive diff classification")?
                             {
@@ -621,7 +635,7 @@ impl<'a> Calculator<'a> {
                         {
                             age = self.field_age(o, &["full_gates"], age)?;
                             if p.full_gates != Some(0) {
-                                self.attributed(o, None)?;
+                                self.attributed_field(o, Some("full_gates"), None)?;
                             }
                             values.insert(
                                 (*key).clone(),
@@ -901,14 +915,8 @@ impl<'a> Calculator<'a> {
                 for row in rows {
                     entities.entry(&row.entity_id).or_default().push(row);
                 }
-                for (entity, mut rows) in entities {
+                for (entity, rows) in entities {
                     let cutoff = self.frame.now - lookback as f64;
-                    let first_inside = rows
-                        .iter()
-                        .position(|row| event_time(row).is_ok_and(|at| at > cutoff))
-                        .unwrap_or(rows.len());
-                    let keep_from = first_inside.saturating_sub(1);
-                    rows.drain(..keep_from);
                     let mut previous: Option<&str> = None;
                     let mut visits: BTreeMap<&str, Vec<&Observation>> = BTreeMap::new();
                     for o in rows {
@@ -921,6 +929,13 @@ impl<'a> Calculator<'a> {
                         }
                     }
                     for (state, visits) in visits {
+                        let Some(first_inside) = visits
+                            .iter()
+                            .position(|row| event_time(row).is_ok_and(|at| at > cutoff))
+                        else {
+                            continue;
+                        };
+                        let visits = visits[first_inside.saturating_sub(1)..].to_vec();
                         if visits.len() as u64 > repeat
                             && visits
                                 .iter()

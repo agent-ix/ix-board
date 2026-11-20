@@ -215,46 +215,76 @@ pub fn read_source_logs(
     batches: &mut Vec<Evidence>,
     mut read: impl FnMut(&Path) -> Result<String, String>,
 ) {
-    for input in &config.parameters.event_logs {
-        let result = read(&input.path).and_then(|body| decode(config, frame, input, &body));
-        match result {
-            Ok(log) => apply(config, frame, input, &log, batches),
-            Err(reason) => {
-                for batch in &mut *batches {
-                    for row in &mut batch.observations {
-                        for selected in &input.kinds {
-                            if let Some(field) = field(*selected) {
-                                stamp(
-                                    row,
-                                    field,
-                                    SourceStamp {
-                                        source: input.source.clone(),
-                                        observed_at: None,
-                                        complete: false,
-                                        reason: Some(reason.clone()),
-                                        evidence_refs: Vec::new(),
-                                    },
-                                );
+    let decoded: Vec<_> = config
+        .parameters
+        .event_logs
+        .iter()
+        .map(|input| {
+            (
+                input,
+                read(&input.path).and_then(|body| decode(config, frame, input, &body)),
+            )
+        })
+        .collect();
+    // Movement coverage depends on finalized claim history, regardless of file/source names.
+    for claims_phase in [true, false] {
+        for (input, result) in &decoded {
+            let selected = LogInput {
+                path: input.path.clone(),
+                source: input.source.clone(),
+                kinds: input
+                    .kinds
+                    .iter()
+                    .copied()
+                    .filter(|kind| (*kind == LogKind::Claims) == claims_phase)
+                    .collect(),
+            };
+            if selected.kinds.is_empty() {
+                continue;
+            }
+            let input = &selected;
+            match result {
+                Ok(log) => apply(config, frame, input, log, batches),
+                Err(reason) => {
+                    for batch in &mut *batches {
+                        for row in &mut batch.observations {
+                            for selected in &input.kinds {
+                                if let Some(field) = field(*selected) {
+                                    stamp(
+                                        row,
+                                        field,
+                                        SourceStamp {
+                                            source: input.source.clone(),
+                                            observed_at: None,
+                                            complete: false,
+                                            reason: Some(reason.clone()),
+                                            evidence_refs: Vec::new(),
+                                            attribution: None,
+                                        },
+                                    );
+                                }
                             }
                         }
                     }
-                }
-                let mut unavailable = Evidence {
-                    source: input.source.clone(),
-                    ..Default::default()
-                };
-                for selected in &input.kinds {
-                    let family = match selected {
-                        LogKind::Lanes => Some("lane"),
-                        LogKind::PinEvents => Some("pin_event"),
-                        LogKind::Checks => Some("check"),
-                        _ => None,
+                    let mut unavailable = Evidence {
+                        source: input.source.clone(),
+                        ..Default::default()
                     };
-                    if let Some(family) = family {
-                        unavailable.reasons.insert(family.into(), reason.clone());
+                    for selected in &input.kinds {
+                        let family = match selected {
+                            LogKind::Lanes => Some("lane"),
+                            LogKind::PinEvents => Some("pin_event"),
+                            LogKind::Checks => Some("check"),
+                            _ => None,
+                        };
+                        if let Some(family) = family {
+                            unavailable.reasons.insert(family.into(), reason.clone());
+                        }
+                    }
+                    if !unavailable.reasons.is_empty() {
+                        batches.push(unavailable);
                     }
                 }
-                batches.push(unavailable);
             }
         }
     }
@@ -363,6 +393,7 @@ fn make_stamp(log: &SourceLog, events: &[&LogEvent], result: Result<(), String>)
         complete: result.is_ok(),
         reason: result.err(),
         evidence_refs: events.iter().map(|e| e.source_ref.clone()).collect(),
+        attribution: None,
     }
 }
 fn ordered_events<'a>(
@@ -407,46 +438,63 @@ fn apply(
                 let mut events = ordered_events(log, *selected, &entity, frame.now);
                 let required_from = if *selected == LogKind::Movement {
                     match &row.fact {
-                        Fact::Issue(i) => i
-                            .claim_at
-                            .as_deref()
-                            .and_then(|at| epoch(at).ok())
-                            .unwrap_or(start),
-                        _ => start,
+                        Fact::Issue(i)
+                            if i.provenance
+                                .get("claim_at")
+                                .is_none_or(|stamp| stamp.complete) =>
+                        {
+                            i.claim_at
+                                .as_deref()
+                                .ok_or_else(|| {
+                                    "missing finalized claim timestamp for movement coverage"
+                                        .to_owned()
+                                })
+                                .and_then(epoch)
+                        }
+                        _ => {
+                            Err("unavailable finalized claim history for movement coverage".into())
+                        }
                     }
                 } else {
-                    start
+                    Ok(start)
                 };
-                let check = coverage(
-                    log,
-                    *selected,
-                    &entity,
-                    required_from,
-                    frame.now,
-                    matches!(
-                        selected,
-                        LogKind::Claims | LogKind::Blocked | LogKind::Completion | LogKind::Gates
-                    ),
-                )
-                .and_then(|c| {
-                    if *selected == LogKind::Movement
-                        && ![
-                            MovementKind::PrHead,
-                            MovementKind::Commit,
-                            MovementKind::Worktree,
-                        ]
-                        .into_iter()
-                        .all(|k| c.movement_sources.contains(&k))
-                    {
-                        return Err(
-                            "incomplete PR-head/commit/worktree movement channel coverage".into(),
-                        );
-                    }
-                    if let Err(reason) = &events {
-                        return Err(reason.clone());
-                    }
-                    Ok(())
-                });
+                let check = required_from
+                    .and_then(|required_from| {
+                        coverage(
+                            log,
+                            *selected,
+                            &entity,
+                            required_from,
+                            frame.now,
+                            matches!(
+                                selected,
+                                LogKind::Claims
+                                    | LogKind::Blocked
+                                    | LogKind::Completion
+                                    | LogKind::Gates
+                            ),
+                        )
+                    })
+                    .and_then(|c| {
+                        if *selected == LogKind::Movement
+                            && ![
+                                MovementKind::PrHead,
+                                MovementKind::Commit,
+                                MovementKind::Worktree,
+                            ]
+                            .into_iter()
+                            .all(|k| c.movement_sources.contains(&k))
+                        {
+                            return Err(
+                                "incomplete PR-head/commit/worktree movement channel coverage"
+                                    .into(),
+                            );
+                        }
+                        if let Err(reason) = &events {
+                            return Err(reason.clone());
+                        }
+                        Ok(())
+                    });
                 let success = check.is_ok();
                 let mut conflict = None;
                 let events = events.as_mut().map(|e| e.as_slice()).unwrap_or(&[]);
@@ -500,9 +548,6 @@ fn apply(
                                     && matches!(&e.record,NativeRecord::Gate{pr} if pr==&entity)
                             }) {
                                 p.full_gates = u64::try_from(events.len()).ok();
-                                if let Some(event) = events.first() {
-                                    row.attribution = event.attribution.clone();
-                                }
                             } else {
                                 p.full_gates = None;
                             }
@@ -517,7 +562,6 @@ fn apply(
                                     conflict=Some("conflicting native/exported substantive diff classifications".into());
                                 } else {
                                     p.repin_only = Some(*repin_only);
-                                    row.attribution = event.attribution.clone();
                                 }
                             }
                         }
@@ -525,6 +569,9 @@ fn apply(
                     }
                 }
                 let mut source = make_stamp(log, events, check);
+                if matches!(selected, LogKind::Gates | LogKind::Diffs) {
+                    source.attribution = events.last().and_then(|event| event.attribution.clone());
+                }
                 if let Some(index) = log.coverage.iter().position(|coverage| {
                     coverage.kind == *selected && coverage.entities.contains(&entity)
                 }) {
@@ -565,6 +612,9 @@ fn apply(
         ..Default::default()
     };
     for event in &log.events {
+        if !input.kinds.contains(&kind(&event.record)) {
+            continue;
+        }
         if epoch(&event.event_at).is_err() || epoch(&event.event_at).is_ok_and(|at| at > frame.now)
         {
             continue;
@@ -683,5 +733,10 @@ fn apply(
             }
         }
     }
-    batches.push(normalized);
+    if !normalized.observations.is_empty()
+        || !normalized.complete.is_empty()
+        || !normalized.reasons.is_empty()
+    {
+        batches.push(normalized);
+    }
 }

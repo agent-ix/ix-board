@@ -15,7 +15,9 @@ wire! {
         /// Missing coverage or source reason.
         reason: Option<String>,
         /// Native event or exported record references.
-        evidence_refs: Vec<String>
+        evidence_refs: Vec<String>,
+        /// Attribution belonging to this field's classification, independently of other fields.
+        #[serde(default)] attribution: Option<Attribution>
     }
 }
 use serde::{Deserialize, Serialize};

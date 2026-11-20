@@ -42,6 +42,7 @@ pub fn enrich_claim_history(
             complete: claim.is_ok(),
             reason: claim.err(),
             evidence_refs: vec![format!("linear:issue:{entity}:history")],
+            attribution: None,
         },
     );
 }
@@ -92,6 +93,7 @@ pub fn enrich_merged_attachments(
                     complete: result.is_ok(),
                     reason: result.err(),
                     evidence_refs: issue.attachment_urls.clone(),
+                    attribution: None,
                 },
             );
         }
