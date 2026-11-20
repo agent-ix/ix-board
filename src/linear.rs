@@ -3114,7 +3114,7 @@ mod tests {
         assert_eq!(order, serde_json::json!({"sortOrder": 3.5}));
     }
 
-    /// Trace: FR-015-AC-1, FR-015-AC-2
+    #[trace("FR-015-AC-1", "FR-015-AC-2")]
     #[test]
     fn protected_credential_preserves_authentication_and_cache_identity() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

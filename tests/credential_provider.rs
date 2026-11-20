@@ -17,6 +17,7 @@ use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::rc::Rc;
+use std::sync::mpsc;
 use std::time::Duration;
 
 struct SavedProvider {
@@ -60,7 +61,6 @@ fn no_fallback() -> Option<String> {
     panic!("CLI fallback must not run for a saved key or a credential failure")
 }
 
-#[trace("FR-015-AC-2", "FR-029-AC-4", "FR-029-AC-8")]
 #[test]
 fn saved_provider_without_override_reaches_real_department_collection() {
     // A subprocess supplies a conflicting environment without mutating the
@@ -88,6 +88,7 @@ fn saved_provider_without_override_reaches_real_department_collection() {
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = format!("http://{}/graphql", listener.local_addr().unwrap());
+    let (completed, completion) = mpsc::channel();
     let server = std::thread::spawn(move || {
         let mut operations = Vec::new();
         for _ in 0..3 {
@@ -141,7 +142,7 @@ fn saved_provider_without_override_reaches_real_department_collection() {
             let body = serde_json::json!({"data":{(resource):{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}).to_string();
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
         }
-        operations
+        completed.send(operations).unwrap();
     });
     let (store, reads) = provider(Ok(Some("fixture-saved-key")));
     let source = LinearGraphQlSource::from_credential_store(&store, None, no_fallback, &endpoint)
@@ -163,7 +164,10 @@ fn saved_provider_without_override_reaches_real_department_collection() {
         1,
         "reader must not resolve credentials a second time"
     );
-    let operations = server.join().unwrap();
+    let operations = completion
+        .recv_timeout(Duration::from_secs(5))
+        .expect("real Linear collection must complete all three HTTP requests before the deadline");
+    server.join().unwrap();
     assert_eq!(operations.len(), 3);
     assert!(operations[0].contains("WorkspaceProjects"));
     assert!(
@@ -172,7 +176,6 @@ fn saved_provider_without_override_reaches_real_department_collection() {
     );
 }
 
-#[trace("FR-015-AC-2")]
 #[test]
 fn explicit_environment_snapshot_precedes_provider() {
     let (store, reads) = provider(Err(SecretError::Locked));
@@ -219,7 +222,6 @@ fn invalid_environment_snapshot_never_falls_through() {
     assert_eq!(reads.get(), 0);
 }
 
-#[trace("FR-015-AC-2")]
 #[test]
 fn provider_access_failures_propagate_without_cli_fallback() {
     for error in [
@@ -238,7 +240,6 @@ fn provider_access_failures_propagate_without_cli_fallback() {
     }
 }
 
-#[trace("FR-015-AC-2", "FR-015-AC-3")]
 #[test]
 fn cli_fallback_runs_only_after_absent_provider_and_missing_stays_error() {
     let (store, reads) = provider(Ok(None));
