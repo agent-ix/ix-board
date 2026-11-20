@@ -1401,7 +1401,7 @@ impl<'a> Calculator<'a> {
     }
     fn repeated_orders(&self) -> Result<Outcome, String> {
         let p = self.population("order")?;
-        let mut revisions: BTreeMap<&str, &str> = BTreeMap::new();
+        let mut revisions: BTreeMap<(&str, &str), &str> = BTreeMap::new();
         let mut repeated = 0_u64;
         for (row, fact) in self.ordered_orders(&p, None)? {
             let OperationFact::Order(f) = fact else {
@@ -1411,7 +1411,7 @@ impl<'a> Calculator<'a> {
                 .evidence_revision
                 .as_deref()
                 .ok_or("missing order evidence/authority revision")?;
-            if revisions.insert(&f.order_id, revision) == Some(revision)
+            if revisions.insert((&f.lane, &f.order_id), revision) == Some(revision)
                 && self.contains(event_time(row)?)
             {
                 repeated += 1;
@@ -1438,7 +1438,7 @@ impl<'a> Calculator<'a> {
             if f.send_id.is_empty() {
                 return Err("missing native order send identity".into());
             }
-            if let Some(previous) = sends.insert(f.send_id.as_str(), f) {
+            if let Some(previous) = sends.insert((f.lane.as_str(), f.send_id.as_str()), f) {
                 if previous != f {
                     return Err("conflicting redelivery order provenance".into());
                 }

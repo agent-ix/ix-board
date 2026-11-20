@@ -792,6 +792,39 @@ fn repeated_order_counts_sends_after_first_only_for_unchanged_evidence() {
     assert_eq!(scalar(&metrics, "repeated_orders"), 1.0);
 }
 
+#[trace("FR-029-AC-2", "FR-029-AC-8")]
+#[test]
+fn different_lanes_do_not_share_native_order_send_counters() {
+    let mut c = config();
+    c.scope.lanes.push(Selector {
+        id: "remote:team:lead".into(),
+        label: "Remote".into(),
+    });
+    let local = row(
+        "local-send",
+        "local-order",
+        -100.0,
+        order("order-1", None, "go", "e1"),
+    );
+    let mut remote = row(
+        "remote-send",
+        "remote-order",
+        -50.0,
+        order("order-1", None, "go", "e1"),
+    );
+    if let Fact::Operation(OperationFact::Order(f)) = &mut remote.fact {
+        f.lane = "remote:team:lead".into();
+        f.send_id = "local-send".into();
+    }
+    assert_eq!(
+        scalar(
+            &collect(&c, &[batch(vec![local, remote])]).0,
+            "repeated_orders"
+        ),
+        0.0
+    );
+}
+
 #[trace("FR-029-AC-4", "FR-029-AC-8")]
 #[test]
 fn redelivered_orders_keep_send_identity_and_messages_keep_original_send_window() {
