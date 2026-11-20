@@ -668,6 +668,26 @@ fn unknown_message_population_never_claims_classification_coverage_or_rate() {
     assert_eq!(metrics["correction_rate"].classification_coverage, None);
 }
 
+#[trace("FR-029-AC-3", "FR-029-AC-9")]
+#[test]
+fn known_source_age_survives_unavailable_capabilities_but_missing_source_clock_stays_unknown() {
+    let mut c = config();
+    c.freshness_seconds = [("fixture".into(), 60)].into();
+    let mut evidence = batch(Vec::new());
+    evidence.observed_at = Some(at(-30.0));
+    evidence
+        .reasons
+        .insert("order".into(), "receipt instrumentation unavailable".into());
+    let metrics = collect(&c, std::slice::from_ref(&evidence)).0;
+    assert_eq!(
+        keyed(&metrics, "source_age_hours", "fixture"),
+        30.0 / 3600.0
+    );
+    assert_eq!(metrics["repeated_orders"].value, None);
+    evidence.observed_at = None;
+    assert_eq!(collect(&c, &[evidence]).0["source_age_hours"].value, None);
+}
+
 #[trace("FR-029-AC-2", "FR-029-AC-5", "FR-029-AC-6")]
 #[test]
 fn independent_teams_assess_native_host_rows_as_healthy_or_overcommitted_without_combined_score() {

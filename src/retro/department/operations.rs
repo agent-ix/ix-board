@@ -98,7 +98,10 @@ impl OperationalConfig {
                     "department.operations.scheduler_files: empty path or unselected host".into(),
                 );
             }
-            if owners.contains("host") || owners.contains("scheduler_request") {
+            if owners.contains("host")
+                || owners.contains("scheduler_request")
+                || owners.contains("scheduler_event")
+            {
                 return Err("department.operations: scheduler and normalized export have duplicate capability ownership".into());
             }
         }
@@ -1165,9 +1168,6 @@ impl<'a> Calculator<'a> {
             }
             let mut oldest: f64 = 0.0;
             for batch in batches {
-                if !batch.reasons.is_empty() {
-                    return Err(format!("source {source} incomplete: {:?}", batch.reasons));
-                }
                 let observed = epoch(
                     batch
                         .observed_at
