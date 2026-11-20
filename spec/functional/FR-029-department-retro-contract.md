@@ -39,11 +39,29 @@ loop lookback/repeat count and the intervals required by selected metrics.
 An absent parameter is recorded as missing evidence/configuration for dependent
 measurements, rather than assigned a numeric default.
 
-Each metric assessment policy names the metric ID, unit, comparator (`gt`, `gte`,
+Each numeric metric assessment policy names the metric ID, selected statistic
+(`value`, `count`, `median` or `p90`), unit, comparator (`gt`, `gte`,
 `lt` or `lte`), amber/red thresholds and comparison basis (`current`,
 `since_previous` or `since_baseline`). Freshness and measurement-window policies
 are explicit. Each class names its required and optional metrics and optional
 owner/action route. No lane capacity is interpreted as a host build-slot limit.
+
+A scalar policy selects `value`; a duration policy explicitly selects `count`,
+`median` or `p90`. The policy unit matches the selected component, rather than
+treating a population count as a duration. A keyed policy declares a nonempty
+set of expected native keys and `key_reduction: worst_severity`. The engine
+SHALL assess the selected statistic separately for every expected key and retain
+each key's value, severity and unavailable/unassessed reason. Missing, unavailable
+or unassessable expected keys contribute unknown; unselected keys remain visible
+as evidence but do not affect this policy. The engine SHALL reduce selected key
+severities with the canonical red > amber > unknown > green precedence, mark
+completeness false if any expected key is unknown, and retain missing-key reasons.
+No averaging across keys or choosing a different statistic is implicit. The
+selected statistic, expected key set and reduction belong to comparison identity.
+If a numeric policy omits its selected statistic or required key selection/reduction,
+then retro SHALL reject configuration before source reads or store writes.
+If a selected statistic, component unit or reduction is invalid for its measurement
+variant, then retro SHALL reject configuration naming the policy field.
 
 The class keys are `flow_wip`, `serial_dependency`, `pin_version_churn`,
 `capacity_resources`, `liveness`, `authority_policy`, `signal_integrity`,
@@ -64,13 +82,32 @@ under `department`, with `version: 1`:
 | `classes` | All ten canonical class IDs, required/optional metric IDs, severity, independent completeness, missing metric IDs/reasons, applied policy/thresholds, source age, comparisons and route (`routed` with configured owner/action, or `unrouted`). |
 | `rollup` | Canonical department severity and completeness with per-class missing-evidence diagnostics; no numeric combined health score. |
 
-Scalar measurements use a numeric value. A keyed measurement uses rows keyed by
+Numeric scalar measurements use a numeric value. A keyed measurement uses rows keyed by
 native entity/state/host/lane identity; duration rows expose count, median and
 nearest-rank p90, and gauge/count rows expose their scalar value. Unavailable
 measurements have null value and a reason, rather than an empty successful row
 set. An available empty count population may be zero only after a complete read.
 References resolve within the envelope or to a source-native record; credentials
 and private transcript bodies are excluded.
+
+A categorical measurement uses a typed `source_observation` value with category,
+source schema version and an observation reference that resolves to the persisted
+source row. For `lane_execution_state`, that row preserves the
+[FR-018](./FR-018-agent-activity-verdicts.md) verdict, lifecycle observations,
+nullable counts/timestamps with reasons, provenance, per-source availability and
+`partial` uncertainty without reclassifying lifecycle evidence. Known categories
+remain visible even when the row is partial; an unavailable category has null
+value with its source reason and retains available evidence. Numeric state codes
+are prohibited. These measurements are display/evidence values, ineligible for
+numeric threshold assessment or subtraction: their assessment is `unassessed`
+with reason `categorical evidence only`, and a required categorical measurement
+therefore contributes unknown to class assessment. Configuring a numeric policy
+for this variant is invalid. Delta may expose available compatible categories
+as previous/current/baseline observations with `same` or `changed` equality,
+never a numeric change, regression or severity inferred from category order.
+Unavailable evidence yields `unavailable`, and changed source schema or other
+comparison identity yields `query_changed`. Numeric derived metrics require
+their own catalog IDs and canonical definitions.
 
 ## Behavior
 
@@ -128,8 +165,10 @@ this model and assessment engine rather than compute parallel metrics.
 | FR-029-AC-6 | All ten classes remain in the report with later collectors absent. Red+unknown yields red/incomplete, amber+unknown amber/incomplete, green+unknown unknown/incomplete, all green green/complete and an empty required set unknown/incomplete; optional metrics change neither severity nor completeness. Department rollup uses the same rules. | Test |
 | FR-029-AC-7 | Changed scope, formula/catalog identity, parameter, window or applicable assessment policy produces query_changed without numeric trend; reordered equivalent config does not. Missing department evidence in a version-1 baseline yields unavailable for new measurements while compatible old metrics still compare. Delta invokes no source reader. | Test |
 | FR-029-AC-8 | Duplicate events and equal timestamps with known source sequence produce exact canonical tag-repin/state-bounce findings once with ordered IDs and deduplication keys. Missing ordering history produces unavailable, not an empty successful finding set. | Test |
-| FR-029-AC-9 | Empty duration populations are unavailable, singleton count/median/p90 agree, zero denominators are unavailable, and partial pages, stale sources and excessive future skew invalidate dependent measurements without turning a class green. | Test |
+| FR-029-AC-9 | Empty duration populations are unavailable. For the singleton [7 hours], count=1, median=7 hours and p90=7 hours. Zero denominators are unavailable, and partial pages, stale sources and excessive future skew invalidate dependent measurements without turning a class green. | Test |
 | FR-029-AC-10 | Version-1 history remains byte-identical when read; unsupported record/envelope versions fail naming the version and leave the store unchanged. Shared JSON round trips preserve keyed values, evidence, comparison states, class completeness and owner/action routing without requiring a live source. | Test |
+| FR-029-AC-11 | For expected state keys A/B/C, fixture A has median=1h/p90=10h, B median=1h/p90=2h, and C is missing. With gte amber=3h/red=5h and p90 selected, key severities are red/green/unknown and the metric is red/incomplete with C's missing-key reason. Selecting median yields green/green/unknown and unknown/incomplete; adding C median=1h/p90=1h yields green/complete for the median policy. Unselected key D with p90=100h changes neither result. Missing statistic/key reduction, empty expected key set, invalid component/unit or numeric policy on categorical evidence fails configuration validation. Changing statistic or expected keys changes comparison identity. | Test |
+| FR-029-AC-12 | An offline lane_execution_state round trip preserves an FR-018 WORKING row and an UNKNOWN/partial row including null timestamp/count reasons, lifecycle provenance and source availability. No numeric state code or invented timestamp appears. Categories remain unassessed with categorical-evidence reason; a required categorical input makes its class unknown/incomplete. Compatible WORKING-to-WORKING and WORKING-to-UNKNOWN observations produce same and changed equality respectively without numeric trend; unavailable evidence produces unavailable and a changed source schema produces query_changed. | Test |
 
 ## Dependencies
 
