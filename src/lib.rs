@@ -135,6 +135,9 @@ pub enum Error {
     /// A required pagination cursor was absent.
     #[error("Linear indicated another page but returned no cursor")]
     MissingCursor,
+    /// A pagination cursor was empty or repeated before completion.
+    #[error("Linear returned an empty or repeated pagination cursor for {resource}")]
+    InvalidCursor { resource: String },
     /// The server returned more than one relation page for an issue.
     #[error("issue {issue} has more relations than the supported page size")]
     RelationsLimit { issue: String },

@@ -19,14 +19,15 @@ use std::process::Command as ProcessCommand;
 
 // Keep the project query below Linear's complexity limit while retaining nested page coverage.
 const PROJECT_PAGE_SIZE: i32 = 20;
-// 50 issues with up to 50 relations and 50 attachments each remain below the query complexity limit.
+// Keep both relation directions small in the issue query; overflow is read separately.
 const ISSUE_PAGE_SIZE: i32 = 50;
 const PROJECT_NESTED_PAGE_SIZE: i32 = 50;
 const INITIATIVE_PAGE_SIZE: i32 = 50;
 const RELATION_PAGE_SIZE: i32 = 50;
+const INITIAL_RELATION_PAGE_SIZE: i32 = 10;
 const PAGE_LIMIT: usize = 1_000;
-// Invalidate cached snapshots predating the project activity and issue assignee fields.
-const CACHE_MODEL_VERSION: &str = "v11";
+// Invalidate snapshots predating complete incoming and outgoing relation reads.
+const CACHE_MODEL_VERSION: &str = "v12";
 const ENDPOINT: &str = "https://api.linear.app/graphql";
 
 const PROJECT_QUERY: &str = r#"
@@ -67,7 +68,11 @@ query WorkspaceIssues($first: Int!, $relationFirst: Int!, $after: String) {
       parent { id }
       relations(first: $relationFirst) {
         nodes { type issue { id } relatedIssue { id } }
-        pageInfo { hasNextPage }
+        pageInfo { hasNextPage endCursor }
+      }
+      inverseRelations(first: $relationFirst) {
+        nodes { type issue { id } relatedIssue { id } }
+        pageInfo { hasNextPage endCursor }
       }
       attachments(first: 50) {
         nodes { url }
@@ -75,6 +80,26 @@ query WorkspaceIssues($first: Int!, $relationFirst: Int!, $after: String) {
       }
     }
     pageInfo { hasNextPage endCursor }
+  }
+}"#;
+
+const OUTGOING_RELATIONS_QUERY: &str = r#"
+query IssueRelations($id: String!, $first: Int!, $after: String) {
+  issue(id: $id) {
+    relations(first: $first, after: $after) {
+      nodes { type issue { id } relatedIssue { id } }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}"#;
+
+const INCOMING_RELATIONS_QUERY: &str = r#"
+query IssueInverseRelations($id: String!, $first: Int!, $after: String) {
+  issue(id: $id) {
+    relations: inverseRelations(first: $first, after: $after) {
+      nodes { type issue { id } relatedIssue { id } }
+      pageInfo { hasNextPage endCursor }
+    }
   }
 }"#;
 
@@ -749,6 +774,53 @@ impl LinearGraphQlSource {
             .collect()
     }
 
+    fn complete_relations(
+        &self,
+        issue_id: &str,
+        connection: &mut Connection<RawRelation>,
+        incoming: bool,
+    ) -> Result<(), Error> {
+        let mut cursors = HashSet::new();
+        for _ in 1..PAGE_LIMIT {
+            if !connection.page_info.has_next_page {
+                return Ok(());
+            }
+            let cursor = connection
+                .page_info
+                .end_cursor
+                .as_deref()
+                .ok_or(Error::MissingCursor)?;
+            if cursor.trim().is_empty() || !cursors.insert(cursor.to_owned()) {
+                return Err(Error::InvalidCursor {
+                    resource: format!(
+                        "issue {issue_id} {} relations",
+                        if incoming { "incoming" } else { "outgoing" }
+                    ),
+                });
+            }
+            let data: IssueRelationsData = self.request(
+                if incoming {
+                    INCOMING_RELATIONS_QUERY
+                } else {
+                    OUTGOING_RELATIONS_QUERY
+                },
+                IssueHistoryVariables {
+                    id: issue_id.to_owned(),
+                    first: RELATION_PAGE_SIZE,
+                    after: Some(cursor.to_owned()),
+                },
+            )?;
+            let page = data.issue.ok_or(Error::MissingWorkspaceData)?.relations;
+            connection.nodes.extend(page.nodes);
+            connection.page_info = page.page_info;
+        }
+        if connection.page_info.has_next_page {
+            Err(Error::PaginationLimit { pages: PAGE_LIMIT })
+        } else {
+            Ok(())
+        }
+    }
+
     fn query<T: DeserializeOwned>(
         &self,
         query: &'static str,
@@ -898,16 +970,13 @@ impl WorkspaceSource for LinearGraphQlSource {
                 ISSUE_QUERY,
                 ISSUE_PAGE_SIZE,
                 after.as_deref(),
-                Some(RELATION_PAGE_SIZE),
+                Some(INITIAL_RELATION_PAGE_SIZE),
                 None,
             )?;
             let connection = result.issues;
-            for raw in connection.nodes {
-                if raw.relations.page_info.has_next_page {
-                    return Err(Error::RelationsLimit {
-                        issue: raw.identifier,
-                    });
-                }
+            for mut raw in connection.nodes {
+                self.complete_relations(&raw.id, &mut raw.relations, false)?;
+                self.complete_relations(&raw.id, &mut raw.inverse_relations, true)?;
                 raw_issues.push(raw);
             }
             if !connection.page_info.has_next_page {
@@ -1149,7 +1218,12 @@ fn canonical_project_status(name: String, status_type: LinearProjectStatusType) 
 fn collect_blocked_by(raw_issues: &[RawIssue]) -> BTreeMap<String, BTreeSet<String>> {
     let mut blocked_by = BTreeMap::<String, BTreeSet<String>>::new();
     for issue in raw_issues {
-        for relation in &issue.relations.nodes {
+        for relation in issue
+            .relations
+            .nodes
+            .iter()
+            .chain(&issue.inverse_relations.nodes)
+        {
             if relation.relation_type == "blocks" {
                 blocked_by
                     .entry(relation.related_issue.id.clone())
@@ -1494,6 +1568,18 @@ struct IssueData {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct IssueRelationsData {
+    issue: Option<RawIssueRelations>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawIssueRelations {
+    relations: Connection<RawRelation>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct IssueHistoryData {
     issue: Option<RawIssueHistory>,
 }
@@ -1536,6 +1622,7 @@ struct RawIssue {
     project_milestone: Option<RawIssueProject>,
     parent: Option<RawIssueProject>,
     relations: Connection<RawRelation>,
+    inverse_relations: Connection<RawRelation>,
     attachments: Option<Connection<RawAttachment>>,
 }
 
@@ -1615,6 +1702,7 @@ mod tests {
         Issue, IssueId, Project, ProjectId, ProjectMutationSource, ProjectPriority,
         ProjectRunStatus, ReadService, TeamKey, WorkspaceSnapshot, WorkspaceSource,
     };
+    use ix_trace_rs::trace;
     use serde_json::Value;
     use sha2::{Digest, Sha256};
     use std::io::{Read, Write};
@@ -1813,6 +1901,195 @@ mod tests {
         })
     }
 
+    fn relation_page(nodes: Vec<Value>, has_next: bool, cursor: Value) -> Value {
+        serde_json::json!({"nodes": nodes, "pageInfo": {"hasNextPage": has_next, "endCursor": cursor}})
+    }
+
+    fn blocking_relation(source: &str, target: &str) -> Value {
+        serde_json::json!({"type": "blocks", "issue": {"id": source}, "relatedIssue": {"id": target}})
+    }
+
+    fn relation_issue(id: &str) -> Value {
+        serde_json::json!({
+            "id": id, "identifier": id, "title": id, "description": null,
+            "priority": 2.0, "sortOrder": 1.0, "state": {"name": "Specced", "type": "started"},
+            "team": {"key": "SWM"}, "project": null,
+            "relations": connection(serde_json::json!([])),
+            "inverseRelations": connection(serde_json::json!([]))
+        })
+    }
+
+    fn relation_responses(issue: Value, pages: Vec<Value>) -> Vec<Value> {
+        let mut responses = vec![
+            serde_json::json!({"data": {"projects": connection(serde_json::json!([]))}}),
+            serde_json::json!({"data": {"issues": connection(serde_json::json!([issue]))}}),
+        ];
+        responses.extend(pages);
+        responses
+    }
+
+    #[trace("FR-011-AC-3", "FR-011-AC-5", "FR-011-AC-6", "FR-004-AC-8")]
+    #[test]
+    fn workspace_relations_paginate_both_directions_and_deduplicate_stable_endpoints() {
+        let mut issue = relation_issue("hub");
+        issue["relations"] = relation_page(
+            vec![blocking_relation("hub", "dependent")],
+            true,
+            serde_json::json!("out-1"),
+        );
+        issue["inverseRelations"] = relation_page(
+            vec![blocking_relation("first", "hub")],
+            true,
+            serde_json::json!("in-1"),
+        );
+        let outgoing = relation_page(
+            vec![blocking_relation("hub", "dependent")],
+            false,
+            Value::Null,
+        );
+        let incoming: Vec<_> = (0..101)
+            .rev()
+            .map(|index| blocking_relation(&format!("blocker-{index:03}"), "hub"))
+            .collect();
+        let pages = vec![
+            outgoing,
+            relation_page(incoming[..50].to_vec(), true, serde_json::json!("in-2")),
+            relation_page(incoming[50..100].to_vec(), true, serde_json::json!("in-3")),
+            relation_page(vec![incoming[100].clone(), blocking_relation("first", "hub"), serde_json::json!({"type": "related", "issue": {"id": "ignored"}, "relatedIssue": {"id": "hub"}})], false, Value::Null),
+        ].into_iter().map(|page| serde_json::json!({"data": {"issue": {"relations": page}}})).collect();
+        let (endpoint, server) = mock_linear(relation_responses(issue, pages));
+        let source = LinearGraphQlSource::with_endpoint("test-key", endpoint).unwrap();
+        let snapshot = source.fetch_workspace().expect("complete relation pages");
+        let expected: Vec<_> = (0..101)
+            .map(|index| IssueId(format!("blocker-{index:03}")))
+            .chain([IssueId("first".to_owned())])
+            .collect();
+        assert_eq!(snapshot.issues[0].blocked_by, expected);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 6);
+        assert_eq!(requests[1]["variables"]["first"], 50);
+        assert_eq!(requests[1]["variables"]["relationFirst"], 10);
+        for (request, cursor) in requests[2..].iter().zip(["out-1", "in-1", "in-2", "in-3"]) {
+            assert_eq!(request["variables"]["id"], "hub");
+            assert_eq!(request["variables"]["after"], cursor);
+            assert_eq!(request["variables"]["first"], 50);
+        }
+        assert!(
+            requests[2]["query"]
+                .as_str()
+                .unwrap()
+                .contains("relations(first:")
+        );
+        assert!(
+            requests[3]["query"]
+                .as_str()
+                .unwrap()
+                .contains("relations: inverseRelations(first:")
+        );
+    }
+
+    #[trace("FR-011-AC-5", "FR-004-AC-3")]
+    #[test]
+    fn workspace_relations_refuse_incomplete_pages_without_caching_partial_snapshots() {
+        for incoming in [false, true] {
+            for failure in [
+                "missing",
+                "blank",
+                "repeated",
+                "malformed",
+                "graphql",
+                "missing-issue",
+                "missing-connection",
+            ] {
+                let mut issue = relation_issue("hub");
+                let field = if incoming {
+                    "inverseRelations"
+                } else {
+                    "relations"
+                };
+                issue[field] = relation_page(
+                    vec![blocking_relation("first", "hub")],
+                    true,
+                    serde_json::json!("start"),
+                );
+                let later = match failure {
+                    "graphql" => serde_json::json!({"errors": [{"message": "later page failed"}]}),
+                    "missing-issue" => serde_json::json!({"data": {"issue": null}}),
+                    "missing-connection" => serde_json::json!({"data": {"issue": {}}}),
+                    _ => {
+                        let cursor = match failure {
+                            "missing" => Value::Null,
+                            "blank" => serde_json::json!("  "),
+                            "repeated" => serde_json::json!("start"),
+                            "malformed" => serde_json::json!(42),
+                            _ => unreachable!(),
+                        };
+                        serde_json::json!({"data": {"issue": {"relations": relation_page(vec![], true, cursor)}}})
+                    }
+                };
+                let mut responses = relation_responses(issue, vec![later]);
+                responses.extend(relation_responses(relation_issue("healthy"), vec![]));
+                let (endpoint, server) = mock_linear(responses);
+                let source = LinearGraphQlSource::with_endpoint("test-key", endpoint).unwrap();
+                let directory = tempfile::tempdir().unwrap();
+                let mut service =
+                    ReadService::open(source, &directory.path().join("cache.sqlite3")).unwrap();
+                let error = service
+                    .workspace_snapshot()
+                    .expect_err("partial relations must fail");
+                match failure {
+                    "missing" => assert!(matches!(error, Error::MissingCursor)),
+                    "blank" | "repeated" => assert!(matches!(error, Error::InvalidCursor { .. })),
+                    "malformed" | "missing-connection" => assert!(matches!(error, Error::Http(_))),
+                    "graphql" => assert!(matches!(error, Error::GraphQl { .. })),
+                    "missing-issue" => assert!(matches!(error, Error::MissingWorkspaceData)),
+                    _ => unreachable!(),
+                }
+                let complete = service
+                    .workspace_snapshot()
+                    .expect("retry must refresh rather than use partial cache");
+                assert_eq!(complete.issues.len(), 1);
+                assert_eq!(complete.issues[0].id, IssueId("healthy".to_owned()));
+                assert_eq!(server.join().unwrap().len(), 5);
+            }
+        }
+    }
+
+    #[trace("FR-011-AC-3", "FR-011-AC-5", "FR-011-AC-6")]
+    #[test]
+    fn paginated_relations_preserve_transitive_focus_blocker_order() {
+        let mut hub = relation_issue("hub");
+        hub["relations"] = relation_page(vec![], true, serde_json::json!("out"));
+        hub["inverseRelations"] = relation_page(vec![], true, serde_json::json!("in"));
+        let (endpoint, server) = mock_linear(vec![
+            serde_json::json!({"data": {"projects": connection(serde_json::json!([]))}}),
+            serde_json::json!({"data": {"issues": connection(serde_json::json!([hub, relation_issue("dependent"), relation_issue("prerequisite")]))}}),
+            serde_json::json!({"data": {"issue": {"relations": connection(serde_json::json!([blocking_relation("hub", "dependent")]))}}}),
+            serde_json::json!({"data": {"issue": {"relations": connection(serde_json::json!([blocking_relation("prerequisite", "hub")]))}}}),
+        ]);
+        let directory = tempfile::tempdir().unwrap();
+        let source = LinearGraphQlSource::with_endpoint("test-key", endpoint).unwrap();
+        let mut service =
+            ReadService::open(source, &directory.path().join("cache.sqlite3")).unwrap();
+        let selection = crate::FocusSelection {
+            issues: vec!["dependent".to_owned()],
+            ..Default::default()
+        };
+        let expansion = service
+            .focus_expand(&selection)
+            .expect("complete blocker closure");
+        assert_eq!(
+            expansion.blocker_layers,
+            vec![
+                vec!["prerequisite".to_owned()],
+                vec!["hub".to_owned()],
+                vec!["dependent".to_owned()]
+            ]
+        );
+        assert_eq!(service.focus_expand(&selection).unwrap(), expansion);
+        assert_eq!(server.join().unwrap().len(), 4);
+    }
+
     fn project_status_response() -> Value {
         serde_json::json!({"data": {"project": {"id": "project-id", "status": {"team": null}}}})
     }
@@ -1898,6 +2175,7 @@ mod tests {
             "priority": 2.0, "sortOrder": 1.0, "state": {"name": "Specced", "type": "started"}, "team": {"key": "SWM"},
             "project": {"id": "project-id"},
             "projectMilestone": {"id": "milestone-id"},
+            "inverseRelations": connection(serde_json::json!([])),
             "relations": connection(serde_json::json!([]))
         });
         let (endpoint, server) = mock_linear(vec![
@@ -1980,6 +2258,7 @@ mod tests {
             "id": "issue-id", "identifier": "SWM-3", "title": "Project ticket", "description": null,
             "priority": 2.0, "sortOrder": 1.0, "state": {"name": "Specced", "type": "started"}, "team": {"key": "SWM"},
             "project": {"id": "project-id"},
+            "inverseRelations": connection(serde_json::json!([])),
             "relations": connection(serde_json::json!([]))
         });
         let (endpoint, server) = mock_linear(vec![
@@ -2016,6 +2295,7 @@ mod tests {
             "description": null, "priority": 2.0, "sortOrder": 1.0,
             "state": {"name": "Done", "type": "completed"}, "team": {"key": "SWM"},
             "project": null,
+            "inverseRelations": connection(serde_json::json!([])),
             "relations": connection(serde_json::json!([{
                 "type": "blocks", "issue": {"id": "completed-blocker"},
                 "relatedIssue": {"id": "ready-ticket"}
@@ -2026,6 +2306,7 @@ mod tests {
             "description": null, "priority": 2.0, "sortOrder": 2.0,
             "state": {"name": "Canceled", "type": "canceled"}, "team": {"key": "SWM"},
             "project": null,
+            "inverseRelations": connection(serde_json::json!([])),
             "relations": connection(serde_json::json!([{
                 "type": "blocks", "issue": {"id": "canceled-blocker"},
                 "relatedIssue": {"id": "canceled-dependent"}
@@ -2035,13 +2316,13 @@ mod tests {
             "parent": {"id": "completed-blocker"}, "id": "ready-ticket", "identifier": "SWM-6", "title": "Now unblocked",
             "description": null, "priority": 2.0, "sortOrder": 3.0,
             "state": {"name": "Specced", "type": "started"}, "team": {"key": "SWM"},
-            "project": {"id": "project-id"}, "relations": connection(serde_json::json!([]))
+            "project": {"id": "project-id"}, "inverseRelations": connection(serde_json::json!([])), "relations": connection(serde_json::json!([]))
         });
         let canceled_dependent = serde_json::json!({
             "id": "canceled-dependent", "identifier": "SWM-7", "title": "Still blocked",
             "description": null, "priority": 2.0, "sortOrder": 4.0,
             "state": {"name": "Specced", "type": "started"}, "team": {"key": "SWM"},
-            "project": {"id": "project-id"}, "relations": connection(serde_json::json!([]))
+            "project": {"id": "project-id"}, "inverseRelations": connection(serde_json::json!([])), "relations": connection(serde_json::json!([]))
         });
         let (endpoint, server) = mock_linear(vec![
             serde_json::json!({"data": {"projects": connection(serde_json::json!([project]))}}),
@@ -2190,6 +2471,7 @@ mod tests {
             "description": null, "priority": 2.0, "sortOrder": 1.0,
             "state": {"name": "Done", "type": "completed"}, "team": {"key": "SWM"},
             "project": null,
+            "inverseRelations": connection(serde_json::json!([])),
             "relations": connection(serde_json::json!([{
                 "type": "blocks", "issue": {"id": "blocker-id"},
                 "relatedIssue": {"id": "ready-ticket"}
@@ -2199,7 +2481,7 @@ mod tests {
             "id": "ready-ticket", "identifier": "SWM-6", "title": "Ready after refresh",
             "description": null, "priority": 2.0, "sortOrder": 2.0,
             "state": {"name": "Specced", "type": "started"}, "team": {"key": "SWM"},
-            "project": {"id": "project-id"}, "relations": connection(serde_json::json!([]))
+            "project": {"id": "project-id"}, "inverseRelations": connection(serde_json::json!([])), "relations": connection(serde_json::json!([]))
         });
         let (endpoint, server) = mock_linear(vec![
             serde_json::json!({"data": {"projects": connection(serde_json::json!([project]))}}),
@@ -2470,6 +2752,7 @@ mod tests {
                     "team": {"key": "SWM"},
                     "assignee": {"id": "worker-uuid", "name": "Worker One"},
                     "project": {"id": "project-uuid"},
+                    "inverseRelations": connection(serde_json::json!([])),
                     "relations": {
                         "nodes": [{
                             "type": "blocks",
