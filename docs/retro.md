@@ -1,3 +1,6 @@
+---
+type: reference
+---
 # Retro: snapshot, delta and backfill
 
 `ix-board retro` is a group of three commands that measure whether a team's work is converging on its gate tickets. `retro snapshot` takes a measurement, `retro delta` compares it with the previous one and a baseline, and `retro backfill` builds a baseline from history. The dev-team `team-retro` skill runs these on a schedule and scores the team's roles from the numbers.
