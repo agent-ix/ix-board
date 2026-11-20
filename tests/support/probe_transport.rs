@@ -33,7 +33,8 @@ fn main() {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input).unwrap();
     assert_eq!(input, env::var("PROBE_EXPECTED_INPUT").unwrap());
-    let location = executable.parent().unwrap();
+    let installed = env::current_exe().unwrap();
+    let location = installed.parent().unwrap();
     let now = if location.ends_with("preferred") {
         11
     } else if location.ends_with(".local/bin") {
@@ -41,7 +42,7 @@ fn main() {
     } else if location.ends_with(".cargo/bin") {
         33
     } else {
-        panic!("unexpected installation: {}", executable.display());
+        panic!("unexpected installation: {}", installed.display());
     };
     let response = env::var("PROBE_RESPONSE").unwrap();
     println!(
