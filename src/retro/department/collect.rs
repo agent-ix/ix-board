@@ -46,6 +46,7 @@ fn family(fact: &Fact) -> &'static str {
         Fact::PinEvent(_) => "pin_event",
         Fact::Check(_) => "check",
         Fact::Lifecycle(_) => "lifecycle",
+        Fact::Operation(f) => f.family(),
     }
 }
 
@@ -85,6 +86,7 @@ impl<'a> Calculator<'a> {
                         .repositories
                         .iter()
                         .any(|s| config.scope.repositories.iter().any(|c| c.id == s.id)),
+                    Fact::Operation(f) => f.selected(&config.scope, o),
                 };
                 selected && seen.insert(o.event_id.as_str())
             })
@@ -1138,6 +1140,8 @@ pub fn collect(
                 },
                 query_parameters: config.parameters.clone(),
                 evidence_refs,
+                classification_coverage: None,
+                operational_parameters: None,
             },
         );
     }
@@ -1185,6 +1189,14 @@ pub fn collect(
             missing: BTreeMap::new(),
         },
     };
+    if let Some(operations) = &config.operations {
+        let (measurements, order_loop) =
+            super::collect_operations(config, operations, frame, batches);
+        report.measurements.extend(measurements);
+        report
+            .loops
+            .insert(order_loop.detector_id.clone(), order_loop);
+    }
     super::assess(&mut report, config, None, None);
     report
 }

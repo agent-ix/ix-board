@@ -2892,6 +2892,135 @@ fn department_config() -> RetroConfig {
     c
 }
 
+#[trace("FR-029-AC-1", "FR-029-AC-2", "FR-029-AC-10")]
+#[test]
+fn read_only_collection_uses_operational_exports_and_writer_appends_exactly_once() {
+    use ix_board::retro::department::Selector;
+    use ix_board::retro::{Frame, collect_snapshot};
+    let rig = base_rig();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("host-export.json");
+    let stamp = ix_board::drift::format_timestamp(NOW);
+    let export = serde_json::json!({"version":1,"coverage":[{"family":"host","entities":["host"],
+        "from":stamp,"until":stamp,"complete":true,"full_history":false}],
+        "evidence":{"source":"operational-host","observed_at":stamp,"complete":["host"],"reasons":{},
+        "observations":[{"event_id":"host:sample:1","entity_id":"host","event_at":stamp,"observed_at":stamp,
+            "sequence":null,"scope":{"hosts":[{"id":"host","label":"Host"}]},"complete":true,
+            "source_ref":"host-agent:sample:1","attribution":null,
+            "fact":{"kind":"operation","data":{"kind":"host","data":{"host":"host","capacity_units":3,
+                "used_units":1,"load_one":1.5,"disk_available_bytes":800,"filesystem":"native-fs",
+                "source_error":null,"sample_observed_at":stamp}}}}]}});
+    std::fs::write(&source, serde_json::to_vec(&export).unwrap()).unwrap();
+    let mut c = department_config();
+    let department = c.department.as_mut().unwrap();
+    department.scope.hosts.push(Selector {
+        id: "host".into(),
+        label: "Host".into(),
+    });
+    department
+        .freshness_seconds
+        .insert("operational-host".into(), 60);
+    department.operations = Some(
+        serde_json::from_value(serde_json::json!({
+        "evidence_files":[{"path":source,"source":"operational-host","families":["host"]}],
+        "disk_reserve_bytes":{"host":1000}}))
+        .unwrap(),
+    );
+    let store = store_in(&dir);
+    let record = collect_snapshot(
+        &c,
+        Frame {
+            now: NOW,
+            window_secs: DAY,
+            end_exclusive: false,
+        },
+        &rig.sources(),
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(
+        !store.path().exists(),
+        "read-only collection must not append a record"
+    );
+    let report = record.department.as_ref().unwrap();
+    assert_eq!(
+        report.measurements["host_slots_used"].value,
+        Some(ix_board::retro::department::Value::Keyed(
+            [("host".into(), 1.0)].into()
+        ))
+    );
+    assert!(
+        report
+            .observations
+            .iter()
+            .any(|r| r.event_id == "host:sample:1")
+    );
+    let persisted = run_snapshot(&c, DAY, NOW, &rig.sources(), &store).unwrap();
+    assert_eq!(persisted, record);
+    assert_eq!(store.read_all().unwrap().len(), 1);
+}
+
+#[trace("FR-029-AC-7", "FR-029-AC-10")]
+#[test]
+fn saved_json_jsonl_and_delta_share_version_validation_without_sources_or_writes() {
+    use ix_board::retro::{SavedReport, decode_saved_report, read_saved_report};
+    let rig = base_rig();
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_in(&dir);
+    let c = department_config();
+    let first = run_snapshot(&c, DAY, NOW, &rig.sources(), &store).unwrap();
+    let second = run_snapshot(&c, DAY, NOW + 1.0, &rig.sources(), &store).unwrap();
+    let bytes = std::fs::read(store.path()).unwrap();
+    let expected = run_delta(&c, &store).unwrap();
+    rig.calls.borrow_mut().clear();
+    assert_eq!(
+        decode_saved_report(&serde_json::to_vec(&second).unwrap(), None).unwrap(),
+        SavedReport::Record(second.clone())
+    );
+    assert_eq!(
+        read_saved_report(store.path(), None).unwrap(),
+        SavedReport::Delta(expected.clone())
+    );
+    assert_eq!(
+        decode_saved_report(&serde_json::to_vec(&expected).unwrap(), None).unwrap(),
+        SavedReport::Delta(expected.clone())
+    );
+    let mut reordered = serde_json::to_vec(&second).unwrap();
+    reordered.push(b'\n');
+    reordered.extend(serde_json::to_vec(&first).unwrap());
+    reordered.push(b'\n');
+    assert_eq!(
+        decode_saved_report(&reordered, None).unwrap(),
+        SavedReport::Delta(expected)
+    );
+    let mut unsupported = serde_json::to_value(&second).unwrap();
+    unsupported["schema_version"] = 99.into();
+    assert!(
+        decode_saved_report(&serde_json::to_vec(&unsupported).unwrap(), None)
+            .unwrap_err()
+            .to_string()
+            .contains("schema_version")
+    );
+    unsupported = serde_json::to_value(&second).unwrap();
+    unsupported["department"]["version"] = 2.into();
+    assert!(
+        decode_saved_report(&serde_json::to_vec(&unsupported).unwrap(), None)
+            .unwrap_err()
+            .to_string()
+            .contains("department.version")
+    );
+    let mut unsupported_delta = serde_json::to_value(run_delta(&c, &store).unwrap()).unwrap();
+    unsupported_delta["department"]["current"]["version"] = 2.into();
+    rig.calls.borrow_mut().clear();
+    assert!(decode_saved_report(&serde_json::to_vec(&unsupported_delta).unwrap(), None).is_err());
+    assert_eq!(std::fs::read(store.path()).unwrap(), bytes);
+    assert!(
+        rig.calls.borrow().is_empty(),
+        "saved input decoding must never invoke sources"
+    );
+}
+
 #[trace("FR-029-AC-1", "FR-029-AC-7", "FR-029-AC-10")]
 #[test]
 fn department_snapshot_appends_v2_preserves_v1_bytes_and_delta_reads_no_collectors() {

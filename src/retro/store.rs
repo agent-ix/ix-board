@@ -236,24 +236,31 @@ impl Store {
     }
 }
 
-fn validate_record(record: &Record) -> Result<(), String> {
+pub(crate) fn validate_record(record: &Record) -> Result<(), String> {
     if record.schema_version > MAX_SCHEMA_VERSION {
         return Err(format!(
             "unsupported schema_version {}",
             record.schema_version
         ));
     }
+    if let Some(report) = &record.department {
+        validate_department_version(report.version)?;
+    }
     match (&record.department, record.schema_version) {
-        (Some(report), 2) if report.version == 1 => Ok(()),
-        (Some(report), _) if report.version != 1 => {
-            Err(format!("unsupported department.version {}", report.version))
-        }
+        (Some(_), 2) => Ok(()),
         (None, 0 | 1) => Ok(()),
         _ => Err(
             "schema_version 2 requires department version 1; schema_version 1 must omit department"
                 .into(),
         ),
     }
+}
+
+pub(crate) fn validate_department_version(version: u32) -> Result<(), String> {
+    if version != 1 {
+        return Err(format!("unsupported department.version {version}"));
+    }
+    Ok(())
 }
 
 /// Resolves `path` through every symbolic link, including links that dangle and components

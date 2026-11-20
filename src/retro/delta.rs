@@ -4,7 +4,7 @@
 //! `ix-board retro delta`: compares the latest snapshot with the previous one and the baseline,
 //! reading only the store (FR-027).
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::RetroError;
 use super::catalog::{CATALOG, Direction, Metric, Record, RecordKind, Status};
@@ -12,7 +12,7 @@ use super::config::RetroConfig;
 use super::store::Store;
 
 /// How one metric compares with one reference record.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChangeState {
     /// Both sides are `ok` with equal queries; `change` holds the difference.
@@ -24,7 +24,8 @@ pub enum ChangeState {
 }
 
 /// The queries of the two sides of a `query_changed` comparison.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Queries {
     /// Query of the latest record.
     pub latest: String,
@@ -33,7 +34,8 @@ pub struct Queries {
 }
 
 /// The comparison of the latest value with one reference record.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Comparison {
     /// `taken_at` of the reference record.
     pub reference_taken_at: String,
@@ -48,7 +50,8 @@ pub struct Comparison {
 }
 
 /// One metric of the latest record with its changes.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetricDelta {
     /// Metric id.
     pub id: String,
@@ -72,7 +75,8 @@ pub struct MetricDelta {
 }
 
 /// The delta report. There is deliberately no combined score.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeltaReport {
     /// Offline department comparisons when the latest record has an envelope.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -102,14 +106,23 @@ pub struct DeltaReport {
 pub fn run_delta(config: &RetroConfig, store: &Store) -> Result<DeltaReport, RetroError> {
     config.validate_department()?;
     let records = store.read_all()?;
-    let baseline = match &config.baseline_taken_at {
+    compare_records(&config.team, config.baseline_taken_at.as_deref(), &records)
+}
+
+/// Applies the store's existing comparison selection to already validated, time-ordered records.
+pub(crate) fn compare_records(
+    team: &str,
+    baseline_taken_at: Option<&str>,
+    records: &[Record],
+) -> Result<DeltaReport, RetroError> {
+    let baseline = match baseline_taken_at {
         Some(wanted) => {
             let wanted_epoch = epoch(wanted);
             Some(
                 records
                     .iter()
                     .find(|record| epoch(&record.taken_at) == wanted_epoch)
-                    .ok_or_else(|| RetroError::BaselineNotFound(wanted.clone()))?,
+                    .ok_or_else(|| RetroError::BaselineNotFound(wanted.into()))?,
             )
         }
         None => records.first(),
@@ -121,7 +134,7 @@ pub fn run_delta(config: &RetroConfig, store: &Store) -> Result<DeltaReport, Ret
     let [.., previous, latest] = snapshots.as_slice() else {
         return Ok(DeltaReport {
             department: None,
-            team: config.team.clone(),
+            team: team.into(),
             message: Some(format!(
                 "no delta: {} snapshot record(s) in the store, two are needed",
                 snapshots.len()
@@ -171,7 +184,7 @@ pub fn run_delta(config: &RetroConfig, store: &Store) -> Result<DeltaReport, Ret
                 baseline.department.as_ref(),
             )
         }),
-        team: config.team.clone(),
+        team: team.into(),
         message: None,
         latest: Some(latest.taken_at.clone()),
         previous: Some(previous.taken_at.clone()),

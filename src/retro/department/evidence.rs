@@ -86,6 +86,8 @@ pub enum Fact {
     Check(CheckFact),
     /// Original lifecycle report, preserved without reclassification.
     Lifecycle(LifecycleFact),
+    /// Typed operational source evidence; semantic fields require explicit attribution.
+    Operation(super::OperationFact),
 }
 wire! {
     /// Lifecycle evidence preserving FR-018 uncertainty without private pane/transcript text.
