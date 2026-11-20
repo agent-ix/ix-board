@@ -70,6 +70,22 @@ pub struct LabeledIssue {
 
 /// Linear reads.
 pub trait LinearSource {
+    /// Current native department issue evidence; histories remain explicitly unavailable
+    /// unless an adapter supplies stable ordered native events.
+    fn department_evidence(
+        &self,
+        scope: &super::department::Scope,
+        since: f64,
+    ) -> super::department::Evidence {
+        match self.workspace(since) {
+            Ok(snapshot) => super::department::workspace_evidence(&snapshot, scope),
+            Err(reason) => super::department::Evidence {
+                source: "linear".into(),
+                reasons: [("issue".into(), reason)].into(),
+                ..Default::default()
+            },
+        }
+    }
     /// The complete workspace snapshot, read in one paginated pass. It is current for every
     /// issue updated at or after `since` (Unix seconds): a cached snapshot is used only when a
     /// fresh read of the recently updated issues proves it so.
@@ -159,6 +175,17 @@ pub const AGENTS_IDLE_AFTER_SECS: u64 = 20 * 60;
 
 /// GitHub reads.
 pub trait GithubSource {
+    /// Normalized dependency, review and check evidence with independent capability coverage.
+    fn department_evidence(
+        &self,
+        _scope: &super::department::Scope,
+        _since: f64,
+    ) -> super::department::Evidence {
+        super::department::Evidence {
+            source: "github".into(),
+            ..Default::default()
+        }
+    }
     /// Every open pull request of `repo`, plus merged ones updated at or after `since`,
     /// read in one paginated pass.
     fn pull_requests(&self, repo: &str, since: f64) -> Result<Vec<PullRequest>, String>;

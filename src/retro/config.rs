@@ -82,6 +82,9 @@ pub struct MainCheck {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetroConfig {
+    /// Optional versioned department evidence and assessment configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub department: Option<super::department::Config>,
     /// Store directory name and default Linear team key.
     pub team: String,
     /// Linear team keys whose open issues count toward scope metrics; defaults to `team`.
@@ -178,7 +181,22 @@ impl RetroConfig {
                 message: format!("{baseline:?} is not a UTC timestamp"),
             });
         }
+        config.validate_department()?;
         Ok(config)
+    }
+
+    /// Validates department configuration before any source or store operation.
+    pub fn validate_department(&self) -> Result<(), ConfigError> {
+        if let Some(department) = &self.department {
+            department
+                .validate()
+                .map_err(|message| ConfigError::BadValue {
+                    path: PathBuf::from("<department>"),
+                    field: "department",
+                    message,
+                })?;
+        }
+        Ok(())
     }
 }
 

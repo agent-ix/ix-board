@@ -153,6 +153,9 @@ pub struct Record {
     pub window: String,
     /// Metrics keyed by id.
     pub metrics: BTreeMap<String, Metric>,
+    /// Version-one department envelope; omitted for legacy version-one records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub department: Option<super::department::Report>,
 }
 
 impl Record {

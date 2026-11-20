@@ -11,6 +11,7 @@ pub mod backfill;
 pub mod catalog;
 pub mod config;
 pub mod delta;
+pub mod department;
 pub mod live;
 pub mod metrics;
 pub mod sources;
@@ -65,19 +66,51 @@ pub fn run_snapshot(
     sources: &Sources<'_>,
     store: &Store,
 ) -> Result<Record, RetroError> {
+    config.validate_department()?;
     store.check_writable()?;
+    let stored = store.read_all()?;
     let frame = Frame {
         now,
         window_secs,
         end_exclusive: false,
     };
+    let metrics = metrics::collect(config, frame, sources);
+    let department = config.department.as_ref().map(|department| {
+        let batches = [
+            sources
+                .linear
+                .department_evidence(&department.scope, frame.now - window_secs as f64),
+            sources
+                .github
+                .department_evidence(&department.scope, frame.now - window_secs as f64),
+        ];
+        let mut report = department::collect(department, frame, &batches, &metrics);
+        let previous = stored
+            .iter()
+            .rev()
+            .find(|r| r.kind == RecordKind::Snapshot)
+            .and_then(|r| r.department.as_ref());
+        let baseline = config
+            .baseline_taken_at
+            .as_ref()
+            .and_then(|at| stored.iter().find(|r| &r.taken_at == at))
+            .or_else(|| stored.first())
+            .and_then(|r| r.department.as_ref());
+        department::assess(&mut report, department, previous, baseline);
+        report
+    });
     let record = Record {
-        schema_version: SCHEMA_VERSION,
+        schema_version: if department.is_some() {
+            2
+        } else {
+            SCHEMA_VERSION
+        },
         kind: RecordKind::Snapshot,
         taken_at: crate::drift::format_timestamp(now.floor()),
         team: config.team.clone(),
         window: format_window(window_secs),
-        metrics: metrics::collect(config, frame, sources),
+        metrics,
+        department,
     };
     store.append(&record)?;
     Ok(record)
@@ -85,7 +118,7 @@ pub fn run_snapshot(
 
 /// One line per metric: id, status, value and unit, or the reason it is unavailable.
 pub fn render_text(record: &Record) -> String {
-    CATALOG
+    let mut text = CATALOG
         .iter()
         .filter_map(|entry| record.metrics.get(entry.id))
         .map(|metric| match (metric.value, &metric.reason) {
@@ -97,7 +130,16 @@ pub fn render_text(record: &Record) -> String {
             ),
         })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    if let Some(report) = &record.department {
+        for (id, class) in &report.classes {
+            text.push_str(&format!(
+                "\n{id}: {:?}; complete={}; route={:?}; missing={:?}",
+                class.summary.severity, class.summary.complete, class.route, class.summary.missing
+            ));
+        }
+    }
+    text
 }
 
 /// The stderr notice naming the unavailable metric ids, or `None` when every metric was read.

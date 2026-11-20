@@ -45,6 +45,7 @@ pub fn run_backfill(
     (linear, github): (&dyn LinearSource, &dyn GithubSource),
     store: &Store,
 ) -> Result<BackfillReport, RetroError> {
+    config.validate_department()?;
     let last_day = until.unwrap_or_else(|| (now / DAY_SECS).floor() * DAY_SECS - DAY_SECS);
     for day in [first_day, last_day] {
         if day + DAY_SECS > now {
@@ -102,14 +103,32 @@ pub fn run_backfill(
         .collect::<Vec<_>>();
     let measured = collect_history(config, &frames, linear, github);
     let mut appended = Vec::new();
-    for ((_, taken_at), metrics) in pending.into_iter().zip(measured) {
+    for ((end, taken_at), metrics) in pending.into_iter().zip(measured) {
+        let department = config.department.as_ref().map(|config| {
+            // Current gauges cannot be reconstructed from today's source snapshot.
+            super::department::collect(
+                config,
+                Frame {
+                    now: end,
+                    window_secs,
+                    end_exclusive: false,
+                },
+                &[],
+                &metrics,
+            )
+        });
         let record = Record {
-            schema_version: SCHEMA_VERSION,
+            schema_version: if department.is_some() {
+                2
+            } else {
+                SCHEMA_VERSION
+            },
             kind: RecordKind::Backfill,
             taken_at,
             team: config.team.clone(),
             window: format_window(window_secs),
             metrics,
+            department,
         };
         store.append(&record)?;
         appended.push(record);

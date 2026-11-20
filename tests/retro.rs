@@ -2003,6 +2003,7 @@ fn stored(id: &str, value: Option<f64>, query: &str) -> Metric {
 
 fn record(kind: RecordKind, taken_at: &str, metrics: &[(&str, Option<f64>, &str)]) -> Record {
     Record {
+        department: None,
         schema_version: 1,
         kind,
         taken_at: taken_at.to_owned(),

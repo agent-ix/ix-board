@@ -9,7 +9,9 @@ use std::path::{Component, Path, PathBuf};
 
 use thiserror::Error as ThisError;
 
-use super::catalog::{Record, SCHEMA_VERSION};
+use super::catalog::Record;
+
+const MAX_SCHEMA_VERSION: u32 = 2;
 
 /// Environment variable naming the store root.
 pub const HOME_VARIABLE: &str = "TEAM_RETRO_HOME";
@@ -51,7 +53,7 @@ pub enum StoreError {
     },
     /// A record carries a newer schema version than this build understands.
     #[error(
-        "{path}: line {line} has schema_version {found}; this build understands up to {SCHEMA_VERSION}"
+        "{path}: line {line} has schema_version {found}; this build understands up to {MAX_SCHEMA_VERSION}"
     )]
     NewerSchema {
         /// Store file.
@@ -147,7 +149,7 @@ impl Store {
             if let Some(found) = value
                 .get("schema_version")
                 .and_then(serde_json::Value::as_u64)
-                && found > u64::from(SCHEMA_VERSION)
+                && !(1..=u64::from(MAX_SCHEMA_VERSION)).contains(&found)
             {
                 return Err(StoreError::NewerSchema {
                     path: self.path.clone(),
@@ -157,6 +159,7 @@ impl Store {
             }
             let record: Record =
                 serde_json::from_value(value).map_err(|error| line_error(error.to_string()))?;
+            validate_record(&record).map_err(line_error)?;
             let taken = crate::drift::timestamp_epoch(&record.taken_at)
                 .map_err(|error| line_error(error.to_string()))?;
             keyed.push((taken, record));
@@ -176,6 +179,12 @@ impl Store {
     /// Refuses before creating anything when the resolved path is inside a git work tree or
     /// the file does not end in a newline.
     pub fn append(&self, record: &Record) -> Result<(), StoreError> {
+        validate_record(record).map_err(|message| StoreError::Line {
+            path: self.path.clone(),
+            line: 0,
+            message,
+        })?;
+        self.read_all()?;
         let resolved = resolve_links(&self.path).map_err(|source| self.io(source))?;
         refuse_inside_git(&resolved)?;
         if let Some(parent) = resolved.parent() {
@@ -214,6 +223,26 @@ impl Store {
             path: self.path.clone(),
             source,
         }
+    }
+}
+
+fn validate_record(record: &Record) -> Result<(), String> {
+    if !(1..=MAX_SCHEMA_VERSION).contains(&record.schema_version) {
+        return Err(format!(
+            "unsupported schema_version {}",
+            record.schema_version
+        ));
+    }
+    match (&record.department, record.schema_version) {
+        (Some(report), 2) if report.version == 1 => Ok(()),
+        (Some(report), _) if report.version != 1 => {
+            Err(format!("unsupported department.version {}", report.version))
+        }
+        (None, 1) => Ok(()),
+        _ => Err(
+            "schema_version 2 requires department version 1; schema_version 1 must omit department"
+                .into(),
+        ),
     }
 }
 

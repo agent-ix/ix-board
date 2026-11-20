@@ -685,6 +685,76 @@ impl LinearGraphQlSource {
             .collect()
     }
 
+    /// Reads native state-entry events for department residence and bounce metrics.
+    /// Equal timestamps deliberately retain unknown sequence rather than inventing order.
+    pub fn fetch_department_state_events(
+        &self,
+        issue_id: &str,
+        scope: &crate::retro::department::Scope,
+        observed_at: &str,
+    ) -> Result<Vec<crate::retro::department::Observation>, String> {
+        use crate::retro::department::{Fact, Observation, StateFact};
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Data {
+            issue: Option<History>,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct History {
+            history: Connection<Event>,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields, rename_all = "camelCase")]
+        struct Event {
+            id: String,
+            created_at: String,
+            to_state: Option<State>,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct State {
+            id: String,
+        }
+        let query = "query IssueHistory($id: String!, $first: Int!, $after: String) { issue(id: $id) { history(first: $first, after: $after) { nodes { id createdAt toState { id } } pageInfo { hasNextPage endCursor } } } }";
+        let events = crate::retro::sources::read_all_pages(|after| {
+            let data: Data = self
+                .request(
+                    query,
+                    IssueHistoryVariables {
+                        id: issue_id.into(),
+                        first: HISTORY_PAGE_SIZE,
+                        after: after.map(str::to_owned),
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+            let history = data.issue.ok_or("missing issue history")?.history;
+            Ok(crate::retro::sources::Page {
+                items: history.nodes,
+                has_next: history.page_info.has_next_page,
+                cursor: history.page_info.end_cursor,
+            })
+        })?;
+        Ok(events
+            .into_iter()
+            .filter_map(|event| {
+                let state = event.to_state?;
+                Some(Observation {
+                    event_id: event.id.clone(),
+                    entity_id: issue_id.into(),
+                    event_at: Some(event.created_at),
+                    observed_at: Some(observed_at.into()),
+                    sequence: None,
+                    scope: scope.clone(),
+                    complete: true,
+                    source_ref: format!("linear:history:{}", event.id),
+                    attribution: None,
+                    fact: Fact::State(StateFact { state: state.id }),
+                })
+            })
+            .collect())
+    }
+
     /// Reads the first line of every comment whose body starts with `prefix` and contains
     /// `needle`. The rest of each comment is dropped.
     pub fn fetch_marker_lines(&self, prefix: &str, needle: &str) -> Result<Vec<String>, String> {
