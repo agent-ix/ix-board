@@ -59,3 +59,20 @@ No real credential store/status, credential-backed ix-board command, token extra
 | cli_fallback_runs_only_after_absent_provider_and_missing_stays_error | FR-015-AC-2 | does not assert criterion; FND-003 |
 | invalid_environment_snapshot_never_falls_through | FR-015-AC-3 | checks whitespace constructor refusal; empty/non-UTF-8 environment adds supplemental guard |
 
+## Dispositions
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-001 | fixed | Round1 at43b72b3: the saved-provider test no longer claims FR-029-AC-4; matrix confirms no credential_provider binder for that criterion. |
+| FND-002 | fixed | Round1 at43b72b3: the saved-provider test no longer claims FR-029-AC-8; matrix confirms no credential_provider binder for that criterion. |
+| FND-003 | fixed | Round1 at43b72b3: unsupported supplemental FR-015-AC-2 tags were removed. The actual redaction/header/cache-identity oracle now has the supported trace attribute for FR-015-AC-1/2 and its exact behavior passes. |
+| FND-004 | fixed | Round1 at43b72b3: recv_timeout(5s) must observe server completion before join. The inspected missing-freshness mutation fails exit101 after5.01s at the explicit all-three-requests deadline rather than hanging. Restored provider tests pass. |
+
+## Disposition pass 1
+
+Frozen revision43b72b376c734a81b6b29fc36e783640de97d00e independently inspected. Original findings and historical binding table above remain unchanged. All four findings are fixed, with no new findings. **Current scoped code/Rust verdict: PASS; mergeable after the lead's final aggregate gate.**
+
+Independent confined checks: five credential_provider integration tests exit0; the protected_credential_preserves_authentication_and_cache_identity unit test exit0; git diff --check exit0. Author fix clippy/fmt/23-linear-test results and adverse log inspected. The production source API is unchanged in this fix; no new credential behavior, global environment mutation or duplicate resolver appeared. The server channel observes successful completion before join; a missing request now has a finite failure. No source changes, push, credentials, extra worktree or aggregate gate. All reviewer compiler/test commands completed; BUILD QUIESCENT.
+
+Current matrix: FR-015-AC-1/2 bind the real protected-credential oracle; credential_provider no longer claims FR-029-AC-4/8 or the unsupported header/cache bindings. Supplemental resolver guards remain tests without false criterion claims. FR-015-AC-3 keeps the fixture's real whitespace refusal binding. Repository assurance is still FAIL/INCOMPLETE for177 legacy untagged criteria, retained by SR6061.
+

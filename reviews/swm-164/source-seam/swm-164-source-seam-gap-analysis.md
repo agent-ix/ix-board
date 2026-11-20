@@ -59,3 +59,9 @@ FND-001 is retained as the historical repository limitation under the lead's exp
 | --- | --- | --- |
 | FND-001 | accepted-no-change | Round1: the lead explicitly excludes the existing legacy trace baseline from this source refactor. Preserve repository FAIL/INCOMPLETE; do not waive new SR6060 findings. |
 
+## Source-seam disposition pass 1 update
+
+Revision43b72b376c734a81b6b29fc36e783640de97d00e: all four SR6060 findings fixed; no new reverse-gap/stub issue. quoin matrix rerun exit0:229 criteria,44 tagged,177 untagged,8 method-without-symbol, no ignored-only criterion. The previously untagged FR-015-AC-1 now binds the existing true redaction/header/cache test along with FR-015-AC-2; unsupported metric/loop tags are gone. coverage rerun exit0 with existing cfg/legacy diagnostics preserved. Static traceability remains distinct from execution evidence.
+
+FND001's standing baseline outcome and prior round1 tracker disposition remain unchanged and are not reposted. **Repository assurance remains FAIL/INCOMPLETE for177 legacy gaps.** This does not block the now-clear scoped source seam after the lead's gate. Current matrix/coverage, two independent confined test logs and read-back evidence are retained under source-seam-review/disposition-1/. Plan completion: not assessed remains the planless result; no plan was introduced.
+
