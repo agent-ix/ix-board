@@ -3221,6 +3221,27 @@ mod tests {
     }
 
     #[test]
+    fn missing_native_status_type_normalizes_to_unknown_category() {
+        let mut missing_type = status_project("no-type", "Completed", "completed");
+        missing_type["status"] = serde_json::json!({"name": "Completed"});
+        let (endpoint, server) = mock_linear(vec![
+            serde_json::json!({"data": {"projects": connection(serde_json::json!([missing_type]))}}),
+            serde_json::json!({"data": {"issues": connection(serde_json::json!([]))}}),
+        ]);
+        let source = LinearGraphQlSource::with_endpoint("test-key", endpoint.clone())
+            .expect("source with local endpoint");
+        let result = source.fetch_workspace();
+        satisfy_unused_mock_requests(&endpoint, 2);
+        server.join().expect("mock server");
+
+        let snapshot = result.expect("missing native type decodes as Unknown");
+        let project = &snapshot.projects[0];
+        assert_eq!(project.status_name.as_deref(), Some("Completed"));
+        assert_eq!(project.status_category, ProjectStatusCategory::Unknown);
+        assert_eq!(project.completion(), ProjectCompletion::Unknown);
+    }
+
+    #[test]
     fn status_category_snapshots_coexist_with_prior_model_cache_entries() {
         let cache_path = std::env::temp_dir().join(format!(
             "ix-board-status-category-cache-{}.sqlite",
