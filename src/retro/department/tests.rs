@@ -750,6 +750,23 @@ fn keyed_policy_selects_count_median_or_p90_per_expected_key_without_averaging()
     assert_eq!(a.summary.severity, Severity::Red);
     assert!(!a.summary.complete);
     assert!(a.summary.missing.contains_key("missing"));
+    let mut report = r.clone();
+    report
+        .measurements
+        .insert("state_cycle_hours".into(), m.clone());
+    let mut c = config();
+    c.policies = vec![p.clone()];
+    c.classes = vec![ClassConfig {
+        id: "flow_wip".into(),
+        required: ["state_cycle_hours".into()].into(),
+        optional: BTreeSet::new(),
+        route: None,
+    }];
+    assess(&mut report, &c, None, None);
+    assert_eq!(report.classes["flow_wip"].summary.severity, Severity::Red);
+    assert!(!report.classes["flow_wip"].summary.complete);
+    assert_eq!(report.rollup.severity, Severity::Red);
+    assert!(!report.rollup.complete);
     p.statistic = Statistic::Count;
     p.unit = "count".into();
     p.expected_keys.remove("missing");

@@ -113,7 +113,7 @@ pub fn summarize(members: &BTreeMap<String, KeyAssessment>) -> Summary {
     let mut missing = BTreeMap::new();
     for (id, member) in members {
         severity = worst(severity, member.severity);
-        if member.severity == Severity::Unknown {
+        if member.severity == Severity::Unknown || member.reason.is_some() {
             missing.insert(
                 id.clone(),
                 member.reason.clone().unwrap_or_else(|| "unassessed".into()),
