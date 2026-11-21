@@ -290,7 +290,11 @@ impl LinearGraphQlSource {
             ))
         };
         Ok(Self {
-            client: Client::builder().timeout(REQUEST_TIMEOUT).build()?,
+            client: Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
+                .build()?,
             api_key,
             endpoint,
             cache_namespace,

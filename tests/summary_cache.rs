@@ -7,12 +7,235 @@ use ix_board::linear_summary::{SummarySnapshot, merge_summary};
 use ix_board::program_review::build_summary_roadmap;
 use ix_board::{Error, LinearGraphQlSource, WorkspaceSource};
 use ix_cli_kit::secrets::SecretStore;
+use ix_trace_rs::trace;
 use serde_json::{Value, json};
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::mpsc;
 use std::time::Duration;
+
+struct ElapsedRefreshClock {
+    before: i64,
+    after: i64,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl ix_board::Clock for ElapsedRefreshClock {
+    fn now_epoch_seconds(&self) -> i64 {
+        if self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+            self.before
+        } else {
+            self.after
+        }
+    }
+}
+
+#[trace("FR-004-AC-3")]
+#[test]
+fn failed_summary_age_uses_return_clock_and_cooldown_matches_absolute_transport_state() {
+    use ix_board::Clock;
+    let (source, requests, cache, _) = fixture_responses(vec![
+        (
+            200,
+            vec![],
+            json!({"data":{"projects":page(json!([project("p1")]),None)}}),
+        ),
+        (
+            200,
+            vec![],
+            json!({"data":{"initiatives":page(json!([initiative()]),None)}}),
+        ),
+        (
+            500,
+            vec![],
+            json!({"errors":[{"message":"failed after elapsed refresh"}]}),
+        ),
+        (
+            429,
+            vec![("Retry-After", "60".to_owned())],
+            json!({"errors":[{"message":"delayed quota response","extensions":{"code":"RATELIMITED"}}]}),
+        ),
+    ]);
+    let first = source.summary_snapshot_cached().expect("complete baseline");
+    let path = cache.path().join("linear.sqlite3");
+    let connection = rusqlite::Connection::open(&path).expect("cache");
+    let sync = first.last_successful_sync - 1000;
+    connection
+        .execute("UPDATE summary_snapshot SET synced_at=?1", [sync])
+        .expect("expired summary");
+    for rate_limited in [false, true] {
+        let after = ix_board::SystemClock.now_epoch_seconds();
+        let clock = ElapsedRefreshClock {
+            before: after - 20,
+            after,
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let fallback = source
+            .summary_snapshot_cached_with_clock(&clock)
+            .expect("last complete fallback");
+        assert!(fallback.freshness.stale);
+        assert_eq!(fallback.data, first.data);
+        assert_eq!(
+            fallback.freshness.age_seconds,
+            Some(after - sync),
+            "elapsed refresh time belongs to source age"
+        );
+        assert_eq!(fallback.last_successful_sync, sync);
+        if rate_limited {
+            let millis = ix_board::quota::QuotaGate::open(&path, &Default::default())
+                .expect("quota")
+                .status()
+                .expect("stored cooldown")
+                .rate_limit_until
+                .expect("observed cooldown");
+            let expected = millis.div_euclid(1000) + i64::from(millis.rem_euclid(1000) > 0);
+            assert_eq!(
+                fallback.freshness.rate_limit_until,
+                Some(expected),
+                "absolute persisted retry deadline is authoritative"
+            );
+            assert!(
+                expected > clock.before + 60,
+                "pre-refresh clock plus remaining duration would understate cooldown"
+            );
+        } else {
+            assert!(fallback.freshness.rate_limit_until.is_none());
+        }
+    }
+    assert_eq!(
+        requests
+            .recv_timeout(Duration::from_secs(5))
+            .expect("four requests")
+            .len(),
+        4
+    );
+}
+
+#[trace("FR-019-AC-5", "FR-030-AC-4", "FR-004-AC-21")]
+#[test]
+fn cold_and_warm_scope_and_roadmap_reuse_summaries_without_advancing_real_detail_reads() {
+    let mut detail = project("p1");
+    detail.as_object_mut().expect("project").remove("progress");
+    detail["content"] = Value::Null;
+    detail["teams"] = page(json!([]), None);
+    detail["projectMilestones"] = page(json!([]), None);
+    let (source, requests, cache, _) = fixture_responses(vec![
+        (
+            200,
+            vec![],
+            json!({"data":{"projects":page(json!([project("p1")]),None)}}),
+        ),
+        (
+            200,
+            vec![],
+            json!({"data":{"initiatives":page(json!([initiative()]),None)}}),
+        ),
+        (
+            200,
+            vec![],
+            json!({"data":{"projects":page(json!([detail]),None)}}),
+        ),
+        (200, vec![], json!({"data":{"issues":page(json!([]),None)}})),
+        (
+            200,
+            vec![],
+            json!({"data":{"projects":page(json!([]),None)}}),
+        ),
+        (
+            200,
+            vec![],
+            json!({"data":{"initiatives":page(json!([]),None)}}),
+        ),
+        (
+            429,
+            vec![("Retry-After", "60".to_owned())],
+            json!({"errors":[{"message":"quota","extensions":{"code":"RATELIMITED"}}]}),
+        ),
+    ]);
+    let scope: ix_board::program_review::ProgramScope =
+        serde_json::from_value(json!({"program":"fixture"})).expect("no repository probes");
+    let cold = source.summary_snapshot_cached().expect("cold summary");
+    ix_board::program_review::check_summary_scope(&scope, &cold.data).expect("cold scope");
+    let cold_roadmap = build_summary_roadmap(&cold.data, None, "observed");
+    let warm = source.summary_snapshot_cached().expect("warm catalogs");
+    ix_board::program_review::check_summary_scope(&scope, &warm.data).expect("warm scope");
+    assert_eq!(
+        build_summary_roadmap(&warm.data, None, "observed"),
+        cold_roadmap
+    );
+    let path = cache.path().join("linear.sqlite3");
+    let mut reader = ix_board::ReadService::open(source.clone(), &path).expect("detail service");
+    assert!(
+        reader
+            .next("SWM")
+            .expect("ticket-dependent read")
+            .is_empty()
+    );
+    assert!(reader.next("SWM").expect("warm detail reuse").is_empty());
+    let connection = rusqlite::Connection::open(&path).expect("cache");
+    let read_detail = || {
+        connection
+            .query_row(
+                "SELECT fetched_at,payload,read_started_at FROM workspace_snapshot",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .expect("actual detail provenance")
+    };
+    let detail_before = read_detail();
+    connection
+        .execute("UPDATE summary_snapshot SET synced_at=synced_at-1000", [])
+        .expect("expire summaries");
+    source.summary_snapshot_cached().expect("summary delta");
+    assert_eq!(
+        read_detail(),
+        detail_before,
+        "summary refresh cannot certify detail freshness"
+    );
+    connection
+        .execute("UPDATE summary_snapshot SET synced_at=synced_at-1000", [])
+        .expect("expire for fallback");
+    let fallback = source
+        .summary_snapshot_cached()
+        .expect("last complete summary");
+    ix_board::program_review::check_summary_scope(&scope, &fallback.data)
+        .expect("scope from stale summary");
+    assert!(fallback.freshness.stale);
+    assert!(fallback.freshness.age_seconds.expect("known age") >= 1000);
+    assert!(fallback.freshness.rate_limit_until.is_some());
+    assert_eq!(
+        read_detail(),
+        detail_before,
+        "fallback does not update detail"
+    );
+    let requests = requests
+        .recv_timeout(Duration::from_secs(5))
+        .expect("complete fixture");
+    assert_eq!(requests.len(), 7);
+    for index in [0, 1, 4, 5, 6] {
+        let query = requests[index]["query"].as_str().expect("summary query");
+        assert!(!query.contains("WorkspaceIssues") && !query.contains("history"));
+    }
+    assert!(
+        requests[2]["query"]
+            .as_str()
+            .expect("detail projects")
+            .contains("WorkspaceProjects")
+    );
+    assert!(
+        requests[3]["query"]
+            .as_str()
+            .expect("detail tickets")
+            .contains("WorkspaceIssues")
+    );
+}
 
 fn page(nodes: Value, cursor: Option<&str>) -> Value {
     json!({"nodes": nodes, "pageInfo": {"hasNextPage":cursor.is_some(), "endCursor":cursor}})
@@ -50,6 +273,22 @@ fn fixture_endpoint(
     tempfile::TempDir,
     String,
 ) {
+    fixture_responses(
+        responses
+            .into_iter()
+            .map(|value| (200, Vec::new(), value))
+            .collect(),
+    )
+}
+
+fn fixture_responses(
+    responses: Vec<(u16, Vec<(&'static str, String)>, Value)>,
+) -> (
+    LinearGraphQlSource,
+    mpsc::Receiver<Vec<Value>>,
+    tempfile::TempDir,
+    String,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("loopback fixture");
     let endpoint = format!(
         "http://{}/graphql",
@@ -58,7 +297,7 @@ fn fixture_endpoint(
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let mut requests = Vec::new();
-        for response in responses {
+        for (status, headers, response) in responses {
             let (mut stream, _) = listener.accept().expect("fixture request");
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
@@ -92,7 +331,11 @@ fn fixture_endpoint(
             }
             requests.push(serde_json::from_slice(&bytes[body_start..]).expect("GraphQL request"));
             let body = response.to_string();
-            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).expect("response");
+            let headers = headers
+                .into_iter()
+                .map(|(name, value)| format!("{name}: {value}\r\n"))
+                .collect::<String>();
+            write!(stream,"HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).expect("response");
         }
         sender.send(requests).expect("request observation");
     });
@@ -111,6 +354,7 @@ fn fixture_endpoint(
 }
 
 /// Trace: FR-020-AC-2, FR-030-AC-1, FR-019-AC-5
+#[trace("FR-020-AC-2")]
 #[test]
 fn native_catalog_pages_never_enumerate_tickets_and_keep_weighted_progress() {
     let (source, requests, _cache) = fixture(vec![
@@ -147,9 +391,23 @@ fn native_catalog_pages_never_enumerate_tickets_and_keep_weighted_progress() {
         row.project_updated_at.as_deref(),
         Some("2026-11-20T00:00:00Z")
     );
+    let json = serde_json::to_value(&roadmap).expect("native JSON roadmap");
+    let row = &json["initiatives"][0]["projects"][0];
+    for field in ["open", "done", "canceled", "last_activity"] {
+        assert!(row[field].is_null(), "unsupported {field} is explicit null");
+    }
+    assert_eq!(row["observed_at"], "2026-11-21T00:00:00Z");
+    assert_eq!(row["progress_source"], "linear_native");
+    assert!(
+        row["activity_unavailable_reason"]
+            .as_str()
+            .expect("reason")
+            .contains("issue")
+    );
 }
 
 /// Trace: FR-030-AC-1, FR-030-AC-2
+#[trace("FR-030-AC-1", "FR-030-AC-2")]
 #[test]
 fn delta_uses_overlap_for_both_catalogs_and_failed_pages_return_no_batch() {
     let (source, requests, _cache) = fixture(vec![
@@ -198,6 +456,7 @@ fn baseline() -> SummarySnapshot {
 }
 
 /// Trace: FR-030-AC-1, FR-030-AC-3
+#[trace("FR-030-AC-1", "FR-030-AC-3")]
 #[test]
 fn stable_id_merge_replaces_membership_removes_tombstones_and_is_idempotent() {
     let baseline = baseline();
@@ -235,6 +494,7 @@ fn stable_id_merge_replaces_membership_removes_tombstones_and_is_idempotent() {
 }
 
 /// Trace: FR-030-AC-1, FR-020-AC-1
+#[trace("FR-030-AC-1", "FR-020-AC-1")]
 #[test]
 fn summary_memberships_paginate_without_loading_tickets() {
     let mut first_project = project("p1");
@@ -263,6 +523,7 @@ fn summary_memberships_paginate_without_loading_tickets() {
 }
 
 /// Trace: FR-030-AC-2
+#[trace("FR-030-AC-2")]
 #[test]
 fn repeated_summary_cursor_is_refused_instead_of_publishing_partial_data() {
     let (source, requests, _cache) = fixture(vec![
@@ -283,6 +544,13 @@ fn repeated_summary_cursor_is_refused_instead_of_publishing_partial_data() {
 }
 
 /// Trace: FR-004-AC-1, FR-004-AC-21, FR-030-AC-1, FR-030-AC-2, FR-030-AC-3, FR-030-AC-4, FR-030-AC-6
+#[trace(
+    "FR-004-AC-1",
+    "FR-004-AC-21",
+    "FR-030-AC-2",
+    "FR-030-AC-3",
+    "FR-030-AC-6"
+)]
 #[test]
 fn persistent_summary_cache_reuses_deltas_preserves_failures_and_reconciles_independently() {
     let mut only_p2 = initiative();

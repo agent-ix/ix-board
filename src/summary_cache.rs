@@ -25,6 +25,15 @@ pub struct SummaryRead {
 impl LinearGraphQlSource {
     /// Returns native summaries from their own cache partition without loading tickets.
     pub fn summary_snapshot_cached(&self) -> Result<SummaryRead, Error> {
+        self.summary_snapshot_cached_with_clock(&SystemClock)
+    }
+
+    /// Reads native summaries using an explicit wall clock for source-age provenance.
+    /// Transport quota continues to use its own persisted absolute server deadlines.
+    pub fn summary_snapshot_cached_with_clock(
+        &self,
+        clock: &dyn Clock,
+    ) -> Result<SummaryRead, Error> {
         let path = self.cache_path();
         crate::cache::restrict_permissions(path)?;
         let ttl = ordinary_ttl()?;
@@ -62,23 +71,30 @@ impl LinearGraphQlSource {
             })
             .transpose()
         };
-        let now = SystemClock.now_epoch_seconds();
         let baseline = load(&connection)?;
+        let now = clock.now_epoch_seconds();
         if let Some((data, sync, full)) = &baseline
             && now >= *sync
             && now.saturating_sub(*sync) < ttl
         {
-            return Ok(summary_read(data.clone(), *sync, *full, now, None));
+            return Ok(summary_read(data.clone(), *sync, *full, now, None, None));
         }
         let refresh = (|| {
             let _lock = RefreshLock::acquire(path, None)?;
             let current = load(&connection)?;
-            let started = SystemClock.now_epoch_seconds();
+            let started = clock.now_epoch_seconds();
             if let Some((data, sync, full)) = &current
                 && started >= *sync
                 && started.saturating_sub(*sync) < ttl
             {
-                return Ok(summary_read(data.clone(), *sync, *full, started, None));
+                return Ok(summary_read(
+                    data.clone(),
+                    *sync,
+                    *full,
+                    started,
+                    None,
+                    None,
+                ));
             }
             let full = current
                 .as_ref()
@@ -114,12 +130,29 @@ impl LinearGraphQlSource {
                 params![key,bytes,started,full_at]).map_err(Error::Cache)?;
             transaction.commit().map_err(Error::Cache)?;
             self.record_metrics(metrics, mode, true)?;
-            Ok(summary_read(data, started, full_at, started, None))
+            Ok(summary_read(
+                data,
+                started,
+                full_at,
+                clock.now_epoch_seconds(),
+                None,
+                None,
+            ))
         })();
         match refresh {
             Ok(read) => Ok(read),
             Err(error) => match baseline {
-                Some((data, sync, full)) => Ok(summary_read(data, sync, full, now, Some(error))),
+                Some((data, sync, full)) => {
+                    let rate_limit_until = stored_rate_limit_until(path).ok().flatten();
+                    Ok(summary_read(
+                        data,
+                        sync,
+                        full,
+                        clock.now_epoch_seconds(),
+                        Some(error),
+                        rate_limit_until,
+                    ))
+                }
                 None => Err(error),
             },
         }
@@ -132,13 +165,8 @@ fn summary_read(
     full: i64,
     now: i64,
     error: Option<Error>,
+    rate_limit_until: Option<i64>,
 ) -> SummaryRead {
-    let rate_limit_until = match &error {
-        Some(Error::LinearRateLimited { retry_after }) => {
-            now.checked_add(i64::try_from(retry_after.as_secs()).unwrap_or(i64::MAX))
-        }
-        _ => None,
-    };
     SummaryRead {
         data,
         last_successful_sync: sync,
@@ -152,4 +180,22 @@ fn summary_read(
             failure_reason: error.map(|error| error.to_string()),
         },
     }
+}
+
+fn stored_rate_limit_until(path: &std::path::Path) -> Result<Option<i64>, Error> {
+    let connection = Connection::open(path).map_err(Error::Cache)?;
+    connection
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(Error::Cache)?;
+    let until: Option<i64> = connection
+        .query_row(
+            "SELECT cooldown FROM linear_shared_quota WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Error::Cache)?;
+    Ok(until
+        .filter(|until| *until > 0)
+        .map(|until| until.div_euclid(1000) + i64::from(until.rem_euclid(1000) > 0)))
 }

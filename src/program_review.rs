@@ -383,8 +383,6 @@ pub struct ProjectInitiativeMismatch {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoadmapInitiative {
-    #[serde(skip)]
-    source_id: String,
     pub name: String,
     pub projects: Vec<RoadmapProject>,
 }
@@ -392,8 +390,6 @@ pub struct RoadmapInitiative {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoadmapProject {
-    #[serde(skip)]
-    source_id: String,
     pub name: String,
     pub status: String,
     pub progress_percent: u8,
@@ -407,8 +403,6 @@ pub struct RoadmapProject {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoadmapUnplacedProject {
-    #[serde(skip)]
-    source_id: String,
     pub name: String,
     pub status: String,
     pub progress_percent: u8,
@@ -418,6 +412,23 @@ pub struct RoadmapUnplacedProject {
     pub last_activity: Option<String>,
 }
 
+struct SourceRow<T> {
+    source_id: String,
+    value: T,
+}
+
+struct GroupedInitiative {
+    source_id: String,
+    name: String,
+    projects: Vec<SourceRow<RoadmapProject>>,
+}
+
+struct GroupedRoadmap {
+    report: ProgramRoadmap,
+    initiatives: Vec<GroupedInitiative>,
+    unplaced_projects: Vec<SourceRow<RoadmapUnplacedProject>>,
+}
+
 /// Build one row per project from a live workspace snapshot. Scope placement
 /// names the primary initiative; remaining memberships are rendered as `also_in`.
 pub fn build_roadmap(
@@ -425,6 +436,35 @@ pub fn build_roadmap(
     workspace: &WorkspaceSnapshot,
     scope: Option<&ProgramScope>,
 ) -> ProgramRoadmap {
+    let grouped = group_roadmap(initiatives, workspace, scope);
+    let mut report = grouped.report;
+    report.initiatives = grouped
+        .initiatives
+        .into_iter()
+        .map(|initiative| RoadmapInitiative {
+            name: initiative.name,
+            projects: initiative
+                .projects
+                .into_iter()
+                .map(|project| project.value)
+                .collect(),
+        })
+        .collect();
+    report.unplaced_projects = grouped
+        .unplaced_projects
+        .into_iter()
+        .map(|project| project.value)
+        .collect();
+    report
+}
+
+/// Build one row per project from a live workspace snapshot. Scope placement
+/// names the primary initiative; remaining memberships are rendered as `also_in`.
+fn group_roadmap(
+    initiatives: &[Initiative],
+    workspace: &WorkspaceSnapshot,
+    scope: Option<&ProgramScope>,
+) -> GroupedRoadmap {
     let mut initiative_by_id: BTreeMap<String, String> = initiatives
         .iter()
         .map(|item| (item.id.clone(), item.name.clone()))
@@ -498,15 +538,19 @@ pub fn build_roadmap(
         .collect::<Vec<_>>();
     sort_names(&mut missing_scope_projects);
 
-    let mut result = ProgramRoadmap {
+    let mut result = GroupedRoadmap {
         initiatives: Vec::new(),
         unplaced_projects: Vec::new(),
-        initiatives_without_projects: Vec::new(),
-        projects_in_multiple_initiatives: Vec::new(),
-        projects_missing_from_scope: Vec::new(),
-        project_membership_mismatches: Vec::new(),
-        missing_scope_initiatives,
-        missing_scope_projects,
+        report: ProgramRoadmap {
+            initiatives: Vec::new(),
+            unplaced_projects: Vec::new(),
+            initiatives_without_projects: Vec::new(),
+            projects_in_multiple_initiatives: Vec::new(),
+            projects_missing_from_scope: Vec::new(),
+            project_membership_mismatches: Vec::new(),
+            missing_scope_initiatives,
+            missing_scope_projects,
+        },
     };
     let mut assigned = BTreeSet::<String>::new();
     for initiative in selected_initiatives {
@@ -550,18 +594,26 @@ pub fn build_roadmap(
             sort_names(&mut also_in);
             if memberships.len() > 1 {
                 result
+                    .report
                     .projects_in_multiple_initiatives
                     .push(project.name.clone());
             }
-            rows.push(roadmap_project(project, &workspace.issues, also_in));
+            rows.push(SourceRow {
+                source_id: project.id.0.clone(),
+                value: roadmap_project(project, &workspace.issues, also_in),
+            });
         }
-        rows.sort_by(|left, right| compare_names(&left.name, &right.name));
+        rows.sort_by(|left, right| {
+            compare_names(&left.value.name, &right.value.name)
+                .then_with(|| left.source_id.cmp(&right.source_id))
+        });
         if rows.is_empty() {
             result
+                .report
                 .initiatives_without_projects
                 .push(initiative.name.clone());
         }
-        result.initiatives.push(RoadmapInitiative {
+        result.initiatives.push(GroupedInitiative {
             source_id: initiative.id.clone(),
             name: initiative.name.clone(),
             projects: rows,
@@ -577,9 +629,10 @@ pub fn build_roadmap(
                 .any(|item| same_name(&item.name, &project.name))
         });
         if project.initiatives.is_empty() && included {
-            result
-                .unplaced_projects
-                .push(roadmap_unplaced(project, &workspace.issues));
+            result.unplaced_projects.push(SourceRow {
+                source_id: project.id.0.clone(),
+                value: roadmap_unplaced(project, &workspace.issues),
+            });
         } else if scope.is_some()
             && !included
             && project.initiatives.iter().any(|membership| {
@@ -589,6 +642,7 @@ pub fn build_roadmap(
             })
         {
             result
+                .report
                 .projects_missing_from_scope
                 .push(project.name.clone());
         }
@@ -624,6 +678,7 @@ pub fn build_roadmap(
             sort_names(&mut missing_from_scope);
             if !missing_from_linear.is_empty() || !missing_from_scope.is_empty() {
                 result
+                    .report
                     .project_membership_mismatches
                     .push(ProjectInitiativeMismatch {
                         project: project.name.clone(),
@@ -633,17 +688,19 @@ pub fn build_roadmap(
             }
         }
     }
+    result.initiatives.sort_by(|left, right| {
+        compare_names(&left.name, &right.name).then_with(|| left.source_id.cmp(&right.source_id))
+    });
+    result.unplaced_projects.sort_by(|left, right| {
+        compare_names(&left.value.name, &right.value.name)
+            .then_with(|| left.source_id.cmp(&right.source_id))
+    });
+    sort_names(&mut result.report.initiatives_without_projects);
+    sort_names(&mut result.report.projects_in_multiple_initiatives);
+    result.report.projects_in_multiple_initiatives.dedup();
+    sort_names(&mut result.report.projects_missing_from_scope);
     result
-        .initiatives
-        .sort_by(|left, right| compare_names(&left.name, &right.name));
-    result
-        .unplaced_projects
-        .sort_by(|left, right| compare_names(&left.name, &right.name));
-    sort_names(&mut result.initiatives_without_projects);
-    sort_names(&mut result.projects_in_multiple_initiatives);
-    result.projects_in_multiple_initiatives.dedup();
-    sort_names(&mut result.projects_missing_from_scope);
-    result
+        .report
         .project_membership_mismatches
         .sort_by(|left, right| compare_names(&left.project, &right.project));
     result
@@ -687,7 +744,6 @@ fn progress(open: usize, done: usize) -> u8 {
 fn roadmap_project(project: &Project, issues: &[Issue], also_in: Vec<String>) -> RoadmapProject {
     let (open, done, canceled, last_activity) = issue_counts(project, issues);
     RoadmapProject {
-        source_id: project.id.0.clone(),
         name: project.name.clone(),
         status: project.status.clone(),
         progress_percent: progress(open, done),
@@ -702,7 +758,6 @@ fn roadmap_project(project: &Project, issues: &[Issue], also_in: Vec<String>) ->
 fn roadmap_unplaced(project: &Project, issues: &[Issue]) -> RoadmapUnplacedProject {
     let (open, done, canceled, last_activity) = issue_counts(project, issues);
     RoadmapUnplacedProject {
-        source_id: project.id.0.clone(),
         name: project.name.clone(),
         status: project.status.clone(),
         progress_percent: progress(open, done),
@@ -815,7 +870,7 @@ pub fn build_summary_roadmap(
     };
     // The legacy builder owns ordering, scope diagnostics and single placement.
     // Its ticket-derived values are discarded; this workspace contains no tickets.
-    let grouping = build_roadmap(&initiatives, &workspace, scope);
+    let grouping = group_roadmap(&initiatives, &workspace, scope);
     let native_row = |id: String, name: String, status: String, also_in: Vec<String>| {
         let project = summary.projects.iter().find(|p| p.project.id.0 == id);
         SummaryRoadmapProject {
@@ -847,7 +902,9 @@ pub fn build_summary_roadmap(
                     projects: group
                         .projects
                         .into_iter()
-                        .map(|p| native_row(p.source_id, p.name, p.status, p.also_in))
+                        .map(|p| {
+                            native_row(p.source_id, p.value.name, p.value.status, p.value.also_in)
+                        })
                         .collect(),
                 }
             })
@@ -855,14 +912,14 @@ pub fn build_summary_roadmap(
         unplaced_projects: grouping
             .unplaced_projects
             .into_iter()
-            .map(|p| native_row(p.source_id, p.name, p.status, Vec::new()))
+            .map(|p| native_row(p.source_id, p.value.name, p.value.status, Vec::new()))
             .collect(),
-        initiatives_without_projects: grouping.initiatives_without_projects,
-        projects_in_multiple_initiatives: grouping.projects_in_multiple_initiatives,
-        projects_missing_from_scope: grouping.projects_missing_from_scope,
-        project_membership_mismatches: grouping.project_membership_mismatches,
-        missing_scope_initiatives: grouping.missing_scope_initiatives,
-        missing_scope_projects: grouping.missing_scope_projects,
+        initiatives_without_projects: grouping.report.initiatives_without_projects,
+        projects_in_multiple_initiatives: grouping.report.projects_in_multiple_initiatives,
+        projects_missing_from_scope: grouping.report.projects_missing_from_scope,
+        project_membership_mismatches: grouping.report.project_membership_mismatches,
+        missing_scope_initiatives: grouping.report.missing_scope_initiatives,
+        missing_scope_projects: grouping.report.missing_scope_projects,
     }
 }
 

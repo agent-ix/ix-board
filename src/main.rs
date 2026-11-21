@@ -1283,14 +1283,13 @@ fn render_summary_roadmap(report: &ix_board::program_review::SummaryRoadmap) -> 
             initiative.health.as_deref().unwrap_or("unknown")
         ));
         for project in &initiative.projects {
-            lines.push(format!("  {} | {} | progress {} | source {} | observed {} | counts unavailable: {} | project updated {}",project.name,project.status,
-                project.progress_percent.map_or_else(|| "unknown".to_owned(),|progress| format!("{progress:.1}%")),project.progress_source,project.observed_at,project.counts_unavailable_reason,project.project_updated_at.as_deref().unwrap_or("unknown")));
+            lines.push(format!("  {}", render_summary_project(project)));
         }
     }
     for project in &report.unplaced_projects {
         lines.push(format!(
-            "unplaced project: {} | {} | counts unavailable: {}",
-            project.name, project.status, project.counts_unavailable_reason
+            "unplaced project: {}",
+            render_summary_project(project)
         ));
     }
     for name in &report.initiatives_without_projects {
@@ -1316,6 +1315,24 @@ fn render_summary_roadmap(report: &ix_board::program_review::SummaryRoadmap) -> 
         lines.push(format!("project membership mismatch: {mismatch:?}"));
     }
     lines.join("\n")
+}
+
+fn render_summary_project(project: &ix_board::program_review::SummaryRoadmapProject) -> String {
+    format!(
+        "{} | {} | progress {} | source {} | observed {} | counts unavailable: {} | issue last activity: {} ({}) | project updated {}",
+        project.name,
+        project.status,
+        project.progress_percent.map_or_else(
+            || "unknown".to_owned(),
+            |progress| format!("{progress:.1}%")
+        ),
+        project.progress_source,
+        project.observed_at,
+        project.counts_unavailable_reason,
+        project.last_activity.as_deref().unwrap_or("unknown"),
+        project.activity_unavailable_reason,
+        project.project_updated_at.as_deref().unwrap_or("unknown")
+    )
 }
 
 fn render_reconcile(report: &ReconcileReport) -> String {
@@ -1938,8 +1955,64 @@ mod tests {
     use ix_board::program_review::ScopeCheckReport;
     use ix_board::{FocusStatus, IssueBatch, IssueId, IssueReference};
     use ix_cli_kit::exit::Outcome;
+    use ix_trace_rs::trace;
 
-    /// Trace: FR-004-AC-3, FR-004-AC-21
+    #[trace("FR-020-AC-2")]
+    #[test]
+    fn native_roadmap_text_reports_complete_provenance_for_placed_and_unplaced_projects() {
+        use ix_board::program_review::{
+            SummaryRoadmap, SummaryRoadmapInitiative, SummaryRoadmapProject,
+        };
+        let row = |name: &str, progress| SummaryRoadmapProject {
+            name: name.to_owned(),
+            status: "Building".to_owned(),
+            progress_percent: Some(progress),
+            progress_source: "linear_native".to_owned(),
+            observed_at: "2026-11-21T00:00:00Z".to_owned(),
+            open: None,
+            done: None,
+            canceled: None,
+            counts_unavailable_reason: "native current ticket count unavailable".to_owned(),
+            last_activity: None,
+            activity_unavailable_reason: "native summary does not expose issue activity".to_owned(),
+            project_updated_at: Some("2026-11-19T00:00:00Z".to_owned()),
+            also_in: Vec::new(),
+        };
+        let report = SummaryRoadmap {
+            initiatives: vec![SummaryRoadmapInitiative {
+                name: "Program".to_owned(),
+                status: Some("Active".to_owned()),
+                health: None,
+                projects: vec![row("Placed", 35.0)],
+            }],
+            unplaced_projects: vec![row("Unplaced", 75.0)],
+            initiatives_without_projects: Vec::new(),
+            projects_in_multiple_initiatives: Vec::new(),
+            projects_missing_from_scope: Vec::new(),
+            project_membership_mismatches: Vec::new(),
+            missing_scope_initiatives: Vec::new(),
+            missing_scope_projects: Vec::new(),
+        };
+        let text = super::render_summary_roadmap(&report);
+        for (name, percentage) in [("Placed", "35.0%"), ("Unplaced", "75.0%")] {
+            let line = text
+                .lines()
+                .find(|line| line.contains(name))
+                .expect("project row");
+            assert!(
+                line.contains(percentage),
+                "native progress is visible: {line}"
+            );
+            assert!(line.contains("source linear_native | observed 2026-11-21T00:00:00Z"));
+            assert!(line.contains("counts unavailable: native current ticket count unavailable"));
+            assert!(line.contains(
+                "issue last activity: unknown (native summary does not expose issue activity)"
+            ));
+            assert!(line.contains("project updated 2026-11-19T00:00:00Z"));
+        }
+    }
+
+    #[trace("FR-004-AC-3", "FR-004-AC-21")]
     #[test]
     fn fallback_json_and_text_preserve_unknown_age_cooldown_and_failure() {
         let output = Output::Cached {

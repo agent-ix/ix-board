@@ -169,7 +169,7 @@ fn cache_coordination_child() {
     }
 }
 
-#[trace("FR-004-AC-1", "FR-004-AC-2")]
+#[trace("FR-004-AC-1", "FR-004-AC-2", "FR-004-AC-20")]
 #[test]
 fn separate_process_waiter_reuses_one_completed_refresh_of_expired_snapshot() {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -193,7 +193,7 @@ fn separate_process_waiter_reuses_one_completed_refresh_of_expired_snapshot() {
     );
 }
 
-#[trace("FR-004-AC-2")]
+#[trace("FR-004-AC-2", "FR-004-AC-20")]
 #[test]
 fn terminating_lock_owner_releases_refresh_ownership_for_another_process() {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -209,7 +209,7 @@ fn terminating_lock_owner_releases_refresh_ownership_for_another_process() {
     );
 }
 
-#[trace("FR-004-AC-3")]
+#[trace("FR-004-AC-3", "FR-004-AC-20")]
 #[test]
 fn held_os_lock_returns_stale_snapshot_or_typed_empty_cache_failure_within_five_seconds() {
     for mode in ["stale-lock", "empty-lock"] {

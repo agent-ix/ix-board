@@ -4,6 +4,7 @@
 //! Offline CLI status and configuration precedence.
 
 use assert_cmd::Command;
+use ix_trace_rs::trace;
 use serde_json::Value;
 
 fn cli(directory: &tempfile::TempDir) -> Command {
@@ -25,6 +26,7 @@ fn cli(directory: &tempfile::TempDir) -> Command {
 }
 
 /// Trace: FR-031-AC-6, FR-004-AC-21
+#[trace("FR-031-AC-6", "FR-004-AC-21")]
 #[test]
 fn offline_status_accepts_empty_and_legacy_databases_without_credentials() {
     let directory = tempfile::tempdir().expect("cache");
@@ -67,6 +69,7 @@ fn offline_status_accepts_empty_and_legacy_databases_without_credentials() {
 }
 
 /// Trace: FR-004-AC-11, FR-031-AC-7
+#[trace("FR-004-AC-11", "FR-031-AC-7")]
 #[test]
 fn environment_overrides_configuration_and_invalid_explicit_settings_fail_offline() {
     let directory = tempfile::tempdir().expect("cache");

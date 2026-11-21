@@ -5,6 +5,7 @@
 
 use ix_board::{Clock, LinearGraphQlSource, ReadService, WorkspaceSnapshot, ready_from_snapshot};
 use ix_cli_kit::secrets::SecretStore;
+use ix_trace_rs::trace;
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::ffi::OsString;
@@ -146,6 +147,7 @@ fn assert_delta(request: &Value, since: i64) {
 }
 
 /// Trace: FR-030-AC-1, FR-030-AC-4
+#[trace("FR-030-AC-1")]
 #[test]
 fn detailed_deltas_preserve_unchanged_records_and_update_blocking_edges_on_unchanged_dependents() {
     let mut b_blocks_c = issue("B");
@@ -292,6 +294,7 @@ fn detailed_deltas_preserve_unchanged_records_and_update_blocking_edges_on_uncha
 }
 
 /// Trace: FR-030-AC-2, FR-030-AC-3, FR-030-AC-6
+#[trace("FR-030-AC-2", "FR-030-AC-3", "FR-030-AC-6")]
 #[test]
 fn failed_detail_page_preserves_watermark_records_and_costs_then_retry_and_daily_full_are_correct()
 {
