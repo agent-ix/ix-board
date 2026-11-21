@@ -167,7 +167,7 @@ impl Collector {
                     })
                     .map(|b| b.machine.as_str())
                     .collect();
-                let machine = if machines.len() == 1 {
+                let machine = if row.machine == "local" && machines.len() == 1 {
                     (*machines.first().expect("one machine")).to_owned()
                 } else {
                     row.machine.clone()
