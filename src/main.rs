@@ -456,7 +456,9 @@ fn main() -> std::process::ExitCode {
         Err(error) => {
             if matches!(
                 error,
-                Error::LinearRateLimited { .. } | Error::LinearLocalBudgetExhausted { .. }
+                Error::LinearRateLimited { .. }
+                    | Error::LinearLocalBudgetExhausted { .. }
+                    | Error::QuotaAdmissionRefused { .. }
             ) {
                 eprintln!("{error}");
             } else {

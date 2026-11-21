@@ -17,6 +17,7 @@ mod named_selection;
 pub mod orphans;
 pub mod program_review;
 pub mod quota;
+mod quota_decision;
 mod read_bound;
 pub mod reconcile;
 pub mod retro;
@@ -134,6 +135,12 @@ pub enum Error {
     /// The shared local allocation is exhausted before transport send.
     #[error("Linear local budget exhausted; retry in {}s", retry_after.as_secs().saturating_add(u64::from(retry_after.subsec_nanos() > 0)))]
     LinearLocalBudgetExhausted { retry_after: std::time::Duration },
+    /// Admission refused with the exact atomic typed decision.
+    #[error("{decision}")]
+    QuotaAdmissionRefused {
+        /// Captured before rendering; subsequent status reads cannot overwrite it.
+        decision: Box<quota::QuotaDecision>,
+    },
     /// A quota setting is invalid.
     #[error("invalid Linear quota configuration: {reason}")]
     InvalidQuotaConfig { reason: &'static str },
@@ -410,12 +417,69 @@ pub trait ProjectMutationSource: WorkspaceSource {
     fn set_project_sort_order(&self, project_id: &ProjectId, sort_order: f64) -> Result<(), Error>;
 }
 
+/// Typed outcome of a particular cached-read attempt, independent of message wording.
+/// Absent legacy metadata is Unknown; it must never be reconstructed from failure text.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RefreshOutcome {
+    /// No typed attempt metadata exists, including legacy serialized snapshots.
+    #[default]
+    Unknown,
+    /// A compatible cached snapshot satisfied this attempt without refreshing.
+    CacheReused,
+    /// A complete source refresh was published.
+    Refreshed,
+    /// Admission refused before send; contains the captured atomic decision.
+    QuotaRefused {
+        /// Quota explanation captured at the failed admission.
+        decision: quota::QuotaDecision,
+    },
+    /// The refresh source or transport failed for a nonquota reason.
+    SourceFailed,
+    /// Shared refresh lock could not be acquired.
+    RefreshLockRefused,
+}
+
+impl RefreshOutcome {
+    pub(crate) fn from_error(error: &Error) -> Self {
+        match error {
+            Error::QuotaAdmissionRefused { decision } => Self::QuotaRefused {
+                decision: (**decision).clone(),
+            },
+            Error::RefreshLockTimeout => Self::RefreshLockRefused,
+            _ => Self::SourceFailed,
+        }
+    }
+}
+
+/// Additive result envelope preserving the wrapped type's public construction contract.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RefreshRead<T> {
+    /// Existing read result with unchanged fields.
+    pub read: T,
+    /// Attempt provenance, Unknown when absent in legacy output.
+    #[serde(default)]
+    pub outcome: RefreshOutcome,
+}
+
+impl Error {
+    /// The quota decision captured at refusal, without parsing rendered text.
+    pub fn quota_decision(&self) -> Option<&quota::QuotaDecision> {
+        match self {
+            Self::QuotaAdmissionRefused { decision } => Some(decision),
+            _ => None,
+        }
+    }
+}
+
 /// Cached read service shared by the CLI and library consumers.
 pub struct ReadService<S, C = SystemClock> {
     source: S,
     cache: SnapshotCache,
     clock: C,
     freshness: Option<CacheFreshness>,
+    outcome: RefreshOutcome,
 }
 
 /// Provenance of the latest ordinary read, including an unsuccessful refresh.
@@ -551,6 +615,7 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
             cache: SnapshotCache::open(cache_path, &cache_namespace)?,
             clock,
             freshness: None,
+            outcome: RefreshOutcome::Unknown,
         })
     }
 
@@ -930,9 +995,15 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
         self.freshness.as_ref()
     }
 
+    /// Typed outcome of the latest ordinary refresh attempt, including fallback.
+    pub fn refresh_outcome(&self) -> &RefreshOutcome {
+        &self.outcome
+    }
+
     fn refresh(&mut self, force: bool) -> Result<WorkspaceSnapshot, Error> {
         let now = self.clock.now_epoch_seconds();
         let before = self.cache.revision()?;
+        self.outcome = RefreshOutcome::CacheReused;
         let result = (|| {
             if !force && let Some(snapshot) = self.cache.fresh(now)? {
                 return Ok(snapshot);
@@ -957,6 +1028,7 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
             let mut snapshot = self.source.refresh_workspace(baseline.as_ref(), None)?;
             snapshot.fetched_at = started;
             self.cache.replace_refresh(started, &snapshot, full)?;
+            self.outcome = RefreshOutcome::Refreshed;
             Ok(snapshot)
         })();
         match result {
@@ -979,10 +1051,19 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
                 Ok(snapshot)
             }
             Err(error) => {
+                self.outcome = RefreshOutcome::from_error(&error);
                 let Some(snapshot) = self.cache.last_complete()? else {
                     return Err(error);
                 };
                 let until = match &error {
+                    Error::QuotaAdmissionRefused { decision } => decision
+                        .blockers
+                        .iter()
+                        .find(|blocker| blocker.state == quota::QuotaState::ServerBackoff)
+                        .and_then(|blocker| blocker.deadline)
+                        .map(|until| {
+                            until.div_euclid(1000) + i64::from(until.rem_euclid(1000) > 0)
+                        }),
                     Error::LinearRateLimited { retry_after } => {
                         self.clock.now_epoch_seconds().checked_add(
                             i64::try_from(

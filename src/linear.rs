@@ -1132,7 +1132,7 @@ impl LinearGraphQlSource {
         let config = crate::quota::QuotaConfig::from_config(crate::settings::load()?.as_ref())?;
         let quota = crate::quota::QuotaGate::open_within(&self.quota_path, &config, deadline)?;
         const ESTIMATED_COMPLEXITY: u64 = 10_000;
-        let reservation = quota.reserve(ESTIMATED_COMPLEXITY, deadline)?;
+        let reservation = quota.reserve_evaluated(ESTIMATED_COMPLEXITY, deadline)?;
         self.metrics
             .requests
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1246,21 +1246,8 @@ fn quota_rate_limit(
     quota: &crate::quota::QuotaGate,
     deadline: Option<&Deadline<'_>>,
 ) -> Result<Error, Error> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |time| {
-            i64::try_from(time.as_millis()).unwrap_or(i64::MAX)
-        });
-    let remaining = quota
-        .status_within(deadline)?
-        .rate_limit_until
-        .unwrap_or_else(|| now.saturating_add(60_000))
-        .saturating_sub(now)
-        .max(0);
-    Ok(Error::LinearRateLimited {
-        retry_after: std::time::Duration::from_secs(
-            u64::try_from(remaining).unwrap_or(u64::MAX).div_ceil(1000),
-        ),
+    Ok(Error::QuotaAdmissionRefused {
+        decision: Box::new(quota.decision_within(10_000, deadline)?),
     })
 }
 
