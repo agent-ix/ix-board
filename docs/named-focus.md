@@ -192,3 +192,64 @@ let selection = service.canonicalize_named_selection_bounded(&policy, &input)?;
   Either way there is no document. The call stores and publishes nothing.
 - Resolve credentials first, as for every bounded read. Policy and unsupported-source
   errors are the same as for `workspace_snapshot_bounded`.
+
+### Keeping your labels: which input became which member
+
+The canonical selection is sorted and de-duplicated, so it cannot say which input
+became which member. When several names, identifiers or UUIDs resolve to one member,
+or you want to keep the text a person typed, use
+`ReadService::resolve_named_selection_bounded`. It is the same call with the same
+deadline, snapshot and resolution, and it also returns what every input occurrence
+resolved to. Do not resolve a second time to find out.
+
+```rust
+use ix_board::{NamedList, NamedMemberInput, NamedSelectionInput};
+use std::collections::BTreeMap;
+
+let input = NamedSelectionInput {
+    team: "SWM".into(),
+    include: vec![
+        NamedMemberInput::Ticket("SWM-2".into()),
+        NamedMemberInput::Project("Project / Alpha".into()),
+        NamedMemberInput::Project("PRJ-1".into()), // the same project by identifier
+    ],
+    exclude: vec![NamedMemberInput::Ticket("SWM-2".into())],
+};
+// Your own labels, keyed by where the input stood: (list, index in that list).
+let labels = BTreeMap::from([
+    ((NamedList::Include, 0), "second ticket"),
+    ((NamedList::Include, 1), "alpha"),
+    ((NamedList::Include, 2), "alpha (by key)"),
+    ((NamedList::Exclude, 0), "skip it"),
+]);
+
+let resolved = service.resolve_named_selection_bounded(&policy, &input)?;
+store(resolved.selection.encode()?); // outside the deadline; carries no label
+for entry in &resolved.associations {
+    let label = labels[&(entry.list, entry.index)];
+    keep(label, &entry.member); // entry.input is the text you supplied
+}
+```
+
+- `resolved.selection` is exactly what `canonicalize_named_selection_bounded` returns,
+  including the bytes of `encode()`. It carries no label.
+- `resolved.associations` has one entry for every input occurrence, exactly once:
+  every `include` occurrence in the order you supplied, then every `exclude`
+  occurrence in the order you supplied. This is the **input order**, not the canonical
+  order. Join by `entry.list` and `entry.index`, which are the list and zero-based
+  index you supplied, or call `resolved.association(list, index)`. Never join by
+  position in `selection.include` or `selection.exclude`: those are sorted and have
+  fewer entries when occurrences collapse.
+- Occurrences stay separate. In the example, `Project / Alpha` and `PRJ-1` are two
+  associations holding the same `member`, and the selection holds it once. The same
+  ticket in both lists is two associations (one per list) and one member in each list
+  of the selection. Repeating an identical input gives one association per repetition,
+  so each can keep a different label. Each entry also carries the `input` you supplied.
+- You own the labels. The SDK does not truncate them, choose between the labels of
+  aliases of one member, or store them: if two aliases carry different labels, which one
+  to keep (first, last, or both) is your decision, and you have every association to
+  decide with.
+- The timeout and error rules are those of `canonicalize_named_selection_bounded`.
+  Capturing the associations is inside the same deadline. A timeout, or any member that
+  is missing, ambiguous, of another team or owned by another project, returns the error
+  and neither a selection nor associations.
