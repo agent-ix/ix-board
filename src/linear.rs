@@ -1364,7 +1364,7 @@ impl LinearGraphQlSource {
                     after: after.clone(),
                     relation_first: None,
                     nested_first: Some(PROJECT_NESTED_PAGE_SIZE),
-                    filter: since.clone().map(UpdatedFilter::new),
+                    filter: since.as_deref().map(UpdatedFilter::new),
                     include_archived: baseline.is_some(),
                 },
             )?;
@@ -1450,7 +1450,7 @@ impl LinearGraphQlSource {
                     after: after.clone(),
                     relation_first: Some(INITIAL_RELATION_PAGE_SIZE),
                     nested_first: None,
-                    filter: since.clone().map(UpdatedFilter::new),
+                    filter: since.as_deref().map(UpdatedFilter::new),
                     include_archived: baseline.is_some(),
                 },
             )?;
@@ -1804,7 +1804,7 @@ struct GraphQlRequest<'a, V> {
 }
 
 #[derive(Serialize)]
-struct Variables {
+struct Variables<'a> {
     first: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "relationFirst")]
@@ -1814,19 +1814,21 @@ struct Variables {
     nested_first: Option<i32>,
     after: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    filter: Option<UpdatedFilter>,
+    filter: Option<UpdatedFilter<'a>>,
     #[serde(rename = "includeArchived")]
     include_archived: bool,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct UpdatedFilter {
-    updated_at: UpdatedLowerBound,
+/// Typed optional root filter shared by detail and native summary queries.
+pub(crate) struct UpdatedFilter<'a> {
+    updated_at: UpdatedLowerBound<'a>,
 }
 
-impl UpdatedFilter {
-    fn new(gte: String) -> Self {
+impl<'a> UpdatedFilter<'a> {
+    /// Includes records updated at or after the non-null source watermark.
+    pub(crate) fn new(gte: &'a str) -> Self {
         Self {
             updated_at: UpdatedLowerBound { gte },
         }
@@ -1834,8 +1836,8 @@ impl UpdatedFilter {
 }
 
 #[derive(Serialize)]
-struct UpdatedLowerBound {
-    gte: String,
+struct UpdatedLowerBound<'a> {
+    gte: &'a str,
 }
 
 #[derive(Serialize)]

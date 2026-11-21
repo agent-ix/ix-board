@@ -3,7 +3,7 @@
 
 //! Native project and initiative catalogs without ticket reads (FR-019, FR-020, FR-030).
 
-use crate::linear::LinearGraphQlSource;
+use crate::linear::{LinearGraphQlSource, UpdatedFilter};
 use crate::{Error, Initiative, Project, ProjectId, ProjectStatusCategory};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -267,20 +267,9 @@ impl<'a> Variables<'a> {
             first,
             after,
             include_archived: since.is_some(),
-            filter: since.map(|gte| UpdatedFilter {
-                updated_at: Since { gte },
-            }),
+            filter: since.map(UpdatedFilter::new),
         }
     }
-}
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct UpdatedFilter<'a> {
-    updated_at: Since<'a>,
-}
-#[derive(Serialize)]
-struct Since<'a> {
-    gte: &'a str,
 }
 #[derive(Serialize)]
 struct MembershipVariables<'a> {
