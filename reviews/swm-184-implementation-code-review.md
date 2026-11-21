@@ -370,3 +370,47 @@ Reviewer make fmt-check and make lint pass; focused six-suite rerun passes 60 to
   "bindings": []
 }
 ```
+
+## Dispositions
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-001 | fixed | Verified against pushed 1d4e44432247003a3559b878fd50e1fe727617df; exact after excerpt below. |
+| FND-002 | fixed | Verified against pushed 1d4e44432247003a3559b878fd50e1fe727617df; exact after excerpt below. |
+| FND-003 | fixed | Verified against pushed 1d4e44432247003a3559b878fd50e1fe727617df; exact after excerpt below. |
+| FND-004 | fixed | Verified against pushed 1d4e44432247003a3559b878fd50e1fe727617df; exact after excerpt below. |
+
+## Disposition verdict (round 1)
+
+PASS. All four code/Rust findings are fixed; no new defects found in the fix diff. Redirect and implicit retries are disabled. Public roadmap literals are restored while internal stable IDs preserve duplicate-name joins. Placed/unplaced text shares complete native provenance and unavailable activity output. Summary fallback samples return time and reads absolute persisted cooldown.
+
+Inspected all fix source and new tests at 1d4e44432247003a3559b878fd50e1fe727617df. Reviewer confined rerun passed 12 tests across retro_shared_cache (1), roadmap_api_compat (2), transport_redirect (1), and summary_cache (8); log /tmp/SWM-184-code-review/disposition-tests.log. Coder final focused logs show 324 affected tests passing, zero failures/ignored, including native text renderer; final check/fmt/lint logs pass. Fresh independent matrix /tmp/SWM-184-code-review/disposition-matrix.json confirms all eleven bindings. No real Linear API or aggregate CI run. Existing spec artifacts, including SR6082, remain untouched. Custody destination: reviews/swm-184-implementation-code-review.md; copy this scratch file byte-identically. Exact runtime model id remains unavailable.
+
+## Disposition evidence (round 1)
+
+```yaml
+{
+  "dispositions": [
+    {
+      "fnd": "FND-001",
+      "outcome": "fixed",
+      "after_excerpt": ".redirect(reqwest::redirect::Policy::none())\n                .retry(reqwest::retry::never())"
+    },
+    {
+      "fnd": "FND-002",
+      "outcome": "fixed",
+      "after_excerpt": "pub struct RoadmapInitiative {\n    pub name: String,\n    pub projects: Vec<RoadmapProject>,\n}"
+    },
+    {
+      "fnd": "FND-003",
+      "outcome": "fixed",
+      "after_excerpt": "for project in &report.unplaced_projects {\n        lines.push(format!(\n            \"unplaced project: {}\",\n            render_summary_project(project)\n        ));\n    }"
+    },
+    {
+      "fnd": "FND-004",
+      "outcome": "fixed",
+      "after_excerpt": "let rate_limit_until = stored_rate_limit_until(path).ok().flatten();\n                    Ok(summary_read(\n                        data,\n                        sync,\n                        full,\n                        clock.now_epoch_seconds(),\n                        Some(error),\n                        rate_limit_until,\n                    ))"
+    }
+  ]
+}
+```

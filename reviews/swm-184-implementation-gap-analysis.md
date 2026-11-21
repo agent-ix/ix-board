@@ -1934,3 +1934,89 @@ Full source/CLI inventory mapped existing queue, scope/focus, hygiene, drift, pr
   "bindings": []
 }
 ```
+
+## Dispositions
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-001 | fixed | Verified against pushed 1d4e44432247003a3559b878fd50e1fe727617df; exact after excerpt below. |
+| FND-002 | fixed | Verified against pushed 1d4e44432247003a3559b878fd50e1fe727617df; exact after excerpt below. |
+| FND-003 | fixed | Verified against pushed 1d4e44432247003a3559b878fd50e1fe727617df; exact after excerpt below. |
+| FND-004 | fixed | Verified against pushed 1d4e44432247003a3559b878fd50e1fe727617df; exact after excerpt below. |
+| FND-005 | fixed | Verified against pushed 1d4e44432247003a3559b878fd50e1fe727617df; exact after excerpt below. |
+| FND-006 | fixed | Verified against pushed 1d4e44432247003a3559b878fd50e1fe727617df; exact after excerpt below. |
+| FND-007 | fixed | Verified against pushed 1d4e44432247003a3559b878fd50e1fe727617df; exact after excerpt below. |
+| FND-008 | fixed | Verified against pushed 1d4e44432247003a3559b878fd50e1fe727617df; exact after excerpt below. |
+| FND-009 | fixed | Verified against pushed 1d4e44432247003a3559b878fd50e1fe727617df; exact after excerpt below. |
+| FND-010 | fixed | Verified against pushed 1d4e44432247003a3559b878fd50e1fe727617df; exact after excerpt below. |
+| FND-011 | fixed | Verified against pushed 1d4e44432247003a3559b878fd50e1fe727617df; exact after excerpt below. |
+
+## Disposition verdict (round 1)
+
+PASS for the eleven SWM-184 review findings: each has a nonignored engine binding and inspected behavioral assertions. All eleven missing bindings are fixed, including two independent concurrent real LiveLinear adapters sharing baseline/delta and charging both history requests. The repository-wide historical matrix remains incomplete (177 untagged, 104 tagged, 9 inspection-only), so this disposition does not claim whole-repository assurance PASS.
+
+Inspected all fix source and new tests at 1d4e44432247003a3559b878fd50e1fe727617df. Reviewer confined rerun passed 12 tests across retro_shared_cache (1), roadmap_api_compat (2), transport_redirect (1), and summary_cache (8); log /tmp/SWM-184-code-review/disposition-tests.log. Coder final focused logs show 324 affected tests passing, zero failures/ignored, including native text renderer; final check/fmt/lint logs pass. Fresh independent matrix /tmp/SWM-184-code-review/disposition-matrix.json confirms all eleven bindings. No real Linear API or aggregate CI run. Existing spec artifacts, including SR6082, remain untouched. Custody destination: reviews/swm-184-implementation-gap-analysis.md; copy this scratch file byte-identically. Exact runtime model id remains unavailable.
+
+## Disposition evidence (round 1)
+
+```yaml
+{
+  "dispositions": [
+    {
+      "fnd": "FND-001",
+      "outcome": "fixed",
+      "after_excerpt": "#[trace(\"FR-004-AC-1\", \"FR-004-AC-2\", \"FR-004-AC-20\")]\n#[test]\nfn separate_process_waiter_reuses_one_completed_refresh_of_expired_snapshot() {"
+    },
+    {
+      "fnd": "FND-002",
+      "outcome": "fixed",
+      "after_excerpt": "    #[trace(\"FR-004-AC-3\", \"FR-004-AC-21\")]\n    #[test]\n    fn fallback_json_and_text_preserve_unknown_age_cooldown_and_failure() {"
+    },
+    {
+      "fnd": "FND-003",
+      "outcome": "fixed",
+      "after_excerpt": "#[trace(\"FR-019-AC-5\", \"FR-030-AC-4\", \"FR-004-AC-21\")]\n#[test]\nfn cold_and_warm_scope_and_roadmap_reuse_summaries_without_advancing_real_detail_reads() {"
+    },
+    {
+      "fnd": "FND-004",
+      "outcome": "fixed",
+      "after_excerpt": "    #[trace(\"FR-020-AC-2\")]\n    #[test]\n    fn native_roadmap_text_reports_complete_provenance_for_placed_and_unplaced_projects() {"
+    },
+    {
+      "fnd": "FND-005",
+      "outcome": "fixed",
+      "after_excerpt": "#[trace(\"FR-030-AC-1\")]\n#[test]\nfn detailed_deltas_preserve_unchanged_records_and_update_blocking_edges_on_unchanged_dependents() {"
+    },
+    {
+      "fnd": "FND-006",
+      "outcome": "fixed",
+      "after_excerpt": "#[trace(\"FR-030-AC-2\", \"FR-030-AC-3\", \"FR-030-AC-6\")]\n#[test]\nfn failed_detail_page_preserves_watermark_records_and_costs_then_retry_and_daily_full_are_correct()"
+    },
+    {
+      "fnd": "FND-007",
+      "outcome": "fixed",
+      "after_excerpt": "#[trace(\"FR-030-AC-2\", \"FR-030-AC-3\", \"FR-030-AC-6\")]\n#[test]\nfn failed_detail_page_preserves_watermark_records_and_costs_then_retry_and_daily_full_are_correct()"
+    },
+    {
+      "fnd": "FND-008",
+      "outcome": "fixed",
+      "after_excerpt": "#[trace(\"FR-019-AC-5\", \"FR-030-AC-4\", \"FR-004-AC-21\")]\n#[test]\nfn cold_and_warm_scope_and_roadmap_reuse_summaries_without_advancing_real_detail_reads() {"
+    },
+    {
+      "fnd": "FND-009",
+      "outcome": "fixed",
+      "after_excerpt": "#[trace(\"FR-030-AC-5\", \"FR-031-AC-4\")]\n#[test]\nfn two_live_retro_workers_reuse_full_and_delta_publications_and_meter_histories() {"
+    },
+    {
+      "fnd": "FND-010",
+      "outcome": "fixed",
+      "after_excerpt": "#[trace(\"FR-030-AC-2\", \"FR-030-AC-3\", \"FR-030-AC-6\")]\n#[test]\nfn failed_detail_page_preserves_watermark_records_and_costs_then_retry_and_daily_full_are_correct()"
+    },
+    {
+      "fnd": "FND-011",
+      "outcome": "fixed",
+      "after_excerpt": "#[trace(\"FR-031-AC-6\", \"FR-004-AC-21\")]\n#[test]\nfn offline_status_accepts_empty_and_legacy_databases_without_credentials() {"
+    }
+  ]
+}
+```
