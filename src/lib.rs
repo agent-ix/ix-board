@@ -27,7 +27,8 @@ pub use named_focus::{
 pub use named_selection::{
     NAMED_SELECTION_SCHEMA_VERSION, NamedMember, NamedMemberInput, NamedSelection,
     NamedSelectionInput, canonicalize_named_selection, decode_named_selection,
-};use read_bound::Budget;
+};
+use read_bound::Budget;
 pub use read_bound::{Deadline, ReadPolicy};
 pub use scope::{ScopeSelection, ScopeSummary, select_scope};
 
