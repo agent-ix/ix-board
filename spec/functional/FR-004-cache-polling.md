@@ -39,7 +39,9 @@ deadline.
   the same deadline. A maximum age above the five-minute entry lifetime is
   refused as an invalid policy; the policy can only be stricter than the
   legacy lifetime.
-- **Deadline.** The deadline covers the whole operation: the cache read and any
+- **Deadline.** The deadline is the bound on the whole operation, measured from
+  the start below, with no additional allowance of one request timeout. It covers
+  the whole operation: the cache read and any
   cache lock wait, every page of every paginated source query, every nested
   read, and the cache write of a refreshed entry. No request starts after the
   deadline has expired, and each request's timeout is the lesser of its legacy
@@ -91,8 +93,8 @@ deadline.
 | FR-004-AC-2 | Given an expired entry and a changed fixture source, the next read refreshes and returns the changed value. | Test |
 | FR-004-AC-3 | Given an expired entry and a failed fixture refresh, the read returns an error and does not return the stale value. | Test |
 | FR-004-AC-4 | Given identical cache state and fixture source, repeated reads return identical results. | Test |
-| FR-004-AC-5 | The CLI and library `ReadService::open_default` SHALL use the same platform cache location, and `IX_BOARD_CACHE_PATH` SHALL override that location. On Unix, an absolute `XDG_CACHE_HOME` SHALL select `<XDG_CACHE_HOME>/ix-board/linear.sqlite3` even when `HOME` is unset; otherwise `HOME` SHALL select `<HOME>/.cache/ix-board/linear.sqlite3`. | Test |
-| FR-004-AC-6 | Given a non-absolute or absent `XDG_CACHE_HOME`, ix-board SHALL fall back to the available home directory; if neither an absolute XDG cache directory nor a home directory is available, the library SHALL return `CacheDirectoryUnavailable` rather than inventing a path. | Test |
+| FR-004-AC-5 | Given an absolute `XDG_CACHE_HOME` on Unix with `HOME` unset or set, the CLI and `ReadService::open_default` both select `<XDG_CACHE_HOME>/ix-board/linear.sqlite3`; given no absolute `XDG_CACHE_HOME` and a set `HOME`, both select `<HOME>/.cache/ix-board/linear.sqlite3`; given `IX_BOARD_CACHE_PATH`, both select that path instead. | Test |
+| FR-004-AC-6 | Given a non-absolute or absent `XDG_CACHE_HOME`, the library falls back to the available home directory; given neither an absolute XDG cache directory nor a home directory, the library returns `CacheDirectoryUnavailable` and invents no path. | Test |
 | FR-004-AC-7 | Project queries use a page size of 20 records. | Test |
 | FR-004-AC-8 | Issue queries use a page size of 50 records. | Test |
 | FR-004-AC-9 | A structured RATELIMITED response produces a typed LinearRateLimited error. | Test |
@@ -100,7 +102,7 @@ deadline.
 | FR-004-AC-11 | Without a read policy, every existing read method keeps the 300-second entry lifetime, the 30-second per-request timeout, no deadline, and its existing typed errors; AC-1 through AC-10 pass unchanged and no existing method signature requires a new argument. | Test |
 | FR-004-AC-12 | Given a bounded read with maximum age 240 seconds, an entry whose source read began 200 seconds earlier is returned with no source read, and an entry whose source read began 250 seconds earlier is refreshed; a maximum age of 301 seconds or more is refused as an invalid policy with no source read. | Test |
 | FR-004-AC-13 | Given a snapshot whose source read began 250 seconds ago but whose cache write or report occurred 10 seconds ago, a bounded read with maximum age 240 seconds refreshes it; an entry with no evidence of when its source read began is refreshed rather than accepted; the returned fetch time is the actual source fetch time. | Test |
-| FR-004-AC-14 | Given a fake source whose pages never complete, a bounded read with deadline D returns the typed timeout with no more than D plus one legacy request timeout elapsed; no page or nested read begins after D, and each request is issued with a timeout no greater than the time remaining. | Test |
+| FR-004-AC-14 | Given a fake source whose pages never complete, a bounded read with deadline D returns the typed timeout with an elapsed time of at most D plus a stated scheduler and clock-precision tolerance of 250 milliseconds, and never D plus a further legacy request timeout; with a controlled clock the elapsed time is exactly D; no page or nested read begins after D, and each request is issued with a timeout no greater than the time remaining, so a request begun with 5 seconds remaining carries a timeout of at most 5 seconds. | Test |
 | FR-004-AC-15 | Given a source whose credential resolution takes longer than the deadline before it becomes ready, a bounded read still performs its full budgeted read after readiness; the bounded read never invokes credential resolution, never retries it, and returns an existing credential error unchanged when the source reports one. | Test |
 | FR-004-AC-16 | After a timeout or failed bounded read, the caller receives no snapshot and the cache holds no partial entry as fresh; a fake source that completes after expiry changes neither the cache nor any later result; the fake observes zero requests after the call returns and exactly one attempt per request issued, and the implementation spawns no detached worker. | Test |
 | FR-004-AC-17 | A source that cannot honor a bound returns the explicit unsupported-bound error before any source read; its legacy read method still works unchanged. | Test |

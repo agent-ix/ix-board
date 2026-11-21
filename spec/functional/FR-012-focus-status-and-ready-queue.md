@@ -80,9 +80,9 @@ issues; blocker-only issues SHALL NOT enter the ready queue unless they are
 also members of the resolved focus issue set.
 
 The optional repeatable `--work-milestone` selector SHALL accept an exact
-milestone name or ID among the selected projects. If supplied, blocker roots
-and ready issues SHALL be limited to focus issues assigned to matching
-milestones. The complete prerequisite closure of those roots SHALL remain
+milestone name or ID among the selected projects. If supplied, the CLI and
+library SHALL limit blocker roots and ready issues to focus issues assigned to
+matching milestones. The complete prerequisite closure of those roots SHALL remain
 visible even when a prerequisite belongs to another milestone or project.
 Project and milestone progress SHALL remain for the full selected focus, so
 the report retains its denominator. A selector matching no selected project
@@ -112,8 +112,15 @@ category. It introduces no second calculator and no store.
   ready, and blocked counts. A ready leaf is one that FR-001 would place in its
   ready queue. A blocked leaf is an open leaf whose complete FR-002 transitive
   `blocked_by` closure contains a prerequisite not classified `Completed`.
-- **Placements.** Each selection reports initiative rows with their projects and
-  direct-ticket rows. A row's counts are restricted to that selection's leaves.
+- **Placements.** Each selection reports initiative rows with their projects,
+  standalone project rows, and direct-ticket rows. A project that the selection
+  includes directly, or that holds a selected leaf, and that is not displayed
+  under any selected initiative, is a **standalone project row** carrying an
+  initiative-link status: `none selected` when the selection includes no
+  initiative that holds it (a known absence), or `unavailable` when initiative
+  links for it cannot be established from the snapshot. These two are distinct
+  and an unavailable link is never reported as no selected initiative. A project
+  row is never dropped because no initiative is displayed. A row's counts are restricted to that selection's leaves.
   A row is marked **partial**, with one or more reasons, when the selection covers
   only part of the Linear object: a milestone-only inclusion, a ticket-only
   inclusion, an exclusion, or the team boundary. A row is marked **shared** when
@@ -124,7 +131,17 @@ category. It introduces no second calculator and no store.
   leaf sets of that team's selections once per leaf, with the same fields.
   Different teams are separate groups with no cross-team total, union, or
   readiness. No result sums per-selection, per-initiative, or per-project
-  totals.
+  totals. The union's state follows its selections: it is `complete` only when
+  every selection of that team is `complete`. When any selection of the team is
+  `incomplete` or `unavailable`, the union is `incomplete` (or `unavailable` when
+  no selection of the team has a usable result), its counts are marked partial,
+  and it names, for each such selection, the caller's key and the cause (the
+  unresolved or unavailable members and the unknown facts). The provisional
+  leaves of an incomplete selection are never merged into a union presented as
+  complete merely because another selection of the team is complete. `empty`
+  selections add no leaves and do not degrade the union; a team whose selections
+  are all `empty` has union state `empty`. Partial availability is therefore
+  visible per team and per selection.
 - **Prerequisites.** An excluded prerequisite stays in the complete blocker
   closure as evidence and is not counted as a member of the selection. An
   exclusion SHALL NOT make an included leaf ready or hide a blocker.
@@ -187,10 +204,12 @@ produce an explicit error and no partial status result.
 | FR-012-AC-14 | Given selections of teams X and Y, the results form separate groups and no total, union, or readiness spans teams. | Test |
 | FR-012-AC-15 | Partial reasons are reported on initiative rows and project rows for a milestone-only inclusion, a ticket-only inclusion, an exclusion, and a team boundary that left other-team leaves out, each alone and together; a ticket-only selection whose project is not included lists its tickets as direct-ticket rows with the project partial and never becomes a project or team selection. | Test |
 | FR-012-AC-16 | Given an included leaf whose only open prerequisite is excluded by the selection, the leaf is not ready and is counted blocked, the prerequisite appears in the complete blocker closure and is not counted in the selection's totals; the same holds for an excluded prerequisite in another project or team; excluding a completed prerequisite changes no readiness. | Test |
-| FR-012-AC-17 | An explicit empty selection returns state `empty` with no rows and zero leaves; a batch with zero selections returns `none`; a selection with an unresolved or unavailable member or an unknown team returns `incomplete` or `unavailable` with counts marked unavailable or partial; the four results are distinguishable and none is reported as complete, healthy, or zero. | Test |
+| FR-012-AC-17 | An explicit empty selection returns state `empty` with no rows and a valid zero leaf count; a batch with zero selections returns `none` with no totals at all; a selection with an unresolved or unavailable member or an unknown team returns `incomplete` or `unavailable` with counts marked unavailable or partial; the four results are distinguishable, and no result that depends on an unresolved, unavailable, or unknown fact is reported as complete, healthy, or zero. | Test |
 | FR-012-AC-18 | A project whose native status category is `Unknown` is reported with that classification and its row is not reported as complete or healthy; the existing status category derivation is reused and not changed. | Test |
 | FR-012-AC-19 | A parent cycle, a missing parent or blocker record, a dependency cycle, or an incomplete snapshot fails the whole batch with the existing explicit error and no partial result; a bounded-read timeout or rate limit returns its FR-004 error and no result; the library stores no last-good result, revision cache, or named definition. | Test |
 | FR-012-AC-20 | Inspection confirms the batch evaluation reuses the FR-010 resolvers and leaf classification, the FR-001 readiness evaluation, the FR-002 closure, and the existing status category, and adds no second calculator, store, service, or raw tracker read. | Inspection |
+| FR-012-AC-21 | Given a batch of team X with a `complete` selection A and a selection B whose exclude member is unresolved, team X's union is `incomplete`, is not reported complete or healthy, names B's key and cause, and marks its counts partial; A's own result stays `complete`; a team Y group with only complete selections stays `complete`; a team whose selections are all `empty` reports union `empty`. | Test |
+| FR-012-AC-22 | Given a selection that includes only project P directly and no initiative, the result contains a standalone project row for P with initiative-link status `none selected`; given a snapshot whose initiative links for P cannot be established, the row reports `unavailable` instead; the two are distinguishable, and in neither case is P's row omitted or P's leaves counted as a direct ticket row. | Test |
 
 ## Dependencies
 
