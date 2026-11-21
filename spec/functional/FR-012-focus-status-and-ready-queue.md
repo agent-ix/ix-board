@@ -113,14 +113,19 @@ category. It introduces no second calculator and no store.
   ready queue. A blocked leaf is an open leaf whose complete FR-002 transitive
   `blocked_by` closure contains a prerequisite not classified `Completed`.
 - **Placements.** Each selection reports initiative rows with their projects,
-  standalone project rows, and direct-ticket rows. A project that the selection
-  includes directly, or that holds a selected leaf, and that is not displayed
-  under any selected initiative, is a **standalone project row** carrying an
+  standalone project rows, and direct-ticket rows. The selection's effective
+  exclusions apply first: an explicitly excluded project is omitted and gets no
+  standalone project row, even if the same selection also includes it directly.
+  A project that is not so excluded, that the selection includes directly or
+  that holds a selected leaf, and that is not displayed under any selected
+  initiative, is a **standalone project row** carrying an
   initiative-link status: `none selected` when the selection includes no
   initiative that holds it (a known absence), or `unavailable` when initiative
   links for it cannot be established from the snapshot. These two are distinct
   and an unavailable link is never reported as no selected initiative. A project
-  row is never dropped because no initiative is displayed. A row's counts are restricted to that selection's leaves.
+  row is never dropped because no initiative is displayed, and a directly
+  included project that is authoritatively known to be empty and is not excluded
+  keeps its standalone row with zero counts. A row's counts are restricted to that selection's leaves.
   A row is marked **partial**, with one or more reasons, when the selection covers
   only part of the Linear object: a milestone-only inclusion, a ticket-only
   inclusion, an exclusion, or the team boundary. A row is marked **shared** when
@@ -132,14 +137,17 @@ category. It introduces no second calculator and no store.
   Different teams are separate groups with no cross-team total, union, or
   readiness. No result sums per-selection, per-initiative, or per-project
   totals. The union's state follows its selections: it is `complete` only when
-  every selection of that team is `complete`. When any selection of the team is
-  `incomplete` or `unavailable`, the union is `incomplete` (or `unavailable` when
-  no selection of the team has a usable result), its counts are marked partial,
+  every non-`empty` selection of that team is `complete` (and at least one is
+  non-`empty`). When any selection of the team is `incomplete` or `unavailable`,
+  including alongside `empty` selections, the union is `incomplete` (or
+  `unavailable` when no selection of the team has a usable result), its counts are marked partial,
   and it names, for each such selection, the caller's key and the cause (the
   unresolved or unavailable members and the unknown facts). The provisional
   leaves of an incomplete selection are never merged into a union presented as
   complete merely because another selection of the team is complete. `empty`
-  selections add no leaves and do not degrade the union; a team whose selections
+  selections add no leaves and do not degrade a union that is otherwise known;
+  unknown-dependent membership or metrics of any selection still contaminate the
+  union's availability and provenance. A team whose selections
   are all `empty` has union state `empty`. Partial availability is therefore
   visible per team and per selection.
 - **Prerequisites.** An excluded prerequisite stays in the complete blocker
@@ -208,8 +216,8 @@ produce an explicit error and no partial status result.
 | FR-012-AC-18 | A project whose native status category is `Unknown` is reported with that classification and its row is not reported as complete or healthy; the existing status category derivation is reused and not changed. | Test |
 | FR-012-AC-19 | A parent cycle, a missing parent or blocker record, a dependency cycle, or an incomplete snapshot fails the whole batch with the existing explicit error and no partial result; a bounded-read timeout or rate limit returns its FR-004 error and no result; the library stores no last-good result, revision cache, or named definition. | Test |
 | FR-012-AC-20 | Inspection confirms the batch evaluation reuses the FR-010 resolvers and leaf classification, the FR-001 readiness evaluation, the FR-002 closure, and the existing status category, and adds no second calculator, store, service, or raw tracker read. | Inspection |
-| FR-012-AC-21 | Given a batch of team X with a `complete` selection A and a selection B whose exclude member is unresolved, team X's union is `incomplete`, is not reported complete or healthy, names B's key and cause, and marks its counts partial; A's own result stays `complete`; a team Y group with only complete selections stays `complete`; a team whose selections are all `empty` reports union `empty`. | Test |
-| FR-012-AC-22 | Given a selection that includes only project P directly and no initiative, the result contains a standalone project row for P with initiative-link status `none selected`; given a snapshot whose initiative links for P cannot be established, the row reports `unavailable` instead; the two are distinguishable, and in neither case is P's row omitted or P's leaves counted as a direct ticket row. | Test |
+| FR-012-AC-21 | Given a batch of team X with a `complete` selection A and a selection B whose exclude member is unresolved, team X's union is `incomplete`, is not reported complete or healthy, names B's key and cause, and marks its counts partial; A's own result stays `complete`; a team Y group with only complete selections stays `complete`; a team whose selections are all `empty` reports union `empty`; a `complete` selection A plus an `empty` selection B yields a `complete` union; an `incomplete` A plus an `empty` B yields an `incomplete` union (`unavailable` when no selection has a usable result). | Test |
+| FR-012-AC-22 | Given a selection that includes only project P directly and no initiative, the result contains a standalone project row for P with initiative-link status `none selected`; given a snapshot whose initiative links for P cannot be established, the row reports `unavailable` instead; the two are distinguishable, and in neither case is P's row omitted or P's leaves counted as a direct ticket row; given a selection that includes P and also excludes P, no standalone row for P appears; given a selection that directly includes an authoritatively known-empty P without excluding it, the standalone row for P is retained with zero counts. Direct-ticket placement is unchanged. | Test |
 
 ## Dependencies
 
