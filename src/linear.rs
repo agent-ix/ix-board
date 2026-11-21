@@ -186,26 +186,40 @@ pub struct LinearGraphQlSource {
 struct TransportMetrics {
     requests: std::sync::atomic::AtomicU64,
     complexity: std::sync::atomic::AtomicU64,
+    reported_complexity: std::sync::atomic::AtomicU64,
+    reported_requests: std::sync::atomic::AtomicU64,
 }
 
 impl LinearGraphQlSource {
-    pub(crate) fn metrics_start(&self) -> (u64, u64, std::time::Instant) {
+    pub(crate) fn metrics_start(&self) -> (u64, u64, u64, u64, std::time::Instant) {
         use std::sync::atomic::Ordering;
         (
             self.metrics.requests.load(Ordering::Relaxed),
             self.metrics.complexity.load(Ordering::Relaxed),
+            self.metrics.reported_complexity.load(Ordering::Relaxed),
+            self.metrics.reported_requests.load(Ordering::Relaxed),
             std::time::Instant::now(),
         )
     }
 
     pub(crate) fn record_metrics(
         &self,
-        start: (u64, u64, std::time::Instant),
+        start: (u64, u64, u64, u64, std::time::Instant),
         mode: &str,
         success: bool,
     ) -> Result<(), Error> {
+        self.record_metrics_within(start, mode, success, None)
+    }
+
+    fn record_metrics_within(
+        &self,
+        start: (u64, u64, u64, u64, std::time::Instant),
+        mode: &str,
+        success: bool,
+        deadline: Option<&Deadline<'_>>,
+    ) -> Result<(), Error> {
         use std::sync::atomic::Ordering;
-        crate::cache_status::record_refresh(
+        crate::cache_status::record_refresh_within(
             &self.quota_path,
             &crate::cache_status::RefreshCounters {
                 mode: mode.to_owned(),
@@ -220,8 +234,28 @@ impl LinearGraphQlSource {
                     .complexity
                     .load(Ordering::Relaxed)
                     .saturating_sub(start.1),
-                duration_millis: u64::try_from(start.2.elapsed().as_millis()).unwrap_or(u64::MAX),
+                returned_complexity: (self.metrics.reported_requests.load(Ordering::Relaxed)
+                    > start.3)
+                    .then(|| {
+                        self.metrics
+                            .reported_complexity
+                            .load(Ordering::Relaxed)
+                            .saturating_sub(start.2)
+                    }),
+                estimated_complexity: self
+                    .metrics
+                    .complexity
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(start.1)
+                    .saturating_sub(
+                        self.metrics
+                            .reported_complexity
+                            .load(Ordering::Relaxed)
+                            .saturating_sub(start.2),
+                    ),
+                duration_millis: u64::try_from(start.4.elapsed().as_millis()).unwrap_or(u64::MAX),
             },
+            deadline,
         )
     }
     pub(crate) fn cache_path(&self) -> &std::path::Path {
@@ -1116,6 +1150,12 @@ impl LinearGraphQlSource {
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<u64>().ok())
         {
+            self.metrics
+                .reported_complexity
+                .fetch_add(actual, std::sync::atomic::Ordering::Relaxed);
+            self.metrics
+                .reported_requests
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if actual >= ESTIMATED_COMPLEXITY {
                 self.metrics.complexity.fetch_add(
                     actual - ESTIMATED_COMPLEXITY,
@@ -1269,35 +1309,18 @@ impl LinearGraphQlSource {
         deadline: Option<&Deadline<'_>>,
         baseline: Option<&WorkspaceSnapshot>,
     ) -> Result<WorkspaceSnapshot, Error> {
-        use std::sync::atomic::Ordering;
-        let started = std::time::Instant::now();
-        let requests = self.metrics.requests.load(Ordering::Relaxed);
-        let complexity = self.metrics.complexity.load(Ordering::Relaxed);
+        let metrics = self.metrics_start();
         let result = self.fetch_workspace_delta(deadline, baseline);
-        if deadline.is_none() {
-            crate::cache_status::record_refresh(
-                &self.quota_path,
-                &crate::cache_status::RefreshCounters {
-                    mode: if baseline.is_some() {
-                        "incremental"
-                    } else {
-                        "full"
-                    }
-                    .to_owned(),
-                    success: result.is_ok(),
-                    requests_attempted: self
-                        .metrics
-                        .requests
-                        .load(Ordering::Relaxed)
-                        .saturating_sub(requests),
-                    complexity: self
-                        .metrics
-                        .complexity
-                        .load(Ordering::Relaxed)
-                        .saturating_sub(complexity),
-                    duration_millis: u64::try_from(started.elapsed().as_millis())
-                        .unwrap_or(u64::MAX),
+        if deadline.is_none_or(|deadline| deadline.remaining().is_ok()) {
+            self.record_metrics_within(
+                metrics,
+                if baseline.is_some() {
+                    "incremental"
+                } else {
+                    "full"
                 },
+                result.is_ok(),
+                deadline,
             )?;
         }
         result

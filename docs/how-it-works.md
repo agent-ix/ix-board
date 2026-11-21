@@ -1,8 +1,7 @@
 # How it works
 
-ix-board loads one snapshot of a Linear workspace, caches it, and computes every
-report from that snapshot. This page describes the data boundary, the cache,
-the readiness rules and the commands that write.
+ix-board is a cached reader of structured Linear data. It computes planning
+reports from shared summaries and detailed workspace snapshots.
 
 ## Structured data only
 

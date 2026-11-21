@@ -26,6 +26,7 @@ impl LinearGraphQlSource {
     /// Returns native summaries from their own cache partition without loading tickets.
     pub fn summary_snapshot_cached(&self) -> Result<SummaryRead, Error> {
         let path = self.cache_path();
+        crate::cache::restrict_permissions(path)?;
         let ttl = ordinary_ttl()?;
         let mut connection = Connection::open(path).map_err(Error::Cache)?;
         connection

@@ -492,7 +492,7 @@ fn with_lock_budget<T>(
 }
 
 #[cfg(unix)]
-fn restrict_permissions(path: &Path) -> Result<(), Error> {
+pub(crate) fn restrict_permissions(path: &Path) -> Result<(), Error> {
     use std::{
         fs::OpenOptions,
         os::unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -509,7 +509,7 @@ fn restrict_permissions(path: &Path) -> Result<(), Error> {
 }
 
 #[cfg(not(unix))]
-fn restrict_permissions(_path: &Path) -> Result<(), Error> {
+pub(crate) fn restrict_permissions(_path: &Path) -> Result<(), Error> {
     Ok(())
 }
 

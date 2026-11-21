@@ -131,6 +131,11 @@ impl LiveLinear {
 }
 
 impl LinearSource for LiveLinear {
+    fn cache_freshness(&self) -> Option<crate::CacheFreshness> {
+        self.service()
+            .ok()
+            .and_then(|service| service.cache_freshness().cloned())
+    }
     fn department_evidence(
         &self,
         scope: &super::department::Scope,

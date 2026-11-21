@@ -35,6 +35,8 @@ pub struct CacheStatus {
     pub datasets: Vec<DatasetStatus>,
     /// Machine/cache-shared allocation and cooldown.
     pub quota: QuotaStatus,
+    /// End of server cooldown in Unix seconds, rounded up from transport precision.
+    pub rate_limit_until: Option<i64>,
     /// Latest refresh counters, null until a refresh has been recorded.
     pub latest_refresh: Option<RefreshCounters>,
 }
@@ -51,6 +53,12 @@ pub struct RefreshCounters {
     pub requests_attempted: u64,
     /// Actual reported complexity or conservative estimate when unavailable.
     pub complexity: u64,
+    /// Complexity returned explicitly by Linear, when any response supplied it.
+    #[serde(default)]
+    pub returned_complexity: Option<u64>,
+    /// Conservative charges for requests without a returned complexity header.
+    #[serde(default)]
+    pub estimated_complexity: u64,
     /// Elapsed monotonic time including failed requests.
     pub duration_millis: u64,
 }
@@ -145,17 +153,29 @@ pub fn read_status(path: &Path) -> Result<CacheStatus, Error> {
     Ok(CacheStatus {
         cache_path: path.display().to_string(),
         datasets,
+        rate_limit_until: quota
+            .rate_limit_until
+            .map(|until| until.div_euclid(1000) + i64::from(until.rem_euclid(1000) > 0)),
         quota,
         latest_refresh,
     })
 }
 
-pub(crate) fn record_refresh(path: &Path, counters: &RefreshCounters) -> Result<(), Error> {
+pub(crate) fn record_refresh_within(
+    path: &Path,
+    counters: &RefreshCounters,
+    deadline: Option<&crate::Deadline<'_>>,
+) -> Result<(), Error> {
+    let wait = match deadline {
+        Some(deadline) => deadline.remaining()?,
+        None => std::time::Duration::from_secs(5),
+    };
     let connection = Connection::open(path).map_err(Error::Cache)?;
-    connection
-        .busy_timeout(std::time::Duration::from_secs(5))
-        .map_err(Error::Cache)?;
+    connection.busy_timeout(wait).map_err(Error::Cache)?;
     connection.execute_batch("CREATE TABLE IF NOT EXISTS refresh_counters(singleton INTEGER PRIMARY KEY CHECK(singleton=1),payload BLOB NOT NULL)").map_err(Error::Cache)?;
+    if let Some(deadline) = deadline {
+        deadline.remaining()?;
+    }
     connection.execute("INSERT INTO refresh_counters(singleton,payload) VALUES(1,?1) ON CONFLICT(singleton) DO UPDATE SET payload=excluded.payload",
         [serde_json::to_vec(counters).map_err(Error::CacheEncode)?]).map_err(Error::Cache)?;
     Ok(())

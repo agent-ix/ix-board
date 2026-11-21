@@ -614,7 +614,7 @@ fn run(command: Command) -> Result<Output, Error> {
         Command::Agents { teams, idle_after } => run_agents(&teams, idle_after).map(Output::Agents),
         Command::Retro {
             command: RetroCommand::Snapshot { config, window },
-        } => run_retro_snapshot(&config, &window).map(Output::Retro),
+        } => run_retro_snapshot(&config, &window),
         Command::Retro {
             command: RetroCommand::Delta { config },
         } => run_retro_delta(&config).map(Output::RetroDelta),
@@ -774,7 +774,7 @@ fn run_agents(teams: &[String], idle_after: u64) -> Result<AgentsReport, Error> 
     Ok(build_report(&hosts, teams, idle_after, &mut next_ready))
 }
 
-fn run_retro_snapshot(config_path: &std::path::Path, window: &str) -> Result<retro::Record, Error> {
+fn run_retro_snapshot(config_path: &std::path::Path, window: &str) -> Result<Output, Error> {
     let config = retro::RetroConfig::load(config_path).map_err(retro::RetroError::from)?;
     let window_secs = retro::parse_window(window).map_err(retro::RetroError::from)?;
     let store = retro::Store::from_env(&config.team).map_err(retro::RetroError::from)?;
@@ -797,7 +797,10 @@ fn run_retro_snapshot(config_path: &std::path::Path, window: &str) -> Result<ret
     if let Some(notice) = retro::unavailable_notice(&record) {
         eprintln!("{notice}");
     }
-    Ok(record)
+    Ok(label_cached(
+        Output::Retro(record),
+        linear.cache_freshness().as_ref(),
+    ))
 }
 
 fn run_retro_delta(config_path: &std::path::Path) -> Result<retro::DeltaReport, Error> {
@@ -1926,6 +1929,28 @@ mod tests {
     use ix_board::program_review::ScopeCheckReport;
     use ix_board::{FocusStatus, IssueBatch, IssueId, IssueReference};
     use ix_cli_kit::exit::Outcome;
+
+    /// Trace: FR-004-AC-3, FR-004-AC-21
+    #[test]
+    fn fallback_json_and_text_preserve_unknown_age_cooldown_and_failure() {
+        let output = Output::Cached {
+            result: Box::new(Output::Queue(Vec::new())),
+            freshness: ix_board::CacheFreshness {
+                stale: true,
+                age_seconds: None,
+                rate_limit_until: Some(1_800_000_060),
+                failure_reason: Some("Linear rate limited; retry in 3s".to_owned()),
+            },
+        };
+        let json = serde_json::to_value(&output).expect("fallback JSON");
+        assert_eq!(json["stale"], true);
+        assert!(json["age_seconds"].is_null());
+        assert_eq!(json["rate_limit_until"], 1_800_000_060);
+        assert_eq!(json["failure_reason"], "Linear rate limited; retry in 3s");
+        let text = super::render_human(&output);
+        assert!(text.contains("stale: true\nage_seconds: unknown\nrate_limit_until: 1800000060"));
+        assert!(text.contains("failure_reason: Linear rate limited; retry in 3s"));
+    }
 
     /// Trace: FR-012-AC-9
     #[test]
