@@ -153,6 +153,25 @@ impl Collector {
         let complete = result.is_ok();
         if let Ok(report) = result {
             for row in report.agents.iter().filter(|r| !r.partial) {
+                // Agent reports label this host "local". Resolve that alias
+                // only through an exact native session AND pane match to a
+                // verified relay binding; never infer it from the hostname.
+                let machines: BTreeSet<_> = self
+                    .state
+                    .scopes
+                    .values()
+                    .flat_map(|s| s.bindings.values())
+                    .filter(|b| {
+                        row.session_id.as_deref() == Some(b.session.as_str())
+                            && row.pane_id == b.pane
+                    })
+                    .map(|b| b.machine.as_str())
+                    .collect();
+                let machine = if machines.len() == 1 {
+                    (*machines.first().expect("one machine")).to_owned()
+                } else {
+                    row.machine.clone()
+                };
                 let clock = i64::try_from(row.collection_finished_at)
                     .ok()
                     .and_then(|s| s.checked_mul(1000));
@@ -161,7 +180,7 @@ impl Collector {
                 };
                 if let Some(session) = &row.session_id {
                     samples.push(ExecutionSample {
-                        machine: row.machine.clone(),
+                        machine: machine.clone(),
                         session: session.clone(),
                         parent_session: None,
                         working: row.verdict == crate::agents::Verdict::Working,
@@ -174,7 +193,7 @@ impl Collector {
                     .filter(|w| w.role == crate::agents::WorkerRole::Worker && w.issues.is_empty())
                 {
                     samples.push(ExecutionSample {
-                        machine: row.machine.clone(),
+                        machine: machine.clone(),
                         session: worker.id.0.clone(),
                         parent_session: worker.parent_id.as_ref().map(|id| id.0.clone()),
                         working: worker.state == crate::agents::WorkerState::Running,
@@ -198,6 +217,10 @@ impl Collector {
     pub fn tracker(config: &Config, now: i64) -> TrackerBatch {
         let source = retro::live::linear_or_unreadable();
         let workspace = source.workspace(now as f64 / 1000.0 - 86400.0);
+        // The native workspace reader stamps completed observations. Anchor
+        // calculations after that read, rather than mistaking read duration
+        // for source clock skew against the poll's starting instant.
+        let now = super::now_ms().unwrap_or(now).max(now);
         let results = config
             .scopes
             .iter()

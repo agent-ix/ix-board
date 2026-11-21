@@ -94,6 +94,15 @@ fn serve(mut stream: TcpStream, cache: &RwLock<Cache>) -> Result<(), Error> {
     Ok(())
 }
 fn run() -> Result<(), Error> {
+    // SystemHost's local lifecycle transport invokes the current executable.
+    // Support the same bounded, read-only protocol as the ix-board CLI.
+    if std::env::args().skip(1).collect::<Vec<_>>() == ["__agent-probe"] {
+        let home = std::env::var_os("HOME").ok_or(Error::Invalid("home unavailable"))?;
+        let response = ix_board::agents::serve_probe(std::io::stdin().lock(), &PathBuf::from(home))
+            .map_err(|e| Error::Source(e.to_string()))?;
+        println!("{response}");
+        return Ok(());
+    }
     let args = Args::parse();
     let config = Config::load(&args.config)?;
     if args.check_config {
