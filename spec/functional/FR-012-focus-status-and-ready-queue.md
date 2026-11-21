@@ -13,6 +13,7 @@ description: The ix-board CLI and library SHALL report project and milestone sta
 dependencies:
   - FR-001
   - FR-002
+  - FR-004
   - FR-005
   - FR-010
   - FR-011
@@ -89,6 +90,58 @@ milestone SHALL fail before emitting a partial report. The JSON result SHALL
 include the effective work-milestone selectors; no selector means all focus
 issues are considered for blockers and ready work.
 
+## Named-selection summaries
+
+The library SHALL additionally evaluate a **batch** of FR-010 named selections
+against one snapshot and return, in one deterministic result, a summary for each
+selection and a combined summary for each team group. This extends, and does not
+replace, `focus status`; it reuses FR-001 readiness, FR-002 prerequisite
+closure, FR-010 membership and leaf rules, and the existing project status
+category. It introduces no second calculator and no store.
+
+- **One snapshot.** Every selection and every combination in one batch is
+  computed from one snapshot, whose actual fetch time the result carries. The
+  caller's opaque key for each selection (for example a focus ID and revision) is
+  returned unchanged with that selection's result, so a result is never presented
+  as another selection or another snapshot. The result order is the order of the
+  FR-010 member and selection keys, then by name, then by ID, and the same input
+  gives the same output.
+- **Per-selection summary.** Each selection reports its state (`empty`, `none`,
+  `complete`, `incomplete`, or `unavailable`), its FR-010 member outcomes, its
+  deduplicated leaf set, and for that set: done, total, remaining by stage,
+  ready, and blocked counts. A ready leaf is one that FR-001 would place in its
+  ready queue. A blocked leaf is an open leaf whose complete FR-002 transitive
+  `blocked_by` closure contains a prerequisite not classified `Completed`.
+- **Placements.** Each selection reports initiative rows with their projects and
+  direct-ticket rows. A row's counts are restricted to that selection's leaves.
+  A row is marked **partial**, with one or more reasons, when the selection covers
+  only part of the Linear object: a milestone-only inclusion, a ticket-only
+  inclusion, an exclusion, or the team boundary. A row is marked **shared** when
+  it appears in more than one selection of the batch or under more than one
+  initiative, and every placement of it shows the same value for the same leaf
+  scope.
+- **Combination.** For each team, the combined summary counts the union of the
+  leaf sets of that team's selections once per leaf, with the same fields.
+  Different teams are separate groups with no cross-team total, union, or
+  readiness. No result sums per-selection, per-initiative, or per-project
+  totals.
+- **Prerequisites.** An excluded prerequisite stays in the complete blocker
+  closure as evidence and is not counted as a member of the selection. An
+  exclusion SHALL NOT make an included leaf ready or hide a blocker.
+- **Unknown is not zero.** A selection that is `empty` (explicit empty include
+  list), the batch with zero selections (`none`), and a selection with an
+  unresolved member, an unavailable member or team, or an incomplete result are
+  distinct states. A project whose native status category is `Unknown` keeps that
+  classification in its row. Counts that depend on unresolved, unavailable, or
+  unknown facts are marked unavailable or partial, never complete, healthy, or
+  zero.
+- **Failures.** A snapshot that is incomplete, a parent cycle, a missing parent,
+  a missing blocker record, or a dependency cycle returns the existing explicit
+  error for the whole batch and no partial result. A failed or timed-out read
+  returns the FR-004 error and no result. The library keeps no last-good result
+  and no revision cache; the caller keeps any last-good result with its original
+  fetch time.
+
 ## Inputs
 
 - One or more inline initiative, project, or issue selectors accepted by
@@ -128,6 +181,16 @@ produce an explicit error and no partial status result.
 | FR-012-AC-8 | A work-milestone selector keeps full project and milestone progress but restricts blocker roots and ready issues to matching milestones, preserving cross-milestone prerequisites; an unknown selector fails explicitly. | Test |
 | FR-012-AC-9 | An empty filtered ready queue reports that it is empty and counts otherwise-ready issues excluded by the selected milestones. | Test |
 | FR-012-AC-10 | A project reached only through milestone or issue focus is marked `partial_focus`, shows only selected or member-bearing milestones, and labels its project totals as selected-focus totals. The work-milestone view filter uses the same name, UUID, qualification, and ambiguity rules as saved milestone focus, but searches only focus projects so an out-of-focus name collision does not block a view. | Test |
+| FR-012-AC-11 | Given three named selections of two teams and one snapshot, one batch call returns each selection's result with its caller key, one combined result per team, and one snapshot fetch time; repeating the call on identical input returns identical order and values; a call on a changed snapshot returns results that all come from that one snapshot. | Test |
+| FR-012-AC-12 | Given a selection with open, completed, canceled, duplicate and parent issues, the per-selection done, total, remaining-by-stage, ready, and blocked counts equal the FR-010 leaf classification and the FR-001 and FR-002 results for the same leaves; two selections over the same project with different effective sets report their own counts. | Test |
+| FR-012-AC-13 | Given two selections of one team that share project P and one leaf placed under two initiatives, the combined result counts each leaf once, each per-selection row keeps its own count, P carries the shared mark in every placement with the same value for the same leaf scope, and no output field equals a sum of overlapping row totals. | Test |
+| FR-012-AC-14 | Given selections of teams X and Y, the results form separate groups and no total, union, or readiness spans teams. | Test |
+| FR-012-AC-15 | Partial reasons are reported on initiative rows and project rows for a milestone-only inclusion, a ticket-only inclusion, an exclusion, and a team boundary that left other-team leaves out, each alone and together; a ticket-only selection whose project is not included lists its tickets as direct-ticket rows with the project partial and never becomes a project or team selection. | Test |
+| FR-012-AC-16 | Given an included leaf whose only open prerequisite is excluded by the selection, the leaf is not ready and is counted blocked, the prerequisite appears in the complete blocker closure and is not counted in the selection's totals; the same holds for an excluded prerequisite in another project or team; excluding a completed prerequisite changes no readiness. | Test |
+| FR-012-AC-17 | An explicit empty selection returns state `empty` with no rows and zero leaves; a batch with zero selections returns `none`; a selection with an unresolved or unavailable member or an unknown team returns `incomplete` or `unavailable` with counts marked unavailable or partial; the four results are distinguishable and none is reported as complete, healthy, or zero. | Test |
+| FR-012-AC-18 | A project whose native status category is `Unknown` is reported with that classification and its row is not reported as complete or healthy; the existing status category derivation is reused and not changed. | Test |
+| FR-012-AC-19 | A parent cycle, a missing parent or blocker record, a dependency cycle, or an incomplete snapshot fails the whole batch with the existing explicit error and no partial result; a bounded-read timeout or rate limit returns its FR-004 error and no result; the library stores no last-good result, revision cache, or named definition. | Test |
+| FR-012-AC-20 | Inspection confirms the batch evaluation reuses the FR-010 resolvers and leaf classification, the FR-001 readiness evaluation, the FR-002 closure, and the existing status category, and adds no second calculator, store, service, or raw tracker read. | Inspection |
 
 ## Dependencies
 
@@ -135,6 +198,7 @@ produce an explicit error and no partial status result.
   [FR-002](FR-002-project-chunk.md),
   [FR-005](FR-005-structured-data-boundary.md),
   [FR-010](FR-010-explicit-work-scope.md),
-  [FR-011](FR-011-inline-planner-focus.md)
+  [FR-011](FR-011-inline-planner-focus.md),
+  [FR-004](FR-004-cache-polling.md) for the bounded snapshot read
 - Structured Linear project, milestone, issue, workflow-state, target-date,
   and blocker records.
