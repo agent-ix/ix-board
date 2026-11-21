@@ -293,6 +293,9 @@ pub struct GitAges {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentRow {
+    /// Verified native session identity, absent in reports predating this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     /// Team (workspace label).
     pub team: String,
     /// Machine label.
@@ -666,6 +669,7 @@ fn build_row(
         })
         .unwrap_or_default();
     AgentRow {
+        session_id: agent.session_id().map(str::to_owned),
         team,
         machine: host.label().into(),
         pane_id: agent.pane_id.clone(),

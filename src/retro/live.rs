@@ -270,8 +270,9 @@ const PULL_REQUEST_QUERY: &str = "query($owner: String!, $name: String!, $after:
     pullRequests(first: 50, states: __STATES__, after: $after,
                  orderBy: {field: UPDATED_AT, direction: DESC}) {
       nodes {
-        number createdAt mergedAt updatedAt isDraft state additions deletions reviewDecision
+        number createdAt mergedAt closedAt updatedAt isDraft state additions deletions reviewDecision
         timelineItems(first: 1, itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT]) { totalCount }
+        reopenEvents: timelineItems(first: 1, itemTypes: [REOPENED_EVENT]) { totalCount }
       }
       pageInfo { hasNextPage endCursor }
     }
@@ -326,6 +327,10 @@ struct RawPullRequest {
     created_at: String,
     #[serde(rename = "mergedAt")]
     merged_at: Option<String>,
+    #[serde(default, rename = "closedAt")]
+    closed_at: Option<String>,
+    #[serde(default, rename = "reopenEvents")]
+    reopen_events: Option<ForcePushes>,
     #[serde(rename = "updatedAt")]
     updated_at: String,
     #[serde(rename = "isDraft")]
@@ -365,6 +370,8 @@ pub fn pull_request_page(
         .into_iter()
         .map(|pr| {
             Ok(PullRequest {
+                closed_at: pr.closed_at.as_deref().map(epoch).transpose()?,
+                reopen_events: pr.reopen_events.map(|events| events.total_count),
                 repo: repo.to_owned(),
                 number: pr.number,
                 open: pr.state == "OPEN",
@@ -527,7 +534,7 @@ impl GithubSource for LiveGithub {
     }
     fn pull_requests(&self, repo: &str, since: f64) -> Result<Vec<PullRequest>, String> {
         let mut all = self.list(repo, "[OPEN]", None)?;
-        all.extend(self.list(repo, "[MERGED]", Some(since))?);
+        all.extend(self.list(repo, "[MERGED, CLOSED]", Some(since))?);
         Ok(all)
     }
 

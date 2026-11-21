@@ -41,6 +41,10 @@ test:
 build:
 	$(CARGO) build --release
 
+.PHONY: build-team-exporter
+build-team-exporter:
+	$(CARGO) build --release --bin ix-team-exporter
+
 .PHONY: clean
 clean:
 	$(CARGO) clean

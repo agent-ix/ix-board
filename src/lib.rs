@@ -18,6 +18,7 @@ mod read_bound;
 pub mod reconcile;
 pub mod retro;
 mod scope;
+pub mod team_metrics;
 pub use named_focus::{
     BatchState, CatalogEvidence, CountAvailability, InitiativeLink, InitiativeRow, LeafCounts,
     ListKind, MemberOutcome, MemberReport, NamedBatch, NamedFocusRequest, PartialReason,
@@ -51,7 +52,7 @@ pub use hygiene::{
     MissingScopeFinding, OverdueMilestoneFinding, PullRequestFinding, PullRequestMismatchKind,
     StaleIssueFinding, TITLE_PAIR_LIMIT,
 };
-pub use linear::LinearGraphQlSource;
+pub use linear::{LinearGraphQlSource, MarkerComment};
 pub use model::{
     ChunkIssue, FocusBlocker, FocusExpansion, FocusIssue, FocusIssueClassification, FocusMember,
     FocusMilestone, FocusMilestoneStatus, FocusPlanChunk, FocusPlanIssue, FocusProgress,

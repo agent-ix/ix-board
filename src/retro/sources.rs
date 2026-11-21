@@ -133,6 +133,10 @@ pub trait LinearSource {
 /// A pull request with the fields the catalog reads.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PullRequest {
+    /// Native last close time, absent for open PRs or older source capabilities.
+    pub closed_at: Option<f64>,
+    /// Native lifetime reopen event count, unknown when that timeline was not collected.
+    pub reopen_events: Option<u64>,
     /// `owner/name`.
     pub repo: String,
     /// Pull request number.
@@ -203,7 +207,7 @@ pub trait GithubSource {
             ..Default::default()
         }
     }
-    /// Every open pull request of `repo`, plus merged ones updated at or after `since`,
+    /// Every open pull request of `repo`, plus merged/closed ones updated at or after `since`,
     /// read in one paginated pass.
     fn pull_requests(&self, repo: &str, since: f64) -> Result<Vec<PullRequest>, String>;
     /// One pull request of any repository, open, merged or closed.
