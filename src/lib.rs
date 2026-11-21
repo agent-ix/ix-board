@@ -368,6 +368,16 @@ pub trait WorkspaceSource: Send + Sync {
         }
     }
 
+    /// Refreshes through the same source path while retaining atomic quota evidence.
+    /// Existing sources may keep implementing only `refresh_workspace`.
+    fn refresh_workspace_evaluated(
+        &self,
+        baseline: Option<&WorkspaceSnapshot>,
+        deadline: Option<&Deadline<'_>>,
+    ) -> Result<WorkspaceSnapshot, Error> {
+        self.refresh_workspace(baseline, deadline)
+    }
+
     /// Identifies the source data for cache isolation. Fixture sources share a stable default.
     fn cache_namespace(&self) -> String {
         "fixture-default".to_owned()
@@ -464,6 +474,30 @@ pub struct RefreshRead<T> {
 }
 
 impl Error {
+    pub(crate) fn legacy_rate_limit(self) -> Self {
+        if let Self::QuotaAdmissionRefused { decision } = self {
+            if decision.state == quota::QuotaState::ServerBackoff {
+                let until = decision
+                    .blockers
+                    .iter()
+                    .find(|blocker| blocker.state == quota::QuotaState::ServerBackoff)
+                    .and_then(|blocker| blocker.deadline)
+                    .unwrap_or(decision.evaluated_at);
+                let seconds = until
+                    .saturating_sub(decision.evaluated_at)
+                    .max(0)
+                    .unsigned_abs()
+                    .div_ceil(1000);
+                return Self::LinearRateLimited {
+                    retry_after: std::time::Duration::from_secs(seconds),
+                };
+            }
+            Self::QuotaAdmissionRefused { decision }
+        } else {
+            self
+        }
+    }
+
     /// The quota decision captured at refusal, without parsing rendered text.
     pub fn quota_decision(&self) -> Option<&quota::QuotaDecision> {
         match self {
@@ -1025,7 +1059,9 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
             } else {
                 self.cache.last_complete()?
             };
-            let mut snapshot = self.source.refresh_workspace(baseline.as_ref(), None)?;
+            let mut snapshot = self
+                .source
+                .refresh_workspace_evaluated(baseline.as_ref(), None)?;
             snapshot.fetched_at = started;
             self.cache.replace_refresh(started, &snapshot, full)?;
             self.outcome = RefreshOutcome::Refreshed;
@@ -1053,7 +1089,7 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
             Err(error) => {
                 self.outcome = RefreshOutcome::from_error(&error);
                 let Some(snapshot) = self.cache.last_complete()? else {
-                    return Err(error);
+                    return Err(error.legacy_rate_limit());
                 };
                 let until = match &error {
                     Error::QuotaAdmissionRefused { decision } => decision

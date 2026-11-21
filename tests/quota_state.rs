@@ -474,3 +474,87 @@ fn generated_interleavings_match_independent_uncompacted_accounting_oracle() {
         );
     }
 }
+
+#[trace("FR-032-AC-6")]
+#[test]
+fn legacy_pairing_preserves_deadline_and_pending_debt_and_corruption_fails_closed() {
+    for usable in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quota.sqlite");
+        let clock = Arc::new(Clock(AtomicI64::new(NOW)));
+        let gate = open(&path, &clock, &QuotaConfig::default());
+        let pending = gate.reserve_evaluated(10000, None).unwrap();
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute("UPDATE linear_shared_quota SET paired_evidence=0,complexity_remaining=155000,complexity_reset=?1,server_complexity_debt=100 WHERE singleton=1",[if usable {NOW+1000}else{0}]).unwrap();
+        drop(gate);
+        let gate = open(&path, &clock, &QuotaConfig::default());
+        let decision = gate.decision(10).unwrap();
+        if usable {
+            assert_eq!(decision.state, QuotaState::ServerReserveHeld);
+            assert_eq!(decision.next_reevaluation_at, Some(NOW + 1000));
+            assert_eq!(decision.evidence[0].outstanding_charge, Some(10100));
+            gate.observe(
+                pending,
+                200,
+                &headers(&[("x-complexity", "5".to_owned())]),
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                gate.decision(10).unwrap().evidence[0].outstanding_charge,
+                Some(105)
+            );
+            db.execute(
+                "UPDATE linear_quota_observations SET provenance='reservation:broken'",
+                [],
+            )
+            .unwrap();
+            assert_eq!(
+                gate.decision(10).unwrap().state,
+                QuotaState::EvidenceUnavailable
+            );
+        } else {
+            assert_eq!(decision.state, QuotaState::EvidenceUnavailable);
+        }
+    }
+}
+
+#[trace("FR-032-AC-6")]
+#[test]
+fn independent_concurrent_gates_cannot_overspend_one_paired_remaining_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("quota.sqlite");
+    let clock = Arc::new(Clock(AtomicI64::new(NOW)));
+    let config = QuotaConfig {
+        reserve_fraction: 0.0,
+        ..QuotaConfig::default()
+    };
+    let gate = open(&path, &clock, &config);
+    request_observation(&gate, 1, NOW + 1000);
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let workers: Vec<_> = (0..2)
+        .map(|_| {
+            let gate = open(&path, &clock, &config);
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                gate.reserve_evaluated(10, None).is_ok()
+            })
+        })
+        .collect();
+    barrier.wait();
+    assert_eq!(
+        workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(|admitted| *admitted)
+            .count(),
+        1
+    );
+    assert_eq!(gate.status().unwrap().requests_used, 1);
+    clock.0.store(NOW + 1000, Ordering::SeqCst);
+    assert_eq!(
+        open(&path, &clock, &config).decision(10).unwrap().state,
+        QuotaState::Available
+    );
+}

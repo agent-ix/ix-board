@@ -432,7 +432,7 @@ impl QuotaGate {
                         if left < 0 || expiry <= 0 {
                             transaction.execute("UPDATE linear_shared_quota SET evidence_error_until=-1 WHERE singleton=1", []).map_err(Error::Cache)?;
                         } else {
-                            transaction.execute("INSERT INTO linear_quota_observations(dimension,remaining,observed_at,expires_at,provenance,paired_reset) VALUES(?1,?2,0,?3,'legacy',0)",params![dimension,left,expiry]).map_err(Error::Cache)?;
+                            transaction.execute("INSERT INTO linear_quota_observations(dimension,remaining,charge,observed_at,expires_at,provenance,paired_reset) VALUES(?1,?2,CASE WHEN ?1='complexity' THEN (SELECT server_complexity_debt FROM linear_shared_quota WHERE singleton=1)+(SELECT COALESCE(SUM(estimate),0) FROM linear_quota_reservations) ELSE 0 END,0,?3,'legacy',0)",params![dimension,left,expiry]).map_err(Error::Cache)?;
                         }
                     }
                 }
@@ -797,7 +797,10 @@ impl QuotaGate {
                 || expiry <= observed
                 || !(provenance == "legacy"
                     || provenance == "headers"
-                    || provenance.starts_with("reservation:"))
+                    || provenance
+                        .strip_prefix("reservation:")
+                        .and_then(|id| id.parse::<i64>().ok())
+                        .is_some_and(|id| id > 0))
             {
                 decision.blockers.push(QuotaBlocker::nondimensional(
                     QuotaState::EvidenceUnavailable,

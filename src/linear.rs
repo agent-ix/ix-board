@@ -1258,6 +1258,14 @@ impl WorkspaceSource for LinearGraphQlSource {
         deadline: Option<&Deadline<'_>>,
     ) -> Result<WorkspaceSnapshot, Error> {
         self.refresh_measured(deadline, baseline)
+            .map_err(Error::legacy_rate_limit)
+    }
+    fn refresh_workspace_evaluated(
+        &self,
+        baseline: Option<&WorkspaceSnapshot>,
+        deadline: Option<&Deadline<'_>>,
+    ) -> Result<WorkspaceSnapshot, Error> {
+        self.refresh_measured(deadline, baseline)
     }
     fn configure_cache(&mut self, path: &std::path::Path) -> Result<(), Error> {
         self.quota_path = path.to_owned();
@@ -1269,6 +1277,7 @@ impl WorkspaceSource for LinearGraphQlSource {
 
     fn fetch_workspace(&self) -> Result<WorkspaceSnapshot, Error> {
         self.fetch_workspace_within(None)
+            .map_err(Error::legacy_rate_limit)
     }
 
     fn supports_bounded_read(&self) -> bool {
@@ -1277,6 +1286,7 @@ impl WorkspaceSource for LinearGraphQlSource {
 
     fn fetch_workspace_bounded(&self, deadline: &Deadline<'_>) -> Result<WorkspaceSnapshot, Error> {
         self.fetch_workspace_within(Some(deadline))
+            .map_err(Error::legacy_rate_limit)
     }
 
     fn catalog_evidence(&self) -> CatalogEvidence {

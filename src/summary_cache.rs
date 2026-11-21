@@ -36,6 +36,7 @@ impl LinearGraphQlSource {
     ) -> Result<SummaryRead, Error> {
         self.summary_snapshot_cached_with_outcome_and_clock(clock)
             .map(|result| result.read)
+            .map_err(Error::legacy_rate_limit)
     }
 
     /// Reads native summaries with typed attempt provenance, preserving SummaryRead literals.
@@ -123,10 +124,10 @@ impl LinearGraphQlSource {
             crate::cache_status::begin_refresh(path, None)?;
             let fetched = match &current {
                 Some((data, sync, _)) if !full => self
-                    .fetch_summary_changes(*sync)
+                    .fetch_summary_changes_evaluated(*sync)
                     .map(|changes| merge_summary(data, changes)),
                 _ => self
-                    .fetch_summary()
+                    .fetch_summary_evaluated()
                     .map(|data| merge_summary(&SummarySnapshot::default(), data)),
             };
             let mode = if full {
