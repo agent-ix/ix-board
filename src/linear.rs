@@ -28,13 +28,13 @@ const RELATION_PAGE_SIZE: i32 = 50;
 const INITIAL_RELATION_PAGE_SIZE: i32 = 10;
 const PAGE_LIMIT: usize = 1_000;
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-// Isolate snapshots carrying native project-status category and display name from older readers.
-const CACHE_MODEL_VERSION: &str = "v14";
+// Full catalog partitions exclude snapshots produced by the old null lower-bound query.
+const CACHE_MODEL_VERSION: &str = "v15";
 const ENDPOINT: &str = "https://api.linear.app/graphql";
 
 const PROJECT_QUERY: &str = r#"
-query WorkspaceProjects($first: Int!, $nestedFirst: Int!, $after: String, $since: DateTimeOrDuration, $includeArchived: Boolean!) {
-  projects(first: $first, after: $after, includeArchived: $includeArchived, filter: { updatedAt: { gte: $since } }) {
+query WorkspaceProjects($first: Int!, $nestedFirst: Int!, $after: String, $filter: ProjectFilter, $includeArchived: Boolean!) {
+  projects(first: $first, after: $after, includeArchived: $includeArchived, filter: $filter) {
     nodes {
       id name description content priority sortOrder targetDate updatedAt archivedAt trashed
       status { name type }
@@ -58,8 +58,8 @@ query WorkspaceInitiatives($first: Int!, $after: String) {
 }"#;
 
 const ISSUE_QUERY: &str = r#"
-query WorkspaceIssues($first: Int!, $relationFirst: Int!, $after: String, $since: DateTimeOrDuration, $includeArchived: Boolean!) {
-  issues(first: $first, after: $after, includeArchived: $includeArchived, filter: { updatedAt: { gte: $since } }) {
+query WorkspaceIssues($first: Int!, $relationFirst: Int!, $after: String, $filter: IssueFilter, $includeArchived: Boolean!) {
+  issues(first: $first, after: $after, includeArchived: $includeArchived, filter: $filter) {
     nodes {
       id identifier title description priority sortOrder createdAt updatedAt archivedAt trashed
       state { name type }
@@ -1107,7 +1107,7 @@ impl LinearGraphQlSource {
                 relation_first,
                 nested_first,
                 after: after.map(str::to_owned),
-                since: None,
+                filter: None,
                 include_archived: false,
             },
         )
@@ -1364,7 +1364,7 @@ impl LinearGraphQlSource {
                     after: after.clone(),
                     relation_first: None,
                     nested_first: Some(PROJECT_NESTED_PAGE_SIZE),
-                    since: since.clone(),
+                    filter: since.clone().map(UpdatedFilter::new),
                     include_archived: baseline.is_some(),
                 },
             )?;
@@ -1450,7 +1450,7 @@ impl LinearGraphQlSource {
                     after: after.clone(),
                     relation_first: Some(INITIAL_RELATION_PAGE_SIZE),
                     nested_first: None,
-                    since: since.clone(),
+                    filter: since.clone().map(UpdatedFilter::new),
                     include_archived: baseline.is_some(),
                 },
             )?;
@@ -1813,9 +1813,29 @@ struct Variables {
     #[serde(rename = "nestedFirst")]
     nested_first: Option<i32>,
     after: Option<String>,
-    since: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    filter: Option<UpdatedFilter>,
     #[serde(rename = "includeArchived")]
     include_archived: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdatedFilter {
+    updated_at: UpdatedLowerBound,
+}
+
+impl UpdatedFilter {
+    fn new(gte: String) -> Self {
+        Self {
+            updated_at: UpdatedLowerBound { gte },
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct UpdatedLowerBound {
+    gte: String,
 }
 
 #[derive(Serialize)]

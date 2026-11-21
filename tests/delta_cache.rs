@@ -138,12 +138,146 @@ fn assert_delta(request: &Value, since: i64) {
     let expected = chrono::DateTime::from_timestamp(since - 60, 0)
         .expect("sync timestamp")
         .to_rfc3339();
-    let observed = if query.contains("SummaryInitiatives") {
-        &request["variables"]["filter"]["updatedAt"]["gte"]
-    } else {
-        &request["variables"]["since"]
-    };
+    assert!(
+        !query.contains("gte: $since"),
+        "filters are typed whole inputs"
+    );
+    assert!(
+        request["variables"].get("since").is_none(),
+        "no undeclared legacy variable"
+    );
+    let observed = &request["variables"]["filter"]["updatedAt"]["gte"];
     assert_eq!(observed, &Value::String(expected));
+}
+
+#[trace("FR-030-AC-3", "FR-030-AC-6", "FR-031-AC-4")]
+#[test]
+fn unfiltered_paged_baseline_replaces_poisoned_model_partition_without_resetting_shared_quota() {
+    use sha2::{Digest, Sha256};
+    let mut first_projects = projects(json!([project("p1")]));
+    first_projects["data"]["projects"]["pageInfo"] =
+        json!({"hasNextPage":true,"endCursor":"projects-2"});
+    let mut first_issues = issues(json!([issue("first-page")]));
+    first_issues["data"]["issues"]["pageInfo"] = json!({"hasNextPage":true,"endCursor":"issues-2"});
+    let mut summary_project = project("native-summary");
+    for field in ["content", "teams", "projectMilestones"] {
+        summary_project
+            .as_object_mut()
+            .expect("project")
+            .remove(field);
+    }
+    summary_project["progress"] = json!(0.5);
+    let (endpoint, requests) = fixture(vec![
+        first_projects,
+        projects(json!([project("p2")])),
+        first_issues,
+        issues(json!([issue("second-page")])),
+        projects(json!([])),
+        issues(json!([issue("delta-added")])),
+        initiatives(),
+        projects(json!([summary_project])),
+        initiatives(),
+    ]);
+    let cache = tempfile::tempdir().expect("cache");
+    let path = cache.path().join("linear.sqlite3");
+    let clock = ManualClock::new();
+    let mut source = source(&endpoint, "poisoned-model-fixture");
+    source.configure_cache(&path).expect("shared cache");
+    let current = source.cache_namespace();
+    assert!(current.starts_with("linear:v15:"));
+    let poisoned = current.replacen("linear:v15:", "linear:v14:", 1);
+    let mut reader = ReadService::with_clock(source.clone(), &path, clock.clone()).expect("reader");
+    let db = Connection::open(&path).expect("seed former partition");
+    let empty = serde_json::to_vec(&WorkspaceSnapshot {
+        fetched_at: clock.now_epoch_seconds(),
+        ..Default::default()
+    })
+    .expect("empty former baseline");
+    db.execute("INSERT INTO workspace_snapshot(cache_key,fetched_at,payload,read_started_at,read_started_for,read_started_digest,full_reconciled_at)
+        VALUES(?1,?2,?3,?2,?2,?4,?2)",rusqlite::params![poisoned,clock.now_epoch_seconds(),empty,format!("{:x}",Sha256::digest(&empty))]).expect("poisoned v14 detail baseline");
+    db.execute_batch("CREATE TABLE summary_snapshot(cache_key TEXT PRIMARY KEY,payload BLOB NOT NULL,synced_at INTEGER NOT NULL,full_at INTEGER NOT NULL)").expect("former summaries");
+    db.execute(
+        "INSERT INTO summary_snapshot VALUES(?1,?2,?3,?3)",
+        rusqlite::params![
+            format!("{poisoned}:summary:v1"),
+            serde_json::to_vec(&ix_board::linear_summary::SummarySnapshot::default())
+                .expect("empty summary"),
+            clock.now_epoch_seconds()
+        ],
+    )
+    .expect("poisoned v14 summary baseline");
+    let gate = ix_board::quota::QuotaGate::open(&path, &Default::default())
+        .expect("existing independent quota");
+    gate.reserve(7, None)
+        .expect("prior admitted transport cost");
+    let baseline = reader
+        .workspace_snapshot()
+        .expect("authoritative paged baseline");
+    assert_eq!(baseline.projects.len(), 2);
+    assert_eq!(baseline.issues.len(), 2);
+    assert!(
+        baseline
+            .issues
+            .iter()
+            .any(|issue| issue.identifier == "second-page")
+    );
+    assert_eq!(gate.status().expect("preserved quota").requests_used, 5);
+    clock.advance(1000);
+    let delta = reader
+        .force_refresh_workspace()
+        .expect("delta on complete baseline");
+    assert_eq!(
+        delta.issues.len(),
+        3,
+        "unchanged baseline pages survive incremental merge"
+    );
+    let summary = source
+        .summary_snapshot_cached()
+        .expect("new model requires native full baseline too");
+    assert_eq!(summary.data.projects[0].project.id.0, "native-summary");
+    assert_eq!(
+        gate.status().expect("all shared attempts").requests_used,
+        10
+    );
+    assert_eq!(
+        gate.status().expect("all shared costs").complexity_used,
+        90_007
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM workspace_snapshot WHERE cache_key=?1",
+            [poisoned],
+            |row| row.get::<_, i64>(0)
+        )
+        .expect("legacy retention"),
+        1
+    );
+    let requests = requests
+        .recv_timeout(Duration::from_secs(5))
+        .expect("complete pages and delta");
+    assert_eq!(requests.len(), 9);
+    for index in [0, 1, 2, 3] {
+        let query = requests[index]["query"].as_str().expect("full query");
+        assert!(
+            !query.contains("gte:") && !query.contains("$since"),
+            "full query cannot construct a null updatedAt lower bound"
+        );
+        assert!(query.contains("filter: $filter"));
+        assert!(requests[index]["variables"].get("filter").is_none());
+        assert!(requests[index]["variables"].get("since").is_none());
+        assert_eq!(requests[index]["variables"]["includeArchived"], false);
+    }
+    assert_eq!(requests[1]["variables"]["after"], "projects-2");
+    assert_eq!(requests[3]["variables"]["after"], "issues-2");
+    for request in &requests[4..7] {
+        assert_delta(request, baseline.fetched_at);
+    }
+    for request in &requests[7..] {
+        assert!(
+            request["variables"]["filter"].is_null(),
+            "native summary root has no lower-bound object on full read"
+        );
+    }
 }
 
 /// Trace: FR-030-AC-1, FR-030-AC-4
@@ -393,8 +527,13 @@ fn failed_detail_page_preserves_watermark_records_and_costs_then_retry_and_daily
             "full scans enumerate only active records"
         );
         assert!(
-            requests[index]["variables"]["since"].is_null(),
-            "full baseline requests have no delta watermark"
+            requests[index]["variables"].get("filter").is_none(),
+            "full baseline omits the entire update filter"
+        );
+        let query = requests[index]["query"].as_str().expect("full query");
+        assert!(
+            !query.contains("$since") && !query.contains("gte:"),
+            "no null lower-bound predicate in full queries"
         );
     }
 }

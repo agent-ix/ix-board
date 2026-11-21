@@ -188,22 +188,14 @@ fn two_live_retro_workers_reuse_full_and_delta_publications_and_meter_histories(
     assert_eq!(requests.len(), 7);
     for request in &requests[..2] {
         assert_eq!(request["variables"]["includeArchived"], false);
-        assert!(request["variables"]["since"].is_null());
+        assert!(request["variables"].get("filter").is_none());
     }
     let expected = chrono::DateTime::from_timestamp(expired.fetched_at - 60, 0)
         .expect("watermark")
         .to_rfc3339();
     for request in &requests[2..5] {
         assert_eq!(request["variables"]["includeArchived"], true);
-        let since = if request["query"]
-            .as_str()
-            .expect("query")
-            .contains("SummaryInitiatives")
-        {
-            &request["variables"]["filter"]["updatedAt"]["gte"]
-        } else {
-            &request["variables"]["since"]
-        };
+        let since = &request["variables"]["filter"]["updatedAt"]["gte"];
         assert_eq!(
             since,
             &Value::String(expected.clone()),
