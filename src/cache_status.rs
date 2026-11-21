@@ -252,3 +252,39 @@ pub fn render_text(status: &CacheStatus) -> String {
     lines.push(format!("latest_refresh: {:?}", status.latest_refresh));
     lines.join("\n")
 }
+
+/// Additive offline status envelope with the evaluated estimate and dimensional evidence.
+#[derive(Debug, Serialize)]
+pub struct EvaluatedCacheStatus {
+    /// Existing counters and dataset provenance, with unchanged meanings.
+    #[serde(flatten)]
+    pub status: CacheStatus,
+    /// Explanation for a conservative 10,000-unit GraphQL request estimate.
+    pub decision: crate::quota::QuotaDecision,
+}
+
+/// Reads cache status and evaluates a labeled request without credentials or network.
+pub fn read_status_with_decision(path: &Path) -> Result<EvaluatedCacheStatus, Error> {
+    let status = read_status(path)?;
+    let decision = QuotaGate::open(
+        path,
+        &QuotaConfig::from_config(crate::settings::load()?.as_ref())?,
+    )?
+    .decision(crate::quota::UNKNOWN_COMPLEXITY)?;
+    Ok(EvaluatedCacheStatus { status, decision })
+}
+
+/// Labeled text equivalent of the evaluated offline JSON envelope.
+pub fn render_evaluated_text(status: &EvaluatedCacheStatus) -> String {
+    format!(
+        "{}\nquota decision: {}\nendpoint: {} | estimated_complexity: {}\nblockers: {}\nserver evidence: {}\nlocal generation: {} | local window deadline: {}",
+        render_text(&status.status),
+        status.decision,
+        status.decision.endpoint,
+        status.decision.estimated_complexity,
+        serde_json::to_string(&status.decision.blockers).expect("typed quota blockers serialize"),
+        serde_json::to_string(&status.decision.evidence).expect("typed quota evidence serializes"),
+        status.decision.local_generation,
+        status.decision.local_window_reset_at
+    )
+}

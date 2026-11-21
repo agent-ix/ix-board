@@ -92,12 +92,25 @@ pub struct InitiativeSummary {
 impl LinearGraphQlSource {
     /// Reads only native summary catalogs, including observed tombstones.
     pub fn fetch_summary(&self) -> Result<SummarySnapshot, Error> {
-        self.fetch_summary_filtered(None)
+        self.fetch_summary_evaluated()
+            .map_err(Error::legacy_rate_limit)
     }
 
     /// Reads records updated since the successful sync minus a 60-second overlap.
     /// No batch is returned until all root and membership pages succeed.
     pub fn fetch_summary_changes(&self, since_epoch: i64) -> Result<SummarySnapshot, Error> {
+        self.fetch_summary_changes_evaluated(since_epoch)
+            .map_err(Error::legacy_rate_limit)
+    }
+
+    pub(crate) fn fetch_summary_evaluated(&self) -> Result<SummarySnapshot, Error> {
+        self.fetch_summary_filtered(None)
+    }
+
+    pub(crate) fn fetch_summary_changes_evaluated(
+        &self,
+        since_epoch: i64,
+    ) -> Result<SummarySnapshot, Error> {
         let epoch = since_epoch.checked_sub(60).ok_or(Error::CacheTimestamp)?;
         let timestamp = chrono::DateTime::from_timestamp(epoch, 0)
             .ok_or(Error::CacheTimestamp)?

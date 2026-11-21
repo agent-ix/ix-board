@@ -1132,7 +1132,7 @@ impl LinearGraphQlSource {
         let config = crate::quota::QuotaConfig::from_config(crate::settings::load()?.as_ref())?;
         let quota = crate::quota::QuotaGate::open_within(&self.quota_path, &config, deadline)?;
         const ESTIMATED_COMPLEXITY: u64 = 10_000;
-        let reservation = quota.reserve(ESTIMATED_COMPLEXITY, deadline)?;
+        let reservation = quota.reserve_evaluated(ESTIMATED_COMPLEXITY, deadline)?;
         self.metrics
             .requests
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1189,9 +1189,17 @@ impl LinearGraphQlSource {
         let value = match response.json::<serde_json::Value>() {
             Ok(value) => value,
             Err(error) => {
-                quota.observe_within(reservation, status, &headers, None, deadline)?;
+                let decision = quota.observe_evaluated_within(
+                    reservation,
+                    status,
+                    &headers,
+                    None,
+                    deadline,
+                )?;
                 if status == 429 {
-                    return Err(quota_rate_limit(&quota, deadline)?);
+                    return Err(Error::QuotaAdmissionRefused {
+                        decision: Box::new(decision),
+                    });
                 }
                 return Err(match status_error {
                     Some(status) => Error::Http(status),
@@ -1199,7 +1207,13 @@ impl LinearGraphQlSource {
                 });
             }
         };
-        quota.observe_within(reservation, status, &headers, Some(&value), deadline)?;
+        let decision = quota.observe_evaluated_within(
+            reservation,
+            status,
+            &headers,
+            Some(&value),
+            deadline,
+        )?;
         if status == 429
             || value
                 .get("errors")
@@ -1213,7 +1227,9 @@ impl LinearGraphQlSource {
                     })
                 })
         {
-            return Err(quota_rate_limit(&quota, deadline)?);
+            return Err(Error::QuotaAdmissionRefused {
+                decision: Box::new(decision),
+            });
         }
         let response: GraphQlResponse<T> =
             serde_json::from_value(value).map_err(Error::LinearDecode)?;
@@ -1242,30 +1258,16 @@ impl LinearGraphQlSource {
     }
 }
 
-fn quota_rate_limit(
-    quota: &crate::quota::QuotaGate,
-    deadline: Option<&Deadline<'_>>,
-) -> Result<Error, Error> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |time| {
-            i64::try_from(time.as_millis()).unwrap_or(i64::MAX)
-        });
-    let remaining = quota
-        .status_within(deadline)?
-        .rate_limit_until
-        .unwrap_or_else(|| now.saturating_add(60_000))
-        .saturating_sub(now)
-        .max(0);
-    Ok(Error::LinearRateLimited {
-        retry_after: std::time::Duration::from_secs(
-            u64::try_from(remaining).unwrap_or(u64::MAX).div_ceil(1000),
-        ),
-    })
-}
-
 impl WorkspaceSource for LinearGraphQlSource {
     fn refresh_workspace(
+        &self,
+        baseline: Option<&WorkspaceSnapshot>,
+        deadline: Option<&Deadline<'_>>,
+    ) -> Result<WorkspaceSnapshot, Error> {
+        self.refresh_measured(deadline, baseline)
+            .map_err(Error::legacy_rate_limit)
+    }
+    fn refresh_workspace_evaluated(
         &self,
         baseline: Option<&WorkspaceSnapshot>,
         deadline: Option<&Deadline<'_>>,
@@ -1282,6 +1284,7 @@ impl WorkspaceSource for LinearGraphQlSource {
 
     fn fetch_workspace(&self) -> Result<WorkspaceSnapshot, Error> {
         self.fetch_workspace_within(None)
+            .map_err(Error::legacy_rate_limit)
     }
 
     fn supports_bounded_read(&self) -> bool {
@@ -1290,6 +1293,7 @@ impl WorkspaceSource for LinearGraphQlSource {
 
     fn fetch_workspace_bounded(&self, deadline: &Deadline<'_>) -> Result<WorkspaceSnapshot, Error> {
         self.fetch_workspace_within(Some(deadline))
+            .map_err(Error::legacy_rate_limit)
     }
 
     fn catalog_evidence(&self) -> CatalogEvidence {

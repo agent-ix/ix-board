@@ -48,11 +48,19 @@ reservation exactly once. Missing cost information and unobserved requests keep
 their conservative estimates. Response headers supply actual limits and reset times.
 Local accounting uses a fixed window and generation, independent of rolling server
 reset headers. Late responses cannot refund charges from a newer local window.
+Server observations keep each remaining value with its own expiry and pending charges.
+A reset from another response cannot prolong an older reserve hold. Expired observations
+leave server headroom unknown; the configured local allocation still applies.
 Server rate limits persist across processes; absent retry metadata means a 60-second cooldown.
 No request starts during cooldown, and commands do not sleep or retry.
 
 Run `ix-board cache status --json` to inspect coverage, successful sync and full
 reconciliation times, quota state, and refresh counters without credentials or network access.
+The labeled `decision` evaluates one GraphQL request with a 10,000-unit complexity estimate.
+Its `blockers` distinguish local allocation, locally enforced server reserve, and actual server cooldown.
+Each blocker carries its owning deadline and limiting dimension. `next_reevaluation_at`
+is the earliest transition; another blocker can still prevent admission then.
+Only an actual server cooldown populates an active `rate_limit_until`.
 `latest_refresh` describes the latest recorded attempt. It is null while a refresh
 is running or when a bounded timeout left no time to record a final descriptor.
 Transport reservations remain counted even when a refresh fails or times out.
@@ -60,10 +68,27 @@ Summary and fallback JSON wrap the command payload in `result`, beside freshness
 Fresh detailed commands retain their array or object payload shape. `cache status`
 provides every dataset's provenance, and library callers can inspect `cache_freshness()`.
 Summary and stale envelopes include `last_successful_sync` and `last_full_reconciliation`.
+Library callers can inspect `refresh_outcome()` for cache reuse, refresh success, quota
+refusal, source failure, or lock refusal. Native summary callers obtain the same typed
+metadata through `summary_snapshot_cached_with_outcome()`. The captured quota decision
+belongs to that attempt. Bounded reads retain the decision through this accessor
+while preserving their existing typed errors and strict refusal of stale data. Older envelopes with absent outcome metadata read as unknown.
 
 `IX_BOARD_CACHE_PATH` selects the database path. See [setup](setup.md#cache-location)
 for the default locations. `focus hygiene` also stores its most recent baseline
 in the same file.
+
+Quota migration installs a transactional writer fence. Older clients fail before
+admission with `ix-board quota writer upgrade required; rebuild ix-board clients`.
+Rebuild CLI and library consumers before their next source refresh. Existing detail
+and summary partitions, successful sync markers, and cached reads remain intact.
+
+Reservations already pending when the fence is installed have unknown late-response
+ownership. Status reports their count in `decision.legacy_pending_reservations` and
+refuses new sends with `EvidenceUnavailable`. No recovery deadline or actual server
+cooldown is inferred. An operator must reconcile those obligations before refresh
+can resume; rebuilding alone does not erase them. New-protocol abandoned reservations
+keep their usual conservative charge and do not enter this cutover quarantine.
 
 Library callers use `ReadService::workspace_snapshot` for the cached snapshot,
 `force_refresh_workspace` to fetch through the cache, and `invalidate_cache`
