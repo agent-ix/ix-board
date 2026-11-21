@@ -917,7 +917,7 @@ mod tests {
         assert_eq!(state.rate_limit_until, None);
     }
 
-    #[ix_trace_rs::trace("FR-031-AC-4", "FR-031-AC-5")]
+    #[trace("FR-031-AC-4", "FR-031-AC-5")]
     #[test]
     fn durable_ledger_rejects_replayed_completion_without_another_refund() {
         let directory = tempfile::tempdir().expect("temporary directory");
