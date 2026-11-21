@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::header::HeaderMap;
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -266,6 +266,21 @@ pub struct QuotaStatus {
     pub request_reset_at: i64,
     /// Complexity accounting reset, Unix milliseconds.
     pub complexity_reset_at: i64,
+    /// Fixed local accounting generation, independent of rolling server reset headers.
+    pub local_generation: i64,
+    /// Fixed local accounting window deadline, Unix milliseconds.
+    pub local_window_reset_at: i64,
+}
+
+/// One durable, single-use attempted-request charge. Dropping it keeps the estimate.
+/// Only the gate can construct this token; completion consumes it by value.
+#[derive(Debug)]
+pub struct Reservation {
+    id: i64,
+    generation: i64,
+    estimated_cost: u64,
+    database_identity: String,
+    server_complexity_generation: i64,
 }
 
 /// Shared quota singleton in the snapshot database, independent of snapshot versions.
@@ -357,6 +372,11 @@ impl QuotaGate {
                 ("endpoint_remaining", "INTEGER"),
                 ("endpoint_reset", "INTEGER NOT NULL DEFAULT 0"),
                 ("endpoint_used", "INTEGER NOT NULL DEFAULT 0"),
+                ("database_identity", "TEXT"),
+                ("local_generation", "INTEGER NOT NULL DEFAULT 0"),
+                ("local_reset", "INTEGER"),
+                ("server_complexity_generation", "INTEGER NOT NULL DEFAULT 0"),
+                ("server_complexity_debt", "INTEGER NOT NULL DEFAULT 0"),
             ] {
                 if !names.iter().any(|existing| existing == name) {
                     transaction
@@ -366,6 +386,29 @@ impl QuotaGate {
                         .map_err(Error::Cache)?;
                 }
             }
+            let window = i64::try_from(gate.config.window_seconds)
+                .unwrap_or(i64::MAX / 1000)
+                .saturating_mul(1000);
+            let reset = gate.clock.now_epoch_millis().saturating_add(window);
+            transaction
+                .execute(
+                    "UPDATE linear_shared_quota SET
+                database_identity=COALESCE(database_identity,lower(hex(randomblob(16)))),
+                local_reset=COALESCE(local_reset,CASE WHEN MAX(request_reset,complexity_reset)>0
+                    THEN MAX(request_reset,complexity_reset) ELSE ?1 END) WHERE singleton=1",
+                    [reset],
+                )
+                .map_err(Error::Cache)?;
+            transaction
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS linear_quota_reservations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                generation INTEGER NOT NULL,
+                estimate INTEGER NOT NULL,
+                server_complexity_generation INTEGER NOT NULL
+            );",
+                )
+                .map_err(Error::Cache)?;
             Ok(())
         })?;
         Ok(gate)
@@ -414,13 +457,17 @@ impl QuotaGate {
         let reset = now.saturating_add(window);
         connection.execute(
             "UPDATE linear_shared_quota SET
-                requests = CASE WHEN request_reset <= ?1 THEN 0 ELSE requests END,
-                complexity = CASE WHEN complexity_reset <= ?1 THEN 0 ELSE complexity END,
+                requests = CASE WHEN local_reset <= ?1 THEN 0 ELSE requests END,
+                complexity = CASE WHEN local_reset <= ?1 THEN 0 ELSE complexity END,
                 request_remaining = CASE WHEN request_reset <= ?1 THEN NULL ELSE request_remaining END,
                 complexity_remaining = CASE WHEN complexity_reset <= ?1 THEN NULL ELSE complexity_remaining END,
-                request_budget = CASE WHEN request_reset <= ?1 THEN NULL ELSE request_budget END,
-                complexity_budget = CASE WHEN complexity_reset <= ?1 THEN NULL ELSE complexity_budget END,
-                endpoint_used = CASE WHEN endpoint_reset <= ?1 THEN 0 ELSE endpoint_used END,
+                request_budget = CASE WHEN local_reset <= ?1 THEN NULL ELSE request_budget END,
+                complexity_budget = CASE WHEN local_reset <= ?1 THEN NULL ELSE complexity_budget END,
+                local_generation=local_generation+CASE WHEN local_reset<=?1 THEN 1 ELSE 0 END,
+                local_reset=CASE WHEN local_reset<=?1 THEN ?2 ELSE local_reset END,
+                server_complexity_generation=server_complexity_generation+CASE WHEN complexity_reset<=?1 THEN 1 ELSE 0 END,
+                server_complexity_debt=CASE WHEN complexity_reset<=?1 THEN 0 ELSE server_complexity_debt END,
+                endpoint_used = CASE WHEN local_reset <= ?1 THEN 0 ELSE endpoint_used END,
                 endpoint_remaining = CASE WHEN endpoint_reset <= ?1 THEN NULL ELSE endpoint_remaining END,
                 endpoint_reset = CASE WHEN endpoint_reset <= ?1 THEN ?2 ELSE endpoint_reset END,
                 request_reset = CASE WHEN request_reset <= ?1 THEN ?2 ELSE request_reset END,
@@ -435,8 +482,8 @@ impl QuotaGate {
         let (fallback_requests, fallback_complexity) = self.config.fallback_limits();
         connection
             .query_row(
-                "SELECT cooldown, requests, complexity, request_reset, complexity_reset,
-                    request_limit, complexity_limit, request_budget, complexity_budget
+                "SELECT cooldown, requests, complexity, local_reset, local_reset,
+                    request_limit, complexity_limit, request_budget, complexity_budget,local_generation
              FROM linear_shared_quota WHERE singleton = 1",
                 [],
                 |row| {
@@ -454,6 +501,8 @@ impl QuotaGate {
                         complexity_used: row.get(2)?,
                         request_reset_at: row.get(3)?,
                         complexity_reset_at: row.get(4)?,
+                        local_generation: row.get(9)?,
+                        local_window_reset_at: row.get(3)?,
                         request_budget: row
                             .get::<_, Option<u64>>(7)?
                             .map_or(request_budget, |old| old.min(request_budget)),
@@ -472,7 +521,7 @@ impl QuotaGate {
         &self,
         estimated_cost: u64,
         deadline: Option<&Deadline<'_>>,
-    ) -> Result<(), Error> {
+    ) -> Result<Reservation, Error> {
         let cost = if estimated_cost == 0 {
             UNKNOWN_COMPLEXITY
         } else {
@@ -498,16 +547,28 @@ impl QuotaGate {
             let (fallback_requests, fallback_complexity) = self.config.fallback_limits();
             let request_headroom = self.config.reserved_headroom(request_limit.unwrap_or(fallback_requests));
             let complexity_headroom = self.config.reserved_headroom(complexity_limit.unwrap_or(fallback_complexity));
+            // Server remaining is an authoritative monotonic observation. Keep
+            // speculative reservations separate so completion cannot restore
+            // headroom consumed by another tool or an out-of-order response.
+            let outstanding:u64=transaction.query_row("SELECT
+                COALESCE((SELECT SUM(estimate) FROM linear_quota_reservations WHERE server_complexity_generation=q.server_complexity_generation),0)+server_complexity_debt
+                FROM linear_shared_quota q WHERE singleton=1",[],|row|row.get(0)).map_err(Error::Cache)?;
+            let complexity_remaining=complexity_remaining.map(|left|left.saturating_sub(outstanding));
             let mut exhausted_until = 0;
-            if state.requests_used >= state.request_budget
-                || request_remaining.is_some_and(|left| left < 1 + request_headroom)
-            {
+            if state.requests_used >= state.request_budget {
                 exhausted_until = state.request_reset_at;
             }
-            if state.complexity_used.saturating_add(cost) > state.complexity_budget
-                || complexity_remaining.is_some_and(|left| left < cost.saturating_add(complexity_headroom))
-            {
+            if state.complexity_used.saturating_add(cost) > state.complexity_budget {
                 exhausted_until = exhausted_until.max(state.complexity_reset_at);
+            }
+            let (server_request_reset,server_complexity_reset): (i64,i64) = transaction.query_row(
+                "SELECT request_reset,complexity_reset FROM linear_shared_quota WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?))
+            ).map_err(Error::Cache)?;
+            if request_remaining.is_some_and(|left|left<1+request_headroom) {
+                exhausted_until=exhausted_until.max(server_request_reset);
+            }
+            if complexity_remaining.is_some_and(|left|left<cost.saturating_add(complexity_headroom)) {
+                exhausted_until=exhausted_until.max(server_complexity_reset);
             }
             exhausted_until = exhausted_until.max(endpoint_until);
             let (endpoint_limit, endpoint_remaining, endpoint_reset, endpoint_used): (Option<u64>, Option<u64>, i64, u64) = transaction.query_row(
@@ -515,9 +576,10 @@ impl QuotaGate {
                 [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             ).map_err(Error::Cache)?;
             let endpoint_headroom = endpoint_limit.map_or(0, |limit| self.config.reserved_headroom(limit));
-            if endpoint_limit.is_some_and(|limit| endpoint_used >= self.config.allocate(limit))
-                || endpoint_remaining.is_some_and(|left| left < 1 + endpoint_headroom)
-            {
+            if endpoint_limit.is_some_and(|limit| endpoint_used >= self.config.allocate(limit)) {
+                exhausted_until=exhausted_until.max(state.local_window_reset_at);
+            }
+            if endpoint_remaining.is_some_and(|left| left < 1 + endpoint_headroom) {
                 exhausted_until = exhausted_until.max(endpoint_reset);
             }
             if exhausted_until > now {
@@ -526,13 +588,16 @@ impl QuotaGate {
             transaction.execute(
                 "UPDATE linear_shared_quota SET requests=requests+1, complexity=complexity+?1,
                  request_remaining=MAX(0,request_remaining-1),
-                 complexity_remaining=MAX(0,complexity_remaining-?1),
                  endpoint_remaining=MAX(0,endpoint_remaining-1),
                  endpoint_used=endpoint_used+1,
                  request_budget=?2, complexity_budget=?3 WHERE singleton=1",
                 params![cost, state.request_budget, state.complexity_budget],
             ).map_err(Error::Cache)?;
-            Ok(())
+            transaction.execute("INSERT INTO linear_quota_reservations(generation,estimate,server_complexity_generation)
+                SELECT local_generation,?1,server_complexity_generation FROM linear_shared_quota WHERE singleton=1",[cost]).map_err(Error::Cache)?;
+            let database_identity = transaction.query_row("SELECT database_identity FROM linear_shared_quota WHERE singleton=1",[],|row|row.get(0)).map_err(Error::Cache)?;
+            let server_complexity_generation = transaction.query_row("SELECT server_complexity_generation FROM linear_shared_quota WHERE singleton=1",[],|row|row.get(0)).map_err(Error::Cache)?;
+            Ok(Reservation { id:transaction.last_insert_rowid(),generation:state.local_generation,estimated_cost:cost,database_identity,server_complexity_generation })
         })
     }
 
@@ -540,26 +605,61 @@ impl QuotaGate {
     /// `graphql` is the complete decoded response, including its open error metadata.
     pub fn observe(
         &self,
+        reservation: Reservation,
         status: u16,
         headers: &HeaderMap,
         graphql: Option<&Value>,
-        estimated_cost: u64,
     ) -> Result<(), Error> {
-        self.observe_within(status, headers, graphql, estimated_cost, None)
+        self.observe_within(reservation, status, headers, graphql, None)
     }
 
     /// Observes a response with SQLite waits under the same operation deadline.
     pub fn observe_within(
         &self,
+        reservation: Reservation,
         status: u16,
         headers: &HeaderMap,
         graphql: Option<&Value>,
-        estimated_cost: u64,
+        deadline: Option<&Deadline<'_>>,
+    ) -> Result<(), Error> {
+        self.observe_response(Some(reservation), status, headers, graphql, deadline)
+    }
+
+    /// Records server metadata without fabricating an attempted-request charge.
+    pub fn observe_headers(
+        &self,
+        status: u16,
+        headers: &HeaderMap,
+        graphql: Option<&Value>,
+    ) -> Result<(), Error> {
+        self.observe_response(None, status, headers, graphql, None)
+    }
+
+    /// Records metadata with SQLite waits bounded by the caller's operation.
+    pub fn observe_headers_within(
+        &self,
+        status: u16,
+        headers: &HeaderMap,
+        graphql: Option<&Value>,
+        deadline: Option<&Deadline<'_>>,
+    ) -> Result<(), Error> {
+        self.observe_response(None, status, headers, graphql, deadline)
+    }
+
+    fn observe_response(
+        &self,
+        reservation: Option<Reservation>,
+        status: u16,
+        headers: &HeaderMap,
+        graphql: Option<&Value>,
         deadline: Option<&Deadline<'_>>,
     ) -> Result<(), Error> {
         self.transaction(deadline, |transaction| {
             let now = self.clock.now_epoch_millis();
             self.advance(transaction, now)?;
+            if let Some(reservation)=reservation {
+                self.settle(transaction,reservation,header_integer(headers,"x-complexity"),header_integer(headers,"x-ratelimit-complexity-remaining").is_some())?;
+            }
             for (kind, limit_column, remaining_column, reset_column) in [
                 ("requests", "request_limit", "request_remaining", "request_reset"),
                 ("complexity", "complexity_limit", "complexity_remaining", "complexity_reset"),
@@ -576,13 +676,9 @@ impl QuotaGate {
                 let sql = format!("UPDATE linear_shared_quota SET {limit_column}=COALESCE(?1,{limit_column}),
                     {remaining_column}=CASE WHEN ?2 IS NULL THEN {remaining_column}
                     WHEN {remaining_column} IS NULL THEN ?2 ELSE MIN({remaining_column},?2) END,
-                    {reset_column}=COALESCE(?3,{reset_column}) WHERE singleton=1");
+                    {reset_column}=CASE WHEN ?3 IS NULL THEN {reset_column}
+                        WHEN {remaining_column} IS NULL THEN ?3 ELSE MAX({reset_column},?3) END WHERE singleton=1");
                 transaction.execute(&sql, params![limit, remaining, reset]).map_err(Error::Cache)?;
-            }
-            let estimate = if estimated_cost == 0 { UNKNOWN_COMPLEXITY } else { estimated_cost };
-            if let Some(actual) = header_integer(headers, "x-complexity") {
-                let additional = actual.saturating_sub(estimate);
-                transaction.execute("UPDATE linear_shared_quota SET complexity=complexity+?1 WHERE singleton=1", params![additional]).map_err(Error::Cache)?;
             }
             let mut exhausted_reset = 0;
             for kind in ["requests", "complexity", "endpoint-requests"] {
@@ -607,6 +703,64 @@ impl QuotaGate {
             }
             Ok(())
         })
+    }
+
+    fn settle(
+        &self,
+        transaction: &rusqlite::Transaction<'_>,
+        reservation: Reservation,
+        actual: Option<u64>,
+        has_remaining: bool,
+    ) -> Result<(), Error> {
+        let (identity,local_generation,server_generation):(String,i64,i64)=transaction.query_row(
+            "SELECT database_identity,local_generation,server_complexity_generation FROM linear_shared_quota WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))
+        ).map_err(Error::Cache)?;
+        if identity != reservation.database_identity {
+            return Err(Error::InvalidQuotaReservation {
+                reason: "reservation belongs to a different quota database",
+            });
+        }
+        let stored:Option<(i64,u64,i64)>=transaction.query_row(
+            "SELECT generation,estimate,server_complexity_generation FROM linear_quota_reservations WHERE id=?1",[reservation.id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))
+        ).optional().map_err(Error::Cache)?;
+        if stored
+            != Some((
+                reservation.generation,
+                reservation.estimated_cost,
+                reservation.server_complexity_generation,
+            ))
+        {
+            return Err(Error::InvalidQuotaReservation {
+                reason: "reservation is absent, already observed, or inconsistent",
+            });
+        }
+        let actual = actual.unwrap_or(reservation.estimated_cost);
+        let delta = i64::try_from(actual).map_err(|_| Error::InvalidQuotaReservation {
+            reason: "actual complexity exceeds persistent accounting range",
+        })? - i64::try_from(reservation.estimated_cost).map_err(|_| {
+            Error::InvalidQuotaReservation {
+                reason: "reserved complexity exceeds persistent accounting range",
+            }
+        })?;
+        if local_generation == reservation.generation {
+            let changed=transaction.execute("UPDATE linear_shared_quota SET complexity=complexity+?1 WHERE singleton=1 AND complexity>=?2",
+                params![delta,reservation.estimated_cost]).map_err(Error::Cache)?;
+            if changed != 1 {
+                return Err(Error::InvalidQuotaReservation {
+                    reason: "reserved complexity is missing from its accounting window",
+                });
+            }
+        }
+        if server_generation == reservation.server_complexity_generation && !has_remaining {
+            transaction.execute("UPDATE linear_shared_quota SET server_complexity_debt=server_complexity_debt+?1 WHERE singleton=1",[actual]).map_err(Error::Cache)?;
+        }
+        transaction
+            .execute(
+                "DELETE FROM linear_quota_reservations WHERE id=?1",
+                [reservation.id],
+            )
+            .map_err(Error::Cache)?;
+        Ok(())
     }
 
     /// Returns accounting state without sending a request or reading credentials.
@@ -747,7 +901,7 @@ mod tests {
             Err(Error::ReadTimeout { .. })
         ));
         assert!(matches!(
-            gate.observe_within(429, &HeaderMap::new(), None, 10, Some(&deadline)),
+            gate.observe_headers_within(429, &HeaderMap::new(), None, Some(&deadline)),
             Err(Error::ReadTimeout { .. })
         ));
         assert!(matches!(
@@ -761,5 +915,38 @@ mod tests {
         let state = gate.status().expect("unbounded status");
         assert_eq!(state.requests_used, 0);
         assert_eq!(state.rate_limit_until, None);
+    }
+
+    #[trace("FR-031-AC-4", "FR-031-AC-5")]
+    #[test]
+    fn durable_ledger_rejects_replayed_completion_without_another_refund() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let gate = QuotaGate::open(
+            &directory.path().join("quota.sqlite"),
+            &QuotaConfig::default(),
+        )
+        .expect("quota");
+        let original = gate.reserve(10_000, None).expect("reservation");
+        // Simulate a duplicate completion at the storage boundary. The public
+        // token deliberately provides neither Clone nor a caller constructor.
+        let replay = Reservation {
+            id: original.id,
+            generation: original.generation,
+            estimated_cost: original.estimated_cost,
+            database_identity: original.database_identity.clone(),
+            server_complexity_generation: original.server_complexity_generation,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("x-complexity", "100".parse().expect("cost header"));
+        gate.observe(original, 200, &headers, None)
+            .expect("first settlement");
+        assert!(matches!(
+            gate.observe(replay, 200, &headers, None),
+            Err(Error::InvalidQuotaReservation { .. })
+        ));
+        assert_eq!(
+            gate.status().expect("one actual charge").complexity_used,
+            100
+        );
     }
 }
