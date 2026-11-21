@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::read_bound::Budget;
-use crate::{Error, IssueId, ProjectId, TeamKey, WorkflowStateType, WorkspaceSnapshot};
+use crate::{Error, IssueId, Project, ProjectId, TeamKey, WorkflowStateType, WorkspaceSnapshot};
 
 /// Explicit assignment selectors, combined as a union within an optional team boundary.
 #[derive(Clone, Debug, Default)]
@@ -57,17 +57,28 @@ pub(crate) fn resolve_initiative_id(
     snapshot: &WorkspaceSnapshot,
     value: &str,
 ) -> Result<String, Error> {
-    let ids = snapshot
-        .projects
-        .iter()
-        .flat_map(|project| &project.initiatives)
-        .filter(|initiative| {
-            initiative.id == value
+    resolve_initiative_id_within(snapshot, value, Budget::unbounded())
+}
+
+/// [`resolve_initiative_id`] that stops with [`Error::ReadTimeout`] once `budget` has expired.
+pub(crate) fn resolve_initiative_id_within(
+    snapshot: &WorkspaceSnapshot,
+    value: &str,
+    budget: Budget<'_>,
+) -> Result<String, Error> {
+    let mut ids = BTreeSet::new();
+    for project in &snapshot.projects {
+        budget.check()?;
+        for initiative in &project.initiatives {
+            budget.check()?;
+            if initiative.id == value
                 || initiative.identifier.eq_ignore_ascii_case(value)
                 || initiative.name.eq_ignore_ascii_case(value)
-        })
-        .map(|initiative| initiative.id.clone())
-        .collect::<BTreeSet<_>>();
+            {
+                ids.insert(initiative.id.clone());
+            }
+        }
+    }
     unique("initiative", value, ids.into_iter().collect())
 }
 
@@ -76,30 +87,38 @@ pub(crate) fn resolve_project_id(
     snapshot: &WorkspaceSnapshot,
     value: &str,
 ) -> Result<ProjectId, Error> {
-    let exact = snapshot
-        .projects
-        .iter()
-        .filter(|p| {
-            p.id.0.eq_ignore_ascii_case(value)
-                || p.identifier
-                    .as_deref()
-                    .is_some_and(|id| id.eq_ignore_ascii_case(value))
-        })
-        .map(|p| p.id.clone())
-        .collect::<Vec<_>>();
+    resolve_project_id_within(snapshot, value, Budget::unbounded())
+}
+
+/// [`resolve_project_id`] that stops with [`Error::ReadTimeout`] once `budget` has expired.
+pub(crate) fn resolve_project_id_within(
+    snapshot: &WorkspaceSnapshot,
+    value: &str,
+    budget: Budget<'_>,
+) -> Result<ProjectId, Error> {
+    let mut exact = Vec::new();
+    for project in &snapshot.projects {
+        budget.check()?;
+        if project.id.0.eq_ignore_ascii_case(value)
+            || project
+                .identifier
+                .as_deref()
+                .is_some_and(|id| id.eq_ignore_ascii_case(value))
+        {
+            exact.push(project.id.clone());
+        }
+    }
     if !exact.is_empty() {
         return unique("project", value, exact);
     }
-    unique(
-        "project",
-        value,
-        snapshot
-            .projects
-            .iter()
-            .filter(|p| p.name.eq_ignore_ascii_case(value))
-            .map(|p| p.id.clone())
-            .collect(),
-    )
+    let mut named = Vec::new();
+    for project in &snapshot.projects {
+        budget.check()?;
+        if project.name.eq_ignore_ascii_case(value) {
+            named.push(project.id.clone());
+        }
+    }
+    unique("project", value, named)
 }
 
 /// Resolve a UUID, globally unique name, or project-qualified name.
@@ -116,19 +135,31 @@ pub(crate) fn resolve_milestone_id_in_projects(
     value: &str,
     allowed_projects: Option<&BTreeSet<ProjectId>>,
 ) -> Result<String, Error> {
-    let projects = snapshot
-        .projects
-        .iter()
-        .filter(|p| allowed_projects.is_none_or(|ids| ids.contains(&p.id)))
-        .collect::<Vec<_>>();
-    let exact = snapshot
-        .projects
-        .iter()
-        .filter(|p| allowed_projects.is_none_or(|ids| ids.contains(&p.id)))
-        .flat_map(|p| &p.milestones)
-        .filter(|m| m.id.eq_ignore_ascii_case(value))
-        .map(|m| m.id.clone())
-        .collect::<BTreeSet<_>>();
+    resolve_milestone_id_within(snapshot, value, allowed_projects, Budget::unbounded())
+}
+
+/// [`resolve_milestone_id_in_projects`] that stops with [`Error::ReadTimeout`] once
+/// `budget` has expired.
+pub(crate) fn resolve_milestone_id_within(
+    snapshot: &WorkspaceSnapshot,
+    value: &str,
+    allowed_projects: Option<&BTreeSet<ProjectId>>,
+    budget: Budget<'_>,
+) -> Result<String, Error> {
+    let mut projects = Vec::new();
+    let mut exact = BTreeSet::new();
+    for project in &snapshot.projects {
+        budget.check()?;
+        if allowed_projects.is_none_or(|ids| ids.contains(&project.id)) {
+            projects.push(project);
+            for milestone in &project.milestones {
+                budget.check()?;
+                if milestone.id.eq_ignore_ascii_case(value) {
+                    exact.insert(milestone.id.clone());
+                }
+            }
+        }
+    }
     if !exact.is_empty() {
         return unique("milestone", value, exact.into_iter().collect());
     }
@@ -136,17 +167,8 @@ pub(crate) fn resolve_milestone_id_in_projects(
     // A slash may belong to either name. Consider the whole name and every
     // split point; deduplicate by canonical milestone ID.
     for project in &projects {
-        for milestone in &project.milestones {
-            if milestone.name.eq_ignore_ascii_case(value.trim()) {
-                names.insert(
-                    milestone.id.clone(),
-                    format!(
-                        "{} ({}) / {} ({})",
-                        project.name, project.id.0, milestone.name, milestone.id
-                    ),
-                );
-            }
-        }
+        budget.check()?;
+        collect_named_milestones(&mut names, project, value.trim(), budget)?;
     }
     for (index, character) in value.char_indices() {
         if character != '/' {
@@ -154,37 +176,30 @@ pub(crate) fn resolve_milestone_id_in_projects(
         }
         let prefix = value[..index].trim();
         let suffix = value[index + 1..].trim();
-        let by_identifier = projects
-            .iter()
-            .filter(|p| {
-                p.id.0.eq_ignore_ascii_case(prefix)
-                    || p.identifier
-                        .as_deref()
-                        .is_some_and(|id| id.eq_ignore_ascii_case(prefix))
-            })
-            .copied()
-            .collect::<Vec<_>>();
+        let mut by_identifier = Vec::new();
+        let mut by_name = Vec::new();
+        for project in &projects {
+            budget.check()?;
+            if project.id.0.eq_ignore_ascii_case(prefix)
+                || project
+                    .identifier
+                    .as_deref()
+                    .is_some_and(|id| id.eq_ignore_ascii_case(prefix))
+            {
+                by_identifier.push(*project);
+            }
+            if project.name.eq_ignore_ascii_case(prefix) {
+                by_name.push(*project);
+            }
+        }
         let matches = if by_identifier.is_empty() {
-            projects
-                .iter()
-                .filter(|p| p.name.eq_ignore_ascii_case(prefix))
-                .copied()
-                .collect::<Vec<_>>()
+            by_name
         } else {
             by_identifier
         };
         for project in matches {
-            for milestone in &project.milestones {
-                if milestone.name.eq_ignore_ascii_case(suffix) {
-                    names.insert(
-                        milestone.id.clone(),
-                        format!(
-                            "{} ({}) / {} ({})",
-                            project.name, project.id.0, milestone.name, milestone.id
-                        ),
-                    );
-                }
-            }
+            budget.check()?;
+            collect_named_milestones(&mut names, project, suffix, budget)?;
         }
     }
     match names.len() {
@@ -208,22 +223,50 @@ pub(crate) fn resolve_milestone_id_in_projects(
     }
 }
 
+/// Records, by milestone ID, each milestone of `project` named `wanted`, with the label
+/// used to list an ambiguous selector's candidates. Checks `budget` for every milestone.
+fn collect_named_milestones(
+    names: &mut BTreeMap<String, String>,
+    project: &Project,
+    wanted: &str,
+    budget: Budget<'_>,
+) -> Result<(), Error> {
+    for milestone in &project.milestones {
+        budget.check()?;
+        if milestone.name.eq_ignore_ascii_case(wanted) {
+            names.insert(
+                milestone.id.clone(),
+                format!(
+                    "{} ({}) / {} ({})",
+                    project.name, project.id.0, milestone.name, milestone.id
+                ),
+            );
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn resolve_ticket_id(
     snapshot: &WorkspaceSnapshot,
     value: &str,
 ) -> Result<IssueId, Error> {
-    unique(
-        "ticket",
-        value,
-        snapshot
-            .issues
-            .iter()
-            .filter(|i| {
-                i.id.0.eq_ignore_ascii_case(value) || i.identifier.eq_ignore_ascii_case(value)
-            })
-            .map(|i| i.id.clone())
-            .collect(),
-    )
+    resolve_ticket_id_within(snapshot, value, Budget::unbounded())
+}
+
+/// [`resolve_ticket_id`] that stops with [`Error::ReadTimeout`] once `budget` has expired.
+pub(crate) fn resolve_ticket_id_within(
+    snapshot: &WorkspaceSnapshot,
+    value: &str,
+    budget: Budget<'_>,
+) -> Result<IssueId, Error> {
+    let mut matches = Vec::new();
+    for issue in &snapshot.issues {
+        budget.check()?;
+        if issue.id.0.eq_ignore_ascii_case(value) || issue.identifier.eq_ignore_ascii_case(value) {
+            matches.push(issue.id.clone());
+        }
+    }
+    unique("ticket", value, matches)
 }
 
 /// Resolves explicit selectors and counts each executable leaf task once.

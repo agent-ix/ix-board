@@ -7,10 +7,12 @@
 //! snapshot on every evaluation (see [`crate::evaluate_named_batch`]).
 
 use std::collections::BTreeSet;
+use std::convert::Infallible;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::read_bound::Budget;
 use crate::{Error, MemberOutcome, TeamKey, WorkspaceSnapshot, scope};
 
 /// The only schema version the named-selection decoder reads.
@@ -124,12 +126,27 @@ impl NamedSelection {
     }
 }
 
+/// The one canonical ordering: sorted by kind, then ID (a milestone's project breaks ties),
+/// without duplicates. `check` runs once for every member before it is ordered, and its
+/// error stops the ordering, so a bounded caller supplies its budget and a caller with no
+/// bound supplies a check that cannot fail.
+fn canonical_list_with<E>(
+    members: Vec<NamedMember>,
+    mut check: impl FnMut() -> Result<(), E>,
+) -> Result<Vec<NamedMember>, E> {
+    let mut ordered = BTreeSet::new();
+    for member in members {
+        check()?;
+        ordered.insert(member);
+    }
+    Ok(ordered.into_iter().collect())
+}
+
+/// [`canonical_list_with`] with no bound. Its check can never fail, and the error type
+/// [`Infallible`] shows that: there is nothing to handle or discard.
 fn canonical_list(members: Vec<NamedMember>) -> Vec<NamedMember> {
-    members
-        .into_iter()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
+    let Ok(ordered) = canonical_list_with(members, || Ok::<(), Infallible>(()));
+    ordered
 }
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -227,20 +244,30 @@ pub struct NamedSelectionInput {
 /// ambiguous, a ticket of another team, a project or initiative holding none of the
 /// team's work, or a milestone owned by another project fails the whole call with no
 /// partial document.
+///
+/// This standalone form has no deadline. A caller that must bound the cache lookup, the
+/// source read and this resolution together uses
+/// [`ReadService::canonicalize_named_selection_bounded`](crate::ReadService::canonicalize_named_selection_bounded).
 pub fn canonicalize_named_selection(
     snapshot: &WorkspaceSnapshot,
     input: &NamedSelectionInput,
+) -> Result<NamedSelection, Error> {
+    canonicalize_within(snapshot, input, Budget::unbounded())
+}
+
+/// [`canonicalize_named_selection`] under a budget shared with the read that produced
+/// `snapshot`. Every scan, and the final ordering of each member list, checks the same
+/// budget and stops with [`Error::ReadTimeout`] once it has expired.
+pub(crate) fn canonicalize_within(
+    snapshot: &WorkspaceSnapshot,
+    input: &NamedSelectionInput,
+    budget: Budget<'_>,
 ) -> Result<NamedSelection, Error> {
     if input.team.trim().is_empty() {
         return Err(Error::InvalidTeam);
     }
     let team = TeamKey(input.team.clone());
-    let known = snapshot.issues.iter().any(|issue| issue.team_key == team)
-        || snapshot
-            .projects
-            .iter()
-            .any(|project| project.team_keys.contains(&team));
-    if !known {
+    if !team_is_known(snapshot, &team, budget)? {
         return Err(Error::ScopeSelection {
             kind: "team",
             identifier: input.team.clone(),
@@ -250,28 +277,71 @@ pub fn canonicalize_named_selection(
     let resolve = |members: &[NamedMemberInput]| {
         members
             .iter()
-            .map(|member| canonical_member(snapshot, &team, member))
+            .map(|member| canonical_member(snapshot, &team, member, budget))
             .collect::<Result<Vec<_>, _>>()
     };
-    Ok(NamedSelection::new(
-        team.clone(),
-        resolve(&input.include)?,
-        resolve(&input.exclude)?,
-    ))
+    let include = resolve(&input.include)?;
+    let exclude = resolve(&input.exclude)?;
+    Ok(NamedSelection {
+        schema_version: NAMED_SELECTION_SCHEMA_VERSION,
+        team: team.clone(),
+        include: canonical_list_within(include, budget)?,
+        exclude: canonical_list_within(exclude, budget)?,
+    })
 }
 
-fn holds_team_work(snapshot: &WorkspaceSnapshot, project_id: &str, team: &TeamKey) -> bool {
-    snapshot
-        .projects
-        .iter()
-        .any(|project| project.id.0 == project_id && project.team_keys.contains(team))
-        || snapshot.issues.iter().any(|issue| {
-            issue.team_key == *team
-                && issue
-                    .project_id
-                    .as_ref()
-                    .is_some_and(|id| id.0 == project_id)
-        })
+/// [`canonical_list`] that checks `budget` for every member it orders.
+fn canonical_list_within(
+    members: Vec<NamedMember>,
+    budget: Budget<'_>,
+) -> Result<Vec<NamedMember>, Error> {
+    canonical_list_with(members, || budget.check())
+}
+
+fn team_is_known(
+    snapshot: &WorkspaceSnapshot,
+    team: &TeamKey,
+    budget: Budget<'_>,
+) -> Result<bool, Error> {
+    for issue in &snapshot.issues {
+        budget.check()?;
+        if issue.team_key == *team {
+            return Ok(true);
+        }
+    }
+    for project in &snapshot.projects {
+        budget.check()?;
+        if budget.contains(&project.team_keys, team)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn holds_team_work(
+    snapshot: &WorkspaceSnapshot,
+    project_id: &str,
+    team: &TeamKey,
+    budget: Budget<'_>,
+) -> Result<bool, Error> {
+    for project in &snapshot.projects {
+        budget.check()?;
+        if project.id.0 == project_id && budget.contains(&project.team_keys, team)? {
+            return Ok(true);
+        }
+    }
+    for issue in &snapshot.issues {
+        budget.check()?;
+        if issue.team_key == *team
+            && issue
+                .project_id
+                .as_ref()
+                .is_some_and(|id| id.0 == project_id)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn rejected(kind: &'static str, identifier: &str, outcome: MemberOutcome) -> Error {
@@ -286,46 +356,58 @@ fn canonical_member(
     snapshot: &WorkspaceSnapshot,
     team: &TeamKey,
     member: &NamedMemberInput,
+    budget: Budget<'_>,
 ) -> Result<NamedMember, Error> {
+    budget.check()?;
     match member {
         NamedMemberInput::Initiative(value) => {
-            let id = scope::resolve_initiative_id(snapshot, value)?;
-            let holds = snapshot
-                .projects
-                .iter()
-                .filter(|project| project.initiatives.iter().any(|i| i.id == id))
-                .any(|project| holds_team_work(snapshot, &project.id.0, team));
+            let id = scope::resolve_initiative_id_within(snapshot, value, budget)?;
+            let mut holds = false;
+            for project in &snapshot.projects {
+                budget.check()?;
+                if budget.any(&project.initiatives, |i| i.id == id)?
+                    && holds_team_work(snapshot, &project.id.0, team, budget)?
+                {
+                    holds = true;
+                    break;
+                }
+            }
             if !holds {
                 return Err(rejected("initiative", value, MemberOutcome::WrongTeam));
             }
             Ok(NamedMember::Initiative { id })
         }
         NamedMemberInput::Project(value) => {
-            let id = scope::resolve_project_id(snapshot, value)?.0;
-            if !holds_team_work(snapshot, &id, team) {
+            let id = scope::resolve_project_id_within(snapshot, value, budget)?.0;
+            if !holds_team_work(snapshot, &id, team, budget)? {
                 return Err(rejected("project", value, MemberOutcome::WrongTeam));
             }
             Ok(NamedMember::Project { id })
         }
         NamedMemberInput::Ticket(value) => {
-            let id = scope::resolve_ticket_id(snapshot, value)?;
-            let in_team = snapshot
-                .issues
-                .iter()
-                .any(|issue| issue.id == id && issue.team_key == *team);
+            let id = scope::resolve_ticket_id_within(snapshot, value, budget)?;
+            let mut in_team = false;
+            for issue in &snapshot.issues {
+                budget.check()?;
+                if issue.id == id && issue.team_key == *team {
+                    in_team = true;
+                    break;
+                }
+            }
             if !in_team {
                 return Err(rejected("issue", value, MemberOutcome::WrongTeam));
             }
             Ok(NamedMember::Issue { id: id.0 })
         }
         NamedMemberInput::Milestone { selector, project } => {
-            let id = scope::resolve_milestone_id(snapshot, selector)?;
-            let owners = snapshot
-                .projects
-                .iter()
-                .filter(|project| project.milestones.iter().any(|m| m.id == id))
-                .map(|project| project.id.0.clone())
-                .collect::<Vec<_>>();
+            let id = scope::resolve_milestone_id_within(snapshot, selector, None, budget)?;
+            let mut owners = Vec::new();
+            for candidate in &snapshot.projects {
+                budget.check()?;
+                if budget.any(&candidate.milestones, |m| m.id == id)? {
+                    owners.push(candidate.id.0.clone());
+                }
+            }
             let [owner] = owners.as_slice() else {
                 return Err(Error::ScopeSelection {
                     kind: "milestone",
@@ -334,7 +416,7 @@ fn canonical_member(
                 });
             };
             if let Some(claimed) = project
-                && scope::resolve_project_id(snapshot, claimed)?.0 != *owner
+                && scope::resolve_project_id_within(snapshot, claimed, budget)?.0 != *owner
             {
                 return Err(rejected(
                     "milestone",
@@ -342,7 +424,7 @@ fn canonical_member(
                     MemberOutcome::ProjectMismatch,
                 ));
             }
-            if !holds_team_work(snapshot, owner, team) {
+            if !holds_team_work(snapshot, owner, team, budget)? {
                 return Err(rejected("milestone", selector, MemberOutcome::WrongTeam));
             }
             Ok(NamedMember::Milestone {
@@ -350,5 +432,136 @@ fn canonical_member(
                 project_id: owner.clone(),
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::{Duration, Instant};
+
+    use ix_trace_rs::trace;
+
+    use super::*;
+    use crate::Clock;
+    use crate::read_bound::Deadline;
+
+    fn initiative(id: &str) -> NamedMember {
+        NamedMember::Initiative { id: id.into() }
+    }
+
+    fn project(id: &str) -> NamedMember {
+        NamedMember::Project { id: id.into() }
+    }
+
+    fn milestone(id: &str, project_id: &str) -> NamedMember {
+        NamedMember::Milestone {
+            id: id.into(),
+            project_id: project_id.into(),
+        }
+    }
+
+    fn issue(id: &str) -> NamedMember {
+        NamedMember::Issue { id: id.into() }
+    }
+
+    /// Every kind, out of order, with duplicates and two milestones sharing one ID.
+    fn mixed() -> Vec<NamedMember> {
+        vec![
+            issue("t2"),
+            milestone("m2", "p1"),
+            project("p2"),
+            initiative("i2"),
+            milestone("m1", "p2"),
+            issue("t1"),
+            milestone("m1", "p1"),
+            project("p1"),
+            initiative("i1"),
+            milestone("m1", "p2"),
+            issue("t2"),
+            initiative("i1"),
+            project("p1"),
+        ]
+    }
+
+    fn canonical_mixed() -> Vec<NamedMember> {
+        vec![
+            initiative("i1"),
+            initiative("i2"),
+            project("p1"),
+            project("p2"),
+            milestone("m1", "p1"),
+            milestone("m1", "p2"),
+            milestone("m2", "p1"),
+            issue("t1"),
+            issue("t2"),
+        ]
+    }
+
+    #[trace("FR-016-AC-6", "FR-016-AC-11")]
+    #[test]
+    fn the_bounded_and_unbounded_orderings_are_one_rule_for_every_kind() {
+        let mut reversed = mixed();
+        reversed.reverse();
+        let lists = [
+            Vec::new(),
+            vec![project("p1"), project("p1")],
+            vec![milestone("m1", "p2"), milestone("m1", "p1")],
+            mixed(),
+            reversed,
+        ];
+        for list in lists {
+            let unbounded = canonical_list(list.clone());
+            assert_eq!(
+                canonical_list_within(list.clone(), Budget::unbounded()).expect("no bound"),
+                unbounded
+            );
+            let built = NamedSelection::new(TeamKey("SWM".into()), list.clone(), list);
+            assert_eq!(built.include, unbounded);
+            assert_eq!(built.exclude, unbounded);
+        }
+        assert_eq!(canonical_list(mixed()), canonical_mixed());
+        assert!(canonical_list(Vec::new()).is_empty());
+    }
+
+    /// A clock that moves one second on every reading, so each budget check costs one.
+    struct StepClock {
+        base: Instant,
+        reads: AtomicU32,
+    }
+
+    impl Clock for StepClock {
+        fn now_epoch_seconds(&self) -> i64 {
+            0
+        }
+
+        fn monotonic_now(&self) -> Instant {
+            let reads = self.reads.fetch_add(1, Ordering::SeqCst);
+            self.base + Duration::from_secs(1) * reads
+        }
+    }
+
+    #[trace("FR-004-AC-14", "FR-016-AC-11")]
+    #[test]
+    fn the_shared_ordering_checks_the_budget_for_every_member_it_orders() {
+        let clock = StepClock {
+            base: Instant::now(),
+            reads: AtomicU32::new(0),
+        };
+        let deadline = Deadline::start(&clock, Duration::from_secs(5));
+        assert!(matches!(
+            canonical_list_within(mixed(), Budget::within(&deadline)),
+            Err(Error::ReadTimeout { .. })
+        ));
+
+        let clock = StepClock {
+            base: Instant::now(),
+            reads: AtomicU32::new(0),
+        };
+        let deadline = Deadline::start(&clock, Duration::from_secs(1_000));
+        assert_eq!(
+            canonical_list_within(mixed(), Budget::within(&deadline)).expect("time to spare"),
+            canonical_mixed()
+        );
     }
 }
