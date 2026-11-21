@@ -4,8 +4,8 @@
 //! Emit the JSON Schema of an ix-board public wire type for downstream generation.
 
 use ix_board::{
-    DriftReport, FocusHygieneReport, FocusPlanChunk, FocusRecord, FocusStatus, Project,
-    ProjectChunk, ReadyItem,
+    DriftReport, FocusHygieneReport, FocusPlanChunk, FocusRecord, FocusStatus, NamedBatch,
+    NamedSelection, Project, ProjectChunk, ReadyItem,
 };
 
 fn main() {
@@ -19,11 +19,13 @@ fn main() {
         "DriftReport" => schemars::schema_for!(DriftReport),
         "FocusStatus" => schemars::schema_for!(FocusStatus),
         "FocusRecord" => schemars::schema_for!(FocusRecord),
+        "NamedSelection" => schemars::schema_for!(NamedSelection),
+        "NamedBatch" => schemars::schema_for!(NamedBatch),
         "FocusHygieneReport" => schemars::schema_for!(FocusHygieneReport),
         "FocusPlanChunk" => schemars::schema_for!(FocusPlanChunk),
         _ => {
             eprintln!(
-                "usage: cargo run --example export_schema -- <Project|ProjectChunk|ReadyItem|DriftReport|FocusStatus|FocusRecord|FocusHygieneReport|FocusPlanChunk|AgentsReport|ProbeResponse>"
+                "usage: cargo run --example export_schema -- <Project|ProjectChunk|ReadyItem|DriftReport|FocusStatus|FocusRecord|NamedSelection|NamedBatch|FocusHygieneReport|FocusPlanChunk|AgentsReport|ProbeResponse>"
             );
             std::process::exit(2);
         }
