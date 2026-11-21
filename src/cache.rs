@@ -10,7 +10,7 @@ use crate::{
 };
 use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// Cache lifetime required by FR-004.
@@ -49,6 +49,8 @@ impl Clock for SystemClock {
 pub(crate) struct SnapshotCache {
     connection: Connection,
     cache_key: String,
+    path: PathBuf,
+    ttl: i64,
 }
 
 impl SnapshotCache {
@@ -76,6 +78,8 @@ impl SnapshotCache {
         Ok(Self {
             connection,
             cache_key: cache_key.to_owned(),
+            path: path.to_owned(),
+            ttl: ordinary_ttl()?,
         })
     }
 
@@ -93,7 +97,7 @@ impl SnapshotCache {
             return Ok(None);
         };
         let expires_at = fetched_at
-            .checked_add(CACHE_TTL_SECONDS)
+            .checked_add(self.ttl)
             .ok_or(Error::CacheTimestamp)?;
         if expires_at <= now {
             return Ok(None);
@@ -101,6 +105,101 @@ impl SnapshotCache {
         serde_json::from_slice(&payload)
             .map(Some)
             .map_err(Error::CacheDecode)
+    }
+
+    pub(crate) fn last_complete(&self) -> Result<Option<WorkspaceSnapshot>, Error> {
+        let payload = self
+            .connection
+            .query_row(
+                "SELECT payload FROM workspace_snapshot WHERE cache_key = ?1",
+                params![self.cache_key],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(Error::Cache)?;
+        payload
+            .map(|bytes| serde_json::from_slice(&bytes).map_err(Error::CacheDecode))
+            .transpose()
+    }
+
+    pub(crate) fn baseline_within(
+        &mut self,
+        now: i64,
+        deadline: &Deadline<'_>,
+    ) -> Result<(Option<WorkspaceSnapshot>, bool), Error> {
+        let key = self.cache_key.clone();
+        let row =
+            with_lock_budget(&mut self.connection, deadline, |connection| {
+                connection.query_row(
+            "SELECT payload,full_reconciled_at FROM workspace_snapshot WHERE cache_key=?1",[key],
+            |row| Ok((row.get::<_,Vec<u8>>(0)?,row.get::<_,Option<i64>>(1)?))).optional()
+            })?;
+        deadline.remaining()?;
+        match row {
+            Some((payload, Some(full))) if now.saturating_sub(full) < 86_400 => {
+                Ok((Some(decode_within(&payload, deadline)?), false))
+            }
+            _ => Ok((None, true)),
+        }
+    }
+
+    pub(crate) fn last_full_reconciliation(&self) -> Result<Option<i64>, Error> {
+        self.connection
+            .query_row(
+                "SELECT full_reconciled_at FROM workspace_snapshot WHERE cache_key = ?1",
+                params![self.cache_key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .map_err(Error::Cache)
+    }
+
+    pub(crate) fn revision(&self) -> Result<Option<i64>, Error> {
+        self.connection
+            .query_row(
+                "SELECT refresh_revision FROM workspace_snapshot WHERE cache_key=?1",
+                params![self.cache_key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Error::Cache)
+    }
+
+    pub(crate) fn source_started_at(&self) -> Result<Option<i64>, Error> {
+        let row = self.connection.query_row("SELECT fetched_at,payload,read_started_at,read_started_for,read_started_digest FROM workspace_snapshot WHERE cache_key=?1",
+            params![self.cache_key],|row| Ok((row.get::<_,i64>(0)?,row.get::<_,Vec<u8>>(1)?,row.get::<_,Option<i64>>(2)?,row.get::<_,Option<i64>>(3)?,row.get::<_,Option<String>>(4)?))).optional().map_err(Error::Cache)?;
+        match row {
+            Some((fetched, payload, Some(started), Some(for_time), Some(digest)))
+                if fetched == for_time && digest == payload_digest(&payload) =>
+            {
+                Ok(Some(started))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    pub(crate) fn replace_refresh(
+        &mut self,
+        now: i64,
+        snapshot: &WorkspaceSnapshot,
+        full: bool,
+    ) -> Result<(), Error> {
+        let payload = serde_json::to_vec(snapshot).map_err(Error::CacheEncode)?;
+        let transaction = self.connection.transaction().map_err(Error::Cache)?;
+        transaction.execute("INSERT INTO workspace_snapshot(cache_key,fetched_at,payload,read_started_at,read_started_for,read_started_digest,full_reconciled_at)
+            VALUES(?1,?2,?3,?2,?2,?4,?5) ON CONFLICT(cache_key) DO UPDATE SET fetched_at=excluded.fetched_at,payload=excluded.payload,
+            read_started_at=excluded.read_started_at,read_started_for=excluded.read_started_for,read_started_digest=excluded.read_started_digest,
+            full_reconciled_at=COALESCE(excluded.full_reconciled_at,workspace_snapshot.full_reconciled_at),refresh_revision=workspace_snapshot.refresh_revision+1",
+            params![self.cache_key,now,payload,payload_digest(&payload),full.then_some(now)]).map_err(Error::Cache)?;
+        transaction.commit().map_err(Error::Cache)
+    }
+
+    pub(crate) fn refresh_lock(
+        &self,
+        deadline: Option<&Deadline<'_>>,
+    ) -> Result<RefreshLock, Error> {
+        RefreshLock::acquire(&self.path, deadline)
     }
 
     pub(crate) fn replace(&mut self, now: i64, snapshot: &WorkspaceSnapshot) -> Result<(), Error> {
@@ -176,6 +275,7 @@ impl SnapshotCache {
         snapshot: &WorkspaceSnapshot,
         read_started_at: i64,
         deadline: &Deadline<'_>,
+        full: bool,
     ) -> Result<(), Error> {
         let payload = serde_json::to_vec(snapshot).map_err(Error::CacheEncode)?;
         let digest = payload_digest(&payload);
@@ -186,18 +286,21 @@ impl SnapshotCache {
             transaction.execute(
                 "INSERT INTO workspace_snapshot(
                      cache_key, fetched_at, payload, read_started_at, read_started_for,
-                     read_started_digest)
-                 VALUES (?1, ?2, ?3, ?4, ?2, ?5)
+                     read_started_digest,full_reconciled_at)
+                 VALUES (?1, ?2, ?3, ?4, ?2, ?5,?6)
                  ON CONFLICT(cache_key) DO UPDATE SET fetched_at = excluded.fetched_at,
                    payload = excluded.payload, read_started_at = excluded.read_started_at,
                    read_started_for = excluded.read_started_for,
-                   read_started_digest = excluded.read_started_digest",
+                   read_started_digest = excluded.read_started_digest,
+                   full_reconciled_at=COALESCE(excluded.full_reconciled_at,workspace_snapshot.full_reconciled_at),
+                   refresh_revision=workspace_snapshot.refresh_revision+1",
                 params![
                     cache_key,
                     snapshot.fetched_at,
                     payload,
                     read_started_at,
-                    digest
+                    digest,
+                    full.then_some(read_started_at)
                 ],
             )?;
             if deadline.remaining().is_err() {
@@ -263,6 +366,67 @@ fn payload_digest(payload: &[u8]) -> String {
     format!("{:x}", Sha256::digest(payload))
 }
 
+/// An adjacent advisory lock, released by the operating system on process exit.
+pub(crate) struct RefreshLock {
+    _file: std::fs::File,
+}
+
+impl RefreshLock {
+    pub(crate) fn acquire(path: &Path, deadline: Option<&Deadline<'_>>) -> Result<Self, Error> {
+        let mut lock_path = path.as_os_str().to_owned();
+        lock_path.push(".refresh.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(PathBuf::from(lock_path))
+            .map_err(Error::CachePermissions)?;
+        let started = Instant::now();
+        loop {
+            if let Some(deadline) = deadline {
+                deadline.remaining()?;
+            }
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return Err(Error::CachePermissions(error));
+                }
+            }
+            let left = LEGACY_BUSY_TIMEOUT.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                return Err(Error::RefreshLockTimeout);
+            }
+            let wait = match deadline {
+                Some(deadline) => left.min(deadline.remaining()?),
+                None => left,
+            };
+            std::thread::sleep(wait.min(Duration::from_millis(10)));
+        }
+    }
+}
+
+pub(crate) fn ordinary_ttl() -> Result<i64, Error> {
+    match std::env::var("IX_BOARD_CACHE_TTL_SECONDS") {
+        Ok(value) => value
+            .parse::<i64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or(Error::InvalidCacheTtl),
+        Err(std::env::VarError::NotPresent) => match crate::settings::load()?
+            .as_ref()
+            .and_then(|config| config.get("cache"))
+            .and_then(|cache| cache.get("ttl_seconds"))
+        {
+            Some(value) => value
+                .as_integer()
+                .filter(|value| *value > 0)
+                .ok_or(Error::InvalidCacheTtl),
+            None => Ok(CACHE_TTL_SECONDS),
+        },
+        Err(std::env::VarError::NotUnicode(_)) => Err(Error::InvalidCacheTtl),
+    }
+}
+
 /// Adds the evidence columns of a bounded read. Old readers select and write only the
 /// original columns, so the table stays usable by them.
 fn add_read_start_columns(connection: &Connection) -> Result<(), Error> {
@@ -278,6 +442,8 @@ fn add_read_start_columns(connection: &Connection) -> Result<(), Error> {
         ("read_started_at", "INTEGER"),
         ("read_started_for", "INTEGER"),
         ("read_started_digest", "TEXT"),
+        ("full_reconciled_at", "INTEGER"),
+        ("refresh_revision", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         if present.iter().any(|name| name == column) {
             continue;
@@ -326,7 +492,7 @@ fn with_lock_budget<T>(
 }
 
 #[cfg(unix)]
-fn restrict_permissions(path: &Path) -> Result<(), Error> {
+pub(crate) fn restrict_permissions(path: &Path) -> Result<(), Error> {
     use std::{
         fs::OpenOptions,
         os::unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -343,7 +509,7 @@ fn restrict_permissions(path: &Path) -> Result<(), Error> {
 }
 
 #[cfg(not(unix))]
-fn restrict_permissions(_path: &Path) -> Result<(), Error> {
+pub(crate) fn restrict_permissions(_path: &Path) -> Result<(), Error> {
     Ok(())
 }
 

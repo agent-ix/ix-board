@@ -70,6 +70,10 @@ pub struct LabeledIssue {
 
 /// Linear reads.
 pub trait LinearSource {
+    /// Provenance of the latest coordinated workspace read, when the source caches.
+    fn cache_freshness(&self) -> Option<crate::CacheFreshness> {
+        None
+    }
     /// Current native department issue evidence; histories remain explicitly unavailable
     /// unless an adapter supplies stable ordered native events.
     fn department_evidence(

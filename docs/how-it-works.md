@@ -1,8 +1,7 @@
 # How it works
 
-ix-board loads one snapshot of a Linear workspace, caches it, and computes every
-report from that snapshot. This page describes the data boundary, the cache,
-the readiness rules and the commands that write.
+ix-board is a cached reader of structured Linear data. It computes planning
+reports from shared summaries and detailed workspace snapshots.
 
 ## Structured data only
 
@@ -23,18 +22,40 @@ Issues.
 
 <a id="cache"></a>
 
-The first read of a session fetches projects, initiatives, milestones and issues
-from Linear in paged queries and stores them as one snapshot in a SQLite file.
-Each snapshot expires five minutes after it was fetched.
+Roadmap and scope checks load native initiative and project summaries. Reports
+that need tickets load a separate detailed snapshot. Each dataset defaults to
+a five-minute lifetime. A warm read makes no Linear request.
 
-- A read of an unexpired snapshot makes no Linear request.
-- A read of an expired snapshot fetches again and replaces it.
-- If the fetch fails, the command returns the error. It never returns the
-  expired snapshot.
-- Text reports show the fetch time and its age. JSON reports carry
-  `fetched_at` as Unix seconds.
-- A Linear rate-limit response is reported as an error with the cooldown derived
-  from the exhausted quota.
+Expired datasets merge records changed since their last successful source read,
+with a 60-second overlap. Archived and trashed records observed in a delta leave
+active results immediately. A full accessible-catalog scan runs at least daily
+when that dataset is requested; it removes unobserved deletions and visibility changes.
+
+One process refreshes at a time using an adjacent operating-system file lock.
+Other processes wait up to five seconds and reuse its completed refresh.
+Dataset identity includes the exact endpoint, an opaque credential digest, model
+version, and coverage. Native Linear credentials bind workspace and authorization
+visibility, so changing a credential requires a separate full baseline. Credentials
+are never stored in the cache. Quota accounting remains shared across those partitions.
+Failed ordinary reads can reuse the last complete compatible snapshot. Such results
+carry `stale`, `age_seconds`, `rate_limit_until`, and `failure_reason` in JSON and text.
+Bounded library reads preserve their explicit age limit, deadline, and error contract.
+
+Every request reserves shared request and estimated complexity capacity before
+send, including histories, update probes, and mutations. Unknown query cost reserves
+10,000 complexity units. Response headers supply actual limits and reset times.
+Server rate limits persist across processes; absent retry metadata means a 60-second cooldown.
+No request starts during cooldown, and commands do not sleep or retry.
+
+Run `ix-board cache status --json` to inspect coverage, successful sync and full
+reconciliation times, quota state, and refresh counters without credentials or network access.
+`latest_refresh` describes the latest recorded attempt. It is null while a refresh
+is running or when a bounded timeout left no time to record a final descriptor.
+Transport reservations remain counted even when a refresh fails or times out.
+Summary and fallback JSON wrap the command payload in `result`, beside freshness metadata.
+Fresh detailed commands retain their array or object payload shape. `cache status`
+provides every dataset's provenance, and library callers can inspect `cache_freshness()`.
+Summary and stale envelopes include `last_successful_sync` and `last_full_reconciliation`.
 
 `IX_BOARD_CACHE_PATH` selects the database path. See [setup](setup.md#cache-location)
 for the default locations. `focus hygiene` also stores its most recent baseline
@@ -42,8 +63,8 @@ in the same file.
 
 Library callers use `ReadService::workspace_snapshot` for the cached snapshot,
 `force_refresh_workspace` to fetch through the cache, and `invalidate_cache`
-to discard a snapshot before a write. A failed forced refresh leaves no cached
-snapshot.
+to discard a snapshot before a write. A forced refresh bypasses the ordinary TTL
+and retains the shared quota and refresh coordination.
 
 ## Readiness
 

@@ -46,6 +46,32 @@ a read fails.
 
 ## Cache location
 
+Configure cache lifetime and quota allocation in `~/.config/ix-board/config.toml`,
+or select a file with `IX_BOARD_CONFIG_PATH`:
+
+```toml
+[cache]
+ttl_seconds = 300
+
+[linear]
+plan_tier = "business"
+quota_share = 0.25
+quota_reserve = 0.1
+```
+
+`IX_BOARD_CACHE_TTL_SECONDS` overrides the file lifetime. It must be a positive
+integer. `IX_BOARD_LINEAR_PLAN_TIER`, `IX_BOARD_LINEAR_AUTH_MODE`,
+`IX_BOARD_LINEAR_QUOTA_SHARE`, and `IX_BOARD_LINEAR_QUOTA_RESERVE` override Linear settings.
+The default tier is `free`; supported tiers are `free`, `basic`, `business`, and
+`enterprise`. Auth modes are `api_key` and `oauth`, with `api_key` the default.
+Quota share must be finite and satisfy `0 < share <= 0.5`; the default is 0.5.
+The additional reserve defaults to 0.1 of that allocation.
+
+Hourly fallback limits are 2,500 requests and 3,000,000 complexity for API keys,
+or 5,000 requests and 2,000,000 complexity for OAuth. Free and basic use these
+limits; business doubles them and enterprise multiplies them by five. Actual
+server limits override these capacities. The single-query ceiling remains 10,000.
+
 The snapshot cache is a SQLite file. Set `IX_BOARD_CACHE_PATH` to choose its
 path. Without it, ix-board uses `$XDG_CACHE_HOME/ix-board` or `~/.cache/ix-board`
 on Linux, `~/Library/Caches/com.agent-ix.ix-board` on macOS, and
