@@ -379,7 +379,7 @@ pub(crate) fn evaluate_batch(
         .map(|draft| context.summarize(draft, &readiness))
         .collect::<Result<Vec<_>, _>>()?;
     budget.check()?;
-    mark_shared(&mut selections);
+    mark_shared(&mut selections, budget)?;
     let teams = context.team_summaries(&selections, &readiness)?;
     Ok(NamedBatch {
         fetched_at: snapshot.fetched_at,
@@ -652,7 +652,7 @@ impl<'a> Context<'a> {
         let team_known = self.team_known(team);
         let mut state = selection_state(selection, team_known, &members);
         let links_uncertain = state != SelectionState::Empty
-            && self.initiative_links_uncertain(team, include.iter().chain(&exclude));
+            && self.initiative_links_uncertain(team, include.iter().chain(&exclude))?;
         if links_uncertain && state == SelectionState::Complete {
             // The known leaves stay, but membership cannot be reported as complete.
             state = SelectionState::Incomplete;
@@ -686,7 +686,7 @@ impl<'a> Context<'a> {
             .cloned()
             .collect();
         draft.leaves = classify_leaves_within(self.snapshot, &draft.effective, self.budget)?;
-        self.place_projects(&mut draft, &exclude);
+        self.place_projects(&mut draft, &exclude)?;
         Ok(draft)
     }
 
@@ -698,29 +698,37 @@ impl<'a> Context<'a> {
         &self,
         team: &TeamKey,
         resolved: impl IntoIterator<Item = &'r (NamedMember, Closure)>,
-    ) -> bool {
+    ) -> Result<bool, Error> {
         if self.evidence.initiative_links {
-            return false;
+            return Ok(false);
         }
-        resolved
-            .into_iter()
-            .filter(|(member, _)| matches!(member, NamedMember::Initiative { .. }))
-            .any(|(_, closure)| {
-                self.snapshot
-                    .projects
-                    .iter()
-                    .any(|p| !closure.projects.contains(&p.id) && self.holds_team_work(p, team))
-            })
+        for (member, closure) in resolved {
+            if !matches!(member, NamedMember::Initiative { .. }) {
+                continue;
+            }
+            for project in &self.snapshot.projects {
+                self.budget.check()?;
+                if !closure.projects.contains(&project.id) && self.holds_team_work(project, team) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Works out which projects the selection covers whole and which sit under an initiative.
-    fn place_projects(&self, draft: &mut Draft<'_>, exclude: &[(NamedMember, Closure)]) {
+    fn place_projects(
+        &self,
+        draft: &mut Draft<'_>,
+        exclude: &[(NamedMember, Closure)],
+    ) -> Result<(), Error> {
         let excluded_initiatives = exclude
             .iter()
             .filter(|(member, _)| matches!(member, NamedMember::Initiative { .. }))
             .map(|(member, _)| member.id().to_owned())
             .collect::<BTreeSet<_>>();
         for (member, closure) in &draft.include {
+            self.budget.check()?;
             match member {
                 NamedMember::Initiative { id } if !excluded_initiatives.contains(id) => {
                     let projects = &closure.projects - &draft.excluded_projects;
@@ -737,6 +745,7 @@ impl<'a> Context<'a> {
                 _ => {}
             }
         }
+        Ok(())
     }
 
     fn is_countable_leaf(&self, issue: &Issue) -> bool {
@@ -788,9 +797,10 @@ impl<'a> Context<'a> {
         &self,
         leaves: impl IntoIterator<Item = &'i IssueId>,
         readiness: &Readiness,
-    ) -> LeafCounts {
+    ) -> Result<LeafCounts, Error> {
         let mut counts = LeafCounts::default();
         for id in leaves {
+            self.budget.check()?;
             let Some(issue) = self.issues.get(id) else {
                 continue;
             };
@@ -806,20 +816,26 @@ impl<'a> Context<'a> {
             counts.ready += usize::from(readiness.ready.contains(id));
             counts.blocked += usize::from(readiness.blocked.contains(id));
         }
-        counts
+        Ok(counts)
     }
 
-    fn project_leaves<'d>(&self, draft: &'d Draft<'_>, project: &ProjectId) -> Vec<&'d IssueId> {
-        draft
-            .leaves
-            .leaf_ids
-            .iter()
-            .filter(|id| {
-                self.issues
-                    .get(*id)
-                    .is_some_and(|i| i.project_id.as_ref() == Some(project))
-            })
-            .collect()
+    fn project_leaves<'d>(
+        &self,
+        draft: &'d Draft<'_>,
+        project: &ProjectId,
+    ) -> Result<Vec<&'d IssueId>, Error> {
+        let mut found = Vec::new();
+        for id in &draft.leaves.leaf_ids {
+            self.budget.check()?;
+            if self
+                .issues
+                .get(id)
+                .is_some_and(|i| i.project_id.as_ref() == Some(project))
+            {
+                found.push(id);
+            }
+        }
+        Ok(found)
     }
 
     fn summarize(
@@ -840,9 +856,9 @@ impl<'a> Context<'a> {
                 .filter_map(|id| self.issues.get(id).copied())
                 .collect::<Vec<_>>();
             (
-                self.initiative_rows(draft, readiness),
-                self.standalone_rows(draft, readiness),
-                self.ticket_rows(draft, readiness),
+                self.initiative_rows(draft, readiness)?,
+                self.standalone_rows(draft, readiness)?,
+                self.ticket_rows(draft, readiness)?,
                 crate::focus_blocker_layers_within(self.snapshot, &roots, self.budget)?,
             )
         } else {
@@ -868,7 +884,7 @@ impl<'a> Context<'a> {
             team_known: draft.team_known,
             members: draft.members.clone(),
             leaf_ids: draft.leaves.leaf_ids.iter().cloned().collect(),
-            counts: self.counts(&draft.leaves.leaf_ids, readiness),
+            counts: self.counts(&draft.leaves.leaf_ids, readiness)?,
             counts_availability: match draft.state {
                 SelectionState::Empty | SelectionState::Complete => CountAvailability::Complete,
                 SelectionState::Incomplete => CountAvailability::Partial,
@@ -888,7 +904,8 @@ impl<'a> Context<'a> {
         readiness: &Readiness,
         project: &Project,
         link: Option<InitiativeLink>,
-    ) -> ProjectRow {
+    ) -> Result<ProjectRow, Error> {
+        self.budget.check()?;
         let mut unknown_facts = Vec::new();
         if project.status_category == ProjectStatusCategory::Unknown {
             unknown_facts.push(UnknownFact::ProjectStatusCategory);
@@ -896,7 +913,8 @@ impl<'a> Context<'a> {
         if link == Some(InitiativeLink::Unavailable) {
             unknown_facts.push(UnknownFact::InitiativeLinks);
         }
-        ProjectRow {
+        let leaves = self.project_leaves(draft, &project.id)?;
+        Ok(ProjectRow {
             project_id: project.id.clone(),
             identifier: project
                 .identifier
@@ -904,19 +922,24 @@ impl<'a> Context<'a> {
                 .unwrap_or_else(|| project.id.0.clone()),
             name: project.name.clone(),
             status_category: project.status_category,
-            counts: self.counts(self.project_leaves(draft, &project.id), readiness),
-            partial: self.project_reasons(draft, project).into_iter().collect(),
+            counts: self.counts(leaves, readiness)?,
+            partial: self.project_reasons(draft, project)?.into_iter().collect(),
             shared: false,
             initiative_link: link,
             unknown_facts,
-        }
+        })
     }
 
-    fn project_reasons(&self, draft: &Draft<'_>, project: &Project) -> BTreeSet<PartialReason> {
+    fn project_reasons(
+        &self,
+        draft: &Draft<'_>,
+        project: &Project,
+    ) -> Result<BTreeSet<PartialReason>, Error> {
         let team = &draft.request.selection.team;
         let mut reasons = BTreeSet::new();
         let project_issues = self.project_issues.get(&project.id);
         for id in project_issues.into_iter().flatten() {
+            self.budget.check()?;
             let Some(issue) = self.issues.get(id) else {
                 continue;
             };
@@ -932,72 +955,82 @@ impl<'a> Context<'a> {
             }
         }
         if draft.fully_included.contains(&project.id) {
-            return reasons;
+            return Ok(reasons);
         }
         for (member, closure) in &draft.include {
+            self.budget.check()?;
             match member {
                 NamedMember::Milestone { project_id, .. } if *project_id == project.id.0 => {
                     reasons.insert(PartialReason::MilestoneOnly);
                 }
-                NamedMember::Issue { .. }
-                    if closure.issues.iter().any(|id| {
-                        draft.effective.contains(id)
+                NamedMember::Issue { .. } => {
+                    for id in &closure.issues {
+                        self.budget.check()?;
+                        if draft.effective.contains(id)
                             && self
                                 .issues
                                 .get(id)
                                 .is_some_and(|i| i.project_id.as_ref() == Some(&project.id))
-                    }) =>
-                {
-                    reasons.insert(PartialReason::TicketOnly);
+                        {
+                            reasons.insert(PartialReason::TicketOnly);
+                            break;
+                        }
+                    }
                 }
                 _ => {}
             }
         }
-        reasons
+        Ok(reasons)
     }
 
-    fn initiative_rows(&self, draft: &Draft<'_>, readiness: &Readiness) -> Vec<InitiativeRow> {
+    fn initiative_rows(
+        &self,
+        draft: &Draft<'_>,
+        readiness: &Readiness,
+    ) -> Result<Vec<InitiativeRow>, Error> {
         let team = &draft.request.selection.team;
-        let mut rows =
-            draft
-                .initiatives
-                .iter()
-                .map(|(id, held)| {
-                    let (identifier, name) = self.initiative_names(id);
-                    let mut partial = BTreeSet::new();
-                    let mut shown = Vec::new();
-                    let mut leaves = Vec::new();
-                    for project in held.iter().filter_map(|p| self.projects.get(p)) {
-                        if draft.excluded_projects.contains(&project.id) {
-                            partial.insert(PartialReason::Exclusion);
-                            continue;
-                        }
-                        partial.extend(self.project_reasons(draft, project).into_iter().filter(
-                            |r| matches!(r, PartialReason::Exclusion | PartialReason::TeamBoundary),
-                        ));
-                        leaves.extend(self.project_leaves(draft, &project.id));
-                        if self.holds_team_work(project, team) {
-                            shown.push(self.project_row(draft, readiness, project, None));
-                        }
-                    }
-                    shown.sort_by(|a, b| {
-                        (&a.identifier, &a.project_id).cmp(&(&b.identifier, &b.project_id))
-                    });
-                    InitiativeRow {
-                        initiative_id: id.clone(),
-                        identifier,
-                        name,
-                        projects: shown,
-                        counts: self.counts(leaves, readiness),
-                        partial: partial.into_iter().collect(),
-                        shared: false,
-                    }
-                })
-                .collect::<Vec<_>>();
+        let mut rows = Vec::new();
+        for (id, held) in &draft.initiatives {
+            self.budget.check()?;
+            let (identifier, name) = self.initiative_names(id);
+            let mut partial = BTreeSet::new();
+            let mut shown = Vec::new();
+            let mut leaves = Vec::new();
+            for project in held.iter().filter_map(|p| self.projects.get(p)) {
+                self.budget.check()?;
+                if draft.excluded_projects.contains(&project.id) {
+                    partial.insert(PartialReason::Exclusion);
+                    continue;
+                }
+                partial.extend(
+                    self.project_reasons(draft, project)?
+                        .into_iter()
+                        .filter(|r| {
+                            matches!(r, PartialReason::Exclusion | PartialReason::TeamBoundary)
+                        }),
+                );
+                leaves.extend(self.project_leaves(draft, &project.id)?);
+                if self.holds_team_work(project, team) {
+                    shown.push(self.project_row(draft, readiness, project, None)?);
+                }
+            }
+            shown.sort_by(|a, b| {
+                (&a.identifier, &a.project_id).cmp(&(&b.identifier, &b.project_id))
+            });
+            rows.push(InitiativeRow {
+                initiative_id: id.clone(),
+                identifier,
+                name,
+                projects: shown,
+                counts: self.counts(leaves, readiness)?,
+                partial: partial.into_iter().collect(),
+                shared: false,
+            });
+        }
         rows.sort_by(|a, b| {
             (&a.identifier, &a.initiative_id).cmp(&(&b.identifier, &b.initiative_id))
         });
-        rows
+        Ok(rows)
     }
 
     fn initiative_names(&self, id: &str) -> (String, String) {
@@ -1012,64 +1045,78 @@ impl<'a> Context<'a> {
             )
     }
 
-    fn standalone_rows(&self, draft: &Draft<'_>, readiness: &Readiness) -> Vec<ProjectRow> {
-        let direct = draft
-            .include
-            .iter()
-            .filter(|(member, _)| matches!(member, NamedMember::Project { .. }))
-            .flat_map(|(_, closure)| closure.projects.iter().cloned());
-        let holding_leaves = draft
-            .leaves
-            .leaf_ids
-            .iter()
-            .filter_map(|id| self.issues.get(id))
-            .filter_map(|issue| issue.project_id.clone());
+    fn standalone_rows(
+        &self,
+        draft: &Draft<'_>,
+        readiness: &Readiness,
+    ) -> Result<Vec<ProjectRow>, Error> {
+        let mut holders = BTreeSet::new();
+        for (member, closure) in &draft.include {
+            self.budget.check()?;
+            if matches!(member, NamedMember::Project { .. }) {
+                holders.extend(closure.projects.iter().cloned());
+            }
+        }
+        for id in &draft.leaves.leaf_ids {
+            self.budget.check()?;
+            if let Some(project) = self.issues.get(id).and_then(|i| i.project_id.clone()) {
+                holders.insert(project);
+            }
+        }
         let link = if self.evidence.initiative_links {
             InitiativeLink::NoneSelected
         } else {
             InitiativeLink::Unavailable
         };
-        let mut rows = direct
-            .chain(holding_leaves)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .filter(|id| !draft.excluded_projects.contains(id) && !draft.displayed.contains(id))
-            .filter_map(|id| self.projects.get(&id))
-            .map(|project| self.project_row(draft, readiness, project, Some(link)))
-            .collect::<Vec<_>>();
+        let mut rows = Vec::new();
+        for id in holders {
+            self.budget.check()?;
+            if draft.excluded_projects.contains(&id) || draft.displayed.contains(&id) {
+                continue;
+            }
+            if let Some(project) = self.projects.get(&id) {
+                rows.push(self.project_row(draft, readiness, project, Some(link))?);
+            }
+        }
         rows.sort_by(|a, b| (&a.identifier, &a.project_id).cmp(&(&b.identifier, &b.project_id)));
-        rows
+        Ok(rows)
     }
 
-    fn ticket_rows(&self, draft: &Draft<'_>, readiness: &Readiness) -> Vec<TicketRow> {
-        let mut rows = draft
-            .include
-            .iter()
-            .filter(|(member, _)| matches!(member, NamedMember::Issue { .. }))
-            .filter_map(|(member, closure)| {
-                let issue = self.issues.get(&IssueId(member.id().to_owned()))?;
-                let covered = issue
-                    .project_id
-                    .as_ref()
-                    .is_some_and(|p| draft.fully_included.contains(p));
-                if covered || !draft.effective.contains(&issue.id) {
-                    return None;
-                }
-                let leaves = closure
-                    .issues
-                    .iter()
-                    .filter(|id| draft.leaves.leaf_ids.contains(*id));
-                Some(TicketRow {
-                    issue_id: issue.id.clone(),
-                    identifier: issue.identifier.clone(),
-                    project_id: issue.project_id.clone(),
-                    counts: self.counts(leaves, readiness),
-                    shared: false,
-                })
-            })
-            .collect::<Vec<_>>();
+    fn ticket_rows(
+        &self,
+        draft: &Draft<'_>,
+        readiness: &Readiness,
+    ) -> Result<Vec<TicketRow>, Error> {
+        let mut rows = Vec::new();
+        for (member, closure) in &draft.include {
+            self.budget.check()?;
+            if !matches!(member, NamedMember::Issue { .. }) {
+                continue;
+            }
+            let Some(issue) = self.issues.get(&IssueId(member.id().to_owned())) else {
+                continue;
+            };
+            let covered = issue
+                .project_id
+                .as_ref()
+                .is_some_and(|p| draft.fully_included.contains(p));
+            if covered || !draft.effective.contains(&issue.id) {
+                continue;
+            }
+            let leaves = closure
+                .issues
+                .iter()
+                .filter(|id| draft.leaves.leaf_ids.contains(*id));
+            rows.push(TicketRow {
+                issue_id: issue.id.clone(),
+                identifier: issue.identifier.clone(),
+                project_id: issue.project_id.clone(),
+                counts: self.counts(leaves, readiness)?,
+                shared: false,
+            });
+        }
         rows.sort_by(|a, b| (&a.identifier, &a.issue_id).cmp(&(&b.identifier, &b.issue_id)));
-        rows
+        Ok(rows)
     }
 
     fn team_summaries(
@@ -1085,22 +1132,24 @@ impl<'a> Context<'a> {
             .into_iter()
             .map(|(team, group)| {
                 self.budget.check()?;
-                let leaves = group
-                    .iter()
-                    .filter(|s| {
-                        matches!(
-                            s.state,
-                            SelectionState::Complete | SelectionState::Incomplete
-                        )
-                    })
-                    .flat_map(|s| s.leaf_ids.iter().cloned())
-                    .collect::<BTreeSet<_>>();
+                let mut leaves = BTreeSet::new();
+                for selection in group.iter().filter(|s| {
+                    matches!(
+                        s.state,
+                        SelectionState::Complete | SelectionState::Incomplete
+                    )
+                }) {
+                    for id in &selection.leaf_ids {
+                        self.budget.check()?;
+                        leaves.insert(id.clone());
+                    }
+                }
                 let state = union_state(&group);
                 Ok(TeamSummary {
                     team: team.clone(),
                     state,
                     selection_keys: group.iter().map(|s| s.key.clone()).collect(),
-                    counts: self.counts(&leaves, readiness),
+                    counts: self.counts(&leaves, readiness)?,
                     leaf_ids: leaves.into_iter().collect(),
                     counts_availability: match state {
                         SelectionState::Empty | SelectionState::Complete => {
@@ -1196,12 +1245,14 @@ fn union_causes(group: &[&SelectionSummary]) -> Vec<UnionCause> {
 }
 
 /// Marks every placement of a project, initiative or ticket that appears more than once.
-fn mark_shared(selections: &mut [SelectionSummary]) {
+fn mark_shared(selections: &mut [SelectionSummary], budget: Budget<'_>) -> Result<(), Error> {
     let mut projects: BTreeMap<ProjectId, usize> = BTreeMap::new();
     let mut initiatives: BTreeMap<String, usize> = BTreeMap::new();
     let mut tickets: BTreeMap<IssueId, usize> = BTreeMap::new();
     for selection in selections.iter() {
+        budget.check()?;
         for initiative in &selection.initiatives {
+            budget.check()?;
             *initiatives
                 .entry(initiative.initiative_id.clone())
                 .or_default() += 1;
@@ -1212,24 +1263,32 @@ fn mark_shared(selections: &mut [SelectionSummary]) {
             .flat_map(|i| &i.projects)
             .chain(&selection.projects)
         {
+            budget.check()?;
             *projects.entry(row.project_id.clone()).or_default() += 1;
         }
         for ticket in &selection.tickets {
+            budget.check()?;
             *tickets.entry(ticket.issue_id.clone()).or_default() += 1;
         }
     }
     for selection in selections.iter_mut() {
+        budget.check()?;
         for initiative in &mut selection.initiatives {
+            budget.check()?;
             initiative.shared = initiatives[&initiative.initiative_id] > 1;
             for row in &mut initiative.projects {
+                budget.check()?;
                 row.shared = projects[&row.project_id] > 1;
             }
         }
         for row in &mut selection.projects {
+            budget.check()?;
             row.shared = projects[&row.project_id] > 1;
         }
         for ticket in &mut selection.tickets {
+            budget.check()?;
             ticket.shared = tickets[&ticket.issue_id] > 1;
         }
     }
+    Ok(())
 }
