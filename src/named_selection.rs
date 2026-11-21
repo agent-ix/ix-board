@@ -67,7 +67,10 @@ impl NamedMember {
     }
 
     fn is_blank(&self) -> bool {
-        let project_blank = matches!(self, Self::Milestone { project_id, .. } if project_id.trim().is_empty());
+        let project_blank = matches!(
+            self,
+            Self::Milestone { project_id, .. } if project_id.trim().is_empty()
+        );
         self.id().trim().is_empty() || project_blank
     }
 }

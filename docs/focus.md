@@ -158,3 +158,6 @@ the record. The command does not send the record anywhere.
 `focus expand` prints the resolved projects, milestones, issues and blocker
 layers without status or readiness, which is useful for checking what a set of
 selectors covers.
+
+Library consumers that store selections with exclusions can use named
+selections and bounded reads; see [named selections](named-focus.md).

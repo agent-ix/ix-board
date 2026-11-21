@@ -34,6 +34,19 @@ fn public_api_models_have_structural_json_schemas() {
     assert!(focus_chunk["properties"]["issues"].is_object());
 }
 
+#[trace("FR-016-AC-2", "FR-012-AC-11")]
+#[test]
+fn named_focus_wire_types_have_structural_json_schemas() {
+    let selection = serde_json::to_value(schemars::schema_for!(ix_board::NamedSelection)).unwrap();
+    let batch = serde_json::to_value(schemars::schema_for!(ix_board::NamedBatch)).unwrap();
+    assert_eq!(selection["type"], "object");
+    assert!(selection["properties"]["include"].is_object());
+    assert!(selection["properties"]["exclude"].is_object());
+    assert!(batch["properties"]["selections"].is_object());
+    assert!(batch["properties"]["teams"].is_object());
+    assert!(batch["$defs"]["SelectionSummary"]["properties"]["members"].is_object());
+}
+
 #[trace("FR-018-AC-7", "FR-018-AC-23")]
 #[test]
 fn lifecycle_schema_and_documented_example_preserve_nullable_counts_and_versions() {

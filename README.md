@@ -183,6 +183,7 @@ low.
 
 - [How it works](docs/how-it-works.md)
 - [Focus](docs/focus.md)
+- [Named selections and bounded reads](docs/named-focus.md)
 - [Program review](docs/program-review.md)
 - [Agents and drift](docs/agents-and-drift.md)
 - [Retro: snapshot, delta and backfill](docs/retro.md)

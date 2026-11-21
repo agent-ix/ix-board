@@ -598,7 +598,8 @@ impl<'a> Context<'a> {
     fn draft<'r>(&self, request: &'r NamedFocusRequest) -> Result<Draft<'r>, Error> {
         let selection = &request.selection;
         let team = &selection.team;
-        let (mut members, include) = self.evaluate_list(team, ListKind::Include, &selection.include);
+        let (mut members, include) =
+            self.evaluate_list(team, ListKind::Include, &selection.include);
         let (excluded_reports, exclude) =
             self.evaluate_list(team, ListKind::Exclude, &selection.exclude);
         members.extend(excluded_reports);
@@ -899,7 +900,9 @@ impl<'a> Context<'a> {
                         shown.push(self.project_row(draft, readiness, project, None));
                     }
                 }
-                shown.sort_by(|a, b| (&a.identifier, &a.project_id).cmp(&(&b.identifier, &b.project_id)));
+                shown.sort_by(|a, b| {
+                    (&a.identifier, &a.project_id).cmp(&(&b.identifier, &b.project_id))
+                });
                 InitiativeRow {
                     initiative_id: id.clone(),
                     identifier,
@@ -911,7 +914,9 @@ impl<'a> Context<'a> {
                 }
             })
             .collect::<Vec<_>>();
-        rows.sort_by(|a, b| (&a.identifier, &a.initiative_id).cmp(&(&b.identifier, &b.initiative_id)));
+        rows.sort_by(|a, b| {
+            (&a.identifier, &a.initiative_id).cmp(&(&b.identifier, &b.initiative_id))
+        });
         rows
     }
 
