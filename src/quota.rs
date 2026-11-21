@@ -601,7 +601,7 @@ impl QuotaGate {
                         ceil_delay(until, decision.evaluated_at)
                     });
                 match decision.state {
-                    QuotaState::ServerBackoff => Error::LinearRateLimited { retry_after },
+                    QuotaState::ServerBackoff => Error::QuotaAdmissionRefused {decision}.legacy_rate_limit(),
                     QuotaState::LocalWindowHeld | QuotaState::ServerReserveHeld => {
                         Error::LinearLocalBudgetExhausted { retry_after }
                     }

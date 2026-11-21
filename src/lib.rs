@@ -923,7 +923,7 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
         self.admit_bounded(policy)?;
         let clock: &dyn Clock = &self.clock;
         let deadline = Deadline::start(clock, policy.deadline);
-        read_within(&self.source, &mut self.cache, clock, policy, &deadline)
+        read_within(&self.source, &mut self.cache, clock, policy, &deadline, &mut self.outcome)
     }
 
     /// Bounded read followed by [`evaluate_named_batch`] over that one snapshot, using
@@ -944,7 +944,7 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
         self.admit_bounded(policy)?;
         let clock: &dyn Clock = &self.clock;
         let deadline = Deadline::start(clock, policy.deadline);
-        let snapshot = read_within(&self.source, &mut self.cache, clock, policy, &deadline)?;
+        let snapshot = read_within(&self.source, &mut self.cache, clock, policy, &deadline, &mut self.outcome)?;
         let evidence = self.source.catalog_evidence();
         deadline.remaining()?;
         let batch =
@@ -978,7 +978,7 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
         self.admit_bounded(policy)?;
         let clock: &dyn Clock = &self.clock;
         let deadline = Deadline::start(clock, policy.deadline);
-        let snapshot = read_within(&self.source, &mut self.cache, clock, policy, &deadline)?;
+        let snapshot = read_within(&self.source, &mut self.cache, clock, policy, &deadline, &mut self.outcome)?;
         deadline.remaining()?;
         let selection =
             named_selection::canonicalize_within(&snapshot, input, Budget::within(&deadline))?;
@@ -1007,7 +1007,7 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
         self.admit_bounded(policy)?;
         let clock: &dyn Clock = &self.clock;
         let deadline = Deadline::start(clock, policy.deadline);
-        let snapshot = read_within(&self.source, &mut self.cache, clock, policy, &deadline)?;
+        let snapshot = read_within(&self.source, &mut self.cache, clock, policy, &deadline, &mut self.outcome)?;
         deadline.remaining()?;
         let resolved =
             named_selection::resolve_within(&snapshot, input, Budget::within(&deadline))?;
@@ -1016,7 +1016,8 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
     }
 
     /// Refuses an invalid policy or a source that cannot honor a bound, before any read.
-    fn admit_bounded(&self, policy: &ReadPolicy) -> Result<(), Error> {
+    fn admit_bounded(&mut self, policy: &ReadPolicy) -> Result<(), Error> {
+        self.outcome=RefreshOutcome::Unknown;
         policy.validate()?;
         if !self.source.supports_bounded_read() {
             return Err(Error::BoundUnsupported);
@@ -1033,7 +1034,7 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
         self.freshness.as_ref()
     }
 
-    /// Typed outcome of the latest ordinary refresh attempt, including fallback.
+    /// Typed outcome of the latest cached read attempt, including bounded refusal.
     pub fn refresh_outcome(&self) -> &RefreshOutcome {
         &self.outcome
     }
@@ -1185,7 +1186,10 @@ fn read_within<S: WorkspaceSource>(
     clock: &dyn Clock,
     policy: &ReadPolicy,
     deadline: &Deadline<'_>,
+    outcome: &mut RefreshOutcome,
 ) -> Result<WorkspaceSnapshot, Error> {
+    *outcome=RefreshOutcome::CacheReused;
+    let result=(|| {
     let max_age = i64::try_from(policy.max_age.as_secs()).unwrap_or(i64::MAX);
     if let Some(snapshot) = cache.fresh_within(clock.now_epoch_seconds(), max_age, deadline)? {
         deadline.remaining()?;
@@ -1199,11 +1203,15 @@ fn read_within<S: WorkspaceSource>(
     let read_started_at = clock.now_epoch_seconds();
     let (baseline, full) = cache.baseline_within(read_started_at, deadline)?;
     deadline.remaining()?;
-    let mut snapshot = source.refresh_workspace(baseline.as_ref(), Some(deadline))?;
+    let mut snapshot = source.refresh_workspace_evaluated(baseline.as_ref(), Some(deadline))?;
     snapshot.fetched_at = read_started_at;
     cache.replace_bounded(&snapshot, read_started_at, deadline, full)?;
     deadline.remaining()?;
+    *outcome=RefreshOutcome::Refreshed;
     Ok(snapshot)
+    })();
+    if let Err(error)=&result { *outcome=RefreshOutcome::from_error(error); }
+    result.map_err(Error::legacy_rate_limit)
 }
 
 fn project_id(snapshot: &WorkspaceSnapshot, identifier: &str) -> Result<ProjectId, Error> {
