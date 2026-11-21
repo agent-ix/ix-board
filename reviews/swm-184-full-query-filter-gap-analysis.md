@@ -66,3 +66,30 @@ Reconciliation: quire matrix (quire 0.52.0, engine 0.62.2). Semantic fanout not 
   "bindings": []
 }
 ```
+
+## Follow-up head verification
+
+Scoped PASS retained at 39e709e6a0a1ce75c051b04c3cc3c16240f2cdc9. The filter-sharing fix adds no requirements or test gaps; existing typed whole-filter regressions remain passing and trace bindings unchanged. No new findings.
+
+## Quota scope extension verification
+
+Scoped PASS retained at b99241a31f911951a3eac0caaf6d7260238737a7. FR-031-AC-4/5 are examined for actual-cost reconciliation and safety. Fresh engine matrix retains both tagged and now explicitly binds the replay regression as well as the new multiprocess, out-of-order, rollover, crash, migration, wrong-store and cheap-catalog fixtures. No new criteria, stubs or unowned behaviors are introduced; existing historic repository trace gaps remain outside scope. Original full-filter and quota-isolation regression remains passing.
+
+```yaml
+{
+  "scope": [
+    {
+      "id": "FR-031-AC-4",
+      "path": "spec/functional/FR-031-shared-linear-quota.md",
+      "role": "examined",
+      "excerpt": "With fixture request/complexity budgets and two competing processes, aggregate sends never exceed either budget; every direct/history request is counted, unknown cost uses the documented estimate, quota reserve prevents the next send, and local refusal has its distinct diagnostic."
+    },
+    {
+      "id": "FR-031-AC-5",
+      "path": "spec/functional/FR-031-shared-linear-quota.md",
+      "role": "examined",
+      "excerpt": "Counters record requests attempted, returned complexity when available, estimated complexity otherwise, duration, mode, and success/failure for each refresh; partial failed refresh costs remain counted and are never described as a successful sync."
+    }
+  ]
+}
+```
