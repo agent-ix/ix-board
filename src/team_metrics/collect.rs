@@ -809,7 +809,7 @@ impl GithubSource for SelectedGithub {
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// Trace: FR-032-AC-5
+    /// Trace: FR-033-AC-5
     #[test]
     fn stale_backoff_snapshots_cannot_refresh_tracker_success() {
         let freshness = |stale, sync| crate::CacheFreshness {
@@ -829,7 +829,7 @@ mod tests {
         assert!(verified_sync_ms(Some(freshness(false, Some(i64::MAX)))).is_err());
         assert!(verified_sync_ms(None).is_err());
     }
-    /// Trace: FR-032-AC-6
+    /// Trace: FR-033-AC-6
     #[test]
     fn removing_or_canceling_work_does_not_create_delivery() {
         let selectors = super::super::Selectors {
@@ -863,7 +863,7 @@ mod tests {
 #[cfg(test)]
 mod revision_tests {
     use super::*;
-    /// Trace: FR-032-AC-6
+    /// Trace: FR-033-AC-6
     #[test]
     fn changing_selectors_invalidates_comparable_effort_history() {
         let old = super::super::Selectors {
