@@ -457,6 +457,10 @@ impl RefreshOutcome {
                 decision: (**decision).clone(),
             },
             Error::RefreshLockTimeout => Self::RefreshLockRefused,
+            Error::LinearRateLimited { .. }
+            | Error::LinearLocalBudgetExhausted { .. }
+            | Error::LinearQueryComplexityExceeded { .. }
+            | Error::InvalidQuotaConfig { .. } => Self::Unknown,
             _ => Self::SourceFailed,
         }
     }

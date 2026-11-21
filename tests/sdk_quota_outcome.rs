@@ -62,6 +62,9 @@ impl WorkspaceSource for FixtureSource {
                 messages: "Linear rate limited; retry in 99s".to_owned(),
             }),
             3 => Err(Error::RefreshLockTimeout),
+            5 => Err(Error::LinearRateLimited {
+                retry_after: Duration::from_secs(10),
+            }),
             _ => Err(Error::GraphQl {
                 messages: "an unrelated replacement diagnostic".to_owned(),
             }),
@@ -203,6 +206,15 @@ fn source_and_lock_outcomes_do_not_classify_failure_message_text() {
         assert!(freshness.stale);
         assert_eq!(freshness.rate_limit_until, None);
     }
+    mode.store(5, Ordering::SeqCst);
+    service
+        .force_refresh_workspace()
+        .expect("legacy error fallback");
+    assert_eq!(
+        service.refresh_outcome(),
+        &RefreshOutcome::Unknown,
+        "a legacy quota error has no captured decision metadata"
+    );
     mode.store(3, Ordering::SeqCst);
     service.force_refresh_workspace().expect("lock fallback");
     assert_eq!(

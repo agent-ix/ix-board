@@ -254,7 +254,7 @@ impl QuotaClock for SystemQuotaClock {
 /// Persisted state visible without credential resolution or a Linear request.
 #[derive(Clone, Debug, Serialize)]
 pub struct QuotaStatus {
-    /// Latest server cooldown, Unix milliseconds; absent before observation.
+    /// Active actual-server cooldown, Unix milliseconds; absent when inactive.
     pub rate_limit_until: Option<i64>,
     /// Current locally allocated request capacity.
     pub request_budget: u64,
