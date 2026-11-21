@@ -40,8 +40,11 @@ the default SHALL be free/basic. Tier fallback SHALL apply multipliers 1, 1, 2,
 and 5 respectively to API-key 2,500 requests/3,000,000 complexity per hour or
 OAuth 5,000 requests/2,000,000 complexity per hour, with a 10,000 single-query
 complexity ceiling. Actual Limit/Remaining/Reset headers SHALL override fallback
-capacity. A configurable share and reserve SHALL leave allowance for other tools;
-defaults SHALL allocate at most 50 percent to ix-board. Business SHALL be selected
+capacity. The transport SHALL apply the configured share to both request and
+complexity capacities. Configuration validation SHALL accept only finite shares
+in the range `0 < share <= 0.5`, including explicit overrides, leaving at least
+50 percent for other tools before applying any additional reserve. Defaults SHALL
+remain within that range. Business SHALL be selected
 for the owner's installation through configuration, not a global default.
 A local budget rejection SHALL make no
 request, use the same stale fallback eligibility, and emit a distinct
@@ -58,7 +61,7 @@ SHALL use a documented conservative estimate, never zero.
 | FR-031-AC-4 | With fixture request/complexity budgets and two competing processes, aggregate sends never exceed either budget; every direct/history request is counted, unknown cost uses the documented estimate, quota reserve prevents the next send, and local refusal has its distinct diagnostic. | Test |
 | FR-031-AC-5 | Counters record requests attempted, returned complexity when available, estimated complexity otherwise, duration, mode, and success/failure for each refresh; partial failed refresh costs remain counted and are never described as a successful sync. | Test |
 | FR-031-AC-6 | `ix-board cache status` returns cache path, dataset coverage, snapshot age/staleness, last successful sync/full reconciliation, `rate_limit_until`, local budget/reset and latest refresh counters in JSON and text without resolving credentials or making any network request; unknown values are explicit. | Test |
-| FR-031-AC-7 | Tier fixtures produce the documented API-key/OAuth fallback limits and multipliers, default to free/basic with at most 50 percent share, reject invalid configuration, and honor lower actual header capacity; two API keys sharing the cache consume one allowance and a query exceeding 10,000 estimated complexity is refused locally. | Test |
+| FR-031-AC-7 | Tier fixtures produce the documented API-key/OAuth fallback limits and multipliers, default to free/basic with at most 50 percent share, and honor lower actual header capacity; explicit shares 0.1 and 0.5 apply to both request and complexity capacities, while zero, negative, above-0.5, non-finite, or malformed shares fail before network access. Two API keys sharing the cache consume one allowance and a query exceeding 10,000 estimated complexity is refused locally. | Test |
 
 ## Dependencies
 

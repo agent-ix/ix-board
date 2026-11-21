@@ -18,6 +18,22 @@ Summary reads SHALL NOT make a detail cache fresh. Commands SHALL request ticket
 data only when their answer needs tickets. Retro workspace reads and update probes
 SHALL use the shared refresh coordinator rather than forcing duplicate full scans.
 
+The read service SHALL partition baseline compatibility by exact source endpoint,
+workspace identity, authorization identity, cache-model/schema version, and dataset
+coverage (summary/detail and any selected scope). The read service SHALL use an
+opaque, secret-free credential-derived identity as a conservative authorization-
+visibility proxy without persisting the credential itself. A changed credential
+SHALL require a new baseline even
+when it belongs to the same user. A missing or mismatched compatibility component
+SHALL prohibit reuse, delta merge, and stale fallback from that baseline. The
+coordinator SHALL establish a full baseline for the requested partition instead;
+if that refresh cannot run or fails, the read SHALL fail without exposing records
+from another partition. Visibility changes made server-side without changing the
+credential cannot be inferred from that proxy; the daily accessible-catalog
+reconciliation remains the bound on removing unobserved inaccessible records.
+This dataset partition SHALL NOT split the conservative cross-credential quota
+gate defined by [FR-031](FR-031-shared-linear-quota.md).
+
 When a compatible baseline exists, the coordinator SHALL request changed issues,
 projects, and initiatives using `updatedAt >= last_successful_sync - 60 seconds`,
 merge by stable ID, and preserve unchanged records. It SHALL include archived
@@ -45,6 +61,7 @@ data is requested; a summary-only command SHALL reconcile only summary catalogs.
 | FR-030-AC-3 | With no baseline, incompatible baseline, or a full reconciliation 24 hours old, the next applicable refresh performs a full scan; an ID absent from its source catalog is removed. An ordinary intervening refresh uses only deltas, and output exposes the last full reconciliation time. | Test |
 | FR-030-AC-4 | Cold roadmap and scope-check fixtures request no issue pages or histories; requesting a ticket-dependent report loads detail, subsequent reports reuse it, and a summary refresh never advances detail freshness. | Test |
 | FR-030-AC-5 | Two retro workers sharing a fixture cache reuse the centrally coordinated snapshot/delta without each probing and forcing a full workspace fetch; ticket/history requests remain covered by the shared quota meter. | Test |
+| FR-030-AC-6 | Fixtures independently change source endpoint, workspace, credential-derived authorization identity, cache-model/schema version, and dataset coverage while retaining overlapping stable record IDs; each mismatch (or absent compatibility metadata) requires a full baseline, never merges or returns the old partition as fallback, and a failed/blocked baseline exposes no old-partition records. An exact partition match permits incremental reuse; changing credentials does not reset the shared quota allowance. | Test |
 
 ## Dependencies
 
