@@ -1084,7 +1084,11 @@ fn unavailable_initiative_links_contaminate_initiative_includes_and_exclusions()
     assert_eq!(included.initiatives.len(), 1, "the known placement is kept");
     assert_eq!(included.state, SelectionState::Incomplete);
     assert_eq!(included.counts_availability, CountAvailability::Partial);
-    assert!(included.unknown_facts.contains(&UnknownFact::InitiativeLinks));
+    assert!(
+        included
+            .unknown_facts
+            .contains(&UnknownFact::InitiativeLinks)
+    );
     // The companion selection names no initiative, so its own result stays complete.
     assert_eq!(plain.state, SelectionState::Complete);
     assert_eq!(plain.counts_availability, CountAvailability::Complete);
@@ -1106,7 +1110,11 @@ fn unavailable_initiative_links_contaminate_initiative_includes_and_exclusions()
     assert_eq!(leaves(excluded), want(&["SWM-2"]), "known leaves are kept");
     assert_eq!(excluded.state, SelectionState::Incomplete);
     assert_eq!(excluded.counts_availability, CountAvailability::Partial);
-    assert!(excluded.unknown_facts.contains(&UnknownFact::InitiativeLinks));
+    assert!(
+        excluded
+            .unknown_facts
+            .contains(&UnknownFact::InitiativeLinks)
+    );
     assert_eq!(hidden.selections[1].state, SelectionState::Complete);
     assert_eq!(hidden.teams[0].state, SelectionState::Incomplete);
     assert!(hidden.teams[0].causes.iter().any(|cause| cause.key == "s0"));

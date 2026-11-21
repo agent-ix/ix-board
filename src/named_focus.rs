@@ -396,6 +396,12 @@ struct Closure {
     issues: BTreeSet<IssueId>,
 }
 
+/// One list's evaluation: a report per member, and the closure of each resolved member.
+struct ListEvaluation {
+    reports: Vec<MemberReport>,
+    resolved: Vec<(NamedMember, Closure)>,
+}
+
 /// One selection's membership, computed but not yet counted.
 struct Draft<'a> {
     request: &'a NamedFocusRequest,
@@ -574,11 +580,7 @@ impl<'a> Context<'a> {
         )
     }
 
-    fn ticket_closure(
-        &self,
-        team: &TeamKey,
-        id: &str,
-    ) -> Result<(MemberOutcome, Closure), Error> {
+    fn ticket_closure(&self, team: &TeamKey, id: &str) -> Result<(MemberOutcome, Closure), Error> {
         let root = IssueId(id.to_owned());
         let Some(issue) = self.issues.get(&root) else {
             return Ok((Self::absent(self.evidence.tickets), Closure::default()));
@@ -616,7 +618,7 @@ impl<'a> Context<'a> {
         team: &TeamKey,
         list: ListKind,
         members: &[NamedMember],
-    ) -> Result<(Vec<MemberReport>, Vec<(NamedMember, Closure)>), Error> {
+    ) -> Result<ListEvaluation, Error> {
         let mut reports = Vec::new();
         let mut resolved = Vec::new();
         for member in members {
@@ -630,17 +632,21 @@ impl<'a> Context<'a> {
                 resolved.push((member.clone(), closure));
             }
         }
-        Ok((reports, resolved))
+        Ok(ListEvaluation { reports, resolved })
     }
 
     fn draft<'r>(&self, request: &'r NamedFocusRequest) -> Result<Draft<'r>, Error> {
         let selection = &request.selection;
         let team = &selection.team;
         self.budget.check()?;
-        let (mut members, include) =
-            self.evaluate_list(team, ListKind::Include, &selection.include)?;
-        let (excluded_reports, exclude) =
-            self.evaluate_list(team, ListKind::Exclude, &selection.exclude)?;
+        let ListEvaluation {
+            reports: mut members,
+            resolved: include,
+        } = self.evaluate_list(team, ListKind::Include, &selection.include)?;
+        let ListEvaluation {
+            reports: excluded_reports,
+            resolved: exclude,
+        } = self.evaluate_list(team, ListKind::Exclude, &selection.exclude)?;
         members.extend(excluded_reports);
         members.sort_by(|a, b| (a.list, &a.member).cmp(&(b.list, &b.member)));
         let team_known = self.team_known(team);
