@@ -25,7 +25,7 @@ pub use named_focus::{
     evaluate_named_batch,
 };
 pub use named_selection::{
-    NAMED_SELECTION_SCHEMA_VERSION, NamedList, NamedMember, NamedMemberInput, NamedSelection,
+    NAMED_SELECTION_SCHEMA_VERSION, NamedMember, NamedMemberInput, NamedSelection,
     NamedSelectionInput, ResolvedNamedInput, ResolvedNamedSelection, canonicalize_named_selection,
     decode_named_selection,
 };
@@ -831,7 +831,7 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
     /// after it has expired. `selection` equals what
     /// [`ReadService::canonicalize_named_selection_bounded`] returns. `associations`
     /// holds each occurrence of `include`, then of `exclude`, exactly once and in input
-    /// order, identified by [`NamedList`] and index; see [`ResolvedNamedSelection`]. A
+    /// order, identified by [`ListKind`] and index; see [`ResolvedNamedSelection`]. A
     /// timeout or any bad member returns the error with neither a selection nor
     /// associations.
     pub fn resolve_named_selection_bounded(

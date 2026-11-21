@@ -203,7 +203,7 @@ deadline, snapshot and resolution, and it also returns what every input occurren
 resolved to. Do not resolve a second time to find out.
 
 ```rust
-use ix_board::{NamedList, NamedMemberInput, NamedSelectionInput};
+use ix_board::{ListKind, NamedMemberInput, NamedSelectionInput};
 use std::collections::BTreeMap;
 
 let input = NamedSelectionInput {
@@ -217,10 +217,10 @@ let input = NamedSelectionInput {
 };
 // Your own labels, keyed by where the input stood: (list, index in that list).
 let labels = BTreeMap::from([
-    ((NamedList::Include, 0), "second ticket"),
-    ((NamedList::Include, 1), "alpha"),
-    ((NamedList::Include, 2), "alpha (by key)"),
-    ((NamedList::Exclude, 0), "skip it"),
+    ((ListKind::Include, 0), "second ticket"),
+    ((ListKind::Include, 1), "alpha"),
+    ((ListKind::Include, 2), "alpha (by key)"),
+    ((ListKind::Exclude, 0), "skip it"),
 ]);
 
 let resolved = service.resolve_named_selection_bounded(&policy, &input)?;
@@ -245,10 +245,9 @@ for entry in &resolved.associations {
   ticket in both lists is two associations (one per list) and one member in each list
   of the selection. Repeating an identical input gives one association per repetition,
   so each can keep a different label. Each entry also carries the `input` you supplied.
-- You own the labels. The SDK does not truncate them, choose between the labels of
-  aliases of one member, or store them: if two aliases carry different labels, which one
-  to keep (first, last, or both) is your decision, and you have every association to
-  decide with.
+- You own the labels. The SDK returns each association with its input and resolved
+  member. Keep your labels alongside the inputs. When aliases have different labels,
+  choose whether to keep the first, last, or all labels.
 - The timeout and error rules are those of `canonicalize_named_selection_bounded`.
   Capturing the associations is inside the same deadline. A timeout, or any member that
   is missing, ambiguous, of another team or owned by another project, returns the error

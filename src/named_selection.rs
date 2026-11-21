@@ -13,7 +13,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::read_bound::Budget;
-use crate::{Error, MemberOutcome, TeamKey, WorkspaceSnapshot, scope};
+use crate::{Error, ListKind, MemberOutcome, TeamKey, WorkspaceSnapshot, scope};
 
 /// The only schema version the named-selection decoder reads.
 pub const NAMED_SELECTION_SCHEMA_VERSION: u32 = 3;
@@ -267,15 +267,6 @@ pub(crate) fn canonicalize_within(
     order_within(resolved, budget)
 }
 
-/// Which member list of a [`NamedSelectionInput`] an input occurrence belongs to.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum NamedList {
-    /// [`NamedSelectionInput::include`].
-    Include,
-    /// [`NamedSelectionInput::exclude`].
-    Exclude,
-}
-
 /// What one input occurrence resolved to, in the same validation pass that produced the
 /// canonical selection.
 ///
@@ -286,7 +277,7 @@ pub enum NamedList {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedNamedInput {
     /// The list the occurrence was supplied in.
-    pub list: NamedList,
+    pub list: ListKind,
     /// The occurrence's zero-based index within that list, as supplied.
     pub index: usize,
     /// The input exactly as supplied at that list and index.
@@ -313,7 +304,7 @@ pub struct ResolvedNamedSelection {
 
 impl ResolvedNamedSelection {
     /// The association of the occurrence at `index` of `list`, if the input had one.
-    pub fn association(&self, list: NamedList, index: usize) -> Option<&ResolvedNamedInput> {
+    pub fn association(&self, list: ListKind, index: usize) -> Option<&ResolvedNamedInput> {
         self.associations
             .iter()
             .find(|entry| entry.list == list && entry.index == index)
@@ -331,8 +322,8 @@ pub(crate) fn resolve_within(
     let resolved = resolve_members(snapshot, input, budget)?;
     let mut associations = Vec::with_capacity(input.include.len() + input.exclude.len());
     for (list, inputs, members) in [
-        (NamedList::Include, &input.include, &resolved.include),
-        (NamedList::Exclude, &input.exclude, &resolved.exclude),
+        (ListKind::Include, &input.include, &resolved.include),
+        (ListKind::Exclude, &input.exclude, &resolved.exclude),
     ] {
         for (index, (supplied, member)) in inputs.iter().zip(members).enumerate() {
             budget.check()?;

@@ -7,7 +7,7 @@
 
 use ix_board::{
     CatalogEvidence, Clock, Deadline, Error, Initiative, Issue, IssueId, LinearGraphQlSource,
-    MemberOutcome, Milestone, NamedFocusRequest, NamedList, NamedMember, NamedMemberInput,
+    ListKind, MemberOutcome, Milestone, NamedFocusRequest, NamedMember, NamedMemberInput,
     NamedSelection, NamedSelectionInput, Project, ProjectId, ProjectStatusCategory, ReadPolicy,
     ReadService, ResolvedNamedSelection, TeamKey, WorkflowStateType, WorkspaceSnapshot,
     WorkspaceSource, canonicalize_named_selection,
@@ -2030,13 +2030,13 @@ fn every_input_occurrence_keeps_its_list_index_and_exact_member() {
         .into_iter()
         .zip(&input.include)
         .enumerate()
-        .map(|(index, (member, supplied))| (NamedList::Include, index, supplied, member))
+        .map(|(index, (member, supplied))| (ListKind::Include, index, supplied, member))
         .chain(
             aliased_exclude_members()
                 .into_iter()
                 .zip(&input.exclude)
                 .enumerate()
-                .map(|(index, (member, supplied))| (NamedList::Exclude, index, supplied, member)),
+                .map(|(index, (member, supplied))| (ListKind::Exclude, index, supplied, member)),
         )
         .collect::<Vec<_>>();
     assert_eq!(resolved.associations.len(), expected.len());
@@ -2046,13 +2046,13 @@ fn every_input_occurrence_keeps_its_list_index_and_exact_member() {
         assert_eq!(entry.member, member, "{list:?}[{index}] resolved member");
         assert_eq!(resolved.association(list, index), Some(entry));
     }
-    assert_eq!(resolved.association(NamedList::Include, 10), None);
-    assert_eq!(resolved.association(NamedList::Exclude, 4), None);
+    assert_eq!(resolved.association(ListKind::Include, 10), None);
+    assert_eq!(resolved.association(ListKind::Exclude, 4), None);
 
     // The associations and the selection describe the same members, per list.
     for (list, canonical) in [
-        (NamedList::Include, &resolved.selection.include),
-        (NamedList::Exclude, &resolved.selection.exclude),
+        (ListKind::Include, &resolved.selection.include),
+        (ListKind::Exclude, &resolved.selection.exclude),
     ] {
         let associated = resolved
             .associations
@@ -2076,18 +2076,18 @@ fn a_caller_attaches_its_own_labels_to_aliases_and_repeats_without_resolving_aga
         .resolve_named_selection_bounded(&policy(240, Duration::from_secs(5)), &input)
         .expect("resolves");
 
-    let labels: BTreeMap<(NamedList, usize), &str> = INCLUDE_LABELS
+    let labels: BTreeMap<(ListKind, usize), &str> = INCLUDE_LABELS
         .iter()
         .enumerate()
-        .map(|(index, label)| ((NamedList::Include, index), *label))
+        .map(|(index, label)| ((ListKind::Include, index), *label))
         .chain(
             EXCLUDE_LABELS
                 .iter()
                 .enumerate()
-                .map(|(index, label)| ((NamedList::Exclude, index), *label)),
+                .map(|(index, label)| ((ListKind::Exclude, index), *label)),
         )
         .collect();
-    let mut by_member: BTreeMap<(NamedList, NamedMember), Vec<&str>> = BTreeMap::new();
+    let mut by_member: BTreeMap<(ListKind, NamedMember), Vec<&str>> = BTreeMap::new();
     for entry in &resolved.associations {
         by_member
             .entry((entry.list, entry.member.clone()))
@@ -2096,27 +2096,27 @@ fn a_caller_attaches_its_own_labels_to_aliases_and_repeats_without_resolving_aga
     }
     // Three spellings of one project keep three labels; the SDK chose none of them.
     assert_eq!(
-        by_member[&(NamedList::Include, want_project("uuid-alpha"))],
+        by_member[&(ListKind::Include, want_project("uuid-alpha"))],
         ["alpha by name", "alpha by key", "alpha by id"]
     );
     // An identical input repeated keeps its separate, distinct metadata.
     assert_eq!(input.include[0], input.include[7]);
     assert_eq!(
-        by_member[&(NamedList::Include, want_issue("uuid-t2"))],
+        by_member[&(ListKind::Include, want_issue("uuid-t2"))],
         ["ticket", "ticket again", "ticket by id"]
     );
     // One member in both lists keeps one label per list.
     assert_eq!(
-        by_member[&(NamedList::Exclude, want_issue("uuid-t2"))],
+        by_member[&(ListKind::Exclude, want_issue("uuid-t2"))],
         ["skip ticket", "skip ticket again"]
     );
     // Same-named milestones of different projects stay distinct by owner.
     assert_eq!(
-        by_member[&(NamedList::Include, want_milestone("uuid-m3", "uuid-other"))],
+        by_member[&(ListKind::Include, want_milestone("uuid-m3", "uuid-other"))],
         ["beta of other"]
     );
     assert_eq!(
-        by_member[&(NamedList::Include, want_milestone("uuid-m2", "uuid-alpha"))],
+        by_member[&(ListKind::Include, want_milestone("uuid-m2", "uuid-alpha"))],
         ["beta of alpha"]
     );
     assert_eq!(
@@ -2147,8 +2147,8 @@ fn the_same_member_in_both_lists_is_one_occurrence_per_list() {
     assert_eq!(
         list_and_index,
         [
-            (NamedList::Include, 0, want_issue("uuid-t1")),
-            (NamedList::Exclude, 0, want_issue("uuid-t1")),
+            (ListKind::Include, 0, want_issue("uuid-t1")),
+            (ListKind::Exclude, 0, want_issue("uuid-t1")),
         ]
     );
     assert_eq!(resolved.selection.include, [want_issue("uuid-t1")]);
