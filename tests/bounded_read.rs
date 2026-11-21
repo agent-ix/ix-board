@@ -6,8 +6,9 @@
 //! loopback server; nothing here reads the process environment or a real credential.
 
 use ix_board::{
-    Clock, Deadline, Error, LinearGraphQlSource, ReadPolicy, ReadService, WorkspaceSnapshot,
-    WorkspaceSource,
+    CatalogEvidence, Clock, Deadline, Error, Issue, IssueId, LinearGraphQlSource, NamedFocusRequest,
+    NamedMember, NamedSelection, Project, ProjectId, ProjectStatusCategory, ReadPolicy,
+    ReadService, TeamKey, WorkflowStateType, WorkspaceSnapshot, WorkspaceSource,
 };
 use ix_cli_kit::secrets::{
     AppScope, CredentialBackend, DeleteStatus, Presence, SecretError, SecretKey, SecretStore,
@@ -32,6 +33,9 @@ struct ManualClock {
     epoch: Arc<AtomicI64>,
     base: Instant,
     elapsed: Arc<Mutex<Duration>>,
+    /// Added to the monotonic time after every reading of it, so work that checks the
+    /// deadline sees time pass without any real waiting. Zero unless a test sets it.
+    step: Arc<Mutex<Duration>>,
 }
 
 impl ManualClock {
@@ -40,7 +44,12 @@ impl ManualClock {
             epoch: Arc::new(AtomicI64::new(epoch)),
             base: Instant::now(),
             elapsed: Arc::new(Mutex::new(Duration::ZERO)),
+            step: Arc::new(Mutex::new(Duration::ZERO)),
         }
+    }
+
+    fn set_step(&self, step: Duration) {
+        *self.step.lock().expect("clock step lock") = step;
     }
 
     fn set_epoch(&self, epoch: i64) {
@@ -62,7 +71,11 @@ impl Clock for ManualClock {
     }
 
     fn monotonic_now(&self) -> Instant {
-        self.base + self.elapsed()
+        let step = *self.step.lock().expect("clock step lock");
+        let mut elapsed = self.elapsed.lock().expect("clock lock");
+        let now = self.base + *elapsed;
+        *elapsed += step;
+        now
     }
 }
 
@@ -87,6 +100,8 @@ struct FakeSource {
     behavior: Arc<Mutex<Behavior>>,
     reads: Arc<AtomicUsize>,
     timeouts: Arc<Mutex<Vec<Duration>>>,
+    /// How long describing the catalog evidence takes on the controlled clock.
+    evidence_cost: Arc<Mutex<Duration>>,
 }
 
 impl FakeSource {
@@ -98,7 +113,12 @@ impl FakeSource {
             behavior: Arc::new(Mutex::new(Behavior::Succeed)),
             reads: Arc::new(AtomicUsize::new(0)),
             timeouts: Arc::new(Mutex::new(Vec::new())),
+            evidence_cost: Arc::new(Mutex::new(Duration::ZERO)),
         }
+    }
+
+    fn evidence_takes(&self, cost: Duration) {
+        *self.evidence_cost.lock().expect("evidence cost lock") = cost;
     }
 
     fn behave(&self, behavior: Behavior) {
@@ -128,6 +148,12 @@ impl WorkspaceSource for FakeSource {
 
     fn supports_bounded_read(&self) -> bool {
         self.bounded
+    }
+
+    fn catalog_evidence(&self) -> CatalogEvidence {
+        let cost = *self.evidence_cost.lock().expect("evidence cost lock");
+        self.clock.advance(cost);
+        CatalogEvidence::default()
     }
 
     fn fetch_workspace_bounded(&self, deadline: &Deadline<'_>) -> Result<WorkspaceSnapshot, Error> {
@@ -948,4 +974,217 @@ fn a_credential_failure_is_the_existing_error_and_nothing_is_read_or_retried() {
         assert_eq!(reads.load(Ordering::SeqCst), 1);
     }
     assert_eq!(server.requests(), 0);
+}
+
+/// One project of `issues` open leaves, enough work that evaluating it checks the budget
+/// many times.
+fn workload(issues: usize) -> WorkspaceSnapshot {
+    let project = Project {
+        id: ProjectId("p1".into()),
+        identifier: Some("PRJ-p1".into()),
+        name: "Project p1".into(),
+        updated_at: None,
+        description: String::new(),
+        content: None,
+        status: "Started".into(),
+        status_name: None,
+        status_category: ProjectStatusCategory::Started,
+        priority: 2,
+        sort_order: 0.0,
+        target_date: None,
+        team_keys: vec![TeamKey("SWM".into())],
+        milestones: vec![],
+        initiatives: vec![],
+    };
+    let issues = (0..issues)
+        .map(|index| Issue {
+            id: IssueId(format!("SWM-{index}")),
+            identifier: format!("SWM-{index}"),
+            title: format!("Issue {index}"),
+            description: None,
+            state: "Specced".into(),
+            state_name: "Specced".into(),
+            state_type: WorkflowStateType::Unstarted,
+            parent_id: None,
+            team_key: TeamKey("SWM".into()),
+            assignee_id: None,
+            assignee_name: None,
+            project_id: Some(ProjectId("p1".into())),
+            project_milestone_id: None,
+            priority: 2.0,
+            sort_order: 0.0,
+            blocked_by: vec![],
+            created_at: None,
+            updated_at: None,
+            attachment_urls: vec![],
+            attachments_complete: true,
+        })
+        .collect();
+    WorkspaceSnapshot {
+        projects: vec![project],
+        issues,
+        fetched_at: 0,
+    }
+}
+
+fn project_batch() -> Vec<NamedFocusRequest> {
+    vec![NamedFocusRequest {
+        key: "focus".into(),
+        selection: NamedSelection::new(
+            TeamKey("SWM".into()),
+            vec![NamedMember::Project { id: "p1".into() }],
+            vec![],
+        ),
+    }]
+}
+
+fn is_timeout(result: &Result<impl std::fmt::Debug, Error>, deadline: Duration) -> bool {
+    matches!(result, Err(Error::ReadTimeout { deadline: actual }) if *actual == deadline)
+}
+
+#[trace("FR-004-AC-14", "FR-004-AC-16")]
+#[test]
+fn a_cache_hit_that_outlives_the_deadline_returns_the_timeout_not_the_snapshot() {
+    let clock = ManualClock::new(11_000);
+    let mut source = FakeSource::new(&clock, true);
+    source.snapshot = workload(400);
+    let directory = tempfile::tempdir().expect("dir");
+    let mut service = open(&source, &clock, &cache_path(&directory));
+    let limits = policy(240, Duration::from_secs(1));
+    service
+        .workspace_snapshot_bounded(&limits)
+        .expect("a cold read fills the cache");
+    assert_eq!(source.reads(), 1);
+    // From here every look at the clock costs 600 ms, so the one second passes while the
+    // cached entry is looked up, copied and decoded.
+    clock.set_step(Duration::from_millis(600));
+    let result = service.workspace_snapshot_bounded(&limits);
+    assert!(
+        is_timeout(&result, Duration::from_secs(1)),
+        "an expired cache hit is the typed timeout, never the snapshot: {:?}",
+        result.map(|snapshot| snapshot.issues.len())
+    );
+    assert_eq!(
+        source.reads(),
+        1,
+        "an expired cache hit starts no source read"
+    );
+    // The entry is untouched and still serves a read that has time to spare.
+    clock.set_step(Duration::ZERO);
+    let served = service
+        .workspace_snapshot_bounded(&limits)
+        .expect("served from the cache");
+    assert_eq!((source.reads(), served.issues.len()), (1, 400));
+}
+
+#[trace("FR-004-AC-14", "FR-012-AC-19")]
+#[test]
+fn the_composed_batch_keeps_one_budget_through_evidence_and_evaluation() {
+    let limit = Duration::from_secs(5);
+    // The source's catalog evidence consumes the rest of the budget after the read.
+    let clock = ManualClock::new(12_000);
+    let mut source = FakeSource::new(&clock, true);
+    source.snapshot = workload(3);
+    source.evidence_takes(Duration::from_secs(6));
+    let directory = tempfile::tempdir().expect("dir");
+    let mut service = open(&source, &clock, &cache_path(&directory));
+    let result = service.named_batch_bounded(&policy(240, limit), &project_batch());
+    assert!(
+        is_timeout(&result, limit),
+        "no publishable batch after expiry: {result:?}"
+    );
+    assert_eq!(source.reads(), 1);
+
+    // A cold read followed by an evaluation that keeps checking the same budget: each
+    // look at the clock costs 100 ms of the one second, so the evaluation of a large
+    // snapshot runs the budget out and the batch is refused rather than returned late.
+    let clock = ManualClock::new(12_000);
+    let mut source = FakeSource::new(&clock, true);
+    source.snapshot = workload(60);
+    let directory = tempfile::tempdir().expect("dir");
+    let mut service = open(&source, &clock, &cache_path(&directory));
+    let limits = policy(240, Duration::from_secs(1));
+    clock.set_step(Duration::from_millis(100));
+    let result = service.named_batch_bounded(&limits, &project_batch());
+    assert!(
+        is_timeout(&result, Duration::from_secs(1)),
+        "a refresh near the deadline cannot evaluate past it: {result:?}"
+    );
+
+    // The same evaluation after a cache hit is under the same single budget.
+    let clock = ManualClock::new(12_000);
+    let mut source = FakeSource::new(&clock, true);
+    source.snapshot = workload(60);
+    let directory = tempfile::tempdir().expect("dir");
+    let mut service = open(&source, &clock, &cache_path(&directory));
+    service
+        .workspace_snapshot_bounded(&limits)
+        .expect("a cold read fills the cache");
+    clock.set_step(Duration::from_millis(100));
+    let result = service.named_batch_bounded(&limits, &project_batch());
+    assert!(
+        is_timeout(&result, Duration::from_secs(1)),
+        "a cache hit near the deadline cannot evaluate past it: {result:?}"
+    );
+    assert_eq!(source.reads(), 1, "the cache hit read nothing");
+
+    // With time to spare the same call returns the complete batch for that one snapshot.
+    clock.set_step(Duration::ZERO);
+    let batch = service
+        .named_batch_bounded(&limits, &project_batch())
+        .expect("the batch with a budget to spare");
+    assert_eq!(batch.selections[0].counts.total, 60);
+    assert_eq!(source.reads(), 1);
+}
+
+#[trace("FR-004-AC-13")]
+#[test]
+fn an_old_writer_replacing_the_payload_in_the_same_second_voids_the_evidence() {
+    let clock = ManualClock::new(13_000);
+    let source = FakeSource::new(&clock, true);
+    let directory = tempfile::tempdir().expect("dir");
+    let path = cache_path(&directory);
+    let mut service = open(&source, &clock, &path);
+    let limits = policy(240, Duration::from_secs(5));
+    service
+        .workspace_snapshot_bounded(&limits)
+        .expect("a cold read writes evidence");
+    assert_eq!(source.reads(), 1);
+    // An older writer stores a different payload at the very same `fetched_at` and
+    // leaves the evidence columns as they were. The clock has not moved, so nothing but
+    // the payload itself can show that the evidence no longer describes it.
+    let foreign = WorkspaceSnapshot {
+        fetched_at: 13_000,
+        ..workload(1)
+    };
+    Connection::open(&path)
+        .expect("open cache")
+        .execute(
+            "INSERT INTO workspace_snapshot(cache_key, fetched_at, payload) VALUES (?1, ?2, ?3)
+             ON CONFLICT(cache_key) DO UPDATE SET fetched_at = excluded.fetched_at,
+               payload = excluded.payload",
+            params![
+                "fixture-default",
+                13_000_i64,
+                serde_json::to_vec(&foreign).expect("encode")
+            ],
+        )
+        .expect("old writer");
+    let refreshed = service
+        .workspace_snapshot_bounded(&limits)
+        .expect("bounded read");
+    assert_eq!(
+        source.reads(),
+        2,
+        "evidence of another payload is refreshed"
+    );
+    assert!(
+        refreshed.issues.is_empty(),
+        "the old writer's payload is not served as bounded data"
+    );
+    // The refresh wrote new evidence, so the next read is a cache hit again.
+    service
+        .workspace_snapshot_bounded(&limits)
+        .expect("cached read");
+    assert_eq!(source.reads(), 2);
 }

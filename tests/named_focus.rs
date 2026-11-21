@@ -1050,3 +1050,77 @@ fn legacy_scope_selection_is_unchanged_beside_the_named_selection() {
     assert_eq!(legacy.leaf_ids.len(), 4);
     assert_eq!(legacy.project_ids.len(), 2);
 }
+
+#[trace("FR-010-AC-17", "FR-010-AC-18", "FR-012-AC-17", "FR-012-AC-21")]
+#[test]
+fn unavailable_initiative_links_contaminate_initiative_includes_and_exclusions() {
+    // Initiative `ini` is known to hold P1. P2 also holds team work, and nothing in the
+    // snapshot says whether P2 is linked to `ini` as well.
+    let snapshot = snapshot(
+        vec![project("p1", &["ini"]), project("p2", &[])],
+        vec![open("SWM-1", "p1"), open("SWM-2", "p2")],
+    );
+    let unknown = CatalogEvidence::default();
+    let established = CatalogEvidence {
+        initiative_links: true,
+        ..CatalogEvidence::default()
+    };
+    let batch = |evidence: &CatalogEvidence, selections: Vec<NamedSelection>| {
+        let requests = selections
+            .into_iter()
+            .enumerate()
+            .map(|(index, chosen)| request(&format!("s{index}"), chosen))
+            .collect::<Vec<_>>();
+        evaluate_named_batch(&snapshot, evidence, &requests).expect("batch evaluates")
+    };
+    let including = || selection("SWM", vec![init("ini")], vec![]);
+    let excluding = || selection("SWM", vec![proj("p1"), proj("p2")], vec![init("ini")]);
+    let companion = || selection("SWM", vec![proj("p1")], vec![]);
+
+    // Include: the known leaf stays, but P2's links could hide more leaves of `ini`.
+    let hidden = batch(&unknown, vec![including(), companion()]);
+    let (included, plain) = (&hidden.selections[0], &hidden.selections[1]);
+    assert_eq!(leaves(included), want(&["SWM-1"]), "known leaves are kept");
+    assert_eq!(included.initiatives.len(), 1, "the known placement is kept");
+    assert_eq!(included.state, SelectionState::Incomplete);
+    assert_eq!(included.counts_availability, CountAvailability::Partial);
+    assert!(included.unknown_facts.contains(&UnknownFact::InitiativeLinks));
+    // The companion selection names no initiative, so its own result stays complete.
+    assert_eq!(plain.state, SelectionState::Complete);
+    assert_eq!(plain.counts_availability, CountAvailability::Complete);
+    // The team union depends on the uncertain selection and names it as a cause.
+    let team = &hidden.teams[0];
+    assert_eq!(team.state, SelectionState::Incomplete);
+    assert_eq!(team.counts_availability, CountAvailability::Partial);
+    let cause = team
+        .causes
+        .iter()
+        .find(|cause| cause.key == "s0")
+        .expect("the initiative selection is a cause");
+    assert_eq!(cause.state, SelectionState::Incomplete);
+    assert!(cause.unknown_facts.contains(&UnknownFact::InitiativeLinks));
+
+    // Exclude: P2 may belong to `ini` and so may already be excluded.
+    let hidden = batch(&unknown, vec![excluding(), companion()]);
+    let excluded = &hidden.selections[0];
+    assert_eq!(leaves(excluded), want(&["SWM-2"]), "known leaves are kept");
+    assert_eq!(excluded.state, SelectionState::Incomplete);
+    assert_eq!(excluded.counts_availability, CountAvailability::Partial);
+    assert!(excluded.unknown_facts.contains(&UnknownFact::InitiativeLinks));
+    assert_eq!(hidden.selections[1].state, SelectionState::Complete);
+    assert_eq!(hidden.teams[0].state, SelectionState::Incomplete);
+    assert!(hidden.teams[0].causes.iter().any(|cause| cause.key == "s0"));
+
+    // With the links established the same selections are complete and no cause remains.
+    let known = batch(&established, vec![including(), excluding(), companion()]);
+    assert!(
+        known
+            .selections
+            .iter()
+            .all(|s| s.state == SelectionState::Complete && s.unknown_facts.is_empty())
+    );
+    assert_eq!(known.teams[0].state, SelectionState::Complete);
+    assert!(known.teams[0].causes.is_empty());
+    assert_eq!(leaves(&known.selections[0]), want(&["SWM-1"]));
+    assert_eq!(leaves(&known.selections[1]), want(&["SWM-2"]));
+}

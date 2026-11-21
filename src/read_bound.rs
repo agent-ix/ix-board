@@ -93,8 +93,9 @@ impl<'a> Deadline<'a> {
 mod tests {
     use super::*;
     use crate::SystemClock;
+    use ix_trace_rs::trace;
 
-    /// Trace: FR-004-AC-12
+    #[trace("FR-004-AC-12")]
     #[test]
     fn policy_rejects_an_age_above_the_entry_lifetime_and_a_zero_deadline() {
         let valid = ReadPolicy {
@@ -119,7 +120,7 @@ mod tests {
         }
     }
 
-    /// Trace: FR-004-AC-14
+    #[trace("FR-004-AC-14")]
     #[test]
     fn request_timeout_is_clamped_to_the_time_remaining() {
         let deadline = Deadline::start(&SystemClock, Duration::from_secs(5));
