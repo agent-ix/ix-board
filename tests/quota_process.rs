@@ -309,4 +309,84 @@ fn actual_cost_and_remaining_headers_preserve_reserve_and_failed_attempt_charges
             .to_string(),
         "Linear local budget exhausted; retry in 60s"
     );
+    gate(&directory.path().join("endpoint.sqlite"), NOW + 60_000)
+        .reserve(10, None)
+        .expect("exhausted endpoint fallback remaining expires with its sixty-second cooldown");
+}
+
+#[trace("FR-031-AC-4", "FR-031-AC-7")]
+#[test]
+fn positive_endpoint_remaining_is_atomically_reserved_across_processes_and_expires() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("quota.sqlite");
+    let shared = gate(&path, NOW);
+    let reset = (NOW + 1000).to_string();
+    shared
+        .observe(
+            200,
+            &headers(&[
+                ("x-ratelimit-endpoint-requests-limit", "100"),
+                ("x-ratelimit-endpoint-requests-remaining", "1"),
+                ("x-ratelimit-endpoint-requests-reset", &reset),
+            ]),
+            None,
+            10,
+        )
+        .expect("positive endpoint headroom");
+    let first = child(&path, "reserve").spawn().expect("first competitor");
+    let second = child(&path, "reserve").spawn().expect("second competitor");
+    assert!(
+        first
+            .wait_with_output()
+            .expect("first outcome")
+            .status
+            .success()
+    );
+    assert!(
+        second
+            .wait_with_output()
+            .expect("second outcome")
+            .status
+            .success()
+    );
+    assert_eq!(
+        shared.status().expect("status").requests_used,
+        1,
+        "one remaining endpoint request cannot admit two processes"
+    );
+    assert_eq!(
+        shared
+            .reserve(10, None)
+            .expect_err("endpoint reservation consumed")
+            .to_string(),
+        "Linear local budget exhausted; retry in 1s"
+    );
+    gate(&path, NOW + 1000)
+        .reserve(10, None)
+        .expect("endpoint reset permits another attempt");
+    assert_eq!(shared.status().expect("status").requests_used, 2);
+}
+
+#[trace("FR-031-AC-4", "FR-031-AC-7")]
+#[test]
+fn actual_endpoint_limit_applies_share_even_without_remaining_header() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("quota.sqlite");
+    let shared = gate(&path, NOW);
+    shared
+        .observe(
+            200,
+            &headers(&[("x-ratelimit-endpoint-requests-limit", "2")]),
+            None,
+            10,
+        )
+        .expect("actual endpoint capacity");
+    shared
+        .reserve(10, None)
+        .expect("one allocated endpoint request");
+    assert!(matches!(
+        shared.reserve(10, None),
+        Err(Error::LinearLocalBudgetExhausted { .. })
+    ));
+    assert_eq!(shared.status().expect("status").requests_used, 1);
 }

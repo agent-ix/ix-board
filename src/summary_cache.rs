@@ -144,6 +144,8 @@ fn summary_read(
         last_successful_sync: sync,
         last_full_reconciliation: full,
         freshness: CacheFreshness {
+            last_successful_sync: Some(sync),
+            last_full_reconciliation: Some(full),
             stale: error.is_some(),
             age_seconds: now.checked_sub(sync).filter(|age| *age >= 0),
             rate_limit_until,

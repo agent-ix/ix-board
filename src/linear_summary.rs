@@ -10,32 +10,32 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const PAGE_LIMIT: usize = 1_000;
 const PROJECTS: &str = r#"
-query SummaryProjects($first:Int!, $after:String, $filter:ProjectFilter) {
- projects(first:$first, after:$after, filter:$filter, includeArchived:true, orderBy:updatedAt) {
+query SummaryProjects($first:Int!, $after:String, $filter:ProjectFilter, $includeArchived:Boolean!) {
+ projects(first:$first, after:$after, filter:$filter, includeArchived:$includeArchived, orderBy:updatedAt) {
   nodes { id name description updatedAt archivedAt trashed progress priority sortOrder targetDate
    status { name type }
-   initiatives(first:10, includeArchived:true) { nodes { id name } pageInfo { hasNextPage endCursor } }
+   initiatives(first:10, includeArchived:false) { nodes { id name } pageInfo { hasNextPage endCursor } }
   }
   pageInfo { hasNextPage endCursor }
  }
 }"#;
 const INITIATIVES: &str = r#"
-query SummaryInitiatives($first:Int!, $after:String, $filter:InitiativeFilter) {
- initiatives(first:$first, after:$after, filter:$filter, includeArchived:true, orderBy:updatedAt) {
+query SummaryInitiatives($first:Int!, $after:String, $filter:InitiativeFilter, $includeArchived:Boolean!) {
+ initiatives(first:$first, after:$after, filter:$filter, includeArchived:$includeArchived, orderBy:updatedAt) {
   nodes { id name updatedAt archivedAt trashed status health
-   projects(first:10, includeArchived:true, includeSubInitiatives:false) { nodes { id } pageInfo { hasNextPage endCursor } }
+   projects(first:10, includeArchived:false, includeSubInitiatives:false) { nodes { id } pageInfo { hasNextPage endCursor } }
   }
   pageInfo { hasNextPage endCursor }
  }
 }"#;
 const PROJECT_MEMBERSHIPS: &str = r#"
 query SummaryProjectMemberships($id:String!, $after:String) {
- project(id:$id) { initiatives(first:50, after:$after, includeArchived:true) {
+ project(id:$id) { initiatives(first:50, after:$after, includeArchived:false) {
  nodes { id name } pageInfo { hasNextPage endCursor } } }
 }"#;
 const INITIATIVE_MEMBERSHIPS: &str = r#"
 query SummaryInitiativeMemberships($id:String!, $after:String) {
- initiative(id:$id) { projects(first:50, after:$after, includeArchived:true, includeSubInitiatives:false) {
+ initiative(id:$id) { projects(first:50, after:$after, includeArchived:false, includeSubInitiatives:false) {
  nodes { id } pageInfo { hasNextPage endCursor } } }
 }"#;
 
@@ -258,12 +258,15 @@ struct Variables<'a> {
     first: i32,
     after: Option<&'a str>,
     filter: Option<UpdatedFilter<'a>>,
+    #[serde(rename = "includeArchived")]
+    include_archived: bool,
 }
 impl<'a> Variables<'a> {
     fn new(first: i32, after: Option<&'a str>, since: Option<&'a str>) -> Self {
         Self {
             first,
             after,
+            include_archived: since.is_some(),
             filter: since.map(|gte| UpdatedFilter {
                 updated_at: Since { gte },
             }),

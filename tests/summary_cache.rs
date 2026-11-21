@@ -129,7 +129,8 @@ fn native_catalog_pages_never_enumerate_tickets_and_keep_weighted_progress() {
     for request in requests {
         let query = request["query"].as_str().expect("query text");
         assert!(!query.contains("issues") && !query.contains("history"));
-        assert!(query.contains("includeArchived:true"));
+        assert!(query.contains("includeArchived:$includeArchived"));
+        assert_eq!(request["variables"]["includeArchived"], false);
     }
     let summary = merge_summary(&SummarySnapshot::default(), snapshot);
     let roadmap = build_summary_roadmap(&summary, None, "2026-11-21T00:00:00Z");

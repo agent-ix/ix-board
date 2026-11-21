@@ -327,7 +327,11 @@ impl QuotaGate {
                 complexity_remaining INTEGER,
                 endpoint_until INTEGER NOT NULL DEFAULT 0,
                 request_budget INTEGER,
-                complexity_budget INTEGER
+                complexity_budget INTEGER,
+                endpoint_limit INTEGER,
+                endpoint_remaining INTEGER,
+                endpoint_reset INTEGER NOT NULL DEFAULT 0,
+                endpoint_used INTEGER NOT NULL DEFAULT 0
             );
             INSERT OR IGNORE INTO linear_shared_quota(singleton) VALUES(1);",
             )
@@ -336,6 +340,34 @@ impl QuotaGate {
             deadline.remaining()?;
         }
         initialized?;
+        // Quota storage evolves independently of snapshot cache versions. Older
+        // quota tables retain their active cooldown and conservative counters.
+        gate.transaction(deadline, |transaction| {
+            let mut statement = transaction
+                .prepare("PRAGMA table_info(linear_shared_quota)")
+                .map_err(Error::Cache)?;
+            let names = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(Error::Cache)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(Error::Cache)?;
+            drop(statement);
+            for (name, definition) in [
+                ("endpoint_limit", "INTEGER"),
+                ("endpoint_remaining", "INTEGER"),
+                ("endpoint_reset", "INTEGER NOT NULL DEFAULT 0"),
+                ("endpoint_used", "INTEGER NOT NULL DEFAULT 0"),
+            ] {
+                if !names.iter().any(|existing| existing == name) {
+                    transaction
+                        .execute_batch(&format!(
+                            "ALTER TABLE linear_shared_quota ADD COLUMN {name} {definition}"
+                        ))
+                        .map_err(Error::Cache)?;
+                }
+            }
+            Ok(())
+        })?;
         Ok(gate)
     }
 
@@ -388,6 +420,9 @@ impl QuotaGate {
                 complexity_remaining = CASE WHEN complexity_reset <= ?1 THEN NULL ELSE complexity_remaining END,
                 request_budget = CASE WHEN request_reset <= ?1 THEN NULL ELSE request_budget END,
                 complexity_budget = CASE WHEN complexity_reset <= ?1 THEN NULL ELSE complexity_budget END,
+                endpoint_used = CASE WHEN endpoint_reset <= ?1 THEN 0 ELSE endpoint_used END,
+                endpoint_remaining = CASE WHEN endpoint_reset <= ?1 THEN NULL ELSE endpoint_remaining END,
+                endpoint_reset = CASE WHEN endpoint_reset <= ?1 THEN ?2 ELSE endpoint_reset END,
                 request_reset = CASE WHEN request_reset <= ?1 THEN ?2 ELSE request_reset END,
                 complexity_reset = CASE WHEN complexity_reset <= ?1 THEN ?2 ELSE complexity_reset END
              WHERE singleton = 1",
@@ -475,6 +510,16 @@ impl QuotaGate {
                 exhausted_until = exhausted_until.max(state.complexity_reset_at);
             }
             exhausted_until = exhausted_until.max(endpoint_until);
+            let (endpoint_limit, endpoint_remaining, endpoint_reset, endpoint_used): (Option<u64>, Option<u64>, i64, u64) = transaction.query_row(
+                "SELECT endpoint_limit, endpoint_remaining, endpoint_reset, endpoint_used FROM linear_shared_quota WHERE singleton=1",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).map_err(Error::Cache)?;
+            let endpoint_headroom = endpoint_limit.map_or(0, |limit| self.config.reserved_headroom(limit));
+            if endpoint_limit.is_some_and(|limit| endpoint_used >= self.config.allocate(limit))
+                || endpoint_remaining.is_some_and(|left| left < 1 + endpoint_headroom)
+            {
+                exhausted_until = exhausted_until.max(endpoint_reset);
+            }
             if exhausted_until > now {
                 return Err(Error::LinearLocalBudgetExhausted { retry_after: ceil_delay(exhausted_until, now) });
             }
@@ -482,6 +527,8 @@ impl QuotaGate {
                 "UPDATE linear_shared_quota SET requests=requests+1, complexity=complexity+?1,
                  request_remaining=MAX(0,request_remaining-1),
                  complexity_remaining=MAX(0,complexity_remaining-?1),
+                 endpoint_remaining=MAX(0,endpoint_remaining-1),
+                 endpoint_used=endpoint_used+1,
                  request_budget=?2, complexity_budget=?3 WHERE singleton=1",
                 params![cost, state.request_budget, state.complexity_budget],
             ).map_err(Error::Cache)?;
@@ -516,11 +563,15 @@ impl QuotaGate {
             for (kind, limit_column, remaining_column, reset_column) in [
                 ("requests", "request_limit", "request_remaining", "request_reset"),
                 ("complexity", "complexity_limit", "complexity_remaining", "complexity_reset"),
+                ("endpoint-requests", "endpoint_limit", "endpoint_remaining", "endpoint_reset"),
             ] {
                 let limit = header_integer(headers, &format!("x-ratelimit-{kind}-limit"));
                 let remaining = header_integer(headers, &format!("x-ratelimit-{kind}-remaining"));
                 let reset = header_integer(headers, &format!("x-ratelimit-{kind}-reset"))
-                    .and_then(|value| i64::try_from(value).ok()).filter(|reset| *reset > now);
+                    .and_then(|value| i64::try_from(value).ok()).filter(|reset| *reset > now)
+                    // Exhausted remaining state must expire with the same fallback
+                    // cooldown, rather than silently extending it to a fallback hour.
+                    .or_else(|| (remaining == Some(0)).then(|| now.saturating_add(60_000)));
                 // Within a window, late concurrent responses must never restore consumed headroom.
                 let sql = format!("UPDATE linear_shared_quota SET {limit_column}=COALESCE(?1,{limit_column}),
                     {remaining_column}=CASE WHEN ?2 IS NULL THEN {remaining_column}

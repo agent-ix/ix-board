@@ -1092,7 +1092,7 @@ fn run_drift(
 fn render_human(output: &Output) -> String {
     match output {
         Output::Cached { result, freshness } => format!(
-            "{}\nstale: {}\nage_seconds: {}\nrate_limit_until: {}{}",
+            "{}\nstale: {}\nage_seconds: {}\nrate_limit_until: {}\nlast_successful_sync: {}\nlast_full_reconciliation: {}{}",
             render_human(result),
             freshness.stale,
             freshness
@@ -1101,6 +1101,12 @@ fn render_human(output: &Output) -> String {
             freshness
                 .rate_limit_until
                 .map_or_else(|| "unknown".to_owned(), |until| until.to_string()),
+            freshness
+                .last_successful_sync
+                .map_or_else(|| "unknown".to_owned(), |sync| sync.to_string()),
+            freshness
+                .last_full_reconciliation
+                .map_or_else(|| "unknown".to_owned(), |full| full.to_string()),
             freshness
                 .failure_reason
                 .as_ref()
@@ -1939,6 +1945,8 @@ mod tests {
         let output = Output::Cached {
             result: Box::new(Output::Queue(Vec::new())),
             freshness: ix_board::CacheFreshness {
+                last_successful_sync: None,
+                last_full_reconciliation: None,
                 stale: true,
                 age_seconds: None,
                 rate_limit_until: Some(1_800_000_060),

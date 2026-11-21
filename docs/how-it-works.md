@@ -53,6 +53,9 @@ reconciliation times, quota state, and refresh counters without credentials or n
 is running or when a bounded timeout left no time to record a final descriptor.
 Transport reservations remain counted even when a refresh fails or times out.
 Summary and fallback JSON wrap the command payload in `result`, beside freshness metadata.
+Fresh detailed commands retain their array or object payload shape. `cache status`
+provides every dataset's provenance, and library callers can inspect `cache_freshness()`.
+Summary and stale envelopes include `last_successful_sync` and `last_full_reconciliation`.
 
 `IX_BOARD_CACHE_PATH` selects the database path. See [setup](setup.md#cache-location)
 for the default locations. `focus hygiene` also stores its most recent baseline

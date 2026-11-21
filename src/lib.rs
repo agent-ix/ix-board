@@ -117,7 +117,7 @@ pub enum Error {
     #[error("Linear request failed: {0}")]
     Http(#[from] reqwest::Error),
     /// Linear exhausted a request or complexity quota.
-    #[error("Linear rate limited; retry in {}s", retry_after.as_secs() + u64::from(retry_after.subsec_nanos() > 0))]
+    #[error("Linear rate limited; retry in {}s", retry_after.as_secs().saturating_add(u64::from(retry_after.subsec_nanos() > 0)))]
     LinearRateLimited {
         /// Minimum cooldown before attempting another source request.
         retry_after: std::time::Duration,
@@ -132,7 +132,7 @@ pub enum Error {
     #[error("ix-board configuration is unreadable or malformed")]
     InvalidConfiguration,
     /// The shared local allocation is exhausted before transport send.
-    #[error("Linear local budget exhausted; retry in {}s", retry_after.as_secs() + u64::from(retry_after.subsec_nanos() > 0))]
+    #[error("Linear local budget exhausted; retry in {}s", retry_after.as_secs().saturating_add(u64::from(retry_after.subsec_nanos() > 0)))]
     LinearLocalBudgetExhausted { retry_after: std::time::Duration },
     /// A quota setting is invalid.
     #[error("invalid Linear quota configuration: {reason}")]
@@ -418,6 +418,10 @@ pub struct ReadService<S, C = SystemClock> {
 /// Provenance of the latest ordinary read, including an unsuccessful refresh.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct CacheFreshness {
+    /// Actual successful source-fetch start, unknown for legacy snapshots.
+    pub last_successful_sync: Option<i64>,
+    /// Last authoritative accessible-catalog reconciliation.
+    pub last_full_reconciliation: Option<i64>,
     /// Whether a failed refresh forced reuse of the last complete snapshot.
     pub stale: bool,
     /// Seconds since the successful source read began.
@@ -960,6 +964,8 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
                     .and_then(|started| self.clock.now_epoch_seconds().checked_sub(started))
                     .filter(|age| *age >= 0);
                 self.freshness = Some(CacheFreshness {
+                    last_successful_sync: self.cache.source_started_at()?,
+                    last_full_reconciliation: self.cache.last_full_reconciliation()?,
                     stale: age.is_none(),
                     age_seconds: age,
                     rate_limit_until: None,
@@ -985,6 +991,8 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
                     _ => None,
                 };
                 self.freshness = Some(CacheFreshness {
+                    last_successful_sync: self.cache.source_started_at()?,
+                    last_full_reconciliation: self.cache.last_full_reconciliation()?,
                     stale: true,
                     age_seconds: self
                         .cache
