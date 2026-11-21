@@ -137,8 +137,18 @@ impl Collector {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        let agents = retro::live::LiveAgents::start(teams.clone());
+        let machines = self
+            .config
+            .scopes
+            .iter()
+            .flat_map(|s| &s.leads)
+            .filter_map(|lead| lead.split(':').next().map(str::to_owned))
+            .collect();
+        let agents = retro::live::LiveAgents::start_on_machines(teams.clone(), machines);
         let result = agents.report(&teams);
+        if let Err(error) = &result {
+            eprintln!("lifecycle evidence: {error}");
+        }
         let mut samples = Vec::new();
         let complete = result.is_ok();
         if let Ok(report) = result {

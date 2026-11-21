@@ -624,6 +624,12 @@ pub struct LiveAgents {
 impl LiveAgents {
     /// Starts reading the agents of `teams` now; [`AgentSource::report`] collects the result.
     pub fn start(teams: Vec<String>) -> Self {
+        Self::start_on_machines(teams, Vec::new())
+    }
+
+    /// Restricts remote reads to configured lead machines; the local host is
+    /// still verified through its native topology. Empty selects every host.
+    pub fn start_on_machines(teams: Vec<String>, machines: Vec<String>) -> Self {
         let (sender, receiver) = std::sync::mpsc::channel();
         if teams.is_empty() {
             return Self {
@@ -635,6 +641,16 @@ impl LiveAgents {
             let report = system_hosts()
                 .map_err(|error| error.to_string())
                 .map(|hosts| {
+                    let hosts: Vec<_> = hosts
+                        .into_iter()
+                        .filter(|host| {
+                            machines.is_empty()
+                                || host.label() == "local"
+                                || machines
+                                    .iter()
+                                    .any(|machine| machine.eq_ignore_ascii_case(host.label()))
+                        })
+                        .collect();
                     let mut no_queue = |_: &str| Ok(None);
                     build_report(&hosts, &teams, AGENTS_IDLE_AFTER_SECS, &mut no_queue)
                 });
