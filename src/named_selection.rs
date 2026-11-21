@@ -13,7 +13,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::read_bound::Budget;
-use crate::{Error, MemberOutcome, TeamKey, WorkspaceSnapshot, scope};
+use crate::{Error, ListKind, MemberOutcome, TeamKey, WorkspaceSnapshot, scope};
 
 /// The only schema version the named-selection decoder reads.
 pub const NAMED_SELECTION_SCHEMA_VERSION: u32 = 3;
@@ -263,6 +263,98 @@ pub(crate) fn canonicalize_within(
     input: &NamedSelectionInput,
     budget: Budget<'_>,
 ) -> Result<NamedSelection, Error> {
+    let resolved = resolve_members(snapshot, input, budget)?;
+    order_within(resolved, budget)
+}
+
+/// What one input occurrence resolved to, in the same validation pass that produced the
+/// canonical selection.
+///
+/// The occurrence is identified by `list` and `index`: the position of `input` in
+/// [`NamedSelectionInput::include`] or [`NamedSelectionInput::exclude`] as the caller
+/// supplied them. Repeated or equal inputs are separate occurrences with separate
+/// indexes, and the same `member` can appear for several occurrences and in both lists.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedNamedInput {
+    /// The list the occurrence was supplied in.
+    pub list: ListKind,
+    /// The occurrence's zero-based index within that list, as supplied.
+    pub index: usize,
+    /// The input exactly as supplied at that list and index.
+    pub input: NamedMemberInput,
+    /// The canonical member that occurrence resolved to.
+    pub member: NamedMember,
+}
+
+/// A canonical [`NamedSelection`] together with what every input occurrence resolved to.
+///
+/// `selection` is sorted and de-duplicated per list and equals what
+/// [`canonicalize_named_selection`] returns for the same snapshot and input.
+/// `associations` is in input order, not canonical order: every occurrence of
+/// `include` in supplied order, then every occurrence of `exclude` in supplied order,
+/// each exactly once. Join an occurrence to your own data by `(list, index)`, never by
+/// position in `selection`. The wire document carries no association.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedNamedSelection {
+    /// The canonical selection to store or publish.
+    pub selection: NamedSelection,
+    /// One entry per input occurrence, in input order.
+    pub associations: Vec<ResolvedNamedInput>,
+}
+
+impl ResolvedNamedSelection {
+    /// The association of the occurrence at `index` of `list`, if the input had one.
+    pub fn association(&self, list: ListKind, index: usize) -> Option<&ResolvedNamedInput> {
+        self.associations
+            .iter()
+            .find(|entry| entry.list == list && entry.index == index)
+    }
+}
+
+/// Like [`canonicalize_within`], and also keeps what every input occurrence resolved to.
+/// It runs the same resolution and the same ordering; it only records the per-occurrence
+/// members that the canonical ordering would otherwise discard.
+pub(crate) fn resolve_within(
+    snapshot: &WorkspaceSnapshot,
+    input: &NamedSelectionInput,
+    budget: Budget<'_>,
+) -> Result<ResolvedNamedSelection, Error> {
+    let resolved = resolve_members(snapshot, input, budget)?;
+    let mut associations = Vec::with_capacity(input.include.len() + input.exclude.len());
+    for (list, inputs, members) in [
+        (ListKind::Include, &input.include, &resolved.include),
+        (ListKind::Exclude, &input.exclude, &resolved.exclude),
+    ] {
+        for (index, (supplied, member)) in inputs.iter().zip(members).enumerate() {
+            budget.check()?;
+            associations.push(ResolvedNamedInput {
+                list,
+                index,
+                input: supplied.clone(),
+                member: member.clone(),
+            });
+        }
+    }
+    Ok(ResolvedNamedSelection {
+        selection: order_within(resolved, budget)?,
+        associations,
+    })
+}
+
+/// Every input occurrence resolved, in input order and before any ordering.
+struct ResolvedMembers {
+    team: TeamKey,
+    include: Vec<NamedMember>,
+    exclude: Vec<NamedMember>,
+}
+
+/// The one resolution pass: validates the team and resolves every occurrence of both
+/// lists, in input order. Any failure fails the whole call.
+fn resolve_members(
+    snapshot: &WorkspaceSnapshot,
+    input: &NamedSelectionInput,
+    budget: Budget<'_>,
+) -> Result<ResolvedMembers, Error> {
     if input.team.trim().is_empty() {
         return Err(Error::InvalidTeam);
     }
@@ -282,11 +374,20 @@ pub(crate) fn canonicalize_within(
     };
     let include = resolve(&input.include)?;
     let exclude = resolve(&input.exclude)?;
+    Ok(ResolvedMembers {
+        team,
+        include,
+        exclude,
+    })
+}
+
+/// The one canonical ordering of resolved members, under `budget`.
+fn order_within(resolved: ResolvedMembers, budget: Budget<'_>) -> Result<NamedSelection, Error> {
     Ok(NamedSelection {
         schema_version: NAMED_SELECTION_SCHEMA_VERSION,
-        team: team.clone(),
-        include: canonical_list_within(include, budget)?,
-        exclude: canonical_list_within(exclude, budget)?,
+        team: resolved.team,
+        include: canonical_list_within(resolved.include, budget)?,
+        exclude: canonical_list_within(resolved.exclude, budget)?,
     })
 }
 

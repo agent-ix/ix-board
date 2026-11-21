@@ -26,7 +26,8 @@ pub use named_focus::{
 };
 pub use named_selection::{
     NAMED_SELECTION_SCHEMA_VERSION, NamedMember, NamedMemberInput, NamedSelection,
-    NamedSelectionInput, canonicalize_named_selection, decode_named_selection,
+    NamedSelectionInput, ResolvedNamedInput, ResolvedNamedSelection, canonicalize_named_selection,
+    decode_named_selection,
 };
 use read_bound::Budget;
 pub use read_bound::{Deadline, ReadPolicy};
@@ -818,6 +819,35 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
             named_selection::canonicalize_within(&snapshot, input, Budget::within(&deadline))?;
         deadline.remaining()?;
         Ok(selection)
+    }
+
+    /// [`ReadService::canonicalize_named_selection_bounded`] that also returns what every
+    /// input occurrence resolved to, so a caller can attach its own labels or original
+    /// reference text without resolving a second time.
+    ///
+    /// It is the same call: one deadline started before the cache lookup, one snapshot,
+    /// one resolution pass, and the same canonical ordering. Capturing the associations
+    /// and the final success check run under that same deadline, so nothing is returned
+    /// after it has expired. `selection` equals what
+    /// [`ReadService::canonicalize_named_selection_bounded`] returns. `associations`
+    /// holds each occurrence of `include`, then of `exclude`, exactly once and in input
+    /// order, identified by [`ListKind`] and index; see [`ResolvedNamedSelection`]. A
+    /// timeout or any bad member returns the error with neither a selection nor
+    /// associations.
+    pub fn resolve_named_selection_bounded(
+        &mut self,
+        policy: &ReadPolicy,
+        input: &NamedSelectionInput,
+    ) -> Result<ResolvedNamedSelection, Error> {
+        self.admit_bounded(policy)?;
+        let clock: &dyn Clock = &self.clock;
+        let deadline = Deadline::start(clock, policy.deadline);
+        let snapshot = read_within(&self.source, &mut self.cache, clock, policy, &deadline)?;
+        deadline.remaining()?;
+        let resolved =
+            named_selection::resolve_within(&snapshot, input, Budget::within(&deadline))?;
+        deadline.remaining()?;
+        Ok(resolved)
     }
 
     /// Refuses an invalid policy or a source that cannot honor a bound, before any read.

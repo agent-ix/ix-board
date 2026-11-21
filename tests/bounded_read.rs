@@ -7,9 +7,10 @@
 
 use ix_board::{
     CatalogEvidence, Clock, Deadline, Error, Initiative, Issue, IssueId, LinearGraphQlSource,
-    MemberOutcome, Milestone, NamedFocusRequest, NamedMember, NamedMemberInput, NamedSelection,
-    NamedSelectionInput, Project, ProjectId, ProjectStatusCategory, ReadPolicy, ReadService,
-    TeamKey, WorkflowStateType, WorkspaceSnapshot, WorkspaceSource, canonicalize_named_selection,
+    ListKind, MemberOutcome, Milestone, NamedFocusRequest, NamedMember, NamedMemberInput,
+    NamedSelection, NamedSelectionInput, Project, ProjectId, ProjectStatusCategory, ReadPolicy,
+    ReadService, ResolvedNamedSelection, TeamKey, WorkflowStateType, WorkspaceSnapshot,
+    WorkspaceSource, canonicalize_named_selection,
 };
 use ix_cli_kit::secrets::{
     AppScope, CredentialBackend, DeleteStatus, Presence, SecretError, SecretKey, SecretStore,
@@ -19,6 +20,7 @@ use ix_trace_rs::trace;
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -1896,4 +1898,505 @@ fn one_project_with_many_team_keys_stops_the_holds_team_work_scan_at_the_deadlin
         &team_input("T-0", project()),
         &team_input(&format!("T-{LAST}"), project()),
     );
+}
+
+fn want_initiative(id: &str) -> NamedMember {
+    NamedMember::Initiative { id: id.into() }
+}
+
+fn want_project(id: &str) -> NamedMember {
+    NamedMember::Project { id: id.into() }
+}
+
+fn want_issue(id: &str) -> NamedMember {
+    NamedMember::Issue { id: id.into() }
+}
+
+fn want_milestone(id: &str, project_id: &str) -> NamedMember {
+    NamedMember::Milestone {
+        id: id.into(),
+        project_id: project_id.into(),
+    }
+}
+
+/// Every kind, out of alphabetical order, with several spellings of one project, one
+/// initiative and one ticket, an identical input repeated, two milestones of the same
+/// name owned by different projects, and members that sit in both lists.
+fn aliased_input() -> NamedSelectionInput {
+    named_input(
+        vec![
+            NamedMemberInput::Ticket("SWM-2".into()),
+            NamedMemberInput::Project("Project / Alpha".into()),
+            NamedMemberInput::Initiative("Delivery".into()),
+            NamedMemberInput::Project("PRJ-1".into()),
+            NamedMemberInput::Project("uuid-alpha".into()),
+            milestone_input("PRJ-1/Beta", Some("PRJ-1")),
+            milestone_input("PRJ-2/Beta", Some("Other")),
+            NamedMemberInput::Ticket("SWM-2".into()),
+            NamedMemberInput::Ticket("uuid-t2".into()),
+            NamedMemberInput::Initiative("I-10".into()),
+        ],
+        vec![
+            NamedMemberInput::Ticket("swm-2".into()),
+            NamedMemberInput::Project("Other".into()),
+            NamedMemberInput::Project("PRJ-1".into()),
+            NamedMemberInput::Ticket("SWM-2".into()),
+        ],
+    )
+}
+
+/// What each occurrence of [`aliased_input`] must resolve to, by hand, in input order.
+fn aliased_include_members() -> Vec<NamedMember> {
+    vec![
+        want_issue("uuid-t2"),
+        want_project("uuid-alpha"),
+        want_initiative("uuid-init"),
+        want_project("uuid-alpha"),
+        want_project("uuid-alpha"),
+        want_milestone("uuid-m2", "uuid-alpha"),
+        want_milestone("uuid-m3", "uuid-other"),
+        want_issue("uuid-t2"),
+        want_issue("uuid-t2"),
+        want_initiative("uuid-init"),
+    ]
+}
+
+fn aliased_exclude_members() -> Vec<NamedMember> {
+    vec![
+        want_issue("uuid-t2"),
+        want_project("uuid-other"),
+        want_project("uuid-alpha"),
+        want_issue("uuid-t2"),
+    ]
+}
+
+/// Labels a caller owns, one per input occurrence. They exist only in this test: the
+/// library has no label field.
+const INCLUDE_LABELS: [&str; 10] = [
+    "ticket",
+    "alpha by name",
+    "delivery by name",
+    "alpha by key",
+    "alpha by id",
+    "beta of alpha",
+    "beta of other",
+    "ticket again",
+    "ticket by id",
+    "delivery by key",
+];
+const EXCLUDE_LABELS: [&str; 4] = [
+    "skip ticket",
+    "skip other",
+    "skip alpha",
+    "skip ticket again",
+];
+
+#[trace("FR-016-AC-11", "FR-016-AC-6")]
+#[test]
+fn every_input_occurrence_keeps_its_list_index_and_exact_member() {
+    let clock = ManualClock::new(18_000);
+    let directory = tempfile::tempdir().expect("dir");
+    let (mut service, source) = naming_service(naming_snapshot(), &clock, &directory);
+    let limits = policy(240, Duration::from_secs(5));
+    let input = aliased_input();
+
+    let resolved = service
+        .resolve_named_selection_bounded(&limits, &input)
+        .expect("resolves");
+    assert_eq!(source.reads(), 1, "one snapshot read served the whole call");
+
+    // The canonical selection is sorted and has no duplicates, per list.
+    assert_eq!(
+        resolved.selection.include,
+        [
+            want_initiative("uuid-init"),
+            want_project("uuid-alpha"),
+            want_milestone("uuid-m2", "uuid-alpha"),
+            want_milestone("uuid-m3", "uuid-other"),
+            want_issue("uuid-t2"),
+        ]
+    );
+    assert_eq!(
+        resolved.selection.exclude,
+        [
+            want_project("uuid-alpha"),
+            want_project("uuid-other"),
+            want_issue("uuid-t2"),
+        ]
+    );
+
+    // Every occurrence appears exactly once: include in supplied order, then exclude.
+    let expected = aliased_include_members()
+        .into_iter()
+        .zip(&input.include)
+        .enumerate()
+        .map(|(index, (member, supplied))| (ListKind::Include, index, supplied, member))
+        .chain(
+            aliased_exclude_members()
+                .into_iter()
+                .zip(&input.exclude)
+                .enumerate()
+                .map(|(index, (member, supplied))| (ListKind::Exclude, index, supplied, member)),
+        )
+        .collect::<Vec<_>>();
+    assert_eq!(resolved.associations.len(), expected.len());
+    for (entry, (list, index, supplied, member)) in resolved.associations.iter().zip(expected) {
+        assert_eq!((entry.list, entry.index), (list, index));
+        assert_eq!(&entry.input, supplied, "{list:?}[{index}] keeps its input");
+        assert_eq!(entry.member, member, "{list:?}[{index}] resolved member");
+        assert_eq!(resolved.association(list, index), Some(entry));
+    }
+    assert_eq!(resolved.association(ListKind::Include, 10), None);
+    assert_eq!(resolved.association(ListKind::Exclude, 4), None);
+
+    // The associations and the selection describe the same members, per list.
+    for (list, canonical) in [
+        (ListKind::Include, &resolved.selection.include),
+        (ListKind::Exclude, &resolved.selection.exclude),
+    ] {
+        let associated = resolved
+            .associations
+            .iter()
+            .filter(|entry| entry.list == list)
+            .map(|entry| &entry.member)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(associated, canonical.iter().collect::<BTreeSet<_>>());
+    }
+    assert_eq!(source.reads(), 1, "nothing resolved a second time");
+}
+
+#[trace("FR-016-AC-11")]
+#[test]
+fn a_caller_attaches_its_own_labels_to_aliases_and_repeats_without_resolving_again() {
+    let clock = ManualClock::new(18_100);
+    let directory = tempfile::tempdir().expect("dir");
+    let (mut service, source) = naming_service(naming_snapshot(), &clock, &directory);
+    let input = aliased_input();
+    let resolved = service
+        .resolve_named_selection_bounded(&policy(240, Duration::from_secs(5)), &input)
+        .expect("resolves");
+
+    let labels: BTreeMap<(ListKind, usize), &str> = INCLUDE_LABELS
+        .iter()
+        .enumerate()
+        .map(|(index, label)| ((ListKind::Include, index), *label))
+        .chain(
+            EXCLUDE_LABELS
+                .iter()
+                .enumerate()
+                .map(|(index, label)| ((ListKind::Exclude, index), *label)),
+        )
+        .collect();
+    let mut by_member: BTreeMap<(ListKind, NamedMember), Vec<&str>> = BTreeMap::new();
+    for entry in &resolved.associations {
+        by_member
+            .entry((entry.list, entry.member.clone()))
+            .or_default()
+            .push(labels[&(entry.list, entry.index)]);
+    }
+    // Three spellings of one project keep three labels; the SDK chose none of them.
+    assert_eq!(
+        by_member[&(ListKind::Include, want_project("uuid-alpha"))],
+        ["alpha by name", "alpha by key", "alpha by id"]
+    );
+    // An identical input repeated keeps its separate, distinct metadata.
+    assert_eq!(input.include[0], input.include[7]);
+    assert_eq!(
+        by_member[&(ListKind::Include, want_issue("uuid-t2"))],
+        ["ticket", "ticket again", "ticket by id"]
+    );
+    // One member in both lists keeps one label per list.
+    assert_eq!(
+        by_member[&(ListKind::Exclude, want_issue("uuid-t2"))],
+        ["skip ticket", "skip ticket again"]
+    );
+    // Same-named milestones of different projects stay distinct by owner.
+    assert_eq!(
+        by_member[&(ListKind::Include, want_milestone("uuid-m3", "uuid-other"))],
+        ["beta of other"]
+    );
+    assert_eq!(
+        by_member[&(ListKind::Include, want_milestone("uuid-m2", "uuid-alpha"))],
+        ["beta of alpha"]
+    );
+    assert_eq!(
+        source.reads(),
+        1,
+        "labels were attached with no second read"
+    );
+}
+
+#[trace("FR-016-AC-11")]
+#[test]
+fn the_same_member_in_both_lists_is_one_occurrence_per_list() {
+    let clock = ManualClock::new(18_200);
+    let directory = tempfile::tempdir().expect("dir");
+    let (mut service, _) = naming_service(naming_snapshot(), &clock, &directory);
+    let input = named_input(
+        vec![NamedMemberInput::Ticket("SWM-1".into())],
+        vec![NamedMemberInput::Ticket("uuid-t1".into())],
+    );
+    let resolved = service
+        .resolve_named_selection_bounded(&policy(240, Duration::from_secs(5)), &input)
+        .expect("resolves");
+    let list_and_index = resolved
+        .associations
+        .iter()
+        .map(|entry| (entry.list, entry.index, entry.member.clone()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        list_and_index,
+        [
+            (ListKind::Include, 0, want_issue("uuid-t1")),
+            (ListKind::Exclude, 0, want_issue("uuid-t1")),
+        ]
+    );
+    assert_eq!(resolved.selection.include, [want_issue("uuid-t1")]);
+    assert_eq!(resolved.selection.exclude, [want_issue("uuid-t1")]);
+}
+
+#[trace("FR-016-AC-11", "FR-016-AC-6")]
+#[test]
+fn the_selection_and_its_wire_bytes_equal_the_canonical_forms_and_carry_no_association() {
+    let clock = ManualClock::new(18_300);
+    let directory = tempfile::tempdir().expect("dir");
+    let (mut service, _) = naming_service(naming_snapshot(), &clock, &directory);
+    let limits = policy(240, Duration::from_secs(5));
+    let input = aliased_input();
+
+    let resolved = service
+        .resolve_named_selection_bounded(&limits, &input)
+        .expect("resolves");
+    let bounded = service
+        .canonicalize_named_selection_bounded(&limits, &input)
+        .expect("bounded canonicalizer");
+    let standalone = canonicalize_named_selection(&naming_snapshot(), &input).expect("standalone");
+    assert_eq!(resolved.selection, bounded);
+    assert_eq!(resolved.selection, standalone);
+    assert_eq!(
+        resolved.selection.encode().expect("encodes"),
+        standalone.encode().expect("encodes")
+    );
+
+    let wire = serde_json::to_value(&resolved.selection).expect("serializes");
+    let keys = wire
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        keys,
+        BTreeSet::from(["schema_version", "team", "include", "exclude"])
+    );
+    assert!(
+        !resolved
+            .selection
+            .encode()
+            .expect("encodes")
+            .contains("label")
+    );
+
+    // An empty input is the explicit empty selection with no associations.
+    let empty = service
+        .resolve_named_selection_bounded(&limits, &named_input(vec![], vec![]))
+        .expect("empty");
+    assert!(empty.associations.is_empty());
+    assert!(empty.selection.include.is_empty() && empty.selection.exclude.is_empty());
+}
+
+#[trace("FR-016-AC-11", "FR-004-AC-14")]
+#[test]
+fn cold_warm_and_changed_sources_resolve_from_one_snapshot_each() {
+    let clock = ManualClock::new(18_400);
+    let directory = tempfile::tempdir().expect("dir");
+    let (mut service, source) = naming_service(naming_snapshot(), &clock, &directory);
+    let limits = policy(240, Duration::from_secs(5));
+    let input = aliased_input();
+
+    let cold = service
+        .resolve_named_selection_bounded(&limits, &input)
+        .expect("cold");
+    assert_eq!(source.reads(), 1);
+    let legacy = service
+        .canonicalize_named_selection_bounded(&limits, &input)
+        .expect("legacy form over the warm cache");
+    assert_eq!(source.reads(), 1);
+    assert_eq!(cold.selection, legacy);
+    let warm = service
+        .resolve_named_selection_bounded(&limits, &input)
+        .expect("warm");
+    assert_eq!(warm, cold);
+    assert_eq!(source.reads(), 1, "the warm call read nothing");
+
+    // A source that would now never answer cannot change a result served from the cache.
+    source.behave(Behavior::NeverComplete);
+    let still_warm = service
+        .resolve_named_selection_bounded(&limits, &input)
+        .expect("still warm");
+    assert_eq!(still_warm, cold);
+    assert_eq!(source.reads(), 1);
+
+    // Past `max_age` the refresh runs under the call's own deadline and times out: no
+    // selection and no associations, and nothing stale is returned.
+    clock.set_epoch(18_400 + 241);
+    let expired = service.resolve_named_selection_bounded(&limits, &input);
+    assert!(is_timeout(&expired, limits.deadline), "{expired:?}");
+    assert_eq!(source.reads(), 2);
+
+    // The source answers again: the next call reads one new snapshot and resolves from it.
+    source.behave(Behavior::Succeed);
+    let refreshed = service
+        .resolve_named_selection_bounded(&limits, &input)
+        .expect("refreshed");
+    assert_eq!(source.reads(), 3);
+    assert_eq!(refreshed, cold);
+}
+
+#[trace("FR-016-AC-11", "FR-004-AC-16")]
+#[test]
+fn a_good_member_then_a_bad_one_returns_no_selection_and_no_associations() {
+    let clock = ManualClock::new(18_500);
+    let directory = tempfile::tempdir().expect("dir");
+    let (mut service, source) = naming_service(naming_snapshot(), &clock, &directory);
+    let limits = policy(240, Duration::from_secs(5));
+    let good = || {
+        vec![
+            NamedMemberInput::Project("Project / Alpha".into()),
+            NamedMemberInput::Ticket("SWM-1".into()),
+        ]
+    };
+    let mut refuse = |include: Vec<NamedMemberInput>, exclude: Vec<NamedMemberInput>| {
+        service.resolve_named_selection_bounded(&limits, &named_input(include, exclude))
+    };
+
+    // The bad member comes after good ones, in either list.
+    let mut after_good = good();
+    after_good.push(milestone_input("Beta", None));
+    assert!(matches!(
+        refuse(after_good, vec![]),
+        Err(Error::AmbiguousMilestone { .. })
+    ));
+    assert!(matches!(
+        refuse(good(), vec![NamedMemberInput::Project("Nothing".into())]),
+        Err(Error::ScopeSelection {
+            kind: "project",
+            ..
+        })
+    ));
+    assert!(matches!(
+        refuse(good(), vec![milestone_input("PRJ-1/Beta", Some("PRJ-2"))]),
+        Err(Error::NamedMemberRejected {
+            outcome: MemberOutcome::ProjectMismatch,
+            ..
+        })
+    ));
+    for other_team in [
+        NamedMemberInput::Ticket("AGE-1".into()),
+        NamedMemberInput::Project("Foreign".into()),
+    ] {
+        let mut include = good();
+        include.push(other_team);
+        assert!(matches!(
+            refuse(include, vec![]),
+            Err(Error::NamedMemberRejected {
+                outcome: MemberOutcome::WrongTeam,
+                ..
+            })
+        ));
+    }
+    let unknown_team = NamedSelectionInput {
+        team: "NOPE".into(),
+        ..named_input(good(), vec![])
+    };
+    assert!(matches!(
+        service.resolve_named_selection_bounded(&limits, &unknown_team),
+        Err(Error::ScopeSelection { kind: "team", .. })
+    ));
+    assert_eq!(source.reads(), 1, "one snapshot served every refusal");
+
+    // An invalid policy and a source that cannot honor a bound fail before any read.
+    let input = named_input(good(), vec![]);
+    assert!(matches!(
+        service.resolve_named_selection_bounded(&policy(301, Duration::from_secs(5)), &input),
+        Err(Error::InvalidReadPolicy { .. })
+    ));
+    let unbounded = FakeSource::new(&clock, false);
+    let directory = tempfile::tempdir().expect("dir");
+    let mut service = open(&unbounded, &clock, &cache_path(&directory));
+    assert!(matches!(
+        service.resolve_named_selection_bounded(&limits, &input),
+        Err(Error::BoundUnsupported)
+    ));
+    assert_eq!((source.reads(), unbounded.reads()), (1, 0));
+}
+
+/// [`timed_canonicalization`] for [`ReadService::resolve_named_selection_bounded`].
+fn timed_resolution(
+    snapshot: WorkspaceSnapshot,
+    input: &NamedSelectionInput,
+    deadline: Duration,
+    from_cache: bool,
+    read_cost: Duration,
+) -> (Result<ResolvedNamedSelection, Error>, Duration) {
+    let clock = ManualClock::new(17_000);
+    let directory = tempfile::tempdir().expect("dir");
+    let (mut service, source) = naming_service(snapshot, &clock, &directory);
+    if from_cache {
+        service
+            .workspace_snapshot_bounded(&policy(240, Duration::from_secs(3600)))
+            .expect("a cold read fills the cache");
+    } else if !read_cost.is_zero() {
+        source.behave(Behavior::Pages {
+            pages: 1,
+            cost: read_cost,
+        });
+    }
+    clock.set_step(WORK_STEP);
+    let before = clock.elapsed();
+    let result = service.resolve_named_selection_bounded(&policy(240, deadline), input);
+    (result, clock.elapsed() - before)
+}
+
+#[trace("FR-004-AC-14", "FR-016-AC-11")]
+#[test]
+fn capturing_associations_spends_the_same_one_budget_as_resolution_and_ordering() {
+    let generous = Duration::from_secs(3600);
+    let (snapshot, heavy) = many_names(30);
+    for (from_cache, read_cost) in [
+        (false, Duration::ZERO),
+        (false, Duration::from_secs(5)),
+        (true, Duration::ZERO),
+    ] {
+        let (legacy, legacy_used) =
+            timed_canonicalization(snapshot.clone(), &heavy, generous, from_cache, read_cost);
+        let (resolved, resolved_used) =
+            timed_resolution(snapshot.clone(), &heavy, generous, from_cache, read_cost);
+        let legacy = legacy.expect("legacy form");
+        let resolved = resolved.expect("association form");
+        assert_eq!(resolved.selection, legacy);
+        assert_eq!(resolved.associations.len(), heavy.include.len());
+        assert!(
+            resolved_used > legacy_used + WORK_STEP * 50,
+            "capturing every occurrence costs controlled time: {resolved_used:?} vs {legacy_used:?}"
+        );
+
+        // A deadline that the legacy form meets but the association form cannot: the
+        // capture is inside the one deadline, not after it and not under a second one.
+        let deadline = legacy_used + (resolved_used - legacy_used) / 2;
+        let (fits, _) =
+            timed_canonicalization(snapshot.clone(), &heavy, deadline, from_cache, read_cost);
+        fits.expect("the legacy form fits");
+        let (late, used) =
+            timed_resolution(snapshot.clone(), &heavy, deadline, from_cache, read_cost);
+        assert!(
+            is_timeout(&late, deadline),
+            "past the one deadline is the typed timeout, with no result (cache {from_cache}, \
+             read {read_cost:?}): {late:?}"
+        );
+        assert!(
+            used <= deadline + WORK_STEP * 100,
+            "capture stops soon after expiry: {used:?} against {deadline:?}"
+        );
+    }
 }
