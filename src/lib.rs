@@ -10,11 +10,25 @@ mod drift;
 mod hygiene;
 mod linear;
 mod model;
+mod named_focus;
+mod named_selection;
 pub mod orphans;
 pub mod program_review;
+mod read_bound;
 pub mod reconcile;
 pub mod retro;
 mod scope;
+pub use named_focus::{
+    BatchState, CatalogEvidence, CountAvailability, InitiativeLink, InitiativeRow, LeafCounts,
+    ListKind, MemberOutcome, MemberReport, NamedBatch, NamedFocusRequest, PartialReason,
+    ProjectRow, SelectionState, SelectionSummary, TeamSummary, TicketRow, UnionCause, UnknownFact,
+    evaluate_named_batch,
+};
+pub use named_selection::{
+    NAMED_SELECTION_SCHEMA_VERSION, NamedMember, NamedMemberInput, NamedSelection,
+    NamedSelectionInput, canonicalize_named_selection, decode_named_selection,
+};
+pub use read_bound::{Deadline, ReadPolicy};
 pub use scope::{ScopeSelection, ScopeSummary, select_scope};
 
 use cache::SnapshotCache;
@@ -247,6 +261,51 @@ pub enum Error {
         /// Project UUID.
         project: String,
     },
+    /// A bounded read used up its operation-wide deadline.
+    #[error("bounded read exceeded its {deadline:?} deadline")]
+    ReadTimeout {
+        /// The deadline the caller requested.
+        deadline: std::time::Duration,
+    },
+    /// The source cannot honor a bounded read, so none was attempted.
+    #[error("this source cannot honor a bounded read")]
+    BoundUnsupported,
+    /// A read policy asked for something a bounded read cannot provide.
+    #[error("invalid read policy: {reason}")]
+    InvalidReadPolicy {
+        /// Which rule the policy broke.
+        reason: &'static str,
+    },
+    /// A named selection document has a version this library does not read.
+    #[error("unsupported named selection schema version {found}; supported version is {supported}")]
+    UnsupportedSchemaVersion {
+        /// Version found in the document.
+        found: i64,
+        /// The only version the named-selection decoder reads.
+        supported: u32,
+    },
+    /// A version 3 named selection document could not be decoded or is not canonical.
+    #[error("invalid named selection: {message}")]
+    InvalidNamedSelection {
+        /// What was wrong with the document.
+        message: String,
+    },
+    /// Two selections in one batch carry the same caller key.
+    #[error("named selection key {key:?} is used more than once")]
+    DuplicateSelectionKey {
+        /// The repeated key.
+        key: String,
+    },
+    /// A named member cannot belong to the selection's team or project.
+    #[error("{kind} {identifier:?} cannot be a member of this selection: {outcome:?}")]
+    NamedMemberRejected {
+        /// Member kind.
+        kind: &'static str,
+        /// Identifier the caller supplied.
+        identifier: String,
+        /// Why the member was refused.
+        outcome: MemberOutcome,
+    },
 }
 
 /// Injectable source of complete structured workspace snapshots.
@@ -257,6 +316,29 @@ pub trait WorkspaceSource: Send + Sync {
     /// Identifies the source data for cache isolation. Fixture sources share a stable default.
     fn cache_namespace(&self) -> String {
         "fixture-default".to_owned()
+    }
+
+    /// Whether [`WorkspaceSource::fetch_workspace_bounded`] honors a deadline.
+    /// A source that returns `true` must override that method too.
+    fn supports_bounded_read(&self) -> bool {
+        false
+    }
+
+    /// Fetches the workspace within `deadline`: no request may start after it expires
+    /// and each request's timeout is `deadline.request_timeout(..)`. It must return
+    /// [`Error::ReadTimeout`] on expiry, and must not retry, sleep, or leave work
+    /// running after it returns.
+    fn fetch_workspace_bounded(
+        &self,
+        _deadline: &Deadline<'_>,
+    ) -> Result<WorkspaceSnapshot, Error> {
+        Err(Error::BoundUnsupported)
+    }
+
+    /// What this source's snapshots enumerate authoritatively. The default claims
+    /// nothing, so an absent record is reported `Unavailable`, never `Missing`.
+    fn catalog_evidence(&self) -> CatalogEvidence {
+        CatalogEvidence::default()
     }
 }
 
@@ -655,6 +737,54 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
     /// Removes this source's cached snapshot before a write or uncertain source state.
     pub fn invalidate_cache(&mut self) -> Result<(), Error> {
         self.cache.invalidate()
+    }
+
+    /// Opt-in bounded read of the workspace snapshot.
+    ///
+    /// The deadline starts when this call begins, on a source whose credentials are
+    /// already resolved; this call never resolves or retries credentials. It covers the
+    /// cache lookup and lock wait, every page and nested read, and the cache write.
+    /// A cached entry is returned only when its source read began no more than
+    /// `policy.max_age` ago; otherwise the snapshot is refreshed under the same deadline.
+    /// The returned `fetched_at` is when the source read began. A timeout or failure
+    /// returns no snapshot, stores nothing as fresh and never returns a stale entry.
+    /// Existing read methods are unaffected.
+    pub fn workspace_snapshot_bounded(
+        &mut self,
+        policy: &ReadPolicy,
+    ) -> Result<WorkspaceSnapshot, Error> {
+        policy.validate()?;
+        if !self.source.supports_bounded_read() {
+            return Err(Error::BoundUnsupported);
+        }
+        let clock: &dyn Clock = &self.clock;
+        let deadline = Deadline::start(clock, policy.deadline);
+        let max_age = i64::try_from(policy.max_age.as_secs()).unwrap_or(i64::MAX);
+        if let Some(snapshot) =
+            self.cache
+                .fresh_within(self.clock.now_epoch_seconds(), max_age, &deadline)?
+        {
+            return Ok(snapshot);
+        }
+        deadline.remaining()?;
+        let read_started_at = self.clock.now_epoch_seconds();
+        let mut snapshot = self.source.fetch_workspace_bounded(&deadline)?;
+        snapshot.fetched_at = read_started_at;
+        self.cache
+            .replace_bounded(&snapshot, read_started_at, &deadline)?;
+        Ok(snapshot)
+    }
+
+    /// Bounded read followed by [`evaluate_named_batch`] over that one snapshot, using
+    /// the source's own catalog evidence. The caller persists or publishes the result
+    /// after this returns; a timeout leaves it nothing to publish.
+    pub fn named_batch_bounded(
+        &mut self,
+        policy: &ReadPolicy,
+        requests: &[NamedFocusRequest],
+    ) -> Result<NamedBatch, Error> {
+        let snapshot = self.workspace_snapshot_bounded(policy)?;
+        evaluate_named_batch(&snapshot, &self.source.catalog_evidence(), requests)
     }
 
     fn snapshot(&mut self) -> Result<WorkspaceSnapshot, Error> {

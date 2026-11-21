@@ -355,12 +355,32 @@ pub fn select_scope(
             .iter()
             .filter_map(|id| by_id.get(id).and_then(|issue| issue.project_id.clone())),
     );
+    let leaves = classify_leaves(snapshot, &result.issue_ids)?;
+    result.leaf_ids = leaves.leaf_ids;
+    result.done = leaves.done;
+    result.remaining_by_stage = leaves.remaining_by_stage;
+    Ok(result)
+}
+
+/// Leaf tasks among a set of selected issues, classified with full snapshot ancestry.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LeafClassification {
+    pub(crate) leaf_ids: BTreeSet<IssueId>,
+    pub(crate) done: usize,
+    pub(crate) remaining_by_stage: BTreeMap<String, usize>,
+}
+
+/// Validates the ancestry of `issue_ids` and classifies their leaf tasks.
+///
+/// A parent is judged against every issue in the snapshot, never only the selected
+/// ones, so excluding a child can never turn its parent into a leaf.
+pub(crate) fn classify_leaves(
+    snapshot: &WorkspaceSnapshot,
+    issue_ids: &BTreeSet<IssueId>,
+) -> Result<LeafClassification, Error> {
+    let by_id: BTreeMap<_, _> = snapshot.issues.iter().map(|i| (&i.id, i)).collect();
     let mut checked = BTreeSet::new();
-    for issue in snapshot
-        .issues
-        .iter()
-        .filter(|i| result.issue_ids.contains(&i.id))
-    {
+    for issue in snapshot.issues.iter().filter(|i| issue_ids.contains(&i.id)) {
         let mut seen = BTreeSet::new();
         let mut next = Some(&issue.id);
         while let Some(id) = next {
@@ -385,10 +405,11 @@ pub fn select_scope(
         .iter()
         .filter_map(|i| i.parent_id.as_ref())
         .collect();
+    let mut result = LeafClassification::default();
     for issue in snapshot
         .issues
         .iter()
-        .filter(|i| result.issue_ids.contains(&i.id) && !parents.contains(&i.id))
+        .filter(|i| issue_ids.contains(&i.id) && !parents.contains(&i.id))
     {
         match issue.state_type {
             WorkflowStateType::Canceled | WorkflowStateType::Duplicate => {}

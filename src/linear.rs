@@ -6,7 +6,8 @@
 use ix_cli_kit::secrets::{AppScope, CredentialBackend, SecretKey, SecretStore, SecretValue};
 
 use crate::{
-    Clock, DriftConfig, DriftEvidence, DriftTicket, Error, HistoricalProject, Initiative, Issue,
+    CatalogEvidence, Clock, Deadline, DriftConfig, DriftEvidence, DriftTicket, Error,
+    HistoricalProject, Initiative, Issue,
     IssueId, IssueTransition, Milestone, Project, ProjectId, ProjectMutationSource,
     ProjectPriority, ProjectRunStatus, ProjectStatusCategory, SystemClock, TeamKey,
     WorkflowStateType, WorkspaceSnapshot, WorkspaceSource, issue_is_open,
@@ -27,6 +28,7 @@ const INITIATIVE_PAGE_SIZE: i32 = 50;
 const RELATION_PAGE_SIZE: i32 = 50;
 const INITIAL_RELATION_PAGE_SIZE: i32 = 10;
 const PAGE_LIMIT: usize = 1_000;
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 // Isolate snapshots carrying native project-status category and display name from older readers.
 const CACHE_MODEL_VERSION: &str = "v13";
 const ENDPOINT: &str = "https://api.linear.app/graphql";
@@ -202,7 +204,7 @@ impl LinearGraphQlSource {
         );
         Ok(Self {
             client: Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
+                .timeout(REQUEST_TIMEOUT)
                 .build()?,
             api_key,
             endpoint,
@@ -929,6 +931,7 @@ impl LinearGraphQlSource {
 
     fn complete_relations(
         &self,
+        deadline: Option<&Deadline<'_>>,
         issue_id: &str,
         connection: &mut Connection<RawRelation>,
         incoming: bool,
@@ -951,7 +954,8 @@ impl LinearGraphQlSource {
                     ),
                 });
             }
-            let data: IssueRelationsData = self.request(
+            let data: IssueRelationsData = self.request_within(
+                deadline,
                 if incoming {
                     INCOMING_RELATIONS_QUERY
                 } else {
@@ -982,7 +986,20 @@ impl LinearGraphQlSource {
         relation_first: Option<i32>,
         nested_first: Option<i32>,
     ) -> Result<T, Error> {
-        self.request(
+        self.query_within(None, query, first, after, relation_first, nested_first)
+    }
+
+    fn query_within<T: DeserializeOwned>(
+        &self,
+        deadline: Option<&Deadline<'_>>,
+        query: &'static str,
+        first: i32,
+        after: Option<&str>,
+        relation_first: Option<i32>,
+        nested_first: Option<i32>,
+    ) -> Result<T, Error> {
+        self.request_within(
+            deadline,
             query,
             Variables {
                 first,
@@ -998,19 +1015,47 @@ impl LinearGraphQlSource {
         query: &'static str,
         variables: V,
     ) -> Result<T, Error> {
-        let response = self
+        self.request_within(None, query, variables)
+    }
+
+    /// Sends one request. With a deadline, nothing is sent once it has expired and the
+    /// request timeout is the lesser of the legacy timeout and the time remaining.
+    fn request_within<T: DeserializeOwned, V: Serialize>(
+        &self,
+        deadline: Option<&Deadline<'_>>,
+        query: &'static str,
+        variables: V,
+    ) -> Result<T, Error> {
+        let mut request = self
             .client
             .post(&self.endpoint)
             .header(reqwest::header::AUTHORIZATION, self.api_key.expose_secret())
-            .json(&GraphQlRequest { query, variables })
-            .send()?;
+            .json(&GraphQlRequest { query, variables });
+        let mut deadline_bound = None;
+        if let Some(deadline) = deadline {
+            let timeout = deadline.request_timeout(REQUEST_TIMEOUT)?;
+            if timeout < REQUEST_TIMEOUT {
+                deadline_bound = Some(deadline.limit());
+            }
+            request = request.timeout(timeout);
+        }
+        let transport_error = |error: reqwest::Error| match deadline_bound {
+            Some(limit) if error.is_timeout() => Error::ReadTimeout { deadline: limit },
+            _ => Error::Http(error),
+        };
+        let response = request.send().map_err(transport_error)?;
         let status_error = response.error_for_status_ref().err();
         let retry_after = rate_limit_delay(response.headers(), std::time::SystemTime::now());
         // Linear deliberately uses HTTP 400 for GraphQL RATELIMITED responses.
         // Inspect its structured errors before returning the HTTP status error.
         let response = match response.json::<GraphQlResponse<T>>() {
             Ok(response) => response,
-            Err(error) => return Err(Error::Http(status_error.unwrap_or(error))),
+            Err(error) => {
+                return Err(match status_error {
+                    Some(status) => Error::Http(status),
+                    None => transport_error(error),
+                });
+            }
         };
         if let Some(errors) = response.errors.filter(|errors| !errors.is_empty()) {
             if errors.iter().any(|error| {
@@ -1043,10 +1088,42 @@ impl WorkspaceSource for LinearGraphQlSource {
     }
 
     fn fetch_workspace(&self) -> Result<WorkspaceSnapshot, Error> {
+        self.fetch_workspace_within(None)
+    }
+
+    fn supports_bounded_read(&self) -> bool {
+        true
+    }
+
+    fn fetch_workspace_bounded(
+        &self,
+        deadline: &Deadline<'_>,
+    ) -> Result<WorkspaceSnapshot, Error> {
+        self.fetch_workspace_within(Some(deadline))
+    }
+
+    fn catalog_evidence(&self) -> CatalogEvidence {
+        // Every project is read with its initiatives, and a project with more than
+        // the page of initiatives fails the read instead of being truncated. The
+        // projects and issues connections hide archived records, so nothing else
+        // is enumerated authoritatively.
+        CatalogEvidence {
+            initiative_links: true,
+            ..CatalogEvidence::default()
+        }
+    }
+}
+
+impl LinearGraphQlSource {
+    fn fetch_workspace_within(
+        &self,
+        deadline: Option<&Deadline<'_>>,
+    ) -> Result<WorkspaceSnapshot, Error> {
         let mut projects = Vec::new();
         let mut after = None;
         for page in 0..PAGE_LIMIT {
-            let result: ProjectData = self.query(
+            let result: ProjectData = self.query_within(
+                deadline,
                 PROJECT_QUERY,
                 PROJECT_PAGE_SIZE,
                 after.as_deref(),
@@ -1123,7 +1200,8 @@ impl WorkspaceSource for LinearGraphQlSource {
         let mut raw_issues = Vec::new();
         let mut after = None;
         for page in 0..PAGE_LIMIT {
-            let result: IssueData = self.query(
+            let result: IssueData = self.query_within(
+                deadline,
                 ISSUE_QUERY,
                 ISSUE_PAGE_SIZE,
                 after.as_deref(),
@@ -1132,8 +1210,8 @@ impl WorkspaceSource for LinearGraphQlSource {
             )?;
             let connection = result.issues;
             for mut raw in connection.nodes {
-                self.complete_relations(&raw.id, &mut raw.relations, false)?;
-                self.complete_relations(&raw.id, &mut raw.inverse_relations, true)?;
+                self.complete_relations(deadline, &raw.id, &mut raw.relations, false)?;
+                self.complete_relations(deadline, &raw.id, &mut raw.inverse_relations, true)?;
                 raw_issues.push(raw);
             }
             if !connection.page_info.has_next_page {
