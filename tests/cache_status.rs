@@ -108,3 +108,62 @@ fn environment_overrides_configuration_and_invalid_explicit_settings_fail_offlin
             ));
     }
 }
+
+#[trace("FR-032-AC-1", "FR-032-AC-2")]
+#[test]
+fn offline_status_names_zero_usage_server_reserve_hold_with_owned_deadline() {
+    use ix_board::quota::{QuotaConfig, QuotaGate};
+    use reqwest::header::HeaderMap;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("cache.sqlite3");
+    let gate = QuotaGate::open(&path, &QuotaConfig::default()).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let reset = i64::try_from(now).unwrap() + 60_000;
+    let mut headers = HeaderMap::new();
+    for (name, value) in [
+        ("x-ratelimit-requests-limit", "10000".to_owned()),
+        ("x-ratelimit-requests-remaining", "250".to_owned()),
+        ("x-ratelimit-requests-reset", reset.to_string()),
+    ] {
+        headers.insert(name, value.parse().unwrap());
+    }
+    gate.observe_headers(200, &headers, None).unwrap();
+    let output = cli(&directory)
+        .args(["cache", "status", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(status["quota"]["requests_used"], 0);
+    assert_eq!(status["quota"]["complexity_used"], 0);
+    assert!(status["rate_limit_until"].is_null());
+    assert_eq!(status["decision"]["state"], "server_reserve_held");
+    assert_eq!(status["decision"]["endpoint"], "graphql");
+    assert_eq!(status["decision"]["estimated_complexity"], 10000);
+    assert_eq!(status["decision"]["blockers"][0]["dimension"], "requests");
+    assert_eq!(status["decision"]["blockers"][0]["deadline"], reset);
+    assert_eq!(status["decision"]["blockers"][0]["reserve"], 500);
+    let output = cli(&directory)
+        .args(["cache", "status"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).unwrap();
+    assert!(
+        text.contains("locally enforced server reserve hold"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("owning deadline Some({reset})")),
+        "{text}"
+    );
+    assert!(text.contains("admission not guaranteed"));
+    assert!(!text.contains("Linear rate limited"));
+}

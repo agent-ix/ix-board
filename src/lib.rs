@@ -17,6 +17,7 @@ mod named_selection;
 pub mod orphans;
 pub mod program_review;
 pub mod quota;
+mod quota_decision;
 mod read_bound;
 pub mod reconcile;
 pub mod retro;
@@ -135,6 +136,12 @@ pub enum Error {
     /// The shared local allocation is exhausted before transport send.
     #[error("Linear local budget exhausted; retry in {}s", retry_after.as_secs().saturating_add(u64::from(retry_after.subsec_nanos() > 0)))]
     LinearLocalBudgetExhausted { retry_after: std::time::Duration },
+    /// Admission refused with the exact atomic typed decision.
+    #[error("{decision}")]
+    QuotaAdmissionRefused {
+        /// Captured before rendering; subsequent status reads cannot overwrite it.
+        decision: Box<quota::QuotaDecision>,
+    },
     /// A quota setting is invalid.
     #[error("invalid Linear quota configuration: {reason}")]
     InvalidQuotaConfig { reason: &'static str },
@@ -362,6 +369,16 @@ pub trait WorkspaceSource: Send + Sync {
         }
     }
 
+    /// Refreshes through the same source path while retaining atomic quota evidence.
+    /// Existing sources may keep implementing only `refresh_workspace`.
+    fn refresh_workspace_evaluated(
+        &self,
+        baseline: Option<&WorkspaceSnapshot>,
+        deadline: Option<&Deadline<'_>>,
+    ) -> Result<WorkspaceSnapshot, Error> {
+        self.refresh_workspace(baseline, deadline)
+    }
+
     /// Identifies the source data for cache isolation. Fixture sources share a stable default.
     fn cache_namespace(&self) -> String {
         "fixture-default".to_owned()
@@ -411,12 +428,97 @@ pub trait ProjectMutationSource: WorkspaceSource {
     fn set_project_sort_order(&self, project_id: &ProjectId, sort_order: f64) -> Result<(), Error>;
 }
 
+/// Typed outcome of a particular cached-read attempt, independent of message wording.
+/// Absent legacy metadata is Unknown; it must never be reconstructed from failure text.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RefreshOutcome {
+    /// No typed attempt metadata exists, including legacy serialized snapshots.
+    #[default]
+    Unknown,
+    /// A compatible cached snapshot satisfied this attempt without refreshing.
+    CacheReused,
+    /// A complete source refresh was published.
+    Refreshed,
+    /// Admission refused before send; contains the captured atomic decision.
+    QuotaRefused {
+        /// Quota explanation captured at the failed admission.
+        decision: quota::QuotaDecision,
+    },
+    /// The refresh source or transport failed for a nonquota reason.
+    SourceFailed,
+    /// Shared refresh lock could not be acquired.
+    RefreshLockRefused,
+}
+
+impl RefreshOutcome {
+    pub(crate) fn from_error(error: &Error) -> Self {
+        match error {
+            Error::QuotaAdmissionRefused { decision } => Self::QuotaRefused {
+                decision: (**decision).clone(),
+            },
+            Error::RefreshLockTimeout => Self::RefreshLockRefused,
+            Error::LinearRateLimited { .. }
+            | Error::LinearLocalBudgetExhausted { .. }
+            | Error::LinearQueryComplexityExceeded { .. }
+            | Error::InvalidQuotaConfig { .. } => Self::Unknown,
+            _ => Self::SourceFailed,
+        }
+    }
+}
+
+/// Additive result envelope preserving the wrapped type's public construction contract.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RefreshRead<T> {
+    /// Existing read result with unchanged fields.
+    pub read: T,
+    /// Attempt provenance, Unknown when absent in legacy output.
+    #[serde(default)]
+    pub outcome: RefreshOutcome,
+}
+
+impl Error {
+    pub(crate) fn legacy_rate_limit(self) -> Self {
+        if let Self::QuotaAdmissionRefused { decision } = self {
+            if decision.state == quota::QuotaState::ServerBackoff {
+                let until = decision
+                    .blockers
+                    .iter()
+                    .find(|blocker| blocker.state == quota::QuotaState::ServerBackoff)
+                    .and_then(|blocker| blocker.deadline)
+                    .unwrap_or(decision.evaluated_at);
+                let seconds = until
+                    .saturating_sub(decision.evaluated_at)
+                    .max(0)
+                    .unsigned_abs()
+                    .div_ceil(1000);
+                return Self::LinearRateLimited {
+                    retry_after: std::time::Duration::from_secs(seconds),
+                };
+            }
+            Self::QuotaAdmissionRefused { decision }
+        } else {
+            self
+        }
+    }
+
+    /// The quota decision captured at refusal, without parsing rendered text.
+    pub fn quota_decision(&self) -> Option<&quota::QuotaDecision> {
+        match self {
+            Self::QuotaAdmissionRefused { decision } => Some(decision),
+            _ => None,
+        }
+    }
+}
+
 /// Cached read service shared by the CLI and library consumers.
 pub struct ReadService<S, C = SystemClock> {
     source: S,
     cache: SnapshotCache,
     clock: C,
     freshness: Option<CacheFreshness>,
+    outcome: RefreshOutcome,
 }
 
 /// Provenance of the latest ordinary read, including an unsuccessful refresh.
@@ -552,6 +654,7 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
             cache: SnapshotCache::open(cache_path, &cache_namespace)?,
             clock,
             freshness: None,
+            outcome: RefreshOutcome::Unknown,
         })
     }
 
@@ -821,7 +924,14 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
         self.admit_bounded(policy)?;
         let clock: &dyn Clock = &self.clock;
         let deadline = Deadline::start(clock, policy.deadline);
-        read_within(&self.source, &mut self.cache, clock, policy, &deadline)
+        read_within(
+            &self.source,
+            &mut self.cache,
+            clock,
+            policy,
+            &deadline,
+            &mut self.outcome,
+        )
     }
 
     /// Bounded read followed by [`evaluate_named_batch`] over that one snapshot, using
@@ -842,7 +952,14 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
         self.admit_bounded(policy)?;
         let clock: &dyn Clock = &self.clock;
         let deadline = Deadline::start(clock, policy.deadline);
-        let snapshot = read_within(&self.source, &mut self.cache, clock, policy, &deadline)?;
+        let snapshot = read_within(
+            &self.source,
+            &mut self.cache,
+            clock,
+            policy,
+            &deadline,
+            &mut self.outcome,
+        )?;
         let evidence = self.source.catalog_evidence();
         deadline.remaining()?;
         let batch =
@@ -876,7 +993,14 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
         self.admit_bounded(policy)?;
         let clock: &dyn Clock = &self.clock;
         let deadline = Deadline::start(clock, policy.deadline);
-        let snapshot = read_within(&self.source, &mut self.cache, clock, policy, &deadline)?;
+        let snapshot = read_within(
+            &self.source,
+            &mut self.cache,
+            clock,
+            policy,
+            &deadline,
+            &mut self.outcome,
+        )?;
         deadline.remaining()?;
         let selection =
             named_selection::canonicalize_within(&snapshot, input, Budget::within(&deadline))?;
@@ -905,7 +1029,14 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
         self.admit_bounded(policy)?;
         let clock: &dyn Clock = &self.clock;
         let deadline = Deadline::start(clock, policy.deadline);
-        let snapshot = read_within(&self.source, &mut self.cache, clock, policy, &deadline)?;
+        let snapshot = read_within(
+            &self.source,
+            &mut self.cache,
+            clock,
+            policy,
+            &deadline,
+            &mut self.outcome,
+        )?;
         deadline.remaining()?;
         let resolved =
             named_selection::resolve_within(&snapshot, input, Budget::within(&deadline))?;
@@ -914,7 +1045,8 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
     }
 
     /// Refuses an invalid policy or a source that cannot honor a bound, before any read.
-    fn admit_bounded(&self, policy: &ReadPolicy) -> Result<(), Error> {
+    fn admit_bounded(&mut self, policy: &ReadPolicy) -> Result<(), Error> {
+        self.outcome = RefreshOutcome::Unknown;
         policy.validate()?;
         if !self.source.supports_bounded_read() {
             return Err(Error::BoundUnsupported);
@@ -931,9 +1063,15 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
         self.freshness.as_ref()
     }
 
+    /// Typed outcome of the latest cached read attempt, including bounded refusal.
+    pub fn refresh_outcome(&self) -> &RefreshOutcome {
+        &self.outcome
+    }
+
     fn refresh(&mut self, force: bool) -> Result<WorkspaceSnapshot, Error> {
         let now = self.clock.now_epoch_seconds();
         let before = self.cache.revision()?;
+        self.outcome = RefreshOutcome::CacheReused;
         let result = (|| {
             if !force && let Some(snapshot) = self.cache.fresh(now)? {
                 return Ok(snapshot);
@@ -955,9 +1093,12 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
             } else {
                 self.cache.last_complete()?
             };
-            let mut snapshot = self.source.refresh_workspace(baseline.as_ref(), None)?;
+            let mut snapshot = self
+                .source
+                .refresh_workspace_evaluated(baseline.as_ref(), None)?;
             snapshot.fetched_at = started;
             self.cache.replace_refresh(started, &snapshot, full)?;
+            self.outcome = RefreshOutcome::Refreshed;
             Ok(snapshot)
         })();
         match result {
@@ -980,10 +1121,19 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
                 Ok(snapshot)
             }
             Err(error) => {
+                self.outcome = RefreshOutcome::from_error(&error);
                 let Some(snapshot) = self.cache.last_complete()? else {
-                    return Err(error);
+                    return Err(error.legacy_rate_limit());
                 };
                 let until = match &error {
+                    Error::QuotaAdmissionRefused { decision } => decision
+                        .blockers
+                        .iter()
+                        .find(|blocker| blocker.state == quota::QuotaState::ServerBackoff)
+                        .and_then(|blocker| blocker.deadline)
+                        .map(|until| {
+                            until.div_euclid(1000) + i64::from(until.rem_euclid(1000) > 0)
+                        }),
                     Error::LinearRateLimited { retry_after } => {
                         self.clock.now_epoch_seconds().checked_add(
                             i64::try_from(
@@ -1065,25 +1215,34 @@ fn read_within<S: WorkspaceSource>(
     clock: &dyn Clock,
     policy: &ReadPolicy,
     deadline: &Deadline<'_>,
+    outcome: &mut RefreshOutcome,
 ) -> Result<WorkspaceSnapshot, Error> {
-    let max_age = i64::try_from(policy.max_age.as_secs()).unwrap_or(i64::MAX);
-    if let Some(snapshot) = cache.fresh_within(clock.now_epoch_seconds(), max_age, deadline)? {
+    *outcome = RefreshOutcome::CacheReused;
+    let result = (|| {
+        let max_age = i64::try_from(policy.max_age.as_secs()).unwrap_or(i64::MAX);
+        if let Some(snapshot) = cache.fresh_within(clock.now_epoch_seconds(), max_age, deadline)? {
+            deadline.remaining()?;
+            return Ok(snapshot);
+        }
         deadline.remaining()?;
-        return Ok(snapshot);
+        let _lock = cache.refresh_lock(Some(deadline))?;
+        if let Some(snapshot) = cache.fresh_within(clock.now_epoch_seconds(), max_age, deadline)? {
+            return Ok(snapshot);
+        }
+        let read_started_at = clock.now_epoch_seconds();
+        let (baseline, full) = cache.baseline_within(read_started_at, deadline)?;
+        deadline.remaining()?;
+        let mut snapshot = source.refresh_workspace_evaluated(baseline.as_ref(), Some(deadline))?;
+        snapshot.fetched_at = read_started_at;
+        cache.replace_bounded(&snapshot, read_started_at, deadline, full)?;
+        deadline.remaining()?;
+        *outcome = RefreshOutcome::Refreshed;
+        Ok(snapshot)
+    })();
+    if let Err(error) = &result {
+        *outcome = RefreshOutcome::from_error(error);
     }
-    deadline.remaining()?;
-    let _lock = cache.refresh_lock(Some(deadline))?;
-    if let Some(snapshot) = cache.fresh_within(clock.now_epoch_seconds(), max_age, deadline)? {
-        return Ok(snapshot);
-    }
-    let read_started_at = clock.now_epoch_seconds();
-    let (baseline, full) = cache.baseline_within(read_started_at, deadline)?;
-    deadline.remaining()?;
-    let mut snapshot = source.refresh_workspace(baseline.as_ref(), Some(deadline))?;
-    snapshot.fetched_at = read_started_at;
-    cache.replace_bounded(&snapshot, read_started_at, deadline, full)?;
-    deadline.remaining()?;
-    Ok(snapshot)
+    result.map_err(Error::legacy_rate_limit)
 }
 
 fn project_id(snapshot: &WorkspaceSnapshot, identifier: &str) -> Result<ProjectId, Error> {

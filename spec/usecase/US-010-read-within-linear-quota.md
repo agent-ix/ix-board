@@ -11,6 +11,8 @@ relationships:
     type: traces_to
   - target: "ix://agent-ix/ix-board/FR-030"
     type: traces_to
+  - target: "ix://agent-ix/ix-board/FR-032"
+    type: traces_to
 provenance:
   source: SWM-184
 ---

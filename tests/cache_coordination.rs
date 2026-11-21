@@ -264,7 +264,7 @@ fn transport_cooldown_child(directory: &Path) {
     ));
 }
 
-#[trace("FR-031-AC-1", "FR-031-AC-2")]
+#[trace("FR-031-AC-1", "FR-031-AC-2", "FR-032-AC-7")]
 #[test]
 fn persisted_cooldown_blocks_all_actual_transport_entry_points_in_another_process() {
     let directory = tempfile::tempdir().expect("temporary directory");
