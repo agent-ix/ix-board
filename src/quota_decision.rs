@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Agent-IX
 
-//! Typed admission evidence for FR-032, captured before any refusal is rendered.
+//! Typed admission evidence captured before any refusal is rendered.
 
 use serde::{Deserialize, Serialize};
 

@@ -1189,9 +1189,17 @@ impl LinearGraphQlSource {
         let value = match response.json::<serde_json::Value>() {
             Ok(value) => value,
             Err(error) => {
-                quota.observe_within(reservation, status, &headers, None, deadline)?;
+                let decision = quota.observe_evaluated_within(
+                    reservation,
+                    status,
+                    &headers,
+                    None,
+                    deadline,
+                )?;
                 if status == 429 {
-                    return Err(quota_rate_limit(&quota, deadline)?);
+                    return Err(Error::QuotaAdmissionRefused {
+                        decision: Box::new(decision),
+                    });
                 }
                 return Err(match status_error {
                     Some(status) => Error::Http(status),
@@ -1199,7 +1207,13 @@ impl LinearGraphQlSource {
                 });
             }
         };
-        quota.observe_within(reservation, status, &headers, Some(&value), deadline)?;
+        let decision = quota.observe_evaluated_within(
+            reservation,
+            status,
+            &headers,
+            Some(&value),
+            deadline,
+        )?;
         if status == 429
             || value
                 .get("errors")
@@ -1213,7 +1227,9 @@ impl LinearGraphQlSource {
                     })
                 })
         {
-            return Err(quota_rate_limit(&quota, deadline)?);
+            return Err(Error::QuotaAdmissionRefused {
+                decision: Box::new(decision),
+            });
         }
         let response: GraphQlResponse<T> =
             serde_json::from_value(value).map_err(Error::LinearDecode)?;
@@ -1240,15 +1256,6 @@ impl LinearGraphQlSource {
         }
         response.data.ok_or(Error::MissingWorkspaceData)
     }
-}
-
-fn quota_rate_limit(
-    quota: &crate::quota::QuotaGate,
-    deadline: Option<&Deadline<'_>>,
-) -> Result<Error, Error> {
-    Ok(Error::QuotaAdmissionRefused {
-        decision: Box::new(quota.decision_within(10_000, deadline)?),
-    })
 }
 
 impl WorkspaceSource for LinearGraphQlSource {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Agent-IX
 
-//! Deterministic persisted admission and independent sequence oracle for FR-032.
+//! Deterministic persisted admission and independent sequence oracle.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -277,6 +277,7 @@ struct Oracle {
     complexity: u64,
     constraints: Vec<Observation>,
     pending: Vec<u64>,
+    retired: usize,
 }
 impl Oracle {
     fn advance(&mut self, time: i64) {
@@ -286,8 +287,10 @@ impl Oracle {
             self.requests = 0;
             self.complexity = 0;
         }
+        let before = self.constraints.len();
         self.constraints
             .retain(|observation| observation.expiry > self.now);
+        self.retired += before - self.constraints.len();
     }
     fn available(&self, cost: u64) -> bool {
         self.requests < 4500
@@ -350,6 +353,7 @@ fn generated_interleavings_match_independent_uncompacted_accounting_oracle() {
             complexity: 0,
             constraints: vec![],
             pending: vec![],
+            retired: 0,
         };
         let mut tokens: Vec<(Reservation, i64)> = vec![];
         let mut rng = seed;
@@ -469,6 +473,10 @@ fn generated_interleavings_match_independent_uncompacted_accounting_oracle() {
             );
         }
         assert!(
+            model.reset >= NOW + 4000 && model.retired >= 3,
+            "seed={seed}, final model={model:?}"
+        );
+        assert!(
             windows >= 20,
             "sequence spans at least three local windows and many evidence expiries"
         );
@@ -557,4 +565,47 @@ fn independent_concurrent_gates_cannot_overspend_one_paired_remaining_request() 
         open(&path, &clock, &config).decision(10).unwrap().state,
         QuotaState::Available
     );
+}
+
+#[trace("FR-032-AC-4", "FR-032-AC-6")]
+#[test]
+fn bounded_observation_storage_fails_closed_without_sliding_or_discarding_live_ownership() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("quota.sqlite");
+    let clock = Arc::new(Clock(AtomicI64::new(NOW)));
+    let gate = open(&path, &clock, &QuotaConfig::default());
+    // Increasing remaining AND expiry form an antichain: neither owns the other.
+    for index in 0..513 {
+        request_observation(
+            &gate,
+            250 + index,
+            NOW + 1000 + i64::try_from(index).unwrap(),
+        );
+    }
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let count: u64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM linear_quota_observations",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 512);
+    let decision = gate.decision(10).unwrap();
+    assert_eq!(decision.state, QuotaState::EvidenceUnavailable);
+    assert_eq!(
+        decision.evidence.first().unwrap().deadline,
+        Some(NOW + 1000)
+    );
+    assert_eq!(decision.next_reevaluation_at, Some(NOW + 1000));
+    clock.0.store(NOW + 1511, Ordering::SeqCst);
+    assert_eq!(
+        gate.decision(10).unwrap().state,
+        QuotaState::EvidenceUnavailable,
+        "unretained final observation remains conservatively guarded until its own expiry"
+    );
+    clock.0.store(NOW + 1512, Ordering::SeqCst);
+    let decision = gate.decision(10).unwrap();
+    assert_eq!(decision.state, QuotaState::Available);
+    assert!(decision.evidence.is_empty());
 }

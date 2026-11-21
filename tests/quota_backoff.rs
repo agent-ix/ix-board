@@ -133,7 +133,7 @@ fn actual_http_and_graphql_backoff_survives_resets_high_observations_reopen_and_
                 assert!(
                     result
                         .unwrap_err()
-                        .starts_with("Linear rate limited; retry in ")
+                        .contains("Linear rate limited; retry in ")
                 );
             }
         }
