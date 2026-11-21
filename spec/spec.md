@@ -141,6 +141,10 @@ records through Linear GraphQL and caches read results locally.
 
 ## Requirements Architecture
 
+SWM-185 adds [FR-032](./functional/FR-032-quota-admission-recovery.md) to
+distinguish quota admission states, expire paired server observations, and expose
+typed refresh outcomes without changing existing public struct construction.
+
 SWM-184 adds [US-010](./usecase/US-010-read-within-linear-quota.md),
 [FR-030](./functional/FR-030-incremental-linear-cache.md), and
 [FR-031](./functional/FR-031-shared-linear-quota.md). It revises
