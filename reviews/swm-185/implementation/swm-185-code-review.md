@@ -504,3 +504,50 @@ Reverse inventory: command/API families map to FR-001..032 (ready/project/search
   ]
 }
 ```
+
+
+## Dispositions
+
+Round1, reviewed frozen f39c31029b0842085ec916d9823eb8ac4ce36b22 after fix commits dac7afd563d7e436bb69dac3c8cd161efff67e74,0cbe749e8e157f6bf11c06190e78e8567f27f564,f39c31029b0842085ec916d9823eb8ac4ce36b22. Original findings and historical verdict above remain unchanged.
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-001 | fixed | Fixed by the authorized atomic writer fence and migration quarantine: legacy SQL updates/ledger writes fail before admission; existing pre-fence tokens become paired_owner0 and force EvidenceUnavailable with no invented deadline. Immediate transactions serialize cutover against old reservations, new guard1 is reset to0 before commit or rolled back on error, and existing actual cooldown keeps precedence. Five cutover fixtures verify stale-header rejection, admission race, unknown in-flight HTTP/GraphQL429, concurrent new writers and snapshot preservation. Refs: src/quota.rs:466. |
+| FND-002 | fixed | ServerBackoff now uses the existing owning-deadline legacy conversion. The regression fixture keeps reevaluation at1s while both decision and legacy reserve report3s; actual-server Error::LinearRateLimited matching remains unchanged. Refs: src/quota.rs:663. |
+| FND-003 | fixed | Bounded reads use the same evaluated source path, capture RefreshOutcome before applying legacy_rate_limit, and preserve old returned Error variants. All four bounded entry points pass their service outcome through read_within. The real-source persisted-backoff fixture verifies captured60s decision, no stale snapshot or publication, zeroHTTP calls, and immunity to later live status. Reuse, refresh, source failure and invalid/unsupported preflight reset their outcome honestly. Refs: src/lib.rs:1241. |
+
+### Round1 evidence and current verdict
+
+**PASS** for this changed-scope review: all three findings have current fixed outcomes and no new concrete regression was found. All six outcomes across SR-6093 and SR-6094 are fixed; no missing or still-open disposition remains. This is mergeable from the reviewer lane, subject to the lead's separately owned final aggregate gate.
+
+82 focused integration tests passed across bounded_quota_outcome2, bounded_read37, cache_coordination5, cache_status3, quota_backoff1, quota_process15, quota_state9, quota_writer_cutover5 and sdk_quota_outcome5. Four focused quota/backoff unit tests passed. Logs: /tmp/SWM-185-code-review/disposition-1-focused.log and /tmp/SWM-185-code-review/disposition-1-units.log. All use local fixture HTTP/SQLite/source/clock seams; no real Linear requests. This pass rechecked fixes and affected behavior without repeating the whole-repository matrix or unrelated audits. No aggregate CI run, source/test/branch edit, commit, push, extra worktree or target directory was made.
+
+The technical fence is a schema compatibility guard, not a security barrier against an operator deliberately altering guard columns or triggers. Actual pre-paired client SQL cannot set the new guard and fails before send. Each new guarded operation is private, starts an IMMEDIATE transaction, and restores committed guard0; error/callback refusal rolls back. Old reservations committed before migration are captured atomically and keep indefinite unknown-response quarantine. Rebuilding does not clear that condition; the documented operator reconciliation remains necessary only if such tokens exist. New-protocol abandoned tokens retain conservative charges without entering legacy quarantine. Existing request/complexity debt, single-use/replay/wrong-store checks, fixed-window/generation behavior and stale/strict-bounded contracts passed the focused regression lanes. Existing actual cooldown remains higher precedence than the quarantine and cannot be shortened by old writes.
+
+Plan completion: not assessed
+
+No additional methods became applicable: code-review/Rust lane and semantic gap disposition were completed; no new spec/plan diff or applicable AssuranceProfile was introduced. has-review was already present.
+
+### Round1 fixed excerpts
+
+```yaml
+{
+  "dispositions": [
+    {
+      "after_excerpt": "                \"CREATE TRIGGER IF NOT EXISTS linear_quota_require_paired_update\n            BEFORE UPDATE ON linear_shared_quota WHEN OLD.paired_writer=0 AND NEW.paired_writer=0\n            BEGIN SELECT RAISE(ABORT,'{message}'); END;\n            CREATE TRIGGER IF NOT EXISTS linear_quota_require_paired_delete\n            BEFORE DELETE ON linear_shared_quota WHEN OLD.paired_writer=0\n            BEGIN SELECT RAISE(ABORT,'{message}'); END;\"",
+      "fnd": "FND-001",
+      "outcome": "fixed"
+    },
+    {
+      "after_excerpt": "                    QuotaState::ServerBackoff => {\n                        Error::QuotaAdmissionRefused { decision }.legacy_rate_limit()\n                    }",
+      "fnd": "FND-002",
+      "outcome": "fixed"
+    },
+    {
+      "after_excerpt": "    if let Err(error) = &result {\n        *outcome = RefreshOutcome::from_error(error);\n    }\n    result.map_err(Error::legacy_rate_limit)",
+      "fnd": "FND-003",
+      "outcome": "fixed"
+    }
+  ]
+}
+```

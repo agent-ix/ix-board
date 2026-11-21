@@ -504,3 +504,50 @@ Reverse inventory: command/API families map to FR-001..032 (ready/project/search
   ]
 }
 ```
+
+
+## Dispositions
+
+Round1, reviewed frozen f39c31029b0842085ec916d9823eb8ac4ce36b22 after fix commits dac7afd563d7e436bb69dac3c8cd161efff67e74,0cbe749e8e157f6bf11c06190e78e8567f27f564,f39c31029b0842085ec916d9823eb8ac4ce36b22. Original findings and historical verdict above remain unchanged.
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-001 | fixed | Five real-SQLite cutover fixtures now execute old writer SQL after migration, verify transaction rollback and debt/token ownership, quarantine old in-flight HTTP429/GraphQLRATELIMITED, exercise an old admission transaction racing migration, retain known cooldown across reopen/windows and preserve cached partition/success markers. They test the chosen technical fence instead of assuming a completed migration remains isolated. Refs: tests/quota_writer_cutover.rs:71. |
+| FND-002 | fixed | New simultaneous-blocker regression invokes both gate.decision and the legacy gate.reserve, asserting earliest reevaluation1s, actual retry3s, unchanged LinearRateLimited variant and exact matching rendered errors. Refs: tests/quota_state.rs:701. |
+| FND-003 | fixed | A real LinearGraphQlSource under persisted actual-server backoff now exercises workspace_snapshot_bounded. Its assertions require existing LinearRateLimited60s, captured ServerBackoff metadata, zero queuedHTTP connections, no published snapshot and stable attempt evidence after another gate expires cooldown. Another fixture verifies bounded refresh/reuse/failure/preflight outcomes. Refs: tests/bounded_quota_outcome.rs:92. |
+
+### Round1 evidence and current verdict
+
+**PASS** for this changed-scope review: all three findings have current fixed outcomes and no new concrete regression was found. All six outcomes across SR-6093 and SR-6094 are fixed; no missing or still-open disposition remains. This is mergeable from the reviewer lane, subject to the lead's separately owned final aggregate gate.
+
+82 focused integration tests passed across bounded_quota_outcome2, bounded_read37, cache_coordination5, cache_status3, quota_backoff1, quota_process15, quota_state9, quota_writer_cutover5 and sdk_quota_outcome5. Four focused quota/backoff unit tests passed. Logs: /tmp/SWM-185-code-review/disposition-1-focused.log and /tmp/SWM-185-code-review/disposition-1-units.log. All use local fixture HTTP/SQLite/source/clock seams; no real Linear requests. This pass rechecked fixes and affected behavior without repeating the whole-repository matrix or unrelated audits. No aggregate CI run, source/test/branch edit, commit, push, extra worktree or target directory was made.
+
+The technical fence is a schema compatibility guard, not a security barrier against an operator deliberately altering guard columns or triggers. Actual pre-paired client SQL cannot set the new guard and fails before send. Each new guarded operation is private, starts an IMMEDIATE transaction, and restores committed guard0; error/callback refusal rolls back. Old reservations committed before migration are captured atomically and keep indefinite unknown-response quarantine. Rebuilding does not clear that condition; the documented operator reconciliation remains necessary only if such tokens exist. New-protocol abandoned tokens retain conservative charges without entering legacy quarantine. Existing request/complexity debt, single-use/replay/wrong-store checks, fixed-window/generation behavior and stale/strict-bounded contracts passed the focused regression lanes. Existing actual cooldown remains higher precedence than the quarantine and cannot be shortened by old writes.
+
+Plan completion: not assessed
+
+No additional methods became applicable: code-review/Rust lane and semantic gap disposition were completed; no new spec/plan diff or applicable AssuranceProfile was introduced. has-review was already present.
+
+### Round1 fixed excerpts
+
+```yaml
+{
+  "dispositions": [
+    {
+      "after_excerpt": "    let error=old.execute(\"UPDATE linear_shared_quota SET request_limit=10000,request_remaining=250,request_reset=?1 WHERE singleton=1\",[NOW+10000]).unwrap_err();\n    assert_upgrade(&error);\n    assert_eq!(\n        current.decision(10).unwrap().next_reevaluation_at,\n        Some(NOW + 1000),\n        \"rejected old update cannot slide imported evidence\"",
+      "fnd": "FND-001",
+      "outcome": "fixed"
+    },
+    {
+      "after_excerpt": "    assert_eq!(decision.next_reevaluation_at, Some(NOW + 1000));\n    let error = gate.reserve(10, None).unwrap_err();\n    assert!(\n        matches!(error,ix_board::Error::LinearRateLimited {retry_after} if retry_after==Duration::from_secs(3))\n    );\n    assert_eq!(error.to_string(), \"Linear rate limited; retry in 3s\");\n    assert_eq!(decision.to_string(), error.to_string());",
+      "fnd": "FND-002",
+      "outcome": "fixed"
+    },
+    {
+      "after_excerpt": "    let captured = match service.refresh_outcome() {\n        RefreshOutcome::QuotaRefused { decision } => decision.clone(),\n        other => panic!(\"bounded attempt lost typed quota provenance: {other:?}\"),\n    };\n    assert_eq!(captured.state, QuotaState::ServerBackoff);\n    assert_eq!(captured.evaluated_at, QUOTA_NOW);\n    assert_eq!(captured.next_reevaluation_at, Some(QUOTA_NOW + 60_000));",
+      "fnd": "FND-003",
+      "outcome": "fixed"
+    }
+  ]
+}
+```
