@@ -6,7 +6,7 @@
 //! loopback server; nothing here reads the process environment or a real credential.
 
 use ix_board::{
-    CatalogEvidence, Clock, Deadline, Error, Issue, IssueId, LinearGraphQlSource,
+    CatalogEvidence, Clock, Deadline, Error, Initiative, Issue, IssueId, LinearGraphQlSource,
     NamedFocusRequest, NamedMember, NamedSelection, Project, ProjectId, ProjectStatusCategory,
     ReadPolicy, ReadService, TeamKey, WorkflowStateType, WorkspaceSnapshot, WorkspaceSource,
 };
@@ -1153,6 +1153,116 @@ fn the_composed_batch_keeps_one_budget_through_evidence_and_evaluation() {
         .expect("the batch with a budget to spare");
     assert_eq!(batch.selections[0].counts.total, 60);
     assert_eq!(source.reads(), 1);
+}
+
+/// `projects` projects of `per_project` open leaves each, all held by initiative `i1`.
+fn initiative_workload(projects: usize, per_project: usize) -> WorkspaceSnapshot {
+    let template = workload(0).projects.remove(0);
+    let initiative = Initiative {
+        id: "i1".into(),
+        identifier: "I-1".into(),
+        name: "Initiative one".into(),
+    };
+    let mut snapshot = WorkspaceSnapshot::default();
+    for project in 0..projects {
+        let id = ProjectId(format!("p{project}"));
+        snapshot.projects.push(Project {
+            id: id.clone(),
+            identifier: Some(format!("PRJ-{project}")),
+            initiatives: vec![initiative.clone()],
+            ..template.clone()
+        });
+        for index in 0..per_project {
+            let mut issue = workload(1).issues.remove(0);
+            issue.id = IssueId(format!("SWM-{project}-{index}"));
+            issue.identifier = format!("SWM-{project}-{index}");
+            issue.project_id = Some(id.clone());
+            snapshot.issues.push(issue);
+        }
+    }
+    snapshot
+}
+
+fn initiative_batch() -> Vec<NamedFocusRequest> {
+    vec![NamedFocusRequest {
+        key: "focus".into(),
+        selection: NamedSelection::new(
+            TeamKey("SWM".into()),
+            vec![NamedMember::Initiative { id: "i1".into() }],
+            vec![],
+        ),
+    }]
+}
+
+/// One composed read of `snapshot` where every look at the clock costs [`WORK_STEP`].
+/// Returns the leaf total or the error, and how much controlled time the call used.
+fn timed_initiative_batch(
+    snapshot: WorkspaceSnapshot,
+    deadline: Duration,
+    from_cache: bool,
+) -> (Result<usize, Error>, Duration) {
+    let clock = ManualClock::new(14_000);
+    let mut source = FakeSource::new(&clock, true);
+    source.snapshot = snapshot;
+    let directory = tempfile::tempdir().expect("dir");
+    let mut service = open(&source, &clock, &cache_path(&directory));
+    if from_cache {
+        service
+            .workspace_snapshot_bounded(&policy(240, Duration::from_secs(3600)))
+            .expect("a cold read fills the cache");
+    }
+    clock.set_step(WORK_STEP);
+    let before = clock.elapsed();
+    let result = service
+        .named_batch_bounded(&policy(240, deadline), &initiative_batch())
+        .map(|batch| batch.selections[0].counts.total);
+    (result, clock.elapsed() - before)
+}
+
+/// The cost of one cooperative deadline check in the placement test below.
+const WORK_STEP: Duration = Duration::from_micros(100);
+
+#[trace("FR-004-AC-14", "FR-012-AC-19")]
+#[test]
+fn row_count_and_placement_work_over_many_projects_stops_at_the_shared_deadline() {
+    // Phase evidence without assuming how many times the engine reads the clock. Both
+    // snapshots hold the same 300 leaves, so decoding, context building, selector
+    // validation, closure and readiness work cost the same. They differ only in the
+    // placement phase (per-project rows, counts and reasons): one project of 300 leaves
+    // against 30 projects of 10, where each project's row scans every selected leaf.
+    // Unchecked work consumes no controlled time, so a deadline that only the
+    // surrounding checks observe would let the many-project batch return late.
+    for from_cache in [false, true] {
+        let generous = Duration::from_secs(3600);
+        let (one, one_used) =
+            timed_initiative_batch(initiative_workload(1, 300), generous, from_cache);
+        let (many, many_used) =
+            timed_initiative_batch(initiative_workload(30, 10), generous, from_cache);
+        assert_eq!(one.expect("one project"), 300);
+        assert_eq!(many.expect("many projects"), 300);
+        assert!(
+            many_used > one_used * 2,
+            "placement must dominate the many-project batch: {many_used:?} vs {one_used:?}"
+        );
+
+        // A deadline between the two: everything before placement, and the cheap
+        // placement of one project, fit; the many-project placement does not.
+        let deadline = one_used + (many_used - one_used) / 2;
+        let (fits, _) = timed_initiative_batch(initiative_workload(1, 300), deadline, from_cache);
+        assert_eq!(fits.expect("same cache, source and context cost fits"), 300);
+
+        let (result, used) =
+            timed_initiative_batch(initiative_workload(30, 10), deadline, from_cache);
+        assert!(
+            is_timeout(&result, deadline),
+            "placement past the one deadline is the typed timeout (cache {from_cache}): {result:?}"
+        );
+        assert!(
+            used <= deadline + WORK_STEP * 100,
+            "placement stops soon after expiry, not after the whole traversal: \
+             {used:?} against {deadline:?} (full run {many_used:?})"
+        );
+    }
 }
 
 #[trace("FR-004-AC-13")]
