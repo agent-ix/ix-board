@@ -43,7 +43,9 @@ list or a whole-team selection. `include: []` is the explicit empty selection.
 To build a selection from names, use `canonicalize_named_selection`. It accepts
 the same names, identifiers, UUIDs and `<project>/<milestone>` forms as `focus
 status`, and refuses a missing, ambiguous, other-team, or project-mismatched member
-without producing a partial document.
+without producing a partial document. It has no deadline of its own. To create or
+update a definition from names under one deadline, use
+[`canonicalize_named_selection_bounded`](#canonicalizing-names-under-one-deadline).
 
 Export the JSON Schema with
 `cargo run --example export_schema -- NamedSelection`.
@@ -150,3 +152,41 @@ let batch = service.named_batch_bounded(&policy, &requests)?; // read, then eval
 
 The existing methods, such as `workspace_snapshot`, are unchanged: five-minute entry
 lifetime, 30-second request timeout, no deadline.
+
+### Canonicalizing names under one deadline
+
+A caller that accepts names or identifiers and must store only canonical IDs uses
+`ReadService::canonicalize_named_selection_bounded`. It starts one deadline, reads
+the snapshot as `workspace_snapshot_bounded` does, and resolves the input against that
+snapshot under the same deadline:
+
+```rust
+use ix_board::{NamedMemberInput, NamedSelectionInput, ReadPolicy};
+
+let input = NamedSelectionInput {
+    team: "SWM".into(),
+    include: vec![
+        NamedMemberInput::Initiative("I-10".into()),
+        NamedMemberInput::Milestone {
+            selector: "Project / Alpha/Beta".into(),
+            project: None,
+        },
+    ],
+    exclude: vec![NamedMemberInput::Ticket("SWM-2".into())],
+};
+let selection = service.canonicalize_named_selection_bounded(&policy, &input)?;
+// Only now, outside the deadline, store or publish `selection.encode()?`.
+```
+
+- The deadline covers the cache lookup and decode, the source read, every name,
+  identifier, team, project, initiative, milestone and ticket scan, and the ordering of
+  each member list. The read's time counts: resolution gets only what is left. The
+  deadline is checked again before the call returns.
+- The result is what `canonicalize_named_selection` returns for the same snapshot and
+  input: IDs only, a milestone with its owning project, an explicit empty `include`
+  kept empty.
+- A timeout is `Error::ReadTimeout`. A member that is missing, ambiguous, of another
+  team or owned by another project is the same error the standalone form returns.
+  Either way there is no document. The call stores and publishes nothing.
+- Resolve credentials first, as for every bounded read. Policy and unsupported-source
+  errors are the same as for `workspace_snapshot_bounded`.

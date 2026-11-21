@@ -7,8 +7,9 @@
 
 use ix_board::{
     CatalogEvidence, Clock, Deadline, Error, Initiative, Issue, IssueId, LinearGraphQlSource,
-    NamedFocusRequest, NamedMember, NamedSelection, Project, ProjectId, ProjectStatusCategory,
-    ReadPolicy, ReadService, TeamKey, WorkflowStateType, WorkspaceSnapshot, WorkspaceSource,
+    MemberOutcome, Milestone, NamedFocusRequest, NamedMember, NamedMemberInput, NamedSelection,
+    NamedSelectionInput, Project, ProjectId, ProjectStatusCategory, ReadPolicy, ReadService,
+    TeamKey, WorkflowStateType, WorkspaceSnapshot, WorkspaceSource, canonicalize_named_selection,
 };
 use ix_cli_kit::secrets::{
     AppScope, CredentialBackend, DeleteStatus, Presence, SecretError, SecretKey, SecretStore,
@@ -1315,4 +1316,371 @@ fn an_old_writer_replacing_the_payload_in_the_same_second_voids_the_evidence() {
         .workspace_snapshot_bounded(&limits)
         .expect("cached read");
     assert_eq!(source.reads(), 2);
+}
+
+fn named_project(id: &str, identifier: &str, name: &str, team: &str) -> Project {
+    Project {
+        id: ProjectId(id.into()),
+        identifier: Some(identifier.into()),
+        name: name.into(),
+        team_keys: vec![TeamKey(team.into())],
+        initiatives: vec![Initiative {
+            id: "uuid-init".into(),
+            identifier: "I-10".into(),
+            name: "Delivery".into(),
+        }],
+        ..workload(0).projects.remove(0)
+    }
+}
+
+fn milestone_record(id: &str, name: &str) -> Milestone {
+    Milestone {
+        id: id.into(),
+        name: name.into(),
+        description: None,
+        sort_order: 1.0,
+        target_date: None,
+    }
+}
+
+fn ticket(id: &str, identifier: &str, team: &str, project: &str, parent: Option<&str>) -> Issue {
+    Issue {
+        id: IssueId(id.into()),
+        identifier: identifier.into(),
+        team_key: TeamKey(team.into()),
+        project_id: Some(ProjectId(project.into())),
+        parent_id: parent.map(|id| IssueId(id.into())),
+        ..workload(1).issues.remove(0)
+    }
+}
+
+/// Two SWM projects holding same-named milestones and a project of another team.
+fn naming_snapshot() -> WorkspaceSnapshot {
+    let mut alpha = named_project("uuid-alpha", "PRJ-1", "Project / Alpha", "SWM");
+    alpha.milestones = vec![
+        milestone_record("uuid-m1", "Derived W/M operators"),
+        milestone_record("uuid-m2", "Beta"),
+    ];
+    let mut other = named_project("uuid-other", "PRJ-2", "Other", "SWM");
+    other.milestones = vec![milestone_record("uuid-m3", "Beta")];
+    let mut foreign = named_project("uuid-foreign", "PRJ-3", "Foreign", "AGE");
+    foreign.initiatives.clear();
+    WorkspaceSnapshot {
+        projects: vec![alpha, other, foreign],
+        issues: vec![
+            ticket("uuid-t1", "SWM-1", "SWM", "uuid-alpha", None),
+            ticket("uuid-t2", "SWM-2", "SWM", "uuid-alpha", Some("uuid-t1")),
+            ticket("uuid-t3", "AGE-1", "AGE", "uuid-foreign", None),
+        ],
+        fetched_at: 0,
+    }
+}
+
+fn milestone_input(selector: &str, project: Option<&str>) -> NamedMemberInput {
+    NamedMemberInput::Milestone {
+        selector: selector.into(),
+        project: project.map(str::to_owned),
+    }
+}
+
+fn named_input(
+    include: Vec<NamedMemberInput>,
+    exclude: Vec<NamedMemberInput>,
+) -> NamedSelectionInput {
+    NamedSelectionInput {
+        team: "SWM".into(),
+        include,
+        exclude,
+    }
+}
+
+fn naming_service(
+    snapshot: WorkspaceSnapshot,
+    clock: &ManualClock,
+    directory: &tempfile::TempDir,
+) -> (ReadService<FakeSource, ManualClock>, FakeSource) {
+    let mut source = FakeSource::new(clock, true);
+    source.snapshot = snapshot;
+    (open(&source, clock, &cache_path(directory)), source)
+}
+
+#[trace("FR-016-AC-11", "FR-004-AC-14")]
+#[test]
+fn composed_canonicalization_resolves_every_member_kind_from_a_cold_read_and_a_warm_cache() {
+    let clock = ManualClock::new(15_000);
+    let directory = tempfile::tempdir().expect("dir");
+    let (mut service, source) = naming_service(naming_snapshot(), &clock, &directory);
+    let limits = policy(240, Duration::from_secs(5));
+    let input = named_input(
+        vec![
+            NamedMemberInput::Initiative("i-10".into()),
+            NamedMemberInput::Project("Project / Alpha".into()),
+            milestone_input("Project / Alpha/Derived W/M operators", None),
+            milestone_input("PRJ-1/Beta", Some("PRJ-1")),
+            NamedMemberInput::Ticket("swm-1".into()),
+        ],
+        vec![
+            NamedMemberInput::Project("Other".into()),
+            NamedMemberInput::Ticket("SWM-2".into()),
+        ],
+    );
+    let cold = service
+        .canonicalize_named_selection_bounded(&limits, &input)
+        .expect("cold read then canonicalization");
+    assert_eq!(source.reads(), 1);
+    let milestone = |id: &str| NamedMember::Milestone {
+        id: id.into(),
+        project_id: "uuid-alpha".into(),
+    };
+    assert_eq!(
+        cold.include,
+        [
+            NamedMember::Initiative {
+                id: "uuid-init".into()
+            },
+            NamedMember::Project {
+                id: "uuid-alpha".into()
+            },
+            milestone("uuid-m1"),
+            milestone("uuid-m2"),
+            NamedMember::Issue {
+                id: "uuid-t1".into()
+            },
+        ]
+    );
+    assert_eq!(
+        cold.exclude,
+        [
+            NamedMember::Project {
+                id: "uuid-other".into()
+            },
+            NamedMember::Issue {
+                id: "uuid-t2".into()
+            },
+        ]
+    );
+    assert_eq!(
+        cold,
+        canonicalize_named_selection(&naming_snapshot(), &input).expect("standalone"),
+        "the bounded form returns exactly what the standalone form does"
+    );
+    let warm = service
+        .canonicalize_named_selection_bounded(&limits, &input)
+        .expect("warm cache then canonicalization");
+    assert_eq!(source.reads(), 1, "the warm call read nothing");
+    assert_eq!(warm, cold);
+
+    // An explicit empty selection stays empty: it is never the whole team.
+    let empty = service
+        .canonicalize_named_selection_bounded(&limits, &named_input(vec![], vec![]))
+        .expect("explicit empty selection");
+    assert!(empty.include.is_empty() && empty.exclude.is_empty());
+    assert!(empty.encode().expect("encodes").contains(r#""include":[]"#));
+}
+
+#[trace("FR-016-AC-11", "FR-004-AC-16")]
+#[test]
+fn composed_canonicalization_failures_return_the_typed_error_and_no_document() {
+    let clock = ManualClock::new(16_000);
+    let directory = tempfile::tempdir().expect("dir");
+    let (mut service, source) = naming_service(naming_snapshot(), &clock, &directory);
+    let limits = policy(240, Duration::from_secs(5));
+    let mut refuse = |include: Vec<NamedMemberInput>| {
+        service.canonicalize_named_selection_bounded(&limits, &named_input(include, vec![]))
+    };
+    assert!(matches!(
+        refuse(vec![milestone_input("Beta", None)]),
+        Err(Error::AmbiguousMilestone { .. })
+    ));
+    assert!(matches!(
+        refuse(vec![NamedMemberInput::Project("Nothing".into())]),
+        Err(Error::ScopeSelection {
+            kind: "project",
+            ..
+        })
+    ));
+    assert!(matches!(
+        refuse(vec![milestone_input("PRJ-1/Beta", Some("PRJ-2"))]),
+        Err(Error::NamedMemberRejected {
+            outcome: MemberOutcome::ProjectMismatch,
+            ..
+        })
+    ));
+    for other_team in [
+        NamedMemberInput::Ticket("AGE-1".into()),
+        NamedMemberInput::Project("Foreign".into()),
+    ] {
+        assert!(matches!(
+            refuse(vec![other_team]),
+            Err(Error::NamedMemberRejected {
+                outcome: MemberOutcome::WrongTeam,
+                ..
+            })
+        ));
+    }
+    // A good member beside a bad one still yields nothing.
+    assert!(
+        refuse(vec![
+            NamedMemberInput::Project("Other".into()),
+            NamedMemberInput::Ticket("SWM-404".into()),
+        ])
+        .is_err()
+    );
+    let unknown_team = NamedSelectionInput {
+        team: "NOPE".into(),
+        ..named_input(vec![], vec![])
+    };
+    assert!(matches!(
+        service.canonicalize_named_selection_bounded(&limits, &unknown_team),
+        Err(Error::ScopeSelection { kind: "team", .. })
+    ));
+    assert_eq!(source.reads(), 1, "one snapshot served every refusal");
+
+    // An invalid policy and a source that cannot honor a bound fail before any read.
+    let input = named_input(vec![], vec![]);
+    assert!(matches!(
+        service.canonicalize_named_selection_bounded(&policy(301, Duration::from_secs(5)), &input),
+        Err(Error::InvalidReadPolicy { .. })
+    ));
+    let unbounded = FakeSource::new(&clock, false);
+    let directory = tempfile::tempdir().expect("dir");
+    let mut service = open(&unbounded, &clock, &cache_path(&directory));
+    assert!(matches!(
+        service.canonicalize_named_selection_bounded(&limits, &input),
+        Err(Error::BoundUnsupported)
+    ));
+    assert_eq!((source.reads(), unbounded.reads()), (1, 0));
+}
+
+/// `projects` SWM projects, each with a milestone and five tickets, and an input naming
+/// every project, a milestone qualified by its project, and a ticket of each, so that
+/// resolving it scans the snapshot hundreds of times.
+fn many_names(projects: usize) -> (WorkspaceSnapshot, NamedSelectionInput) {
+    let mut snapshot = WorkspaceSnapshot::default();
+    let mut include = vec![NamedMemberInput::Initiative("I-10".into())];
+    for index in 0..projects {
+        let id = format!("p{index}");
+        let identifier = format!("PRJ-{index}");
+        let mut project = named_project(&id, &identifier, &format!("Name {index}"), "SWM");
+        project.milestones = vec![milestone_record(
+            &format!("m{index}"),
+            &format!("Stage {index}"),
+        )];
+        snapshot.projects.push(project);
+        for leaf in 0..5 {
+            let key = format!("SWM-{index}-{leaf}");
+            snapshot.issues.push(ticket(&key, &key, "SWM", &id, None));
+        }
+        include.push(NamedMemberInput::Project(format!("Name {index}")));
+        include.push(milestone_input(
+            &format!("PRJ-{index}/Stage {index}"),
+            Some(&format!("Name {index}")),
+        ));
+        include.push(NamedMemberInput::Ticket(format!("SWM-{index}-0")));
+    }
+    (snapshot, named_input(include, vec![]))
+}
+
+/// One composed canonicalization where every look at the clock costs [`WORK_STEP`] and a
+/// cold source read costs `read_cost`. Returns the result and the controlled time used.
+fn timed_canonicalization(
+    snapshot: WorkspaceSnapshot,
+    input: &NamedSelectionInput,
+    deadline: Duration,
+    from_cache: bool,
+    read_cost: Duration,
+) -> (Result<NamedSelection, Error>, Duration) {
+    let clock = ManualClock::new(17_000);
+    let directory = tempfile::tempdir().expect("dir");
+    let (mut service, source) = naming_service(snapshot, &clock, &directory);
+    if from_cache {
+        service
+            .workspace_snapshot_bounded(&policy(240, Duration::from_secs(3600)))
+            .expect("a cold read fills the cache");
+    } else if !read_cost.is_zero() {
+        source.behave(Behavior::Pages {
+            pages: 1,
+            cost: read_cost,
+        });
+    }
+    clock.set_step(WORK_STEP);
+    let before = clock.elapsed();
+    let result = service.canonicalize_named_selection_bounded(&policy(240, deadline), input);
+    (result, clock.elapsed() - before)
+}
+
+#[trace("FR-004-AC-14", "FR-016-AC-11")]
+#[test]
+fn the_deadline_expires_during_many_name_and_reference_scans_not_before_them() {
+    // The two inputs share a snapshot, so the cache lookup, decode and team scan cost the
+    // same. They differ only in resolution: no members against hundreds of scans. Work
+    // that does not check the deadline consumes no controlled time, so a deadline that
+    // only the surrounding checks observe would let the heavy input return late.
+    let generous = Duration::from_secs(3600);
+    for from_cache in [false, true] {
+        let (snapshot, heavy) = many_names(30);
+        let trivial = named_input(vec![], vec![]);
+        let none = Duration::ZERO;
+        let (light, light_used) =
+            timed_canonicalization(snapshot.clone(), &trivial, generous, from_cache, none);
+        let (full, full_used) =
+            timed_canonicalization(snapshot.clone(), &heavy, generous, from_cache, none);
+        light.expect("trivial input");
+        assert_eq!(full.expect("heavy input").include.len(), 91);
+        assert!(
+            full_used > light_used * 2,
+            "resolution must dominate the heavy input: {full_used:?} vs {light_used:?}"
+        );
+
+        // A deadline between the two: everything before resolution fits; resolution does not.
+        let deadline = light_used + (full_used - light_used) / 2;
+        let (fits, _) =
+            timed_canonicalization(snapshot.clone(), &trivial, deadline, from_cache, none);
+        fits.expect("the same read and context cost fits");
+        let (result, used) = timed_canonicalization(snapshot, &heavy, deadline, from_cache, none);
+        assert!(
+            is_timeout(&result, deadline),
+            "resolution past the one deadline is the typed timeout (cache {from_cache}): {result:?}"
+        );
+        assert!(
+            used <= deadline + WORK_STEP * 100,
+            "resolution stops soon after expiry, not after every scan: \
+             {used:?} against {deadline:?} (full run {full_used:?})"
+        );
+    }
+}
+
+#[trace("FR-004-AC-14", "FR-004-AC-16")]
+#[test]
+fn time_the_read_used_is_not_given_back_to_resolution() {
+    // The source read costs five controlled seconds. The deadline leaves room for the
+    // read and a trivial resolution, but only half of what the heavy resolution needs.
+    // A second deadline started after the read would give resolution the whole limit again
+    // and the heavy input would succeed.
+    let read_cost = Duration::from_secs(5);
+    let generous = Duration::from_secs(3600);
+    let (snapshot, heavy) = many_names(30);
+    let trivial = named_input(vec![], vec![]);
+    let (light, light_used) =
+        timed_canonicalization(snapshot.clone(), &trivial, generous, false, read_cost);
+    let (full, full_used) =
+        timed_canonicalization(snapshot.clone(), &heavy, generous, false, read_cost);
+    light.expect("trivial input");
+    full.expect("heavy input");
+    assert!(
+        full_used - light_used > WORK_STEP * 100,
+        "resolution must cost real controlled time: {full_used:?} vs {light_used:?}"
+    );
+    let deadline = light_used + (full_used - light_used) / 2;
+    assert!(
+        deadline > read_cost,
+        "the read alone fits inside the deadline"
+    );
+    let (fits, _) = timed_canonicalization(snapshot.clone(), &trivial, deadline, false, read_cost);
+    fits.expect("the read and a trivial resolution fit");
+    let (result, _) = timed_canonicalization(snapshot, &heavy, deadline, false, read_cost);
+    assert!(
+        is_timeout(&result, deadline),
+        "the read's time counts against resolution: {result:?}"
+    );
 }

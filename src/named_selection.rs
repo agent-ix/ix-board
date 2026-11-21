@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::read_bound::Budget;
 use crate::{Error, MemberOutcome, TeamKey, WorkspaceSnapshot, scope};
 
 /// The only schema version the named-selection decoder reads.
@@ -227,20 +228,30 @@ pub struct NamedSelectionInput {
 /// ambiguous, a ticket of another team, a project or initiative holding none of the
 /// team's work, or a milestone owned by another project fails the whole call with no
 /// partial document.
+///
+/// This standalone form has no deadline. A caller that must bound the cache lookup, the
+/// source read and this resolution together uses
+/// [`ReadService::canonicalize_named_selection_bounded`](crate::ReadService::canonicalize_named_selection_bounded).
 pub fn canonicalize_named_selection(
     snapshot: &WorkspaceSnapshot,
     input: &NamedSelectionInput,
+) -> Result<NamedSelection, Error> {
+    canonicalize_within(snapshot, input, Budget::unbounded())
+}
+
+/// [`canonicalize_named_selection`] under a budget shared with the read that produced
+/// `snapshot`. Every scan, and the final ordering of each member list, checks the same
+/// budget and stops with [`Error::ReadTimeout`] once it has expired.
+pub(crate) fn canonicalize_within(
+    snapshot: &WorkspaceSnapshot,
+    input: &NamedSelectionInput,
+    budget: Budget<'_>,
 ) -> Result<NamedSelection, Error> {
     if input.team.trim().is_empty() {
         return Err(Error::InvalidTeam);
     }
     let team = TeamKey(input.team.clone());
-    let known = snapshot.issues.iter().any(|issue| issue.team_key == team)
-        || snapshot
-            .projects
-            .iter()
-            .any(|project| project.team_keys.contains(&team));
-    if !known {
+    if !team_is_known(snapshot, &team, budget)? {
         return Err(Error::ScopeSelection {
             kind: "team",
             identifier: input.team.clone(),
@@ -250,28 +261,76 @@ pub fn canonicalize_named_selection(
     let resolve = |members: &[NamedMemberInput]| {
         members
             .iter()
-            .map(|member| canonical_member(snapshot, &team, member))
+            .map(|member| canonical_member(snapshot, &team, member, budget))
             .collect::<Result<Vec<_>, _>>()
     };
-    Ok(NamedSelection::new(
-        team.clone(),
-        resolve(&input.include)?,
-        resolve(&input.exclude)?,
-    ))
+    let include = resolve(&input.include)?;
+    let exclude = resolve(&input.exclude)?;
+    Ok(NamedSelection {
+        schema_version: NAMED_SELECTION_SCHEMA_VERSION,
+        team: team.clone(),
+        include: canonical_list_within(include, budget)?,
+        exclude: canonical_list_within(exclude, budget)?,
+    })
 }
 
-fn holds_team_work(snapshot: &WorkspaceSnapshot, project_id: &str, team: &TeamKey) -> bool {
-    snapshot
-        .projects
-        .iter()
-        .any(|project| project.id.0 == project_id && project.team_keys.contains(team))
-        || snapshot.issues.iter().any(|issue| {
-            issue.team_key == *team
-                && issue
-                    .project_id
-                    .as_ref()
-                    .is_some_and(|id| id.0 == project_id)
-        })
+/// [`canonical_list`] that checks `budget` for every member it orders.
+fn canonical_list_within(
+    members: Vec<NamedMember>,
+    budget: Budget<'_>,
+) -> Result<Vec<NamedMember>, Error> {
+    let mut ordered = BTreeSet::new();
+    for member in members {
+        budget.check()?;
+        ordered.insert(member);
+    }
+    Ok(ordered.into_iter().collect())
+}
+
+fn team_is_known(
+    snapshot: &WorkspaceSnapshot,
+    team: &TeamKey,
+    budget: Budget<'_>,
+) -> Result<bool, Error> {
+    for issue in &snapshot.issues {
+        budget.check()?;
+        if issue.team_key == *team {
+            return Ok(true);
+        }
+    }
+    for project in &snapshot.projects {
+        budget.check()?;
+        if project.team_keys.contains(team) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn holds_team_work(
+    snapshot: &WorkspaceSnapshot,
+    project_id: &str,
+    team: &TeamKey,
+    budget: Budget<'_>,
+) -> Result<bool, Error> {
+    for project in &snapshot.projects {
+        budget.check()?;
+        if project.id.0 == project_id && project.team_keys.contains(team) {
+            return Ok(true);
+        }
+    }
+    for issue in &snapshot.issues {
+        budget.check()?;
+        if issue.team_key == *team
+            && issue
+                .project_id
+                .as_ref()
+                .is_some_and(|id| id.0 == project_id)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn rejected(kind: &'static str, identifier: &str, outcome: MemberOutcome) -> Error {
@@ -286,46 +345,58 @@ fn canonical_member(
     snapshot: &WorkspaceSnapshot,
     team: &TeamKey,
     member: &NamedMemberInput,
+    budget: Budget<'_>,
 ) -> Result<NamedMember, Error> {
+    budget.check()?;
     match member {
         NamedMemberInput::Initiative(value) => {
-            let id = scope::resolve_initiative_id(snapshot, value)?;
-            let holds = snapshot
-                .projects
-                .iter()
-                .filter(|project| project.initiatives.iter().any(|i| i.id == id))
-                .any(|project| holds_team_work(snapshot, &project.id.0, team));
+            let id = scope::resolve_initiative_id_within(snapshot, value, budget)?;
+            let mut holds = false;
+            for project in &snapshot.projects {
+                budget.check()?;
+                if project.initiatives.iter().any(|i| i.id == id)
+                    && holds_team_work(snapshot, &project.id.0, team, budget)?
+                {
+                    holds = true;
+                    break;
+                }
+            }
             if !holds {
                 return Err(rejected("initiative", value, MemberOutcome::WrongTeam));
             }
             Ok(NamedMember::Initiative { id })
         }
         NamedMemberInput::Project(value) => {
-            let id = scope::resolve_project_id(snapshot, value)?.0;
-            if !holds_team_work(snapshot, &id, team) {
+            let id = scope::resolve_project_id_within(snapshot, value, budget)?.0;
+            if !holds_team_work(snapshot, &id, team, budget)? {
                 return Err(rejected("project", value, MemberOutcome::WrongTeam));
             }
             Ok(NamedMember::Project { id })
         }
         NamedMemberInput::Ticket(value) => {
-            let id = scope::resolve_ticket_id(snapshot, value)?;
-            let in_team = snapshot
-                .issues
-                .iter()
-                .any(|issue| issue.id == id && issue.team_key == *team);
+            let id = scope::resolve_ticket_id_within(snapshot, value, budget)?;
+            let mut in_team = false;
+            for issue in &snapshot.issues {
+                budget.check()?;
+                if issue.id == id && issue.team_key == *team {
+                    in_team = true;
+                    break;
+                }
+            }
             if !in_team {
                 return Err(rejected("issue", value, MemberOutcome::WrongTeam));
             }
             Ok(NamedMember::Issue { id: id.0 })
         }
         NamedMemberInput::Milestone { selector, project } => {
-            let id = scope::resolve_milestone_id(snapshot, selector)?;
-            let owners = snapshot
-                .projects
-                .iter()
-                .filter(|project| project.milestones.iter().any(|m| m.id == id))
-                .map(|project| project.id.0.clone())
-                .collect::<Vec<_>>();
+            let id = scope::resolve_milestone_id_within(snapshot, selector, None, budget)?;
+            let mut owners = Vec::new();
+            for candidate in &snapshot.projects {
+                budget.check()?;
+                if candidate.milestones.iter().any(|m| m.id == id) {
+                    owners.push(candidate.id.0.clone());
+                }
+            }
             let [owner] = owners.as_slice() else {
                 return Err(Error::ScopeSelection {
                     kind: "milestone",
@@ -334,7 +405,7 @@ fn canonical_member(
                 });
             };
             if let Some(claimed) = project
-                && scope::resolve_project_id(snapshot, claimed)?.0 != *owner
+                && scope::resolve_project_id_within(snapshot, claimed, budget)?.0 != *owner
             {
                 return Err(rejected(
                     "milestone",
@@ -342,7 +413,7 @@ fn canonical_member(
                     MemberOutcome::ProjectMismatch,
                 ));
             }
-            if !holds_team_work(snapshot, owner, team) {
+            if !holds_team_work(snapshot, owner, team, budget)? {
                 return Err(rejected("milestone", selector, MemberOutcome::WrongTeam));
             }
             Ok(NamedMember::Milestone {

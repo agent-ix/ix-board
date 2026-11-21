@@ -27,8 +27,7 @@ pub use named_focus::{
 pub use named_selection::{
     NAMED_SELECTION_SCHEMA_VERSION, NamedMember, NamedMemberInput, NamedSelection,
     NamedSelectionInput, canonicalize_named_selection, decode_named_selection,
-};
-use read_bound::Budget;
+};use read_bound::Budget;
 pub use read_bound::{Deadline, ReadPolicy};
 pub use scope::{ScopeSelection, ScopeSummary, select_scope};
 
@@ -785,6 +784,39 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
             named_focus::evaluate_batch(&snapshot, &evidence, requests, Budget::within(&deadline))?;
         deadline.remaining()?;
         Ok(batch)
+    }
+
+    /// Bounded read followed by [`canonicalize_named_selection`] over that one snapshot:
+    /// the way to turn a person's names and identifiers into a canonical
+    /// [`NamedSelection`] before storing or publishing it.
+    ///
+    /// One deadline, started after the source's credentials are ready and before the
+    /// cache lookup, covers the cache lookup and decode, the source read, and the whole
+    /// resolution: every name, identifier, team, project, initiative, milestone and
+    /// ticket scan, and the ordering of each member list. Each of those checks the same
+    /// deadline as it goes, and it is checked again before this returns, so a document is
+    /// never returned after the deadline has expired. The snapshot is at most
+    /// `policy.max_age` old, as for [`ReadService::workspace_snapshot_bounded`].
+    ///
+    /// The result is exactly what [`canonicalize_named_selection`] returns for the same
+    /// snapshot and input. A timeout, or a member that is missing, ambiguous, of another
+    /// team or owned by another project, returns the error and no document. Nothing is
+    /// stored or published here: the caller does that after this returns, outside the
+    /// deadline.
+    pub fn canonicalize_named_selection_bounded(
+        &mut self,
+        policy: &ReadPolicy,
+        input: &NamedSelectionInput,
+    ) -> Result<NamedSelection, Error> {
+        self.admit_bounded(policy)?;
+        let clock: &dyn Clock = &self.clock;
+        let deadline = Deadline::start(clock, policy.deadline);
+        let snapshot = read_within(&self.source, &mut self.cache, clock, policy, &deadline)?;
+        deadline.remaining()?;
+        let selection =
+            named_selection::canonicalize_within(&snapshot, input, Budget::within(&deadline))?;
+        deadline.remaining()?;
+        Ok(selection)
     }
 
     /// Refuses an invalid policy or a source that cannot honor a bound, before any read.
