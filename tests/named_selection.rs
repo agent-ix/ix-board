@@ -94,8 +94,7 @@ fn explicit_empty_decodes_but_malformed_documents_are_invalid_never_empty() {
     let mut milestone_without_project = valid();
     milestone_without_project["include"] = json!([{"kind": "milestone", "id": "m1"}]);
     let mut project_on_other_kind = valid();
-    project_on_other_kind["include"] =
-        json!([{"kind": "project", "id": "p1", "project_id": "p1"}]);
+    project_on_other_kind["include"] = json!([{"kind": "project", "id": "p1", "project_id": "p1"}]);
     let mut duplicate = valid();
     duplicate["include"] = json!([
         {"kind": "project", "id": "p1"},
@@ -170,12 +169,18 @@ fn other_versions_are_unsupported_and_checked_before_any_other_member() {
     // Unsupported and invalid are different errors.
     let mut invalid = valid();
     invalid["include"] = json!("nope");
-    assert!(matches!(decode(&invalid), Err(Error::InvalidNamedSelection { .. })));
+    assert!(matches!(
+        decode(&invalid),
+        Err(Error::InvalidNamedSelection { .. })
+    ));
     // A missing or non-integer version is an undecodable document, not an unsupported one.
     for version in [json!(null), json!("3"), json!(3.5)] {
         let mut document = valid();
         document["schema_version"] = version;
-        assert!(matches!(decode(&document), Err(Error::InvalidNamedSelection { .. })));
+        assert!(matches!(
+            decode(&document),
+            Err(Error::InvalidNamedSelection { .. })
+        ));
     }
     // The legacy record type is unchanged for a version 3 document: it still refuses it.
     assert!(serde_json::from_value::<FocusRecord>(valid()).is_err());
@@ -228,7 +233,10 @@ fn the_named_selection_schema_is_strict_and_the_version_two_schema_is_unchanged(
         .filter_map(Value::as_str)
         .collect::<Vec<_>>();
     members.sort_unstable();
-    assert_eq!(members, ["reported_at", "schema_version", "selection", "status"]);
+    assert_eq!(
+        members,
+        ["reported_at", "schema_version", "selection", "status"]
+    );
     assert!(record["properties"].get("team").is_none());
     assert!(record["properties"].get("include").is_none());
     assert_eq!(FOCUS_RECORD_SCHEMA_VERSION, 2);
@@ -369,7 +377,10 @@ fn names_canonicalize_to_ids_with_the_owning_project_and_failures_leave_no_docum
     // The stored document keeps no label, expanded issue ID or status.
     let bytes = document.encode().expect("encodes");
     for forbidden in ["Alpha", "Delivery", "SWM-1", "label", "Todo", "Started"] {
-        assert!(!bytes.contains(forbidden), "{forbidden} must not be stored: {bytes}");
+        assert!(
+            !bytes.contains(forbidden),
+            "{forbidden} must not be stored: {bytes}"
+        );
     }
     let refused =
         |members: Vec<NamedMemberInput>| canonicalize_named_selection(&snapshot, &input(members));
@@ -380,11 +391,18 @@ fn names_canonicalize_to_ids_with_the_owning_project_and_failures_leave_no_docum
     ));
     assert!(matches!(
         refused(vec![milestone_input("Missing", None)]),
-        Err(Error::ScopeSelection { kind: "milestone", matches: 0, .. })
+        Err(Error::ScopeSelection {
+            kind: "milestone",
+            matches: 0,
+            ..
+        })
     ));
     assert!(matches!(
         refused(vec![NamedMemberInput::Project("Nothing".into())]),
-        Err(Error::ScopeSelection { kind: "project", .. })
+        Err(Error::ScopeSelection {
+            kind: "project",
+            ..
+        })
     ));
     // The recorded project must own the milestone.
     assert!(matches!(

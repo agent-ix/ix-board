@@ -679,12 +679,11 @@ impl<'a> Context<'a> {
             .filter_map(|id| self.issues.get(id).copied())
             .collect::<Vec<_>>();
         crate::dependency_layer_ids(self.snapshot, &roots)?;
-        let ready_identifiers = crate::ready_queue_for(self.snapshot, |issue| {
-            leaves.contains(&issue.id)
-        })?
-        .into_iter()
-        .map(|item| item.identifier)
-        .collect::<BTreeSet<_>>();
+        let ready_identifiers =
+            crate::ready_queue_for(self.snapshot, |issue| leaves.contains(&issue.id))?
+                .into_iter()
+                .map(|item| item.identifier)
+                .collect::<BTreeSet<_>>();
         let by_id = self
             .snapshot
             .issues
@@ -875,45 +874,42 @@ impl<'a> Context<'a> {
 
     fn initiative_rows(&self, draft: &Draft<'_>, readiness: &Readiness) -> Vec<InitiativeRow> {
         let team = &draft.request.selection.team;
-        let mut rows = draft
-            .initiatives
-            .iter()
-            .map(|(id, held)| {
-                let (identifier, name) = self.initiative_names(id);
-                let mut partial = BTreeSet::new();
-                let mut shown = Vec::new();
-                let mut leaves = Vec::new();
-                for project in held.iter().filter_map(|p| self.projects.get(p)) {
-                    if draft.excluded_projects.contains(&project.id) {
-                        partial.insert(PartialReason::Exclusion);
-                        continue;
+        let mut rows =
+            draft
+                .initiatives
+                .iter()
+                .map(|(id, held)| {
+                    let (identifier, name) = self.initiative_names(id);
+                    let mut partial = BTreeSet::new();
+                    let mut shown = Vec::new();
+                    let mut leaves = Vec::new();
+                    for project in held.iter().filter_map(|p| self.projects.get(p)) {
+                        if draft.excluded_projects.contains(&project.id) {
+                            partial.insert(PartialReason::Exclusion);
+                            continue;
+                        }
+                        partial.extend(self.project_reasons(draft, project).into_iter().filter(
+                            |r| matches!(r, PartialReason::Exclusion | PartialReason::TeamBoundary),
+                        ));
+                        leaves.extend(self.project_leaves(draft, &project.id));
+                        if self.holds_team_work(project, team) {
+                            shown.push(self.project_row(draft, readiness, project, None));
+                        }
                     }
-                    partial.extend(
-                        self.project_reasons(draft, project)
-                            .into_iter()
-                            .filter(|r| {
-                                matches!(r, PartialReason::Exclusion | PartialReason::TeamBoundary)
-                            }),
-                    );
-                    leaves.extend(self.project_leaves(draft, &project.id));
-                    if self.holds_team_work(project, team) {
-                        shown.push(self.project_row(draft, readiness, project, None));
+                    shown.sort_by(|a, b| {
+                        (&a.identifier, &a.project_id).cmp(&(&b.identifier, &b.project_id))
+                    });
+                    InitiativeRow {
+                        initiative_id: id.clone(),
+                        identifier,
+                        name,
+                        projects: shown,
+                        counts: self.counts(leaves, readiness),
+                        partial: partial.into_iter().collect(),
+                        shared: false,
                     }
-                }
-                shown.sort_by(|a, b| {
-                    (&a.identifier, &a.project_id).cmp(&(&b.identifier, &b.project_id))
-                });
-                InitiativeRow {
-                    initiative_id: id.clone(),
-                    identifier,
-                    name,
-                    projects: shown,
-                    counts: self.counts(leaves, readiness),
-                    partial: partial.into_iter().collect(),
-                    shared: false,
-                }
-            })
-            .collect::<Vec<_>>();
+                })
+                .collect::<Vec<_>>();
         rows.sort_by(|a, b| {
             (&a.identifier, &a.initiative_id).cmp(&(&b.identifier, &b.initiative_id))
         });
@@ -1007,7 +1003,10 @@ impl<'a> Context<'a> {
                 let leaves = group
                     .iter()
                     .filter(|s| {
-                        matches!(s.state, SelectionState::Complete | SelectionState::Incomplete)
+                        matches!(
+                            s.state,
+                            SelectionState::Complete | SelectionState::Incomplete
+                        )
                     })
                     .flat_map(|s| s.leaf_ids.iter().cloned())
                     .collect::<BTreeSet<_>>();
@@ -1069,13 +1068,18 @@ fn union_state(group: &[&SelectionSummary]) -> SelectionState {
     if non_empty.is_empty() {
         return SelectionState::Empty;
     }
-    if non_empty.iter().all(|s| s.state == SelectionState::Complete) {
-        return SelectionState::Complete;
-    }
     if non_empty
         .iter()
-        .any(|s| matches!(s.state, SelectionState::Complete | SelectionState::Incomplete))
+        .all(|s| s.state == SelectionState::Complete)
     {
+        return SelectionState::Complete;
+    }
+    if non_empty.iter().any(|s| {
+        matches!(
+            s.state,
+            SelectionState::Complete | SelectionState::Incomplete
+        )
+    }) {
         SelectionState::Incomplete
     } else {
         SelectionState::Unavailable
@@ -1113,7 +1117,9 @@ fn mark_shared(selections: &mut [SelectionSummary]) {
     let mut tickets: BTreeMap<IssueId, usize> = BTreeMap::new();
     for selection in selections.iter() {
         for initiative in &selection.initiatives {
-            *initiatives.entry(initiative.initiative_id.clone()).or_default() += 1;
+            *initiatives
+                .entry(initiative.initiative_id.clone())
+                .or_default() += 1;
         }
         for row in selection
             .initiatives

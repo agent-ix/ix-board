@@ -67,7 +67,9 @@ impl<'a> Deadline<'a> {
 
     /// Time spent since the deadline started.
     pub fn elapsed(&self) -> Duration {
-        self.clock.monotonic_now().saturating_duration_since(self.start)
+        self.clock
+            .monotonic_now()
+            .saturating_duration_since(self.start)
     }
 
     /// Time left, or [`Error::ReadTimeout`] once none is left.

@@ -5,10 +5,10 @@
 use ix_board::{
     BatchState, CatalogEvidence, CountAvailability, Error, FocusSelection, Initiative,
     InitiativeLink, Issue, IssueId, ListKind, MemberOutcome, Milestone, NamedBatch,
-    NamedFocusRequest, NamedMember, NamedSelection, PartialReason, Project, ProjectId,
-    ProjectRow, ProjectStatusCategory, ReadService, ScopeSelection, SelectionState,
-    SelectionSummary, TeamKey, UnknownFact, WorkflowStateType, WorkspaceSnapshot,
-    WorkspaceSource, evaluate_named_batch, select_scope,
+    NamedFocusRequest, NamedMember, NamedSelection, PartialReason, Project, ProjectId, ProjectRow,
+    ProjectStatusCategory, ReadService, ScopeSelection, SelectionState, SelectionSummary, TeamKey,
+    UnknownFact, WorkflowStateType, WorkspaceSnapshot, WorkspaceSource, evaluate_named_batch,
+    select_scope,
 };
 use ix_trace_rs::trace;
 use std::collections::BTreeSet;
@@ -269,7 +269,11 @@ fn each_exclusion_kind_removes_its_own_closure_within_the_team() {
 fn exclusion_is_local_to_its_selection_and_same_team_selections_union_once() {
     let snapshot = snapshot(
         vec![project("p1", &[]), project("p2", &[])],
-        vec![open("SWM-1", "p1"), open("SWM-2", "p1"), open("SWM-3", "p2")],
+        vec![
+            open("SWM-1", "p1"),
+            open("SWM-2", "p1"),
+            open("SWM-3", "p2"),
+        ],
     );
     let batch = evaluate(
         &snapshot,
@@ -365,8 +369,8 @@ fn explicit_empty_selection_and_no_active_selection_are_distinct_states() {
     assert_eq!(whole.leaf_ids.len(), 4);
     // An empty inline FocusSelection is still rejected.
     let cache = tempfile::tempdir().expect("cache dir");
-    let mut service = ReadService::open(Fixture(snapshot), &cache.path().join("c.sqlite3"))
-        .expect("service");
+    let mut service =
+        ReadService::open(Fixture(snapshot), &cache.path().join("c.sqlite3")).expect("service");
     assert!(matches!(
         service.focus_status(&FocusSelection::default()),
         Err(Error::EmptyFocus)
@@ -462,7 +466,12 @@ fn member_outcomes_need_authoritative_evidence_to_be_missing() {
     .expect("evaluates")
     .selections
     .remove(0);
-    for member in [proj("gone"), tick("SWM-404"), init("nope"), mile("m-nope", "p1")] {
+    for member in [
+        proj("gone"),
+        tick("SWM-404"),
+        init("nope"),
+        mile("m-nope", "p1"),
+    ] {
         assert_eq!(
             outcome(&proven, ListKind::Include, &member),
             MemberOutcome::Missing
@@ -528,7 +537,10 @@ fn the_team_boundary_counts_only_the_selected_team_and_says_so() {
     );
     let summary = one(&snapshot, selection("SWM", vec![init("ini")], vec![]));
     assert_eq!(leaves(&summary), want(&["SWM-1"]));
-    assert_eq!(summary.initiatives[0].partial, [PartialReason::TeamBoundary]);
+    assert_eq!(
+        summary.initiatives[0].partial,
+        [PartialReason::TeamBoundary]
+    );
     assert_eq!(
         summary.initiatives[0].projects[0].partial,
         [PartialReason::TeamBoundary]
@@ -562,7 +574,10 @@ fn one_batch_is_one_snapshot_ordered_by_key_with_teams_kept_separate() {
     let requests = || {
         vec![
             request("focus-1@rev-3", selection("SWM", vec![proj("p1")], vec![])),
-            request("focus-0@rev-1", selection("SWM", vec![tick("SWM-1")], vec![])),
+            request(
+                "focus-0@rev-1",
+                selection("SWM", vec![tick("SWM-1")], vec![]),
+            ),
             request("focus-2@rev-9", selection("AGE", vec![proj("p2")], vec![])),
         ]
     };
@@ -574,14 +589,27 @@ fn one_batch_is_one_snapshot_ordered_by_key_with_teams_kept_separate() {
         .map(|s| s.key.as_str())
         .collect::<Vec<_>>();
     assert_eq!(keys, ["focus-0@rev-1", "focus-1@rev-3", "focus-2@rev-9"]);
-    assert_eq!(evaluate(&first, requests()), batch, "identical input, identical output");
+    assert_eq!(
+        evaluate(&first, requests()),
+        batch,
+        "identical input, identical output"
+    );
     let teams = batch
         .teams
         .iter()
         .map(|t| (t.team.0.as_str(), t.counts.total))
         .collect::<Vec<_>>();
-    assert_eq!(teams, [("AGE", 2), ("SWM", 2)], "no cross-team total or union");
-    assert!(batch.teams[0].leaf_ids.iter().all(|id| id.0.starts_with("AGE")));
+    assert_eq!(
+        teams,
+        [("AGE", 2), ("SWM", 2)],
+        "no cross-team total or union"
+    );
+    assert!(
+        batch.teams[0]
+            .leaf_ids
+            .iter()
+            .all(|id| id.0.starts_with("AGE"))
+    );
     // A changed snapshot gives results that all come from that one snapshot.
     let mut second = first.clone();
     second.fetched_at = 9_999;
@@ -612,7 +640,12 @@ fn counts_equal_the_existing_leaf_readiness_and_blocker_results() {
             started("SWM-2", "p1"),
             done("SWM-3", "p1"),
             issue("SWM-4", Some("p1"), WorkflowStateType::Canceled, "Canceled"),
-            issue("SWM-5", Some("p1"), WorkflowStateType::Duplicate, "Duplicate"),
+            issue(
+                "SWM-5",
+                Some("p1"),
+                WorkflowStateType::Duplicate,
+                "Duplicate",
+            ),
             open("SWM-6", "p1"),
             child_of(open("SWM-7", "p1"), "SWM-6"),
             blocked_by(open("SWM-8", "p1"), &["SWM-2"]),
@@ -627,7 +660,10 @@ fn counts_equal_the_existing_leaf_readiness_and_blocker_results() {
         },
     )
     .expect("legacy scope");
-    assert_eq!(all.leaf_ids.iter().cloned().collect::<BTreeSet<_>>(), legacy.leaf_ids);
+    assert_eq!(
+        all.leaf_ids.iter().cloned().collect::<BTreeSet<_>>(),
+        legacy.leaf_ids
+    );
     assert_eq!(all.counts.total, legacy.leaf_ids.len());
     assert_eq!(all.counts.done, legacy.done);
     assert_eq!(all.counts.remaining_by_stage, legacy.remaining_by_stage);
@@ -660,7 +696,10 @@ fn shared_rows_keep_their_own_counts_and_no_total_is_a_sum_of_overlaps() {
     let batch = evaluate(
         &snapshot,
         vec![
-            request("a", selection("SWM", vec![init("ini1"), init("ini2")], vec![])),
+            request(
+                "a",
+                selection("SWM", vec![init("ini1"), init("ini2")], vec![]),
+            ),
             request("b", selection("SWM", vec![proj("p1"), proj("p2")], vec![])),
         ],
     );
@@ -674,7 +713,10 @@ fn shared_rows_keep_their_own_counts_and_no_total_is_a_sum_of_overlaps() {
     assert!(placements.iter().all(|row| row.shared));
     assert_eq!(placements[0].counts, placements[1].counts);
     assert_eq!(placements[0].counts.total, 1);
-    assert_eq!(a.counts.total, 1, "the leaf under two initiatives counts once");
+    assert_eq!(
+        a.counts.total, 1,
+        "the leaf under two initiatives counts once"
+    );
     assert!(a.initiatives.iter().all(|row| !row.shared));
     let b = &batch.selections[1];
     assert!(standalone(b, "p1").shared);
@@ -785,7 +827,10 @@ fn an_excluded_prerequisite_blocks_and_stays_in_the_closure_without_being_counte
         .map(|blocker| blocker.identifier.as_str())
         .collect::<BTreeSet<_>>();
     for prerequisite in ["SWM-2", "SWM-3", "AGE-9", "SWM-6"] {
-        assert!(closure.contains(prerequisite), "{prerequisite} stays as evidence");
+        assert!(
+            closure.contains(prerequisite),
+            "{prerequisite} stays as evidence"
+        );
     }
     let excluded_done = one(
         &snapshot,
@@ -806,20 +851,28 @@ fn an_unknown_status_category_is_kept_and_never_reported_healthy() {
     );
     let batch = evaluate(
         &snapshot,
-        vec![request("k", selection("SWM", vec![proj("p1"), proj("p2")], vec![]))],
+        vec![request(
+            "k",
+            selection("SWM", vec![proj("p1"), proj("p2")], vec![]),
+        )],
     );
     let summary = &batch.selections[0];
     let row = standalone(summary, "p2");
     assert_eq!(row.status_category, ProjectStatusCategory::Unknown);
-    assert!(row.unknown_facts.contains(&UnknownFact::ProjectStatusCategory));
+    assert!(
+        row.unknown_facts
+            .contains(&UnknownFact::ProjectStatusCategory)
+    );
     assert!(
         !standalone(summary, "p1")
             .unknown_facts
             .contains(&UnknownFact::ProjectStatusCategory)
     );
-    assert!(summary
-        .unknown_facts
-        .contains(&UnknownFact::ProjectStatusCategory));
+    assert!(
+        summary
+            .unknown_facts
+            .contains(&UnknownFact::ProjectStatusCategory)
+    );
     // The union's provenance names the selection that depends on the unknown fact.
     assert_eq!(batch.teams[0].causes.len(), 1);
     assert_eq!(batch.teams[0].causes[0].key, "k");
@@ -895,7 +948,10 @@ fn a_team_union_is_only_as_known_as_its_selections() {
     assert_eq!(team.causes.len(), 1);
     assert_eq!(team.causes[0].key, "s1");
     assert_eq!(team.causes[0].members[0].list, ListKind::Exclude);
-    assert_eq!(team.causes[0].members[0].outcome, MemberOutcome::Unavailable);
+    assert_eq!(
+        team.causes[0].members[0].outcome,
+        MemberOutcome::Unavailable
+    );
     assert_eq!(
         union_of(vec![empty(), empty()]).teams[0].state,
         SelectionState::Empty
@@ -954,7 +1010,10 @@ fn standalone_projects_report_a_link_status_and_honor_exclusions() {
     let row = standalone(&none_selected, "p1");
     assert_eq!(row.initiative_link, Some(InitiativeLink::NoneSelected));
     assert_eq!(row.counts.total, 1);
-    assert!(none_selected.tickets.is_empty(), "never counted as a direct ticket");
+    assert!(
+        none_selected.tickets.is_empty(),
+        "never counted as a direct ticket"
+    );
     let unavailable = with(&CatalogEvidence::default(), included);
     let row = standalone(&unavailable, "p1");
     assert_eq!(row.initiative_link, Some(InitiativeLink::Unavailable));
@@ -969,7 +1028,10 @@ fn standalone_projects_report_a_link_status_and_honor_exclusions() {
     // Direct-ticket placement is unchanged.
     let ticket = with(&known, selection("SWM", vec![tick("SWM-1")], vec![]));
     assert_eq!(ticket.tickets.len(), 1);
-    assert_eq!(standalone(&ticket, "p1").partial, [PartialReason::TicketOnly]);
+    assert_eq!(
+        standalone(&ticket, "p1").partial,
+        [PartialReason::TicketOnly]
+    );
 }
 
 #[trace("FR-010-AC-20")]

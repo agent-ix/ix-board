@@ -7,10 +7,9 @@ use ix_cli_kit::secrets::{AppScope, CredentialBackend, SecretKey, SecretStore, S
 
 use crate::{
     CatalogEvidence, Clock, Deadline, DriftConfig, DriftEvidence, DriftTicket, Error,
-    HistoricalProject, Initiative, Issue,
-    IssueId, IssueTransition, Milestone, Project, ProjectId, ProjectMutationSource,
-    ProjectPriority, ProjectRunStatus, ProjectStatusCategory, SystemClock, TeamKey,
-    WorkflowStateType, WorkspaceSnapshot, WorkspaceSource, issue_is_open,
+    HistoricalProject, Initiative, Issue, IssueId, IssueTransition, Milestone, Project, ProjectId,
+    ProjectMutationSource, ProjectPriority, ProjectRunStatus, ProjectStatusCategory, SystemClock,
+    TeamKey, WorkflowStateType, WorkspaceSnapshot, WorkspaceSource, issue_is_open,
 };
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -203,9 +202,7 @@ impl LinearGraphQlSource {
             Sha256::digest(api_key.expose_secret().as_bytes())
         );
         Ok(Self {
-            client: Client::builder()
-                .timeout(REQUEST_TIMEOUT)
-                .build()?,
+            client: Client::builder().timeout(REQUEST_TIMEOUT).build()?,
             api_key,
             endpoint,
             cache_namespace,
@@ -1095,10 +1092,7 @@ impl WorkspaceSource for LinearGraphQlSource {
         true
     }
 
-    fn fetch_workspace_bounded(
-        &self,
-        deadline: &Deadline<'_>,
-    ) -> Result<WorkspaceSnapshot, Error> {
+    fn fetch_workspace_bounded(&self, deadline: &Deadline<'_>) -> Result<WorkspaceSnapshot, Error> {
         self.fetch_workspace_within(Some(deadline))
     }
 

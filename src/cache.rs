@@ -170,7 +170,8 @@ impl SnapshotCache {
         let payload = serde_json::to_vec(snapshot).map_err(Error::CacheEncode)?;
         let cache_key = self.cache_key.clone();
         let committed = with_lock_budget(&mut self.connection, deadline, |connection| {
-            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             transaction.execute(
                 "INSERT INTO workspace_snapshot(
                      cache_key, fetched_at, payload, read_started_at, read_started_for)

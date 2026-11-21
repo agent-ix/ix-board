@@ -71,7 +71,10 @@ enum Behavior {
     Succeed,
     NeverComplete,
     /// Each page costs this long; the read fails once a request's timeout is reached.
-    Pages { pages: usize, cost: Duration },
+    Pages {
+        pages: usize,
+        cost: Duration,
+    },
     CompleteAfterExpiry,
 }
 
@@ -182,16 +185,13 @@ fn cache_path(directory: &tempfile::TempDir) -> PathBuf {
 fn rows(path: &Path) -> i64 {
     Connection::open(path)
         .expect("open cache")
-        .query_row("SELECT count(*) FROM workspace_snapshot", [], |row| row.get(0))
+        .query_row("SELECT count(*) FROM workspace_snapshot", [], |row| {
+            row.get(0)
+        })
         .expect("count rows")
 }
 
-fn write_row(
-    path: &Path,
-    fetched_at: i64,
-    started: Option<i64>,
-    started_for: Option<i64>,
-) {
+fn write_row(path: &Path, fetched_at: i64, started: Option<i64>, started_for: Option<i64>) {
     let snapshot = WorkspaceSnapshot {
         fetched_at,
         ..WorkspaceSnapshot::default()
@@ -224,7 +224,9 @@ fn legacy_reads_keep_the_five_minute_lifetime_and_need_no_policy() {
     service.workspace_snapshot().expect("cached at 299 seconds");
     assert_eq!(source.reads(), 1);
     clock.set_epoch(10_300);
-    service.workspace_snapshot().expect("refresh at 300 seconds");
+    service
+        .workspace_snapshot()
+        .expect("refresh at 300 seconds");
     assert_eq!(source.reads(), 2);
 }
 
@@ -236,14 +238,20 @@ fn cached_data_is_accepted_by_the_age_of_its_source_read_and_over_age_is_refresh
     let directory = tempfile::tempdir().expect("dir");
     let mut service = open(&source, &clock, &cache_path(&directory));
     let limits = policy(240, Duration::from_secs(5));
-    let first = service.workspace_snapshot_bounded(&limits).expect("cold read");
+    let first = service
+        .workspace_snapshot_bounded(&limits)
+        .expect("cold read");
     assert_eq!((source.reads(), first.fetched_at), (1, 1_000));
     clock.set_epoch(1_200);
-    let cached = service.workspace_snapshot_bounded(&limits).expect("age 200");
+    let cached = service
+        .workspace_snapshot_bounded(&limits)
+        .expect("age 200");
     assert_eq!(source.reads(), 1, "age 200 <= 240 needs no source read");
     assert_eq!(cached.fetched_at, 1_000, "the actual source fetch time");
     clock.set_epoch(1_250);
-    let refreshed = service.workspace_snapshot_bounded(&limits).expect("age 250");
+    let refreshed = service
+        .workspace_snapshot_bounded(&limits)
+        .expect("age 250");
     assert_eq!((source.reads(), refreshed.fetched_at), (2, 1_250));
     for invalid in [
         policy(301, Duration::from_secs(5)),
@@ -256,9 +264,11 @@ fn cached_data_is_accepted_by_the_age_of_its_source_read_and_over_age_is_refresh
         ));
     }
     assert_eq!(source.reads(), 2, "an invalid policy reads nothing");
-    assert!(service
-        .workspace_snapshot_bounded(&policy(300, Duration::from_secs(5)))
-        .is_ok());
+    assert!(
+        service
+            .workspace_snapshot_bounded(&policy(300, Duration::from_secs(5)))
+            .is_ok()
+    );
 }
 
 #[trace("FR-004-AC-13")]
@@ -272,15 +282,21 @@ fn age_is_measured_from_the_source_read_not_the_cache_write() {
     let limits = policy(240, Duration::from_secs(5));
     // Source read began 250 s ago, but the entry was written 10 s ago.
     write_row(&path, 1_990, Some(1_750), Some(1_990));
-    service.workspace_snapshot_bounded(&limits).expect("refresh");
+    service
+        .workspace_snapshot_bounded(&limits)
+        .expect("refresh");
     assert_eq!(source.reads(), 1, "age by source read start refreshes");
     // An entry with no evidence of its source read start is refreshed, never accepted.
     write_row(&path, 1_990, None, None);
-    service.workspace_snapshot_bounded(&limits).expect("refresh");
+    service
+        .workspace_snapshot_bounded(&limits)
+        .expect("refresh");
     assert_eq!(source.reads(), 2);
     // Evidence that belongs to a different payload is not trusted.
     write_row(&path, 1_990, Some(1_900), Some(1_980));
-    service.workspace_snapshot_bounded(&limits).expect("refresh");
+    service
+        .workspace_snapshot_bounded(&limits)
+        .expect("refresh");
     assert_eq!(source.reads(), 3);
     // Valid evidence within the age is returned with its own fetch time.
     write_row(&path, 1_800, Some(1_800), Some(1_800));
@@ -299,10 +315,14 @@ fn old_and_new_cache_entries_coexist_with_old_readers_and_writers() {
     let limits = policy(240, Duration::from_secs(5));
     // A legacy entry has no read-start evidence, so a bounded read refreshes it.
     service.workspace_snapshot().expect("legacy read");
-    service.workspace_snapshot_bounded(&limits).expect("bounded read");
+    service
+        .workspace_snapshot_bounded(&limits)
+        .expect("bounded read");
     assert_eq!(source.reads(), 2);
     // A bounded entry still serves a legacy read without another source read.
-    service.workspace_snapshot().expect("legacy read of bounded entry");
+    service
+        .workspace_snapshot()
+        .expect("legacy read of bounded entry");
     assert_eq!(source.reads(), 2);
     // An older strict reader sees the original columns and an undecorated payload.
     let connection = Connection::open(&path).expect("open cache");
@@ -326,7 +346,9 @@ fn old_and_new_cache_entries_coexist_with_old_readers_and_writers() {
         )
         .expect("old writer");
     clock.set_epoch(3_006);
-    service.workspace_snapshot_bounded(&limits).expect("bounded read");
+    service
+        .workspace_snapshot_bounded(&limits)
+        .expect("bounded read");
     assert_eq!(source.reads(), 3);
 }
 
@@ -356,8 +378,14 @@ fn a_cache_created_before_the_evidence_columns_still_opens_and_serves_legacy_rea
     let clock = ManualClock::new(5_000);
     let source = FakeSource::new(&clock, true);
     let mut service = open(&source, &clock, &path);
-    service.workspace_snapshot().expect("legacy read of an old entry");
-    assert_eq!(source.reads(), 0, "the old entry is still fresh for legacy reads");
+    service
+        .workspace_snapshot()
+        .expect("legacy read of an old entry");
+    assert_eq!(
+        source.reads(),
+        0,
+        "the old entry is still fresh for legacy reads"
+    );
     service
         .workspace_snapshot_bounded(&policy(240, Duration::from_secs(5)))
         .expect("bounded read refreshes it");
@@ -377,13 +405,19 @@ fn requests_never_start_after_the_deadline_and_each_is_clamped_to_the_time_left(
         service.workspace_snapshot_bounded(&limits),
         Err(Error::ReadTimeout { deadline }) if deadline == Duration::from_secs(5)
     ));
-    assert_eq!(clock.elapsed(), Duration::from_secs(5), "exactly the deadline");
+    assert_eq!(
+        clock.elapsed(),
+        Duration::from_secs(5),
+        "exactly the deadline"
+    );
     assert_eq!(source.timeouts(), [Duration::from_secs(5)]);
     // Pages that each cost 2 s: the requests carry 5 s, 3 s and 1 s, and a fourth
     // never starts.
     let clock = ManualClock::new(6_000);
     let source = FakeSource::new(&clock, true);
-    let mut service = open(&source, &clock, &cache_path(&tempfile::tempdir().expect("dir")));
+    // The directory must outlive the service, or the cache file vanishes mid-read.
+    let directory = tempfile::tempdir().expect("dir");
+    let mut service = open(&source, &clock, &cache_path(&directory));
     source.behave(Behavior::Pages {
         pages: 10,
         cost: Duration::from_secs(2),
@@ -400,7 +434,8 @@ fn requests_never_start_after_the_deadline_and_each_is_clamped_to_the_time_left(
     // With plenty of time the legacy 30-second request timeout still caps each request.
     let clock = ManualClock::new(6_000);
     let source = FakeSource::new(&clock, true);
-    let mut service = open(&source, &clock, &cache_path(&tempfile::tempdir().expect("dir")));
+    let directory = tempfile::tempdir().expect("dir");
+    let mut service = open(&source, &clock, &cache_path(&directory));
     source.behave(Behavior::Pages {
         pages: 1,
         cost: SECOND,
@@ -427,8 +462,14 @@ fn a_late_completion_changes_neither_the_cache_nor_a_later_result() {
     ));
     assert_eq!(rows(&path), 0, "nothing is stored as fresh after expiry");
     source.behave(Behavior::Succeed);
-    service.workspace_snapshot_bounded(&limits).expect("later read");
-    assert_eq!(source.reads(), 2, "the late result was not served from the cache");
+    service
+        .workspace_snapshot_bounded(&limits)
+        .expect("later read");
+    assert_eq!(
+        source.reads(),
+        2,
+        "the late result was not served from the cache"
+    );
     assert_eq!(rows(&path), 1);
 }
 
@@ -446,7 +487,9 @@ fn a_source_that_cannot_honor_a_bound_fails_before_any_read_and_legacy_reads_sti
     ));
     assert_eq!(source.reads(), 0);
     // Even with a fresh entry in the cache the unsupported bound is refused, not ignored.
-    service.workspace_snapshot().expect("legacy read still works");
+    service
+        .workspace_snapshot()
+        .expect("legacy read still works");
     assert_eq!(source.reads(), 1);
     assert!(matches!(
         service.workspace_snapshot_bounded(&limits),
@@ -465,12 +508,17 @@ fn a_locked_cache_times_out_within_the_deadline_without_reading_the_source() {
     // The default clock is real, so the lock wait is genuinely bounded by the deadline.
     let mut service = ReadService::open(source.clone(), &path).expect("service opens");
     let blocker = Connection::open(&path).expect("second connection");
-    blocker.execute_batch("BEGIN EXCLUSIVE").expect("hold the lock");
+    blocker
+        .execute_batch("BEGIN EXCLUSIVE")
+        .expect("hold the lock");
     let deadline = Duration::from_millis(400);
     let started = Instant::now();
     let result = service.workspace_snapshot_bounded(&policy(240, deadline));
     let elapsed = started.elapsed();
-    assert!(matches!(result, Err(Error::ReadTimeout { .. })), "{result:?}");
+    assert!(
+        matches!(result, Err(Error::ReadTimeout { .. })),
+        "{result:?}"
+    );
     assert!(
         elapsed <= deadline + Duration::from_millis(250),
         "returned after {elapsed:?}"
@@ -602,11 +650,16 @@ fn serve(
                 .lines()
                 .find_map(|line| {
                     let (key, value) = line.split_once(':')?;
-                    key.eq_ignore_ascii_case(name).then(|| value.trim().to_owned())
+                    key.eq_ignore_ascii_case(name)
+                        .then(|| value.trim().to_owned())
                 })
                 .unwrap_or_default()
         };
-        break (end + 4, header("content-length").parse().unwrap_or(0), header("authorization"));
+        break (
+            end + 4,
+            header("content-length").parse().unwrap_or(0),
+            header("authorization"),
+        );
     };
     while request.len() < header_end + length {
         let size = stream.read(&mut buffer).unwrap_or(0);
@@ -712,8 +765,11 @@ fn linear_service(
     directory: &tempfile::TempDir,
 ) -> ReadService<LinearGraphQlSource> {
     let (source, _) = linear_source(&server.endpoint, Ok("fixture-saved-key"), Duration::ZERO);
-    ReadService::open(source.expect("fake credentials resolve"), &cache_path(directory))
-        .expect("service opens")
+    ReadService::open(
+        source.expect("fake credentials resolve"),
+        &cache_path(directory),
+    )
+    .expect("service opens")
 }
 
 const SLACK: Duration = Duration::from_millis(250);
@@ -735,15 +791,26 @@ fn a_page_that_never_completes_times_out_within_the_deadline_with_no_work_left_b
     let started = Instant::now();
     let result = service.workspace_snapshot_bounded(&policy(240, deadline));
     let elapsed = started.elapsed();
-    assert!(matches!(result, Err(Error::ReadTimeout { .. })), "{result:?}");
+    assert!(
+        matches!(result, Err(Error::ReadTimeout { .. })),
+        "{result:?}"
+    );
     assert!(
         elapsed <= deadline + SLACK,
         "{elapsed:?} must not add a further request timeout to {deadline:?}"
     );
-    assert_eq!(server.requests(), 2, "the first page, then the page that hangs");
+    assert_eq!(
+        server.requests(),
+        2,
+        "the first page, then the page that hangs"
+    );
     assert_eq!(rows(&cache_path(&directory)), 0, "nothing stored as fresh");
     std::thread::sleep(Duration::from_millis(400));
-    assert_eq!(server.requests(), 2, "no retry or request after the call returned");
+    assert_eq!(
+        server.requests(),
+        2,
+        "no retry or request after the call returned"
+    );
 }
 
 #[trace("FR-004-AC-14")]
@@ -771,9 +838,16 @@ fn a_nested_relation_read_is_inside_the_same_deadline() {
     let deadline = Duration::from_millis(700);
     let started = Instant::now();
     let result = service.workspace_snapshot_bounded(&policy(240, deadline));
-    assert!(matches!(result, Err(Error::ReadTimeout { .. })), "{result:?}");
+    assert!(
+        matches!(result, Err(Error::ReadTimeout { .. })),
+        "{result:?}"
+    );
     assert!(started.elapsed() <= deadline + SLACK);
-    assert_eq!(server.requests(), 3, "projects, issues, then the nested relations page");
+    assert_eq!(
+        server.requests(),
+        3,
+        "projects, issues, then the nested relations page"
+    );
 }
 
 #[trace("FR-004-AC-18")]
@@ -798,7 +872,10 @@ fn a_rate_limit_is_the_typed_error_with_its_cooldown_and_is_never_retried() {
         panic!("a rate limit must be the typed error, got {result:?}");
     };
     assert_eq!(*retry_after, Duration::from_secs(60));
-    assert!(started.elapsed() < Duration::from_secs(5), "no sleep or retry");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "no sleep or retry"
+    );
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(server.requests(), 1);
 }
@@ -845,7 +922,11 @@ fn the_budget_starts_after_credentials_are_ready_and_credentials_are_never_resol
         .workspace_snapshot_bounded(&policy(240, deadline))
         .expect("the full budget is available after the credential wait");
     assert!(snapshot.fetched_at > 0);
-    assert_eq!(reads.load(Ordering::SeqCst), 1, "credentials resolved once, before the read");
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "credentials resolved once, before the read"
+    );
     assert_eq!(
         server.authorizations(),
         ["fixture-saved-key", "fixture-saved-key"],

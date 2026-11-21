@@ -108,7 +108,11 @@ impl NamedSelection {
 
     /// This selection in canonical order, with the supported version.
     pub fn canonical(&self) -> Self {
-        Self::new(self.team.clone(), self.include.clone(), self.exclude.clone())
+        Self::new(
+            self.team.clone(),
+            self.include.clone(),
+            self.exclude.clone(),
+        )
     }
 
     /// Encodes the canonical JSON document: the same selection always gives the same
@@ -169,9 +173,14 @@ pub fn decode_named_selection(bytes: &[u8]) -> Result<NamedSelection, Error> {
     if selection.team.0.trim().is_empty() {
         return Err(invalid("team must not be blank"));
     }
-    for (list, members) in [("include", &selection.include), ("exclude", &selection.exclude)] {
+    for (list, members) in [
+        ("include", &selection.include),
+        ("exclude", &selection.exclude),
+    ] {
         if members.iter().any(NamedMember::is_blank) {
-            return Err(invalid(format!("{list} holds a member with a blank identifier")));
+            return Err(invalid(format!(
+                "{list} holds a member with a blank identifier"
+            )));
         }
         let distinct = members.iter().collect::<BTreeSet<_>>();
         if distinct.len() != members.len() {
@@ -252,11 +261,17 @@ pub fn canonicalize_named_selection(
 }
 
 fn holds_team_work(snapshot: &WorkspaceSnapshot, project_id: &str, team: &TeamKey) -> bool {
-    snapshot.projects.iter().any(|project| {
-        project.id.0 == project_id && project.team_keys.contains(team)
-    }) || snapshot.issues.iter().any(|issue| {
-        issue.team_key == *team && issue.project_id.as_ref().is_some_and(|id| id.0 == project_id)
-    })
+    snapshot
+        .projects
+        .iter()
+        .any(|project| project.id.0 == project_id && project.team_keys.contains(team))
+        || snapshot.issues.iter().any(|issue| {
+            issue.team_key == *team
+                && issue
+                    .project_id
+                    .as_ref()
+                    .is_some_and(|id| id.0 == project_id)
+        })
 }
 
 fn rejected(kind: &'static str, identifier: &str, outcome: MemberOutcome) -> Error {
@@ -321,7 +336,11 @@ fn canonical_member(
             if let Some(claimed) = project
                 && scope::resolve_project_id(snapshot, claimed)?.0 != *owner
             {
-                return Err(rejected("milestone", selector, MemberOutcome::ProjectMismatch));
+                return Err(rejected(
+                    "milestone",
+                    selector,
+                    MemberOutcome::ProjectMismatch,
+                ));
             }
             if !holds_team_work(snapshot, owner, team) {
                 return Err(rejected("milestone", selector, MemberOutcome::WrongTeam));
