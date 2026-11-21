@@ -5,19 +5,24 @@
 
 pub mod agents;
 mod cache;
+pub mod cache_status;
 pub mod chain;
 mod drift;
 mod hygiene;
 mod linear;
+pub mod linear_summary;
 mod model;
 mod named_focus;
 mod named_selection;
 pub mod orphans;
 pub mod program_review;
+pub mod quota;
 mod read_bound;
 pub mod reconcile;
 pub mod retro;
 mod scope;
+mod settings;
+mod summary_cache;
 pub use named_focus::{
     BatchState, CatalogEvidence, CountAvailability, InitiativeLink, InitiativeRow, LeafCounts,
     ListKind, MemberOutcome, MemberReport, NamedBatch, NamedFocusRequest, PartialReason,
@@ -32,6 +37,7 @@ pub use named_selection::{
 use read_bound::Budget;
 pub use read_bound::{Deadline, ReadPolicy};
 pub use scope::{ScopeSelection, ScopeSummary, select_scope};
+pub use summary_cache::SummaryRead;
 
 use cache::SnapshotCache;
 pub use cache::{CACHE_TTL_SECONDS, Clock, SystemClock};
@@ -111,11 +117,29 @@ pub enum Error {
     #[error("Linear request failed: {0}")]
     Http(#[from] reqwest::Error),
     /// Linear exhausted a request or complexity quota.
-    #[error("Linear rate limited; retry in {retry_after:?}")]
+    #[error("Linear rate limited; retry in {}s", retry_after.as_secs() + u64::from(retry_after.subsec_nanos() > 0))]
     LinearRateLimited {
         /// Minimum cooldown before attempting another source request.
         retry_after: std::time::Duration,
     },
+    /// The ordinary refresh could not acquire its shared lock within five seconds.
+    #[error("Linear refresh lock timed out")]
+    RefreshLockTimeout,
+    /// An explicit cache lifetime was malformed or nonpositive.
+    #[error("cache TTL must be a positive integer number of seconds")]
+    InvalidCacheTtl,
+    /// The selected settings file is unreadable or malformed.
+    #[error("ix-board configuration is unreadable or malformed")]
+    InvalidConfiguration,
+    /// The shared local allocation is exhausted before transport send.
+    #[error("Linear local budget exhausted; retry in {}s", retry_after.as_secs() + u64::from(retry_after.subsec_nanos() > 0))]
+    LinearLocalBudgetExhausted { retry_after: std::time::Duration },
+    /// A quota setting is invalid.
+    #[error("invalid Linear quota configuration: {reason}")]
+    InvalidQuotaConfig { reason: &'static str },
+    /// A single request exceeds Linear's fixed complexity ceiling.
+    #[error("Linear query complexity {cost} exceeds limit {limit}")]
+    LinearQueryComplexityExceeded { cost: u64, limit: u64 },
     /// Neither an environment override nor a saved Linear credential exists.
     #[error("Linear API key is missing; run `ix-board auth login` or set LINEAR_API_KEY")]
     MissingApiKey,
@@ -140,6 +164,9 @@ pub enum Error {
     /// Linear returned GraphQL errors.
     #[error("Linear GraphQL error: {messages}")]
     GraphQl { messages: String },
+    /// A successful HTTP response violated the typed Linear wire contract.
+    #[error("invalid Linear response: {0}")]
+    LinearDecode(#[source] serde_json::Error),
     /// Linear returned a response without workspace data.
     #[error("the Linear source returned no workspace data")]
     MissingWorkspaceData,
@@ -312,8 +339,24 @@ pub enum Error {
 
 /// Injectable source of complete structured workspace snapshots.
 pub trait WorkspaceSource: Send + Sync {
+    /// Binds transport quota accounting to the same shared cache as the coordinator.
+    fn configure_cache(&mut self, _path: &Path) -> Result<(), Error> {
+        Ok(())
+    }
     /// Fetches all projects and issues needed for cross-team dependency resolution.
     fn fetch_workspace(&self) -> Result<WorkspaceSnapshot, Error>;
+
+    /// Refreshes a compatible baseline. Sources without deltas retain complete reads.
+    fn refresh_workspace(
+        &self,
+        _baseline: Option<&WorkspaceSnapshot>,
+        deadline: Option<&Deadline<'_>>,
+    ) -> Result<WorkspaceSnapshot, Error> {
+        match deadline {
+            Some(deadline) => self.fetch_workspace_bounded(deadline),
+            None => self.fetch_workspace(),
+        }
+    }
 
     /// Identifies the source data for cache isolation. Fixture sources share a stable default.
     fn cache_namespace(&self) -> String {
@@ -369,6 +412,20 @@ pub struct ReadService<S, C = SystemClock> {
     source: S,
     cache: SnapshotCache,
     clock: C,
+    freshness: Option<CacheFreshness>,
+}
+
+/// Provenance of the latest ordinary read, including an unsuccessful refresh.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct CacheFreshness {
+    /// Whether a failed refresh forced reuse of the last complete snapshot.
+    pub stale: bool,
+    /// Seconds since the successful source read began.
+    pub age_seconds: Option<i64>,
+    /// End of the observed server cooldown, in Unix seconds.
+    pub rate_limit_until: Option<i64>,
+    /// Why the current snapshot could not be refreshed.
+    pub failure_reason: Option<String>,
 }
 
 impl<S: WorkspaceSource> ReadService<S, SystemClock> {
@@ -479,12 +536,14 @@ mod cache_path_tests {
 
 impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
     /// Opens a service with an injected clock, primarily useful for deterministic cache tests.
-    pub fn with_clock(source: S, cache_path: &Path, clock: C) -> Result<Self, Error> {
+    pub fn with_clock(mut source: S, cache_path: &Path, clock: C) -> Result<Self, Error> {
+        source.configure_cache(cache_path)?;
         let cache_namespace = source.cache_namespace();
         Ok(Self {
             source,
             cache: SnapshotCache::open(cache_path, &cache_namespace)?,
             clock,
+            freshness: None,
         })
     }
 
@@ -727,13 +786,9 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
     }
 
     /// Fetches a new workspace snapshot even when the cache is still fresh.
-    /// A failed fetch leaves the cache empty so later reads cannot use stale data.
+    /// Quota and locking still apply, and a failed fetch preserves last-good storage.
     pub fn force_refresh_workspace(&mut self) -> Result<WorkspaceSnapshot, Error> {
-        self.cache.invalidate()?;
-        let mut snapshot = self.source.fetch_workspace()?;
-        snapshot.fetched_at = self.clock.now_epoch_seconds();
-        self.cache.replace(snapshot.fetched_at, &snapshot)?;
-        Ok(snapshot)
+        self.refresh(true)
     }
 
     /// Removes this source's cached snapshot before a write or uncertain source state.
@@ -860,11 +915,88 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
     }
 
     fn snapshot(&mut self) -> Result<WorkspaceSnapshot, Error> {
+        self.refresh(false)
+    }
+
+    /// Provenance of the latest ordinary read. Bounded reads never fall back.
+    pub fn cache_freshness(&self) -> Option<&CacheFreshness> {
+        self.freshness.as_ref()
+    }
+
+    fn refresh(&mut self, force: bool) -> Result<WorkspaceSnapshot, Error> {
         let now = self.clock.now_epoch_seconds();
-        if let Some(snapshot) = self.cache.fresh(now)? {
-            return Ok(snapshot);
+        let before = self.cache.revision()?;
+        let result = (|| {
+            if !force && let Some(snapshot) = self.cache.fresh(now)? {
+                return Ok(snapshot);
+            }
+            let _lock = self.cache.refresh_lock(None)?;
+            let now = self.clock.now_epoch_seconds();
+            if let Some(snapshot) = self.cache.fresh(now)?
+                && (!force || self.cache.revision()? != before)
+            {
+                return Ok(snapshot);
+            }
+            let started = self.clock.now_epoch_seconds();
+            let full = self
+                .cache
+                .last_full_reconciliation()?
+                .is_none_or(|last| started.saturating_sub(last) >= 86_400);
+            let baseline = if full {
+                None
+            } else {
+                self.cache.last_complete()?
+            };
+            let mut snapshot = self.source.refresh_workspace(baseline.as_ref(), None)?;
+            snapshot.fetched_at = started;
+            self.cache.replace_refresh(started, &snapshot, full)?;
+            Ok(snapshot)
+        })();
+        match result {
+            Ok(snapshot) => {
+                let age = self
+                    .cache
+                    .source_started_at()?
+                    .and_then(|started| self.clock.now_epoch_seconds().checked_sub(started))
+                    .filter(|age| *age >= 0);
+                self.freshness = Some(CacheFreshness {
+                    stale: age.is_none(),
+                    age_seconds: age,
+                    rate_limit_until: None,
+                    failure_reason: age
+                        .is_none()
+                        .then(|| "source fetch provenance unavailable".to_owned()),
+                });
+                Ok(snapshot)
+            }
+            Err(error) => {
+                let Some(snapshot) = self.cache.last_complete()? else {
+                    return Err(error);
+                };
+                let until = match &error {
+                    Error::LinearRateLimited { retry_after } => {
+                        self.clock.now_epoch_seconds().checked_add(
+                            i64::try_from(
+                                retry_after.as_secs() + u64::from(retry_after.subsec_nanos() > 0),
+                            )
+                            .unwrap_or(i64::MAX),
+                        )
+                    }
+                    _ => None,
+                };
+                self.freshness = Some(CacheFreshness {
+                    stale: true,
+                    age_seconds: self
+                        .cache
+                        .source_started_at()?
+                        .and_then(|started| self.clock.now_epoch_seconds().checked_sub(started))
+                        .filter(|age| *age >= 0),
+                    rate_limit_until: until,
+                    failure_reason: Some(error.to_string()),
+                });
+                Ok(snapshot)
+            }
         }
-        self.force_refresh_workspace()
     }
 }
 
@@ -928,10 +1060,16 @@ fn read_within<S: WorkspaceSource>(
         return Ok(snapshot);
     }
     deadline.remaining()?;
+    let _lock = cache.refresh_lock(Some(deadline))?;
+    if let Some(snapshot) = cache.fresh_within(clock.now_epoch_seconds(), max_age, deadline)? {
+        return Ok(snapshot);
+    }
     let read_started_at = clock.now_epoch_seconds();
-    let mut snapshot = source.fetch_workspace_bounded(deadline)?;
+    let (baseline, full) = cache.baseline_within(read_started_at, deadline)?;
+    deadline.remaining()?;
+    let mut snapshot = source.refresh_workspace(baseline.as_ref(), Some(deadline))?;
     snapshot.fetched_at = read_started_at;
-    cache.replace_bounded(&snapshot, read_started_at, deadline)?;
+    cache.replace_bounded(&snapshot, read_started_at, deadline, full)?;
     deadline.remaining()?;
     Ok(snapshot)
 }

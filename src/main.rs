@@ -7,9 +7,9 @@ use clap::{Parser, Subcommand};
 use ix_board::agents::{AgentsReport, ReadyTicket, build_report, parse_duration, render_text};
 use ix_board::chain::{ChainReport, evaluate_chain, open_scope_issues, resolve_issue};
 use ix_board::orphans::{OrphansReport, find_orphans};
-use ix_board::program_review::{
-    ProgramRoadmap, ProgramScope, ScopeCheckReport, build_roadmap, check_scope,
-};
+#[cfg(test)]
+use ix_board::program_review::ProgramRoadmap;
+use ix_board::program_review::{ProgramScope, ScopeCheckReport};
 use ix_board::reconcile::{
     DEFAULT_STALE_DAYS, ReconcileReport, collect_github_evidence, evaluate_reconcile,
     repositories_for_scope, resolve_project,
@@ -19,8 +19,8 @@ use ix_board::{
     DriftConfig, DriftError, DriftEvidenceFile, DriftReport, Error, FocusExpansion,
     FocusHygieneReport, FocusPlanChunk, FocusProjectMembership, FocusRecord, FocusSelection,
     FocusStatus, IssueBatch, LinearGraphQlSource, NextStep, ProjectChunk, ProjectPriority,
-    ProjectRunStatus, ReadService, ReadyItem, SearchResult, WorkspaceSource, evaluate_drift,
-    evaluate_drift_file, render_drift_text,
+    ProjectRunStatus, ReadService, ReadyItem, SearchResult, evaluate_drift, evaluate_drift_file,
+    render_drift_text,
 };
 use ix_cli_kit::exit::Outcome;
 use ix_cli_kit::secrets::{AppScope, SecretKey, SecretStore, SecretValue};
@@ -57,6 +57,11 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Inspect shared cache and quota state without resolving credentials.
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommand,
+    },
     /// Internal read-only lifecycle probe protocol.
     #[command(name = "__agent-probe", hide = true)]
     AgentProbe,
@@ -159,6 +164,12 @@ enum Command {
         #[arg(long, required = true)]
         scope: PathBuf,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum CacheCommand {
+    /// Show dataset freshness and shared allowance.
+    Status,
 }
 
 #[derive(Subcommand, Debug)]
@@ -326,6 +337,13 @@ enum ProjectCommand {
 #[derive(Serialize)]
 #[serde(untagged)]
 enum Output {
+    Cached {
+        result: Box<Output>,
+        #[serde(flatten)]
+        freshness: ix_board::CacheFreshness,
+    },
+    CacheStatus(ix_board::cache_status::CacheStatus),
+    SummaryRoadmap(ix_board::program_review::SummaryRoadmap),
     Auth {
         status: String,
         source: Option<String>,
@@ -354,6 +372,7 @@ enum Output {
         label: String,
     },
     ProgramScopeCheck(ScopeCheckReport),
+    #[cfg(test)]
     ProgramRoadmap(ProgramRoadmap),
     Reconcile(ReconcileReport),
     Chain(ChainReport),
@@ -409,6 +428,11 @@ fn main() -> std::process::ExitCode {
     }
     match run(cli.command) {
         Ok(output) => {
+            if let Output::Cached { freshness, .. } = &output
+                && let Some(reason) = &freshness.failure_reason
+            {
+                eprintln!("{reason}");
+            }
             let rendered = if cli.json {
                 ix_cli_kit::json::encode_canonical(&output, true).map_err(|error| error.to_string())
             } else {
@@ -430,7 +454,14 @@ fn main() -> std::process::ExitCode {
             }
         }
         Err(error) => {
-            emit_diagnostic(diagnostics, "error", &format_cli_error(&error));
+            if matches!(
+                error,
+                Error::LinearRateLimited { .. } | Error::LinearLocalBudgetExhausted { .. }
+            ) {
+                eprintln!("{error}");
+            } else {
+                emit_diagnostic(diagnostics, "error", &format_cli_error(&error));
+            }
             std::process::ExitCode::from(match error {
                 Error::InvalidTeam
                 | Error::InvalidQuery
@@ -454,6 +485,7 @@ fn main() -> std::process::ExitCode {
 
 fn output_outcome(output: &Output) -> Outcome {
     match output {
+        Output::Cached { result, .. } => output_outcome(result),
         Output::Issues(batch) if batch.issues.is_empty() && !batch.missing.is_empty() => {
             Outcome::Invalid
         }
@@ -569,6 +601,10 @@ fn validate_command(command: &Command) -> Result<(), Error> {
 
 fn run(command: Command) -> Result<Output, Error> {
     match command {
+        Command::Cache {
+            command: CacheCommand::Status,
+        } => ix_board::cache_status::read_status(&ix_board::default_cache_path()?)
+            .map(Output::CacheStatus),
         Command::Auth { command } => run_auth(command),
         Command::Drift {
             config,
@@ -599,11 +635,12 @@ fn run(command: Command) -> Result<Output, Error> {
                 message: error.to_string(),
             })?;
             let source = LinearGraphQlSource::from_env()?;
-            let initiatives = source.fetch_initiatives()?;
-            let workspace = ix_board::WorkspaceSource::fetch_workspace(&source)?;
-            check_scope(&scope, &initiatives, &workspace)
-                .map(Output::ProgramScopeCheck)
-                .map_err(Error::from)
+            let read = source.summary_snapshot_cached()?;
+            let report = ix_board::program_review::check_summary_scope(&scope, &read.data)?;
+            Ok(Output::Cached {
+                result: Box::new(Output::ProgramScopeCheck(report)),
+                freshness: read.freshness,
+            })
         }
         Command::Roadmap { scope } => {
             let scope = scope.map(ProgramScope::load).transpose().map_err(|error| {
@@ -612,13 +649,16 @@ fn run(command: Command) -> Result<Output, Error> {
                 }
             })?;
             let source = LinearGraphQlSource::from_env()?;
-            let initiatives = source.fetch_initiatives()?;
-            let workspace = ix_board::WorkspaceSource::fetch_workspace(&source)?;
-            Ok(Output::ProgramRoadmap(build_roadmap(
-                &initiatives,
-                &workspace,
+            let read = source.summary_snapshot_cached()?;
+            let report = ix_board::program_review::build_summary_roadmap(
+                &read.data,
                 scope.as_ref(),
-            )))
+                &format_utc(read.last_successful_sync),
+            );
+            Ok(Output::Cached {
+                result: Box::new(Output::SummaryRoadmap(report)),
+                freshness: read.freshness,
+            })
         }
         Command::Reconcile {
             project,
@@ -631,7 +671,8 @@ fn run(command: Command) -> Result<Output, Error> {
                 }
             })?;
             let source = LinearGraphQlSource::from_env()?;
-            let workspace = source.fetch_workspace()?;
+            let mut service = ReadService::open_default(source)?;
+            let workspace = service.workspace_snapshot()?;
             let project_record = resolve_project(&workspace, &project).map_err(Error::from)?;
             let project_issues = workspace
                 .issues
@@ -656,7 +697,7 @@ fn run(command: Command) -> Result<Output, Error> {
                 stale_days,
                 now_epoch,
             )
-            .map(Output::Reconcile)
+            .map(|report| label_cached(Output::Reconcile(report), service.cache_freshness()))
             .map_err(Error::from)
         }
         Command::Chain { issue, scope } => {
@@ -666,7 +707,8 @@ fn run(command: Command) -> Result<Output, Error> {
                 }
             })?;
             let source = LinearGraphQlSource::from_env()?;
-            let workspace = source.fetch_workspace()?;
+            let mut service = ReadService::open_default(source)?;
+            let workspace = service.workspace_snapshot()?;
             let starts = if let Some(issue) = issue.as_deref() {
                 vec![
                     resolve_issue(&workspace, issue)
@@ -693,7 +735,7 @@ fn run(command: Command) -> Result<Output, Error> {
                 })?
                 .as_secs_f64();
             evaluate_chain(&workspace, &starts, scope.as_ref(), now_epoch)
-                .map(Output::Chain)
+                .map(|report| label_cached(Output::Chain(report), service.cache_freshness()))
                 .map_err(Error::from)
         }
         Command::Orphans { scope } => {
@@ -701,9 +743,10 @@ fn run(command: Command) -> Result<Output, Error> {
                 message: error.to_string(),
             })?;
             let source = LinearGraphQlSource::from_env()?;
-            let workspace = source.fetch_workspace()?;
+            let mut service = ReadService::open_default(source)?;
+            let workspace = service.workspace_snapshot()?;
             find_orphans(&scope, &workspace)
-                .map(Output::Orphans)
+                .map(|report| label_cached(Output::Orphans(report), service.cache_freshness()))
                 .map_err(Error::from)
         }
         other => run_linear(other),
@@ -838,7 +881,8 @@ fn run_auth(command: AuthCommand) -> Result<Output, Error> {
 fn run_linear(command: Command) -> Result<Output, Error> {
     let source = LinearGraphQlSource::from_env()?;
     let mut service = ReadService::open_default(source)?;
-    match command {
+    let result = match command {
+        Command::Cache { .. } => unreachable!("cache commands are handled before Linear dispatch"),
         Command::Auth { .. } => unreachable!("auth commands are handled before Linear dispatch"),
         Command::AgentProbe => unreachable!("probe is handled before normal dispatch"),
         Command::Agents { .. } => unreachable!("agents is handled before Linear dispatch"),
@@ -978,6 +1022,26 @@ fn run_linear(command: Command) -> Result<Output, Error> {
                 label: priority.label().to_owned(),
             }
         }),
+    }?;
+    match service
+        .cache_freshness()
+        .filter(|freshness| freshness.stale)
+    {
+        Some(freshness) => Ok(Output::Cached {
+            result: Box::new(result),
+            freshness: freshness.clone(),
+        }),
+        None => Ok(result),
+    }
+}
+
+fn label_cached(result: Output, freshness: Option<&ix_board::CacheFreshness>) -> Output {
+    match freshness.filter(|freshness| freshness.stale) {
+        Some(freshness) => Output::Cached {
+            result: Box::new(result),
+            freshness: freshness.clone(),
+        },
+        None => result,
     }
 }
 
@@ -1021,6 +1085,23 @@ fn run_drift(
 
 fn render_human(output: &Output) -> String {
     match output {
+        Output::Cached { result, freshness } => format!(
+            "{}\nstale: {}\nage_seconds: {}\nrate_limit_until: {}{}",
+            render_human(result),
+            freshness.stale,
+            freshness
+                .age_seconds
+                .map_or_else(|| "unknown".to_owned(), |age| age.to_string()),
+            freshness
+                .rate_limit_until
+                .map_or_else(|| "unknown".to_owned(), |until| until.to_string()),
+            freshness
+                .failure_reason
+                .as_ref()
+                .map_or_else(String::new, |reason| format!("\nfailure_reason: {reason}"))
+        ),
+        Output::CacheStatus(status) => ix_board::cache_status::render_text(status),
+        Output::SummaryRoadmap(report) => render_summary_roadmap(report),
         Output::Auth { status, source } => match source {
             Some(source) => format!("Linear credential {status} ({source})"),
             None => format!("Linear credential {status}"),
@@ -1093,6 +1174,7 @@ fn render_human(output: &Output) -> String {
             }
             lines.join("\n")
         }
+        #[cfg(test)]
         Output::ProgramRoadmap(report) => render_roadmap(report),
         Output::Reconcile(report) => render_reconcile(report),
         Output::Chain(report) => render_chain(report),
@@ -1110,6 +1192,7 @@ fn render_human(output: &Output) -> String {
     }
 }
 
+#[cfg(test)]
 fn render_roadmap(report: &ProgramRoadmap) -> String {
     let mut lines = Vec::new();
     for initiative in &report.initiatives {
@@ -1174,6 +1257,51 @@ fn render_roadmap(report: &ProgramRoadmap) -> String {
                 mismatch.missing_from_scope.join(", ")
             ));
         }
+    }
+    lines.join("\n")
+}
+
+fn render_summary_roadmap(report: &ix_board::program_review::SummaryRoadmap) -> String {
+    let mut lines = Vec::new();
+    for initiative in &report.initiatives {
+        lines.push(format!(
+            "{} | status {} | health {}",
+            initiative.name,
+            initiative.status.as_deref().unwrap_or("unknown"),
+            initiative.health.as_deref().unwrap_or("unknown")
+        ));
+        for project in &initiative.projects {
+            lines.push(format!("  {} | {} | progress {} | source {} | observed {} | counts unavailable: {} | project updated {}",project.name,project.status,
+                project.progress_percent.map_or_else(|| "unknown".to_owned(),|progress| format!("{progress:.1}%")),project.progress_source,project.observed_at,project.counts_unavailable_reason,project.project_updated_at.as_deref().unwrap_or("unknown")));
+        }
+    }
+    for project in &report.unplaced_projects {
+        lines.push(format!(
+            "unplaced project: {} | {} | counts unavailable: {}",
+            project.name, project.status, project.counts_unavailable_reason
+        ));
+    }
+    for name in &report.initiatives_without_projects {
+        lines.push(format!("initiative without projects: {name}"));
+    }
+    for name in &report.missing_scope_initiatives {
+        lines.push(format!(
+            "initiative listed in scope file but missing from Linear: {name}"
+        ));
+    }
+    for name in &report.missing_scope_projects {
+        lines.push(format!(
+            "project listed in scope file but missing from Linear: {name}"
+        ));
+    }
+    for name in &report.projects_missing_from_scope {
+        lines.push(format!("project missing from scope: {name}"));
+    }
+    for name in &report.projects_in_multiple_initiatives {
+        lines.push(format!("project in multiple initiatives: {name}"));
+    }
+    for mismatch in &report.project_membership_mismatches {
+        lines.push(format!("project membership mismatch: {mismatch:?}"));
     }
     lines.join("\n")
 }

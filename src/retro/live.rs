@@ -111,9 +111,10 @@ impl LiveLinear {
     /// client and resolved credential. Construction does not resolve credentials
     /// again or select a platform cache path.
     pub fn with_source(
-        source: LinearGraphQlSource,
+        mut source: LinearGraphQlSource,
         cache_path: &Path,
     ) -> Result<Self, crate::Error> {
+        crate::WorkspaceSource::configure_cache(&mut source, cache_path)?;
         Ok(Self {
             source: source.clone(),
             service: Mutex::new(ReadService::open(source, cache_path)?),
@@ -190,23 +191,10 @@ impl LinearSource for LiveLinear {
         }
         evidence
     }
-    fn workspace(&self, since: f64) -> Result<WorkspaceSnapshot, String> {
-        let mut service = self.service()?;
-        let cached = service
+    fn workspace(&self, _since: f64) -> Result<WorkspaceSnapshot, String> {
+        self.service()?
             .workspace_snapshot()
-            .map_err(|error| error.to_string())?;
-        let service = std::cell::RefCell::new(service);
-        current_workspace(
-            since,
-            cached,
-            |since| self.source.fetch_issue_updates(since),
-            || {
-                service
-                    .borrow_mut()
-                    .force_refresh_workspace()
-                    .map_err(|error| error.to_string())
-            },
-        )
+            .map_err(|error| error.to_string())
     }
 
     fn project_open_count(&self, project: &str) -> Result<usize, String> {

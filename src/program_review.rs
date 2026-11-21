@@ -383,6 +383,8 @@ pub struct ProjectInitiativeMismatch {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoadmapInitiative {
+    #[serde(skip)]
+    source_id: String,
     pub name: String,
     pub projects: Vec<RoadmapProject>,
 }
@@ -390,6 +392,8 @@ pub struct RoadmapInitiative {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoadmapProject {
+    #[serde(skip)]
+    source_id: String,
     pub name: String,
     pub status: String,
     pub progress_percent: u8,
@@ -403,6 +407,8 @@ pub struct RoadmapProject {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoadmapUnplacedProject {
+    #[serde(skip)]
+    source_id: String,
     pub name: String,
     pub status: String,
     pub progress_percent: u8,
@@ -556,6 +562,7 @@ pub fn build_roadmap(
                 .push(initiative.name.clone());
         }
         result.initiatives.push(RoadmapInitiative {
+            source_id: initiative.id.clone(),
             name: initiative.name.clone(),
             projects: rows,
         });
@@ -680,6 +687,7 @@ fn progress(open: usize, done: usize) -> u8 {
 fn roadmap_project(project: &Project, issues: &[Issue], also_in: Vec<String>) -> RoadmapProject {
     let (open, done, canceled, last_activity) = issue_counts(project, issues);
     RoadmapProject {
+        source_id: project.id.0.clone(),
         name: project.name.clone(),
         status: project.status.clone(),
         progress_percent: progress(open, done),
@@ -694,6 +702,7 @@ fn roadmap_project(project: &Project, issues: &[Issue], also_in: Vec<String>) ->
 fn roadmap_unplaced(project: &Project, issues: &[Issue]) -> RoadmapUnplacedProject {
     let (open, done, canceled, last_activity) = issue_counts(project, issues);
     RoadmapUnplacedProject {
+        source_id: project.id.0.clone(),
         name: project.name.clone(),
         status: project.status.clone(),
         progress_percent: progress(open, done),
@@ -701,6 +710,159 @@ fn roadmap_unplaced(project: &Project, issues: &[Issue]) -> RoadmapUnplacedProje
         done,
         canceled,
         last_activity,
+    }
+}
+
+/// Native summary roadmap; counts remain nullable when Linear exposes no current aggregate.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SummaryRoadmap {
+    /// Deterministically grouped initiatives and their native status.
+    pub initiatives: Vec<SummaryRoadmapInitiative>,
+    /// Projects without an initiative.
+    pub unplaced_projects: Vec<SummaryRoadmapProject>,
+    /// Initiatives without a visible project.
+    pub initiatives_without_projects: Vec<String>,
+    /// Projects with multiple initiative memberships.
+    pub projects_in_multiple_initiatives: Vec<String>,
+    /// Live projects omitted from the selected scope.
+    pub projects_missing_from_scope: Vec<String>,
+    /// Declared and live membership differences.
+    pub project_membership_mismatches: Vec<ProjectInitiativeMismatch>,
+    /// Scope-declared initiatives absent from Linear.
+    pub missing_scope_initiatives: Vec<String>,
+    /// Scope-declared projects absent from Linear.
+    pub missing_scope_projects: Vec<String>,
+}
+
+/// Native initiative status with project summaries; no invented progress aggregate.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SummaryRoadmapInitiative {
+    /// Initiative display name.
+    pub name: String,
+    /// Native lifecycle status when available.
+    pub status: Option<String>,
+    /// Native reported health when available.
+    pub health: Option<String>,
+    /// Projects assigned to this primary initiative.
+    pub projects: Vec<SummaryRoadmapProject>,
+}
+
+/// Project facts from native Linear summaries, without enumerating tickets.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SummaryRoadmapProject {
+    /// Project display name.
+    pub name: String,
+    /// Native lifecycle status.
+    pub status: String,
+    /// Native estimate-weighted progress, expressed as a percentage.
+    pub progress_percent: Option<f64>,
+    /// Source of progress; native progress is not completed-ticket percentage.
+    pub progress_source: String,
+    /// Time the source fetch began, retained from the summary dataset.
+    pub observed_at: String,
+    /// Current open issue count; null because no native current aggregate exists.
+    pub open: Option<usize>,
+    /// Current completed issue count; null because no native current aggregate exists.
+    pub done: Option<usize>,
+    /// Current canceled issue count; null because no native current aggregate exists.
+    pub canceled: Option<usize>,
+    /// Reason counts are unavailable.
+    pub counts_unavailable_reason: String,
+    /// Issue last activity; null because summaries do not expose this aggregate.
+    pub last_activity: Option<String>,
+    /// Reason issue last activity is unavailable.
+    pub activity_unavailable_reason: String,
+    /// Native project updatedAt; distinct from issue activity.
+    pub project_updated_at: Option<String>,
+    /// Other initiative memberships.
+    pub also_in: Vec<String>,
+}
+
+/// Checks scope using only shared native summary catalogs and GitHub probes.
+pub fn check_summary_scope(
+    scope: &ProgramScope,
+    summary: &crate::linear_summary::SummarySnapshot,
+) -> Result<ScopeCheckReport, ProgramReviewError> {
+    let initiatives = summary
+        .initiatives
+        .iter()
+        .map(|i| i.initiative.clone())
+        .collect::<Vec<_>>();
+    let workspace = WorkspaceSnapshot {
+        projects: summary.projects.iter().map(|p| p.project.clone()).collect(),
+        ..WorkspaceSnapshot::default()
+    };
+    check_scope(scope, &initiatives, &workspace)
+}
+
+/// Builds a deterministic native summary roadmap without accessing issues or histories.
+pub fn build_summary_roadmap(
+    summary: &crate::linear_summary::SummarySnapshot,
+    scope: Option<&ProgramScope>,
+    observed_at: &str,
+) -> SummaryRoadmap {
+    let initiatives = summary
+        .initiatives
+        .iter()
+        .map(|i| i.initiative.clone())
+        .collect::<Vec<_>>();
+    let workspace = WorkspaceSnapshot {
+        projects: summary.projects.iter().map(|p| p.project.clone()).collect(),
+        ..WorkspaceSnapshot::default()
+    };
+    // The legacy builder owns ordering, scope diagnostics and single placement.
+    // Its ticket-derived values are discarded; this workspace contains no tickets.
+    let grouping = build_roadmap(&initiatives, &workspace, scope);
+    let native_row = |id: String, name: String, status: String, also_in: Vec<String>| {
+        let project = summary.projects.iter().find(|p| p.project.id.0 == id);
+        SummaryRoadmapProject {
+            name, status,
+            progress_percent: project.and_then(|p| p.progress).map(|fraction| fraction * 100.0),
+            progress_source: "linear_native".to_owned(),
+            observed_at: observed_at.to_owned(),
+            open: None, done: None, canceled: None,
+            counts_unavailable_reason: "Linear summary connections expose no current issue totalCount; estimate scope and history arrays are not current issue counts".to_owned(),
+            last_activity: None,
+            activity_unavailable_reason: "Linear project summaries expose no issue last-activity aggregate".to_owned(),
+            project_updated_at: project.map(|p| p.updated_at.clone()),
+            also_in,
+        }
+    };
+    SummaryRoadmap {
+        initiatives: grouping
+            .initiatives
+            .into_iter()
+            .map(|group| {
+                let initiative = summary
+                    .initiatives
+                    .iter()
+                    .find(|i| i.initiative.id == group.source_id);
+                SummaryRoadmapInitiative {
+                    name: group.name,
+                    status: initiative.map(|i| i.status.clone()),
+                    health: initiative.and_then(|i| i.health.clone()),
+                    projects: group
+                        .projects
+                        .into_iter()
+                        .map(|p| native_row(p.source_id, p.name, p.status, p.also_in))
+                        .collect(),
+                }
+            })
+            .collect(),
+        unplaced_projects: grouping
+            .unplaced_projects
+            .into_iter()
+            .map(|p| native_row(p.source_id, p.name, p.status, Vec::new()))
+            .collect(),
+        initiatives_without_projects: grouping.initiatives_without_projects,
+        projects_in_multiple_initiatives: grouping.projects_in_multiple_initiatives,
+        projects_missing_from_scope: grouping.projects_missing_from_scope,
+        project_membership_mismatches: grouping.project_membership_mismatches,
+        missing_scope_initiatives: grouping.missing_scope_initiatives,
+        missing_scope_projects: grouping.missing_scope_projects,
     }
 }
 
