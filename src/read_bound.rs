@@ -115,6 +115,27 @@ impl<'d> Budget<'d> {
             None => Ok(()),
         }
     }
+
+    /// Whether any of `items` satisfies `matches`, checking the budget before each one so a
+    /// long list inside a record is bounded like the records around it.
+    pub(crate) fn any<I, F>(&self, items: I, mut matches: F) -> Result<bool, Error>
+    where
+        I: IntoIterator,
+        F: FnMut(I::Item) -> bool,
+    {
+        for item in items {
+            self.check()?;
+            if matches(item) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether `items` holds `needle`, checking the budget before each comparison.
+    pub(crate) fn contains<T: PartialEq>(&self, items: &[T], needle: &T) -> Result<bool, Error> {
+        self.any(items, |item| item == needle)
+    }
 }
 
 /// How many decoded bytes pass between deadline checks.

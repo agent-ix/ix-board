@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::read_bound::Budget;
-use crate::{Error, IssueId, ProjectId, TeamKey, WorkflowStateType, WorkspaceSnapshot};
+use crate::{Error, IssueId, Project, ProjectId, TeamKey, WorkflowStateType, WorkspaceSnapshot};
 
 /// Explicit assignment selectors, combined as a union within an optional team boundary.
 #[derive(Clone, Debug, Default)]
@@ -69,17 +69,15 @@ pub(crate) fn resolve_initiative_id_within(
     let mut ids = BTreeSet::new();
     for project in &snapshot.projects {
         budget.check()?;
-        ids.extend(
-            project
-                .initiatives
-                .iter()
-                .filter(|initiative| {
-                    initiative.id == value
-                        || initiative.identifier.eq_ignore_ascii_case(value)
-                        || initiative.name.eq_ignore_ascii_case(value)
-                })
-                .map(|initiative| initiative.id.clone()),
-        );
+        for initiative in &project.initiatives {
+            budget.check()?;
+            if initiative.id == value
+                || initiative.identifier.eq_ignore_ascii_case(value)
+                || initiative.name.eq_ignore_ascii_case(value)
+            {
+                ids.insert(initiative.id.clone());
+            }
+        }
     }
     unique("initiative", value, ids.into_iter().collect())
 }
@@ -154,13 +152,12 @@ pub(crate) fn resolve_milestone_id_within(
         budget.check()?;
         if allowed_projects.is_none_or(|ids| ids.contains(&project.id)) {
             projects.push(project);
-            exact.extend(
-                project
-                    .milestones
-                    .iter()
-                    .filter(|m| m.id.eq_ignore_ascii_case(value))
-                    .map(|m| m.id.clone()),
-            );
+            for milestone in &project.milestones {
+                budget.check()?;
+                if milestone.id.eq_ignore_ascii_case(value) {
+                    exact.insert(milestone.id.clone());
+                }
+            }
         }
     }
     if !exact.is_empty() {
@@ -171,17 +168,7 @@ pub(crate) fn resolve_milestone_id_within(
     // split point; deduplicate by canonical milestone ID.
     for project in &projects {
         budget.check()?;
-        for milestone in &project.milestones {
-            if milestone.name.eq_ignore_ascii_case(value.trim()) {
-                names.insert(
-                    milestone.id.clone(),
-                    format!(
-                        "{} ({}) / {} ({})",
-                        project.name, project.id.0, milestone.name, milestone.id
-                    ),
-                );
-            }
-        }
+        collect_named_milestones(&mut names, project, value.trim(), budget)?;
     }
     for (index, character) in value.char_indices() {
         if character != '/' {
@@ -212,17 +199,7 @@ pub(crate) fn resolve_milestone_id_within(
         };
         for project in matches {
             budget.check()?;
-            for milestone in &project.milestones {
-                if milestone.name.eq_ignore_ascii_case(suffix) {
-                    names.insert(
-                        milestone.id.clone(),
-                        format!(
-                            "{} ({}) / {} ({})",
-                            project.name, project.id.0, milestone.name, milestone.id
-                        ),
-                    );
-                }
-            }
+            collect_named_milestones(&mut names, project, suffix, budget)?;
         }
     }
     match names.len() {
@@ -244,6 +221,29 @@ pub(crate) fn resolve_milestone_id_within(
             candidates: names.into_values().collect::<Vec<_>>().join("; "),
         }),
     }
+}
+
+/// Records, by milestone ID, each milestone of `project` named `wanted`, with the label
+/// used to list an ambiguous selector's candidates. Checks `budget` for every milestone.
+fn collect_named_milestones(
+    names: &mut BTreeMap<String, String>,
+    project: &Project,
+    wanted: &str,
+    budget: Budget<'_>,
+) -> Result<(), Error> {
+    for milestone in &project.milestones {
+        budget.check()?;
+        if milestone.name.eq_ignore_ascii_case(wanted) {
+            names.insert(
+                milestone.id.clone(),
+                format!(
+                    "{} ({}) / {} ({})",
+                    project.name, project.id.0, milestone.name, milestone.id
+                ),
+            );
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn resolve_ticket_id(

@@ -181,7 +181,9 @@ let selection = service.canonicalize_named_selection_bounded(&policy, &input)?;
 - The deadline covers the cache lookup and decode, the source read, every name,
   identifier, team, project, initiative, milestone and ticket scan, and the ordering of
   each member list. The read's time counts: resolution gets only what is left. The
-  deadline is checked again before the call returns.
+  deadline is checked for every record of a scan, including the initiatives, milestones
+  and team keys inside one project, so a single large project cannot outrun it, and
+  again before the call returns.
 - The result is what `canonicalize_named_selection` returns for the same snapshot and
   input: IDs only, a milestone with its owning project, an explicit empty `include`
   kept empty.

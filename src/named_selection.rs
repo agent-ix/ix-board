@@ -7,6 +7,7 @@
 //! snapshot on every evaluation (see [`crate::evaluate_named_batch`]).
 
 use std::collections::BTreeSet;
+use std::convert::Infallible;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -125,12 +126,27 @@ impl NamedSelection {
     }
 }
 
+/// The one canonical ordering: sorted by kind, then ID (a milestone's project breaks ties),
+/// without duplicates. `check` runs once for every member before it is ordered, and its
+/// error stops the ordering, so a bounded caller supplies its budget and a caller with no
+/// bound supplies a check that cannot fail.
+fn canonical_list_with<E>(
+    members: Vec<NamedMember>,
+    mut check: impl FnMut() -> Result<(), E>,
+) -> Result<Vec<NamedMember>, E> {
+    let mut ordered = BTreeSet::new();
+    for member in members {
+        check()?;
+        ordered.insert(member);
+    }
+    Ok(ordered.into_iter().collect())
+}
+
+/// [`canonical_list_with`] with no bound. Its check can never fail, and the error type
+/// [`Infallible`] shows that: there is nothing to handle or discard.
 fn canonical_list(members: Vec<NamedMember>) -> Vec<NamedMember> {
-    members
-        .into_iter()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
+    let Ok(ordered) = canonical_list_with(members, || Ok::<(), Infallible>(()));
+    ordered
 }
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -279,12 +295,7 @@ fn canonical_list_within(
     members: Vec<NamedMember>,
     budget: Budget<'_>,
 ) -> Result<Vec<NamedMember>, Error> {
-    let mut ordered = BTreeSet::new();
-    for member in members {
-        budget.check()?;
-        ordered.insert(member);
-    }
-    Ok(ordered.into_iter().collect())
+    canonical_list_with(members, || budget.check())
 }
 
 fn team_is_known(
@@ -300,7 +311,7 @@ fn team_is_known(
     }
     for project in &snapshot.projects {
         budget.check()?;
-        if project.team_keys.contains(team) {
+        if budget.contains(&project.team_keys, team)? {
             return Ok(true);
         }
     }
@@ -315,7 +326,7 @@ fn holds_team_work(
 ) -> Result<bool, Error> {
     for project in &snapshot.projects {
         budget.check()?;
-        if project.id.0 == project_id && project.team_keys.contains(team) {
+        if project.id.0 == project_id && budget.contains(&project.team_keys, team)? {
             return Ok(true);
         }
     }
@@ -354,7 +365,7 @@ fn canonical_member(
             let mut holds = false;
             for project in &snapshot.projects {
                 budget.check()?;
-                if project.initiatives.iter().any(|i| i.id == id)
+                if budget.any(&project.initiatives, |i| i.id == id)?
                     && holds_team_work(snapshot, &project.id.0, team, budget)?
                 {
                     holds = true;
@@ -393,7 +404,7 @@ fn canonical_member(
             let mut owners = Vec::new();
             for candidate in &snapshot.projects {
                 budget.check()?;
-                if candidate.milestones.iter().any(|m| m.id == id) {
+                if budget.any(&candidate.milestones, |m| m.id == id)? {
                     owners.push(candidate.id.0.clone());
                 }
             }
