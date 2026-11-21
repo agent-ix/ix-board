@@ -103,6 +103,14 @@ A batch with no selections has `state: none` and no totals. A team union is
 selection that keeps it from being complete. A project whose Linear status category
 is `unknown` keeps that category in its row and lists it under `unknown_facts`.
 
+Initiative members depend on each project's initiative links. When the source does not
+establish them (`CatalogEvidence::initiative_links` is `false`) and a project that holds
+the team's work is not known to belong to the initiative, that project may still belong
+to it. An initiative include or exclude then keeps the leaves it knows, but its selection
+is `incomplete` with `initiative_links` under `unknown_facts`, and the team union is
+`incomplete` and names the selection in `causes`. Set `initiative_links` only when the
+source really enumerates every project's links.
+
 ## Bounded read
 
 `ReadService::workspace_snapshot_bounded` reads the snapshot under a policy:
@@ -124,8 +132,11 @@ let batch = service.named_batch_bounded(&policy, &requests)?; // read, then eval
   Cached data that cannot show when its read began (for example from an older
   version) is refreshed, not accepted. `snapshot.fetched_at` is when the source read
   began.
-- `deadline` bounds the whole call: the cache lookup and lock wait, every page and
-  nested request, and the cache write. Each request gets the lesser of 30 seconds and
+- `deadline` bounds the whole call: the cache lookup, lock wait and decoding, every
+  page and nested request, and the cache write. `named_batch_bounded` keeps that one
+  deadline through the source's catalog evidence, validation and evaluation too, and
+  returns `Error::ReadTimeout` rather than a batch that finished late. A cached
+  snapshot is also returned only while the deadline has not expired. Each request gets the lesser of 30 seconds and
   the time left, and none starts after the deadline. Expiry is `Error::ReadTimeout`,
   distinct from a transport failure and from `Error::LinearRateLimited`, which keeps
   its cooldown. There is no retry, and nothing keeps running after the call returns.

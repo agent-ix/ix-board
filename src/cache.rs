@@ -3,8 +3,13 @@
 
 //! SQLite persistence for the five-minute structured workspace snapshot.
 
-use crate::{Error, WorkspaceSnapshot, hygiene::FocusBaseline, read_bound::Deadline};
+use crate::{
+    Error, WorkspaceSnapshot,
+    hygiene::FocusBaseline,
+    read_bound::{Deadline, decode_within},
+};
 use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -106,7 +111,7 @@ impl SnapshotCache {
                  VALUES (?1, ?2, ?3)
                  ON CONFLICT(cache_key) DO UPDATE SET fetched_at = excluded.fetched_at,
                    payload = excluded.payload, read_started_at = NULL,
-                   read_started_for = NULL",
+                   read_started_for = NULL, read_started_digest = NULL",
                 params![self.cache_key, now, payload],
             )
             .map_err(Error::Cache)?;
@@ -125,7 +130,8 @@ impl SnapshotCache {
         let row = with_lock_budget(&mut self.connection, deadline, |connection| {
             connection
                 .query_row(
-                    "SELECT fetched_at, payload, read_started_at, read_started_for
+                    "SELECT fetched_at, payload, read_started_at, read_started_for,
+                            read_started_digest
                      FROM workspace_snapshot WHERE cache_key = ?1",
                     params![cache_key],
                     |row| {
@@ -134,17 +140,22 @@ impl SnapshotCache {
                             row.get::<_, Vec<u8>>(1)?,
                             row.get::<_, Option<i64>>(2)?,
                             row.get::<_, Option<i64>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
                         ))
                     },
                 )
                 .optional()
         })?;
-        let Some((fetched_at, payload, Some(started), Some(started_for))) = row else {
+        // The lookup and copy may have used the rest of the budget.
+        deadline.remaining()?;
+        let Some((fetched_at, payload, Some(started), Some(started_for), Some(digest))) = row
+        else {
             return Ok(None);
         };
         // The evidence only describes the payload it was written with. A writer that
-        // does not keep it replaces the payload and moves `fetched_at`.
-        if started_for != fetched_at {
+        // does not keep it replaces the payload, possibly within the same second, so
+        // equal timestamps prove nothing: the evidence must carry the payload's digest.
+        if started_for != fetched_at || digest != payload_digest(&payload) {
             return Ok(None);
         }
         let expires_at = fetched_at
@@ -154,9 +165,8 @@ impl SnapshotCache {
         if expires_at <= now || age < 0 || age > max_age_seconds {
             return Ok(None);
         }
-        serde_json::from_slice(&payload)
-            .map(Some)
-            .map_err(Error::CacheDecode)
+        // Decoding checks the deadline as it goes and again before it returns success.
+        decode_within(&payload, deadline).map(Some)
     }
 
     /// Stores a refreshed snapshot with the time its source read began, unless the
@@ -168,18 +178,27 @@ impl SnapshotCache {
         deadline: &Deadline<'_>,
     ) -> Result<(), Error> {
         let payload = serde_json::to_vec(snapshot).map_err(Error::CacheEncode)?;
+        let digest = payload_digest(&payload);
         let cache_key = self.cache_key.clone();
         let committed = with_lock_budget(&mut self.connection, deadline, |connection| {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             transaction.execute(
                 "INSERT INTO workspace_snapshot(
-                     cache_key, fetched_at, payload, read_started_at, read_started_for)
-                 VALUES (?1, ?2, ?3, ?4, ?2)
+                     cache_key, fetched_at, payload, read_started_at, read_started_for,
+                     read_started_digest)
+                 VALUES (?1, ?2, ?3, ?4, ?2, ?5)
                  ON CONFLICT(cache_key) DO UPDATE SET fetched_at = excluded.fetched_at,
                    payload = excluded.payload, read_started_at = excluded.read_started_at,
-                   read_started_for = excluded.read_started_for",
-                params![cache_key, snapshot.fetched_at, payload, read_started_at],
+                   read_started_for = excluded.read_started_for,
+                   read_started_digest = excluded.read_started_digest",
+                params![
+                    cache_key,
+                    snapshot.fetched_at,
+                    payload,
+                    read_started_at,
+                    digest
+                ],
             )?;
             if deadline.remaining().is_err() {
                 // Dropping the transaction rolls it back: nothing is stored after expiry.
@@ -238,6 +257,12 @@ impl SnapshotCache {
     }
 }
 
+/// The SHA-256 of a stored payload, as lowercase hex. Read-start evidence carries it so
+/// that it only ever vouches for the exact payload it was written with.
+fn payload_digest(payload: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(payload))
+}
+
 /// Adds the evidence columns of a bounded read. Old readers select and write only the
 /// original columns, so the table stays usable by them.
 fn add_read_start_columns(connection: &Connection) -> Result<(), Error> {
@@ -249,12 +274,16 @@ fn add_read_start_columns(connection: &Connection) -> Result<(), Error> {
         .map_err(Error::Cache)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(Error::Cache)?;
-    for column in ["read_started_at", "read_started_for"] {
+    for (column, kind) in [
+        ("read_started_at", "INTEGER"),
+        ("read_started_for", "INTEGER"),
+        ("read_started_digest", "TEXT"),
+    ] {
         if present.iter().any(|name| name == column) {
             continue;
         }
         match connection.execute(
-            &format!("ALTER TABLE workspace_snapshot ADD COLUMN {column} INTEGER"),
+            &format!("ALTER TABLE workspace_snapshot ADD COLUMN {column} {kind}"),
             [],
         ) {
             Ok(_) => {}

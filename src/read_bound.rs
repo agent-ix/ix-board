@@ -89,6 +89,84 @@ impl<'a> Deadline<'a> {
     }
 }
 
+/// An optional share of a bounded read's deadline for work that runs after the read.
+///
+/// Evaluation loops call [`Budget::check`] cooperatively, so they stop with
+/// [`Error::ReadTimeout`] once the one operation-wide deadline has expired. The
+/// unbounded budget never expires, which keeps every existing caller unchanged.
+#[derive(Clone, Copy)]
+pub(crate) struct Budget<'d>(Option<&'d Deadline<'d>>);
+
+impl<'d> Budget<'d> {
+    /// No bound: [`Budget::check`] always succeeds.
+    pub(crate) const fn unbounded() -> Self {
+        Self(None)
+    }
+
+    /// Shares `deadline`, the same one the read used, rather than starting another.
+    pub(crate) const fn within(deadline: &'d Deadline<'d>) -> Self {
+        Self(Some(deadline))
+    }
+
+    /// Fails with [`Error::ReadTimeout`] once the deadline has expired.
+    pub(crate) fn check(&self) -> Result<(), Error> {
+        match self.0 {
+            Some(deadline) => deadline.remaining().map(|_| ()),
+            None => Ok(()),
+        }
+    }
+}
+
+/// How many decoded bytes pass between deadline checks.
+const DECODE_CHECK_INTERVAL: usize = 16 * 1024;
+
+/// Serves a slice and fails with a timed-out error once the deadline has expired,
+/// checking it every [`DECODE_CHECK_INTERVAL`] bytes so a large payload is bounded.
+struct BudgetedSlice<'a, 'd> {
+    bytes: &'a [u8],
+    since_check: usize,
+    budget: Budget<'d>,
+}
+
+impl std::io::Read for BudgetedSlice<'_, '_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.since_check >= DECODE_CHECK_INTERVAL {
+            self.since_check = 0;
+            self.budget
+                .check()
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))?;
+        }
+        let served = std::io::Read::read(&mut self.bytes, buf)?;
+        self.since_check += served;
+        Ok(served)
+    }
+}
+
+/// Decodes a cached payload without outrunning the deadline: it is checked before the
+/// decode, every [`DECODE_CHECK_INTERVAL`] bytes during it and after it.
+pub(crate) fn decode_within<T: serde::de::DeserializeOwned>(
+    payload: &[u8],
+    deadline: &Deadline<'_>,
+) -> Result<T, Error> {
+    deadline.remaining()?;
+    let reader = BudgetedSlice {
+        bytes: payload,
+        since_check: 0,
+        budget: Budget::within(deadline),
+    };
+    let decoded = serde_json::from_reader(reader).map_err(|error| {
+        if error.io_error_kind() == Some(std::io::ErrorKind::TimedOut) {
+            Error::ReadTimeout {
+                deadline: deadline.limit(),
+            }
+        } else {
+            Error::CacheDecode(error)
+        }
+    })?;
+    deadline.remaining()?;
+    Ok(decoded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

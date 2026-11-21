@@ -28,6 +28,7 @@ pub use named_selection::{
     NAMED_SELECTION_SCHEMA_VERSION, NamedMember, NamedMemberInput, NamedSelection,
     NamedSelectionInput, canonicalize_named_selection, decode_named_selection,
 };
+use read_bound::Budget;
 pub use read_bound::{Deadline, ReadPolicy};
 pub use scope::{ScopeSelection, ScopeSummary, select_scope};
 
@@ -753,38 +754,46 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
         &mut self,
         policy: &ReadPolicy,
     ) -> Result<WorkspaceSnapshot, Error> {
-        policy.validate()?;
-        if !self.source.supports_bounded_read() {
-            return Err(Error::BoundUnsupported);
-        }
+        self.admit_bounded(policy)?;
         let clock: &dyn Clock = &self.clock;
         let deadline = Deadline::start(clock, policy.deadline);
-        let max_age = i64::try_from(policy.max_age.as_secs()).unwrap_or(i64::MAX);
-        if let Some(snapshot) =
-            self.cache
-                .fresh_within(self.clock.now_epoch_seconds(), max_age, &deadline)?
-        {
-            return Ok(snapshot);
-        }
-        deadline.remaining()?;
-        let read_started_at = self.clock.now_epoch_seconds();
-        let mut snapshot = self.source.fetch_workspace_bounded(&deadline)?;
-        snapshot.fetched_at = read_started_at;
-        self.cache
-            .replace_bounded(&snapshot, read_started_at, &deadline)?;
-        Ok(snapshot)
+        read_within(&self.source, &mut self.cache, clock, policy, &deadline)
     }
 
     /// Bounded read followed by [`evaluate_named_batch`] over that one snapshot, using
-    /// the source's own catalog evidence. The caller persists or publishes the result
-    /// after this returns; a timeout leaves it nothing to publish.
+    /// the source's own catalog evidence.
+    ///
+    /// One deadline, started after the source's credentials are ready and before the
+    /// cache lookup, covers the cache lookup and decode, the source read, the catalog
+    /// evidence, the selection validation and the whole evaluation, including its
+    /// ancestry, closure, readiness and per-selection traversals. Each of those checks
+    /// the same deadline as it goes and again before this returns, so a batch is never
+    /// returned after it has expired: the caller receives [`Error::ReadTimeout`] and has
+    /// nothing to publish. The caller persists or publishes the result after this returns.
     pub fn named_batch_bounded(
         &mut self,
         policy: &ReadPolicy,
         requests: &[NamedFocusRequest],
     ) -> Result<NamedBatch, Error> {
-        let snapshot = self.workspace_snapshot_bounded(policy)?;
-        evaluate_named_batch(&snapshot, &self.source.catalog_evidence(), requests)
+        self.admit_bounded(policy)?;
+        let clock: &dyn Clock = &self.clock;
+        let deadline = Deadline::start(clock, policy.deadline);
+        let snapshot = read_within(&self.source, &mut self.cache, clock, policy, &deadline)?;
+        let evidence = self.source.catalog_evidence();
+        deadline.remaining()?;
+        let batch =
+            named_focus::evaluate_batch(&snapshot, &evidence, requests, Budget::within(&deadline))?;
+        deadline.remaining()?;
+        Ok(batch)
+    }
+
+    /// Refuses an invalid policy or a source that cannot honor a bound, before any read.
+    fn admit_bounded(&self, policy: &ReadPolicy) -> Result<(), Error> {
+        policy.validate()?;
+        if !self.source.supports_bounded_read() {
+            return Err(Error::BoundUnsupported);
+        }
+        Ok(())
     }
 
     fn snapshot(&mut self) -> Result<WorkspaceSnapshot, Error> {
@@ -840,6 +849,30 @@ impl<S: ProjectMutationSource, C: Clock> ReadService<S, C> {
     }
 }
 
+/// The bounded read under one already-started deadline: a cache hit within the policy's
+/// age, otherwise a refresh. Success is returned only while the deadline has not expired,
+/// whichever path produced it.
+fn read_within<S: WorkspaceSource>(
+    source: &S,
+    cache: &mut SnapshotCache,
+    clock: &dyn Clock,
+    policy: &ReadPolicy,
+    deadline: &Deadline<'_>,
+) -> Result<WorkspaceSnapshot, Error> {
+    let max_age = i64::try_from(policy.max_age.as_secs()).unwrap_or(i64::MAX);
+    if let Some(snapshot) = cache.fresh_within(clock.now_epoch_seconds(), max_age, deadline)? {
+        deadline.remaining()?;
+        return Ok(snapshot);
+    }
+    deadline.remaining()?;
+    let read_started_at = clock.now_epoch_seconds();
+    let mut snapshot = source.fetch_workspace_bounded(deadline)?;
+    snapshot.fetched_at = read_started_at;
+    cache.replace_bounded(&snapshot, read_started_at, deadline)?;
+    deadline.remaining()?;
+    Ok(snapshot)
+}
+
 fn project_id(snapshot: &WorkspaceSnapshot, identifier: &str) -> Result<ProjectId, Error> {
     snapshot
         .projects
@@ -867,6 +900,15 @@ fn ready_queue_for(
     snapshot: &WorkspaceSnapshot,
     is_member: impl Fn(&Issue) -> bool,
 ) -> Result<Vec<ReadyItem>, Error> {
+    ready_queue_within(snapshot, is_member, Budget::unbounded())
+}
+
+/// [`ready_queue_for`] that stops with [`Error::ReadTimeout`] once `budget` has expired.
+fn ready_queue_within(
+    snapshot: &WorkspaceSnapshot,
+    is_member: impl Fn(&Issue) -> bool,
+    budget: Budget<'_>,
+) -> Result<Vec<ReadyItem>, Error> {
     let projects: HashMap<_, _> = snapshot
         .projects
         .iter()
@@ -879,6 +921,7 @@ fn ready_queue_for(
         .collect();
     let mut candidates = Vec::new();
     for issue in &snapshot.issues {
+        budget.check()?;
         if !is_member(issue) || !issue_is_open(issue) {
             continue;
         }
@@ -891,7 +934,9 @@ fn ready_queue_for(
         let Some(project) = projects.get(project_id).copied() else {
             continue;
         };
-        if project.status != "Started" || !blockers_completed(issue, &issues)? {
+        if project.status != "Started"
+            || !unresolved_blockers_within(issue, &issues, budget)?.is_empty()
+        {
             continue;
         }
         candidates.push((project, issue, step));
@@ -955,18 +1000,24 @@ fn spec_step(spec_state: &str) -> Option<NextStep> {
     }
 }
 
-fn blockers_completed(issue: &Issue, issues: &HashMap<&IssueId, &Issue>) -> Result<bool, Error> {
-    Ok(unresolved_blockers(issue, issues)?.is_empty())
-}
-
 fn unresolved_blockers(
     issue: &Issue,
     issues: &HashMap<&IssueId, &Issue>,
+) -> Result<BTreeSet<String>, Error> {
+    unresolved_blockers_within(issue, issues, Budget::unbounded())
+}
+
+/// [`unresolved_blockers`] that stops with [`Error::ReadTimeout`] once `budget` has expired.
+fn unresolved_blockers_within(
+    issue: &Issue,
+    issues: &HashMap<&IssueId, &Issue>,
+    budget: Budget<'_>,
 ) -> Result<BTreeSet<String>, Error> {
     let mut pending = issue.blocked_by.to_vec();
     let mut visited = BTreeSet::new();
     let mut unresolved = BTreeSet::new();
     while let Some(blocker_id) = pending.pop() {
+        budget.check()?;
         if !visited.insert(blocker_id.clone()) {
             continue;
         }
@@ -1904,7 +1955,16 @@ fn focus_blocker_layers(
     snapshot: &WorkspaceSnapshot,
     focus_roots: &[&Issue],
 ) -> Result<Vec<Vec<FocusBlocker>>, Error> {
-    let layers = dependency_layer_ids(snapshot, focus_roots)?;
+    focus_blocker_layers_within(snapshot, focus_roots, Budget::unbounded())
+}
+
+/// [`focus_blocker_layers`] that stops with [`Error::ReadTimeout`] once `budget` has expired.
+fn focus_blocker_layers_within(
+    snapshot: &WorkspaceSnapshot,
+    focus_roots: &[&Issue],
+    budget: Budget<'_>,
+) -> Result<Vec<Vec<FocusBlocker>>, Error> {
+    let layers = dependency_layers_within(snapshot, focus_roots, budget)?;
     let issues: HashMap<_, _> = snapshot
         .issues
         .iter()
@@ -1915,6 +1975,7 @@ fn focus_blocker_layers(
         let mut pending = root.blocked_by.clone();
         let mut visited = BTreeSet::new();
         while let Some(id) = pending.pop() {
+            budget.check()?;
             if !visited.insert(id.clone()) {
                 continue;
             }
@@ -1937,6 +1998,7 @@ fn focus_blocker_layers(
             layer
                 .into_iter()
                 .map(|id| {
+                    budget.check()?;
                     let issue =
                         issues
                             .get(&id)
@@ -2033,6 +2095,15 @@ fn dependency_layer_ids(
     snapshot: &WorkspaceSnapshot,
     project_issues: &[&Issue],
 ) -> Result<Vec<Vec<IssueId>>, Error> {
+    dependency_layers_within(snapshot, project_issues, Budget::unbounded())
+}
+
+/// [`dependency_layer_ids`] that stops with [`Error::ReadTimeout`] once `budget` has expired.
+fn dependency_layers_within(
+    snapshot: &WorkspaceSnapshot,
+    project_issues: &[&Issue],
+    budget: Budget<'_>,
+) -> Result<Vec<Vec<IssueId>>, Error> {
     let issues: HashMap<_, _> = snapshot
         .issues
         .iter()
@@ -2044,6 +2115,7 @@ fn dependency_layer_ids(
         .map(|issue| issue.id.clone())
         .collect::<Vec<_>>();
     while let Some(id) = pending.pop() {
+        budget.check()?;
         if !closure.insert(id.clone()) {
             continue;
         }
@@ -2056,6 +2128,7 @@ fn dependency_layer_ids(
         closure.iter().cloned().map(|id| (id, 0)).collect();
     let mut dependents: BTreeMap<IssueId, Vec<IssueId>> = BTreeMap::new();
     for issue_id in &closure {
+        budget.check()?;
         let issue = issues
             .get(issue_id)
             .ok_or_else(|| Error::MissingDependency {
@@ -2082,6 +2155,7 @@ fn dependency_layer_ids(
         let current = std::mem::take(&mut ready);
         let mut ordered_layer = Vec::with_capacity(current.len());
         for id in &current {
+            budget.check()?;
             let _issue = issues.get(id).ok_or_else(|| Error::MissingDependency {
                 issue: id.0.clone(),
             })?;

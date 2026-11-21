@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use crate::read_bound::Budget;
 use crate::{Error, IssueId, ProjectId, TeamKey, WorkflowStateType, WorkspaceSnapshot};
 
 /// Explicit assignment selectors, combined as a union within an optional team boundary.
@@ -378,12 +379,22 @@ pub(crate) fn classify_leaves(
     snapshot: &WorkspaceSnapshot,
     issue_ids: &BTreeSet<IssueId>,
 ) -> Result<LeafClassification, Error> {
+    classify_leaves_within(snapshot, issue_ids, Budget::unbounded())
+}
+
+/// [`classify_leaves`] that stops with [`Error::ReadTimeout`] once `budget` has expired.
+pub(crate) fn classify_leaves_within(
+    snapshot: &WorkspaceSnapshot,
+    issue_ids: &BTreeSet<IssueId>,
+    budget: Budget<'_>,
+) -> Result<LeafClassification, Error> {
     let by_id: BTreeMap<_, _> = snapshot.issues.iter().map(|i| (&i.id, i)).collect();
     let mut checked = BTreeSet::new();
     for issue in snapshot.issues.iter().filter(|i| issue_ids.contains(&i.id)) {
         let mut seen = BTreeSet::new();
         let mut next = Some(&issue.id);
         while let Some(id) = next {
+            budget.check()?;
             if checked.contains(id) {
                 break;
             }
@@ -411,6 +422,7 @@ pub(crate) fn classify_leaves(
         .iter()
         .filter(|i| issue_ids.contains(&i.id) && !parents.contains(&i.id))
     {
+        budget.check()?;
         match issue.state_type {
             WorkflowStateType::Canceled | WorkflowStateType::Duplicate => {}
             WorkflowStateType::Completed => {

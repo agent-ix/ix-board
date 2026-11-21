@@ -12,7 +12,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::scope::{LeafClassification, classify_leaves};
+use crate::read_bound::Budget;
+use crate::scope::{LeafClassification, classify_leaves_within};
 use crate::{
     Error, FocusBlocker, Issue, IssueId, NamedMember, NamedSelection, Project, ProjectId,
     ProjectStatusCategory, TeamKey, WorkflowStateType, WorkspaceSnapshot,
@@ -332,6 +333,19 @@ pub fn evaluate_named_batch(
     evidence: &CatalogEvidence,
     requests: &[NamedFocusRequest],
 ) -> Result<NamedBatch, Error> {
+    evaluate_batch(snapshot, evidence, requests, Budget::unbounded())
+}
+
+/// The one evaluation engine. A bounded read passes the deadline it already started, so
+/// validation and every traversal below stop with [`Error::ReadTimeout`] once it has
+/// expired; the public function above passes no bound and behaves as it always did.
+pub(crate) fn evaluate_batch(
+    snapshot: &WorkspaceSnapshot,
+    evidence: &CatalogEvidence,
+    requests: &[NamedFocusRequest],
+    budget: Budget<'_>,
+) -> Result<NamedBatch, Error> {
+    budget.check()?;
     let mut keys = BTreeSet::new();
     for request in requests {
         if !keys.insert(&request.key) {
@@ -348,7 +362,7 @@ pub fn evaluate_named_batch(
             teams: Vec::new(),
         });
     }
-    let context = Context::new(snapshot, evidence);
+    let context = Context::new(snapshot, evidence, budget)?;
     let mut ordered = requests.iter().collect::<Vec<_>>();
     ordered.sort_by(|left, right| left.key.cmp(&right.key));
     let drafts = ordered
@@ -364,8 +378,9 @@ pub fn evaluate_named_batch(
         .iter()
         .map(|draft| context.summarize(draft, &readiness))
         .collect::<Result<Vec<_>, _>>()?;
+    budget.check()?;
     mark_shared(&mut selections);
-    let teams = context.team_summaries(&selections, &readiness);
+    let teams = context.team_summaries(&selections, &readiness)?;
     Ok(NamedBatch {
         fetched_at: snapshot.fetched_at,
         state: BatchState::Evaluated,
@@ -386,6 +401,9 @@ struct Draft<'a> {
     request: &'a NamedFocusRequest,
     state: SelectionState,
     team_known: bool,
+    /// An initiative member resolved without established links, so hidden links may add
+    /// leaves to it or to what its exclusion removes.
+    links_uncertain: bool,
     members: Vec<MemberReport>,
     include: Vec<(NamedMember, Closure)>,
     included: BTreeSet<IssueId>,
@@ -414,14 +432,20 @@ struct Context<'a> {
     children: BTreeMap<IssueId, Vec<IssueId>>,
     project_issues: BTreeMap<ProjectId, Vec<IssueId>>,
     parents: BTreeSet<IssueId>,
+    budget: Budget<'a>,
 }
 
 impl<'a> Context<'a> {
-    fn new(snapshot: &'a WorkspaceSnapshot, evidence: &'a CatalogEvidence) -> Self {
+    fn new(
+        snapshot: &'a WorkspaceSnapshot,
+        evidence: &'a CatalogEvidence,
+        budget: Budget<'a>,
+    ) -> Result<Self, Error> {
         let mut children: BTreeMap<IssueId, Vec<IssueId>> = BTreeMap::new();
         let mut project_issues: BTreeMap<ProjectId, Vec<IssueId>> = BTreeMap::new();
         let mut parents = BTreeSet::new();
         for issue in &snapshot.issues {
+            budget.check()?;
             if let Some(parent) = &issue.parent_id {
                 children
                     .entry(parent.clone())
@@ -436,7 +460,8 @@ impl<'a> Context<'a> {
                     .push(issue.id.clone());
             }
         }
-        Self {
+        budget.check()?;
+        Ok(Self {
             snapshot,
             evidence,
             issues: snapshot.issues.iter().map(|i| (i.id.clone(), i)).collect(),
@@ -448,7 +473,8 @@ impl<'a> Context<'a> {
             children,
             project_issues,
             parents,
-        }
+            budget,
+        })
     }
 
     fn team_known(&self, team: &TeamKey) -> bool {
@@ -478,13 +504,20 @@ impl<'a> Context<'a> {
         }
     }
 
-    fn member_closure(&self, team: &TeamKey, member: &NamedMember) -> (MemberOutcome, Closure) {
-        match member {
+    fn member_closure(
+        &self,
+        team: &TeamKey,
+        member: &NamedMember,
+    ) -> Result<(MemberOutcome, Closure), Error> {
+        self.budget.check()?;
+        let resolved = match member {
             NamedMember::Initiative { id } => self.initiative_closure(id),
             NamedMember::Project { id } => self.project_closure(id),
             NamedMember::Milestone { id, project_id } => self.milestone_closure(id, project_id),
-            NamedMember::Issue { id } => self.ticket_closure(team, id),
-        }
+            NamedMember::Issue { id } => self.ticket_closure(team, id)?,
+        };
+        self.budget.check()?;
+        Ok(resolved)
     }
 
     fn initiative_closure(&self, id: &str) -> (MemberOutcome, Closure) {
@@ -541,28 +574,33 @@ impl<'a> Context<'a> {
         )
     }
 
-    fn ticket_closure(&self, team: &TeamKey, id: &str) -> (MemberOutcome, Closure) {
+    fn ticket_closure(
+        &self,
+        team: &TeamKey,
+        id: &str,
+    ) -> Result<(MemberOutcome, Closure), Error> {
         let root = IssueId(id.to_owned());
         let Some(issue) = self.issues.get(&root) else {
-            return (Self::absent(self.evidence.tickets), Closure::default());
+            return Ok((Self::absent(self.evidence.tickets), Closure::default()));
         };
         if issue.team_key != *team {
-            return (MemberOutcome::WrongTeam, Closure::default());
+            return Ok((MemberOutcome::WrongTeam, Closure::default()));
         }
         let mut issues = BTreeSet::new();
         let mut pending = vec![root];
         while let Some(next) = pending.pop() {
+            self.budget.check()?;
             if issues.insert(next.clone()) {
                 pending.extend(self.children.get(&next).into_iter().flatten().cloned());
             }
         }
-        (
+        Ok((
             MemberOutcome::Resolved,
             Closure {
                 projects: BTreeSet::new(),
                 issues,
             },
-        )
+        ))
     }
 
     fn issues_of(&self, projects: &BTreeSet<ProjectId>) -> BTreeSet<IssueId> {
@@ -578,11 +616,11 @@ impl<'a> Context<'a> {
         team: &TeamKey,
         list: ListKind,
         members: &[NamedMember],
-    ) -> (Vec<MemberReport>, Vec<(NamedMember, Closure)>) {
+    ) -> Result<(Vec<MemberReport>, Vec<(NamedMember, Closure)>), Error> {
         let mut reports = Vec::new();
         let mut resolved = Vec::new();
         for member in members {
-            let (outcome, closure) = self.member_closure(team, member);
+            let (outcome, closure) = self.member_closure(team, member)?;
             reports.push(MemberReport {
                 list,
                 member: member.clone(),
@@ -592,24 +630,32 @@ impl<'a> Context<'a> {
                 resolved.push((member.clone(), closure));
             }
         }
-        (reports, resolved)
+        Ok((reports, resolved))
     }
 
     fn draft<'r>(&self, request: &'r NamedFocusRequest) -> Result<Draft<'r>, Error> {
         let selection = &request.selection;
         let team = &selection.team;
+        self.budget.check()?;
         let (mut members, include) =
-            self.evaluate_list(team, ListKind::Include, &selection.include);
+            self.evaluate_list(team, ListKind::Include, &selection.include)?;
         let (excluded_reports, exclude) =
-            self.evaluate_list(team, ListKind::Exclude, &selection.exclude);
+            self.evaluate_list(team, ListKind::Exclude, &selection.exclude)?;
         members.extend(excluded_reports);
         members.sort_by(|a, b| (a.list, &a.member).cmp(&(b.list, &b.member)));
         let team_known = self.team_known(team);
-        let state = selection_state(selection, team_known, &members);
+        let mut state = selection_state(selection, team_known, &members);
+        let links_uncertain = state != SelectionState::Empty
+            && self.initiative_links_uncertain(team, include.iter().chain(&exclude));
+        if links_uncertain && state == SelectionState::Complete {
+            // The known leaves stay, but membership cannot be reported as complete.
+            state = SelectionState::Incomplete;
+        }
         let mut draft = Draft {
             request,
             state,
             team_known,
+            links_uncertain,
             members,
             included: closure_issues(&include),
             excluded: closure_issues(&exclude),
@@ -633,9 +679,32 @@ impl<'a> Context<'a> {
             .filter(|id| self.issues.get(*id).is_some_and(|i| i.team_key == *team))
             .cloned()
             .collect();
-        draft.leaves = classify_leaves(self.snapshot, &draft.effective)?;
+        draft.leaves = classify_leaves_within(self.snapshot, &draft.effective, self.budget)?;
         self.place_projects(&mut draft, &exclude);
         Ok(draft)
+    }
+
+    /// Whether an initiative include or exclude member may cover more than the snapshot
+    /// shows. Without established initiative links, a project holding the team's work
+    /// that is not known to belong to the initiative may still belong to it, so the
+    /// initiative's leaves (or the leaves its exclusion removes) are not fully known.
+    fn initiative_links_uncertain<'r>(
+        &self,
+        team: &TeamKey,
+        resolved: impl IntoIterator<Item = &'r (NamedMember, Closure)>,
+    ) -> bool {
+        if self.evidence.initiative_links {
+            return false;
+        }
+        resolved
+            .into_iter()
+            .filter(|(member, _)| matches!(member, NamedMember::Initiative { .. }))
+            .any(|(_, closure)| {
+                self.snapshot
+                    .projects
+                    .iter()
+                    .any(|p| !closure.projects.contains(&p.id) && self.holds_team_work(p, team))
+            })
     }
 
     /// Works out which projects the selection covers whole and which sit under an initiative.
@@ -678,12 +747,15 @@ impl<'a> Context<'a> {
             .iter()
             .filter_map(|id| self.issues.get(id).copied())
             .collect::<Vec<_>>();
-        crate::dependency_layer_ids(self.snapshot, &roots)?;
-        let ready_identifiers =
-            crate::ready_queue_for(self.snapshot, |issue| leaves.contains(&issue.id))?
-                .into_iter()
-                .map(|item| item.identifier)
-                .collect::<BTreeSet<_>>();
+        crate::dependency_layers_within(self.snapshot, &roots, self.budget)?;
+        let ready_identifiers = crate::ready_queue_within(
+            self.snapshot,
+            |issue| leaves.contains(&issue.id),
+            self.budget,
+        )?
+        .into_iter()
+        .map(|item| item.identifier)
+        .collect::<BTreeSet<_>>();
         let by_id = self
             .snapshot
             .issues
@@ -693,11 +765,12 @@ impl<'a> Context<'a> {
         let mut ready = BTreeSet::new();
         let mut blocked = BTreeSet::new();
         for issue in roots {
+            self.budget.check()?;
             if ready_identifiers.contains(&issue.identifier) {
                 ready.insert(issue.id.clone());
             }
             if crate::model::issue_is_open(issue)
-                && !crate::unresolved_blockers(issue, &by_id)?.is_empty()
+                && !crate::unresolved_blockers_within(issue, &by_id, self.budget)?.is_empty()
             {
                 blocked.insert(issue.id.clone());
             }
@@ -748,6 +821,7 @@ impl<'a> Context<'a> {
         draft: &Draft<'_>,
         readiness: &Readiness,
     ) -> Result<SelectionSummary, Error> {
+        self.budget.check()?;
         let selection = &draft.request.selection;
         let usable = matches!(
             draft.state,
@@ -763,20 +837,24 @@ impl<'a> Context<'a> {
                 self.initiative_rows(draft, readiness),
                 self.standalone_rows(draft, readiness),
                 self.ticket_rows(draft, readiness),
-                crate::focus_blocker_layers(self.snapshot, &roots)?,
+                crate::focus_blocker_layers_within(self.snapshot, &roots, self.budget)?,
             )
         } else {
             (Vec::new(), Vec::new(), Vec::new(), Vec::new())
         };
-        let mut unknown_facts = initiatives
+        let unknown_facts = initiatives
             .iter()
             .flat_map(|row| &row.projects)
             .chain(&projects)
             .flat_map(|row| row.unknown_facts.iter().copied())
+            .chain(
+                draft
+                    .links_uncertain
+                    .then_some(UnknownFact::InitiativeLinks),
+            )
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        unknown_facts.sort();
         Ok(SelectionSummary {
             key: draft.request.key.clone(),
             team: selection.team.clone(),
@@ -992,7 +1070,7 @@ impl<'a> Context<'a> {
         &self,
         selections: &[SelectionSummary],
         readiness: &Readiness,
-    ) -> Vec<TeamSummary> {
+    ) -> Result<Vec<TeamSummary>, Error> {
         let mut by_team: BTreeMap<&TeamKey, Vec<&SelectionSummary>> = BTreeMap::new();
         for selection in selections {
             by_team.entry(&selection.team).or_default().push(selection);
@@ -1000,6 +1078,7 @@ impl<'a> Context<'a> {
         by_team
             .into_iter()
             .map(|(team, group)| {
+                self.budget.check()?;
                 let leaves = group
                     .iter()
                     .filter(|s| {
@@ -1011,7 +1090,7 @@ impl<'a> Context<'a> {
                     .flat_map(|s| s.leaf_ids.iter().cloned())
                     .collect::<BTreeSet<_>>();
                 let state = union_state(&group);
-                TeamSummary {
+                Ok(TeamSummary {
                     team: team.clone(),
                     state,
                     selection_keys: group.iter().map(|s| s.key.clone()).collect(),
@@ -1025,7 +1104,7 @@ impl<'a> Context<'a> {
                         SelectionState::Unavailable => CountAvailability::Unavailable,
                     },
                     causes: union_causes(&group),
-                }
+                })
             })
             .collect()
     }

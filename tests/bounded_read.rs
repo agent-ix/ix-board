@@ -17,6 +17,7 @@ use ix_cli_kit::secrets::{
 use ix_trace_rs::trace;
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -217,23 +218,33 @@ fn rows(path: &Path) -> i64 {
         .expect("count rows")
 }
 
+/// Writes a bounded-read row. Evidence is complete when `started` is present: the entry
+/// then carries the digest of its own payload, as a bounded read writes it.
 fn write_row(path: &Path, fetched_at: i64, started: Option<i64>, started_for: Option<i64>) {
+    write_row_with_digest(path, fetched_at, started, started_for, true);
+}
+
+fn write_row_with_digest(
+    path: &Path,
+    fetched_at: i64,
+    started: Option<i64>,
+    started_for: Option<i64>,
+    digest: bool,
+) {
     let snapshot = WorkspaceSnapshot {
         fetched_at,
         ..WorkspaceSnapshot::default()
     };
+    let payload = serde_json::to_vec(&snapshot).expect("encode");
+    let digest = (digest && started.is_some()).then(|| format!("{:x}", Sha256::digest(&payload)));
     Connection::open(path)
         .expect("open cache")
         .execute(
             "INSERT OR REPLACE INTO workspace_snapshot(
-                 cache_key, fetched_at, payload, read_started_at, read_started_for)
-             VALUES ('fixture-default', ?1, ?2, ?3, ?4)",
-            params![
-                fetched_at,
-                serde_json::to_vec(&snapshot).expect("encode"),
-                started,
-                started_for
-            ],
+                 cache_key, fetched_at, payload, read_started_at, read_started_for,
+                 read_started_digest)
+             VALUES ('fixture-default', ?1, ?2, ?3, ?4, ?5)",
+            params![fetched_at, payload, started, started_for, digest],
         )
         .expect("write row");
 }
@@ -328,6 +339,13 @@ fn age_is_measured_from_the_source_read_not_the_cache_write() {
     write_row(&path, 1_800, Some(1_800), Some(1_800));
     let cached = service.workspace_snapshot_bounded(&limits).expect("cached");
     assert_eq!((source.reads(), cached.fetched_at), (3, 1_800));
+    // Timestamps that agree are not enough: evidence without the digest of its payload
+    // cannot show that it describes this payload, so it is refreshed.
+    write_row_with_digest(&path, 1_800, Some(1_800), Some(1_800), false);
+    service
+        .workspace_snapshot_bounded(&limits)
+        .expect("refresh");
+    assert_eq!(source.reads(), 4);
 }
 
 #[trace("FR-004-AC-11", "FR-004-AC-13")]
