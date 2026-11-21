@@ -81,6 +81,13 @@ fn source(endpoint: &str, credential: &str) -> LinearGraphQlSource {
     .expect("explicit fixture credential")
 }
 fn fixture(responses: Vec<Value>) -> (String, mpsc::Receiver<Vec<Value>>) {
+    fixture_with_cost(responses, None)
+}
+
+fn fixture_with_cost(
+    responses: Vec<Value>,
+    actual_cost: Option<u64>,
+) -> (String, mpsc::Receiver<Vec<Value>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("loopback fixture");
     let endpoint = format!(
         "http://{}/graphql",
@@ -89,7 +96,7 @@ fn fixture(responses: Vec<Value>) -> (String, mpsc::Receiver<Vec<Value>>) {
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let mut requests = Vec::new();
-        for response in responses {
+        for (index, response) in responses.into_iter().enumerate() {
             let (mut stream, _) = listener.accept().expect("fixture request");
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
@@ -123,11 +130,67 @@ fn fixture(responses: Vec<Value>) -> (String, mpsc::Receiver<Vec<Value>>) {
             }
             requests.push(serde_json::from_slice(&bytes[start..]).expect("typed JSON request"));
             let body = response.to_string();
-            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).expect("fixture response");
+            let accounting = actual_cost.map_or_else(String::new,|cost| {
+                let used = u64::try_from(index+1).expect("fixture request count")*cost;
+                let reset = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("epoch").as_millis()+3_600_000;
+                format!("X-Complexity: {cost}\r\nX-RateLimit-Requests-Limit: 100000\r\nX-RateLimit-Complexity-Limit: 6000000\r\nX-RateLimit-Complexity-Remaining: {}\r\nX-RateLimit-Complexity-Reset: {reset}\r\n",6_000_000-used)
+            });
+            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{accounting}Content-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).expect("fixture response");
         }
         sender.send(requests).expect("observations");
     });
     (endpoint, receiver)
+}
+
+#[trace("FR-031-AC-4", "FR-031-AC-5", "FR-030-AC-3")]
+#[test]
+fn a_complete_small_cost_catalog_can_exceed_270_transport_requests() {
+    let mut responses = vec![projects(json!([]))];
+    for index in 1..=300 {
+        let mut response = issues(json!([issue(&format!("SWM-{index}"))]));
+        if index < 300 {
+            response["data"]["issues"]["pageInfo"] =
+                json!({"hasNextPage":true,"endCursor":format!("issues-{index}")});
+        }
+        responses.push(response);
+    }
+    let (endpoint, requests) = fixture_with_cost(responses, Some(100));
+    let cache = tempfile::tempdir().expect("cache");
+    let path = cache.path().join("linear.sqlite3");
+    let mut reader =
+        ReadService::open(source(&endpoint, "actual-cost-full-catalog"), &path).expect("reader");
+    let snapshot = reader
+        .workspace_snapshot()
+        .expect("every page fits the actual shared complexity budget");
+    assert_eq!(
+        snapshot.issues.len(),
+        300,
+        "full catalog cannot stop at conservative reservation capacity"
+    );
+    assert!(
+        snapshot
+            .issues
+            .iter()
+            .any(|issue| issue.identifier == "SWM-300")
+    );
+    let status = ix_board::cache_status::read_status(&path).expect("offline shared accounting");
+    assert_eq!(status.quota.requests_used, 301);
+    assert_eq!(
+        status.quota.complexity_used, 30_100,
+        "observed actual cost replaces each estimate exactly once"
+    );
+    let refresh = status.latest_refresh.expect("successful complete refresh");
+    assert!(refresh.success);
+    assert_eq!(refresh.requests_attempted, 301);
+    assert_eq!(refresh.returned_complexity, Some(30_100));
+    assert_eq!(refresh.estimated_complexity, 0);
+    assert_eq!(
+        requests
+            .recv_timeout(Duration::from_secs(5))
+            .expect("all real fixture sends")
+            .len(),
+        301
+    );
 }
 fn is_ready(snapshot: &WorkspaceSnapshot, id: &str) -> bool {
     ready_from_snapshot(snapshot, "SWM")
@@ -211,7 +274,8 @@ fn unfiltered_paged_baseline_replaces_poisoned_model_partition_without_resetting
     .expect("poisoned v14 summary baseline");
     let gate = ix_board::quota::QuotaGate::open(&path, &Default::default())
         .expect("existing independent quota");
-    gate.reserve(7, None)
+    let _unobserved_legacy_charge = gate
+        .reserve(7, None)
         .expect("prior admitted transport cost");
     let baseline = reader
         .workspace_snapshot()

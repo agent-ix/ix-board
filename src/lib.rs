@@ -137,6 +137,9 @@ pub enum Error {
     /// A quota setting is invalid.
     #[error("invalid Linear quota configuration: {reason}")]
     InvalidQuotaConfig { reason: &'static str },
+    /// A completion token does not identify one pending reservation in this cache.
+    #[error("invalid Linear quota reservation: {reason}")]
+    InvalidQuotaReservation { reason: &'static str },
     /// A single request exceeds Linear's fixed complexity ceiling.
     #[error("Linear query complexity {cost} exceeds limit {limit}")]
     LinearQueryComplexityExceeded { cost: u64, limit: u64 },

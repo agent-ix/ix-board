@@ -1132,7 +1132,7 @@ impl LinearGraphQlSource {
         let config = crate::quota::QuotaConfig::from_config(crate::settings::load()?.as_ref())?;
         let quota = crate::quota::QuotaGate::open_within(&self.quota_path, &config, deadline)?;
         const ESTIMATED_COMPLEXITY: u64 = 10_000;
-        quota.reserve(ESTIMATED_COMPLEXITY, deadline)?;
+        let reservation = quota.reserve(ESTIMATED_COMPLEXITY, deadline)?;
         self.metrics
             .requests
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1189,7 +1189,7 @@ impl LinearGraphQlSource {
         let value = match response.json::<serde_json::Value>() {
             Ok(value) => value,
             Err(error) => {
-                quota.observe_within(status, &headers, None, ESTIMATED_COMPLEXITY, deadline)?;
+                quota.observe_within(reservation, status, &headers, None, deadline)?;
                 if status == 429 {
                     return Err(quota_rate_limit(&quota, deadline)?);
                 }
@@ -1199,13 +1199,7 @@ impl LinearGraphQlSource {
                 });
             }
         };
-        quota.observe_within(
-            status,
-            &headers,
-            Some(&value),
-            ESTIMATED_COMPLEXITY,
-            deadline,
-        )?;
+        quota.observe_within(reservation, status, &headers, Some(&value), deadline)?;
         if status == 429
             || value
                 .get("errors")

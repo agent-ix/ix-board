@@ -43,7 +43,11 @@ Bounded library reads preserve their explicit age limit, deadline, and error con
 
 Every request reserves shared request and estimated complexity capacity before
 send, including histories, update probes, and mutations. Unknown query cost reserves
-10,000 complexity units. Response headers supply actual limits and reset times.
+10,000 complexity units. A response reporting actual complexity replaces its own
+reservation exactly once. Missing cost information and unobserved requests keep
+their conservative estimates. Response headers supply actual limits and reset times.
+Local accounting uses a fixed window and generation, independent of rolling server
+reset headers. Late responses cannot refund charges from a newer local window.
 Server rate limits persist across processes; absent retry metadata means a 60-second cooldown.
 No request starts during cooldown, and commands do not sleep or retry.
 
