@@ -3,7 +3,10 @@
 
 //! Actual detailed-cache refreshes against an offline GraphQL service (FR-030).
 
-use ix_board::{Clock, LinearGraphQlSource, ReadService, WorkspaceSnapshot, ready_from_snapshot};
+use ix_board::{
+    Clock, LinearGraphQlSource, ReadService, WorkspaceSnapshot, WorkspaceSource,
+    ready_from_snapshot,
+};
 use ix_cli_kit::secrets::SecretStore;
 use ix_trace_rs::trace;
 use rusqlite::Connection;
