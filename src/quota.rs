@@ -963,7 +963,7 @@ impl QuotaGate {
                 let reset = header_integer(headers, &format!("x-ratelimit-{kind}-reset")).and_then(|value| i64::try_from(value).ok());
                 // An explicitly expired pair is retired, never re-dated as fallback evidence.
                 if reset.is_some_and(|reset| reset <= now) { continue; }
-                let expiry = reset.unwrap_or_else(|| now.saturating_add(if remaining==0 {60_000} else {i64::try_from(self.config.window_seconds).unwrap_or(3600)*1000}));
+                let expiry = reset.unwrap_or_else(|| now.saturating_add(if remaining==0 {(i64::try_from(self.config.window_seconds).unwrap_or(3600)*1000).min(60_000)} else {i64::try_from(self.config.window_seconds).unwrap_or(3600)*1000}));
                 let capacity: Option<u64> = transaction.query_row(&format!("SELECT {limit_column} FROM linear_shared_quota WHERE singleton=1"),[],|row|row.get(0)).map_err(Error::Cache)?;
                 let capacity = capacity.or_else(|| match dimension {"requests"=>Some(self.config.fallback_limits().0),"complexity"=>Some(self.config.fallback_limits().1),_=>None});
                 let charge: i64 = if dimension=="complexity" {

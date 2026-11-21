@@ -609,3 +609,58 @@ fn bounded_observation_storage_fails_closed_without_sliding_or_discarding_live_o
     assert_eq!(decision.state, QuotaState::Available);
     assert!(decision.evidence.is_empty());
 }
+
+#[trace("FR-032-AC-4", "FR-032-AC-6")]
+#[test]
+fn short_fallback_and_invalid_arithmetic_keep_fixed_expiry_and_owned_debt() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("quota.sqlite");
+    let clock = Arc::new(Clock(AtomicI64::new(NOW)));
+    let config = QuotaConfig {
+        window_seconds: 1,
+        ..QuotaConfig::default()
+    };
+    let gate = open(&path, &clock, &config);
+    gate.observe_headers(
+        200,
+        &headers(&[("x-ratelimit-requests-remaining", "0".to_owned())]),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        gate.decision(10).unwrap().next_reevaluation_at,
+        Some(NOW + 1000),
+        "missing reset cannot exceed configured fallback duration"
+    );
+    clock.0.store(NOW + 1000, Ordering::SeqCst);
+    let reservation = gate.reserve_evaluated(10, None).unwrap();
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute(
+        "UPDATE linear_shared_quota SET server_complexity_debt=?1",
+        [i64::MAX],
+    )
+    .unwrap();
+    let decision = gate
+        .observe_evaluated_within(
+            reservation,
+            200,
+            &headers(&[("x-complexity", "20".to_owned())]),
+            None,
+            None,
+        )
+        .unwrap();
+    assert_eq!(decision.state, QuotaState::EvidenceUnavailable);
+    let (pending,debt):(i64,i64)=db.query_row("SELECT (SELECT COUNT(*) FROM linear_quota_reservations),server_complexity_debt FROM linear_shared_quota",[],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+    assert_eq!(
+        (pending, debt),
+        (1, i64::MAX),
+        "unrepresentable settlement retains the durable obligation and fails closed"
+    );
+    assert!(gate.reserve_evaluated(10, None).is_err());
+    clock.0.store(i64::MAX, Ordering::SeqCst);
+    assert_eq!(
+        gate.decision(10).unwrap().state,
+        QuotaState::EvidenceUnavailable,
+        "clock arithmetic cannot overflow into invented headroom"
+    );
+}
