@@ -380,6 +380,7 @@ impl QuotaGate {
                 ("server_complexity_generation", "INTEGER NOT NULL DEFAULT 0"),
                 ("server_complexity_debt", "INTEGER NOT NULL DEFAULT 0"),
                 ("paired_evidence", "INTEGER NOT NULL DEFAULT 0"),
+                ("paired_writer", "INTEGER NOT NULL DEFAULT 0"),
                 ("last_clock", "INTEGER NOT NULL DEFAULT 0"),
                 ("evidence_error_until", "INTEGER NOT NULL DEFAULT 0"),
             ] {
@@ -391,6 +392,9 @@ impl QuotaGate {
                         .map_err(Error::Cache)?;
                 }
             }
+            // The first migration adds the guard inside this transaction; later
+            // opens already enter through the same guarded transaction boundary.
+            transaction.execute("UPDATE linear_shared_quota SET paired_writer=1 WHERE singleton=1",[]).map_err(Error::Cache)?;
             let window = i64::try_from(gate.config.window_seconds)
                 .unwrap_or(i64::MAX / 1000)
                 .saturating_mul(1000);
@@ -414,6 +418,12 @@ impl QuotaGate {
             );",
                 )
                 .map_err(Error::Cache)?;
+            let owned:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('linear_quota_reservations') WHERE name='paired_owner')",[],|row|row.get(0)).map_err(Error::Cache)?;
+            if !owned {
+                // Existing tokens belong to a pre-fence writer, whose late response
+                // cannot publish cooldown/actual cost after the fence is installed.
+                transaction.execute_batch("ALTER TABLE linear_quota_reservations ADD COLUMN paired_owner INTEGER NOT NULL DEFAULT 0").map_err(Error::Cache)?;
+            }
             transaction.execute_batch("CREATE TABLE IF NOT EXISTS linear_quota_observations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, dimension TEXT NOT NULL,
                 remaining INTEGER NOT NULL, charge INTEGER NOT NULL DEFAULT 0,
@@ -439,9 +449,43 @@ impl QuotaGate {
                 }
                 transaction.execute("UPDATE linear_shared_quota SET paired_evidence=1 WHERE singleton=1", []).map_err(Error::Cache)?;
             }
+            Self::install_writer_fence(transaction)?;
             Ok(())
         })?;
         Ok(gate)
+    }
+
+    fn install_writer_fence(connection: &Connection) -> Result<(), Error> {
+        // An old writer cannot establish paired observation/charge ownership.
+        // Fence its transaction before send or settlement, rather than infer
+        // provenance from its lossy remaining/reset projection. The guard is
+        // private to a write transaction and is always zero in committed state.
+        let message = "ix-board quota writer upgrade required; rebuild ix-board clients";
+        connection
+            .execute_batch(&format!(
+                "CREATE TRIGGER IF NOT EXISTS linear_quota_require_paired_update
+            BEFORE UPDATE ON linear_shared_quota WHEN OLD.paired_writer=0 AND NEW.paired_writer=0
+            BEGIN SELECT RAISE(ABORT,'{message}'); END;
+            CREATE TRIGGER IF NOT EXISTS linear_quota_require_paired_delete
+            BEFORE DELETE ON linear_shared_quota WHEN OLD.paired_writer=0
+            BEGIN SELECT RAISE(ABORT,'{message}'); END;"
+            ))
+            .map_err(Error::Cache)?;
+        for (name, operation) in [
+            ("insert", "INSERT"),
+            ("update", "UPDATE"),
+            ("delete", "DELETE"),
+        ] {
+            connection
+                .execute_batch(&format!(
+                    "CREATE TRIGGER IF NOT EXISTS linear_quota_require_paired_reservation_{name}
+                BEFORE {operation} ON linear_quota_reservations
+                WHEN (SELECT paired_writer FROM linear_shared_quota WHERE singleton=1)=0
+                BEGIN SELECT RAISE(ABORT,'{message}'); END;"
+                ))
+                .map_err(Error::Cache)?;
+        }
+        Ok(())
     }
 
     fn connection(&self, deadline: Option<&Deadline<'_>>) -> Result<Connection, Error> {
@@ -467,7 +511,22 @@ impl QuotaGate {
             if let Some(deadline) = deadline {
                 deadline.remaining()?;
             }
+            let guarded:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('linear_shared_quota') WHERE name='paired_writer')",[],|row|row.get(0)).map_err(Error::Cache)?;
+            if guarded {
+                transaction
+                    .execute(
+                        "UPDATE linear_shared_quota SET paired_writer=1 WHERE singleton=1",
+                        [],
+                    )
+                    .map_err(Error::Cache)?;
+            }
             let value = operation(&transaction)?;
+            transaction
+                .execute(
+                    "UPDATE linear_shared_quota SET paired_writer=0 WHERE singleton=1",
+                    [],
+                )
+                .map_err(Error::Cache)?;
             if let Some(deadline) = deadline {
                 deadline.remaining()?;
             }
@@ -601,7 +660,9 @@ impl QuotaGate {
                         ceil_delay(until, decision.evaluated_at)
                     });
                 match decision.state {
-                    QuotaState::ServerBackoff => Error::QuotaAdmissionRefused {decision}.legacy_rate_limit(),
+                    QuotaState::ServerBackoff => {
+                        Error::QuotaAdmissionRefused { decision }.legacy_rate_limit()
+                    }
                     QuotaState::LocalWindowHeld | QuotaState::ServerReserveHeld => {
                         Error::LinearLocalBudgetExhausted { retry_after }
                     }
@@ -635,8 +696,8 @@ impl QuotaGate {
                  endpoint_used=endpoint_used+1, request_budget=?2, complexity_budget=?3 WHERE singleton=1",
                 params![cost,state.request_budget,state.complexity_budget]).map_err(Error::Cache)?;
             transaction.execute("UPDATE linear_quota_observations SET charge=charge+CASE WHEN dimension='complexity' THEN ?1 ELSE 1 END", [cost]).map_err(Error::Cache)?;
-            transaction.execute("INSERT INTO linear_quota_reservations(generation,estimate,server_complexity_generation)
-                SELECT local_generation,?1,server_complexity_generation FROM linear_shared_quota WHERE singleton=1",[cost]).map_err(Error::Cache)?;
+            transaction.execute("INSERT INTO linear_quota_reservations(generation,estimate,server_complexity_generation,paired_owner)
+                SELECT local_generation,?1,server_complexity_generation,1 FROM linear_shared_quota WHERE singleton=1",[cost]).map_err(Error::Cache)?;
             let (database_identity, server_complexity_generation) = transaction.query_row("SELECT database_identity,server_complexity_generation FROM linear_shared_quota WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?))).map_err(Error::Cache)?;
             Ok(Ok(Reservation { id:transaction.last_insert_rowid(),generation:state.local_generation,estimated_cost:cost,database_identity,server_complexity_generation }))
         })?
@@ -699,6 +760,19 @@ impl QuotaGate {
                 |row| row.get(0),
             )
             .map_err(Error::Cache)?;
+        decision.legacy_pending_reservations = connection
+            .query_row(
+                "SELECT COUNT(*) FROM linear_quota_reservations WHERE paired_owner!=1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Error::Cache)?;
+        if decision.legacy_pending_reservations > 0 {
+            decision.blockers.push(QuotaBlocker::nondimensional(
+                QuotaState::EvidenceUnavailable,
+                None,
+            ));
+        }
         if pending >= 8192 {
             decision.blockers.push(QuotaBlocker::nondimensional(
                 QuotaState::EvidenceUnavailable,

@@ -144,6 +144,9 @@ pub struct QuotaDecision {
     pub estimated_complexity: u64,
     /// Endpoint to which the decision applies.
     pub endpoint: String,
+    /// Unresolved pre-fence reservations; their late response/cooldown is unknown.
+    #[serde(default)]
+    pub legacy_pending_reservations: u64,
     /// Fixed local accounting generation, independent of observation identities.
     pub local_generation: i64,
     /// Fixed local deadline in Unix milliseconds.
@@ -161,6 +164,7 @@ impl QuotaDecision {
             estimated_complexity: cost,
             endpoint: "graphql".to_owned(),
             local_generation: generation,
+            legacy_pending_reservations: 0,
             local_window_reset_at: reset,
         }
     }
@@ -205,6 +209,13 @@ impl std::fmt::Display for QuotaDecision {
             QuotaState::ServerBackoff => unreachable!("handled above"),
         };
         write!(f, "{label}")?;
+        if self.legacy_pending_reservations > 0 {
+            write!(
+                f,
+                "; {} pre-paired reservations require cutover reconciliation; rebuild ix-board clients",
+                self.legacy_pending_reservations
+            )?;
+        }
         for blocker in &self.blockers {
             write!(
                 f,

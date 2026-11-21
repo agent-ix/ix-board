@@ -77,6 +77,18 @@ belongs to that attempt. Older envelopes with absent outcome metadata read as un
 for the default locations. `focus hygiene` also stores its most recent baseline
 in the same file.
 
+Quota migration installs a transactional writer fence. Older clients fail before
+admission with `ix-board quota writer upgrade required; rebuild ix-board clients`.
+Rebuild CLI and library consumers before their next source refresh. Existing detail
+and summary partitions, successful sync markers, and cached reads remain intact.
+
+Reservations already pending when the fence is installed have unknown late-response
+ownership. Status reports their count in `decision.legacy_pending_reservations` and
+refuses new sends with `EvidenceUnavailable`. No recovery deadline or actual server
+cooldown is inferred. An operator must reconcile those obligations before refresh
+can resume; rebuilding alone does not erase them. New-protocol abandoned reservations
+keep their usual conservative charge and do not enter this cutover quarantine.
+
 Library callers use `ReadService::workspace_snapshot` for the cached snapshot,
 `force_refresh_workspace` to fetch through the cache, and `invalidate_cache`
 to discard a snapshot before a write. A forced refresh bypasses the ordinary TTL

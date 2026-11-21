@@ -106,7 +106,16 @@ fn actual_http_and_graphql_backoff_survives_resets_high_observations_reopen_and_
             headers.insert(name, value.parse().unwrap());
         }
         gate.observe_headers(200, &headers, None).unwrap();
-        rusqlite::Connection::open(&path).unwrap().execute("UPDATE linear_shared_quota SET local_reset=?1,complexity_reset=?1 WHERE singleton=1",[now-1]).unwrap();
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("BEGIN IMMEDIATE; UPDATE linear_shared_quota SET paired_writer=1")
+            .unwrap();
+        db.execute(
+            "UPDATE linear_shared_quota SET local_reset=?1,complexity_reset=?1 WHERE singleton=1",
+            [now - 1],
+        )
+        .unwrap();
+        db.execute_batch("UPDATE linear_shared_quota SET paired_writer=0; COMMIT")
+            .unwrap();
         let reopened = QuotaGate::open(&path, &QuotaConfig::default()).unwrap();
         let state = reopened.status().unwrap();
         assert_eq!(state.rate_limit_until, Some(until));

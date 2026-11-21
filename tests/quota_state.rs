@@ -6,6 +6,7 @@
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
 
 use ix_board::quota::{
     QuotaClock, QuotaConfig, QuotaDimension, QuotaGate, QuotaState, Reservation,
@@ -35,6 +36,14 @@ fn headers(pairs: &[(&str, String)]) -> HeaderMap {
 fn open(path: &Path, clock: &Arc<Clock>, config: &QuotaConfig) -> QuotaGate {
     QuotaGate::open_with_clock(path, config, clock.clone()).unwrap()
 }
+fn fixture_update<P: rusqlite::Params>(db: &rusqlite::Connection, sql: &str, values: P) {
+    db.execute_batch("BEGIN IMMEDIATE; UPDATE linear_shared_quota SET paired_writer=1")
+        .unwrap();
+    db.execute(sql, values).unwrap();
+    db.execute_batch("UPDATE linear_shared_quota SET paired_writer=0; COMMIT")
+        .unwrap();
+}
+
 fn request_observation(gate: &QuotaGate, remaining: u64, reset: i64) {
     gate.observe_headers(
         200,
@@ -196,11 +205,11 @@ fn precedence_keeps_every_blocker_and_unknown_transition() {
     let gate = open(&path, &clock, &QuotaConfig::default());
     request_observation(&gate, 250, NOW + 2000);
     let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute(
+    fixture_update(
+        &db,
         "UPDATE linear_shared_quota SET requests=4500,complexity=1350000,evidence_error_until=-1",
         [],
-    )
-    .unwrap();
+    );
     gate.observe_headers(
         429,
         &headers(&[
@@ -251,14 +260,20 @@ fn precedence_keeps_every_blocker_and_unknown_transition() {
         gate.decision(10001).unwrap().state,
         QuotaState::EvidenceUnavailable
     );
-    db.execute("UPDATE linear_shared_quota SET evidence_error_until=0", [])
-        .unwrap();
+    fixture_update(
+        &db,
+        "UPDATE linear_shared_quota SET evidence_error_until=0",
+        [],
+    );
     assert_eq!(
         gate.decision(10001).unwrap().state,
         QuotaState::RequestRejected
     );
-    db.execute("UPDATE linear_shared_quota SET requests=0,complexity=0", [])
-        .unwrap();
+    fixture_update(
+        &db,
+        "UPDATE linear_shared_quota SET requests=0,complexity=0",
+        [],
+    );
     assert_eq!(gate.decision(10).unwrap().state, QuotaState::Available);
 }
 
@@ -493,7 +508,11 @@ fn legacy_pairing_preserves_deadline_and_pending_debt_and_corruption_fails_close
         let gate = open(&path, &clock, &QuotaConfig::default());
         let pending = gate.reserve_evaluated(10000, None).unwrap();
         let db = rusqlite::Connection::open(&path).unwrap();
-        db.execute("UPDATE linear_shared_quota SET paired_evidence=0,complexity_remaining=155000,complexity_reset=?1,server_complexity_debt=100 WHERE singleton=1",[if usable {NOW+1000}else{0}]).unwrap();
+        fixture_update(
+            &db,
+            "UPDATE linear_shared_quota SET paired_evidence=0,complexity_remaining=155000,complexity_reset=?1,server_complexity_debt=100 WHERE singleton=1",
+            [if usable { NOW + 1000 } else { 0 }],
+        );
         drop(gate);
         let gate = open(&path, &clock, &QuotaConfig::default());
         let decision = gate.decision(10).unwrap();
@@ -635,11 +654,11 @@ fn short_fallback_and_invalid_arithmetic_keep_fixed_expiry_and_owned_debt() {
     clock.0.store(NOW + 1000, Ordering::SeqCst);
     let reservation = gate.reserve_evaluated(10, None).unwrap();
     let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute(
+    fixture_update(
+        &db,
         "UPDATE linear_shared_quota SET server_complexity_debt=?1",
         [i64::MAX],
-    )
-    .unwrap();
+    );
     let decision = gate
         .observe_evaluated_within(
             reservation,
@@ -663,4 +682,27 @@ fn short_fallback_and_invalid_arithmetic_keep_fixed_expiry_and_owned_debt() {
         QuotaState::EvidenceUnavailable,
         "clock arithmetic cannot overflow into invented headroom"
     );
+}
+
+#[trace("FR-032-AC-2", "FR-032-AC-7", "FR-031-AC-3")]
+#[test]
+fn legacy_actual_server_error_uses_backoff_owner_not_earlier_reserve_reevaluation() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(Clock(AtomicI64::new(NOW)));
+    let gate = open(
+        &dir.path().join("quota.sqlite"),
+        &clock,
+        &QuotaConfig::default(),
+    );
+    request_observation(&gate, 250, NOW + 1000);
+    gate.observe_headers(429, &headers(&[("retry-after", "3".to_owned())]), None)
+        .unwrap();
+    let decision = gate.decision(10).unwrap();
+    assert_eq!(decision.next_reevaluation_at, Some(NOW + 1000));
+    let error = gate.reserve(10, None).unwrap_err();
+    assert!(
+        matches!(error,ix_board::Error::LinearRateLimited {retry_after} if retry_after==Duration::from_secs(3))
+    );
+    assert_eq!(error.to_string(), "Linear rate limited; retry in 3s");
+    assert_eq!(decision.to_string(), error.to_string());
 }
