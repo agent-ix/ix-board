@@ -342,7 +342,7 @@ enum Output {
         #[serde(flatten)]
         freshness: ix_board::CacheFreshness,
     },
-    CacheStatus(ix_board::cache_status::CacheStatus),
+    CacheStatus(ix_board::cache_status::EvaluatedCacheStatus),
     SummaryRoadmap(ix_board::program_review::SummaryRoadmap),
     Auth {
         status: String,
@@ -605,7 +605,7 @@ fn run(command: Command) -> Result<Output, Error> {
     match command {
         Command::Cache {
             command: CacheCommand::Status,
-        } => ix_board::cache_status::read_status(&ix_board::default_cache_path()?)
+        } => ix_board::cache_status::read_status_with_decision(&ix_board::default_cache_path()?)
             .map(Output::CacheStatus),
         Command::Auth { command } => run_auth(command),
         Command::Drift {
@@ -1114,7 +1114,7 @@ fn render_human(output: &Output) -> String {
                 .as_ref()
                 .map_or_else(String::new, |reason| format!("\nfailure_reason: {reason}"))
         ),
-        Output::CacheStatus(status) => ix_board::cache_status::render_text(status),
+        Output::CacheStatus(status) => ix_board::cache_status::render_evaluated_text(status),
         Output::SummaryRoadmap(report) => render_summary_roadmap(report),
         Output::Auth { status, source } => match source {
             Some(source) => format!("Linear credential {status} ({source})"),
