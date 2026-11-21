@@ -373,6 +373,15 @@ impl LinearGraphQlSource {
 
     /// Collects current Linear scope and issue transitions for live priority-goal drift.
     pub fn collect_drift_evidence(&self, config: &DriftConfig) -> Result<DriftEvidence, Error> {
+        self.collect_drift_evidence_cached(config)
+            .map(|(evidence, _)| evidence)
+    }
+
+    /// Collects drift evidence with coordinated snapshot fallback provenance.
+    pub fn collect_drift_evidence_cached(
+        &self,
+        config: &DriftConfig,
+    ) -> Result<(DriftEvidence, Option<crate::CacheFreshness>), Error> {
         let report_epoch = crate::drift::timestamp_epoch(&config.report_time)?;
         let window_start = report_epoch - config.window_hours * 3600.0;
         let priority_goal_history_start = config
@@ -380,8 +389,8 @@ impl LinearGraphQlSource {
             .iter()
             .map(|goal| report_epoch - goal.no_progress_hours * 3600.0)
             .min_by(f64::total_cmp);
-        let snapshot =
-            crate::ReadService::open(self.clone(), &self.quota_path)?.workspace_snapshot()?;
+        let mut service = crate::ReadService::open(self.clone(), &self.quota_path)?;
+        let snapshot = service.workspace_snapshot()?;
         let projects_by_id: HashMap<_, _> = snapshot
             .projects
             .iter()
@@ -753,7 +762,7 @@ impl LinearGraphQlSource {
                 reason: "no live OTel source is configured".to_owned(),
             },
         ]);
-        Ok(evidence)
+        Ok((evidence, service.cache_freshness().cloned()))
     }
 
     /// Reads one issue's complete state history for the retro commands; a history that stops
@@ -1310,6 +1319,7 @@ impl LinearGraphQlSource {
         baseline: Option<&WorkspaceSnapshot>,
     ) -> Result<WorkspaceSnapshot, Error> {
         let metrics = self.metrics_start();
+        crate::cache_status::begin_refresh(&self.quota_path, deadline)?;
         let result = self.fetch_workspace_delta(deadline, baseline);
         if deadline.is_none_or(|deadline| deadline.remaining().is_ok()) {
             self.record_metrics_within(

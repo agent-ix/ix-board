@@ -181,6 +181,38 @@ pub(crate) fn record_refresh_within(
     Ok(())
 }
 
+pub(crate) fn begin_refresh(
+    path: &Path,
+    deadline: Option<&crate::Deadline<'_>>,
+) -> Result<(), Error> {
+    let wait = match deadline {
+        Some(deadline) => deadline.remaining()?,
+        None => std::time::Duration::from_secs(5),
+    };
+    let mut connection = Connection::open(path).map_err(Error::Cache)?;
+    connection.busy_timeout(wait).map_err(Error::Cache)?;
+    let result = (|| {
+        connection.execute_batch("CREATE TABLE IF NOT EXISTS refresh_counters(singleton INTEGER PRIMARY KEY CHECK(singleton=1),payload BLOB NOT NULL)").map_err(Error::Cache)?;
+        if let Some(deadline) = deadline {
+            deadline.remaining()?;
+        }
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(Error::Cache)?;
+        transaction
+            .execute("DELETE FROM refresh_counters WHERE singleton=1", [])
+            .map_err(Error::Cache)?;
+        if let Some(deadline) = deadline {
+            deadline.remaining()?;
+        }
+        transaction.commit().map_err(Error::Cache)
+    })();
+    if let Some(deadline) = deadline {
+        deadline.remaining()?;
+    }
+    result
+}
+
 fn table_exists(connection: &Connection, table: &str) -> Result<bool, Error> {
     connection
         .query_row(

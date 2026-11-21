@@ -49,6 +49,10 @@ No request starts during cooldown, and commands do not sleep or retry.
 
 Run `ix-board cache status --json` to inspect coverage, successful sync and full
 reconciliation times, quota state, and refresh counters without credentials or network access.
+`latest_refresh` describes the latest recorded attempt. It is null while a refresh
+is running or when a bounded timeout left no time to record a final descriptor.
+Transport reservations remain counted even when a refresh fails or times out.
+Summary and fallback JSON wrap the command payload in `result`, beside freshness metadata.
 
 `IX_BOARD_CACHE_PATH` selects the database path. See [setup](setup.md#cache-location)
 for the default locations. `focus hygiene` also stores its most recent baseline

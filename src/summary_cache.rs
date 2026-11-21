@@ -84,6 +84,7 @@ impl LinearGraphQlSource {
                 .as_ref()
                 .is_none_or(|(_, _, full)| started.saturating_sub(*full) >= 86_400);
             let metrics = self.metrics_start();
+            crate::cache_status::begin_refresh(path, None)?;
             let fetched = match &current {
                 Some((data, sync, _)) if !full => self
                     .fetch_summary_changes(*sync)

@@ -610,7 +610,7 @@ fn run(command: Command) -> Result<Output, Error> {
             config,
             evidence,
             live,
-        } => run_drift(&config, evidence.as_ref(), live).map(Output::Drift),
+        } => run_drift(&config, evidence.as_ref(), live),
         Command::Agents { teams, idle_after } => run_agents(&teams, idle_after).map(Output::Agents),
         Command::Retro {
             command: RetroCommand::Snapshot { config, window },
@@ -1052,7 +1052,7 @@ fn run_drift(
     config_path: &PathBuf,
     evidence_path: Option<&PathBuf>,
     live: bool,
-) -> Result<DriftReport, Error> {
+) -> Result<Output, Error> {
     let config_text =
         std::fs::read_to_string(config_path).map_err(|source| Error::DriftInputRead {
             path: config_path.display().to_string(),
@@ -1065,8 +1065,11 @@ fn run_drift(
         })?;
     if live {
         let source = LinearGraphQlSource::from_env()?;
-        let evidence = source.collect_drift_evidence(&config)?;
-        return Ok(evaluate_drift(&config, &evidence)?);
+        let (evidence, freshness) = source.collect_drift_evidence_cached(&config)?;
+        return Ok(label_cached(
+            Output::Drift(evaluate_drift(&config, &evidence)?),
+            freshness.as_ref(),
+        ));
     }
     let evidence_path = evidence_path.ok_or_else(|| {
         Error::Drift(DriftError::InvalidConfig {
@@ -1083,7 +1086,7 @@ fn run_drift(
             path: evidence_path.display().to_string(),
             source,
         })?;
-    Ok(evaluate_drift_file(&config, &evidence)?)
+    Ok(Output::Drift(evaluate_drift_file(&config, &evidence)?))
 }
 
 fn render_human(output: &Output) -> String {
