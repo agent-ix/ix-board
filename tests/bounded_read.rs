@@ -362,6 +362,7 @@ fn old_and_new_cache_entries_coexist_with_old_readers_and_writers() {
     let limits = policy(240, Duration::from_secs(5));
     // A legacy entry has no read-start evidence, so a bounded read refreshes it.
     service.workspace_snapshot().expect("legacy read");
+    write_row(&path, 3_000, None, None);
     service
         .workspace_snapshot_bounded(&limits)
         .expect("bounded read");

@@ -28,17 +28,17 @@ const RELATION_PAGE_SIZE: i32 = 50;
 const INITIAL_RELATION_PAGE_SIZE: i32 = 10;
 const PAGE_LIMIT: usize = 1_000;
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-// Isolate snapshots carrying native project-status category and display name from older readers.
-const CACHE_MODEL_VERSION: &str = "v13";
+// Full catalog partitions exclude snapshots produced by the old null lower-bound query.
+const CACHE_MODEL_VERSION: &str = "v15";
 const ENDPOINT: &str = "https://api.linear.app/graphql";
 
 const PROJECT_QUERY: &str = r#"
-query WorkspaceProjects($first: Int!, $nestedFirst: Int!, $after: String) {
-  projects(first: $first, after: $after) {
+query WorkspaceProjects($first: Int!, $nestedFirst: Int!, $after: String, $filter: ProjectFilter, $includeArchived: Boolean!) {
+  projects(first: $first, after: $after, includeArchived: $includeArchived, filter: $filter) {
     nodes {
-      id identifier name description content priority sortOrder targetDate updatedAt
+      id name description content priority sortOrder targetDate updatedAt archivedAt trashed
       status { name type }
-      initiatives(first: 10) { nodes { id identifier name } pageInfo { hasNextPage } }
+      initiatives(first: 10) { nodes { id name } pageInfo { hasNextPage } }
       teams(first: $nestedFirst) { nodes { key } pageInfo { hasNextPage } }
       projectMilestones(first: $nestedFirst) {
         nodes { id name description sortOrder targetDate }
@@ -52,16 +52,16 @@ query WorkspaceProjects($first: Int!, $nestedFirst: Int!, $after: String) {
 const INITIATIVES_QUERY: &str = r#"
 query WorkspaceInitiatives($first: Int!, $after: String) {
   initiatives(first: $first, after: $after) {
-    nodes { id identifier name }
+    nodes { id name }
     pageInfo { hasNextPage endCursor }
   }
 }"#;
 
 const ISSUE_QUERY: &str = r#"
-query WorkspaceIssues($first: Int!, $relationFirst: Int!, $after: String) {
-  issues(first: $first, after: $after) {
+query WorkspaceIssues($first: Int!, $relationFirst: Int!, $after: String, $filter: IssueFilter, $includeArchived: Boolean!) {
+  issues(first: $first, after: $after, includeArchived: $includeArchived, filter: $filter) {
     nodes {
-      id identifier title description priority sortOrder createdAt updatedAt
+      id identifier title description priority sortOrder createdAt updatedAt archivedAt trashed
       state { name type }
       team { key }
       assignee { id name }
@@ -178,9 +178,89 @@ pub struct LinearGraphQlSource {
     api_key: SecretValue,
     endpoint: String,
     cache_namespace: String,
+    quota_path: std::path::PathBuf,
+    metrics: std::sync::Arc<TransportMetrics>,
+}
+
+#[derive(Default)]
+struct TransportMetrics {
+    requests: std::sync::atomic::AtomicU64,
+    complexity: std::sync::atomic::AtomicU64,
+    reported_complexity: std::sync::atomic::AtomicU64,
+    reported_requests: std::sync::atomic::AtomicU64,
 }
 
 impl LinearGraphQlSource {
+    pub(crate) fn metrics_start(&self) -> (u64, u64, u64, u64, std::time::Instant) {
+        use std::sync::atomic::Ordering;
+        (
+            self.metrics.requests.load(Ordering::Relaxed),
+            self.metrics.complexity.load(Ordering::Relaxed),
+            self.metrics.reported_complexity.load(Ordering::Relaxed),
+            self.metrics.reported_requests.load(Ordering::Relaxed),
+            std::time::Instant::now(),
+        )
+    }
+
+    pub(crate) fn record_metrics(
+        &self,
+        start: (u64, u64, u64, u64, std::time::Instant),
+        mode: &str,
+        success: bool,
+    ) -> Result<(), Error> {
+        self.record_metrics_within(start, mode, success, None)
+    }
+
+    fn record_metrics_within(
+        &self,
+        start: (u64, u64, u64, u64, std::time::Instant),
+        mode: &str,
+        success: bool,
+        deadline: Option<&Deadline<'_>>,
+    ) -> Result<(), Error> {
+        use std::sync::atomic::Ordering;
+        crate::cache_status::record_refresh_within(
+            &self.quota_path,
+            &crate::cache_status::RefreshCounters {
+                mode: mode.to_owned(),
+                success,
+                requests_attempted: self
+                    .metrics
+                    .requests
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(start.0),
+                complexity: self
+                    .metrics
+                    .complexity
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(start.1),
+                returned_complexity: (self.metrics.reported_requests.load(Ordering::Relaxed)
+                    > start.3)
+                    .then(|| {
+                        self.metrics
+                            .reported_complexity
+                            .load(Ordering::Relaxed)
+                            .saturating_sub(start.2)
+                    }),
+                estimated_complexity: self
+                    .metrics
+                    .complexity
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(start.1)
+                    .saturating_sub(
+                        self.metrics
+                            .reported_complexity
+                            .load(Ordering::Relaxed)
+                            .saturating_sub(start.2),
+                    ),
+                duration_millis: u64::try_from(start.4.elapsed().as_millis()).unwrap_or(u64::MAX),
+            },
+            deadline,
+        )
+    }
+    pub(crate) fn cache_path(&self) -> &std::path::Path {
+        &self.quota_path
+    }
     /// Creates a source using the supplied Linear API key.
     pub fn new(api_key: impl Into<String>) -> Result<Self, Error> {
         Self::with_endpoint(api_key, ENDPOINT)
@@ -198,14 +278,28 @@ impl LinearGraphQlSource {
             return Err(Error::MissingApiKey);
         }
         let cache_namespace = format!(
-            "linear:{CACHE_MODEL_VERSION}:sha256:{:x}",
-            Sha256::digest(api_key.expose_secret().as_bytes())
+            "linear:{CACHE_MODEL_VERSION}:detail:sha256:{:x}",
+            Sha256::digest(format!("{endpoint}:{}", api_key.expose_secret()).as_bytes())
         );
+        let quota_path = if endpoint == ENDPOINT {
+            crate::default_cache_path()?
+        } else {
+            std::env::temp_dir().join(format!(
+                "ix-board-fixture-{:x}.sqlite3",
+                Sha256::digest(endpoint.as_bytes())
+            ))
+        };
         Ok(Self {
-            client: Client::builder().timeout(REQUEST_TIMEOUT).build()?,
+            client: Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
+                .build()?,
             api_key,
             endpoint,
             cache_namespace,
+            quota_path,
+            metrics: std::sync::Arc::default(),
         })
     }
 
@@ -283,6 +377,15 @@ impl LinearGraphQlSource {
 
     /// Collects current Linear scope and issue transitions for live priority-goal drift.
     pub fn collect_drift_evidence(&self, config: &DriftConfig) -> Result<DriftEvidence, Error> {
+        self.collect_drift_evidence_cached(config)
+            .map(|(evidence, _)| evidence)
+    }
+
+    /// Collects drift evidence with coordinated snapshot fallback provenance.
+    pub fn collect_drift_evidence_cached(
+        &self,
+        config: &DriftConfig,
+    ) -> Result<(DriftEvidence, Option<crate::CacheFreshness>), Error> {
         let report_epoch = crate::drift::timestamp_epoch(&config.report_time)?;
         let window_start = report_epoch - config.window_hours * 3600.0;
         let priority_goal_history_start = config
@@ -290,7 +393,8 @@ impl LinearGraphQlSource {
             .iter()
             .map(|goal| report_epoch - goal.no_progress_hours * 3600.0)
             .min_by(f64::total_cmp);
-        let snapshot = self.fetch_workspace()?;
+        let mut service = crate::ReadService::open(self.clone(), &self.quota_path)?;
+        let snapshot = service.workspace_snapshot()?;
         let projects_by_id: HashMap<_, _> = snapshot
             .projects
             .iter()
@@ -662,7 +766,7 @@ impl LinearGraphQlSource {
                 reason: "no live OTel source is configured".to_owned(),
             },
         ]);
-        Ok(evidence)
+        Ok((evidence, service.cache_freshness().cloned()))
     }
 
     /// Reads one issue's complete state history for the retro commands; a history that stops
@@ -1028,11 +1132,13 @@ impl LinearGraphQlSource {
                 relation_first,
                 nested_first,
                 after: after.map(str::to_owned),
+                filter: None,
+                include_archived: false,
             },
         )
     }
 
-    fn request<T: DeserializeOwned, V: Serialize>(
+    pub(crate) fn request<T: DeserializeOwned, V: Serialize>(
         &self,
         query: &str,
         variables: V,
@@ -1042,12 +1148,22 @@ impl LinearGraphQlSource {
 
     /// Sends one request. With a deadline, nothing is sent once it has expired and the
     /// request timeout is the lesser of the legacy timeout and the time remaining.
-    fn request_within<T: DeserializeOwned, V: Serialize>(
+    pub(crate) fn request_within<T: DeserializeOwned, V: Serialize>(
         &self,
         deadline: Option<&Deadline<'_>>,
         query: &str,
         variables: V,
     ) -> Result<T, Error> {
+        let config = crate::quota::QuotaConfig::from_config(crate::settings::load()?.as_ref())?;
+        let quota = crate::quota::QuotaGate::open_within(&self.quota_path, &config, deadline)?;
+        const ESTIMATED_COMPLEXITY: u64 = 10_000;
+        let reservation = quota.reserve(ESTIMATED_COMPLEXITY, deadline)?;
+        self.metrics
+            .requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.metrics
+            .complexity
+            .fetch_add(ESTIMATED_COMPLEXITY, std::sync::atomic::Ordering::Relaxed);
         let mut request = self
             .client
             .post(&self.endpoint)
@@ -1066,19 +1182,66 @@ impl LinearGraphQlSource {
             _ => Error::Http(error),
         };
         let response = request.send().map_err(transport_error)?;
+        let status = response.status().as_u16();
+        let headers = response.headers().clone();
+        if let Some(actual) = headers
+            .get("x-complexity")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            self.metrics
+                .reported_complexity
+                .fetch_add(actual, std::sync::atomic::Ordering::Relaxed);
+            self.metrics
+                .reported_requests
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if actual >= ESTIMATED_COMPLEXITY {
+                self.metrics.complexity.fetch_add(
+                    actual - ESTIMATED_COMPLEXITY,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            } else {
+                self.metrics.complexity.fetch_sub(
+                    ESTIMATED_COMPLEXITY - actual,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+        }
         let status_error = response.error_for_status_ref().err();
         let retry_after = rate_limit_delay(response.headers(), std::time::SystemTime::now());
         // Linear deliberately uses HTTP 400 for GraphQL RATELIMITED responses.
         // Inspect its structured errors before returning the HTTP status error.
-        let response = match response.json::<GraphQlResponse<T>>() {
-            Ok(response) => response,
+        let value = match response.json::<serde_json::Value>() {
+            Ok(value) => value,
             Err(error) => {
+                quota.observe_within(reservation, status, &headers, None, deadline)?;
+                if status == 429 {
+                    return Err(quota_rate_limit(&quota, deadline)?);
+                }
                 return Err(match status_error {
                     Some(status) => Error::Http(status),
                     None => transport_error(error),
                 });
             }
         };
+        quota.observe_within(reservation, status, &headers, Some(&value), deadline)?;
+        if status == 429
+            || value
+                .get("errors")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|errors| {
+                    errors.iter().any(|error| {
+                        error
+                            .pointer("/extensions/code")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("RATELIMITED")
+                    })
+                })
+        {
+            return Err(quota_rate_limit(&quota, deadline)?);
+        }
+        let response: GraphQlResponse<T> =
+            serde_json::from_value(value).map_err(Error::LinearDecode)?;
         if let Some(errors) = response.errors.filter(|errors| !errors.is_empty()) {
             if errors.iter().any(|error| {
                 error
@@ -1104,7 +1267,40 @@ impl LinearGraphQlSource {
     }
 }
 
+fn quota_rate_limit(
+    quota: &crate::quota::QuotaGate,
+    deadline: Option<&Deadline<'_>>,
+) -> Result<Error, Error> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |time| {
+            i64::try_from(time.as_millis()).unwrap_or(i64::MAX)
+        });
+    let remaining = quota
+        .status_within(deadline)?
+        .rate_limit_until
+        .unwrap_or_else(|| now.saturating_add(60_000))
+        .saturating_sub(now)
+        .max(0);
+    Ok(Error::LinearRateLimited {
+        retry_after: std::time::Duration::from_secs(
+            u64::try_from(remaining).unwrap_or(u64::MAX).div_ceil(1000),
+        ),
+    })
+}
+
 impl WorkspaceSource for LinearGraphQlSource {
+    fn refresh_workspace(
+        &self,
+        baseline: Option<&WorkspaceSnapshot>,
+        deadline: Option<&Deadline<'_>>,
+    ) -> Result<WorkspaceSnapshot, Error> {
+        self.refresh_measured(deadline, baseline)
+    }
+    fn configure_cache(&mut self, path: &std::path::Path) -> Result<(), Error> {
+        self.quota_path = path.to_owned();
+        Ok(())
+    }
     fn cache_namespace(&self) -> String {
         self.cache_namespace.clone()
     }
@@ -1138,19 +1334,65 @@ impl LinearGraphQlSource {
         &self,
         deadline: Option<&Deadline<'_>>,
     ) -> Result<WorkspaceSnapshot, Error> {
+        self.refresh_measured(deadline, None)
+    }
+
+    fn refresh_measured(
+        &self,
+        deadline: Option<&Deadline<'_>>,
+        baseline: Option<&WorkspaceSnapshot>,
+    ) -> Result<WorkspaceSnapshot, Error> {
+        let metrics = self.metrics_start();
+        crate::cache_status::begin_refresh(&self.quota_path, deadline)?;
+        let result = self.fetch_workspace_delta(deadline, baseline);
+        if deadline.is_none_or(|deadline| deadline.remaining().is_ok()) {
+            self.record_metrics_within(
+                metrics,
+                if baseline.is_some() {
+                    "incremental"
+                } else {
+                    "full"
+                },
+                result.is_ok(),
+                deadline,
+            )?;
+        }
+        result
+    }
+
+    fn fetch_workspace_delta(
+        &self,
+        deadline: Option<&Deadline<'_>>,
+        baseline: Option<&WorkspaceSnapshot>,
+    ) -> Result<WorkspaceSnapshot, Error> {
+        let since = baseline
+            .and_then(|snapshot| {
+                chrono::DateTime::from_timestamp(snapshot.fetched_at.saturating_sub(60), 0)
+            })
+            .map(|time| time.to_rfc3339());
+        let mut removed_projects = BTreeSet::new();
+        let mut removed_issues = BTreeSet::new();
         let mut projects = Vec::new();
         let mut after = None;
         for page in 0..PAGE_LIMIT {
-            let result: ProjectData = self.query_within(
+            let result: ProjectData = self.request_within(
                 deadline,
                 PROJECT_QUERY,
-                PROJECT_PAGE_SIZE,
-                after.as_deref(),
-                None,
-                Some(PROJECT_NESTED_PAGE_SIZE),
+                Variables {
+                    first: PROJECT_PAGE_SIZE,
+                    after: after.clone(),
+                    relation_first: None,
+                    nested_first: Some(PROJECT_NESTED_PAGE_SIZE),
+                    filter: since.as_deref().map(UpdatedFilter::new),
+                    include_archived: baseline.is_some(),
+                },
             )?;
             let connection = result.projects;
             for raw in connection.nodes {
+                if raw.archived_at.is_some() || raw.trashed == Some(true) {
+                    removed_projects.insert(ProjectId(raw.id));
+                    continue;
+                }
                 if raw.teams.page_info.has_next_page {
                     return Err(Error::NestedPaginationLimit {
                         resource: format!("project {} teams", raw.id),
@@ -1219,16 +1461,24 @@ impl LinearGraphQlSource {
         let mut raw_issues = Vec::new();
         let mut after = None;
         for page in 0..PAGE_LIMIT {
-            let result: IssueData = self.query_within(
+            let result: IssueData = self.request_within(
                 deadline,
                 ISSUE_QUERY,
-                ISSUE_PAGE_SIZE,
-                after.as_deref(),
-                Some(INITIAL_RELATION_PAGE_SIZE),
-                None,
+                Variables {
+                    first: ISSUE_PAGE_SIZE,
+                    after: after.clone(),
+                    relation_first: Some(INITIAL_RELATION_PAGE_SIZE),
+                    nested_first: None,
+                    filter: since.as_deref().map(UpdatedFilter::new),
+                    include_archived: baseline.is_some(),
+                },
             )?;
             let connection = result.issues;
             for mut raw in connection.nodes {
+                if raw.archived_at.is_some() || raw.trashed == Some(true) {
+                    removed_issues.insert(IssueId(raw.id));
+                    continue;
+                }
                 self.complete_relations(deadline, &raw.id, &mut raw.relations, false)?;
                 self.complete_relations(deadline, &raw.id, &mut raw.inverse_relations, true)?;
                 raw_issues.push(raw);
@@ -1248,7 +1498,11 @@ impl LinearGraphQlSource {
         }
 
         let blocked_by = collect_blocked_by(&raw_issues);
-        let issues = raw_issues
+        let changed_issue_ids: BTreeSet<_> = raw_issues
+            .iter()
+            .map(|issue| IssueId(issue.id.clone()))
+            .collect();
+        let issues: Vec<Issue> = raw_issues
             .into_iter()
             .map(|raw| {
                 let state_type = raw.state.status_type;
@@ -1291,6 +1545,79 @@ impl LinearGraphQlSource {
                 }
             })
             .collect();
+        if let Some(baseline) = baseline {
+            let mut merged_projects: BTreeMap<_, _> = baseline
+                .projects
+                .iter()
+                .cloned()
+                .map(|project| (project.id.clone(), project))
+                .collect();
+            for id in &removed_projects {
+                merged_projects.remove(id);
+            }
+            for project in projects {
+                merged_projects.insert(project.id.clone(), project);
+            }
+            projects = merged_projects.into_values().collect();
+            for initiative in self.fetch_initiative_changes(baseline.fetched_at, deadline)? {
+                for project in &mut projects {
+                    project
+                        .initiatives
+                        .retain(|member| member.id != initiative.initiative.id);
+                    if !initiative.archived
+                        && !initiative.trashed
+                        && initiative.project_ids.contains(&project.id)
+                    {
+                        project.initiatives.push(initiative.initiative.clone());
+                        project.initiatives.sort_by(|a, b| a.id.cmp(&b.id));
+                    }
+                }
+            }
+            let mut merged_issues: BTreeMap<_, _> = baseline
+                .issues
+                .iter()
+                .cloned()
+                .map(|issue| (issue.id.clone(), issue))
+                .collect();
+            for id in &removed_issues {
+                merged_issues.remove(id);
+            }
+            for issue in issues {
+                merged_issues.insert(issue.id.clone(), issue);
+            }
+            let issues = merged_issues
+                .into_values()
+                .map(|mut issue| {
+                    issue.blocked_by.retain(|id| {
+                        !removed_issues.contains(id) && !changed_issue_ids.contains(id)
+                    });
+                    issue.blocked_by.extend(
+                        blocked_by
+                            .get(&issue.id.0)
+                            .into_iter()
+                            .flatten()
+                            .cloned()
+                            .map(IssueId),
+                    );
+                    issue.blocked_by.sort();
+                    issue.blocked_by.dedup();
+                    if issue
+                        .project_id
+                        .as_ref()
+                        .is_some_and(|id| removed_projects.contains(id))
+                    {
+                        issue.project_id = None;
+                        issue.project_milestone_id = None;
+                    }
+                    issue
+                })
+                .collect();
+            return Ok(WorkspaceSnapshot {
+                projects,
+                issues,
+                fetched_at: SystemClock.now_epoch_seconds(),
+            });
+        }
         Ok(WorkspaceSnapshot {
             projects,
             issues,
@@ -1496,7 +1823,7 @@ struct GraphQlRequest<'a, V> {
 }
 
 #[derive(Serialize)]
-struct Variables {
+struct Variables<'a> {
     first: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "relationFirst")]
@@ -1505,6 +1832,31 @@ struct Variables {
     #[serde(rename = "nestedFirst")]
     nested_first: Option<i32>,
     after: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    filter: Option<UpdatedFilter<'a>>,
+    #[serde(rename = "includeArchived")]
+    include_archived: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+/// Typed optional root filter shared by detail and native summary queries.
+pub(crate) struct UpdatedFilter<'a> {
+    updated_at: UpdatedLowerBound<'a>,
+}
+
+impl<'a> UpdatedFilter<'a> {
+    /// Includes records updated at or after the non-null source watermark.
+    pub(crate) fn new(gte: &'a str) -> Self {
+        Self {
+            updated_at: UpdatedLowerBound { gte },
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct UpdatedLowerBound<'a> {
+    gte: &'a str,
 }
 
 #[derive(Serialize)]
@@ -1685,6 +2037,10 @@ struct UpdatedProject {
 struct RawProject {
     id: String,
     identifier: Option<String>,
+    #[serde(default)]
+    archived_at: Option<String>,
+    #[serde(default)]
+    trashed: Option<bool>,
     name: String,
     updated_at: Option<String>,
     description: String,
@@ -1862,6 +2218,10 @@ struct RawIssueHistoryEvent {
 struct RawIssue {
     id: String,
     identifier: String,
+    #[serde(default)]
+    archived_at: Option<String>,
+    #[serde(default)]
+    trashed: Option<bool>,
     title: String,
     description: Option<String>,
     priority: f64,
@@ -2357,7 +2717,9 @@ mod tests {
                 match failure {
                     "missing" => assert!(matches!(error, Error::MissingCursor)),
                     "blank" | "repeated" => assert!(matches!(error, Error::InvalidCursor { .. })),
-                    "malformed" | "missing-connection" => assert!(matches!(error, Error::Http(_))),
+                    "malformed" | "missing-connection" => {
+                        assert!(matches!(error, Error::LinearDecode(_)))
+                    }
                     "graphql" => assert!(matches!(error, Error::GraphQl { .. })),
                     "missing-issue" => assert!(matches!(error, Error::MissingWorkspaceData)),
                     _ => unreachable!(),
@@ -3395,7 +3757,7 @@ mod tests {
         server.join().expect("mock server");
 
         assert_ne!(new_namespace, old_namespace);
-        assert!(new_namespace.starts_with("linear:v13:"));
+        assert!(new_namespace.starts_with(&format!("linear:{CACHE_MODEL_VERSION}:")));
         let old_row = cached_payload(&cache_path, &old_namespace).expect("prior entry remains");
         assert_eq!(old_row, old_payload);
         let old_value: Value = serde_json::from_slice(&old_row).expect("prior payload");
@@ -3467,8 +3829,8 @@ mod tests {
         assert_eq!(
             source.cache_namespace,
             format!(
-                "linear:{CACHE_MODEL_VERSION}:sha256:{:x}",
-                Sha256::digest(b"fictional-test-token")
+                "linear:{CACHE_MODEL_VERSION}:detail:sha256:{:x}",
+                Sha256::digest(format!("{}:fictional-test-token", source.endpoint).as_bytes())
             )
         );
         source

@@ -93,7 +93,7 @@ fn sample(at: i64, working: bool) -> Vec<ExecutionSample> {
 }
 
 /// Provenance: SWM-180, SWM-181; short stages and read replay.
-/// Trace: FR-030-AC-1
+/// Trace: FR-032-AC-1
 #[test]
 fn short_stages_survive_removal_and_replayed_events_do_not_count_twice() {
     let dir = tempfile::tempdir().unwrap();
@@ -148,7 +148,7 @@ fn short_stages_survive_removal_and_replayed_events_do_not_count_twice() {
 }
 
 /// Provenance: SWM-181; reports are not execution, pauses/outages never improve throughput.
-/// Trace: FR-030-AC-2
+/// Trace: FR-032-AC-2
 #[test]
 fn execution_needs_consecutive_verified_observations_and_preserves_stalls() {
     let dir = tempfile::tempdir().unwrap();
@@ -196,7 +196,7 @@ fn execution_needs_consecutive_verified_observations_and_preserves_stalls() {
 }
 
 /// Provenance: SWM-181; reused pane labels must not inherit the prior session's assignments.
-/// Trace: FR-030-AC-2
+/// Trace: FR-032-AC-2
 #[test]
 fn a_replacement_session_clears_previous_incarnation_assignments() {
     let dir = tempfile::tempdir().unwrap();
@@ -223,7 +223,7 @@ fn a_replacement_session_clears_previous_incarnation_assignments() {
 }
 
 /// Provenance: SWM-181; shared assignments cannot be charged twice.
-/// Trace: FR-030-AC-2
+/// Trace: FR-032-AC-2
 #[test]
 fn overlapping_scopes_do_not_double_credit_execution() {
     let dir = tempfile::tempdir().unwrap();
@@ -256,7 +256,7 @@ fn overlapping_scopes_do_not_double_credit_execution() {
 }
 
 /// Provenance: SWM-181; cursor/events/current totals form one durable checkpoint.
-/// Trace: FR-030-AC-1
+/// Trace: FR-032-AC-1
 #[test]
 fn journal_restores_cursor_and_totals_and_prunes_older_evidence() {
     let dir = tempfile::tempdir().unwrap();
@@ -293,7 +293,7 @@ fn journal_restores_cursor_and_totals_and_prunes_older_evidence() {
 }
 
 /// Provenance: SWM-181; no unknown-as-zero, private IDs as labels, or rolling counters.
-/// Trace: FR-030-AC-5
+/// Trace: FR-032-AC-5
 #[test]
 fn export_omits_unknown_values_and_uses_only_bounded_labels() {
     let dir = tempfile::tempdir().unwrap();
@@ -318,7 +318,7 @@ fn export_omits_unknown_values_and_uses_only_bounded_labels() {
 }
 
 /// Provenance: SWM-181; unsupported schemas cannot overwrite evidence.
-/// Trace: FR-030-AC-4
+/// Trace: FR-032-AC-4
 #[test]
 fn unsupported_journal_and_unknown_config_fields_are_refused() {
     let dir = tempfile::tempdir().unwrap();
@@ -338,7 +338,7 @@ fn unsupported_journal_and_unknown_config_fields_are_refused() {
 }
 
 /// Provenance: SWM-181; scalar throughput snapshots retain gauge semantics.
-/// Trace: FR-030-AC-5
+/// Trace: FR-032-AC-5
 #[test]
 fn windowed_metrics_are_gauges_and_expired_sources_lose_values() {
     let dir = tempfile::tempdir().unwrap();
@@ -379,7 +379,7 @@ fn windowed_metrics_are_gauges_and_expired_sources_lose_values() {
 }
 
 /// Provenance: SWM-181; an outage cannot advance accounting beyond source coverage.
-/// Trace: FR-030-AC-3
+/// Trace: FR-032-AC-3
 #[test]
 fn delayed_completion_after_history_outage_remains_replayable() {
     let dir = tempfile::tempdir().unwrap();
@@ -421,7 +421,7 @@ fn delayed_completion_after_history_outage_remains_replayable() {
 }
 
 /// Provenance: SWM-181; metadata updates must replace stale worker identity.
-/// Trace: FR-030-AC-3
+/// Trace: FR-032-AC-3
 #[test]
 fn same_stage_upsert_updates_worker_binding_without_resetting_start() {
     let dir = tempfile::tempdir().unwrap();
@@ -450,7 +450,7 @@ fn same_stage_upsert_updates_worker_binding_without_resetting_start() {
 }
 
 /// Provenance: SWM-181; failed attempts do not advance last-success or invent population zeros.
-/// Trace: FR-030-AC-5
+/// Trace: FR-032-AC-5
 #[test]
 fn failed_lifecycle_keeps_last_success_and_omits_current_ages() {
     let dir = tempfile::tempdir().unwrap();
@@ -476,7 +476,7 @@ fn failed_lifecycle_keeps_last_success_and_omits_current_ages() {
 }
 
 /// Provenance: SWM-181; snapshots establish only current assignment facts.
-/// Trace: FR-030-AC-7
+/// Trace: FR-032-AC-7
 #[test]
 fn bootstrap_never_invents_historical_stage_starts() {
     let dir = tempfile::tempdir().unwrap();
@@ -511,7 +511,7 @@ fn bootstrap_never_invents_historical_stage_starts() {
 }
 
 /// Provenance: SWM-181; Unicode-heavy events stay within the actual byte ceiling.
-/// Trace: FR-030-AC-4
+/// Trace: FR-032-AC-4
 #[test]
 fn unicode_event_retention_evicts_before_the_page_limit_is_hit() {
     let dir = tempfile::tempdir().unwrap();
@@ -530,7 +530,7 @@ fn unicode_event_retention_evicts_before_the_page_limit_is_hit() {
     assert_eq!(journal.load().unwrap().cursor, "300-0");
 }
 
-/// Trace: FR-030-AC-2, FR-030-AC-6
+/// Trace: FR-032-AC-2, FR-032-AC-6
 #[test]
 fn completed_stages_do_not_leak_into_a_disjoint_scope_with_the_same_lead() {
     let dir = tempfile::tempdir().unwrap();
@@ -581,7 +581,7 @@ fn completed_stages_do_not_leak_into_a_disjoint_scope_with_the_same_lead() {
     assert!(state.scopes["factory:disjoint"].stages.is_empty());
 }
 
-/// Trace: FR-030-AC-2, FR-030-AC-7
+/// Trace: FR-032-AC-2, FR-032-AC-7
 #[test]
 fn a_lead_working_a_different_reported_scope_has_unknown_parent_attribution() {
     let dir = tempfile::tempdir().unwrap();

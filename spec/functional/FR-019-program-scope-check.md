@@ -15,6 +15,10 @@ availability. It SHALL report missing initiatives, missing projects, missing
 repositories, and projects that are not placed in the declared scope. It SHALL
 make no changes to Linear or GitHub.
 
+The command SHALL reuse the shared initiative/project summary catalogs without
+enumerating issues or histories; it SHALL expose Linear source freshness even
+when a quota cooldown requires the last complete catalog.
+
 The scope file SHALL describe program membership and ownership only. It SHALL
 not persist counts or other values that can be derived from live source data.
 GitHub repository probes SHALL have a bounded request timeout and report a
@@ -28,6 +32,7 @@ timeout as an error naming the affected repository.
 | FR-019-AC-2 | Given the scope and live Linear catalogs, the check reports missing initiatives, missing projects, and unplaced projects; given GitHub results, it reports missing repositories and treats an unauthenticated 404 as unverifiable rather than asserting absence. | Test |
 | FR-019-AC-3 | Every GitHub repository request has a finite timeout; a timed-out request returns an error identifying the repository and does not produce a successful check report. | Test |
 | FR-019-AC-4 | Scope checking is read-only with respect to Linear and GitHub. | Inspection |
+| FR-019-AC-5 | Cold and warm scope checks fetch no issue/history pages, reuse summary catalogs, and expose stale/age/cooldown metadata when using a last complete catalog. | Test |
 
 ## Dependencies
 

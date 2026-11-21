@@ -412,6 +412,23 @@ pub struct RoadmapUnplacedProject {
     pub last_activity: Option<String>,
 }
 
+struct SourceRow<T> {
+    source_id: String,
+    value: T,
+}
+
+struct GroupedInitiative {
+    source_id: String,
+    name: String,
+    projects: Vec<SourceRow<RoadmapProject>>,
+}
+
+struct GroupedRoadmap {
+    report: ProgramRoadmap,
+    initiatives: Vec<GroupedInitiative>,
+    unplaced_projects: Vec<SourceRow<RoadmapUnplacedProject>>,
+}
+
 /// Build one row per project from a live workspace snapshot. Scope placement
 /// names the primary initiative; remaining memberships are rendered as `also_in`.
 pub fn build_roadmap(
@@ -419,6 +436,35 @@ pub fn build_roadmap(
     workspace: &WorkspaceSnapshot,
     scope: Option<&ProgramScope>,
 ) -> ProgramRoadmap {
+    let grouped = group_roadmap(initiatives, workspace, scope);
+    let mut report = grouped.report;
+    report.initiatives = grouped
+        .initiatives
+        .into_iter()
+        .map(|initiative| RoadmapInitiative {
+            name: initiative.name,
+            projects: initiative
+                .projects
+                .into_iter()
+                .map(|project| project.value)
+                .collect(),
+        })
+        .collect();
+    report.unplaced_projects = grouped
+        .unplaced_projects
+        .into_iter()
+        .map(|project| project.value)
+        .collect();
+    report
+}
+
+/// Build one row per project from a live workspace snapshot. Scope placement
+/// names the primary initiative; remaining memberships are rendered as `also_in`.
+fn group_roadmap(
+    initiatives: &[Initiative],
+    workspace: &WorkspaceSnapshot,
+    scope: Option<&ProgramScope>,
+) -> GroupedRoadmap {
     let mut initiative_by_id: BTreeMap<String, String> = initiatives
         .iter()
         .map(|item| (item.id.clone(), item.name.clone()))
@@ -492,15 +538,19 @@ pub fn build_roadmap(
         .collect::<Vec<_>>();
     sort_names(&mut missing_scope_projects);
 
-    let mut result = ProgramRoadmap {
+    let mut result = GroupedRoadmap {
         initiatives: Vec::new(),
         unplaced_projects: Vec::new(),
-        initiatives_without_projects: Vec::new(),
-        projects_in_multiple_initiatives: Vec::new(),
-        projects_missing_from_scope: Vec::new(),
-        project_membership_mismatches: Vec::new(),
-        missing_scope_initiatives,
-        missing_scope_projects,
+        report: ProgramRoadmap {
+            initiatives: Vec::new(),
+            unplaced_projects: Vec::new(),
+            initiatives_without_projects: Vec::new(),
+            projects_in_multiple_initiatives: Vec::new(),
+            projects_missing_from_scope: Vec::new(),
+            project_membership_mismatches: Vec::new(),
+            missing_scope_initiatives,
+            missing_scope_projects,
+        },
     };
     let mut assigned = BTreeSet::<String>::new();
     for initiative in selected_initiatives {
@@ -544,18 +594,27 @@ pub fn build_roadmap(
             sort_names(&mut also_in);
             if memberships.len() > 1 {
                 result
+                    .report
                     .projects_in_multiple_initiatives
                     .push(project.name.clone());
             }
-            rows.push(roadmap_project(project, &workspace.issues, also_in));
+            rows.push(SourceRow {
+                source_id: project.id.0.clone(),
+                value: roadmap_project(project, &workspace.issues, also_in),
+            });
         }
-        rows.sort_by(|left, right| compare_names(&left.name, &right.name));
+        rows.sort_by(|left, right| {
+            compare_names(&left.value.name, &right.value.name)
+                .then_with(|| left.source_id.cmp(&right.source_id))
+        });
         if rows.is_empty() {
             result
+                .report
                 .initiatives_without_projects
                 .push(initiative.name.clone());
         }
-        result.initiatives.push(RoadmapInitiative {
+        result.initiatives.push(GroupedInitiative {
+            source_id: initiative.id.clone(),
             name: initiative.name.clone(),
             projects: rows,
         });
@@ -570,9 +629,10 @@ pub fn build_roadmap(
                 .any(|item| same_name(&item.name, &project.name))
         });
         if project.initiatives.is_empty() && included {
-            result
-                .unplaced_projects
-                .push(roadmap_unplaced(project, &workspace.issues));
+            result.unplaced_projects.push(SourceRow {
+                source_id: project.id.0.clone(),
+                value: roadmap_unplaced(project, &workspace.issues),
+            });
         } else if scope.is_some()
             && !included
             && project.initiatives.iter().any(|membership| {
@@ -582,6 +642,7 @@ pub fn build_roadmap(
             })
         {
             result
+                .report
                 .projects_missing_from_scope
                 .push(project.name.clone());
         }
@@ -617,6 +678,7 @@ pub fn build_roadmap(
             sort_names(&mut missing_from_scope);
             if !missing_from_linear.is_empty() || !missing_from_scope.is_empty() {
                 result
+                    .report
                     .project_membership_mismatches
                     .push(ProjectInitiativeMismatch {
                         project: project.name.clone(),
@@ -626,17 +688,19 @@ pub fn build_roadmap(
             }
         }
     }
+    result.initiatives.sort_by(|left, right| {
+        compare_names(&left.name, &right.name).then_with(|| left.source_id.cmp(&right.source_id))
+    });
+    result.unplaced_projects.sort_by(|left, right| {
+        compare_names(&left.value.name, &right.value.name)
+            .then_with(|| left.source_id.cmp(&right.source_id))
+    });
+    sort_names(&mut result.report.initiatives_without_projects);
+    sort_names(&mut result.report.projects_in_multiple_initiatives);
+    result.report.projects_in_multiple_initiatives.dedup();
+    sort_names(&mut result.report.projects_missing_from_scope);
     result
-        .initiatives
-        .sort_by(|left, right| compare_names(&left.name, &right.name));
-    result
-        .unplaced_projects
-        .sort_by(|left, right| compare_names(&left.name, &right.name));
-    sort_names(&mut result.initiatives_without_projects);
-    sort_names(&mut result.projects_in_multiple_initiatives);
-    result.projects_in_multiple_initiatives.dedup();
-    sort_names(&mut result.projects_missing_from_scope);
-    result
+        .report
         .project_membership_mismatches
         .sort_by(|left, right| compare_names(&left.project, &right.project));
     result
@@ -701,6 +765,161 @@ fn roadmap_unplaced(project: &Project, issues: &[Issue]) -> RoadmapUnplacedProje
         done,
         canceled,
         last_activity,
+    }
+}
+
+/// Native summary roadmap; counts remain nullable when Linear exposes no current aggregate.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SummaryRoadmap {
+    /// Deterministically grouped initiatives and their native status.
+    pub initiatives: Vec<SummaryRoadmapInitiative>,
+    /// Projects without an initiative.
+    pub unplaced_projects: Vec<SummaryRoadmapProject>,
+    /// Initiatives without a visible project.
+    pub initiatives_without_projects: Vec<String>,
+    /// Projects with multiple initiative memberships.
+    pub projects_in_multiple_initiatives: Vec<String>,
+    /// Live projects omitted from the selected scope.
+    pub projects_missing_from_scope: Vec<String>,
+    /// Declared and live membership differences.
+    pub project_membership_mismatches: Vec<ProjectInitiativeMismatch>,
+    /// Scope-declared initiatives absent from Linear.
+    pub missing_scope_initiatives: Vec<String>,
+    /// Scope-declared projects absent from Linear.
+    pub missing_scope_projects: Vec<String>,
+}
+
+/// Native initiative status with project summaries; no invented progress aggregate.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SummaryRoadmapInitiative {
+    /// Initiative display name.
+    pub name: String,
+    /// Native lifecycle status when available.
+    pub status: Option<String>,
+    /// Native reported health when available.
+    pub health: Option<String>,
+    /// Projects assigned to this primary initiative.
+    pub projects: Vec<SummaryRoadmapProject>,
+}
+
+/// Project facts from native Linear summaries, without enumerating tickets.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SummaryRoadmapProject {
+    /// Project display name.
+    pub name: String,
+    /// Native lifecycle status.
+    pub status: String,
+    /// Native estimate-weighted progress, expressed as a percentage.
+    pub progress_percent: Option<f64>,
+    /// Source of progress; native progress is not completed-ticket percentage.
+    pub progress_source: String,
+    /// Time the source fetch began, retained from the summary dataset.
+    pub observed_at: String,
+    /// Current open issue count; null because no native current aggregate exists.
+    pub open: Option<usize>,
+    /// Current completed issue count; null because no native current aggregate exists.
+    pub done: Option<usize>,
+    /// Current canceled issue count; null because no native current aggregate exists.
+    pub canceled: Option<usize>,
+    /// Reason counts are unavailable.
+    pub counts_unavailable_reason: String,
+    /// Issue last activity; null because summaries do not expose this aggregate.
+    pub last_activity: Option<String>,
+    /// Reason issue last activity is unavailable.
+    pub activity_unavailable_reason: String,
+    /// Native project updatedAt; distinct from issue activity.
+    pub project_updated_at: Option<String>,
+    /// Other initiative memberships.
+    pub also_in: Vec<String>,
+}
+
+/// Checks scope using only shared native summary catalogs and GitHub probes.
+pub fn check_summary_scope(
+    scope: &ProgramScope,
+    summary: &crate::linear_summary::SummarySnapshot,
+) -> Result<ScopeCheckReport, ProgramReviewError> {
+    let initiatives = summary
+        .initiatives
+        .iter()
+        .map(|i| i.initiative.clone())
+        .collect::<Vec<_>>();
+    let workspace = WorkspaceSnapshot {
+        projects: summary.projects.iter().map(|p| p.project.clone()).collect(),
+        ..WorkspaceSnapshot::default()
+    };
+    check_scope(scope, &initiatives, &workspace)
+}
+
+/// Builds a deterministic native summary roadmap without accessing issues or histories.
+pub fn build_summary_roadmap(
+    summary: &crate::linear_summary::SummarySnapshot,
+    scope: Option<&ProgramScope>,
+    observed_at: &str,
+) -> SummaryRoadmap {
+    let initiatives = summary
+        .initiatives
+        .iter()
+        .map(|i| i.initiative.clone())
+        .collect::<Vec<_>>();
+    let workspace = WorkspaceSnapshot {
+        projects: summary.projects.iter().map(|p| p.project.clone()).collect(),
+        ..WorkspaceSnapshot::default()
+    };
+    // The legacy builder owns ordering, scope diagnostics and single placement.
+    // Its ticket-derived values are discarded; this workspace contains no tickets.
+    let grouping = group_roadmap(&initiatives, &workspace, scope);
+    let native_row = |id: String, name: String, status: String, also_in: Vec<String>| {
+        let project = summary.projects.iter().find(|p| p.project.id.0 == id);
+        SummaryRoadmapProject {
+            name, status,
+            progress_percent: project.and_then(|p| p.progress).map(|fraction| fraction * 100.0),
+            progress_source: "linear_native".to_owned(),
+            observed_at: observed_at.to_owned(),
+            open: None, done: None, canceled: None,
+            counts_unavailable_reason: "Linear summary connections expose no current issue totalCount; estimate scope and history arrays are not current issue counts".to_owned(),
+            last_activity: None,
+            activity_unavailable_reason: "Linear project summaries expose no issue last-activity aggregate".to_owned(),
+            project_updated_at: project.map(|p| p.updated_at.clone()),
+            also_in,
+        }
+    };
+    SummaryRoadmap {
+        initiatives: grouping
+            .initiatives
+            .into_iter()
+            .map(|group| {
+                let initiative = summary
+                    .initiatives
+                    .iter()
+                    .find(|i| i.initiative.id == group.source_id);
+                SummaryRoadmapInitiative {
+                    name: group.name,
+                    status: initiative.map(|i| i.status.clone()),
+                    health: initiative.and_then(|i| i.health.clone()),
+                    projects: group
+                        .projects
+                        .into_iter()
+                        .map(|p| {
+                            native_row(p.source_id, p.value.name, p.value.status, p.value.also_in)
+                        })
+                        .collect(),
+                }
+            })
+            .collect(),
+        unplaced_projects: grouping
+            .unplaced_projects
+            .into_iter()
+            .map(|p| native_row(p.source_id, p.value.name, p.value.status, Vec::new()))
+            .collect(),
+        initiatives_without_projects: grouping.report.initiatives_without_projects,
+        projects_in_multiple_initiatives: grouping.report.projects_in_multiple_initiatives,
+        projects_missing_from_scope: grouping.report.projects_missing_from_scope,
+        project_membership_mismatches: grouping.report.project_membership_mismatches,
+        missing_scope_initiatives: grouping.report.missing_scope_initiatives,
+        missing_scope_projects: grouping.report.missing_scope_projects,
     }
 }
 

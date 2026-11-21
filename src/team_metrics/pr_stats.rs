@@ -128,7 +128,7 @@ mod tests {
             force_pushes: Some(0),
         }
     }
-    /// Trace: FR-030-AC-9
+    /// Trace: FR-032-AC-9
     #[test]
     fn closure_and_review_ratios_keep_their_populations_distinct() {
         let mut abandoned = pr(1);
@@ -153,7 +153,7 @@ mod tests {
         assert_eq!(values["pr_changes_requested_share"], 0.5);
         assert_eq!(values["prs_reopened_open"], 1.0);
     }
-    /// Trace: FR-030-AC-9
+    /// Trace: FR-032-AC-9
     #[test]
     fn no_decisive_reviews_or_closures_means_unavailable_ratios() {
         let v = calculate(&[pr(1)], 100000.0).values;

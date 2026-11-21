@@ -2002,23 +2002,33 @@ fn invalidation_removes_only_the_current_source_snapshot() {
     assert_eq!(second_source.reads.load(Ordering::SeqCst), 1);
 }
 
+/// Trace: FR-004-AC-3, FR-004-AC-21
 #[test]
-fn failed_forced_refresh_does_not_leave_a_fresh_stale_snapshot() {
+fn failed_forced_refresh_preserves_last_complete_snapshot_and_failure_provenance() {
     let directory = TempDir::new().expect("temporary directory");
     let source = FixtureSource::new(queue_fixture());
     let mut reads = service(source.clone(), ManualClock::new(10_000), &directory);
     reads.workspace_snapshot().expect("initial cache fill");
     source.fail.store(true, Ordering::SeqCst);
 
-    assert!(matches!(
-        reads.force_refresh_workspace(),
-        Err(Error::GraphQl { .. })
-    ));
-    assert!(matches!(
-        reads.workspace_snapshot(),
-        Err(Error::GraphQl { .. })
-    ));
-    assert_eq!(source.reads.load(Ordering::SeqCst), 3);
+    let fallback = reads
+        .force_refresh_workspace()
+        .expect("last complete snapshot");
+    assert_eq!(fallback.fetched_at, 10_000);
+    let freshness = reads.cache_freshness().expect("fallback metadata");
+    assert!(freshness.stale);
+    assert_eq!(freshness.age_seconds, Some(0));
+    assert!(
+        freshness
+            .failure_reason
+            .as_deref()
+            .expect("reason")
+            .contains("fixture refresh failed")
+    );
+    reads
+        .workspace_snapshot()
+        .expect("original successful snapshot remains within TTL");
+    assert_eq!(source.reads.load(Ordering::SeqCst), 2);
 }
 
 #[test]
@@ -2080,8 +2090,9 @@ fn cache_database_permissions_are_restricted_for_existing_files() {
     assert_eq!(mode, 0o600);
 }
 
+/// Trace: FR-004-AC-3
 #[test]
-fn failed_expired_refresh_returns_error_instead_of_stale_snapshot() {
+fn failed_expired_refresh_returns_labeled_last_complete_snapshot() {
     let directory = TempDir::new().expect("temporary directory");
     let source = FixtureSource::new(queue_fixture());
     let clock = ManualClock::new(20_000);
@@ -2090,7 +2101,23 @@ fn failed_expired_refresh_returns_error_instead_of_stale_snapshot() {
     assert!(!reads.search("SWM-1").expect("initial read").is_empty());
     clock.set(20_000 + ix_board::CACHE_TTL_SECONDS);
     source.fail.store(true, Ordering::SeqCst);
-    assert!(matches!(reads.search("SWM-1"), Err(Error::GraphQl { .. })));
+    assert!(
+        !reads
+            .search("SWM-1")
+            .expect("last complete results")
+            .is_empty()
+    );
+    let freshness = reads.cache_freshness().expect("fallback provenance");
+    assert!(freshness.stale);
+    assert_eq!(freshness.age_seconds, Some(300));
+    assert!(freshness.rate_limit_until.is_none());
+    assert!(
+        freshness
+            .failure_reason
+            .as_deref()
+            .expect("reason")
+            .contains("fixture refresh failed")
+    );
     assert_eq!(source.reads.load(Ordering::SeqCst), 2);
 }
 

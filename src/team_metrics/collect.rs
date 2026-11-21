@@ -216,11 +216,12 @@ impl Collector {
     /// Collects tracker/VCS data using shared retro calculations, outside the activity worker.
     pub fn tracker(config: &Config, now: i64) -> TrackerBatch {
         let source = retro::live::linear_or_unreadable();
-        let workspace = source.workspace(now as f64 / 1000.0 - 86400.0);
+        let workspace = tracker_workspace(source.as_ref(), now as f64 / 1000.0 - 86400.0);
         // The native workspace reader stamps completed observations. Anchor
         // calculations after that read, rather than mistaking read duration
         // for source clock skew against the poll's starting instant.
         let now = super::now_ms().unwrap_or(now).max(now);
+        let source_sync_ms = verified_sync_ms(source.cache_freshness()).unwrap_or(now);
         let results = config
             .scopes
             .iter()
@@ -526,7 +527,7 @@ impl Collector {
             })
             .collect();
         TrackerBatch {
-            at_ms: now,
+            at_ms: source_sync_ms,
             results,
         }
     }
@@ -648,6 +649,23 @@ fn update_members(
     state.members = new.clone();
     state.selectors = Some(selectors.clone());
 }
+// A cache fallback is useful to interactive readers but cannot certify current
+// tracker populations or refresh the exporter's last-success timestamp.
+fn tracker_workspace(source: &dyn LinearSource, since: f64) -> Result<WorkspaceSnapshot, String> {
+    let snapshot = source.workspace(since)?;
+    verified_sync_ms(source.cache_freshness())?;
+    Ok(snapshot)
+}
+
+fn verified_sync_ms(freshness: Option<crate::CacheFreshness>) -> Result<i64, String> {
+    freshness
+        .filter(|f| !f.stale)
+        .and_then(|f| f.last_successful_sync)
+        .filter(|at| *at > 0)
+        .and_then(|at| at.checked_mul(1000))
+        .ok_or_else(|| "tracker cache is stale or has no verified sync provenance".into())
+}
+
 struct NoAgents;
 impl AgentSource for NoAgents {
     fn report(&self, _: &[String]) -> Result<crate::agents::AgentsReport, String> {
@@ -791,7 +809,27 @@ impl GithubSource for SelectedGithub {
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// Trace: FR-030-AC-6
+    /// Trace: FR-032-AC-5
+    #[test]
+    fn stale_backoff_snapshots_cannot_refresh_tracker_success() {
+        let freshness = |stale, sync| crate::CacheFreshness {
+            last_successful_sync: sync,
+            last_full_reconciliation: Some(100),
+            stale,
+            age_seconds: Some(30),
+            rate_limit_until: Some(200),
+            failure_reason: None,
+        };
+        assert_eq!(
+            verified_sync_ms(Some(freshness(false, Some(123)))).unwrap(),
+            123000
+        );
+        assert!(verified_sync_ms(Some(freshness(true, Some(123)))).is_err());
+        assert!(verified_sync_ms(Some(freshness(false, None))).is_err());
+        assert!(verified_sync_ms(Some(freshness(false, Some(i64::MAX)))).is_err());
+        assert!(verified_sync_ms(None).is_err());
+    }
+    /// Trace: FR-032-AC-6
     #[test]
     fn removing_or_canceling_work_does_not_create_delivery() {
         let selectors = super::super::Selectors {
@@ -825,7 +863,7 @@ mod tests {
 #[cfg(test)]
 mod revision_tests {
     use super::*;
-    /// Trace: FR-030-AC-6
+    /// Trace: FR-032-AC-6
     #[test]
     fn changing_selectors_invalidates_comparable_effort_history() {
         let old = super::super::Selectors {

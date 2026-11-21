@@ -727,6 +727,7 @@ pub struct Initiative {
     /// Linear UUID.
     pub id: String,
     /// Human-readable Linear initiative identifier, such as I-10.
+    #[serde(default)]
     pub identifier: String,
     /// Initiative name.
     pub name: String,

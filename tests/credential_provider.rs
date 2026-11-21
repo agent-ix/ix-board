@@ -91,7 +91,7 @@ fn saved_provider_without_override_reaches_real_department_collection() {
     let (completed, completion) = mpsc::channel();
     let server = std::thread::spawn(move || {
         let mut operations = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..2 {
             let (mut stream, _) = listener.accept().unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
@@ -135,7 +135,10 @@ fn saved_provider_without_override_reaches_real_department_collection() {
             let resource = if query.contains("WorkspaceProjects") {
                 "projects"
             } else {
-                assert!(query.contains("issues("), "expected real issue queries");
+                assert!(
+                    query.contains("WorkspaceIssues"),
+                    "expected the complete workspace issue query"
+                );
                 "issues"
             };
             operations.push(query.to_owned());
@@ -166,13 +169,16 @@ fn saved_provider_without_override_reaches_real_department_collection() {
     );
     let operations = completion
         .recv_timeout(Duration::from_secs(5))
-        .expect("real Linear collection must complete all three HTTP requests before the deadline");
+        .expect("real Linear collection must complete both workspace requests before the deadline");
     server.join().unwrap();
-    assert_eq!(operations.len(), 3);
+    assert_eq!(operations.len(), 2);
     assert!(operations[0].contains("WorkspaceProjects"));
+    assert!(operations[1].contains("WorkspaceIssues"));
     assert!(
-        operations[2].contains("updatedAt"),
-        "real freshness read must run"
+        operations
+            .iter()
+            .all(|query| !query.contains("IssueUpdates")),
+        "shared workspace collection needs no independent freshness probe"
     );
 }
 

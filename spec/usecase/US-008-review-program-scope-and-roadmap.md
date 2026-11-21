@@ -33,10 +33,10 @@ scripts or stored tallies.
 
 ### US-008-EX-2: Review live program progress
 
-- **Given** an optional scope file and one complete Linear workspace snapshot
+- **Given** an optional scope file and Linear initiative/project summaries
 - **When** I run `ix-board roadmap`
 - **Then** ix-board groups projects under initiatives and derives project
-  progress from the snapshot's issue records
+  progress with explicit native-summary provenance, freshness, and unavailable counts
 
 ### US-008-EX-3: Find unprojected issues
 

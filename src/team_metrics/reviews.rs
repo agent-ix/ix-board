@@ -322,7 +322,7 @@ mod tests {
             "clean: false\nfindings:\n  - fnd: FND-1\n    severity: high\n    finding: private prose is not counted",
         )
     }
-    /// Trace: FR-030-AC-10
+    /// Trace: FR-032-AC-10
     #[test]
     fn pending_findings_are_not_fabricated_as_confirmed_or_clean() {
         let v = calculate(&[review()], &allowed(), &BTreeMap::new(), 100000.0)
@@ -333,7 +333,7 @@ mod tests {
         assert_eq!(v["review_classifiable_prs_24h"], 0.0);
         assert!(!v.contains_key("review_confirmed_finding_pr_share_24h"));
     }
-    /// Trace: FR-030-AC-10
+    /// Trace: FR-032-AC-10
     #[test]
     fn latest_disposition_supersedes_earlier_outcomes_and_native_ids_deduplicate() {
         let fixed = comment(
@@ -361,7 +361,7 @@ mod tests {
         assert_eq!(v["review_findings_confirmed_high_24h"], 0.0);
         assert_eq!(v["review_confirmed_finding_pr_share_24h"], 0.0);
     }
-    /// Trace: FR-030-AC-10
+    /// Trace: FR-032-AC-10
     #[test]
     fn confirmed_findings_use_severity_and_new_pr_first_record_time() {
         let fixed = comment(
@@ -382,7 +382,7 @@ mod tests {
         assert_eq!(v["review_confirmed_finding_pr_share_24h"], 1.0);
         assert_eq!(v["new_pr_first_review_median_seconds_24h"], 1000.0);
     }
-    /// Trace: FR-030-AC-10
+    /// Trace: FR-032-AC-10
     #[test]
     fn missing_or_contradictory_structured_evidence_is_unavailable() {
         let mut r = review();
