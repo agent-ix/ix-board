@@ -1684,3 +1684,216 @@ fn time_the_read_used_is_not_given_back_to_resolution() {
         "the read's time counts against resolution: {result:?}"
     );
 }
+
+/// How many records one project holds in the nested-phase tests below. The outer project
+/// count stays at one, so only the nested traversal can account for the difference.
+const NESTED: u32 = 2_000;
+
+/// The last nested index.
+const LAST: u32 = NESTED - 1;
+
+/// A single project whose nested lists hold [`NESTED`] initiatives, milestones and team
+/// keys. Initiative `init-N`, milestone `m-N` (named `Stage N`) and team `T-N` all start at
+/// 0 (the team list is led by `SWM`), so a selector for the first record ends a scan at once and one for the last record
+/// ends it only after the whole list, in the very same payload.
+fn nested_snapshot() -> WorkspaceSnapshot {
+    let mut project = named_project("p0", "PRJ-0", "Solo", "SWM");
+    project.initiatives = (0..NESTED)
+        .map(|index| Initiative {
+            id: format!("init-{index}"),
+            identifier: format!("I-{index}"),
+            name: format!("Initiative {index}"),
+        })
+        .collect();
+    project.milestones = (0..NESTED)
+        .map(|index| milestone_record(&format!("m-{index}"), &format!("Stage {index}")))
+        .collect();
+    // `SWM` leads, so every other test finds its team at the first key.
+    project.team_keys = std::iter::once(TeamKey("SWM".into()))
+        .chain((0..NESTED).map(|index| TeamKey(format!("T-{index}"))))
+        .collect();
+    WorkspaceSnapshot {
+        projects: vec![project],
+        ..WorkspaceSnapshot::default()
+    }
+}
+
+/// [`nested_snapshot`] plus two issues of the first and last team, so that the team is
+/// known from the issues and only the project's own team list is left to search.
+fn nested_snapshot_with_team_issues() -> WorkspaceSnapshot {
+    let mut snapshot = nested_snapshot();
+    snapshot.issues = vec![
+        ticket("t-first", "T-0-1", "T-0", "p0", None),
+        ticket("t-last", "T-1-1", &format!("T-{LAST}"), "p0", None),
+    ];
+    snapshot
+}
+
+fn team_input(team: &str, include: Vec<NamedMemberInput>) -> NamedSelectionInput {
+    NamedSelectionInput {
+        team: team.into(),
+        include,
+        exclude: vec![],
+    }
+}
+
+/// The adverse oracle for one nested phase. `light` and `heavy` run against the same
+/// snapshot, so the cache lookup, decode, team scan and outer project count cost the same;
+/// the inputs differ only in how much of the phase under test the heavy one must search.
+/// Every look at the clock costs [`WORK_STEP`], so a traversal that does not check the
+/// deadline uses no controlled time and the heavy input would not cost more.
+fn assert_nested_phase_stops_at_the_deadline(
+    phase: &str,
+    snapshot: &WorkspaceSnapshot,
+    light: &NamedSelectionInput,
+    heavy: &NamedSelectionInput,
+) {
+    let generous = Duration::from_secs(3600);
+    let none = Duration::ZERO;
+    let expected = canonicalize_named_selection(snapshot, heavy).expect("standalone heavy");
+    for from_cache in [false, true] {
+        let (fast, light_used) =
+            timed_canonicalization(snapshot.clone(), light, generous, from_cache, none);
+        let (slow, heavy_used) =
+            timed_canonicalization(snapshot.clone(), heavy, generous, from_cache, none);
+        fast.expect("light input");
+        assert_eq!(
+            slow.expect("heavy input"),
+            expected,
+            "{phase}: the bounded form returns what the standalone form does"
+        );
+        assert!(
+            heavy_used >= light_used + WORK_STEP * (NESTED / 2),
+            "{phase} (cache {from_cache}): the nested traversal must cost controlled time, so \
+             it checks the deadline inside the list: {heavy_used:?} against {light_used:?}"
+        );
+
+        // A deadline between the two: the read, decode and the light input's own work fit;
+        // the heavy traversal does not.
+        let deadline = light_used + (heavy_used - light_used) / 2;
+        let (fits, _) = timed_canonicalization(snapshot.clone(), light, deadline, from_cache, none);
+        fits.expect("the same read and context cost fits");
+        let (result, used) =
+            timed_canonicalization(snapshot.clone(), heavy, deadline, from_cache, none);
+        assert!(
+            is_timeout(&result, deadline),
+            "{phase} (cache {from_cache}): the typed timeout and no document: {result:?}"
+        );
+        assert!(
+            used <= deadline + WORK_STEP * 10,
+            "{phase} (cache {from_cache}): stops within a few checks of expiry, not after the \
+             whole list: {used:?} against {deadline:?} (full run {heavy_used:?})"
+        );
+    }
+}
+
+fn initiative_member(index: u32) -> Vec<NamedMemberInput> {
+    vec![NamedMemberInput::Initiative(format!("init-{index}"))]
+}
+
+fn milestone_member(selector: &str) -> Vec<NamedMemberInput> {
+    vec![milestone_input(selector, None)]
+}
+
+#[trace("FR-004-AC-14", "FR-016-AC-11")]
+#[test]
+fn one_project_with_many_initiatives_stops_the_initiative_lookup_at_the_deadline() {
+    // Light names nothing; heavy names the first initiative, whose membership check ends
+    // at once. The one project's initiative list is searched for the selector only.
+    assert_nested_phase_stops_at_the_deadline(
+        "initiative lookup",
+        &nested_snapshot(),
+        &team_input("SWM", vec![]),
+        &team_input("SWM", initiative_member(0)),
+    );
+}
+
+#[trace("FR-004-AC-14", "FR-016-AC-11")]
+#[test]
+fn one_project_with_many_initiatives_stops_the_initiative_membership_scan_at_the_deadline() {
+    // Both look up their initiative through the whole list. The first ends its membership
+    // scan at once, the last only after every initiative of the project.
+    assert_nested_phase_stops_at_the_deadline(
+        "initiative membership",
+        &nested_snapshot(),
+        &team_input("SWM", initiative_member(0)),
+        &team_input("SWM", initiative_member(LAST)),
+    );
+}
+
+#[trace("FR-004-AC-14", "FR-016-AC-11")]
+#[test]
+fn one_project_with_many_milestones_stops_the_exact_id_pass_at_the_deadline() {
+    // Heavy names the first milestone by UUID: the exact pass searches the whole list.
+    assert_nested_phase_stops_at_the_deadline(
+        "milestone exact id",
+        &nested_snapshot(),
+        &team_input("SWM", vec![]),
+        &team_input("SWM", milestone_member("m-0")),
+    );
+}
+
+#[trace("FR-004-AC-14", "FR-016-AC-11")]
+#[test]
+fn one_project_with_many_milestones_stops_the_whole_name_pass_at_the_deadline() {
+    // Both pass the exact pass over the whole list; only a name goes on to the name pass.
+    assert_nested_phase_stops_at_the_deadline(
+        "milestone whole name",
+        &nested_snapshot(),
+        &team_input("SWM", milestone_member("m-0")),
+        &team_input("SWM", milestone_member("Stage 0")),
+    );
+}
+
+#[trace("FR-004-AC-14", "FR-016-AC-11")]
+#[test]
+fn one_project_with_many_milestones_stops_the_qualified_name_pass_at_the_deadline() {
+    // Both pass the exact and whole-name passes; only the qualified selector then searches
+    // the named project's milestones again at its slash.
+    assert_nested_phase_stops_at_the_deadline(
+        "milestone qualified name",
+        &nested_snapshot(),
+        &team_input("SWM", milestone_member("Stage 0")),
+        &team_input("SWM", milestone_member("PRJ-0/Stage 0")),
+    );
+}
+
+#[trace("FR-004-AC-14", "FR-016-AC-11")]
+#[test]
+fn one_project_with_many_milestones_stops_the_owner_scan_at_the_deadline() {
+    // Both pass the exact pass over the whole list. The first milestone ends the owner
+    // scan at once, the last only after every milestone of the project.
+    assert_nested_phase_stops_at_the_deadline(
+        "milestone owner",
+        &nested_snapshot(),
+        &team_input("SWM", milestone_member("m-0")),
+        &team_input("SWM", milestone_member(&format!("m-{LAST}"))),
+    );
+}
+
+#[trace("FR-004-AC-14", "FR-016-AC-11")]
+#[test]
+fn one_project_with_many_team_keys_stops_the_team_known_scan_at_the_deadline() {
+    // No issues, so a team is known only from the project's team list: the first key ends
+    // the scan at once, the last only after every key.
+    assert_nested_phase_stops_at_the_deadline(
+        "team known",
+        &nested_snapshot(),
+        &team_input("T-0", vec![]),
+        &team_input(&format!("T-{LAST}"), vec![]),
+    );
+}
+
+#[trace("FR-004-AC-14", "FR-016-AC-11")]
+#[test]
+fn one_project_with_many_team_keys_stops_the_holds_team_work_scan_at_the_deadline() {
+    // Each team is known from an issue at once. Whether the project holds that team's
+    // work is then found in its team list: at the first key, or after every key.
+    let project = || vec![NamedMemberInput::Project("p0".into())];
+    assert_nested_phase_stops_at_the_deadline(
+        "project holds team work",
+        &nested_snapshot_with_team_issues(),
+        &team_input("T-0", project()),
+        &team_input(&format!("T-{LAST}"), project()),
+    );
+}

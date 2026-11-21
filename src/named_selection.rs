@@ -423,3 +423,134 @@ fn canonical_member(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::{Duration, Instant};
+
+    use ix_trace_rs::trace;
+
+    use super::*;
+    use crate::Clock;
+    use crate::read_bound::Deadline;
+
+    fn initiative(id: &str) -> NamedMember {
+        NamedMember::Initiative { id: id.into() }
+    }
+
+    fn project(id: &str) -> NamedMember {
+        NamedMember::Project { id: id.into() }
+    }
+
+    fn milestone(id: &str, project_id: &str) -> NamedMember {
+        NamedMember::Milestone {
+            id: id.into(),
+            project_id: project_id.into(),
+        }
+    }
+
+    fn issue(id: &str) -> NamedMember {
+        NamedMember::Issue { id: id.into() }
+    }
+
+    /// Every kind, out of order, with duplicates and two milestones sharing one ID.
+    fn mixed() -> Vec<NamedMember> {
+        vec![
+            issue("t2"),
+            milestone("m2", "p1"),
+            project("p2"),
+            initiative("i2"),
+            milestone("m1", "p2"),
+            issue("t1"),
+            milestone("m1", "p1"),
+            project("p1"),
+            initiative("i1"),
+            milestone("m1", "p2"),
+            issue("t2"),
+            initiative("i1"),
+            project("p1"),
+        ]
+    }
+
+    fn canonical_mixed() -> Vec<NamedMember> {
+        vec![
+            initiative("i1"),
+            initiative("i2"),
+            project("p1"),
+            project("p2"),
+            milestone("m1", "p1"),
+            milestone("m1", "p2"),
+            milestone("m2", "p1"),
+            issue("t1"),
+            issue("t2"),
+        ]
+    }
+
+    #[trace("FR-016-AC-6", "FR-016-AC-11")]
+    #[test]
+    fn the_bounded_and_unbounded_orderings_are_one_rule_for_every_kind() {
+        let mut reversed = mixed();
+        reversed.reverse();
+        let lists = [
+            Vec::new(),
+            vec![project("p1"), project("p1")],
+            vec![milestone("m1", "p2"), milestone("m1", "p1")],
+            mixed(),
+            reversed,
+        ];
+        for list in lists {
+            let unbounded = canonical_list(list.clone());
+            assert_eq!(
+                canonical_list_within(list.clone(), Budget::unbounded()).expect("no bound"),
+                unbounded
+            );
+            let built = NamedSelection::new(TeamKey("SWM".into()), list.clone(), list);
+            assert_eq!(built.include, unbounded);
+            assert_eq!(built.exclude, unbounded);
+        }
+        assert_eq!(canonical_list(mixed()), canonical_mixed());
+        assert!(canonical_list(Vec::new()).is_empty());
+    }
+
+    /// A clock that moves one second on every reading, so each budget check costs one.
+    struct StepClock {
+        base: Instant,
+        reads: AtomicU32,
+    }
+
+    impl Clock for StepClock {
+        fn now_epoch_seconds(&self) -> i64 {
+            0
+        }
+
+        fn monotonic_now(&self) -> Instant {
+            let reads = self.reads.fetch_add(1, Ordering::SeqCst);
+            self.base + Duration::from_secs(1) * reads
+        }
+    }
+
+    #[trace("FR-004-AC-14", "FR-016-AC-11")]
+    #[test]
+    fn the_shared_ordering_checks_the_budget_for_every_member_it_orders() {
+        let clock = StepClock {
+            base: Instant::now(),
+            reads: AtomicU32::new(0),
+        };
+        let deadline = Deadline::start(&clock, Duration::from_secs(5));
+        assert!(matches!(
+            canonical_list_within(mixed(), Budget::within(&deadline)),
+            Err(Error::ReadTimeout { .. })
+        ));
+
+        let clock = StepClock {
+            base: Instant::now(),
+            reads: AtomicU32::new(0),
+        };
+        let deadline = Deadline::start(&clock, Duration::from_secs(1_000));
+        assert_eq!(
+            canonical_list_within(mixed(), Budget::within(&deadline)).expect("time to spare"),
+            canonical_mixed()
+        );
+    }
+}
