@@ -1984,7 +1984,12 @@ const INCLUDE_LABELS: [&str; 10] = [
     "ticket by id",
     "delivery by key",
 ];
-const EXCLUDE_LABELS: [&str; 4] = ["skip ticket", "skip other", "skip alpha", "skip ticket again"];
+const EXCLUDE_LABELS: [&str; 4] = [
+    "skip ticket",
+    "skip other",
+    "skip alpha",
+    "skip ticket again",
+];
 
 #[trace("FR-016-AC-11", "FR-016-AC-6")]
 #[test]
@@ -2114,7 +2119,11 @@ fn a_caller_attaches_its_own_labels_to_aliases_and_repeats_without_resolving_aga
         by_member[&(NamedList::Include, want_milestone("uuid-m2", "uuid-alpha"))],
         ["beta of alpha"]
     );
-    assert_eq!(source.reads(), 1, "labels were attached with no second read");
+    assert_eq!(
+        source.reads(),
+        1,
+        "labels were attached with no second read"
+    );
 }
 
 #[trace("FR-016-AC-11")]
@@ -2269,20 +2278,14 @@ fn a_good_member_then_a_bad_one_returns_no_selection_and_no_associations() {
         Err(Error::AmbiguousMilestone { .. })
     ));
     assert!(matches!(
-        refuse(
-            good(),
-            vec![NamedMemberInput::Project("Nothing".into())]
-        ),
+        refuse(good(), vec![NamedMemberInput::Project("Nothing".into())]),
         Err(Error::ScopeSelection {
             kind: "project",
             ..
         })
     ));
     assert!(matches!(
-        refuse(
-            good(),
-            vec![milestone_input("PRJ-1/Beta", Some("PRJ-2"))]
-        ),
+        refuse(good(), vec![milestone_input("PRJ-1/Beta", Some("PRJ-2"))]),
         Err(Error::NamedMemberRejected {
             outcome: MemberOutcome::ProjectMismatch,
             ..
