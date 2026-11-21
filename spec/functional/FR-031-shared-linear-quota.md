@@ -47,8 +47,10 @@ in the range `0 < share <= 0.5`, including explicit overrides, leaving at least
 remain within that range. Business SHALL be selected
 for the owner's installation through configuration, not a global default.
 A local budget rejection SHALL make no
-request, use the same stale fallback eligibility, and emit a distinct
-`Linear local budget exhausted; retry in <N>s` diagnostic. Unknown complexity
+request and use the same stale fallback eligibility. Local-window exhaustion,
+server reserve holds, and actual-server cooldown SHALL have the distinct typed
+states and truthful diagnostics defined by
+[FR-032](FR-032-quota-admission-recovery.md). Unknown complexity
 SHALL use a documented conservative estimate, never zero.
 
 ## Acceptance Criteria
@@ -58,7 +60,7 @@ SHALL use a documented conservative estimate, never zero.
 | FR-031-AC-1 | A fixture HTTP 429 with a non-JSON body and Retry-After, and a GraphQL RATELIMITED fixture with exhausted request/complexity resets, persist the latest applicable retry-until; two observations never shorten it; absent usable metadata yields 60 seconds. | Test |
 | FR-031-AC-2 | After one process records cooldown, a separately launched process using the same cache attempts workspace, direct issue, history, probe, and force-refresh reads and sends zero requests until expiry; after expiry one eligible attempt is permitted. | Test |
 | FR-031-AC-3 | With 2.1 seconds remaining the actual-server diagnostic is exactly `Linear rate limited; retry in 3s`; no retry or sleep occurs, and an empty cache fails without network. | Test |
-| FR-031-AC-4 | With fixture request/complexity budgets and two competing processes, aggregate sends never exceed either budget; every direct/history request is counted, unknown cost uses the documented estimate, quota reserve prevents the next send, and local refusal has its distinct diagnostic. | Test |
+| FR-031-AC-4 | With fixture request/complexity budgets and two competing processes, aggregate sends never exceed either budget; every direct/history request is counted, unknown cost uses the documented estimate, quota reserve prevents the next send, and local refusal has its distinct typed diagnostic under [FR-032](FR-032-quota-admission-recovery.md). | Test |
 | FR-031-AC-5 | Counters record requests attempted, returned complexity when available, estimated complexity otherwise, duration, mode, and success/failure for each refresh; partial failed refresh costs remain counted and are never described as a successful sync. | Test |
 | FR-031-AC-6 | `ix-board cache status` returns cache path, dataset coverage, snapshot age/staleness, last successful sync/full reconciliation, `rate_limit_until`, local budget/reset and latest refresh counters in JSON and text without resolving credentials or making any network request; unknown values are explicit. | Test |
 | FR-031-AC-7 | Tier fixtures produce the documented API-key/OAuth fallback limits and multipliers, default to free/basic with at most 50 percent share, and honor lower actual header capacity; explicit shares 0.1 and 0.5 apply to both request and complexity capacities, while zero, negative, above-0.5, non-finite, or malformed shares fail before network access. Two API keys sharing the cache consume one allowance and a query exceeding 10,000 estimated complexity is refused locally. | Test |
