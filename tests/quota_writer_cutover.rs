@@ -132,6 +132,12 @@ fn old_inflight_http_and_graphql_429_cannot_be_followed_by_a_new_send() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("quota.sqlite");
         legacy_schema(&path, true);
+        if graphql {
+            Connection::open(&path)
+                .unwrap()
+                .execute("UPDATE linear_shared_quota SET cooldown=?1", [NOW + 3000])
+                .unwrap();
+        }
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let fixture = listener.try_clone().unwrap();
         let (accepted_tx, accepted_rx) = mpsc::channel();
@@ -173,7 +179,14 @@ fn old_inflight_http_and_graphql_429_cannot_be_followed_by_a_new_send() {
         let clock = Arc::new(GateClock(AtomicI64::new(NOW)));
         let current = gate(&path, &clock);
         let decision = current.decision(10).unwrap();
-        assert_eq!(decision.state, QuotaState::EvidenceUnavailable);
+        assert_eq!(
+            decision.state,
+            if graphql {
+                QuotaState::ServerBackoff
+            } else {
+                QuotaState::EvidenceUnavailable
+            }
+        );
         assert_eq!(decision.legacy_pending_reservations, 1);
         release_tx.send(()).unwrap();
         let mut response = String::new();
@@ -206,7 +219,7 @@ fn old_inflight_http_and_graphql_429_cannot_be_followed_by_a_new_send() {
         assert_eq!(before, (1, 10000, 123, 0));
         assert_eq!(
             current.status().unwrap().rate_limit_until,
-            None,
+            if graphql { Some(NOW + 3000) } else { None },
             "an unrecordable old response must not invent a known actual cooldown"
         );
         for time in [NOW, NOW + 90_000, NOW + 3_600_001] {
@@ -215,7 +228,11 @@ fn old_inflight_http_and_graphql_429_cannot_be_followed_by_a_new_send() {
             let refusal = reopened.reserve_evaluated(10, None).unwrap_err();
             assert_eq!(
                 refusal.quota_decision().unwrap().state,
-                QuotaState::EvidenceUnavailable
+                if graphql && time < NOW + 3000 {
+                    QuotaState::ServerBackoff
+                } else {
+                    QuotaState::EvidenceUnavailable
+                }
             );
             assert_eq!(
                 refusal
@@ -386,4 +403,45 @@ fn quota_only_migration_preserves_complete_snapshot_partition_and_success_marker
         .unwrap(),
         ("existing-summary".to_owned(), b"{}".to_vec(), 900, 800)
     );
+}
+
+#[trace("FR-032-AC-6")]
+#[test]
+fn old_admission_committed_before_migration_is_quarantined_at_the_same_cutover() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("quota.sqlite");
+    legacy_schema(&path, false);
+    let mut old = Connection::open(&path).unwrap();
+    let transaction = old
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    transaction
+        .execute(
+            "UPDATE linear_shared_quota SET requests=requests+1,complexity=complexity+10000",
+            [],
+        )
+        .unwrap();
+    transaction.execute("INSERT INTO linear_quota_reservations(generation,estimate,server_complexity_generation) VALUES(0,10000,0)",[]).unwrap();
+    let clock = Arc::new(GateClock(AtomicI64::new(NOW)));
+    let (starting_tx, starting_rx) = mpsc::channel();
+    let migrate_path = path.clone();
+    let migrate_clock = clock.clone();
+    let worker = std::thread::spawn(move || {
+        starting_tx.send(()).unwrap();
+        gate(&migrate_path, &migrate_clock)
+    });
+    starting_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    transaction.commit().unwrap();
+    let migrated = worker.join().unwrap();
+    assert_eq!(
+        migrated.decision(10).unwrap().legacy_pending_reservations,
+        1,
+        "the migration cannot miss an old reservation whose write transaction preceded its fence"
+    );
+    assert_eq!(
+        migrated.decision(10).unwrap().state,
+        QuotaState::EvidenceUnavailable
+    );
+    assert_upgrade(&old.execute("INSERT INTO linear_quota_reservations(generation,estimate,server_complexity_generation) VALUES(0,10000,0)",[]).unwrap_err());
+    assert_eq!(obligations(&old), (1, 10000, 123, 0));
 }

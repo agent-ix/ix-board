@@ -71,7 +71,8 @@ Summary and stale envelopes include `last_successful_sync` and `last_full_reconc
 Library callers can inspect `refresh_outcome()` for cache reuse, refresh success, quota
 refusal, source failure, or lock refusal. Native summary callers obtain the same typed
 metadata through `summary_snapshot_cached_with_outcome()`. The captured quota decision
-belongs to that attempt. Older envelopes with absent outcome metadata read as unknown.
+belongs to that attempt. Bounded reads retain the decision through this accessor
+while preserving their existing typed errors and strict refusal of stale data. Older envelopes with absent outcome metadata read as unknown.
 
 `IX_BOARD_CACHE_PATH` selects the database path. See [setup](setup.md#cache-location)
 for the default locations. `focus hygiene` also stores its most recent baseline
