@@ -15,6 +15,8 @@ use std::net::TcpListener;
 use std::sync::mpsc;
 use std::time::Duration;
 
+type FixtureResponse = (u16, Vec<(&'static str, String)>, Value);
+
 struct ElapsedRefreshClock {
     before: i64,
     after: i64,
@@ -282,7 +284,7 @@ fn fixture_endpoint(
 }
 
 fn fixture_responses(
-    responses: Vec<(u16, Vec<(&'static str, String)>, Value)>,
+    responses: Vec<FixtureResponse>,
 ) -> (
     LinearGraphQlSource,
     mpsc::Receiver<Vec<Value>>,
