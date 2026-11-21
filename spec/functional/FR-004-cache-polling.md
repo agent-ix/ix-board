@@ -7,27 +7,49 @@ relationships:
     type: implements
 provenance:
   source: SWM-2
-description: The ix-board read library SHALL use a local SQLite cache and refresh cached Linear data on a five-minute polling cadence.
+description: The ix-board read library SHALL share coordinated SQLite snapshots with explicit freshness and strict opt-in bounded reads.
 dependencies: []
 ---
 # FR-004: Refresh cached Linear reads by polling
 
 ## Description
 
-The ix-board read library SHALL use SQLite to cache structured Linear read data.
-Each cache entry expires five minutes after it is fetched. A read of an expired
-entry SHALL refresh it from Linear before returning. A refresh failure SHALL
-return an error. Stale cache data SHALL NOT be returned after a failed refresh.
-A successful refresh SHALL replace the expired value.
+The ix-board read library SHALL use shared SQLite storage to cache structured
+Linear read data. Ordinary reads SHALL reuse a snapshot within the configured
+TTL and otherwise attempt the coordinated incremental refresh defined by
+[FR-030](FR-030-incremental-linear-cache.md). TTL SHALL resolve from
+`IX_BOARD_CACHE_TTL_SECONDS`, then `[cache].ttl_seconds` in configuration, then
+300 seconds. Values SHALL be positive integer seconds; invalid explicit values
+SHALL fail before network access. The default remains five minutes after adopting
+incremental reads; a longer lifetime is not the quota remedy.
+
+Before refreshing a dataset, the coordinator SHALL acquire an exclusive OS file
+lock adjacent to the shared SQLite file and recheck freshness and quota state
+after acquisition. The lock SHALL cover refresh and atomic publication; lock
+ownership SHALL be released by RAII and process termination. An ordinary wait
+SHALL last at most five seconds; a bounded wait SHALL also respect its remaining
+deadline. Waiters SHALL reuse a completed refresh rather than duplicate it. A
+forced refresh SHALL bypass TTL only, never quota, locking, or freshness recheck
+against a refresh completed after the operation began.
+
+If cooldown, local quota refusal, lock timeout, or refresh failure prevents an
+ordinary read, the service SHALL return its last complete compatible snapshot
+when available. All such CLI results SHALL expose `stale`, `age_seconds`, and
+`rate_limit_until` in JSON and equivalent labeled text; age SHALL refer to the
+last successful source-fetch start, never the failed attempt. Unknown age SHALL
+be null/unknown and SHALL NOT be reported fresh. The result SHALL retain the
+failure reason; an unavailable component SHALL remain unavailable rather than
+becoming a zero count. Without a complete snapshot the read SHALL fail with a
+typed error. No failure SHALL advance successful freshness or sync metadata.
+The strict bounded-read contract below overrides ordinary fallback.
 
 ## Bounded reads (opt-in)
 
 The library SHALL additionally offer a **bounded read** that a caller opts into
 with an explicit read policy: a maximum cache age and an operation-wide
 deadline. The policy is a parameter of the new operation only. Every existing
-read method keeps its legacy behavior: the five-minute entry lifetime, the
-30-second per-request transport timeout, the existing typed errors, and no
-deadline.
+read method keeps its signature and the 30-second per-request transport timeout;
+ordinary reads adopt the coordinated TTL and explicitly labeled fallback above.
 
 - **Age.** A cached entry satisfies the policy only when the age of the data,
   measured from when the source read that produced it began, is no greater than
@@ -36,9 +58,9 @@ deadline.
   the time of a later read. An entry that cannot show when its source read
   began (for example an entry written before that evidence was kept) does not
   satisfy a policy. An entry that does not satisfy the policy is refreshed under
-  the same deadline. A maximum age above the five-minute entry lifetime is
+  the same deadline. A maximum age above the fixed 300-second ceiling is
   refused as an invalid policy; the policy can only be stricter than the
-  legacy lifetime.
+  300-second bounded-read ceiling, independently of the configurable ordinary TTL.
 - **Deadline.** The deadline is the bound on the whole operation, measured from
   the start below, with no additional allowance of one request timeout. It covers
   the whole operation: the cache read and any
@@ -72,7 +94,7 @@ deadline.
 
 - Structured Linear records obtained through the read client.
 - Cached records and their refresh metadata.
-- The five-minute cache-entry lifetime.
+- The configured ordinary cache-entry lifetime (default five minutes).
 - For a bounded read only: the caller's maximum cache age and operation-wide
   deadline, and a source that can honor them.
 
@@ -80,7 +102,7 @@ deadline.
 
 - Cached records for reads that do not require a refresh.
 - Refreshed records after a successful poll observes source changes.
-- An error when an expired entry cannot be refreshed.
+- A labeled last complete snapshot, or typed error without one, when refresh fails.
 - For a bounded read: the snapshot with its actual source fetch time, or a
   typed timeout, unsupported-bound, invalid-policy, rate-limit, or existing
   failure error, and no partial snapshot.
@@ -91,7 +113,7 @@ deadline.
 |----|----------|--------------|
 | FR-004-AC-1 | Given an unexpired cache entry, repeated fixture reads use the cached value and return identical results without another source read. | Test |
 | FR-004-AC-2 | Given an expired entry and a changed fixture source, the next read refreshes and returns the changed value. | Test |
-| FR-004-AC-3 | Given an expired entry and a failed fixture refresh, the read returns an error and does not return the stale value. | Test |
+| FR-004-AC-3 | Given an expired complete entry and a failed or rate-limited fixture refresh, an ordinary read returns that entry labeled stale with its unchanged actual age and cooldown in JSON and text; without a complete entry it returns a typed error; a bounded read returns no stale snapshot. | Test |
 | FR-004-AC-4 | Given identical cache state and fixture source, repeated reads return identical results. | Test |
 | FR-004-AC-5 | Given an absolute `XDG_CACHE_HOME` on Unix with `HOME` unset or set, the CLI and `ReadService::open_default` both select `<XDG_CACHE_HOME>/ix-board/linear.sqlite3`; given no absolute `XDG_CACHE_HOME` and a set `HOME`, both select `<HOME>/.cache/ix-board/linear.sqlite3`; given `IX_BOARD_CACHE_PATH`, both select that path instead. | Test |
 | FR-004-AC-6 | Given a non-absolute or absent `XDG_CACHE_HOME`, the library falls back to the available home directory; given neither an absolute XDG cache directory nor a home directory, the library returns `CacheDirectoryUnavailable` and invents no path. | Test |
@@ -99,7 +121,7 @@ deadline.
 | FR-004-AC-8 | Issue queries use a page size of 50 records. | Test |
 | FR-004-AC-9 | A structured RATELIMITED response produces a typed LinearRateLimited error. | Test |
 | FR-004-AC-10 | A rate-limit error carries the cooldown derived from exhausted quota resets. | Test |
-| FR-004-AC-11 | Without a read policy, every existing read method keeps the 300-second entry lifetime, the 30-second per-request timeout, no deadline, and its existing typed errors; AC-1 through AC-10 pass unchanged and no existing method signature requires a new argument. | Test |
+| FR-004-AC-11 | Without a read policy, existing method signatures require no new argument and preserve the 30-second per-request timeout; TTL is 300 seconds by default, explicit environment overrides configuration, and zero/negative/non-integer TTL fails before a request. | Test |
 | FR-004-AC-12 | Given a bounded read with maximum age 240 seconds, an entry whose source read began 200 seconds earlier is returned with no source read, and an entry whose source read began 250 seconds earlier is refreshed; a maximum age of 301 seconds or more is refused as an invalid policy with no source read. | Test |
 | FR-004-AC-13 | Given a snapshot whose source read began 250 seconds ago but whose cache write or report occurred 10 seconds ago, a bounded read with maximum age 240 seconds refreshes it; an entry with no evidence of when its source read began is refreshed rather than accepted; the returned fetch time is the actual source fetch time. | Test |
 | FR-004-AC-14 | Given a fake source whose pages never complete, a bounded read with deadline D returns the typed timeout with an elapsed time of at most D plus a stated scheduler and clock-precision tolerance of 250 milliseconds, and never D plus a further legacy request timeout; with a controlled clock the elapsed time is exactly D; no page or nested read begins after D, and each request is issued with a timeout no greater than the time remaining, so a request begun with 5 seconds remaining carries a timeout of at most 5 seconds. | Test |
@@ -108,6 +130,8 @@ deadline.
 | FR-004-AC-17 | A source that cannot honor a bound returns the explicit unsupported-bound error before any source read; its legacy read method still works unchanged. | Test |
 | FR-004-AC-18 | A structured RATELIMITED response during a bounded read returns the existing typed rate-limit error with its cooldown, not a timeout, and the library does not retry or sleep; a deadline that expires first returns the timeout. | Test |
 | FR-004-AC-19 | Given a cache that is locked for longer than the deadline, a bounded read returns the typed timeout within the deadline and does not read the source; a refreshed entry is written to the cache only before expiry. | Test |
+| FR-004-AC-20 | Two separately launched processes read the same expired dataset concurrently; exactly one source refresh occurs and the waiter reuses it after rechecking. A held lock causes ordinary fallback/error within five seconds, and terminating the owner releases the OS lock without a stale lockfile preventing recovery. | Test |
+| FR-004-AC-21 | A summary refresh, failed refresh, or fallback never advances detail freshness; pre-provenance snapshots have unknown age and fail bounded freshness checks. Fallback preserves unavailable components and does not invent zero values. | Test |
 
 ## Dependencies
 

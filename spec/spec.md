@@ -39,7 +39,9 @@ with the last successful report for that focus.
 - The `next --team <T>`, `project-chunk <project>`, and `search <query>` read
   commands and their corresponding library behavior.
 - Ready-queue eligibility, blocker layers, reasons, and ordering.
-- Structured Linear data reads and the SQLite cache with a five-minute poll.
+- Shared incremental Linear reads, summary/detail coverage, and SQLite caching
+  with configurable TTL (default five minutes), coordinated refresh, quota
+  backoff, and explicitly labeled last-snapshot fallback for ordinary reads.
 - Fixture-backed checks for queue layering, readiness, and cache invalidation.
 - The warm-cache latency target and team-leader skill handoff.
 - `project set-status` for `Started`/`Paused` and `project set-priority` for
@@ -138,6 +140,14 @@ records through Linear GraphQL and caches read results locally.
 - Library consumers rely on the same deterministic read results and queue rules.
 
 ## Requirements Architecture
+
+SWM-184 adds [US-010](./usecase/US-010-read-within-linear-quota.md),
+[FR-030](./functional/FR-030-incremental-linear-cache.md), and
+[FR-031](./functional/FR-031-shared-linear-quota.md). It revises
+[FR-004](./functional/FR-004-cache-polling.md) ordinary freshness/fallback while
+preserving strict bounded reads, and uses native summaries for
+[FR-020](./functional/FR-020-program-roadmap.md) and
+[FR-019](./functional/FR-019-program-scope-check.md).
 
 The use case US-001 traces to FR-001 through FR-007 and NFR-001. US-002 traces
 to FR-008 and FR-009, which depend on the queue and structured-data boundary.
