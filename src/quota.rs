@@ -438,8 +438,6 @@ impl QuotaGate {
                 provenance TEXT NOT NULL, paired_reset INTEGER NOT NULL, capacity INTEGER
             );").map_err(Error::Cache)?;
             transaction.execute_batch("CREATE INDEX IF NOT EXISTS quota_observation_expiry ON linear_quota_observations(expires_at);
-                CREATE INDEX IF NOT EXISTS quota_observation_dominates ON linear_quota_observations(dimension,expires_at,remaining-charge);
-                CREATE INDEX IF NOT EXISTS quota_observation_dominated ON linear_quota_observations(dimension,remaining-charge,expires_at);
                 CREATE INDEX IF NOT EXISTS quota_observation_remaining ON linear_quota_observations(dimension,remaining);").map_err(Error::Cache)?;
             let migrated: bool = transaction.query_row("SELECT paired_evidence FROM linear_shared_quota WHERE singleton=1", [], |row| row.get(0)).map_err(Error::Cache)?;
             if !migrated {
