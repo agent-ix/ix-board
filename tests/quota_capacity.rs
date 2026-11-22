@@ -138,3 +138,83 @@ fn full_business_allocation_across_three_windows_keeps_non_dominated_evidence_av
         max_operation.as_millis()
     );
 }
+
+#[trace("FR-032-AC-5", "FR-032-AC-6", "FR-032-AC-10")]
+#[test]
+fn upgraded_capacity_preserves_previous_lost_evidence_hold_until_its_absolute_expiry() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("quota.sqlite");
+    let clock = Arc::new(Clock(AtomicI64::new(NOW)));
+    let config = QuotaConfig {
+        tier: PlanTier::Business,
+        ..QuotaConfig::default()
+    };
+    let gate = QuotaGate::open_with_clock(&path, &config, clock.clone()).unwrap();
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch("BEGIN IMMEDIATE; UPDATE linear_shared_quota SET paired_writer=1")
+        .unwrap();
+    db.execute("UPDATE linear_shared_quota SET request_limit=5000,complexity_limit=6000000,requests=555,complexity=194396,evidence_error_until=?1",[NOW+5000]).unwrap();
+    db.execute_batch("UPDATE linear_shared_quota SET paired_writer=0; COMMIT")
+        .unwrap();
+    // Additional safely retained metadata cannot recover constraints discarded by
+    // the previous binary. Preserve its persisted unknown-evidence deadline.
+    for request in 0..600 {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-ratelimit-requests-remaining",
+            (4441 + request).to_string().parse().unwrap(),
+        );
+        headers.insert(
+            "x-ratelimit-requests-reset",
+            (NOW + 6000 + request).to_string().parse().unwrap(),
+        );
+        gate.observe_headers(200, &headers, None).unwrap();
+    }
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM linear_quota_observations",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        600,
+        "new capacity retains observations beyond the former cap"
+    );
+    for time in [NOW, NOW + 4999] {
+        clock.0.store(time, Ordering::SeqCst);
+        let reopened = QuotaGate::open_with_clock(&path, &config, clock.clone()).unwrap();
+        let error = reopened.reserve_evaluated(10_000, None).unwrap_err();
+        assert_eq!(
+            error.quota_decision().unwrap().state,
+            QuotaState::EvidenceUnavailable
+        );
+        assert_eq!(
+            error.quota_decision().unwrap().next_reevaluation_at,
+            Some(NOW + 5000)
+        );
+        let status = reopened.status().unwrap();
+        assert_eq!(
+            (status.requests_used, status.complexity_used),
+            (555, 194396)
+        );
+        assert_eq!(status.rate_limit_until, None);
+    }
+    clock.0.store(NOW + 5000, Ordering::SeqCst);
+    let reopened = QuotaGate::open_with_clock(&path, &config, clock).unwrap();
+    assert_eq!(
+        reopened.decision(10_000).unwrap().state,
+        QuotaState::Available
+    );
+    reopened.reserve_evaluated(10_000, None).unwrap();
+    assert_eq!(reopened.status().unwrap().requests_used, 556);
+    assert_eq!(
+        db.query_row(
+            "SELECT evidence_error_until FROM linear_shared_quota",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        NOW + 5000,
+        "upgrade did not erase or rewrite lost evidence"
+    );
+}

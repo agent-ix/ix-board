@@ -950,17 +950,17 @@ impl QuotaGate {
             }
             evidence.observed_at = Some(observed);
             evidence.paired_reset = paired;
-            // Available observations remain visible as evidence, independently of blockers.
+            // Report a restrictive representative per dimension without serializing
+            // the complete frontier. Every observation is evaluated and every
+            // actual blocker remains present independently of this summary.
             if let Some(previous) = decision
                 .evidence
                 .iter_mut()
                 .find(|previous| previous.dimension == evidence.dimension)
             {
-                let margin = effective.saturating_sub(reserve);
-                let previous_margin = previous
-                    .effective_remaining
-                    .unwrap_or(0)
-                    .saturating_sub(previous.reserve.unwrap_or(0));
+                let margin = i128::from(effective) - i128::from(reserve);
+                let previous_margin = i128::from(previous.effective_remaining.unwrap_or(0))
+                    - i128::from(previous.reserve.unwrap_or(0));
                 if (margin, evidence.deadline, evidence.observation_id)
                     < (previous_margin, previous.deadline, previous.observation_id)
                 {
