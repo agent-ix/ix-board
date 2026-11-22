@@ -19,6 +19,13 @@ use crate::{Deadline, Error};
 /// Conservative charge when the transport cannot estimate a query's complexity.
 pub const UNKNOWN_COMPLEXITY: u64 = 10_000;
 
+// Three dimensions, 12,500 requests/window at the largest documented fallback
+// (Enterprise OAuth, half share, zero reserve), and adjacent boundary bursts
+// require 75,000 live observations for a one-window evidence horizon. Three
+// complete populations require 112,500. Keep an explicit hard ceiling above both;
+// longer horizons or unusually large actual limits still fail closed at the bound.
+const OBSERVATION_CAPACITY: u64 = 131_072;
+
 /// Linear subscription used only when the server has supplied no actual limit.
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -430,6 +437,10 @@ impl QuotaGate {
                 observed_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
                 provenance TEXT NOT NULL, paired_reset INTEGER NOT NULL, capacity INTEGER
             );").map_err(Error::Cache)?;
+            transaction.execute_batch("CREATE INDEX IF NOT EXISTS quota_observation_expiry ON linear_quota_observations(expires_at);
+                CREATE INDEX IF NOT EXISTS quota_observation_dominates ON linear_quota_observations(dimension,expires_at,remaining-charge);
+                CREATE INDEX IF NOT EXISTS quota_observation_dominated ON linear_quota_observations(dimension,remaining-charge,expires_at);
+                CREATE INDEX IF NOT EXISTS quota_observation_remaining ON linear_quota_observations(dimension,remaining);").map_err(Error::Cache)?;
             let migrated: bool = transaction.query_row("SELECT paired_evidence FROM linear_shared_quota WHERE singleton=1", [], |row| row.get(0)).map_err(Error::Cache)?;
             if !migrated {
                 for (dimension, remaining, reset, limit) in [
@@ -942,7 +953,24 @@ impl QuotaGate {
             evidence.observed_at = Some(observed);
             evidence.paired_reset = paired;
             // Available observations remain visible as evidence, independently of blockers.
-            decision.evidence.push(evidence.clone());
+            if let Some(previous) = decision
+                .evidence
+                .iter_mut()
+                .find(|previous| previous.dimension == evidence.dimension)
+            {
+                let margin = effective.saturating_sub(reserve);
+                let previous_margin = previous
+                    .effective_remaining
+                    .unwrap_or(0)
+                    .saturating_sub(previous.reserve.unwrap_or(0));
+                if (margin, evidence.deadline, evidence.observation_id)
+                    < (previous_margin, previous.deadline, previous.observation_id)
+                {
+                    *previous = evidence.clone();
+                }
+            } else {
+                decision.evidence.push(evidence.clone());
+            }
             if effective < reserve.saturating_add(estimate) {
                 decision.blockers.push(evidence);
             }
@@ -1049,7 +1077,7 @@ impl QuotaGate {
                 if dominated { continue; }
                 transaction.execute("DELETE FROM linear_quota_observations WHERE dimension=?1 AND remaining-charge>=?2-?3 AND expires_at<=?4 AND COALESCE(capacity,0)<=?5",params![dimension,remaining,charge,expiry,capacity.unwrap_or(0)]).map_err(Error::Cache)?;
                 let count: u64 = transaction.query_row("SELECT COUNT(*) FROM linear_quota_observations",[],|row|row.get(0)).map_err(Error::Cache)?;
-                if count>=512 {
+                if count>=OBSERVATION_CAPACITY {
                     transaction.execute("UPDATE linear_shared_quota SET evidence_error_until=CASE WHEN evidence_error_until=-1 THEN -1 ELSE MAX(evidence_error_until,?1) END WHERE singleton=1",[expiry]).map_err(Error::Cache)?;
                 } else {
                     transaction.execute("INSERT INTO linear_quota_observations(dimension,remaining,charge,observed_at,expires_at,provenance,paired_reset,capacity) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![dimension,remaining,charge,now,expiry,provenance,reset.is_some(),capacity]).map_err(Error::Cache)?;
