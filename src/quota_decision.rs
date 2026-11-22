@@ -134,7 +134,7 @@ pub struct QuotaDecision {
     pub state: QuotaState,
     /// Every applicable independent hold.
     pub blockers: Vec<QuotaBlocker>,
-    /// Most restrictive live server evidence per dimension; all active blockers remain below.
+    /// Most restrictive live server evidence per dimension; all active guards remain in `blockers`.
     pub evidence: Vec<QuotaBlocker>,
     /// Absolute evaluation time in Unix milliseconds.
     pub evaluated_at: i64,
