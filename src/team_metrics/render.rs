@@ -89,6 +89,30 @@ pub fn render(
         types: BTreeSet::new(),
         count: 0,
     };
+    let frontier = state
+        .quota_frontier
+        .as_ref()
+        .filter(|q| (0..=90000).contains(&now.saturating_sub(q.at_ms)));
+    out.metric(
+        "ix_team_linear_quota_frontier_available",
+        "",
+        flag(frontier.is_some()),
+        false,
+    )?;
+    if let Some(frontier) = frontier {
+        out.metric(
+            "ix_team_linear_quota_observations",
+            "",
+            frontier.count as f64,
+            false,
+        )?;
+        out.metric(
+            "ix_team_linear_quota_frontier_timestamp_seconds",
+            "",
+            frontier.at_ms as f64 / 1000.0,
+            false,
+        )?;
+    }
     out.metric(
         "ix_team_exporter_journal_bytes",
         "",

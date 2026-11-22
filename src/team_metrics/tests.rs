@@ -317,6 +317,31 @@ fn export_omits_unknown_values_and_uses_only_bounded_labels() {
     assert!(text.contains("# TYPE ix_team_execution_seconds_total counter"));
 }
 
+/// Trace: FR-033-AC-11
+#[test]
+fn frontier_monitor_omits_missing_stale_and_future_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(dir.path());
+    let mut state = state(&config);
+    assert!(
+        !render(&config, &state, 0, 1000)
+            .unwrap()
+            .contains("ix_team_linear_quota_observations{")
+    );
+    state.quota_frontier = Some(super::quota_frontier::Observation {
+        count: 600,
+        at_ms: 1000,
+    });
+    let text = render(&config, &state, 0, 2000).unwrap();
+    assert!(text.contains("ix_team_linear_quota_observations{} 600"));
+    assert!(text.contains("ix_team_linear_quota_frontier_available{} 1"));
+    for now in [999, 91001] {
+        let text = render(&config, &state, 0, now).unwrap();
+        assert!(!text.contains("ix_team_linear_quota_observations{"));
+        assert!(text.contains("ix_team_linear_quota_frontier_available{} 0"));
+    }
+}
+
 /// Provenance: SWM-181; unsupported schemas cannot overwrite evidence.
 /// Trace: FR-033-AC-4
 #[test]

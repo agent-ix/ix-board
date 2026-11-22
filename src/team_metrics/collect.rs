@@ -101,6 +101,9 @@ impl Collector {
     }
     /// Polls the installed relay command and lifecycle sources on their own cadence.
     pub fn activity(&mut self, now: i64) -> Result<(), Error> {
+        self.state.quota_frontier = crate::default_cache_path()
+            .ok()
+            .and_then(|path| super::quota_frontier::read(&path, now).ok());
         let history = self.history(&CommandHistory, now);
         let leads: Vec<_> = self
             .config

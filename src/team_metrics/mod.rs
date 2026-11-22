@@ -6,6 +6,7 @@ mod config;
 mod history;
 mod journal;
 mod pr_stats;
+mod quota_frontier;
 mod render;
 mod reviews;
 mod timeline;

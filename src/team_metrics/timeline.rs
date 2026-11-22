@@ -10,6 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct State {
+    #[serde(default)]
+    pub(crate) quota_frontier: Option<super::quota_frontier::Observation>,
     pub(crate) cursor: String,
     pub(crate) history_from_ms: Option<i64>,
     pub(crate) history_at_ms: i64,
