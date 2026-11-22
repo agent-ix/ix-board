@@ -593,23 +593,26 @@ fn bounded_observation_storage_fails_closed_without_sliding_or_discarding_live_o
     let path = dir.path().join("quota.sqlite");
     let clock = Arc::new(Clock(AtomicI64::new(NOW)));
     let gate = open(&path, &clock, &QuotaConfig::default());
-    // Increasing remaining AND expiry form an antichain: neither owns the other.
-    for index in 0..513 {
-        request_observation(
-            &gate,
-            250 + index,
-            NOW + 1000 + i64::try_from(index).unwrap(),
-        );
-    }
+    // Seed the production bound directly so this safety fixture does not perform
+    // O(capacity²) header calls. The final observation uses the real insert path.
+    const CAPACITY: i64 = 131_072;
     let db = rusqlite::Connection::open(&path).unwrap();
-    let count: u64 = db
+    db.execute("WITH RECURSIVE positions(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM positions WHERE i+1<?1)
+        INSERT INTO linear_quota_observations(dimension,remaining,charge,observed_at,expires_at,provenance,paired_reset,capacity)
+        SELECT 'requests',250+i,0,?2,?2+1000+i,'headers',1,10000 FROM positions",rusqlite::params![CAPACITY,NOW]).unwrap();
+    request_observation(
+        &gate,
+        u64::try_from(250 + CAPACITY).unwrap(),
+        NOW + 1000 + CAPACITY,
+    );
+    let count: i64 = db
         .query_row(
             "SELECT COUNT(*) FROM linear_quota_observations",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(count, 512);
+    assert_eq!(count, CAPACITY);
     let decision = gate.decision(10).unwrap();
     assert_eq!(decision.state, QuotaState::EvidenceUnavailable);
     assert_eq!(
@@ -617,13 +620,13 @@ fn bounded_observation_storage_fails_closed_without_sliding_or_discarding_live_o
         Some(NOW + 1000)
     );
     assert_eq!(decision.next_reevaluation_at, Some(NOW + 1000));
-    clock.0.store(NOW + 1511, Ordering::SeqCst);
+    clock.0.store(NOW + 1000 + CAPACITY - 1, Ordering::SeqCst);
     assert_eq!(
         gate.decision(10).unwrap().state,
         QuotaState::EvidenceUnavailable,
         "unretained final observation remains conservatively guarded until its own expiry"
     );
-    clock.0.store(NOW + 1512, Ordering::SeqCst);
+    clock.0.store(NOW + 1000 + CAPACITY, Ordering::SeqCst);
     let decision = gate.decision(10).unwrap();
     assert_eq!(decision.state, QuotaState::Available);
     assert!(decision.evidence.is_empty());

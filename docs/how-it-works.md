@@ -51,6 +51,12 @@ reset headers. Late responses cannot refund charges from a newer local window.
 Server observations keep each remaining value with its own expiry and pending charges.
 A reset from another response cannot prolong an older reserve hold. Expired observations
 leave server headroom unknown; the configured local allocation still applies.
+Storage retains up to 131,072 paired observations. This covers the largest documented
+fallback allowance across adjacent full-window bursts with a one-window evidence horizon.
+Longer observation horizons or larger server-reported limits can reach this finite bound.
+A discarded constraint causes an unknown-evidence hold until its owning deadline.
+Increasing storage capacity preserves any such hold already recorded by an older client.
+Status summarizes nonblocking evidence by dimension and retains every active blocker.
 Server rate limits persist across processes; absent retry metadata means a 60-second cooldown.
 No request starts during cooldown, and commands do not sleep or retry.
 
