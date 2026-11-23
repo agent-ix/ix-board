@@ -26,8 +26,9 @@ pub(crate) fn read(path: &Path, now: i64) -> Result<Observation, rusqlite::Error
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ix_trace_rs::trace;
 
-    /// Trace: FR-033-AC-11
+    #[trace("FR-033-AC-11")]
     #[test]
     fn observing_a_frontier_above_512_does_not_change_the_database() {
         let directory = tempfile::tempdir().unwrap();

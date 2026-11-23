@@ -2,17 +2,19 @@
 // Copyright (C) 2026 Agent-IX
 //! Exporter-owned GitHub admission, persisted response cache and bounded queries.
 use super::Config;
+use super::github_http::Http;
 use crate::retro::sources::{GithubSource, MainCommit, PullRequest, PullRequestInfo};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub(super) const TTL_MS: i64 = 900_000;
 const HOUR_MS: i64 = 3_600_000;
-const MAX_BODY: usize = 1024 * 1024;
+pub(super) const MAX_BODY: usize = 1024 * 1024;
 const MAX_REQUESTS: i64 = 40;
 // Fixed selections expose at most 50 PR nodes and two one-item timeline
 // connections per PR (or 25 flat linked PR aliases). Reserve 25 points even
@@ -26,78 +28,26 @@ const MAX_QUERY: usize = 16 * 1024;
 const CACHE_BYTES: i64 = 4 * 1024 * 1024;
 
 pub(super) struct Request {
-    args: Vec<String>,
-    conditional: bool,
+    pub(super) fields: BTreeMap<String, String>,
+    pub(super) conditional: bool,
 }
 pub(super) struct Response {
-    status: u16,
-    headers: BTreeMap<String, String>,
-    body: String,
+    pub(super) status: u16,
+    pub(super) headers: BTreeMap<String, String>,
+    pub(super) body: String,
 }
 pub(super) trait Transport {
+    fn namespace(&self) -> &str;
     fn send(&self, request: &Request, etag: Option<&str>) -> Result<Response, String>;
 }
-pub(super) struct Gh;
-impl Transport for Gh {
-    fn send(&self, request: &Request, etag: Option<&str>) -> Result<Response, String> {
-        #[cfg(unix)]
-        {
-            let mut command = std::process::Command::new("gh");
-            command.args(["api", "--hostname", "github.com", "--include"]);
-            command.args(&request.args);
-            if let Some(etag) = etag {
-                command.args(["-H", &format!("If-None-Match: {etag}")]);
-            }
-            let output = super::history::command_output(
-                &mut command,
-                Duration::from_secs(20),
-                MAX_BODY + 32 * 1024,
-            )
-            .map_err(|e| e.to_string())?;
-            // gh exits nonzero for HTTP errors; parse their headers before returning failure.
-            let response = parse_http(&output.bytes)?;
-            if !output.status.success() && response.status < 400 && response.status != 304 {
-                return Err("GitHub command failed without an HTTP error".into());
-            }
-            Ok(response)
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (request, etag);
-            Err("GitHub exporter transport requires Unix/WSL".into())
-        }
-    }
+trait Clock: Send + Sync {
+    fn now_ms(&self) -> Result<i64, String>;
 }
-fn parse_http(bytes: &[u8]) -> Result<Response, String> {
-    let text = std::str::from_utf8(bytes).map_err(|_| "GitHub HTTP response is not UTF-8")?;
-    let (head, body) = text
-        .split_once("\r\n\r\n")
-        .or_else(|| text.split_once("\n\n"))
-        .ok_or("GitHub HTTP headers missing")?;
-    if head.len() > 32 * 1024 || body.len() > MAX_BODY {
-        return Err("GitHub response byte limit exceeded".into());
+struct SystemClock;
+impl Clock for SystemClock {
+    fn now_ms(&self) -> Result<i64, String> {
+        super::now_ms().map_err(|_| "GitHub clock unavailable".into())
     }
-    let mut lines = head.lines();
-    let status = lines
-        .next()
-        .filter(|s| s.starts_with("HTTP/"))
-        .and_then(|s| s.split_whitespace().nth(1))
-        .and_then(|s| s.parse::<u16>().ok())
-        .filter(|s| (100..=599).contains(s))
-        .ok_or("GitHub HTTP status missing")?;
-    let mut headers = BTreeMap::new();
-    for line in lines {
-        let (name, value) = line.split_once(':').ok_or("invalid GitHub HTTP header")?;
-        let name = name.to_ascii_lowercase();
-        if headers.insert(name, value.trim().to_owned()).is_some() {
-            return Err("duplicate GitHub HTTP header".into());
-        }
-    }
-    Ok(Response {
-        status,
-        headers,
-        body: body.into(),
-    })
 }
 struct Cached {
     body: String,
@@ -106,10 +56,17 @@ struct Cached {
 struct Guard<T> {
     db: RefCell<Connection>,
     transport: T,
+    clock: Arc<dyn Clock>,
     cache_bytes: i64,
 }
 impl<T: Transport> Guard<T> {
     fn open(config: &Config, transport: T) -> Result<Self, String> {
+        Self::with_clock(config, transport, Arc::new(SystemClock))
+    }
+    fn with_clock(config: &Config, transport: T, clock: Arc<dyn Clock>) -> Result<Self, String> {
+        if transport.namespace().is_empty() || transport.namespace().len() > 256 {
+            return Err("GitHub credential namespace unavailable".into());
+        }
         // Use the journal itself: two workers and restarted processes share admission,
         // response leases and the configured SQLite page ceiling, with no new quota file.
         let db = Connection::open(&config.state_path).map_err(|e| e.to_string())?;
@@ -132,10 +89,12 @@ impl<T: Transport> Guard<T> {
         }
         db.pragma_update(None, "max_page_count", config.max_bytes / page_size)
             .map_err(|e| e.to_string())?;
-        db.execute_batch("CREATE TABLE IF NOT EXISTS github_gate(id INTEGER PRIMARY KEY CHECK(id=1), cooldown INTEGER NOT NULL, lease INTEGER NOT NULL); INSERT OR IGNORE INTO github_gate VALUES(1,0,0); CREATE TABLE IF NOT EXISTS github_sends(at INTEGER NOT NULL, cost INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS github_responses(key TEXT PRIMARY KEY, body TEXT NOT NULL, etag TEXT, at INTEGER NOT NULL);").map_err(|e| e.to_string())?;
+        db.execute_batch("CREATE TABLE IF NOT EXISTS github_gate(id INTEGER PRIMARY KEY CHECK(id=1), cooldown INTEGER NOT NULL, lease INTEGER NOT NULL); INSERT OR IGNORE INTO github_gate VALUES(1,0,0); CREATE TABLE IF NOT EXISTS github_clock(id INTEGER PRIMARY KEY CHECK(id=1), at INTEGER NOT NULL); INSERT OR IGNORE INTO github_clock VALUES(1,0); CREATE TABLE IF NOT EXISTS github_sends(at INTEGER NOT NULL, cost INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS github_responses(key TEXT PRIMARY KEY, body TEXT NOT NULL, etag TEXT, at INTEGER NOT NULL);").map_err(|e| e.to_string())?;
+        db.execute("UPDATE github_clock SET at=max(at,coalesce((SELECT max(at) FROM github_sends),0),coalesce((SELECT max(at) FROM github_responses),0)) WHERE id=1", []).map_err(|e| e.to_string())?;
         Ok(Self {
             db: RefCell::new(db),
             transport,
+            clock,
             cache_bytes: i64::try_from(config.max_bytes / 8)
                 .map_err(|_| "cache budget overflow")?
                 .min(CACHE_BYTES),
@@ -144,17 +103,25 @@ impl<T: Transport> Guard<T> {
     fn request(
         &self,
         request: &Request,
-        now: i64,
-        validate: impl Fn(&str) -> Result<(), String>,
+        validate: impl Fn(&str, i64) -> Result<(), String>,
     ) -> Result<Cached, String> {
-        if request.args.iter().map(String::len).sum::<usize>() > MAX_QUERY {
+        let encoded = serde_json::to_vec(&request.fields).map_err(|_| "invalid GitHub request")?;
+        if encoded.len() > MAX_QUERY {
             return Err("GitHub query byte limit exceeded".into());
         }
         let key = format!(
             "{:x}",
-            Sha256::digest(serde_json::to_vec(&request.args).map_err(|e| e.to_string())?)
+            Sha256::digest(
+                serde_json::to_vec(&(
+                    self.transport.namespace(),
+                    &request.fields,
+                    request.conditional
+                ))
+                .map_err(|e| e.to_string())?
+            )
         );
         let mut db = self.db.borrow_mut();
+        let now = self.clock.now_ms()?;
         // Retention also advances during cooldowns and cache-only cycles.
         db.execute(
             "DELETE FROM github_responses WHERE at < ?1",
@@ -164,6 +131,14 @@ impl<T: Transport> Guard<T> {
         let tx = db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
+        // Sample after acquiring admission, never from the collection frame.
+        let now = self.clock.now_ms()?;
+        let last_clock: i64 = tx
+            .query_row("SELECT at FROM github_clock WHERE id=1", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        if now <= 0 || now < last_clock {
+            return Err("GitHub clock precedes persisted admission/receipt".into());
+        }
         let (cooldown, lease): (i64, i64) = tx
             .query_row(
                 "SELECT cooldown,lease FROM github_gate WHERE id=1",
@@ -187,7 +162,7 @@ impl<T: Transport> Guard<T> {
             && *at <= now
             && now.saturating_sub(*at) < TTL_MS
         {
-            validate(body)?;
+            validate(body, *at)?;
             return Ok(Cached {
                 body: body.clone(),
                 at: *at,
@@ -217,6 +192,8 @@ impl<T: Transport> Guard<T> {
             params![now, RESERVED_COST],
         )
         .map_err(|e| e.to_string())?;
+        tx.execute("UPDATE github_clock SET at=?1 WHERE id=1", [now])
+            .map_err(|e| e.to_string())?;
         tx.execute(
             "UPDATE github_gate SET lease=?1 WHERE id=1",
             [now.saturating_add(90_000)],
@@ -228,11 +205,20 @@ impl<T: Transport> Guard<T> {
             .and_then(|(_, etag, _)| etag.as_deref())
             .filter(|_| request.conditional);
         let response = self.transport.send(request, etag);
+        let (received, response) = match self.clock.now_ms() {
+            Ok(at) if at >= now => (at, response),
+            _ => (now, Err("GitHub response clock moved backwards".into())),
+        };
         let tx = db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
         tx.execute("UPDATE github_gate SET lease=0 WHERE id=1", [])
             .map_err(|e| e.to_string())?;
+        tx.execute(
+            "UPDATE github_clock SET at=max(at,?1) WHERE id=1",
+            [received],
+        )
+        .map_err(|e| e.to_string())?;
         let result = match response {
             Ok(response) => {
                 let graph_limit = serde_json::from_str::<GraphResponse>(&response.body)
@@ -247,16 +233,16 @@ impl<T: Transport> Guard<T> {
                     || graph_limit.is_some();
                 if limited {
                     let graph_reset = graph_limit.and_then(|r| chrono::DateTime::parse_from_rfc3339(&r.data.rate.reset_at).ok()).map(|d| d.timestamp_millis()).unwrap_or(0);
-                    let until = backoff(&response, now).max(graph_reset);
+                    let until = backoff(&response, received).max(graph_reset);
                     tx.execute("UPDATE github_gate SET cooldown=max(cooldown,?1) WHERE id=1", [until]).map_err(|e| e.to_string())?;
                     Err("GitHub server rate limit; cooldown persisted".into())
                 } else if response.status == 304 && request.conditional {
                     match &old {
-                        Some((body, _, _)) => validate(body).map(|()| Cached { body: body.clone(), at: now }),
+                        Some((body, _, _)) => validate(body, received).map(|()| Cached { body: body.clone(), at: received }),
                         None => Err("GitHub 304 without cached representation".into()),
                     }
                 } else if response.status == 200 && response.body.len() <= MAX_BODY {
-                    validate(&response.body).map(|()| Cached { body: response.body.clone(), at: now })
+                    validate(&response.body, received).map(|()| Cached { body: response.body.clone(), at: received })
                 } else {
                     Err("GitHub HTTP response unavailable".into())
                 }.and_then(|cached| {
@@ -283,7 +269,7 @@ impl<T: Transport> Guard<T> {
             // retry storms. A longer server cooldown always wins.
             tx.execute(
                 "UPDATE github_gate SET cooldown=max(cooldown,?1) WHERE id=1",
-                [now.saturating_add(HOUR_MS)],
+                [received.saturating_add(HOUR_MS)],
             )
             .map_err(|e| e.to_string())?;
         }
@@ -362,27 +348,21 @@ fn graph_request(query: &str, repo: &str, after: Option<&str>) -> Result<Request
     }) {
         return Err("invalid repository".into());
     }
-    let mut args = vec![
-        "--method".into(),
-        "POST".into(),
-        "graphql".into(),
-        "-f".into(),
-        format!("query={query}"),
-        "-f".into(),
-        format!("owner={owner}"),
-        "-f".into(),
-        format!("name={name}"),
-    ];
+    let mut fields = BTreeMap::from([
+        ("query".into(), query.into()),
+        ("owner".into(), owner.into()),
+        ("name".into(), name.into()),
+    ]);
     if let Some(after) = after {
         if after.len() > 1024 {
             return Err("GitHub cursor byte limit exceeded".into());
         }
-        args.extend(["-f".into(), format!("after={after}")]);
+        fields.insert("after".into(), after.into());
     }
     // GraphQL POST has no conditional GET representation. REST requests, when
     // admitted by this transport, use conditional=true and retain ETags on 304.
     Ok(Request {
-        args,
+        fields,
         conditional: false,
     })
 }
@@ -390,7 +370,7 @@ fn graph_request(query: &str, repo: &str, after: Option<&str>) -> Result<Request
 type PrRows = Result<Vec<PullRequest>, String>;
 type InfoRows = Result<BTreeMap<u64, PullRequestInfo>, String>;
 
-pub(super) struct SelectedGithub<T = Gh> {
+pub(super) struct SelectedGithub<T = Http> {
     guard: Result<Guard<T>, String>,
     allowed: BTreeSet<(String, u64)>,
     complete: bool,
@@ -407,7 +387,12 @@ impl SelectedGithub {
         complete: bool,
         now: i64,
     ) -> Self {
-        Self::with_guard(Guard::open(config, Gh), allowed, complete, now)
+        Self::with_guard(
+            Http::local().and_then(|transport| Guard::open(config, transport)),
+            allowed,
+            complete,
+            now,
+        )
     }
 }
 impl<T: Transport> SelectedGithub<T> {
@@ -433,6 +418,15 @@ impl<T: Transport> SelectedGithub<T> {
     }
     fn available(&self) -> Result<(), String> {
         let guard = self.guard.as_ref().map_err(Clone::clone)?;
+        let now = guard.clock.now_ms()?;
+        let last_clock: i64 = guard
+            .db
+            .borrow()
+            .query_row("SELECT at FROM github_clock WHERE id=1", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        if now < last_clock {
+            return Err("GitHub clock precedes persisted receipt".into());
+        }
         let cooldown: i64 = guard
             .db
             .borrow()
@@ -440,7 +434,7 @@ impl<T: Transport> SelectedGithub<T> {
                 r.get(0)
             })
             .map_err(|e| e.to_string())?;
-        if cooldown > self.now {
+        if cooldown > now {
             return Err("GitHub persisted cooldown active".into());
         }
         Ok(())
@@ -448,8 +442,8 @@ impl<T: Transport> SelectedGithub<T> {
     fn read(
         &self,
         request: &Request,
-        validate: impl Fn(&str) -> Result<(), String>,
-    ) -> Result<String, String> {
+        validate: impl Fn(&str, i64) -> Result<(), String>,
+    ) -> Result<Cached, String> {
         if self.start.elapsed() >= Duration::from_secs(45) {
             return Err("GitHub collection time budget exhausted".into());
         }
@@ -460,13 +454,13 @@ impl<T: Transport> SelectedGithub<T> {
             .guard
             .as_ref()
             .map_err(Clone::clone)?
-            .request(request, self.now, validate)?;
+            .request(request, validate)?;
         self.oldest_at.set(if self.oldest_at.get() == 0 {
             cached.at
         } else {
             self.oldest_at.get().min(cached.at)
         });
-        Ok(cached.body)
+        Ok(cached)
     }
     fn list(&self, repo: &str, states: &str, since: Option<f64>) -> PrRows {
         let query = crate::retro::live::PULL_REQUEST_QUERY
@@ -482,8 +476,11 @@ impl<T: Transport> SelectedGithub<T> {
         let mut previous_update = f64::INFINITY;
         for _ in 0..MAX_PAGES {
             let request = graph_request(&query, repo, cursor.as_deref())?;
-            let body = self.read(&request, |body| validate_page(body, repo, since, states))?;
-            let page = crate::retro::live::pull_request_page(&graph_body(&body)?, repo, since)?;
+            let body = self.read(&request, |body, at| {
+                validate_page(body, repo, since, states, at)
+            })?;
+            let page =
+                crate::retro::live::pull_request_page(&graph_body(&body.body)?, repo, since)?;
             if page.items.len() > 50 || page.items.iter().any(|p| !seen.insert(p.number)) {
                 return Err("GitHub duplicate/oversize PR page".into());
             }
@@ -560,15 +557,17 @@ impl<T: Transport> SelectedGithub<T> {
             for chunk in numbers.chunks(25) {
                 let fields = chunk
                     .iter()
-                    .map(|n| format!("p{n}: pullRequest(number: {n}) {{ mergedAt updatedAt }}"))
+                    .map(|n| format!("p{n}: pullRequest(number: {n}) {{ state createdAt mergedAt closedAt updatedAt }}"))
                     .collect::<Vec<_>>()
                     .join("\n");
                 let query = format!(
                     "query($owner:String!,$name:String!) {{ rateLimit {{ cost remaining resetAt }} repository(owner:$owner,name:$name) {{ {fields} }} }}"
                 );
                 let request = graph_request(&query, repo, None)?;
-                let body = self.read(&request, |body| parse_infos(body, chunk).map(|_| ()))?;
-                rows.extend(parse_infos(&body, chunk)?);
+                let body = self.read(&request, |body, at| {
+                    parse_infos(body, chunk, at).map(|_| ())
+                })?;
+                rows.extend(parse_infos(&body.body, chunk, body.at)?);
             }
             Ok(rows)
         })();
@@ -576,7 +575,13 @@ impl<T: Transport> SelectedGithub<T> {
         result
     }
 }
-fn validate_page(body: &str, repo: &str, since: Option<f64>, states: &str) -> Result<(), String> {
+fn validate_page(
+    body: &str,
+    repo: &str,
+    since: Option<f64>,
+    states: &str,
+    at: i64,
+) -> Result<(), String> {
     let response: GraphResponse = serde_json::from_str(body).map_err(|e| e.to_string())?;
     let nodes = response
         .data
@@ -596,6 +601,19 @@ fn validate_page(body: &str, repo: &str, since: Option<f64>, states: &str) -> Re
     {
         return Err("GitHub PR page has unknown/incorrect states or too many nodes".into());
     }
+    for node in nodes {
+        let mut projection = serde_json::Map::new();
+        for field in ["state", "createdAt", "mergedAt", "closedAt", "updatedAt"] {
+            projection.insert(
+                field.into(),
+                node.get(field)
+                    .ok_or("GitHub PR status field missing")?
+                    .clone(),
+            );
+        }
+        let info: RawInfo = serde_json::from_value(projection.into()).map_err(|e| e.to_string())?;
+        info.validate(at)?;
+    }
     let page = crate::retro::live::pull_request_page(&graph_body(body)?, repo, since)?;
     if page
         .items
@@ -609,17 +627,69 @@ fn validate_page(body: &str, repo: &str, since: Option<f64>, states: &str) -> Re
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawInfo {
-    #[serde(rename = "mergedAt")]
+    state: PrState,
+    #[serde(rename = "createdAt")]
+    created_at: String,
+    #[serde(rename = "mergedAt", deserialize_with = "required_nullable_time")]
     merged_at: Option<String>,
+    #[serde(rename = "closedAt", deserialize_with = "required_nullable_time")]
+    closed_at: Option<String>,
     #[serde(rename = "updatedAt")]
     updated_at: String,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum PrState {
+    Open,
+    Closed,
+    Merged,
+}
+fn required_nullable_time<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(value) => Ok(Some(value)),
+        _ => Err(serde::de::Error::custom(
+            "native timestamp must be a string or explicit null",
+        )),
+    }
+}
+impl RawInfo {
+    fn validate(&self, at: i64) -> Result<(), String> {
+        let created = epoch(&self.created_at)?;
+        let updated = epoch(&self.updated_at)?;
+        let merged = self.merged_at.as_deref().map(epoch).transpose()?;
+        let closed = self.closed_at.as_deref().map(epoch).transpose()?;
+        if created < 0.0
+            || created > updated
+            || updated > at.saturating_add(30_000) as f64 / 1000.0
+            || merged.is_some_and(|t| t < created || t > updated)
+            || closed.is_some_and(|t| t < created || t > updated)
+        {
+            return Err("GitHub native PR timestamps are inconsistent/future".into());
+        }
+        let consistent = match self.state {
+            PrState::Open => merged.is_none() && closed.is_none(),
+            PrState::Closed => merged.is_none() && closed.is_some(),
+            PrState::Merged => matches!((merged,closed), (Some(m),Some(c)) if m <= c),
+        };
+        if !consistent {
+            return Err("GitHub native PR state and merge/close evidence disagree".into());
+        }
+        Ok(())
+    }
 }
 fn epoch(text: &str) -> Result<f64, String> {
     chrono::DateTime::parse_from_rfc3339(text)
         .map(|t| t.timestamp_millis() as f64 / 1000.0)
         .map_err(|e| e.to_string())
 }
-fn parse_infos(body: &str, numbers: &[u64]) -> Result<BTreeMap<u64, PullRequestInfo>, String> {
+fn parse_infos(
+    body: &str,
+    numbers: &[u64],
+    at: i64,
+) -> Result<BTreeMap<u64, PullRequestInfo>, String> {
     graph_body(body)?;
     let response: GraphResponse = serde_json::from_str(body).map_err(|e| e.to_string())?;
     let mut data: BTreeMap<String, Option<RawInfo>> =
@@ -630,9 +700,7 @@ fn parse_infos(body: &str, numbers: &[u64]) -> Result<BTreeMap<u64, PullRequestI
             .remove(&format!("p{n}"))
             .ok_or("GitHub linked PR batch field missing")?;
         if let Some(info) = info {
-            if let Some(at) = &info.merged_at {
-                epoch(at)?;
-            }
+            info.validate(at)?;
             rows.insert(
                 *n,
                 PullRequestInfo {
@@ -701,6 +769,7 @@ impl<T: Transport> GithubSource for SelectedGithub<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ix_trace_rs::trace;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -709,6 +778,8 @@ mod tests {
     struct Fake {
         count: Arc<AtomicUsize>,
         handler: Arc<Handler>,
+        clock: Arc<TestClock>,
+        namespace: String,
     }
     impl Fake {
         fn new(
@@ -717,6 +788,8 @@ mod tests {
             Self {
                 count: Arc::new(AtomicUsize::new(0)),
                 handler: Arc::new(handler),
+                clock: Arc::new(TestClock(std::sync::atomic::AtomicI64::new(1000))),
+                namespace: "offline-principal".into(),
             }
         }
         fn count(&self) -> usize {
@@ -724,10 +797,50 @@ mod tests {
         }
     }
     impl Transport for Fake {
+        fn namespace(&self) -> &str {
+            &self.namespace
+        }
         fn send(&self, request: &Request, etag: Option<&str>) -> Result<Response, String> {
             self.count.fetch_add(1, Ordering::SeqCst);
             (self.handler)(request, etag)
         }
+    }
+    struct TestClock(std::sync::atomic::AtomicI64);
+    impl TestClock {
+        fn set(&self, at: i64) {
+            self.0.store(at, Ordering::SeqCst);
+        }
+    }
+    impl Clock for TestClock {
+        fn now_ms(&self) -> Result<i64, String> {
+            Ok(self.0.load(Ordering::SeqCst))
+        }
+    }
+    fn open(config: &Config, fake: Fake) -> Result<Guard<Fake>, String> {
+        let clock = fake.clock.clone();
+        Guard::with_clock(config, fake, clock)
+    }
+    impl Guard<Fake> {
+        fn request_at(
+            &self,
+            request: &Request,
+            at: i64,
+            validate: impl Fn(&str, i64) -> Result<(), String>,
+        ) -> Result<Cached, String> {
+            self.transport.clock.set(at);
+            self.request(request, validate)
+        }
+    }
+    fn source(
+        guard: Result<Guard<Fake>, String>,
+        allowed: BTreeSet<(String, u64)>,
+        complete: bool,
+        at: i64,
+    ) -> SelectedGithub<Fake> {
+        if let Ok(g) = &guard {
+            g.transport.clock.set(at);
+        }
+        SelectedGithub::with_guard(guard, allowed, complete, at)
     }
     fn config(path: &std::path::Path) -> Config {
         serde_json::from_value(serde_json::json!({
@@ -746,16 +859,7 @@ mod tests {
     fn graph() -> Fake {
         Fake::new(|request, _| {
             assert!(!request.conditional);
-            assert!(request.args.iter().any(|a| a == "graphql"));
-            assert!(
-                !request.args.iter().any(|a| a.starts_with("repos/")),
-                "no per-PR REST request permitted"
-            );
-            let query = request
-                .args
-                .iter()
-                .find_map(|a| a.strip_prefix("query="))
-                .unwrap();
+            let query = request.fields.get("query").unwrap();
             assert!(query.len() < MAX_QUERY);
             let repository = if query.contains("pullRequests(") {
                 serde_json::json!({"pullRequests":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}})
@@ -763,7 +867,7 @@ mod tests {
                 let mut fields = serde_json::Map::new();
                 for number in query.split("pullRequest(number: ").skip(1) {
                     let n: u64 = number.split(')').next().unwrap().parse().unwrap();
-                    fields.insert(format!("p{n}"),serde_json::json!({"mergedAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z"}));
+                    fields.insert(format!("p{n}"),serde_json::json!({"state":"MERGED","createdAt":"1970-01-01T00:00:00Z","mergedAt":"1970-01-01T00:00:00Z","closedAt":"1970-01-01T00:00:00Z","updatedAt":"1970-01-01T00:00:00Z"}));
                 }
                 assert!(fields.len() <= 25);
                 serde_json::Value::Object(fields)
@@ -773,17 +877,17 @@ mod tests {
     }
     fn request(key: usize, conditional: bool) -> Request {
         Request {
-            args: vec![format!("fixture-{key}")],
+            fields: [("fixture".into(), key.to_string())].into(),
             conditional,
         }
     }
-    fn valid_json(body: &str) -> Result<(), String> {
+    fn valid_json(body: &str, _at: i64) -> Result<(), String> {
         serde_json::from_str::<serde_json::Value>(body)
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
 
-    /// Trace: FR-033-AC-12, FR-033-AC-13
+    #[trace("FR-033-AC-12", "FR-033-AC-13")]
     #[test]
     fn thousands_of_old_links_have_constant_batched_cost_across_scopes_cycles_and_restart() {
         let dir = tempfile::tempdir().unwrap();
@@ -795,8 +899,8 @@ mod tests {
             .collect();
         let at = 1_000_000;
         for offset in [0, 1000, 2000, TTL_MS] {
-            let source = SelectedGithub::with_guard(
-                Guard::open(&cfg, transport.clone()),
+            let source = source(
+                open(&cfg, transport.clone()),
                 allowed.clone(),
                 true,
                 at + offset,
@@ -824,21 +928,23 @@ mod tests {
         }
     }
 
-    /// Trace: FR-033-AC-12
+    #[trace("FR-033-AC-12")]
     #[test]
     fn hard_budget_survives_restart_and_no_probe_or_send_is_admitted() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = config(dir.path());
         let fake = Fake::new(|_, _| Ok(response("{}".into())));
-        let guard = Guard::open(&cfg, fake.clone()).unwrap();
+        let guard = open(&cfg, fake.clone()).unwrap();
         for n in 0..40 {
-            guard.request(&request(n, false), 1000, valid_json).unwrap();
+            guard
+                .request_at(&request(n, false), 1000, valid_json)
+                .unwrap();
         }
         drop(guard);
-        let guard = Guard::open(&cfg, fake.clone()).unwrap();
+        let guard = open(&cfg, fake.clone()).unwrap();
         assert!(
             guard
-                .request(&request(41, false), 1001, valid_json)
+                .request_at(&request(41, false), 1001, valid_json)
                 .is_err()
         );
         assert_eq!(fake.count(), 40);
@@ -850,7 +956,7 @@ mod tests {
         assert_eq!(cost, 1000);
     }
 
-    /// Trace: FR-033-AC-12
+    #[trace("FR-033-AC-12")]
     #[test]
     fn concurrent_workers_share_persisted_lease_and_completed_representation() {
         let dir = tempfile::tempdir().unwrap();
@@ -863,24 +969,32 @@ mod tests {
             release_rx.lock().unwrap().recv().unwrap();
             Ok(response("{}".into()))
         });
-        let other = Guard::open(&cfg, fake.clone()).unwrap();
+        let other = open(&cfg, fake.clone()).unwrap();
         let cfg2 = config(dir.path());
         let fake2 = fake.clone();
         let worker = std::thread::spawn(move || {
-            Guard::open(&cfg2, fake2)
+            open(&cfg2, fake2)
                 .unwrap()
-                .request(&request(1, false), 1000, valid_json)
+                .request_at(&request(1, false), 1000, valid_json)
                 .map(|c| c.at)
         });
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert!(other.request(&request(1, false), 1000, valid_json).is_err());
-        assert!(other.request(&request(2, false), 1000, valid_json).is_err());
+        assert!(
+            other
+                .request_at(&request(1, false), 1000, valid_json)
+                .is_err()
+        );
+        assert!(
+            other
+                .request_at(&request(2, false), 1000, valid_json)
+                .is_err()
+        );
         assert_eq!(fake.count(), 1);
         release_tx.send(()).unwrap();
         assert_eq!(worker.join().unwrap().unwrap(), 1000);
         assert_eq!(
             other
-                .request(&request(1, false), 1001, valid_json)
+                .request_at(&request(1, false), 1001, valid_json)
                 .unwrap()
                 .at,
             1000
@@ -888,7 +1002,7 @@ mod tests {
         assert_eq!(fake.count(), 1);
     }
 
-    /// Trace: FR-033-AC-13
+    #[trace("FR-033-AC-13")]
     #[test]
     fn conditional_304_revalidates_but_warm_cache_does_not_renew_time() {
         let dir = tempfile::tempdir().unwrap();
@@ -906,33 +1020,33 @@ mod tests {
             }),
             _ => panic!("conditional validator changed"),
         });
-        let guard = Guard::open(&cfg, fake.clone()).unwrap();
+        let guard = open(&cfg, fake.clone()).unwrap();
         assert_eq!(
             guard
-                .request(&request(1, true), 1000, valid_json)
+                .request_at(&request(1, true), 1000, valid_json)
                 .unwrap()
                 .at,
             1000
         );
         assert_eq!(
             guard
-                .request(&request(1, true), 1001, valid_json)
+                .request_at(&request(1, true), 1001, valid_json)
                 .unwrap()
                 .at,
             1000
         );
         assert_eq!(
             guard
-                .request(&request(1, true), 1000 + TTL_MS, valid_json)
+                .request_at(&request(1, true), 1000 + TTL_MS, valid_json)
                 .unwrap()
                 .at,
             1000 + TTL_MS
         );
         drop(guard);
-        let guard = Guard::open(&cfg, fake.clone()).unwrap();
+        let guard = open(&cfg, fake.clone()).unwrap();
         assert_eq!(
             guard
-                .request(&request(1, true), 1000 + 2 * TTL_MS, valid_json)
+                .request_at(&request(1, true), 1000 + 2 * TTL_MS, valid_json)
                 .unwrap()
                 .body,
             "{}"
@@ -940,7 +1054,7 @@ mod tests {
         assert_eq!(fake.count(), 3);
     }
 
-    /// Trace: FR-033-AC-12, FR-033-AC-13
+    #[trace("FR-033-AC-12", "FR-033-AC-13")]
     #[test]
     fn server_cooldowns_and_errors_remain_unavailable_after_restart() {
         for status in [403, 429, 200] {
@@ -958,13 +1072,17 @@ mod tests {
                     body: "{}".into(),
                 })
             });
-            let guard = Guard::open(&cfg, fake.clone()).unwrap();
-            assert!(guard.request(&request(0, false), 1000, valid_json).is_err());
-            drop(guard);
-            let guard = Guard::open(&cfg, fake.clone()).unwrap();
+            let guard = open(&cfg, fake.clone()).unwrap();
             assert!(
                 guard
-                    .request(&request(1, false), 9_500_000, valid_json)
+                    .request_at(&request(0, false), 1000, valid_json)
+                    .is_err()
+            );
+            drop(guard);
+            let guard = open(&cfg, fake.clone()).unwrap();
+            assert!(
+                guard
+                    .request_at(&request(1, false), 9_500_000, valid_json)
                     .is_err()
             );
             assert_eq!(fake.count(), 1);
@@ -975,13 +1093,9 @@ mod tests {
                 .unwrap();
             assert_eq!(cooldown, 10_001_000);
         }
-        let raw = b"HTTP/2.0 429 Too Many Requests\r\nRetry-After: 10000\r\nX-RateLimit-Remaining: 0\r\n\r\n{\"message\":\"limited\"}";
-        let http = parse_http(raw).unwrap();
-        assert_eq!(http.status, 429);
-        assert_eq!(backoff(&http, 1000), 10_001_000);
     }
 
-    /// Trace: FR-033-AC-13
+    #[trace("FR-033-AC-13")]
     #[test]
     fn malformed_partial_null_and_cost_excess_never_certify_evidence() {
         for body in [
@@ -993,8 +1107,8 @@ mod tests {
             let cfg = config(dir.path());
             let body = body.to_owned();
             let fake = Fake::new(move |_, _| Ok(response(body.clone())));
-            let source = SelectedGithub::with_guard(
-                Guard::open(&cfg, fake.clone()),
+            let source = source(
+                open(&cfg, fake.clone()),
                 [("agent-ix/one".into(), 1)].into(),
                 true,
                 1000,
@@ -1004,41 +1118,36 @@ mod tests {
             assert_eq!(fake.count(), 1);
         }
         let null = serde_json::json!({"data":{"rateLimit":{"cost":1,"remaining":100,"resetAt":"2030-01-01T00:00:00Z"},"repository":{"p1":null}}}).to_string();
-        assert!(parse_infos(&null, &[1]).unwrap().is_empty());
-        assert!(parse_infos(&null, &[2]).is_err());
+        assert!(parse_infos(&null, &[1], 1000).unwrap().is_empty());
+        assert!(parse_infos(&null, &[2], 1000).is_err());
     }
 
-    /// Trace: FR-033-AC-12, FR-033-AC-13
+    #[trace("FR-033-AC-12", "FR-033-AC-13")]
     #[test]
     fn pagination_storage_and_input_bounds_fail_closed() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = config(dir.path());
         let fake = Fake::new(|request, _| {
             let n = request
-                .args
-                .iter()
-                .find_map(|a| a.strip_prefix("after="))
+                .fields
+                .get("after")
+                .map(String::as_str)
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0)
                 + 1;
             Ok(response(serde_json::json!({"data":{"rateLimit":{"cost":1,"remaining":100,"resetAt":"2030-01-01T00:00:00Z"},"repository":{"pullRequests":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":n.to_string()}}}}}).to_string()))
         });
-        let source = SelectedGithub::with_guard(
-            Guard::open(&cfg, fake.clone()),
-            BTreeSet::new(),
-            true,
-            1000,
-        );
+        let source = source(open(&cfg, fake.clone()), BTreeSet::new(), true, 1000);
         assert!(source.pull_requests("agent-ix/one", 0.0).is_err());
         assert_eq!(fake.count(), MAX_PAGES);
         assert!(source.pull_requests("../invalid", 0.0).is_err());
         assert_eq!(fake.count(), MAX_PAGES);
-        let guard = Guard::open(&cfg, fake.clone()).unwrap();
+        let guard = open(&cfg, fake.clone()).unwrap();
         assert!(
             guard
-                .request(
+                .request_at(
                     &Request {
-                        args: vec!["x".repeat(MAX_QUERY + 1)],
+                        fields: [("query".into(), "x".repeat(MAX_QUERY + 1))].into(),
                         conditional: false
                     },
                     1000,
@@ -1047,15 +1156,11 @@ mod tests {
                 .is_err()
         );
         assert_eq!(fake.count(), MAX_PAGES);
-        assert!(
-            parse_http(format!("HTTP/2.0 200 OK\r\n\r\n{}", "x".repeat(MAX_BODY + 1)).as_bytes())
-                .is_err()
-        );
         let large = Fake::new(|_, _| Ok(response("x".repeat(MAX_BODY + 1))));
-        let guard = Guard::open(&cfg, large.clone()).unwrap();
+        let guard = open(&cfg, large.clone()).unwrap();
         assert!(
             guard
-                .request(&request(10, false), 1000, |_| Ok(()))
+                .request_at(&request(10, false), 1000, |_, _| Ok(()))
                 .is_err()
         );
         assert_eq!(large.count(), 1);
@@ -1067,18 +1172,13 @@ mod tests {
         assert_eq!(cached, MAX_PAGES as i64);
     }
 
-    /// Trace: FR-033-AC-12
+    #[trace("FR-033-AC-12")]
     #[test]
     fn legacy_expensive_callbacks_are_explicitly_unavailable_and_source_free() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = config(dir.path());
         let fake = graph();
-        let source = SelectedGithub::with_guard(
-            Guard::open(&cfg, fake.clone()),
-            BTreeSet::new(),
-            true,
-            1000,
-        );
+        let source = source(open(&cfg, fake.clone()), BTreeSet::new(), true, 1000);
         assert!(source.main_commits("agent-ix/one", "main", 0.0).is_err());
         let config: crate::retro::department::Config = serde_json::from_value(serde_json::json!({"version":1,"policy_id":"fixture","scope":{},"freshness_seconds":{},"clock_tolerance_seconds":30})).unwrap();
         let evidence = source.department_evidence(&config, 0.0);
@@ -1088,16 +1188,18 @@ mod tests {
         assert_eq!(fake.count(), 0);
     }
 
-    /// Trace: FR-033-AC-13
+    #[trace("FR-033-AC-13")]
     #[test]
     fn persistent_cache_storage_and_retention_are_bounded() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = config(dir.path());
         let fake = Fake::new(|_, _| Ok(response("x".repeat(40_000))));
-        let guard = Guard::open(&cfg, fake).unwrap();
+        let guard = open(&cfg, fake).unwrap();
         for n in 0..150 {
             let now = 1000 + i64::try_from(n / 40).unwrap() * HOUR_MS;
-            guard.request(&request(n, false), now, |_| Ok(())).unwrap();
+            guard
+                .request_at(&request(n, false), now, |_, _| Ok(()))
+                .unwrap();
         }
         let (bytes, count): (i64, i64) = guard
             .db
@@ -1118,7 +1220,7 @@ mod tests {
             .unwrap();
         assert!(
             guard
-                .request(&request(200, false), 8 * 86_400_000, |_| Ok(()))
+                .request_at(&request(200, false), 8 * 86_400_000, |_, _| Ok(()))
                 .is_err()
         );
         let count: i64 = guard
@@ -1132,7 +1234,7 @@ mod tests {
         );
     }
 
-    /// Trace: FR-033-AC-12, FR-033-AC-13
+    #[trace("FR-033-AC-12", "FR-033-AC-13")]
     #[test]
     fn graph_reset_and_missing_conditional_representation_cannot_bypass_admission() {
         let dir = tempfile::tempdir().unwrap();
@@ -1140,17 +1242,17 @@ mod tests {
         let fake = Fake::new(|_, _| {
             Ok(response(serde_json::json!({"data":{"rateLimit":{"cost":1,"remaining":0,"resetAt":"2030-01-01T00:00:00Z"},"repository":null}}).to_string()))
         });
-        let guard = Guard::open(&cfg, fake.clone()).unwrap();
+        let guard = open(&cfg, fake.clone()).unwrap();
         assert!(
             guard
-                .request(&request(0, false), 1000, graph_body_validator)
+                .request_at(&request(0, false), 1000, graph_body_validator)
                 .is_err()
         );
         drop(guard);
-        let guard = Guard::open(&cfg, fake.clone()).unwrap();
+        let guard = open(&cfg, fake.clone()).unwrap();
         assert!(
             guard
-                .request(&request(1, false), 1000 + 2 * HOUR_MS, graph_body_validator)
+                .request_at(&request(1, false), 1000 + 2 * HOUR_MS, graph_body_validator)
                 .is_err()
         );
         assert_eq!(fake.count(), 1);
@@ -1163,9 +1265,17 @@ mod tests {
                 body: String::new(),
             })
         });
-        let guard = Guard::open(&cfg, fake.clone()).unwrap();
-        assert!(guard.request(&request(0, true), 1000, valid_json).is_err());
-        assert!(guard.request(&request(0, true), 1001, valid_json).is_err());
+        let guard = open(&cfg, fake.clone()).unwrap();
+        assert!(
+            guard
+                .request_at(&request(0, true), 1000, valid_json)
+                .is_err()
+        );
+        assert!(
+            guard
+                .request_at(&request(0, true), 1001, valid_json)
+                .is_err()
+        );
         assert_eq!(fake.count(), 1);
         let response = Response {
             status: 429,
@@ -1178,21 +1288,17 @@ mod tests {
         };
         assert_eq!(backoff(&response, 1000), 7_200_000);
     }
-    fn graph_body_validator(body: &str) -> Result<(), String> {
+    fn graph_body_validator(body: &str, _at: i64) -> Result<(), String> {
         graph_body(body).map(|_| ())
     }
 
-    /// Trace: FR-033-AC-12, FR-033-AC-13
+    #[trace("FR-033-AC-12", "FR-033-AC-13")]
     #[test]
     fn native_open_and_merged_rows_resolve_callbacks_without_detail_requests() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = config(dir.path());
         let fake = Fake::new(|request, _| {
-            let query = request
-                .args
-                .iter()
-                .find_map(|a| a.strip_prefix("query="))
-                .unwrap();
+            let query = request.fields.get("query").unwrap();
             let open = query.contains("states: [OPEN]");
             let node = serde_json::json!({
                 "number":if open {1} else {2},"state":if open {"OPEN"} else {"MERGED"},
@@ -1208,7 +1314,7 @@ mod tests {
             .unwrap()
             .timestamp_millis();
         let allowed = [("agent-ix/one".into(), 1), ("agent-ix/one".into(), 2)].into();
-        let source = SelectedGithub::with_guard(Guard::open(&cfg, fake.clone()), allowed, true, at);
+        let source = source(open(&cfg, fake.clone()), allowed, true, at);
         let rows = source
             .pull_requests("agent-ix/one", at as f64 / 1000.0 - 86_400.0)
             .unwrap();
@@ -1234,5 +1340,363 @@ mod tests {
             2,
             "a shared cooldown overrides prior per-cycle memoization"
         );
+    }
+
+    #[trace("FR-033-AC-12", "FR-033-AC-13")]
+    #[test]
+    fn later_requests_use_admission_and_receipt_clocks_instead_of_the_collection_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let mut fake = graph();
+        let base = fake.handler.clone();
+        let clock = fake.clock.clone();
+        fake.handler = Arc::new(move |request, etag| {
+            let response = base(request, etag)?;
+            clock.set(clock.now_ms()? + 20_000);
+            Ok(response)
+        });
+        let source = source(open(&cfg, fake.clone()), BTreeSet::new(), true, 1000);
+        fake.clock.set(1_000_000);
+        source.pull_requests("agent-ix/one", 0.0).unwrap();
+        let guard = source.guard.as_ref().unwrap();
+        let charges: Vec<i64> = guard
+            .db
+            .borrow()
+            .prepare("SELECT at FROM github_sends ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(charges, vec![1_000_000, 1_020_000]);
+        assert_eq!(source.observed_at(), 1_020_000);
+        assert_eq!(fake.count(), 2);
+        drop(source);
+        let guard = open(&cfg, fake.clone()).unwrap();
+        assert!(
+            guard
+                .request_at(&request(8, false), 1_030_000, valid_json)
+                .is_err(),
+            "a restarted worker with a clock older than the prior receipt must fail closed"
+        );
+        assert_eq!(fake.count(), 2);
+    }
+
+    #[trace("FR-033-AC-12")]
+    #[test]
+    fn rolling_hour_keeps_late_charges_and_cooldown_begins_at_response_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let fake = Fake::new(|_, _| Ok(response("{}".into())));
+        let guard = open(&cfg, fake.clone()).unwrap();
+        for n in 0..40 {
+            guard
+                .request_at(
+                    &request(n, false),
+                    1000 + i64::try_from(n).unwrap() * 1000,
+                    valid_json,
+                )
+                .unwrap();
+        }
+        drop(guard);
+        let guard = open(&cfg, fake.clone()).unwrap();
+        guard
+            .request_at(&request(40, false), HOUR_MS + 2000, valid_json)
+            .unwrap();
+        guard
+            .request_at(&request(41, false), HOUR_MS + 2000, valid_json)
+            .unwrap();
+        assert!(
+            guard
+                .request_at(&request(42, false), HOUR_MS + 2000, valid_json)
+                .is_err()
+        );
+        assert_eq!(
+            fake.count(),
+            42,
+            "only the first two charges have aged out of the rolling hour"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let mut fake = Fake::new(|_, _| unreachable!());
+        let clock = fake.clock.clone();
+        fake.handler = Arc::new(move |_, _| {
+            clock.set(21_000);
+            Ok(Response {
+                status: 429,
+                headers: [("retry-after".into(), "7200".into())].into(),
+                body: String::new(),
+            })
+        });
+        let guard = open(&cfg, fake.clone()).unwrap();
+        assert!(
+            guard
+                .request_at(&request(0, false), 1000, valid_json)
+                .is_err()
+        );
+        let until: i64 = guard
+            .db
+            .borrow()
+            .query_row("SELECT cooldown FROM github_gate", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(until, 7_221_000);
+        drop(guard);
+        let guard = open(&cfg, fake.clone()).unwrap();
+        assert!(
+            guard
+                .request_at(&request(1, false), 7_211_000, valid_json)
+                .is_err()
+        );
+        assert_eq!(fake.count(), 1);
+    }
+
+    #[trace("FR-033-AC-12", "FR-033-AC-13")]
+    #[test]
+    fn backward_response_clock_never_stores_a_fresh_representation() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let mut fake = Fake::new(|_, _| unreachable!());
+        let clock = fake.clock.clone();
+        fake.handler = Arc::new(move |_, _| {
+            clock.set(999);
+            Ok(response("{}".into()))
+        });
+        let guard = open(&cfg, fake.clone()).unwrap();
+        assert!(
+            guard
+                .request_at(&request(1, false), 1000, valid_json)
+                .is_err()
+        );
+        let count: i64 = guard
+            .db
+            .borrow()
+            .query_row("SELECT count(*) FROM github_responses", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(
+            guard
+                .request_at(&request(2, false), 999, valid_json)
+                .is_err()
+        );
+        assert_eq!(fake.count(), 1);
+    }
+
+    #[trace("FR-033-AC-12", "FR-033-AC-13")]
+    #[test]
+    fn credential_namespaces_isolate_private_cache_bodies_and_share_the_hard_budget() {
+        use super::super::github_http::tests::{Fixture, reply};
+        let server =
+            Fixture::start(|n, _| reply(200, "", &format!("{{\"account_observation\":{n}}}")));
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let clock = Arc::new(TestClock(std::sync::atomic::AtomicI64::new(1000)));
+        let first = Http::fixture(&server.endpoint, "offline-first-account").unwrap();
+        let first_ns = first.namespace().to_owned();
+        let guard = Guard::with_clock(&cfg, first, clock.clone()).unwrap();
+        assert_eq!(
+            guard.request(&request(0, false), valid_json).unwrap().body,
+            "{\"account_observation\":1}"
+        );
+        drop(guard);
+        let same = Http::fixture(&server.endpoint, "offline-first-account").unwrap();
+        assert_eq!(same.namespace(), first_ns);
+        let guard = Guard::with_clock(&cfg, same, clock.clone()).unwrap();
+        assert_eq!(
+            guard.request(&request(0, false), valid_json).unwrap().body,
+            "{\"account_observation\":1}"
+        );
+        drop(guard);
+        let second = Http::fixture(&server.endpoint, "offline-second-account").unwrap();
+        assert_ne!(second.namespace(), first_ns);
+        let guard = Guard::with_clock(&cfg, second, clock).unwrap();
+        assert_eq!(
+            guard.request(&request(0, false), valid_json).unwrap().body,
+            "{\"account_observation\":2}"
+        );
+        let seen = server.finish();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0].contains("Bearer offline-first-account"));
+        assert!(seen[1].contains("Bearer offline-second-account"));
+        assert!(Http::fixture("http://127.0.0.1:1/graphql", "").is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let mut fake = Fake::new(|_, _| Ok(response("{}".into())));
+        fake.namespace.clear();
+        assert!(
+            open(&cfg, fake.clone()).is_err(),
+            "an unknown principal cannot inspect any cached body"
+        );
+        fake.namespace = "first".into();
+        let guard = open(&cfg, fake.clone()).unwrap();
+        for n in 0..40 {
+            guard
+                .request_at(&request(n, false), 1000, valid_json)
+                .unwrap();
+        }
+        drop(guard);
+        fake.namespace = "second".into();
+        let guard = open(&cfg, fake.clone()).unwrap();
+        assert!(
+            guard
+                .request_at(&request(0, false), 1000, valid_json)
+                .is_err()
+        );
+        assert_eq!(
+            fake.count(),
+            40,
+            "account switches cannot reset shared request accounting"
+        );
+    }
+
+    #[trace("FR-033-AC-12")]
+    #[test]
+    fn the_fortieth_actual_http_attempt_cannot_hide_an_extra_redirect_send() {
+        use super::super::github_http::tests::{Fixture, reply};
+        let server = Fixture::start(|n, _| {
+            if n == 40 {
+                reply(302, "Location: /again\r\n", "{}")
+            } else {
+                reply(200, "", "{}")
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let http = Http::fixture(&server.endpoint, "offline-credential").unwrap();
+        let clock = Arc::new(TestClock(std::sync::atomic::AtomicI64::new(1000)));
+        let guard = Guard::with_clock(&cfg, http, clock).unwrap();
+        for n in 0..39 {
+            guard.request(&request(n, false), valid_json).unwrap();
+        }
+        assert!(guard.request(&request(39, false), valid_json).is_err());
+        assert!(guard.request(&request(40, false), valid_json).is_err());
+        let ledger: i64 = guard
+            .db
+            .borrow()
+            .query_row("SELECT count(*) FROM github_sends", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ledger, 40);
+        assert_eq!(
+            server.finish().len(),
+            40,
+            "wire requests, including redirects, must match admitted debits"
+        );
+    }
+
+    #[trace("FR-033-AC-13")]
+    #[test]
+    fn required_nullable_native_status_fields_and_timestamp_consistency_are_not_inferred() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-11-22T01:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let native = serde_json::json!({"state":"OPEN","createdAt":"2026-11-20T00:00:00Z","updatedAt":"2026-11-22T00:00:00Z","mergedAt":null,"closedAt":null});
+        let batch = |node| {
+            serde_json::json!({"data":{"rateLimit":{"cost":1,"remaining":100,"resetAt":"2030-01-01T00:00:00Z"},"repository":{"p1":node}}}).to_string()
+        };
+        assert!(!parse_infos(&batch(native.clone()), &[1], at).unwrap()[&1].merged);
+        for field in ["mergedAt", "closedAt", "state", "createdAt", "updatedAt"] {
+            let mut missing = native.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                parse_infos(&batch(missing), &[1], at).is_err(),
+                "missing {field} cannot certify a native PR status"
+            );
+        }
+        for (field, value) in [
+            ("state", serde_json::json!("MERGED")),
+            ("state", serde_json::json!("CLOSED")),
+            ("mergedAt", serde_json::json!("2026-11-21T00:00:00Z")),
+            ("closedAt", serde_json::json!("2026-11-21T00:00:00Z")),
+            ("createdAt", serde_json::json!("2026-11-23T00:00:00Z")),
+            ("updatedAt", serde_json::json!("2026-11-23T00:00:00Z")),
+        ] {
+            let mut invalid = native.clone();
+            invalid[field] = value;
+            assert!(parse_infos(&batch(invalid), &[1], at).is_err());
+        }
+        let mut merged = native;
+        merged["state"] = serde_json::json!("MERGED");
+        merged["mergedAt"] = serde_json::json!("2026-11-22T00:00:00Z");
+        merged["closedAt"] = serde_json::json!("2026-11-22T00:00:00Z");
+        assert!(parse_infos(&batch(merged.clone()), &[1], at).unwrap()[&1].merged);
+        for field in ["mergedAt", "closedAt"] {
+            let mut invalid = merged.clone();
+            invalid[field] = serde_json::Value::Null;
+            invalid["number"] = serde_json::json!(1);
+            invalid["isDraft"] = serde_json::json!(false);
+            invalid["additions"] = serde_json::json!(0);
+            invalid["deletions"] = serde_json::json!(0);
+            invalid["reviewDecision"] = serde_json::Value::Null;
+            invalid["timelineItems"] = serde_json::json!({"totalCount":0});
+            let body=serde_json::json!({"data":{"rateLimit":{"cost":1,"remaining":100,"resetAt":"2030-01-01T00:00:00Z"},"repository":{"pullRequests":{"nodes":[invalid],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}).to_string();
+            assert!(validate_page(&body, "agent-ix/one", None, "[MERGED, CLOSED]", at).is_err());
+        }
+    }
+
+    #[trace("FR-033-AC-12")]
+    #[test]
+    fn two_workers_share_a_fresh_lease_while_a_late_request_crosses_the_hour_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let mut fake = Fake::new(|_, _| unreachable!());
+        let count = fake.count.clone();
+        let clock = fake.clock.clone();
+        fake.handler = Arc::new(move |_, _| {
+            if count.load(Ordering::SeqCst) == 40 {
+                entered_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+                clock.set(HOUR_MS + 20_500);
+            }
+            Ok(response("{}".into()))
+        });
+        let guard = open(&cfg, fake.clone()).unwrap();
+        for n in 0..39 {
+            guard
+                .request_at(&request(n, false), 1000, valid_json)
+                .unwrap();
+        }
+        drop(guard);
+        let other = open(&cfg, fake.clone()).unwrap();
+        let cfg2 = config(dir.path());
+        let fake2 = fake.clone();
+        let worker = std::thread::spawn(move || {
+            open(&cfg2, fake2)
+                .unwrap()
+                .request_at(&request(39, false), HOUR_MS + 500, valid_json)
+                .map(|c| c.at)
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let lease: i64 = other
+            .db
+            .borrow()
+            .query_row("SELECT lease FROM github_gate", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(lease, HOUR_MS + 90_500);
+        assert!(
+            other
+                .request_at(&request(40, false), HOUR_MS + 1001, valid_json)
+                .is_err()
+        );
+        assert_eq!(fake.count(), 40);
+        release_tx.send(()).unwrap();
+        assert_eq!(worker.join().unwrap().unwrap(), HOUR_MS + 20_500);
+        other
+            .request_at(&request(40, false), HOUR_MS + 20_501, valid_json)
+            .unwrap();
+        let charges: Vec<i64> = other
+            .db
+            .borrow()
+            .prepare("SELECT at FROM github_sends ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(charges, vec![HOUR_MS + 500, HOUR_MS + 20_501]);
+        assert_eq!(fake.count(), 41);
     }
 }

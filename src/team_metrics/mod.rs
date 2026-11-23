@@ -4,6 +4,7 @@
 mod collect;
 mod config;
 mod github;
+mod github_http;
 mod history;
 mod journal;
 mod pr_stats;

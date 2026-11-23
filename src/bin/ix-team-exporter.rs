@@ -187,7 +187,8 @@ fn main() -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// Trace: FR-030-AC-8
+    use ix_trace_rs::trace;
+    #[trace("FR-033-AC-8")]
     #[test]
     fn fragmented_http_line_serves_the_cached_metrics() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

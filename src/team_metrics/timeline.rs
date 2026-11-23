@@ -124,7 +124,7 @@ fn scope_matches(selected: &Selectors, reported: &relay_work_wire::ReportedScope
         && same(&selected.projects, &reported.projects)
         && same(&selected.tickets, &reported.tickets)
 }
-fn numeric_cursor(id: &str) -> Result<(u64, u64), Error> {
+pub(super) fn numeric_cursor(id: &str) -> Result<(u64, u64), Error> {
     let (a, b) = id.split_once('-').ok_or(Error::Invalid("stream cursor"))?;
     Ok((
         a.parse().map_err(|_| Error::Invalid("stream cursor"))?,

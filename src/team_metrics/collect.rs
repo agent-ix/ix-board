@@ -55,6 +55,7 @@ impl Collector {
     /// Reads at most sixteen bounded pages per tick and checkpoints each page.
     pub fn history(&mut self, source: &impl History, now: i64) -> Result<(), Error> {
         for _ in 0..16 {
+            self.state.history_ok = false;
             let page = match source.page(&self.state.cursor) {
                 Ok(p) => p,
                 Err(e) => {
@@ -62,8 +63,24 @@ impl Collector {
                     return Err(e);
                 }
             };
-            if page.version != 1 || page.observed_at_ms > now.saturating_add(30000) {
+            if page.version != 1
+                || page.observed_at_ms < self.state.history_at_ms
+                || page.observed_at_ms < 0
+                || page.observed_at_ms > now.saturating_add(30000)
+                || page.events.len() > 500
+                || page.next_cursor.len() > 64
+                || page
+                    .available_from_ms
+                    .is_some_and(|at| at < 0 || at > page.observed_at_ms)
+            {
                 return Err(Error::Invalid("history protocol/clock skew"));
+            }
+            let previous = super::timeline::numeric_cursor(&self.state.cursor)?;
+            let next = super::timeline::numeric_cursor(&page.next_cursor)?;
+            let observed = u64::try_from(page.observed_at_ms)
+                .map_err(|_| Error::Invalid("history timestamp"))?;
+            if next < previous || next.0 > observed {
+                return Err(Error::Invalid("history cursor regression/future"));
             }
             let mut candidate = self.state.clone();
             if page.truncated {
@@ -77,12 +94,30 @@ impl Collector {
             }
             let mut accepted: Vec<Event> = Vec::new();
             for event in &page.events {
-                if event.at_ms > page.observed_at_ms {
+                if event.id.len() > 64
+                    || event.at_ms > page.observed_at_ms
+                    || u64::try_from(event.at_ms).ok()
+                        != Some(super::timeline::numeric_cursor(&event.id)?.0)
+                {
                     return Err(Error::Invalid("event follows source watermark"));
                 }
                 if candidate.apply(&self.config, event)? {
                     accepted.push(event.clone());
                 }
+            }
+            if page.events.is_empty() && next > previous {
+                // Version-one relay history advances an empty stream to its seven-day
+                // retention floor. Source coverage can start later than that floor.
+                let floor = page.observed_at_ms.saturating_sub(604_800_000).max(0);
+                if page.has_more
+                    || page.next_cursor != format!("{floor}-0")
+                    || page.available_from_ms.is_some_and(|at| at < floor)
+                {
+                    return Err(Error::Invalid(
+                        "empty history cursor lacks retention coverage",
+                    ));
+                }
+                candidate.cursor = page.next_cursor.clone();
             }
             if page.next_cursor != candidate.cursor || (page.has_more && accepted.is_empty()) {
                 return Err(Error::Invalid("history cursor did not match page"));
@@ -744,7 +779,8 @@ impl LinearSource for SelectedLinear<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// Trace: FR-033-AC-5
+    use ix_trace_rs::trace;
+    #[trace("FR-033-AC-5")]
     #[test]
     fn stale_backoff_snapshots_cannot_refresh_tracker_success() {
         let freshness = |stale, sync| crate::CacheFreshness {
@@ -764,7 +800,7 @@ mod tests {
         assert!(verified_sync_ms(Some(freshness(false, Some(i64::MAX)))).is_err());
         assert!(verified_sync_ms(None).is_err());
     }
-    /// Trace: FR-033-AC-6
+    #[trace("FR-033-AC-6")]
     #[test]
     fn removing_or_canceling_work_does_not_create_delivery() {
         let selectors = super::super::Selectors {
@@ -798,7 +834,8 @@ mod tests {
 #[cfg(test)]
 mod revision_tests {
     use super::*;
-    /// Trace: FR-033-AC-6
+    use ix_trace_rs::trace;
+    #[trace("FR-033-AC-6")]
     #[test]
     fn changing_selectors_invalidates_comparable_effort_history() {
         let old = super::super::Selectors {

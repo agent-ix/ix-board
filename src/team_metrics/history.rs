@@ -70,7 +70,7 @@ pub(super) struct CommandOutput {
     pub status: std::process::ExitStatus,
 }
 
-// HTTP status and rate-limit headers remain readable on nonzero gh exits.
+// Local credential-provider output stays internal and bounded, including on failure.
 #[cfg(unix)]
 pub(super) fn command_output(
     command: &mut Command,
@@ -141,8 +141,9 @@ pub fn read_history(_program: &str, _args: &[&str], _timeout: Duration) -> Resul
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use ix_trace_rs::trace;
 
-    /// Trace: FR-033-AC-12
+    #[trace("FR-033-AC-12")]
     #[test]
     fn nonzero_source_exit_preserves_http_status_headers_and_body() {
         let mut command = Command::new(std::env::current_exe().unwrap());
@@ -160,7 +161,6 @@ mod tests {
         );
     }
 
-    /// Trace: FR-033-AC-12
     #[test]
     #[ignore = "nonzero HTTP subprocess fixture"]
     fn http_failure() {

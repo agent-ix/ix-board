@@ -6,6 +6,7 @@ use super::{
     wire::AssignmentStatus,
 };
 use crate::WorkflowStateType;
+use ix_trace_rs::trace;
 use std::collections::BTreeMap;
 fn config(path: &std::path::Path) -> Config {
     Config {
@@ -93,7 +94,7 @@ fn sample(at: i64, working: bool) -> Vec<ExecutionSample> {
 }
 
 /// Provenance: SWM-180, SWM-181; short stages and read replay.
-/// Trace: FR-033-AC-1
+#[trace("FR-033-AC-1")]
 #[test]
 fn short_stages_survive_removal_and_replayed_events_do_not_count_twice() {
     let dir = tempfile::tempdir().unwrap();
@@ -148,7 +149,7 @@ fn short_stages_survive_removal_and_replayed_events_do_not_count_twice() {
 }
 
 /// Provenance: SWM-181; reports are not execution, pauses/outages never improve throughput.
-/// Trace: FR-033-AC-2
+#[trace("FR-033-AC-2")]
 #[test]
 fn execution_needs_consecutive_verified_observations_and_preserves_stalls() {
     let dir = tempfile::tempdir().unwrap();
@@ -196,7 +197,7 @@ fn execution_needs_consecutive_verified_observations_and_preserves_stalls() {
 }
 
 /// Provenance: SWM-181; reused pane labels must not inherit the prior session's assignments.
-/// Trace: FR-033-AC-2
+#[trace("FR-033-AC-2")]
 #[test]
 fn a_replacement_session_clears_previous_incarnation_assignments() {
     let dir = tempfile::tempdir().unwrap();
@@ -223,7 +224,7 @@ fn a_replacement_session_clears_previous_incarnation_assignments() {
 }
 
 /// Provenance: SWM-181; shared assignments cannot be charged twice.
-/// Trace: FR-033-AC-2
+#[trace("FR-033-AC-2")]
 #[test]
 fn overlapping_scopes_do_not_double_credit_execution() {
     let dir = tempfile::tempdir().unwrap();
@@ -256,7 +257,7 @@ fn overlapping_scopes_do_not_double_credit_execution() {
 }
 
 /// Provenance: SWM-181; cursor/events/current totals form one durable checkpoint.
-/// Trace: FR-033-AC-1
+#[trace("FR-033-AC-1")]
 #[test]
 fn journal_restores_cursor_and_totals_and_prunes_older_evidence() {
     let dir = tempfile::tempdir().unwrap();
@@ -293,7 +294,7 @@ fn journal_restores_cursor_and_totals_and_prunes_older_evidence() {
 }
 
 /// Provenance: SWM-181; no unknown-as-zero, private IDs as labels, or rolling counters.
-/// Trace: FR-033-AC-5
+#[trace("FR-033-AC-5")]
 #[test]
 fn export_omits_unknown_values_and_uses_only_bounded_labels() {
     let dir = tempfile::tempdir().unwrap();
@@ -317,7 +318,7 @@ fn export_omits_unknown_values_and_uses_only_bounded_labels() {
     assert!(text.contains("# TYPE ix_team_execution_seconds_total counter"));
 }
 
-/// Trace: FR-033-AC-11
+#[trace("FR-033-AC-11")]
 #[test]
 fn frontier_monitor_omits_missing_stale_and_future_counts() {
     let dir = tempfile::tempdir().unwrap();
@@ -343,7 +344,7 @@ fn frontier_monitor_omits_missing_stale_and_future_counts() {
 }
 
 /// Provenance: SWM-181; unsupported schemas cannot overwrite evidence.
-/// Trace: FR-033-AC-4
+#[trace("FR-033-AC-4")]
 #[test]
 fn unsupported_journal_and_unknown_config_fields_are_refused() {
     let dir = tempfile::tempdir().unwrap();
@@ -363,7 +364,7 @@ fn unsupported_journal_and_unknown_config_fields_are_refused() {
 }
 
 /// Provenance: SWM-181; scalar throughput snapshots retain gauge semantics.
-/// Trace: FR-033-AC-5
+#[trace("FR-033-AC-5")]
 #[test]
 fn windowed_metrics_are_gauges_and_expired_sources_lose_values() {
     let dir = tempfile::tempdir().unwrap();
@@ -404,7 +405,7 @@ fn windowed_metrics_are_gauges_and_expired_sources_lose_values() {
 }
 
 /// Provenance: SWM-181; an outage cannot advance accounting beyond source coverage.
-/// Trace: FR-033-AC-3
+#[trace("FR-033-AC-3")]
 #[test]
 fn delayed_completion_after_history_outage_remains_replayable() {
     let dir = tempfile::tempdir().unwrap();
@@ -446,7 +447,7 @@ fn delayed_completion_after_history_outage_remains_replayable() {
 }
 
 /// Provenance: SWM-181; metadata updates must replace stale worker identity.
-/// Trace: FR-033-AC-3
+#[trace("FR-033-AC-3")]
 #[test]
 fn same_stage_upsert_updates_worker_binding_without_resetting_start() {
     let dir = tempfile::tempdir().unwrap();
@@ -475,7 +476,7 @@ fn same_stage_upsert_updates_worker_binding_without_resetting_start() {
 }
 
 /// Provenance: SWM-181; failed attempts do not advance last-success or invent population zeros.
-/// Trace: FR-033-AC-5
+#[trace("FR-033-AC-5")]
 #[test]
 fn failed_lifecycle_keeps_last_success_and_omits_current_ages() {
     let dir = tempfile::tempdir().unwrap();
@@ -501,7 +502,7 @@ fn failed_lifecycle_keeps_last_success_and_omits_current_ages() {
 }
 
 /// Provenance: SWM-181; snapshots establish only current assignment facts.
-/// Trace: FR-033-AC-7
+#[trace("FR-033-AC-7")]
 #[test]
 fn bootstrap_never_invents_historical_stage_starts() {
     let dir = tempfile::tempdir().unwrap();
@@ -536,7 +537,7 @@ fn bootstrap_never_invents_historical_stage_starts() {
 }
 
 /// Provenance: SWM-181; Unicode-heavy events stay within the actual byte ceiling.
-/// Trace: FR-033-AC-4
+#[trace("FR-033-AC-4")]
 #[test]
 fn unicode_event_retention_evicts_before_the_page_limit_is_hit() {
     let dir = tempfile::tempdir().unwrap();
@@ -555,7 +556,7 @@ fn unicode_event_retention_evicts_before_the_page_limit_is_hit() {
     assert_eq!(journal.load().unwrap().cursor, "300-0");
 }
 
-/// Trace: FR-033-AC-2, FR-033-AC-6
+#[trace("FR-033-AC-2", "FR-033-AC-6")]
 #[test]
 fn completed_stages_do_not_leak_into_a_disjoint_scope_with_the_same_lead() {
     let dir = tempfile::tempdir().unwrap();
@@ -606,7 +607,7 @@ fn completed_stages_do_not_leak_into_a_disjoint_scope_with_the_same_lead() {
     assert!(state.scopes["factory:disjoint"].stages.is_empty());
 }
 
-/// Trace: FR-033-AC-2, FR-033-AC-7
+#[trace("FR-033-AC-2", "FR-033-AC-7")]
 #[test]
 fn a_lead_working_a_different_reported_scope_has_unknown_parent_attribution() {
     let dir = tempfile::tempdir().unwrap();
@@ -649,7 +650,7 @@ fn a_lead_working_a_different_reported_scope_has_unknown_parent_attribution() {
     );
 }
 
-/// Trace: FR-033-AC-5, FR-033-AC-13
+#[trace("FR-033-AC-5", "FR-033-AC-13")]
 #[test]
 fn cached_github_values_expire_independently_of_fresh_tracker_polls() {
     let dir = tempfile::tempdir().unwrap();
@@ -670,4 +671,109 @@ fn cached_github_values_expire_independently_of_fresh_tracker_polls() {
     assert!(expired.contains("source=\"github_prs\"} 0\n"));
     assert!(!expired.contains("ix_team_prs_closed_unmerged_24h{"));
     assert!(expired.contains("ix_team_source_last_success_timestamp_seconds{team_id=\"factory\",scope_id=\"completion\",source=\"github_prs\"} 100\n"));
+}
+
+#[trace("FR-033-AC-1", "FR-033-AC-3")]
+#[test]
+fn empty_retention_floor_checkpoints_once_and_survives_next_tick_and_restart() {
+    struct EmptyFloor {
+        seen: std::cell::RefCell<Vec<String>>,
+        truncated: bool,
+    }
+    impl History for EmptyFloor {
+        fn page(&self, after: &str) -> Result<EventPage, Error> {
+            self.seen.borrow_mut().push(after.into());
+            Ok(EventPage {
+                version: 1,
+                available_from_ms: Some(700_000_000),
+                observed_at_ms: 700_000_000,
+                truncated: self.truncated,
+                next_cursor: "95200000-0".into(),
+                has_more: false,
+                events: vec![],
+            })
+        }
+    }
+    for expired in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let mut collector = Collector::open(cfg.clone()).unwrap();
+        if expired {
+            collector
+                .state
+                .apply(
+                    &cfg,
+                    &event(
+                        1000,
+                        Change::Agent {
+                            agent: assignment("coder", AssignmentStatus::Running),
+                        },
+                    ),
+                )
+                .unwrap();
+        }
+        let history = EmptyFloor {
+            seen: Default::default(),
+            truncated: expired,
+        };
+        collector.history(&history, 700_000_000).unwrap();
+        assert!(collector.state.history_ok);
+        assert_eq!(collector.state.cursor, "95200000-0");
+        assert_eq!(collector.state.history_from_ms, Some(700_000_000));
+        if expired {
+            assert!(
+                collector.state.scopes["factory:completion"]
+                    .assignments
+                    .is_empty()
+            );
+        }
+        collector.history(&history, 700_000_000).unwrap();
+        assert_eq!(
+            history.seen.borrow().len(),
+            2,
+            "empty terminal pages must not spin"
+        );
+        drop(collector);
+        let mut collector = Collector::open(cfg).unwrap();
+        assert_eq!(collector.state.cursor, "95200000-0");
+        collector.history(&history, 700_000_000).unwrap();
+        assert_eq!(history.seen.borrow().last().unwrap(), "95200000-0");
+        assert_eq!(history.seen.borrow().len(), 3);
+    }
+}
+
+#[trace("FR-033-AC-1", "FR-033-AC-3")]
+#[test]
+fn invalid_empty_history_advancement_never_changes_cursor_or_retains_health() {
+    struct Page(EventPage);
+    impl History for Page {
+        fn page(&self, _: &str) -> Result<EventPage, Error> {
+            Ok(self.0.clone())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path());
+    let mut collector = Collector::open(cfg).unwrap();
+    for (next, has_more, coverage, observed) in [
+        ("95200000-1", false, Some(95_200_000), 700_000_000),
+        ("95200000-0", true, Some(95_200_000), 700_000_000),
+        ("95200000-0", false, Some(1), 700_000_000),
+        ("95200000-0", false, Some(800_000_000), 700_000_000),
+        ("bad", false, Some(95_200_000), 700_000_000),
+        ("95200000-0", false, Some(95_200_000), 1),
+    ] {
+        collector.state.history_ok = true;
+        let page = Page(EventPage {
+            version: 1,
+            available_from_ms: coverage,
+            observed_at_ms: observed,
+            truncated: false,
+            next_cursor: next.into(),
+            has_more,
+            events: vec![],
+        });
+        assert!(collector.history(&page, 700_000_000).is_err());
+        assert_eq!(collector.state.cursor, "0-0");
+        assert!(!collector.state.history_ok);
+    }
 }
