@@ -42,7 +42,7 @@ src/agents/            # agents verdicts, Herdr and harness adapters
 examples/              # export_schema (JSON Schema for wire types)
 tests/                 # integration tests and fixtures
 spec/                  # requirements artifacts
-docs/                  # user documentation and figures (docs/images/figures.py)
+docs/                  # user documentation and figures (docs/images/figures.json via `ixd build`)
 plugin/                # Claude Code and Codex plugin skills
 scripts/               # local tooling
 ```
