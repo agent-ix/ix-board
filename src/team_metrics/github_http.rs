@@ -81,6 +81,7 @@ impl Transport for Http {
         &self.namespace
     }
     fn send(&self, request: &Request, etag: Option<&str>) -> Result<Response, String> {
+        let body = request.encoded()?;
         let method = if request.conditional {
             reqwest::Method::GET
         } else {
@@ -92,14 +93,28 @@ impl Transport for Http {
             .bearer_auth(self.credential.expose_secret())
             .header("Accept", "application/vnd.github+json");
         if request.conditional {
-            builder = builder.query(&request.fields);
+            let variables = serde_json::to_string(&request.variables)
+                .map_err(|_| "invalid GitHub variables")?;
+            builder = builder.query(&[
+                ("query", request.query.as_str()),
+                ("variables", variables.as_str()),
+            ]);
         } else {
-            builder = builder.json(&request.fields);
+            builder = builder
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body);
         }
         if let Some(etag) = etag {
             builder = builder.header("If-None-Match", etag);
         }
-        let mut response = builder.send().map_err(|_| "GitHub HTTP attempt failed")?;
+        let outgoing = builder.build().map_err(|_| "invalid GitHub HTTP request")?;
+        if request.conditional && outgoing.url().as_str().len() > super::github::MAX_QUERY {
+            return Err("GitHub encoded query URL byte limit exceeded".into());
+        }
+        let mut response = self
+            .client
+            .execute(outgoing)
+            .map_err(|_| "GitHub HTTP attempt failed")?;
         let status = response.status().as_u16();
         let mut headers = BTreeMap::new();
         for name in [
@@ -240,7 +255,8 @@ pub(in crate::team_metrics) mod tests {
             let server = Fixture::start(move |_, _| reply(status, "Location: /again\r\n", "{}"));
             let transport = Http::fixture(&server.endpoint, "offline-credential").unwrap();
             let request = Request {
-                fields: [("query".into(), "query { fixture }".into())].into(),
+                query: "query { fixture }".into(),
+                variables: BTreeMap::new(),
                 conditional: false,
             };
             assert_eq!(transport.send(&request, None).unwrap().status, status);
@@ -264,7 +280,8 @@ pub(in crate::team_metrics) mod tests {
         });
         let transport = Http::fixture(&server.endpoint, "offline-credential").unwrap();
         let request = Request {
-            fields: BTreeMap::new(),
+            query: "query { fixture }".into(),
+            variables: BTreeMap::new(),
             conditional: false,
         };
         let response = transport.send(&request, None).unwrap();

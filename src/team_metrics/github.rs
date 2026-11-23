@@ -24,12 +24,24 @@ const MAX_COST: i64 = 1000;
 const MAX_PAGES: usize = 4;
 const MAX_OLD: usize = 50;
 const MAX_REPOS: usize = 32;
-const MAX_QUERY: usize = 16 * 1024;
+pub(super) const MAX_QUERY: usize = 16 * 1024;
 const CACHE_BYTES: i64 = 4 * 1024 * 1024;
 
+#[derive(serde::Serialize)]
 pub(super) struct Request {
-    pub(super) fields: BTreeMap<String, String>,
+    pub(super) query: String,
+    pub(super) variables: BTreeMap<String, String>,
+    #[serde(skip)]
     pub(super) conditional: bool,
+}
+impl Request {
+    pub(super) fn encoded(&self) -> Result<Vec<u8>, String> {
+        let body = serde_json::to_vec(self).map_err(|_| "invalid GitHub request")?;
+        if body.len() > MAX_QUERY {
+            return Err("GitHub serialized query byte limit exceeded".into());
+        }
+        Ok(body)
+    }
 }
 pub(super) struct Response {
     pub(super) status: u16,
@@ -105,19 +117,12 @@ impl<T: Transport> Guard<T> {
         request: &Request,
         validate: impl Fn(&str, i64) -> Result<(), String>,
     ) -> Result<Cached, String> {
-        let encoded = serde_json::to_vec(&request.fields).map_err(|_| "invalid GitHub request")?;
-        if encoded.len() > MAX_QUERY {
-            return Err("GitHub query byte limit exceeded".into());
-        }
+        let encoded = request.encoded()?;
         let key = format!(
             "{:x}",
             Sha256::digest(
-                serde_json::to_vec(&(
-                    self.transport.namespace(),
-                    &request.fields,
-                    request.conditional
-                ))
-                .map_err(|e| e.to_string())?
+                serde_json::to_vec(&(self.transport.namespace(), &encoded, request.conditional))
+                    .map_err(|e| e.to_string())?
             )
         );
         let mut db = self.db.borrow_mut();
@@ -348,21 +353,19 @@ fn graph_request(query: &str, repo: &str, after: Option<&str>) -> Result<Request
     }) {
         return Err("invalid repository".into());
     }
-    let mut fields = BTreeMap::from([
-        ("query".into(), query.into()),
-        ("owner".into(), owner.into()),
-        ("name".into(), name.into()),
-    ]);
+    let mut variables =
+        BTreeMap::from([("owner".into(), owner.into()), ("name".into(), name.into())]);
     if let Some(after) = after {
         if after.len() > 1024 {
             return Err("GitHub cursor byte limit exceeded".into());
         }
-        fields.insert("after".into(), after.into());
+        variables.insert("after".into(), after.into());
     }
     // GraphQL POST has no conditional GET representation. REST requests, when
     // admitted by this transport, use conditional=true and retain ETags on 304.
     Ok(Request {
-        fields,
+        query: query.into(),
+        variables,
         conditional: false,
     })
 }
@@ -859,7 +862,7 @@ mod tests {
     fn graph() -> Fake {
         Fake::new(|request, _| {
             assert!(!request.conditional);
-            let query = request.fields.get("query").unwrap();
+            let query = &request.query;
             assert!(query.len() < MAX_QUERY);
             let repository = if query.contains("pullRequests(") {
                 serde_json::json!({"pullRequests":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}})
@@ -877,7 +880,8 @@ mod tests {
     }
     fn request(key: usize, conditional: bool) -> Request {
         Request {
-            fields: [("fixture".into(), key.to_string())].into(),
+            query: format!("fixture-{key}"),
+            variables: BTreeMap::new(),
             conditional,
         }
     }
@@ -1129,7 +1133,7 @@ mod tests {
         let cfg = config(dir.path());
         let fake = Fake::new(|request, _| {
             let n = request
-                .fields
+                .variables
                 .get("after")
                 .map(String::as_str)
                 .and_then(|s| s.parse::<u64>().ok())
@@ -1147,7 +1151,8 @@ mod tests {
             guard
                 .request_at(
                     &Request {
-                        fields: [("query".into(), "x".repeat(MAX_QUERY + 1))].into(),
+                        query: "x".repeat(MAX_QUERY + 1),
+                        variables: BTreeMap::new(),
                         conditional: false
                     },
                     1000,
@@ -1298,7 +1303,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = config(dir.path());
         let fake = Fake::new(|request, _| {
-            let query = request.fields.get("query").unwrap();
+            let query = &request.query;
             let open = query.contains("states: [OPEN]");
             let node = serde_json::json!({
                 "number":if open {1} else {2},"state":if open {"OPEN"} else {"MERGED"},
@@ -1698,5 +1703,136 @@ mod tests {
             .unwrap();
         assert_eq!(charges, vec![HOUR_MS + 500, HOUR_MS + 20_501]);
         assert_eq!(fake.count(), 41);
+    }
+
+    #[trace("FR-033-AC-12", "FR-033-AC-13")]
+    #[test]
+    fn actual_http_body_nests_variables_for_listing_historical_and_paginated_queries() {
+        use super::super::github_http::tests::{Fixture, reply};
+        let server = Fixture::start(|_, request| {
+            assert!(request.starts_with("POST /graphql HTTP/1.1\r\n"));
+            let body = request.split_once("\r\n\r\n").unwrap().1;
+            assert!(body.len() <= MAX_QUERY);
+            let payload: serde_json::Value = serde_json::from_str(body).unwrap();
+            let root = payload.as_object().unwrap();
+            assert_eq!(
+                root.len(),
+                2,
+                "only query and variables belong at the GraphQL JSON root"
+            );
+            let query = root.get("query").unwrap().as_str().unwrap();
+            let variables = root.get("variables").unwrap().as_object().unwrap();
+            assert_eq!(variables.get("owner").unwrap(), "agent-ix");
+            assert_eq!(variables.get("name").unwrap(), "one");
+            assert!(query.contains("$owner"));
+            assert!(query.contains("$name"));
+            let repository = if query.contains("pullRequests(") {
+                let (nodes, has_next, cursor) = if query.contains("states: [OPEN]") {
+                    let number = if variables.get("after").is_none() {
+                        1
+                    } else {
+                        assert_eq!(variables.get("after").unwrap(), "opaque-page-two");
+                        2
+                    };
+                    let node = serde_json::json!({"number":number,"state":"OPEN","createdAt":"1970-01-01T00:00:00Z","updatedAt":"1970-01-01T00:00:00Z","mergedAt":null,"closedAt":null,"isDraft":false,"additions":3,"deletions":2,"reviewDecision":null,"timelineItems":{"totalCount":0},"reopenEvents":{"totalCount":0}});
+                    (
+                        vec![node],
+                        number == 1,
+                        if number == 1 {
+                            Some("opaque-page-two")
+                        } else {
+                            None
+                        },
+                    )
+                } else {
+                    assert_eq!(variables.len(), 2);
+                    assert!(query.contains("states: [MERGED, CLOSED]"));
+                    (Vec::new(), false, None)
+                };
+                serde_json::json!({"pullRequests":{"nodes":nodes,"pageInfo":{"hasNextPage":has_next,"endCursor":cursor}}})
+            } else {
+                assert_eq!(variables.len(), 2);
+                assert!(query.contains("p3: pullRequest(number: 3)"));
+                serde_json::json!({"p3":{"state":"MERGED","createdAt":"1970-01-01T00:00:00Z","updatedAt":"1970-01-01T00:00:00Z","mergedAt":"1970-01-01T00:00:00Z","closedAt":"1970-01-01T00:00:00Z"}})
+            };
+            let response = serde_json::json!({"data":{"rateLimit":{"cost":3,"remaining":100,"resetAt":"2030-01-01T00:00:00Z"},"repository":repository}}).to_string();
+            reply(200, "", &response)
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let http = Http::fixture(&server.endpoint, "offline-credential").unwrap();
+        let clock = Arc::new(TestClock(std::sync::atomic::AtomicI64::new(1000)));
+        let guard = Guard::with_clock(&cfg, http, clock).unwrap();
+        let allowed = (1..=3).map(|n| ("agent-ix/one".into(), n)).collect();
+        let source = SelectedGithub::with_guard(Ok(guard), allowed, true, 1000);
+        let prs = source.pull_requests("agent-ix/one", 0.0).unwrap();
+        assert_eq!(
+            prs.iter().map(|pr| pr.number).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(source.pull_request("agent-ix/one", 3).unwrap().merged);
+        assert!(!source.pull_request("agent-ix/one", 1).unwrap().merged);
+        let seen = server.finish();
+        assert_eq!(
+            seen.len(),
+            4,
+            "two open pages, one recent page and one historical batch"
+        );
+        let pagination: Vec<_> = seen
+            .iter()
+            .map(|request| {
+                let payload: serde_json::Value =
+                    serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+                payload["variables"].get("after").cloned()
+            })
+            .collect();
+        assert_eq!(
+            pagination,
+            vec![None, Some(serde_json::json!("opaque-page-two")), None, None]
+        );
+    }
+
+    #[trace("FR-033-AC-12", "FR-033-AC-13")]
+    #[test]
+    fn final_serialized_graphql_body_limit_includes_envelope_variables_and_json_escaping() {
+        use super::super::github_http::tests::{Fixture, reply};
+        let server = Fixture::start(|_, request| {
+            let body = request.split_once("\r\n\r\n").unwrap().1;
+            assert_eq!(body.len(), MAX_QUERY);
+            let value: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert!(value["variables"].is_object());
+            reply(200, "", "{}")
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let http = Http::fixture(&server.endpoint, "offline-credential").unwrap();
+        let clock = Arc::new(TestClock(std::sync::atomic::AtomicI64::new(1000)));
+        let guard = Guard::with_clock(&cfg, http, clock).unwrap();
+        let mut request = graph_request("", "agent-ix/one", None).unwrap();
+        let overhead = request.encoded().unwrap().len();
+        request.query = "x".repeat(MAX_QUERY - overhead);
+        assert_eq!(request.encoded().unwrap().len(), MAX_QUERY);
+        guard.request(&request, valid_json).unwrap();
+        request.variables.insert("after".into(), "page".into());
+        assert!(
+            guard.request(&request, valid_json).is_err(),
+            "variable/envelope bytes must be included before admission"
+        );
+        request.query = "\"".repeat(MAX_QUERY / 2);
+        assert!(
+            guard.request(&request, valid_json).is_err(),
+            "JSON escaping must be measured after serialization"
+        );
+        let sends: i64 = guard
+            .db
+            .borrow()
+            .query_row("SELECT count(*) FROM github_sends", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sends, 1);
+        assert_eq!(
+            server.finish().len(),
+            1,
+            "oversize final bodies must cause zero HTTP sends"
+        );
     }
 }
