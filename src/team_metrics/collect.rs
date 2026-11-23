@@ -498,6 +498,7 @@ impl Collector {
                     let pr_stats = all_prs
                         .as_ref()
                         .ok()
+                        .filter(|_| github.observed_at() > 0)
                         .map(|prs| super::pr_stats::calculate(prs, now as f64 / 1000.0));
                     let review_stats = (|| -> Result<super::reviews::ReviewStats, String> {
                         let client =
@@ -599,10 +600,10 @@ impl Collector {
                     state.pr_stats = result.pr_stats;
                     state.review_stats = result.review_stats;
                     state.github_observed_at_ms = result.github_at_ms;
-                    if state.pr_stats.is_some() {
-                        state.pr_success_at_ms = result.github_at_ms.min(batch.at_ms);
+                    if state.pr_stats.is_some() && result.github_at_ms > 0 {
+                        state.pr_success_at_ms = result.github_at_ms;
                     }
-                    if state.review_stats.is_some() {
+                    if state.review_stats.is_some() && result.github_at_ms > 0 {
                         state.review_success_at_ms = result.github_at_ms.min(batch.at_ms);
                     }
                     state.tracker_at_ms = batch.at_ms;
@@ -780,6 +781,63 @@ impl LinearSource for SelectedLinear<'_> {
 mod tests {
     use super::*;
     use ix_trace_rs::trace;
+    #[trace("FR-033-AC-5", "FR-033-AC-13")]
+    #[test]
+    fn provider_receipt_and_cached_provenance_do_not_inherit_linear_poll_times() {
+        let dir = tempfile::tempdir().unwrap();
+        let config: Config = serde_json::from_value(serde_json::json!({"version":1,"listen":"127.0.0.1:0","state_path":dir.path().join("state.sqlite"),"scopes":[{"team_id":"fixture","scope_id":"work","selectors":{"team":"SWM"},"leads":["draco:SWM:code"],"herdr_teams":[],"retro_config":"unused"}]})).unwrap();
+        let mut collector = Collector::open(config.clone()).unwrap();
+        let batch = |linear_at: i64, github_at: i64, available: bool| {
+            let record = serde_json::from_value(serde_json::json!({
+                "schema_version":1, "kind":"snapshot", "taken_at":"1970-01-01T00:01:40Z",
+                "team":"fixture", "window":"24h", "metrics":{}
+            }))
+            .unwrap();
+            TrackerBatch {
+                at_ms: linear_at,
+                results: vec![(
+                    "fixture:work".into(),
+                    Ok(TrackerResult {
+                        members: BTreeMap::new(),
+                        record,
+                        build_execution_seconds_24h: None,
+                        ready_issues: None,
+                        blocked_issues: None,
+                        query_identity: "fixture".into(),
+                        resolved_selectors: super::super::Selectors::default(),
+                        pr_stats: available.then(|| super::super::pr_stats::calculate(&[], 0.0)),
+                        review_stats: None,
+                        github_at_ms: github_at,
+                    }),
+                )],
+            }
+        };
+        collector
+            .apply_tracker(batch(1_000_000, 1_020_000, true))
+            .unwrap();
+        assert_eq!(
+            collector.state.scopes["fixture:work"].pr_success_at_ms,
+            1_020_000
+        );
+        collector
+            .apply_tracker(batch(1_100_000, 1_020_000, true))
+            .unwrap();
+        assert_eq!(
+            collector.state.scopes["fixture:work"].pr_success_at_ms,
+            1_020_000
+        );
+        collector.apply_tracker(batch(1_200_000, 0, false)).unwrap();
+        assert_eq!(
+            collector.state.scopes["fixture:work"].pr_success_at_ms,
+            1_020_000
+        );
+        drop(collector);
+        let collector = Collector::open(config).unwrap();
+        assert_eq!(
+            collector.state.scopes["fixture:work"].pr_success_at_ms,
+            1_020_000
+        );
+    }
     #[trace("FR-033-AC-5")]
     #[test]
     fn stale_backoff_snapshots_cannot_refresh_tracker_success() {
