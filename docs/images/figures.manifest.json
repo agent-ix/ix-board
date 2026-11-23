@@ -1,0 +1,9 @@
+{
+  "files": [
+    "ready-queue-light.svg",
+    "ready-queue-dark.svg",
+    "focus-light.svg",
+    "focus-dark.svg"
+  ],
+  "generated_by": "ixd build"
+}

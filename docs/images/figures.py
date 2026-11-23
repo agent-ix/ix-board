@@ -7,9 +7,11 @@ Regenerate from the repository root with the agent-ix/dev-tools skill:
     python3 -m pip install fonttools
     python3 <dev-tools>/skills/docs-figures/scripts/render.py docs/images/figures.py
 
-Add --check to confirm the committed SVGs are current. The cache lifetime, the
-ready-queue ordering keys, the spec-state mapping and the project run state are
-read from the Rust sources in this repository.
+Add --check to confirm the committed SVGs are current. Only the overview is defined
+here: it shows the cache lifetime in minutes, derived from `CACHE_TTL_SECONDS` in
+seconds, which docs/images/figures.json cannot yet express (no arithmetic in value
+bindings). The ready-queue and focus figures are defined in docs/images/figures.json
+and rendered by `make figures`.
 """
 
 import re
@@ -42,31 +44,6 @@ def cache_minutes():
     """The snapshot lifetime in minutes, from `CACHE_TTL_SECONDS`."""
     seconds = int(re.search(r"CACHE_TTL_SECONDS: i64 = (\d+);", _source("src/cache.rs")).group(1))
     return seconds // 60
-
-
-def ordering_keys():
-    """The ready-queue sort keys in order, from the reason string in `ready_queue_for`."""
-    text = _source("src/lib.rs")
-    tail = re.search(r"ordered by ([^\"]+)\"", text).group(1)
-    keys = [part.replace(" {}", "").strip() for part in tail.split(", ")]
-    return keys + ["identifier"]
-
-
-def next_steps():
-    """Spec state to next step, from `spec_step`."""
-    body = _source("src/lib.rs").split("fn spec_step", 1)[1].split("\n}\n", 1)[0]
-    steps = {}
-    for line in body.splitlines():
-        step = re.search(r"=> Some\(NextStep::(\w+)\)", line)
-        if step:
-            for state in re.findall(r'"(\w+)"', line):
-                steps[state] = step.group(1)
-    return steps
-
-
-def running_status():
-    """The project state that lets tickets into the queue, from `ready_queue_for`."""
-    return re.search(r'project\.status != "(\w+)"', _source("src/lib.rs")).group(1)
 
 
 # ---- figures -----------------------------------------------------------------
@@ -125,115 +102,4 @@ def overview():
     return f
 
 
-def ready_queue():
-    """A small blocker graph: which tickets are ready, which are not, and the queue order."""
-    keys = ordering_keys()
-    steps = next_steps()
-    running = running_status()
-    f = Figure(
-        "ready-queue",
-        820,
-        408,
-        "A ticket is ready when its project is Started, its spec state is Backlog, Specify or "
-        "Specced, and every ticket in its chain of blockers is Completed. A blocker that is "
-        "still in progress or Canceled keeps a ticket out. Ready tickets are ordered by "
-        + ", ".join(keys[:-1])
-        + f", then {keys[-1]}.",
-    )
-    bx, tx, qx = 0, 230, 560
-    bw, tw, qw = 150, 240, 250
-    row = 70
-
-    def y_of(i):
-        return 26 + i * row
-
-    f.text(bx, 12, "BLOCKER", "muted", "mono", SMALL)
-    f.text(tx, 12, "TICKET", "muted", "mono", SMALL)
-    f.text(qx, 12, "READY QUEUE", "muted", "mono", SMALL)
-
-    # (blocker, ticket, spec state, outcome, sub-line of the ticket)
-    rows = [
-        (None, "ENG-8", "Specced", "ready", f"Specced · next step {steps['Specced']}"),
-        (("ENG-1", "Completed"), "ENG-2", "Backlog", "ready", f"Backlog · next step {steps['Backlog']}"),
-        (("ENG-3", "In Progress"), "ENG-4", "Specced", "blocked", "Specced · blocker open"),
-        (("ENG-5", "Canceled"), "ENG-6", "Specced", "blocked", "Specced · blocker Canceled"),
-        (None, "ENG-9", "Specced", "excluded", f"project not {running}"),
-    ]
-    for i, entry in enumerate(rows):
-        blocker, ticket, _state, outcome, sub = entry
-        y = y_of(i)
-        role = {"ready": "logic", "blocked": "evidence", "excluded": "muted"}[outcome]
-        if blocker:
-            f.box(bx, y, bw, 50, "ink", blocker[0], blocker[1])
-            f.line([(bx + bw, y + 25), (tx - 3, y + 25)], "ink")
-            f.note(bx + bw + 14, y + 17, "blocks", "ink")
-        else:
-            f.text(bx, y + 30, "no blockers", "muted", "mono", SMALL)
-        f.box(tx, y, tw, 50, role, ticket, sub, dashed=(outcome == "excluded"))
-
-    # The queue: ready tickets in order, level with their rows.
-    ready_rows = [(0, "ENG-8", "Urgent"), (1, "ENG-2", "High")]
-    for n, (i, ticket, prio) in enumerate(ready_rows, start=1):
-        y = y_of(i)
-        f.line([(tx + tw, y + 25), (qx - 3, y + 25)], "logic", weight=2.4)
-        f.box(qx, y, qw, 50, "logic", f"{n}.  {ticket}", f"ticket priority {prio}")
-
-    # Ordering keys, read from the ready-queue sort.
-    top = y_of(2) + 6
-    f.text(qx, top, "ORDERED BY", "muted", "mono", SMALL)
-    for n, key in enumerate(keys, start=1):
-        f.text(qx, top + 24 + (n - 1) * 24, f"{n}.  {key}", "ink", "mono", SMALL + 1)
-    f.legend(0, 392, [
-        ("logic", "ready", "box"),
-        ("evidence", "blocked", "box"),
-        ("muted", "excluded", "dash"),
-        ("ink", "blocker", "box"),
-    ])
-    return f
-
-
-def focus():
-    """Selectors resolve to one focus issue set that feeds four reports."""
-    f = Figure(
-        "focus",
-        860,
-        262,
-        "A focus is a union of initiative, project, milestone and issue selectors. ix-board "
-        "resolves it to a deduplicated set of issues with their blocker layers. The status, "
-        "hygiene, plan-chunk and report commands read that set.",
-    )
-    sel = [
-        ("--initiative", "UUID, I-10 or name"),
-        ("--project", "UUID, identifier or name"),
-        ("--milestone", "name or project/name"),
-        ("--issue", "identifier, with descendants"),
-    ]
-    ys = [i * 66 for i in range(4)]
-    cy = (ys[0] + ys[-1] + 52) // 2
-    for (name, sub), y in zip(sel, ys):
-        f.box(0, y, 230, 52, "ink", name, sub)
-    bus = 262
-    f.line([(bus, ys[0] + 26), (bus, ys[-1] + 26)], "ink", arrow=False)
-    for y in ys:
-        f.line([(230, y + 26), (bus, y + 26)], "ink", arrow=False)
-    f.line([(bus, cy), (297, cy)], "ink")
-    f.box(300, cy - 39, 220, 78, "logic", "focus issues", "deduplicated union", "blocker layers")
-    f.text(300, cy + 66, "--work-milestone narrows", "muted", "mono", SMALL)
-    f.text(300, cy + 86, "ready work and handoff roots", "muted", "mono", SMALL)
-
-    reports = [
-        ("status", "progress · blockers · ready"),
-        ("hygiene", "findings · diff"),
-        ("plan-chunk", "ordered handoff"),
-        ("report", "versioned JSON record"),
-    ]
-    rbus = 552
-    f.line([(520, cy), (rbus, cy)], "logic", arrow=False)
-    f.line([(rbus, ys[0] + 26), (rbus, ys[-1] + 26)], "logic", arrow=False)
-    for (name, sub), y in zip(reports, ys):
-        f.line([(rbus, y + 26), (597, y + 26)], "logic")
-        f.box(600, y, 260, 52, "evidence", name, sub)
-    return f
-
-
-FIGURES = [overview, ready_queue, focus]
+FIGURES = [overview]

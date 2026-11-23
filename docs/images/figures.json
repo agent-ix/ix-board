@@ -1,0 +1,82 @@
+{
+  "style": "pencil",
+  "data": {
+    "key1": {"from":"regex","path":"src/lib.rs","pattern":"ordered by ([a-z ]+) \\{\\}, [a-z ]+ \\{\\}, [a-z ]+ \\{\\}, [a-z ]+ \\{\\}","group":1},
+    "key2": {"from":"regex","path":"src/lib.rs","pattern":"ordered by [a-z ]+ \\{\\}, ([a-z ]+) \\{\\}, [a-z ]+ \\{\\}, [a-z ]+ \\{\\}","group":1},
+    "key3": {"from":"regex","path":"src/lib.rs","pattern":"ordered by [a-z ]+ \\{\\}, [a-z ]+ \\{\\}, ([a-z ]+) \\{\\}, [a-z ]+ \\{\\}","group":1},
+    "key4": {"from":"regex","path":"src/lib.rs","pattern":"ordered by [a-z ]+ \\{\\}, [a-z ]+ \\{\\}, [a-z ]+ \\{\\}, ([a-z ]+) \\{\\}","group":1},
+    "specced_step": {"from":"regex","path":"src/lib.rs","pattern":"\"Specced\" => Some\\(NextStep::(\\w+)\\)"},
+    "backlog_step": {"from":"regex","path":"src/lib.rs","pattern":"\"Backlog\" => Some\\(NextStep::(\\w+)\\)"},
+    "running": {"from":"regex","path":"src/lib.rs","pattern":"project\\.status != \"(\\w+)\""}
+  },
+  "figures": [
+    {
+      "id": "ready-queue",
+      "width": 820, "height": 408,
+      "label": "A ticket is ready when its project is Started, its spec state is Backlog, Specify or Specced, and every ticket in its chain of blockers is Completed. A blocker that is still in progress or Canceled keeps a ticket out. Ready tickets are ordered by {key1}, {key2}, {key3}, {key4}, then identifier.",
+      "items": [
+        {"k":"text","at":[0,12],"text":"BLOCKER","role":"muted","size":13},
+        {"k":"text","at":[230,12],"text":"TICKET","role":"muted","size":13},
+        {"k":"text","at":[560,12],"text":"READY QUEUE","role":"muted","size":13},
+        {"k":"text","at":[0,56],"text":"no blockers","role":"muted","size":13},
+        {"k":"box","at":[230,26,240,50],"role":"logic","title":"ENG-8","subs":["Specced · next step {specced_step}"]},
+        {"k":"box","at":[0,96,150,50],"role":"ink","title":"ENG-1","subs":["Completed"]},
+        {"k":"line","points":[[150,121],[227,121]]},
+        {"k":"note","at":[164,113],"text":"blocks","role":"ink"},
+        {"k":"box","at":[230,96,240,50],"role":"logic","title":"ENG-2","subs":["Backlog · next step {backlog_step}"]},
+        {"k":"box","at":[0,166,150,50],"role":"ink","title":"ENG-3","subs":["In Progress"]},
+        {"k":"line","points":[[150,191],[227,191]]},
+        {"k":"note","at":[164,183],"text":"blocks","role":"ink"},
+        {"k":"box","at":[230,166,240,50],"role":"evidence","title":"ENG-4","subs":["Specced · blocker open"]},
+        {"k":"box","at":[0,236,150,50],"role":"ink","title":"ENG-5","subs":["Canceled"]},
+        {"k":"line","points":[[150,261],[227,261]]},
+        {"k":"note","at":[164,253],"text":"blocks","role":"ink"},
+        {"k":"box","at":[230,236,240,50],"role":"evidence","title":"ENG-6","subs":["Specced · blocker Canceled"]},
+        {"k":"text","at":[0,336],"text":"no blockers","role":"muted","size":13},
+        {"k":"box","at":[230,306,240,50],"role":"muted","title":"ENG-9","subs":["project not {running}"],"dashed":true},
+        {"k":"line","points":[[470,51],[557,51]],"role":"logic","weight":2.4},
+        {"k":"box","at":[560,26,250,50],"role":"logic","title":"1.  ENG-8","subs":["ticket priority Urgent"]},
+        {"k":"line","points":[[470,121],[557,121]],"role":"logic","weight":2.4},
+        {"k":"box","at":[560,96,250,50],"role":"logic","title":"2.  ENG-2","subs":["ticket priority High"]},
+        {"k":"text","at":[560,172],"text":"ORDERED BY","role":"muted","size":13},
+        {"k":"text","at":[560,196],"text":"1.  {key1}"},
+        {"k":"text","at":[560,220],"text":"2.  {key2}"},
+        {"k":"text","at":[560,244],"text":"3.  {key3}"},
+        {"k":"text","at":[560,268],"text":"4.  {key4}"},
+        {"k":"text","at":[560,292],"text":"5.  identifier"},
+        {"k":"legend","at":[0,392],"entries":[["logic","ready","box"],["evidence","blocked","box"],["muted","excluded","dash"],["ink","blocker","box"]]}
+      ]
+    },
+    {
+      "id": "focus",
+      "width": 860, "height": 262,
+      "label": "A focus is a union of initiative, project, milestone and issue selectors. ix-board resolves it to a deduplicated set of issues with their blocker layers. The status, hygiene, plan-chunk and report commands read that set.",
+      "items": [
+        {"k":"box","at":[0,0,230,52],"role":"ink","title":"--initiative","subs":["UUID, I-10 or name"]},
+        {"k":"box","at":[0,66,230,52],"role":"ink","title":"--project","subs":["UUID, identifier or name"]},
+        {"k":"box","at":[0,132,230,52],"role":"ink","title":"--milestone","subs":["name or project/name"]},
+        {"k":"box","at":[0,198,230,52],"role":"ink","title":"--issue","subs":["identifier, with descendants"]},
+        {"k":"line","points":[[262,26],[262,224]],"arrow":false},
+        {"k":"line","points":[[230,26],[262,26]],"arrow":false},
+        {"k":"line","points":[[230,92],[262,92]],"arrow":false},
+        {"k":"line","points":[[230,158],[262,158]],"arrow":false},
+        {"k":"line","points":[[230,224],[262,224]],"arrow":false},
+        {"k":"line","points":[[262,125],[297,125]]},
+        {"k":"box","at":[300,86,220,78],"role":"logic","title":"focus issues","subs":["deduplicated union","blocker layers"]},
+        {"k":"text","at":[300,191],"text":"--work-milestone narrows","role":"muted","size":13},
+        {"k":"text","at":[300,211],"text":"ready work and handoff roots","role":"muted","size":13},
+        {"k":"line","points":[[520,125],[552,125]],"role":"logic","arrow":false},
+        {"k":"line","points":[[552,26],[552,224]],"role":"logic","arrow":false},
+        {"k":"line","points":[[552,26],[597,26]],"role":"logic"},
+        {"k":"box","at":[600,0,260,52],"role":"evidence","title":"status","subs":["progress · blockers · ready"]},
+        {"k":"line","points":[[552,92],[597,92]],"role":"logic"},
+        {"k":"box","at":[600,66,260,52],"role":"evidence","title":"hygiene","subs":["findings · diff"]},
+        {"k":"line","points":[[552,158],[597,158]],"role":"logic"},
+        {"k":"box","at":[600,132,260,52],"role":"evidence","title":"plan-chunk","subs":["ordered handoff"]},
+        {"k":"line","points":[[552,224],[597,224]],"role":"logic"},
+        {"k":"box","at":[600,198,260,52],"role":"evidence","title":"report","subs":["versioned JSON record"]}
+      ]
+    }
+  ]
+}
+
