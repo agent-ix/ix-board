@@ -123,7 +123,7 @@ query MarkerComments($first: Int!, $after: String, $prefix: String!, $needle: St
     after: $after
     filter: { and: [{ body: { startsWith: $prefix } }, { body: { contains: $needle } }] }
   ) {
-    nodes { body }
+    nodes { id createdAt body }
     pageInfo { hasNextPage endCursor }
   }
 }"#;
@@ -944,15 +944,44 @@ impl LinearGraphQlSource {
     /// Reads the first line of every comment whose body starts with `prefix` and contains
     /// `needle`. The rest of each comment is dropped.
     pub fn fetch_marker_lines(&self, prefix: &str, needle: &str) -> Result<Vec<String>, String> {
-        let comments = crate::retro::sources::read_all_pages(|after| {
+        Ok(self
+            .fetch_marker_comments(prefix, needle, None)?
+            .iter()
+            .map(|comment| crate::retro::metrics::first_line(&comment.body).to_owned())
+            .collect())
+    }
+
+    /// Reads complete attributed marker comments, optionally bounded by native creation time.
+    /// Bodies remain source data and never become metric labels or instructions.
+    pub fn fetch_marker_comments(
+        &self,
+        prefix: &str,
+        needle: &str,
+        since: Option<f64>,
+    ) -> Result<Vec<MarkerComment>, String> {
+        let query = if since.is_some() {
+            MARKER_COMMENTS_QUERY
+                .replace(
+                    "$needle: String!)",
+                    "$needle: String!, $since: DateTimeOrDuration!)",
+                )
+                .replace(
+                    "{ body: { contains: $needle } }]",
+                    "{ body: { contains: $needle } }, {createdAt: {gte: $since}}]",
+                )
+        } else {
+            MARKER_COMMENTS_QUERY.to_owned()
+        };
+        crate::retro::sources::read_all_pages(|after| {
             let data: CommentData = self
                 .request(
-                    MARKER_COMMENTS_QUERY,
+                    &query,
                     MarkerVariables {
                         first: ISSUE_PAGE_SIZE,
                         after: after.map(str::to_owned),
                         prefix: prefix.to_owned(),
                         needle: needle.to_owned(),
+                        since: since.map(crate::drift::format_timestamp),
                     },
                 )
                 .map_err(|error| error.to_string())?;
@@ -961,11 +990,7 @@ impl LinearGraphQlSource {
                 has_next: data.comments.page_info.has_next_page,
                 cursor: data.comments.page_info.end_cursor,
             })
-        })?;
-        Ok(comments
-            .iter()
-            .map(|comment| crate::retro::metrics::first_line(&comment.body).to_owned())
-            .collect())
+        })
     }
 
     /// Reads the id and update time of every issue updated at or after `since` (Unix seconds),
@@ -1115,7 +1140,7 @@ impl LinearGraphQlSource {
 
     pub(crate) fn request<T: DeserializeOwned, V: Serialize>(
         &self,
-        query: &'static str,
+        query: &str,
         variables: V,
     ) -> Result<T, Error> {
         self.request_within(None, query, variables)
@@ -1126,7 +1151,7 @@ impl LinearGraphQlSource {
     pub(crate) fn request_within<T: DeserializeOwned, V: Serialize>(
         &self,
         deadline: Option<&Deadline<'_>>,
-        query: &'static str,
+        query: &str,
         variables: V,
     ) -> Result<T, Error> {
         let config = crate::quota::QuotaConfig::from_config(crate::settings::load()?.as_ref())?;
@@ -2082,6 +2107,8 @@ struct MarkerVariables {
     after: Option<String>,
     prefix: String,
     needle: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    since: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -2115,13 +2142,21 @@ struct LabelVariables {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CommentData {
-    comments: Connection<RawComment>,
+    comments: Connection<MarkerComment>,
 }
 
-#[derive(Deserialize)]
+/// Native tracker comment retained for attributed review evidence.
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawComment {
-    body: String,
+pub struct MarkerComment {
+    /// Native comment ID, absent in older selected projections.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Source creation time, never inferred from prose.
+    #[serde(default, rename = "createdAt")]
+    pub created_at: Option<String>,
+    /// Structured marker/data payload, kept outside metric labels.
+    pub body: String,
 }
 
 #[derive(Deserialize)]

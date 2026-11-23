@@ -258,13 +258,14 @@ fn epoch(text: &str) -> Result<f64, String> {
 /// GitHub through the authenticated `gh` CLI, GET and GraphQL queries only.
 pub struct LiveGithub;
 
-const PULL_REQUEST_QUERY: &str = "query($owner: String!, $name: String!, $after: String) {
+pub(crate) const PULL_REQUEST_QUERY: &str = "query($owner: String!, $name: String!, $after: String) {
   repository(owner: $owner, name: $name) {
     pullRequests(first: 50, states: __STATES__, after: $after,
                  orderBy: {field: UPDATED_AT, direction: DESC}) {
       nodes {
-        number createdAt mergedAt updatedAt isDraft state additions deletions reviewDecision
+        number createdAt mergedAt closedAt updatedAt isDraft state additions deletions reviewDecision
         timelineItems(first: 1, itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT]) { totalCount }
+        reopenEvents: timelineItems(first: 1, itemTypes: [REOPENED_EVENT]) { totalCount }
       }
       pageInfo { hasNextPage endCursor }
     }
@@ -319,6 +320,10 @@ struct RawPullRequest {
     created_at: String,
     #[serde(rename = "mergedAt")]
     merged_at: Option<String>,
+    #[serde(default, rename = "closedAt")]
+    closed_at: Option<String>,
+    #[serde(default, rename = "reopenEvents")]
+    reopen_events: Option<ForcePushes>,
     #[serde(rename = "updatedAt")]
     updated_at: String,
     #[serde(rename = "isDraft")]
@@ -358,6 +363,8 @@ pub fn pull_request_page(
         .into_iter()
         .map(|pr| {
             Ok(PullRequest {
+                closed_at: pr.closed_at.as_deref().map(epoch).transpose()?,
+                reopen_events: pr.reopen_events.map(|events| events.total_count),
                 repo: repo.to_owned(),
                 number: pr.number,
                 open: pr.state == "OPEN",
@@ -520,7 +527,7 @@ impl GithubSource for LiveGithub {
     }
     fn pull_requests(&self, repo: &str, since: f64) -> Result<Vec<PullRequest>, String> {
         let mut all = self.list(repo, "[OPEN]", None)?;
-        all.extend(self.list(repo, "[MERGED]", Some(since))?);
+        all.extend(self.list(repo, "[MERGED, CLOSED]", Some(since))?);
         Ok(all)
     }
 
@@ -610,6 +617,12 @@ pub struct LiveAgents {
 impl LiveAgents {
     /// Starts reading the agents of `teams` now; [`AgentSource::report`] collects the result.
     pub fn start(teams: Vec<String>) -> Self {
+        Self::start_on_machines(teams, Vec::new())
+    }
+
+    /// Restricts remote reads to configured lead machines; the local host is
+    /// still verified through its native topology. Empty selects every host.
+    pub fn start_on_machines(teams: Vec<String>, machines: Vec<String>) -> Self {
         let (sender, receiver) = std::sync::mpsc::channel();
         if teams.is_empty() {
             return Self {
@@ -621,6 +634,16 @@ impl LiveAgents {
             let report = system_hosts()
                 .map_err(|error| error.to_string())
                 .map(|hosts| {
+                    let hosts: Vec<_> = hosts
+                        .into_iter()
+                        .filter(|host| {
+                            machines.is_empty()
+                                || host.label() == "local"
+                                || machines
+                                    .iter()
+                                    .any(|machine| machine.eq_ignore_ascii_case(host.label()))
+                        })
+                        .collect();
                     let mut no_queue = |_: &str| Ok(None);
                     build_report(&hosts, &teams, AGENTS_IDLE_AFTER_SECS, &mut no_queue)
                 });

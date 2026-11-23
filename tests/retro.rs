@@ -368,6 +368,8 @@ fn histories() -> BTreeMap<String, Result<Vec<StateChange>, String>> {
 fn pr(number: u64, open: bool) -> PullRequest {
     PullRequest {
         repo: "agent-ix/x".to_owned(),
+        closed_at: None,
+        reopen_events: None,
         number,
         open,
         draft: false,
@@ -406,6 +408,7 @@ fn default_prs() -> Vec<PullRequest> {
 
 fn agent_row(verdict: Verdict, last_turn: Option<u64>) -> AgentRow {
     AgentRow {
+        session_id: None,
         team: "SWM".to_owned(),
         machine: "local".to_owned(),
         pane_id: "w1:p1".to_owned(),
@@ -3246,6 +3249,8 @@ impl DepartmentFixtureGithub {
     fn pr(&self) -> PullRequest {
         PullRequest {
             repo: "fixture/repo".into(),
+            closed_at: None,
+            reopen_events: None,
             number: 1,
             open: false,
             draft: false,

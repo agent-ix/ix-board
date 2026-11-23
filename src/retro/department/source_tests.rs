@@ -21,6 +21,8 @@ fn config() -> Config {
 fn native_pr() -> PullRequest {
     PullRequest {
         repo: "fixture/repo".into(),
+        closed_at: None,
+        reopen_events: None,
         number: 1,
         open: false,
         draft: false,

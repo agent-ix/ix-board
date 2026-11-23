@@ -238,6 +238,13 @@
           "format": "uint64",
           "minimum": 0
         },
+        "session_id": {
+          "description": "Verified native session identity, absent in reports predating this field.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "subagent_age_secs": {
           "description": "Seconds since the newest subagent write.",
           "type": [
