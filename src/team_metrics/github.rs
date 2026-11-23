@@ -428,6 +428,20 @@ impl<T: Transport> SelectedGithub<T> {
     pub(super) fn observed_at(&self) -> i64 {
         self.oldest_at.get()
     }
+    fn available(&self) -> Result<(), String> {
+        let guard = self.guard.as_ref().map_err(Clone::clone)?;
+        let cooldown: i64 = guard
+            .db
+            .borrow()
+            .query_row("SELECT cooldown FROM github_gate WHERE id=1", [], |r| {
+                r.get(0)
+            })
+            .map_err(|e| e.to_string())?;
+        if cooldown > self.now {
+            return Err("GitHub persisted cooldown active".into());
+        }
+        Ok(())
+    }
     fn read(
         &self,
         request: &Request,
@@ -632,6 +646,7 @@ fn parse_infos(body: &str, numbers: &[u64]) -> Result<BTreeMap<u64, PullRequestI
 }
 impl<T: Transport> GithubSource for SelectedGithub<T> {
     fn pull_requests(&self, repo: &str, since: f64) -> PrRows {
+        self.available()?;
         if !self.complete {
             return Err("selected issue PR attachments incomplete".into());
         }
@@ -645,6 +660,7 @@ impl<T: Transport> GithubSource for SelectedGithub<T> {
         })
     }
     fn pull_request(&self, repo: &str, number: u64) -> Result<PullRequestInfo, String> {
+        self.available()?;
         if !self.complete || !self.allowed.contains(&(repo.into(), number)) {
             return Err("linked PR identity/attachment evidence unavailable".into());
         }
