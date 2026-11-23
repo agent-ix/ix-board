@@ -258,7 +258,7 @@ fn epoch(text: &str) -> Result<f64, String> {
 /// GitHub through the authenticated `gh` CLI, GET and GraphQL queries only.
 pub struct LiveGithub;
 
-const PULL_REQUEST_QUERY: &str = "query($owner: String!, $name: String!, $after: String) {
+pub(crate) const PULL_REQUEST_QUERY: &str = "query($owner: String!, $name: String!, $after: String) {
   repository(owner: $owner, name: $name) {
     pullRequests(first: 50, states: __STATES__, after: $after,
                  orderBy: {field: UPDATED_AT, direction: DESC}) {

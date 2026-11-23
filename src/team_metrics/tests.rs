@@ -648,3 +648,26 @@ fn a_lead_working_a_different_reported_scope_has_unknown_parent_attribution() {
             .contains_key("execution_seconds")
     );
 }
+
+/// Trace: FR-033-AC-5, FR-033-AC-13
+#[test]
+fn cached_github_values_expire_independently_of_fresh_tracker_polls() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(dir.path());
+    let mut state = state(&config);
+    let scope = state.scopes.get_mut("factory:completion").unwrap();
+    scope.tracker_ok = true;
+    scope.tracker_at_ms = 1_000_000;
+    scope.github_observed_at_ms = 100_000;
+    scope.pr_success_at_ms = 100_000;
+    scope.review_success_at_ms = 100_000;
+    scope.pr_stats = Some(super::pr_stats::calculate(&[], 1000.0));
+    let fresh = render(&config, &state, 1000, 999_999).unwrap();
+    assert!(fresh.contains("source=\"github_prs\"} 1\n"));
+    assert!(fresh.contains("ix_team_prs_closed_unmerged_24h{"));
+    let expired = render(&config, &state, 1000, 1_000_000).unwrap();
+    assert!(expired.contains("source=\"tracker\"} 1\n"));
+    assert!(expired.contains("source=\"github_prs\"} 0\n"));
+    assert!(!expired.contains("ix_team_prs_closed_unmerged_24h{"));
+    assert!(expired.contains("ix_team_source_last_success_timestamp_seconds{team_id=\"factory\",scope_id=\"completion\",source=\"github_prs\"} 100\n"));
+}

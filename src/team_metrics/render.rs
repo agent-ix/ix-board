@@ -166,18 +166,26 @@ pub fn render(
         let history_fresh = state.history_ok
             && now.saturating_sub(state.history_at_ms)
                 <= i64::try_from(config.activity_interval_seconds * 3000).unwrap_or(i64::MAX);
+        let github_fresh = s.github_observed_at_ms > 0
+            && (0..super::github::TTL_MS).contains(&now.saturating_sub(s.github_observed_at_ms));
+        let pr_fresh = tracker_fresh
+            && s.pr_success_at_ms > 0
+            && (0..super::github::TTL_MS).contains(&now.saturating_sub(s.pr_success_at_ms));
+        let review_fresh = tracker_fresh
+            && s.review_success_at_ms > 0
+            && (0..super::github::TTL_MS).contains(&now.saturating_sub(s.review_success_at_ms));
         for (source, ok, at) in [
             ("tracker", tracker_fresh, s.tracker_at_ms),
             ("lifecycle", life_fresh, s.lifecycle_success_at_ms),
             ("history", history_fresh, state.history_at_ms),
             (
                 "github_prs",
-                tracker_fresh && s.pr_stats.is_some(),
+                pr_fresh && s.pr_stats.is_some(),
                 s.pr_success_at_ms,
             ),
             (
                 "review_records",
-                tracker_fresh && s.review_stats.is_some(),
+                review_fresh && s.review_stats.is_some(),
                 s.review_success_at_ms,
             ),
         ] {
@@ -378,7 +386,11 @@ pub fn render(
         for (id, name, factor) in LEGACY {
             let metric = s.record.as_ref().and_then(|r| r.metrics.get(*id));
             let value = metric
-                .filter(|m| m.status == Status::Ok && tracker_fresh)
+                .filter(|m| {
+                    m.status == Status::Ok
+                        && tracker_fresh
+                        && (!m.source.split('+').any(|s| s == "github") || github_fresh)
+                })
                 .and_then(|m| m.value);
             out.metric(
                 "ix_team_metric_available",
@@ -415,11 +427,14 @@ pub fn render(
         for (names, values) in [
             (
                 super::pr_stats::NAMES,
-                s.pr_stats.as_ref().map(|p| &p.values),
+                s.pr_stats.as_ref().filter(|_| pr_fresh).map(|p| &p.values),
             ),
             (
                 super::reviews::NAMES,
-                s.review_stats.as_ref().map(|p| &p.values),
+                s.review_stats
+                    .as_ref()
+                    .filter(|_| review_fresh)
+                    .map(|p| &p.values),
             ),
         ] {
             for name in names {
@@ -441,11 +456,15 @@ pub fn render(
                 }
             }
         }
-        let verified = s.record.as_ref().filter(|_| tracker_fresh).and_then(|r| {
-            let closed = r.metrics.get("path_closed")?.value?;
-            let unverified = r.metrics.get("path_closed_unverified")?.value?;
-            (closed >= unverified).then_some(closed - unverified)
-        });
+        let verified = s
+            .record
+            .as_ref()
+            .filter(|_| tracker_fresh && github_fresh)
+            .and_then(|r| {
+                let closed = r.metrics.get("path_closed")?.value?;
+                let unverified = r.metrics.get("path_closed_unverified")?.value?;
+                (closed >= unverified).then_some(closed - unverified)
+            });
         if let Some(value) = verified {
             out.metric("ix_team_verified_path_closed_24h", &labels, value, false)?;
             if value > 0.0

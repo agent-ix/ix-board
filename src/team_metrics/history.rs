@@ -52,6 +52,27 @@ pub fn read_history(program: &str, args: &[&str], timeout: Duration) -> Result<V
 }
 #[cfg(unix)]
 fn read_command(mut command: Command, timeout: Duration) -> Result<Vec<u8>, Error> {
+    let output = command_output(&mut command, timeout, 8 * 1024 * 1024)?;
+    if output.success {
+        Ok(output.bytes)
+    } else {
+        Err(Error::Source("source command failed".into()))
+    }
+}
+
+#[cfg(unix)]
+pub(super) struct CommandOutput {
+    pub bytes: Vec<u8>,
+    pub success: bool,
+}
+
+// HTTP status and rate-limit headers remain readable on nonzero gh exits.
+#[cfg(unix)]
+pub(super) fn command_output(
+    command: &mut Command,
+    timeout: Duration,
+    max_bytes: usize,
+) -> Result<CommandOutput, Error> {
     let name = command.get_program().to_string_lossy().into_owned();
     let mut child = SourceChild(
         command
@@ -81,8 +102,8 @@ fn read_command(mut command: Command, timeout: Duration) -> Result<Vec<u8>, Erro
             match stdout.read(&mut chunk) {
                 Ok(0) => closed = true,
                 Ok(n) => {
-                    if bytes.len() + n > 8 * 1024 * 1024 {
-                        return Err(Error::Source(format!("{name} output exceeded 8MiB")));
+                    if bytes.len() + n > max_bytes {
+                        return Err(Error::Source(format!("{name} output exceeded byte limit")));
                     }
                     bytes.extend_from_slice(&chunk[..n]);
                     progress = true;
@@ -98,11 +119,10 @@ fn read_command(mut command: Command, timeout: Duration) -> Result<Vec<u8>, Erro
         if let Some(status) = child.0.try_wait()?
             && closed
         {
-            return if status.success() {
-                Ok(bytes)
-            } else {
-                Err(Error::Source(format!("{name} exited {status}")))
-            };
+            return Ok(CommandOutput {
+                bytes,
+                success: status.success(),
+            });
         }
         if !progress {
             thread::sleep(Duration::from_millis(5));
@@ -120,6 +140,35 @@ pub fn read_history(_program: &str, _args: &[&str], _timeout: Duration) -> Resul
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// Trace: FR-033-AC-12
+    #[test]
+    fn nonzero_source_exit_preserves_http_status_headers_and_body() {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--ignored",
+            "--exact",
+            "team_metrics::history::tests::http_failure",
+            "--nocapture",
+        ]);
+        let output = command_output(&mut command, Duration::from_secs(5), 32768).unwrap();
+        assert!(!output.success);
+        let text = std::str::from_utf8(&output.bytes).unwrap();
+        assert!(
+            text.contains("HTTP/2.0 429 Too Many Requests\r\nRetry-After: 7200\r\n\r\nlimited")
+        );
+    }
+
+    /// Trace: FR-033-AC-12
+    #[test]
+    #[ignore = "nonzero HTTP subprocess fixture"]
+    fn http_failure() {
+        use std::io::Write;
+        std::io::stdout()
+            .write_all(b"HTTP/2.0 429 Too Many Requests\r\nRetry-After: 7200\r\n\r\nlimited")
+            .unwrap();
+        std::process::exit(1);
+    }
 
     #[test]
     fn a_descendant_retaining_stdout_cannot_extend_the_source_deadline() {

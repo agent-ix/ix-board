@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Agent-IX
+use super::github::SelectedGithub;
 use super::history::CommandHistory;
 use super::timeline::{ExecutionSample, Member};
 use super::{Config, Error, Event, History, Journal, ScopeState, State};
@@ -22,6 +23,7 @@ struct TrackerResult {
     resolved_selectors: super::Selectors,
     pr_stats: Option<super::pr_stats::PrStats>,
     review_stats: Option<super::reviews::ReviewStats>,
+    github_at_ms: i64,
 }
 
 /// Owns durable state; network collection never runs on the HTTP listener.
@@ -392,11 +394,7 @@ impl Collector {
                             Some(seconds)
                         })
                     });
-                    let github = SelectedGithub {
-                        allowed,
-                        cache: std::cell::RefCell::new(BTreeMap::new()),
-                        complete: attachments_complete,
-                    };
+                    let github = SelectedGithub::new(config, allowed, attachments_complete, now);
                     let agents = NoAgents;
                     // Agent share requires session-qualified polling, not a second broad read.
                     cfg.herdr_teams.clear();
@@ -524,6 +522,7 @@ impl Collector {
                         resolved_selectors,
                         pr_stats,
                         review_stats,
+                        github_at_ms: github.observed_at(),
                     })
                 })();
                 (scope.key(), result)
@@ -564,11 +563,12 @@ impl Collector {
                     state.record = Some(result.record);
                     state.pr_stats = result.pr_stats;
                     state.review_stats = result.review_stats;
+                    state.github_observed_at_ms = result.github_at_ms;
                     if state.pr_stats.is_some() {
-                        state.pr_success_at_ms = batch.at_ms;
+                        state.pr_success_at_ms = result.github_at_ms.min(batch.at_ms);
                     }
                     if state.review_stats.is_some() {
-                        state.review_success_at_ms = batch.at_ms;
+                        state.review_success_at_ms = result.github_at_ms.min(batch.at_ms);
                     }
                     state.tracker_at_ms = batch.at_ms;
                     state.tracker_ok = true;
@@ -741,74 +741,6 @@ impl LinearSource for SelectedLinear<'_> {
         })
     }
 }
-type PrCache = BTreeMap<(String, u64), Result<Vec<retro::sources::PullRequest>, String>>;
-struct SelectedGithub {
-    cache: std::cell::RefCell<PrCache>,
-    allowed: BTreeSet<(String, u64)>,
-    complete: bool,
-}
-impl GithubSource for SelectedGithub {
-    fn pull_requests(
-        &self,
-        repo: &str,
-        since: f64,
-    ) -> Result<Vec<retro::sources::PullRequest>, String> {
-        if !self.complete {
-            return Err("selected issue PR attachments incomplete".into());
-        }
-        let key = (repo.to_owned(), since.to_bits());
-        if let Some(value) = self.cache.borrow().get(&key) {
-            return value.clone();
-        }
-        let value = retro::live::LiveGithub
-            .pull_requests(repo, since)
-            .map(|prs| {
-                prs.into_iter()
-                    .filter(|p| self.allowed.contains(&(p.repo.clone(), p.number)))
-                    .collect()
-            });
-        self.cache.borrow_mut().insert(key, value.clone());
-        value
-    }
-    fn pull_request(
-        &self,
-        repo: &str,
-        number: u64,
-    ) -> Result<retro::sources::PullRequestInfo, String> {
-        retro::live::LiveGithub.pull_request(repo, number)
-    }
-    fn main_commits(
-        &self,
-        repo: &str,
-        branch: &str,
-        since: f64,
-    ) -> Result<Vec<retro::sources::MainCommit>, String> {
-        retro::live::LiveGithub.main_commits(repo, branch, since)
-    }
-    fn department_evidence(
-        &self,
-        config: &retro::department::Config,
-        since: f64,
-    ) -> retro::department::Evidence {
-        let mut evidence = retro::live::LiveGithub.department_evidence(config, since);
-        evidence.observations.retain(|o| {
-            !matches!(o.fact, retro::department::Fact::PullRequest(_))
-                || self
-                    .allowed
-                    .iter()
-                    .any(|(repo, n)| o.entity_id.ends_with(&format!("{repo}#{n}")))
-        });
-        if !self.complete {
-            evidence.complete.remove("pull_request");
-            evidence.reasons.insert(
-                "pull_request".into(),
-                "selected issue attachments incomplete".into(),
-            );
-        }
-        evidence
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

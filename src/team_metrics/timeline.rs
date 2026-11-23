@@ -38,6 +38,8 @@ pub struct ScopeState {
     pub(crate) review_stats: Option<super::reviews::ReviewStats>,
     pub(crate) pr_success_at_ms: i64,
     pub(crate) review_success_at_ms: i64,
+    #[serde(default)]
+    pub(crate) github_observed_at_ms: i64,
     pub(crate) assignments: BTreeMap<String, Active>,
     pub(crate) pauses: BTreeMap<String, bool>,
     pub(crate) reported_scope: BTreeMap<String, String>,

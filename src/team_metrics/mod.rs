@@ -3,6 +3,7 @@
 //! Bounded operational-team evidence and cached Prometheus export.
 mod collect;
 mod config;
+mod github;
 mod history;
 mod journal;
 mod pr_stats;
