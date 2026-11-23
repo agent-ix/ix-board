@@ -14,6 +14,9 @@ pub(super) const TTL_MS: i64 = 900_000;
 const HOUR_MS: i64 = 3_600_000;
 const MAX_BODY: usize = 1024 * 1024;
 const MAX_REQUESTS: i64 = 40;
+// Fixed selections expose at most 50 PR nodes and two one-item timeline
+// connections per PR (or 25 flat linked PR aliases). Reserve 25 points even
+// though GitHub's documented connection calculation yields a few points.
 const RESERVED_COST: i64 = 25;
 const MAX_COST: i64 = 1000;
 const MAX_PAGES: usize = 4;
@@ -53,7 +56,7 @@ impl Transport for Gh {
             .map_err(|e| e.to_string())?;
             // gh exits nonzero for HTTP errors; parse their headers before returning failure.
             let response = parse_http(&output.bytes)?;
-            if !output.success && response.status < 400 && response.status != 304 {
+            if !output.status.success() && response.status < 400 && response.status != 304 {
                 return Err("GitHub command failed without an HTTP error".into());
             }
             Ok(response)
@@ -1216,5 +1219,20 @@ mod tests {
         assert!(source.pull_request("agent-ix/one", 2).unwrap().merged);
         assert_eq!(fake.count(), 2);
         assert_eq!(source.observed_at(), at);
+        source
+            .guard
+            .as_ref()
+            .unwrap()
+            .db
+            .borrow()
+            .execute("UPDATE github_gate SET cooldown=?1", [at + HOUR_MS])
+            .unwrap();
+        assert!(source.pull_requests("agent-ix/one", 0.0).is_err());
+        assert!(source.pull_request("agent-ix/one", 1).is_err());
+        assert_eq!(
+            fake.count(),
+            2,
+            "a shared cooldown overrides prior per-cycle memoization"
+        );
     }
 }

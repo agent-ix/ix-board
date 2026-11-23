@@ -53,17 +53,21 @@ pub fn read_history(program: &str, args: &[&str], timeout: Duration) -> Result<V
 #[cfg(unix)]
 fn read_command(mut command: Command, timeout: Duration) -> Result<Vec<u8>, Error> {
     let output = command_output(&mut command, timeout, 8 * 1024 * 1024)?;
-    if output.success {
+    if output.status.success() {
         Ok(output.bytes)
     } else {
-        Err(Error::Source("source command failed".into()))
+        Err(Error::Source(format!(
+            "{} exited {}",
+            command.get_program().to_string_lossy(),
+            output.status
+        )))
     }
 }
 
 #[cfg(unix)]
 pub(super) struct CommandOutput {
     pub bytes: Vec<u8>,
-    pub success: bool,
+    pub status: std::process::ExitStatus,
 }
 
 // HTTP status and rate-limit headers remain readable on nonzero gh exits.
@@ -119,10 +123,7 @@ pub(super) fn command_output(
         if let Some(status) = child.0.try_wait()?
             && closed
         {
-            return Ok(CommandOutput {
-                bytes,
-                success: status.success(),
-            });
+            return Ok(CommandOutput { bytes, status });
         }
         if !progress {
             thread::sleep(Duration::from_millis(5));
@@ -152,7 +153,7 @@ mod tests {
             "--nocapture",
         ]);
         let output = command_output(&mut command, Duration::from_secs(5), 32768).unwrap();
-        assert!(!output.success);
+        assert!(!output.status.success());
         let text = std::str::from_utf8(&output.bytes).unwrap();
         assert!(
             text.contains("HTTP/2.0 429 Too Many Requests\r\nRetry-After: 7200\r\n\r\nlimited")
