@@ -70,3 +70,11 @@ Round 1, fix head 69af642.
 | FND-003 | still-open | The unit-test partial tags are removed, but tests/fleet_cli.rs:58 still tags `status_writes_the_ledger_and_query_reads_the_defect_without_writing` with FR-039-AC-7, which reads `defect_rows` only, not idle minutes or actions with time-to-action; the matrix still reports AC-7 tagged. Remove that tag (or test idle minutes and actions) to match the PR body. |
 | FND-004 | fixed | `the_default_path_is_under_the_state_directory_and_outside_any_work_tree` checks both XDG and HOME defaults pass `refuse_inside_git`, the real default is outside the checkout, and a state dir inside a work tree is refused. |
 | FND-005 | fixed | FR-039 now names `host_tick` and the run columns in Behavior and lists `idle_lane_episodes_with_ready_work`, `lane_tick_rows` and `lane_span` in the view table (duplicated, see FND-006). |
+
+Round 2, fix head 8c95176.
+
+| FND | Outcome | Reason |
+| --- | --- | --- |
+| FND-003 | fixed | The FR-039-AC-7 tag is removed from tests/fleet_cli.rs; `quoin matrix` now reports AC-7 untagged, matching the PR body. |
+| FND-006 | fixed | The duplicated `idle_lane_episodes_with_ready_work`, `lane_tick_rows` and `lane_span` rows are removed from the FR-039 view table. |
+| FND-007 | fixed | The PR body maps AC-6 to SWM-214, AC-16 to SWM-255 and the ground-truth part of AC-8 to SWM-216 (ix-board fleet calibrate, Backlog). |
