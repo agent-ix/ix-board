@@ -33,3 +33,10 @@ Checked and clean:
 | --- | --- | --- | --- |
 | FND-001 | medium | The gnu binary is built on `ubuntu-latest` (24.04, glibc 2.39). terra's WSL, a rollout host in this ticket, has glibc 2.35. Bundled C code (libsqlite3-sys, ring) compiled against 2.39 headers can require symbols newer than 2.35 (for example `__isoc23_strtol@GLIBC_2.38`), and the binary then fails to start on terra. `ubuntu-latest` also moves the floor up without notice. Build on `ubuntu-22.04`, or check `objdump -T` of the artifact for symbols above GLIBC_2.35. | .github/workflows/release.yml:14 |
 | FND-002 | medium | If the tag is pushed before the manual darwin release exists, action-gh-release creates the release itself. That release is titled with the bare tag (`v0.7.3`, not `ix-board 0.7.3`), has no notes, and is published as latest. The later manual `gh release create` then fails with "already exists", and the operator must switch to `gh release upload` and `gh release edit`. The header comment says both assets land on the same release, but nothing makes that order hold. Either document the order (create the release first, or use `gh release upload` afterwards) or set the release `name` in the action. | .github/workflows/release.yml:3-4,39-42 |
+
+## Dispositions
+
+| FND | Outcome | reason |
+| --- | --- | --- |
+| FND-001 | fixed | e9f3124: `linux-binary` now `runs-on: ubuntu-22.04` (glibc 2.35, terra WSL floor). actionlint exit 0. |
+| FND-002 | accepted-no-change | e9f3124 sets `name: ix-board ${{ github.ref_name }}` and adds a README Releases section that documents the order (`gh release upload` when the release exists), so the failed-create path is resolved. The title is `ix-board v0.7.3` against the existing `ix-board 0.7.2` style, and the action also applies that name to a manually created release. The code lead accepted this cosmetic difference without change. |
