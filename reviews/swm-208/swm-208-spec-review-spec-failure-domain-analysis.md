@@ -80,3 +80,4 @@ failure in assign, double assignment, and concurrent ledger writers.
 | FND-008 | fixed | a8266e2: executed_at = target lane's first transition into the action's expected state; lead/project actions have none |
 | FND-009 | fixed | ef0735f: FR-036 lists tickets held only by an UNREACHABLE lane in unowned_ready with note owner_unreachable and keeps the lane out of short_queues; AC-7 |
 | FND-010 | fixed | ef0735f: FR-041 stale hosts contribute no slots or capacity, UNREACHABLE lanes are excluded from demand and the duty mean, and their tickets are not subtracted from the buffer; AC-8, AC-9 |
+| FND-011 | fixed | e71a737: FR-041-AC-2 reads "assigned to a reachable lane" |
