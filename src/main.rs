@@ -798,7 +798,9 @@ fn run_fleet_status() -> Result<ix_board::fleet::FleetReport, Error> {
     let sources = ix_board::fleet::Sources {
         relay: live::read_relay(config.host_timeout),
         series,
-        receipts: &live::PendingOrderReceipts,
+        receipts: &live::RelayOrderReceipts {
+            timeout: config.host_timeout,
+        },
         weak: &live::NoWeakSignals,
     };
     let local_now_ms = std::time::SystemTime::now()

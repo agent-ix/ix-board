@@ -3,10 +3,11 @@
 
 //! Fleet lane status acceptance tests over fake relay data and fake Prometheus responses.
 
-use ix_board::fleet::live::{PromQuery, PrometheusSeries};
+use ix_board::fleet::live::{self, PromQuery, PrometheusSeries};
 use ix_board::fleet::*;
 use ix_trace_rs::trace;
 use relay_core::fleet::HostLaneList;
+use relay_core::receipts::{ReceiptEvent, ReceiptOutcome};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -373,8 +374,7 @@ fn ack_expired_orders_are_stale_with_or_without_a_delivered_receipt() {
 #[test]
 fn unavailable_order_receipts_are_a_defect_not_an_empty_list() {
     let mut world = World::one_host(&["h:w:1"], vec![raw("h:w:1", HookKind::Stop, 5)], &[]);
-    let pending = ix_board::fleet::live::PendingOrderReceipts;
-    world.receipts = pending.expired_orders();
+    world.receipts = Err(SourceError("relay receipts: connection refused".to_owned()));
     let report = world.run();
     assert!(has_defect(&report, DefectKind::UnreadableSource));
     assert!(!report.complete);
@@ -1055,4 +1055,58 @@ fn per_host_absence_is_visible_even_when_other_hosts_have_data() {
 
 fn on_count(report: &FleetReport, kind: DefectKind) -> usize {
     report.defects.iter().filter(|d| d.kind == kind).count()
+}
+
+fn receipt(id: &str, outcome: ReceiptOutcome, queue: &str) -> ReceiptEvent {
+    ReceiptEvent {
+        event_id: format!("{id}/{outcome:?}"),
+        original_id: id.to_owned(),
+        attempt_id: None,
+        outcome,
+        sender: "s".to_owned(),
+        target: queue.to_owned(),
+        event_time_ms: Some(1),
+        observed_at_ms: 1,
+        evidence: None,
+        reason: None,
+        session: None,
+        expect_ticket: None,
+        delivered_at_ms: None,
+    }
+}
+
+#[trace("FR-034-AC-12")]
+#[test]
+fn recorded_ack_expired_receipts_give_expired_orders_per_lane_address() {
+    use ReceiptOutcome::{AckExpired, Acted, Delivered, Queued};
+    let lanes: BTreeMap<String, String> = [("q1", "h:w:1"), ("q2", "h:w:2"), ("q3", "h:w:3")]
+        .map(|(q, a)| (q.to_owned(), a.to_owned()))
+        .into();
+    let events = vec![
+        receipt("a", Queued, "q1"),
+        receipt("a", Delivered, "q1"),
+        receipt("a", AckExpired, "q1"),
+        receipt("b", Queued, "q2"),
+        receipt("b", AckExpired, "q2"),
+        receipt("c", Queued, "q3"),
+        receipt("c", Delivered, "q3"),
+        receipt("c", Acted, "q3"),
+        receipt("d", AckExpired, "gone"),
+    ];
+    let mut orders = live::expired_orders_from(&events, &lanes);
+    orders.sort_by(|x, y| x.addr.cmp(&y.addr));
+    assert_eq!(orders, vec![order("h:w:1", true), order("h:w:2", false)]);
+}
+
+#[trace("FR-034-AC-12")]
+#[test]
+fn an_undelivered_order_without_an_expiry_receipt_is_never_stale() {
+    let lanes: BTreeMap<String, String> = [("q1".to_owned(), "h:w:1".to_owned())].into();
+    let events = vec![
+        receipt("a", ReceiptOutcome::Queued, "q1"),
+        receipt("a", ReceiptOutcome::TimedOut, "q1"),
+    ];
+    assert!(live::expired_orders_from(&events, &lanes).is_empty());
+    let source = include_str!("../src/fleet/live.rs");
+    assert!(!source.contains("ack_deadline") && !source.contains("deadline_ms"));
 }
