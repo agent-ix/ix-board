@@ -45,3 +45,21 @@ failure in assign, double assignment, and concurrent ledger writers.
 - FR-040, FR-040-AC-6 (examined)
 - FR-041, FR-041-AC-1, FR-041-AC-3 (examined)
 - FR-038 (examined, clean for failure domain: failed tick emits no metric)
+
+## New findings (disposition pass 1)
+
+| ID | Severity | Summary | Refs |
+| --- | --- | --- | --- |
+| FND-007 | medium | FR-039 `ground_truth_sample` is labelled at each tick, but FR-040 truth at `t` needs events up to `t+W` (active in [t-W,t+W]; inactive when no tool-use follows within W). A label written at tick time `t` cannot see that future, so persisted labels for spans beyond relay retention are premature or wrong. Label sample `t-W` at tick `t` instead. | spec/functional/FR-039-fleet-ledger.md:28-30; spec/functional/FR-040-fleet-calibrate.md:27-29 |
+| FND-008 | low | `executed_at` = first `post_tool` on the target lane after emission. That fires at once on a lane that is already working, and for lead-targeted actions (`escalate_*`, `escalate_stale_pr`) the lane's tool use is unrelated to the lead acting, so time-to-action reads near zero. | spec/functional/FR-039-fleet-ledger.md:45-48 |
+
+## Dispositions
+
+| FND | outcome | sha/reason |
+| --- | --- | --- |
+| FND-001 | fixed | 0aef701: FR-040 detects history truncation (unavailable: history_truncated) and persists ground_truth_sample per tick; AC-8 |
+| FND-002 | fixed | 0aef701: FR-034 uses relay server time for all ages, `clock_skew` defect over max_clock_skew; AC-13 |
+| FND-003 | fixed | 0aef701: FR-041 excludes lanes below minimum observed time; no_duty / zero_duty make demand unavailable; AC-4 |
+| FND-004 | fixed | 0aef701: FR-035 stores the list only after the relay accepts the order; a send failure writes no list. Lead decision: no rollback after an accepted send; exit non-zero and record the order (step 4, AC-3) |
+| FND-005 | fixed | 0aef701: FR-035 step 2 refuses a ticket in another lane's assignment and names that lane; AC-4 |
+| FND-006 | fixed | 0aef701: FR-039 single-writer lock, monotonic sequence, gap rule at tick cadence (default 5m); AC-2, AC-3 |

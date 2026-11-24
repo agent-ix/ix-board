@@ -29,16 +29,17 @@ The command SHALL NOT store assignments in `PLAN-*.md` or any prose file.
 3. The command sends one relay order whose body contains, per ticket in order, the
    identifier, title, state, description and acceptance criteria exactly as read,
    plus the queue position. The order carries the deadline (default 5m, `--deadline`
-   overrides) so the relay applies `AckExpired`, and never-delivered `TimedOut`.
-4. The command stores the list only after the relay accepts the order. A send
+   overrides) so the relay applies `AckExpired` (also to an order never delivered).
+4. The command writes the list through the ix-relay FR-072 assignment list. FR-072 accepts writes only from a caller with the orchestrator role (an accidental-write guard, not authentication) and refuses a lane on a stale host with `host_registry_stale`. The command SHALL check both conditions before sending, report a refusal and exit non-zero without sending.
+5. The command stores the list only after the relay accepts the order. A send
    failure writes no list. A list-write failure after an accepted send exits
    non-zero, names the sent order and records it in the ledger.
-5. The command waits until the deadline. `Acted` means only that the session acted;
+6. The command waits until the deadline. `Acted` means only that the session acted;
    assignment is confirmed only when the lane's derived focus
    ([FR-037](./FR-037-fleet-focus-and-drift.md)) equals the first assigned ticket
    before the deadline. The command prints one of `confirmed`, `acted_not_focused`,
-   `ack_expired` or `timed_out` and exits zero only for `confirmed`.
-6. A later `assign` replaces the list; the ledger retains the previous list
+   `ack_expired` or `timed_out`, where `timed_out` is `AckExpired` with no `Delivered` receipt and exits zero only for `confirmed`.
+7. A later `assign` replaces the list; the ledger retains the previous list
    ([FR-039](./FR-039-fleet-ledger.md)).
 
 ## Acceptance Criteria
@@ -50,10 +51,11 @@ The command SHALL NOT store assignments in `PLAN-*.md` or any prose file.
 | FR-035-AC-3 | A send failure leaves the stored list unchanged; a list-write failure after an accepted send exits non-zero, names the order and records it. | Test |
 | FR-035-AC-4 | A ticket in another lane's assignment is refused with that lane named and no send; an unreadable, Done, Canceled or merged ticket fails before any send. | Test |
 | FR-035-AC-5 | `Acted` with a focus on another ticket prints `acted_not_focused` and exits non-zero; focus on the first assigned ticket before the deadline prints `confirmed` and exits zero. | Test |
-| FR-035-AC-6 | An `AckExpired` receipt and a never-delivered `TimedOut` receipt print `ack_expired` and `timed_out` respectively, exit non-zero and leave the ledger entry. | Test |
+| FR-035-AC-6 | An `AckExpired` receipt after `Delivered` prints `ack_expired`, and an `AckExpired` receipt with no `Delivered` receipt prints `timed_out`; both, exit non-zero and leave the ledger entry. | Test |
 | FR-035-AC-7 | A second `assign` replaces the stored list and the ledger retains both lists with timestamps. | Test |
+| FR-035-AC-8 | A caller without the orchestrator role, and a lane the relay marks stale (`host_registry_stale`), each make the command exit non-zero before any send and write no list. | Test |
 
 ## Dependencies
 
 - A new ix-relay requirement (PR #52) SHALL own an ordered ticket list per lane address, writable by `fleet assign` and readable by ix-board. Until it exists `fleet assign` cannot store lists.
-- Orders with an acknowledgement deadline, and `Acted`/`AckExpired`/`TimedOut` receipts (ix-relay). Ticket text is read through the [FR-001](./FR-001-ready-queue.md) and [FR-017](./FR-017-batch-issue-read.md) readers.
+- Orders with an acknowledgement deadline, and `Delivered`/`Acted`/`AckExpired` receipts (ix-relay). Ticket text is read through the [FR-001](./FR-001-ready-queue.md) and [FR-017](./FR-017-batch-issue-read.md) readers.

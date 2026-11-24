@@ -56,7 +56,8 @@ per host so a host without hook events is visible.
 | FR-040-AC-5 | Audit samples added with `calibrate audit add` are validated, stored, and drive the fused WORKING precision; a malformed audit is refused. | Test |
 | FR-040-AC-6 | The report states whether WORKING error is under 10% over 24h and shows per-host ground-truth coverage. | Test |
 | FR-040-AC-7 | Boundary fixtures at `W` seconds around the sample time classify truth as specified. | Test |
-| FR-040-AC-8 | When the retrieved history starts after the window start or the stream is at its bound, the span reports `unavailable: history_truncated` and contributes no samples; persisted tick labels cover the older span. | Test |
+| FR-040-AC-8 | When the retrieved history starts after the window start or the stream is at its bound, the span reports `unavailable: history_truncated` and contributes no samples; persisted tick labels cover the older span; at tick `t` only labels for `t-W` are written. | Test |
+| FR-040-AC-9 | At tick `t` the ledger gains a label for `t-W` and none for `t`; a label is not written until events through `t` are retained. | Test |
 
 ## Dependencies
 

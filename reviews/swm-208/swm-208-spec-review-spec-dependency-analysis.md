@@ -57,3 +57,25 @@ not exist or differ:
 - FR-041 (examined)
 - FR-043 (examined; replacement map consistent with FR-069 Replaces list, clean)
 - ix-relay PR52 FR-045, FR-067, FR-068, FR-069, FR-070, FR-071 (context_only)
+
+## New findings (disposition pass 1)
+
+| ID | Severity | Summary | Refs |
+| --- | --- | --- | --- |
+| FND-009 | medium | ix-relay PR52 at f1f1015 has no `TimedOut` receipt. FR-071 records `AckExpired` both for delivered orders and for never-delivered orders (measured from enqueue). FR-035 step 3, step 5 and AC-6 expect "a never-delivered TimedOut receipt" printing `timed_out`, and FR-034 Inputs, AC-8, Dependencies and spec.md still name `TimedOut`. ix-board must derive `timed_out` from `AckExpired` with no `Delivered` receipt. | spec/functional/FR-035-fleet-assign.md:32,53 |
+| FND-010 | medium | FR-034 reads "pane classification per lane (dialog … wait_loop, none)" from Prometheus and ranks a pane class "captured after the last hook event" above hook evidence. PR52 exports pane classes only as `ix_fleet_lane_blocked{reason}`, mixed with the hook reasons `permission` and `question`, with no `none` series and no pane capture time (the sample time is push time). The precedence rule of FR-034-AC-7 has no source. | spec/functional/FR-034-fleet-lane-status.md:32-34,54-55,96 |
+| FND-011 | low | FR-034 keeps `max_tool_runtime` (2h) as ix-board configuration, while PR52 configures it in relay `[fleet]` and exports it in `ix.fleet.config` next to `working_window` and `no_events_after`. This is the duplicate-constant pattern fixed for the working window; ix-board `no_events` also differs from relay `no_events_after`. | spec/functional/FR-034-fleet-lane-status.md:40-41 |
+| FND-012 | low | spec.md out-of-scope still says `fleet assign` writes "relay `work agent`", but the write target is now the PR52 FR-072 assignment list. FR-072 also accepts writes only from a caller with the orchestrator role, a prerequisite FR-035 does not state. | spec/spec.md:100 |
+
+## Dispositions
+
+| FND | outcome | sha/reason |
+| --- | --- | --- |
+| FND-001 | fixed | 0aef701 + ix-relay PR52 f1f1015 FR-072: ordered per-lane list keyed by lane address, written by the orchestrator; FR-035 depends on it |
+| FND-002 | fixed | PR52 f1f1015 exports wait_loop (lane.blocked reason) and ix.fleet.lane.compile_seconds; FR-034/FR-041 consume them |
+| FND-003 | fixed | 0aef701: FR-034 uses FR-068 kinds and fields with the mappings (blocked/permission to dialog, stop question to question); AC-6 |
+| FND-004 | fixed | 0aef701: FR-034 pane classes match FR-069 (queued_question to question). The precedence rule is now explicit; its data source is the new FND-010 |
+| FND-005 | fixed | 0aef701: STALE-ORDER covers never-delivered orders; assign sends an order with a deadline; Acted confirmed by derived focus (FR-035 step 5) |
+| FND-006 | fixed | 0aef701 + PR52: relay lane.state has no unknown; one working window read from relay config; relay series advisory |
+| FND-007 | fixed | 0aef701: join key is the relay address; Redis via relay-core and Prometheus HTTP API named; stale_source defect |
+| FND-008 | fixed | 0aef701: FR-041 interim supply (server-capacity) and duty (watcher compile seconds); AC-5 |

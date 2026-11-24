@@ -97,8 +97,8 @@ with the last successful report for that focus.
 - Mutating Linear fields other than project status and priority, or mutating
   GitHub data. The retro store (FR-025) is local state outside every repository,
   not Linear or GitHub data.
-- Writing Linear or relay data from `fleet tick`, `plan-coverage`, `saturation` and `calibrate`; only `fleet assign` writes (relay `work agent`), and defect tickets are emitted for the caller to file.
-- Collecting hook events and host probes, and the relay `Acted`, `AckExpired` and `TimedOut` receipts: owned by ix-relay (PR #52). The build scheduler that supplies sustainable slots is a separate tool.
+- Writing Linear or relay data from `fleet tick`, `plan-coverage`, `saturation` and `calibrate`; only `fleet assign` writes (the ix-relay FR-072 ordered assignment list, orchestrator role), and defect tickets are emitted for the caller to file.
+- Collecting hook events and host probes, and the relay `Delivered`, `Acted` and `AckExpired` receipts: owned by ix-relay (PR #52). The build scheduler that supplies sustainable slots is a separate tool.
 
 - Combining retro metrics into a single health score, and scoring subjective
   qualities such as brief clarity or role discipline; the retro commands report

@@ -68,3 +68,22 @@ owner and threshold and the standing-order source undefined (decision 6).
 - FR-018 SWM-210 additions, FR-018-AC-27..AC-29 (examined, clean)
 - FR-008 live-input bullet (examined, clean); FR-033 addition (examined)
 - US-011 (examined, clean); spec/spec.md scope and out-of-scope additions (examined)
+
+## Dispositions
+
+| FND | outcome | sha/reason |
+| --- | --- | --- |
+| FND-001 | fixed | 0aef701: FR-034 rule 6 makes hook prompt/pre_tool/post_tool in the window sufficient; weak signals need two agreeing sources |
+| FND-002 | fixed | 0aef701: FR-034-AC-2 now asserts WORKING from hook events alone and no unconfirmed_activity subreason |
+| FND-003 | fixed | 0aef701: FR-034 LOOP is pane wait_loop or loop_stops stops with no pre_tool between them |
+| FND-004 | fixed | 0aef701: FR-041 buffer counts ready, unassigned and unstarted tickets only; AC-2 added |
+| FND-005 | fixed | 0aef701: FR-038 stale_pr_after (configurable, default 3h), target the PR's lane lead; AC-5 |
+| FND-006 | fixed | 0aef701: FR-038 answer_dialog reads the SWM-226 file; a missing or unreadable file gives escalate_block |
+| FND-007 | fixed | 0aef701: escalate_block row added with condition, target and severity |
+| FND-008 | fixed | 0aef701: exporter reads the last committed ledger tick and omits it past twice the tick interval (FR-038, FR-033-AC-14) |
+| FND-009 | fixed | 0aef701: add_lane target is per-host configuration, default 0.85 |
+| FND-010 | fixed | 0aef701: configurable focus window (10m); ambiguous carries the newest ticket and the list |
+| FND-011 | fixed | 0aef701: focus computed on read, no focus store; AC-6 asserts no store written |
+| FND-012 | fixed | 0aef701: executed_at = first post_tool on the target lane after emission (FR-039-AC-6) |
+| FND-013 | fixed | 0aef701: FR-034-AC-15 masks run timestamp and state ages |
+| FND-014 | fixed | 80eb4a0: quire validate reports no grammar warnings on FR-034 or FR-043 |
