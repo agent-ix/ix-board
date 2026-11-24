@@ -24,12 +24,12 @@ fn defect_text(defect: &Defect) -> String {
         _ => String::new(),
     };
     format!(
-        "{} source={} host={} lane={} first_seen_ms={} {}",
+        "{} source={} host={} lane={} observed_ms={} {}",
         kind,
         defect.source,
         defect.host.as_deref().unwrap_or("-"),
         defect.lane.as_deref().unwrap_or("-"),
-        defect.first_seen_ms,
+        defect.observed_ms,
         defect.reason
     )
 }
@@ -46,12 +46,24 @@ pub fn render_text(report: &FleetReport) -> String {
             .map_or_else(|| "-".to_owned(), |ms| ms.to_string());
         let _ = writeln!(
             out,
-            "{}  {}  {}  age={}  last_event_ms={}",
+            "{}  {}  {}  age={}  last_event_ms={}{}",
             row.lane,
             row.host,
             class_text(row),
             age,
-            last
+            last,
+            if row.thresholds_defaulted {
+                "  thresholds_defaulted"
+            } else {
+                ""
+            }
+        );
+    }
+    for host in &report.hosts {
+        let _ = writeln!(
+            out,
+            "host {}: lanes={} working={} not_working={}",
+            host.host, host.lanes, host.working, host.not_working
         );
     }
     for defect in &report.defects {

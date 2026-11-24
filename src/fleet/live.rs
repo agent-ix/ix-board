@@ -7,7 +7,7 @@
 use super::SourceError;
 use super::classify::WeakSource;
 use super::report::{
-    ExpiredOrder, HostSeries, OrderReceipts, ProbeReading, RegInfo, RelayConfig, RelaySnapshot,
+    HostSeries, OrderReceipt, OrderReceipts, ProbeReading, RegInfo, RelayConfig, RelaySnapshot,
     SeriesSource, WeakSignals, parse_event,
 };
 use relay_core::config::{CoreFlags, load_core};
@@ -28,24 +28,41 @@ pub fn read_relay(timeout: Duration) -> Result<RelaySnapshot, SourceError> {
     let fail = |what: &str, e: relay_core::Error| SourceError(format!("relay {what}: {e}"));
     let lists = relay.lane_lists().map_err(|e| fail("lane lists", e))?;
     let agents = relay.agents().map_err(|e| fail("registrations", e))?;
-    let registrations: Vec<RegInfo> = agents
-        .registrations
-        .iter()
-        .filter_map(|reg| {
-            Some(RegInfo {
-                addr: reg.full_address()?.to_string(),
+    let mut registrations = Vec::new();
+    let mut registration_defects = Vec::new();
+    for reg in &agents.registrations {
+        match reg.full_address() {
+            Some(addr) => registrations.push(RegInfo {
+                addr: addr.to_string(),
                 last_seen_ms: reg.last_seen_ms,
                 has_pane: reg.herdr_pane.is_some(),
-            })
-        })
-        .collect();
+            }),
+            None => registration_defects.push(format!(
+                "registration {}: no resolvable server:workspace:tab address (no verified place)",
+                reg.name
+            )),
+        }
+    }
+    for skipped in &agents.skipped {
+        registration_defects.push(format!(
+            "registration {}: record did not decode: {}",
+            skipped.field, skipped.error
+        ));
+    }
+    let lane_registry_absent = lists.lists.is_empty();
     let mut snapshot = RelaySnapshot {
         now_ms: lists.now_ms,
         lists: lists.lists,
         unreadable_lists: lists.unreadable,
+        lane_registry_absent,
         registrations,
+        registration_defects,
         ..RelaySnapshot::default()
     };
+    snapshot.activity_absent = relay
+        .activity_len()
+        .map_err(|e| fail("activity length", e))?
+        == 0;
     let stream = relay
         .activity_events(ACTIVITY_MAX_EVENTS)
         .map_err(|e| fail("activity stream", e))?;
@@ -140,14 +157,29 @@ impl PromQuery for PromHttp {
     }
 }
 
-/// A source that reads nothing because no Prometheus URL is configured.
-pub struct NoPrometheus;
+/// Prometheus series names, derived in this one place from ix-relay FR-045's declared kinds and
+/// units and Prometheus 3's default OTLP translation (`UnderscoreEscapingWithSuffixes`): dots
+/// become underscores, unit `s` adds `_seconds` unless the name already ends so, unit `1` on a
+/// gauge adds `_ratio`, and a monotonic sum adds `_total`. Live evidence of the rule is
+/// `herdr_pane_status_ratio` for `herdr.pane.status` (gauge, unit `1`).
+pub mod series {
+    /// `ix.fleet.lane.blocked`, gauge, unit `1`. Exported only while a lane is blocked, so an
+    /// empty result is normal and is not a `series_absent` defect.
+    pub const LANE_BLOCKED: &str = "ix_fleet_lane_blocked_ratio";
+    /// `ix.fleet.probe_ok`, gauge, unit `1`.
+    pub const PROBE_OK: &str = "ix_fleet_probe_ok_ratio";
+    /// `ix.fleet.config`, gauge, unit `s`.
+    pub const CONFIG: &str = "ix_fleet_config_seconds";
+    /// `ix.fleet.lane.compile_seconds`, monotonic sum, unit `s`.
+    pub const COMPILE_SECONDS: &str = "ix_fleet_lane_compile_seconds_total";
+}
 
-impl SeriesSource for NoPrometheus {
+/// A series source that cannot read; the reason is the defect text of every host.
+pub struct UnavailablePrometheus(pub String);
+
+impl SeriesSource for UnavailablePrometheus {
     fn host_series(&self, _host: &str) -> Result<HostSeries, SourceError> {
-        Err(SourceError(
-            "no Prometheus URL configured (IX_PROMETHEUS_URL or [fleet] prometheus_url)".to_owned(),
-        ))
+        Err(SourceError(self.0.clone()))
     }
 }
 
@@ -201,14 +233,18 @@ impl<Q: PromQuery> SeriesSource for PrometheusSeries<Q> {
             samples(&self.query.query(&expr)?)
         };
         let mut series = HostSeries::default();
-        for (labels, value) in read(format!("ix_fleet_lane_blocked{{host=\"{host}\"}}"))? {
+        for (labels, value) in read(format!("{}{{host=\"{host}\"}}", series::LANE_BLOCKED))? {
             if value >= 1.0
                 && let (Some(lane), Some(reason)) = (labels.get("lane"), labels.get("reason"))
             {
                 series.blocked.insert(lane.to_lowercase(), reason.clone());
             }
         }
-        for (labels, value) in read(format!("ix_fleet_probe_ok{{host=\"{host}\"}}"))? {
+        let probes = read(format!("{}{{host=\"{host}\"}}", series::PROBE_OK))?;
+        if probes.is_empty() {
+            series.absent.push(series::PROBE_OK.to_owned());
+        }
+        for (labels, value) in probes {
             if let Some(source) = labels.get("source") {
                 series.probes.push(ProbeReading {
                     source: source.clone(),
@@ -218,7 +254,11 @@ impl<Q: PromQuery> SeriesSource for PrometheusSeries<Q> {
         }
         series.probes.sort_by(|a, b| a.source.cmp(&b.source));
         let mut config = RelayConfig::default();
-        for (labels, value) in read(format!("ix_fleet_config{{host=\"{host}\"}}"))? {
+        let configs = read(format!("{}{{host=\"{host}\"}}", series::CONFIG))?;
+        if configs.is_empty() {
+            series.absent.push(series::CONFIG.to_owned());
+        }
+        for (labels, value) in configs {
             match labels.get("name").map(String::as_str) {
                 Some("working_window") => config.working_window = secs(value),
                 Some("max_tool_runtime") => config.max_tool_runtime = secs(value),
@@ -227,15 +267,18 @@ impl<Q: PromQuery> SeriesSource for PrometheusSeries<Q> {
             }
         }
         series.config = config;
-        for (labels, value) in read(format!(
-            "ix_fleet_lane_compile_seconds_total{{host=\"{host}\"}}"
-        ))? {
+        let compiles = read(format!("{}{{host=\"{host}\"}}", series::COMPILE_SECONDS))?;
+        if compiles.is_empty() {
+            series.absent.push(series::COMPILE_SECONDS.to_owned());
+        }
+        for (labels, value) in compiles {
             if let Some(lane) = labels.get("lane") {
                 series.compile_seconds.insert(lane.to_lowercase(), value);
             }
         }
         let ages = read(format!(
-            "time() - timestamp(ix_fleet_config{{host=\"{host}\"}})"
+            "time() - timestamp({}{{host=\"{host}\"}})",
+            series::CONFIG
         ))?;
         series.sample_age = ages.into_iter().filter_map(|(_, value)| secs(value)).max();
         Ok(series)
@@ -248,7 +291,7 @@ impl<Q: PromQuery> SeriesSource for PrometheusSeries<Q> {
 pub struct PendingOrderReceipts;
 
 impl OrderReceipts for PendingOrderReceipts {
-    fn expired_orders(&self) -> Result<Vec<ExpiredOrder>, SourceError> {
+    fn orders(&self) -> Result<Vec<OrderReceipt>, SourceError> {
         Err(SourceError(
             "AckExpired receipts are not on ix-relay main (ix-relay PR #56); STALE-ORDER unavailable"
                 .to_owned(),
@@ -256,7 +299,8 @@ impl OrderReceipts for PendingOrderReceipts {
     }
 }
 
-/// The seam for herdr weak signals; the live command wires none, so only hook evidence works.
+/// The seam for herdr weak signals (title, pane text). The live command wires none yet, so only
+/// hook evidence makes WORKING; live weak signals are SWM-264.
 pub struct NoWeakSignals;
 
 impl WeakSignals for NoWeakSignals {

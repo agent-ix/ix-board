@@ -75,16 +75,27 @@ The command evaluates classes in this order and emits the first that matches:
 
 When a lane's evidence is missing, stale or failed, the command SHALL class the lane
 by these rules using the evidence available and SHALL add a source-defect row naming source,
-host, lane, reason and first-seen time. The defect kinds are `missing_lane`,
-`missing_host`, `no_events` (a registered lane with no event for `no_events_after`),
+host, lane, reason and observation time (the run's relay time; a true first-seen time needs the
+fleet ledger of [FR-039](./FR-039-fleet-ledger.md)). The defect kinds are `missing_lane`,
+`missing_host`, `no_events` (a registered lane whose newest event is not `stop`, `idle`,
+`session_end` or `blocked`, matching the relay `ix.fleet.lane.no_events`, and that has emitted no
+event for `no_events_after`; a quiet lane never carries it),
+`relay_activity_absent` (the relay holds no activity stream), `lane_registry_absent` (no host
+lane list exists), `series_absent` (a queried watcher series that must exist returned nothing on
+any host), a registration with no resolvable address or that does not decode (an
+`unreadable_source` row naming its id),
 `stale_source` (a source older than twice its scrape or push interval),
 `clock_skew` (relay server time and the ix-board clock differ by more than
-`max_clock_skew`) and `unreadable_source` and `stale_host_registry`. A report with any defect SHALL NOT
+`max_clock_skew`) and `unreadable_source` and `stale_host_registry`. When the relay thresholds cannot
+be read, the command SHALL class lanes with the documented relay defaults, mark each such row
+`thresholds_defaulted` and add a defect. A registration SHALL NOT override an expired host lane
+list: a lane on a host whose lease lapsed is `UNREACHABLE`. A report with any defect SHALL NOT
 state that all hosts or lanes are in target, and its JSON carries `complete: false`.
 
 Each row carries lane, host, class, reason, state age, last event time, the
 evidence items used with timestamps and sources, the focus
-([FR-037](./FR-037-fleet-focus-and-drift.md)) and the evidence-schema version.
+([FR-037](./FR-037-fleet-focus-and-drift.md)) and the evidence-schema version. The report carries per-host capacity
+figures: lanes total, `working` and `not_working` (including `UNREACHABLE`).
 A failing host SHALL NOT remove the rows of other hosts.
 The command SHALL bound each host read by a per-host timeout.
 The command SHALL exit non-zero when any defect row exists. ix-board classification
@@ -102,7 +113,7 @@ is authoritative for fleet decisions; the relay lane-state series is advisory.
 | FR-034-AC-6 | The mapping fixtures give relay `ix_fleet_lane_blocked` reasons `dialog` and `permission` BLOCKED(dialog), `question` and `queued_question` BLOCKED(question), `login` and `usage_limit` their reasons, and a `session_end` DEAD. | Test |
 | FR-034-AC-7 | With the relay series reporting a reason that disagrees with raw hook or pane fixtures, the class follows the relay series; the code holds no hook-versus-pane precedence rule (an inspection of the source finds none). | Test |
 | FR-034-AC-8 | An order with `AckExpired` and a `Delivered` receipt, and one with `AckExpired` and no `Delivered` receipt (`timed_out`), each yield STALE-ORDER. | Test |
-| FR-034-AC-9 | A lane with no event for the relay `no_events_after` is IDLE with a `no_events` defect; a lane the relay marks `stale` is `UNREACHABLE` with a `stale_host_registry` defect, never IDLE, and counts as not working in capacity figures; a failed probe, unreadable source, or a source older than twice its interval adds the matching defect while the lane is still emitted. | Test |
+| FR-034-AC-9 | A lane whose newest event is a `prompt` or `pre_tool` older than the relay `no_events_after` is IDLE with a `no_events` defect, and a lane whose newest event is `stop`, `idle`, `session_end` or `blocked`, or that has no event, does not carry it; a lane the relay marks `stale` is `UNREACHABLE` with a `stale_host_registry` defect, never IDLE, and counts as not working in capacity figures; a failed probe, unreadable source, or a source older than twice its interval adds the matching defect while the lane is still emitted. | Test |
 | FR-034-AC-10 | A configured lane with no registry record and a configured host with no lanes give `missing_lane`/`missing_host` defects, `complete` false and a non-zero exit. | Test |
 | FR-034-AC-11 | The working window equals the value read from the relay configuration; a fixture changing it changes classification and the code holds no second constant (an inspection of the source finds one definition). | Test |
 | FR-034-AC-16 | `max_tool_runtime` and `no_events_after` equal the relay `ix.fleet.config` values and ix-board configuration rejects local overrides of them. | Test |
@@ -110,6 +121,9 @@ is authoritative for fleet decisions; the relay lane-state series is advisory.
 | FR-034-AC-13 | A relay-to-ix-board clock difference above `max_clock_skew` raises `clock_skew` and every age is still computed from relay server time; host-local timestamps never enter an age. | Test |
 | FR-034-AC-14 | One host timing out leaves other hosts' rows unchanged and adds an `unreadable_source` defect within the per-host bound. | Test |
 | FR-034-AC-15 | Text and `--json` carry the same rows, defects and `complete`; two runs on identical evidence give identical JSON once run-time-dependent fields (run timestamp and state ages) are masked. | Test |
+| FR-034-AC-17 | A missing activity stream, a missing lane registry, a registration with no resolvable address or that does not decode, and a watcher series absent on every host each add a run-level defect naming the source, and the run is not complete. | Test |
+| FR-034-AC-18 | The report carries per-host lanes total, working and not working, with `UNREACHABLE` lanes counted as not working. | Test |
+| FR-034-AC-19 | With Prometheus unset or unreadable, hook evidence still classes lanes with the documented relay defaults, every such row is marked `thresholds_defaulted`, and one run-level defect names the remedy; a registration on a host whose lease lapsed is `UNREACHABLE`. | Test |
 
 ## Dependencies
 

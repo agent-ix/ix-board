@@ -59,6 +59,7 @@ fn series(window: u64, blocked: &[(&str, &str)]) -> HostSeries {
         },
         compile_seconds: BTreeMap::new(),
         sample_age: Some(Duration::from_secs(10)),
+        absent: Vec::new(),
     }
 }
 
@@ -82,9 +83,9 @@ impl SeriesSource for FakeSeries {
     }
 }
 
-struct Receipts(Result<Vec<ExpiredOrder>, SourceError>);
+struct Receipts(Result<Vec<OrderReceipt>, SourceError>);
 impl OrderReceipts for Receipts {
-    fn expired_orders(&self) -> Result<Vec<ExpiredOrder>, SourceError> {
+    fn orders(&self) -> Result<Vec<OrderReceipt>, SourceError> {
         self.0.clone()
     }
 }
@@ -99,7 +100,7 @@ impl WeakSignals for Weak {
 struct World {
     relay: RelaySnapshot,
     series: FakeSeries,
-    receipts: Result<Vec<ExpiredOrder>, SourceError>,
+    receipts: Result<Vec<OrderReceipt>, SourceError>,
     weak: BTreeMap<String, Vec<WeakSource>>,
     cfg: FleetConfig,
 }
@@ -132,11 +133,28 @@ impl World {
         let weak = Weak(self.weak.clone());
         let sources = Sources {
             relay: Ok(self.relay.clone()),
-            series: Arc::new(self.series.clone()),
+            series: Some(Arc::new(self.series.clone())),
             receipts: &receipts,
             weak: &weak,
         };
         build_report(&self.cfg, &sources, local_now_ms)
+    }
+}
+
+fn order(
+    addr: &str,
+    delivered_ms: Option<i64>,
+    acted_ms: Option<i64>,
+    deadline_secs: u64,
+    ack_expired: bool,
+) -> OrderReceipt {
+    OrderReceipt {
+        addr: addr.to_owned(),
+        enqueued_ms: delivered_ms.map_or(NOW - 5000, |d| d - 1000),
+        delivered_ms,
+        deadline: Duration::from_secs(deadline_secs),
+        acted_ms,
+        ack_expired,
     }
 }
 
@@ -351,14 +369,8 @@ fn ack_expired_orders_are_stale_with_or_without_a_delivered_receipt() {
         &[],
     );
     world.receipts = Ok(vec![
-        ExpiredOrder {
-            addr: "h:w:1".to_owned(),
-            delivered: true,
-        },
-        ExpiredOrder {
-            addr: "h:w:2".to_owned(),
-            delivered: false,
-        },
+        order("h:w:1", Some(NOW - 5000), None, 300, true),
+        order("h:w:2", None, None, 300, true),
     ]);
     let report = world.run();
     assert_eq!(
@@ -376,7 +388,7 @@ fn ack_expired_orders_are_stale_with_or_without_a_delivered_receipt() {
 fn unavailable_order_receipts_are_a_defect_not_an_empty_list() {
     let mut world = World::one_host(&["h:w:1"], vec![raw("h:w:1", HookKind::Stop, 5)], &[]);
     let pending = ix_board::fleet::live::PendingOrderReceipts;
-    world.receipts = pending.expired_orders();
+    world.receipts = pending.orders();
     let report = world.run();
     assert!(has_defect(&report, DefectKind::UnreadableSource));
     assert!(!report.complete);
@@ -387,8 +399,11 @@ fn unavailable_order_receipts_are_a_defect_not_an_empty_list() {
 #[test]
 fn quiet_stale_failed_and_old_sources_add_defects_and_keep_the_lanes() {
     let mut world = World::one_host(
-        &["h:w:1", "h:w:2"],
-        vec![raw("h:w:1", HookKind::Stop, NO_EVENTS + 1)],
+        &["h:w:1", "h:w:2", "h:w:3"],
+        vec![
+            raw("h:w:1", HookKind::Stop, NO_EVENTS + 1),
+            raw("h:w:2", HookKind::Prompt, NO_EVENTS + 1),
+        ],
         &[],
     );
     world.relay.lists.push(HostLaneList {
@@ -401,18 +416,18 @@ fn quiet_stale_failed_and_old_sources_add_defects_and_keep_the_lanes() {
     world.series.hosts.insert("old".to_owned(), Ok(bad));
     let report = world.run();
     assert_eq!(class_of(&report, "h:w:1").0, ClassKind::Idle);
-    assert!(
+    let no_events = |lane: &str| {
         report
             .defects
             .iter()
-            .any(|d| d.kind == DefectKind::NoEvents && d.lane.as_deref() == Some("h:w:1"))
-    );
+            .any(|d| d.kind == DefectKind::NoEvents && d.lane.as_deref() == Some(lane))
+    };
     assert!(
-        report
-            .defects
-            .iter()
-            .any(|d| d.kind == DefectKind::NoEvents && d.lane.as_deref() == Some("h:w:2"))
+        no_events("h:w:2"),
+        "a stale prompt with no later event is not quiet"
     );
+    assert!(!no_events("h:w:1"), "a newest stop is quiet");
+    assert!(!no_events("h:w:3"), "a lane with no event is quiet");
     assert_eq!(class_of(&report, "old:w:1").0, ClassKind::Unreachable);
     assert!(has_defect(&report, DefectKind::StaleHostRegistry));
     assert!(has_defect(&report, DefectKind::StaleSource));
@@ -422,7 +437,7 @@ fn quiet_stale_failed_and_old_sources_add_defects_and_keep_the_lanes() {
             .iter()
             .any(|d| d.kind == DefectKind::UnreadableSource && d.source == "probe:cpu")
     );
-    assert_eq!(report.rows.len(), 3);
+    assert_eq!(report.rows.len(), 4);
 }
 
 #[trace("FR-034-AC-10")]
@@ -454,14 +469,26 @@ fn the_working_window_is_the_relay_value_and_no_second_constant_exists() {
     assert_eq!(class_of(&short.run(), "h:w:1").0, ClassKind::Idle);
     let long = World::one_host(&["h:w:1"], events, &[]);
     assert_eq!(class_of(&long.run(), "h:w:1").0, ClassKind::Working);
-    for source in [
+    let sources = [
         include_str!("../src/fleet/classify.rs"),
         include_str!("../src/fleet/config.rs"),
         include_str!("../src/fleet/report.rs"),
         include_str!("../src/fleet/live.rs"),
+    ]
+    .concat();
+    for constant in [
+        "from_secs(10 * 60)",
+        "from_secs(2 * 60 * 60)",
+        "from_secs(30 * 60)",
     ] {
-        assert!(!source.contains("from_secs(600)") && !source.contains("from_secs(10 * 60)"));
-        assert!(!source.contains("from_secs(7200)") && !source.contains("from_secs(1800)"));
+        assert_eq!(
+            sources.matches(constant).count(),
+            1,
+            "{constant} is defined once"
+        );
+    }
+    for literal in ["from_secs(600)", "from_secs(7200)", "from_secs(1800)"] {
+        assert!(!sources.contains(literal), "{literal}");
     }
 }
 
@@ -680,10 +707,10 @@ fn a_failed_relay_read_is_a_defect_with_no_rows() {
     let weak = Weak(BTreeMap::new());
     let sources = Sources {
         relay: Err(SourceError("connection refused".to_owned())),
-        series: Arc::new(FakeSeries {
+        series: Some(Arc::new(FakeSeries {
             hosts: BTreeMap::new(),
             slow: None,
-        }),
+        })),
         receipts: &receipts,
         weak: &weak,
     };
@@ -701,4 +728,269 @@ fn stored_relay_events_parse_and_unreadable_ones_are_refused() {
     assert_eq!(parsed.event.kind, HookKind::PreTool);
     assert!(parse_event(r#"{"addr":"h:w:1","server_ms":5,"kind":"mystery"}"#).is_none());
     assert!(parse_event("not json").is_none());
+}
+
+#[trace("FR-034-AC-12", "FR-034-AC-8")]
+#[test]
+fn the_order_deadline_boundary_runs_from_delivery_or_enqueue_on_relay_time() {
+    let deadline = 300u64;
+    let delivered = NOW - 300_000;
+    // Exactly at the deadline is not expired; one second beyond is.
+    assert_eq!(
+        order_expired(&order("a", Some(delivered), None, deadline, false), NOW),
+        None
+    );
+    assert_eq!(
+        order_expired(
+            &order("a", Some(delivered), None, deadline, false),
+            NOW + 1000
+        ),
+        Some(true)
+    );
+    // An order never delivered runs from enqueue and is `timed_out`.
+    let undelivered = order("a", None, None, deadline, false);
+    let at = undelivered.enqueued_ms + 300_000;
+    assert_eq!(order_expired(&undelivered, at), None);
+    assert_eq!(order_expired(&undelivered, at + 1000), Some(false));
+    // `Acted` before the deadline cancels it; a recorded AckExpired always counts.
+    assert_eq!(
+        order_expired(
+            &order("a", Some(delivered), Some(NOW - 1000), deadline, false),
+            NOW + 60_000
+        ),
+        None
+    );
+    assert_eq!(
+        order_expired(
+            &order("a", Some(delivered), None, deadline, true),
+            NOW - 250_000
+        ),
+        Some(true)
+    );
+    // The boundary reaches the class.
+    let mut world = World::one_host(&["h:w:1"], vec![raw("h:w:1", HookKind::Stop, 5)], &[]);
+    world.receipts = Ok(vec![order("h:w:1", Some(delivered), None, deadline, false)]);
+    assert_ne!(class_of(&world.run(), "h:w:1").0, ClassKind::StaleOrder);
+    world.receipts = Ok(vec![order(
+        "h:w:1",
+        Some(delivered - 1000),
+        None,
+        deadline,
+        false,
+    )]);
+    assert_eq!(class_of(&world.run(), "h:w:1").0, ClassKind::StaleOrder);
+}
+
+#[trace("FR-034-AC-4")]
+#[test]
+fn a_later_stop_idle_or_blocked_event_ends_an_open_pre_tool() {
+    for later in [HookKind::Stop, HookKind::Idle, HookKind::Blocked] {
+        // An interrupted tool: the pre_tool is older than max_tool_runtime but not the newest
+        // event, so the lane is neither STUCK nor kept WORKING by it.
+        let report = World::one_host(
+            &["h:w:1"],
+            vec![
+                raw("h:w:1", HookKind::PreTool, TOOL + 100),
+                raw("h:w:1", later, TOOL + 50),
+            ],
+            &[],
+        )
+        .run();
+        assert_eq!(class_of(&report, "h:w:1").0, ClassKind::Idle, "{later:?}");
+        // Inside the working window the pre_tool still counts as hook evidence.
+        let recent = World::one_host(
+            &["h:w:1"],
+            vec![
+                raw("h:w:1", HookKind::PreTool, 100),
+                raw("h:w:1", later, 50),
+            ],
+            &[],
+        )
+        .run();
+        assert_eq!(
+            class_of(&recent, "h:w:1").0,
+            ClassKind::Working,
+            "{later:?}"
+        );
+    }
+    // Still open when it is the newest event.
+    let stuck = World::one_host(
+        &["h:w:1"],
+        vec![raw("h:w:1", HookKind::PreTool, TOOL + 1)],
+        &[],
+    )
+    .run();
+    assert_eq!(class_of(&stuck, "h:w:1").0, ClassKind::Stuck);
+}
+
+#[trace("FR-034-AC-17")]
+#[test]
+fn absent_sources_and_unresolvable_registrations_are_run_level_defects() {
+    let mut world = World::one_host(&["h:w:1"], vec![], &[]);
+    world.relay.activity_absent = true;
+    world.relay.lane_registry_absent = true;
+    world.relay.registration_defects = vec![
+        "registration lead-a: no resolvable address".to_owned(),
+        "registration lead-b: record did not decode".to_owned(),
+    ];
+    let report = world.run();
+    assert!(has_defect(&report, DefectKind::RelayActivityAbsent));
+    assert!(has_defect(&report, DefectKind::LaneRegistryAbsent));
+    let registrations: Vec<_> = report
+        .defects
+        .iter()
+        .filter(|d| d.source == "relay.registrations")
+        .collect();
+    assert_eq!(registrations.len(), 2);
+    assert!(registrations.iter().any(|d| d.reason.contains("lead-a")));
+    assert!(!report.complete);
+    assert_eq!(report.coverage(), Coverage::Partial);
+
+    // A watcher series absent on every host is one run-level defect; absent on one host is not.
+    let mut world = World::one_host(&["h:w:1", "g:w:1"], vec![], &[]);
+    let mut gone = series(WINDOW, &[]);
+    gone.absent = vec!["ix_fleet_lane_compile_seconds_total".to_owned()];
+    world.series.hosts.insert("h".to_owned(), Ok(gone.clone()));
+    world
+        .series
+        .hosts
+        .insert("g".to_owned(), Ok(series(WINDOW, &[])));
+    assert!(!has_defect(&world.run(), DefectKind::SeriesAbsent));
+    world.series.hosts.insert("g".to_owned(), Ok(gone));
+    let report = world.run();
+    assert_eq!(
+        report
+            .defects
+            .iter()
+            .filter(|d| d.kind == DefectKind::SeriesAbsent)
+            .count(),
+        1
+    );
+}
+
+#[trace("FR-034-AC-18", "FR-034-AC-9")]
+#[test]
+fn the_report_carries_per_host_capacity_with_unreachable_as_not_working() {
+    let mut world = World::one_host(
+        &["h:w:1", "h:w:2"],
+        vec![raw("h:w:1", HookKind::Prompt, 5)],
+        &[],
+    );
+    world.relay.lists.push(HostLaneList {
+        refreshed_ms: NOW - 90_000,
+        ..list("old", &["old:w:1"])
+    });
+    world
+        .series
+        .hosts
+        .insert("old".to_owned(), Ok(series(WINDOW, &[])));
+    let report = world.run();
+    let summary: Vec<_> = report
+        .hosts
+        .iter()
+        .map(|h| (h.host.as_str(), h.lanes, h.working, h.not_working))
+        .collect();
+    assert_eq!(summary, [("h", 2, 1, 1), ("old", 1, 0, 1)]);
+    assert!(render_text(&report).contains("host old: lanes=1 working=0 not_working=1"));
+}
+
+#[trace("FR-034-AC-19")]
+#[test]
+fn an_unreadable_prometheus_keeps_hook_evidence_with_marked_default_thresholds() {
+    let events = vec![
+        raw("h:w:1", HookKind::Prompt, 100),
+        raw("h:w:2", HookKind::PreTool, TOOL + 1),
+    ];
+    let mut world = World::one_host(&["h:w:1", "h:w:2"], events, &[]);
+    // Unset URL: one run-level defect with the remedy, no per-host defects.
+    let receipts = Receipts(Ok(Vec::new()));
+    let weak = Weak(BTreeMap::new());
+    let sources = Sources {
+        relay: Ok(world.relay.clone()),
+        series: None,
+        receipts: &receipts,
+        weak: &weak,
+    };
+    let report = build_report(&world.cfg, &sources, NOW);
+    assert_eq!(class_of(&report, "h:w:1").0, ClassKind::Working);
+    assert_eq!(class_of(&report, "h:w:2").0, ClassKind::Stuck);
+    assert!(report.rows.iter().all(|r| r.thresholds_defaulted));
+    let prom: Vec<_> = report
+        .defects
+        .iter()
+        .filter(|d| d.source == "prometheus")
+        .collect();
+    assert_eq!(prom.len(), 1);
+    assert!(
+        prom[0]
+            .reason
+            .contains("set IX_PROMETHEUS_URL or [fleet] prometheus_url")
+    );
+    // A host that fails to read is marked the same way, with its own reason.
+    world.series.hosts.insert(
+        "h".to_owned(),
+        Err(SourceError("client build failed: tls".to_owned())),
+    );
+    let report = world.run();
+    assert_eq!(class_of(&report, "h:w:1").0, ClassKind::Working);
+    assert!(report.rows.iter().all(|r| r.thresholds_defaulted));
+    assert!(
+        report
+            .defects
+            .iter()
+            .any(|d| d.reason.contains("client build failed"))
+    );
+    // A healthy host is not marked.
+    let healthy = World::one_host(&["h:w:1"], vec![raw("h:w:1", HookKind::Prompt, 5)], &[]).run();
+    assert!(healthy.rows.iter().all(|r| !r.thresholds_defaulted));
+}
+
+#[trace("FR-034-AC-19", "FR-034-AC-9")]
+#[test]
+fn a_registration_does_not_override_a_lapsed_host_list() {
+    let mut world = World::one_host(&["h:w:1"], vec![raw("h:w:1", HookKind::Prompt, 5)], &[]);
+    world.relay.lists.push(HostLaneList {
+        refreshed_ms: NOW - 90_000,
+        ..list("old", &["old:w:1"])
+    });
+    world.relay.registrations = vec![RegInfo {
+        addr: "old:w:1".to_owned(),
+        last_seen_ms: NOW - 1000,
+        has_pane: true,
+    }];
+    world
+        .series
+        .hosts
+        .insert("old".to_owned(), Ok(series(WINDOW, &[])));
+    let report = world.run();
+    assert_eq!(class_of(&report, "old:w:1").0, ClassKind::Unreachable);
+    assert!(has_defect(&report, DefectKind::StaleHostRegistry));
+}
+
+#[trace("FR-034-AC-17")]
+#[test]
+fn empty_prometheus_results_mark_the_required_series_absent_under_one_set_of_names() {
+    use ix_board::fleet::live::series;
+    let empty = vector("");
+    let source = PrometheusSeries {
+        query: CannedProm(BTreeMap::from([
+            ("ix_fleet_lane_blocked", empty),
+            ("ix_fleet_probe_ok", empty),
+            ("ix_fleet_config", empty),
+            ("ix_fleet_lane_compile_seconds_total", empty),
+            ("time() - timestamp", empty),
+        ])),
+    };
+    let read = source.host_series("h").unwrap();
+    assert_eq!(
+        read.absent,
+        [series::PROBE_OK, series::CONFIG, series::COMPILE_SECONDS]
+    );
+    assert_eq!(series::LANE_BLOCKED, "ix_fleet_lane_blocked_ratio");
+    assert_eq!(series::PROBE_OK, "ix_fleet_probe_ok_ratio");
+    assert_eq!(series::CONFIG, "ix_fleet_config_seconds");
+    assert_eq!(
+        series::COMPILE_SECONDS,
+        "ix_fleet_lane_compile_seconds_total"
+    );
 }

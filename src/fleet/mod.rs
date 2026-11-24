@@ -17,12 +17,15 @@ pub use classify::{
     Class, ClassKind, Classification, Evidence, HookEvent, HookKind, LaneInput, Thresholds,
     WeakSource, classify,
 };
-pub use config::FleetConfig;
+pub use config::{
+    FleetConfig, RELAY_DEFAULT_MAX_TOOL_RUNTIME, RELAY_DEFAULT_NO_EVENTS_AFTER,
+    RELAY_DEFAULT_WORKING_WINDOW,
+};
 pub use render::render_text;
 pub use report::{
-    Coverage, Defect, DefectKind, ExpiredOrder, FleetReport, HostSeries, LaneRow, OrderReceipts,
-    ProbeReading, RawEvent, RegInfo, RelayConfig, RelaySnapshot, SCHEMA_VERSION, SeriesSource,
-    Sources, WeakSignals, build_report, parse_event,
+    Coverage, Defect, DefectKind, FleetReport, HostSeries, HostSummary, LaneRow, OrderReceipt,
+    OrderReceipts, ProbeReading, RawEvent, RegInfo, RelayConfig, RelaySnapshot, SCHEMA_VERSION,
+    SeriesSource, Sources, WeakSignals, build_report, order_expired, parse_event,
 };
 
 use thiserror::Error as ThisError;

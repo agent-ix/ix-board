@@ -28,6 +28,15 @@ const KNOWN: [&str; 8] = [
     "host_timeout_secs",
 ];
 
+/// The relay defaults for the three relay-owned thresholds (ix-relay `[fleet]` documentation).
+/// The one definition in ix-board: used only for a lane whose host did not report
+/// `ix.fleet.config`, and every such row is marked `thresholds_defaulted`.
+pub const RELAY_DEFAULT_WORKING_WINDOW: Duration = Duration::from_secs(10 * 60);
+/// Relay default `max_tool_runtime`; see [`RELAY_DEFAULT_WORKING_WINDOW`].
+pub const RELAY_DEFAULT_MAX_TOOL_RUNTIME: Duration = Duration::from_secs(2 * 60 * 60);
+/// Relay default `no_events_after`; see [`RELAY_DEFAULT_WORKING_WINDOW`].
+pub const RELAY_DEFAULT_NO_EVENTS_AFTER: Duration = Duration::from_secs(30 * 60);
+
 /// ix-board-owned fleet settings and the configured lanes and hosts.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FleetConfig {

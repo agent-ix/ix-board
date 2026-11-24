@@ -787,13 +787,14 @@ fn run_fleet_status() -> Result<ix_board::fleet::FleetReport, Error> {
         settings.as_ref(),
         std::env::var("IX_PROMETHEUS_URL").ok(),
     )?;
-    let series: std::sync::Arc<dyn ix_board::fleet::SeriesSource> = match &config.prometheus_url {
-        Some(url) => match live::PromHttp::new(url, config.host_timeout) {
-            Ok(query) => std::sync::Arc::new(live::PrometheusSeries { query }),
-            Err(_) => std::sync::Arc::new(live::NoPrometheus),
-        },
-        None => std::sync::Arc::new(live::NoPrometheus),
-    };
+    let series: Option<std::sync::Arc<dyn ix_board::fleet::SeriesSource>> = config
+        .prometheus_url
+        .as_ref()
+        .map(|url| match live::PromHttp::new(url, config.host_timeout) {
+            Ok(query) => std::sync::Arc::new(live::PrometheusSeries { query })
+                as std::sync::Arc<dyn ix_board::fleet::SeriesSource>,
+            Err(error) => std::sync::Arc::new(live::UnavailablePrometheus(error.to_string())),
+        });
     let sources = ix_board::fleet::Sources {
         relay: live::read_relay(config.host_timeout),
         series,

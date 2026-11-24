@@ -206,13 +206,13 @@ pub(crate) fn blocked_class(raw: &str) -> Option<&'static str> {
     }
 }
 
-/// An open `pre_tool`: newer than every `post_tool`.
+/// An open `pre_tool`: the lane's newest event. A later `post_tool`, `stop`, `idle`, `blocked`
+/// or any other event ends it, as in the relay lane-state rule.
 fn open_pre_tool(events: &[HookEvent]) -> Option<HookEvent> {
-    let pre = newest(events, HookKind::PreTool)?;
-    match newest(events, HookKind::PostTool) {
-        Some(post) if post.server_ms >= pre.server_ms => None,
-        _ => Some(pre),
-    }
+    events
+        .last()
+        .copied()
+        .filter(|event| event.kind == HookKind::PreTool)
 }
 
 fn looping(events: &[HookEvent], th: &Thresholds, now_ms: i64) -> bool {
