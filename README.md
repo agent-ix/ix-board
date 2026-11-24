@@ -190,6 +190,10 @@ low.
 - [CLI reference](docs/cli-reference.md)
 - [Setup and troubleshooting](docs/setup.md)
 
+## Releases
+
+Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`, which builds the `x86_64-unknown-linux-gnu` binary and attaches the tarball and `.sha256` to the GitHub release, creating the release if it does not exist. The `aarch64-apple-darwin` asset is built and attached by hand. When the release already exists, upload it with `gh release upload <tag> <tarball> <tarball>.sha256`.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Every contribution requires a signed
