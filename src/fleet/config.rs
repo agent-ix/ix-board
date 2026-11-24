@@ -103,7 +103,7 @@ impl Default for FleetConfig {
             cycle_interval: Duration::from_secs(DEFAULT_CYCLE_SECS),
             grace: None,
             team_keys: Vec::new(),
-            focus_window: Duration::from_secs(600),
+            focus_window: Duration::from_mins(10),
         }
     }
 }
