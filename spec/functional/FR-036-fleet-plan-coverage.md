@@ -9,6 +9,8 @@ relationships:
     type: depends_on
   - target: "ix://agent-ix/ix-board/FR-035"
     type: depends_on
+  - target: "ix://agent-ix/ix-board/FR-039"
+    type: depends_on
 ---
 # FR-036: Report plan coverage gaps between ready work and lane assignments
 

@@ -43,7 +43,7 @@ its condition persists. Kinds and rules:
 | `act_on_undetermined` | a reachable lane, on a host that is not `UNREACHABLE`, has a lane-scoped evidence defect: `no_events`, or a `missing_lane`, `stale_source` or `unreadable_source` defect naming that lane. Carries the defect, the lane's remaining assigned ticket if any, and `treat_as: idle` | the lane |
 | `ladder_rung` | a condition with a ladder persists past a rung time (below). Carries the parent action id, `rung` 1 to 3 and the recipient | the worker, the lane's lead or the orchestrator per rung |
 | `escalate_drain` | a lane marked draining ([FR-041](./FR-041-fleet-saturation.md)) is still draining after the drain cap (configurable, default 4h) | the lane's lead |
-| `fix_source` | a source-defect row persists beyond its configured age | the fleet owner |
+| `fix_source` | a source-defect row persists beyond its configured age | the orchestrator, who fixes it or routes it to the owning repository |
 
 Actions are sorted by severity, lane and kind. The output for identical evidence is
 identical. A lane with an unresolved defect is not excluded. An unreadable
@@ -60,7 +60,8 @@ The tick owns one in-fleet ladder; the owner is paged only by Alertmanager and t
 - **Rung 0** is the condition's own action, sent to that action's target in the same tick.
 - **Rungs 1 to 3.** While the condition persists the tick emits a `ladder_rung` action to the worker (rung 1), the lane's lead (rung 2) and the orchestrator (rung 3), each in the first committed tick at or after 1, 2 and 3 tick intervals from `condition_started_at`. Each is emitted once. A rung is emitted even when its recipient already received an earlier rung, and its `due_by` is the next tick interval. Its latency from the rung time is therefore at most one tick interval.
 - **The ladder ends** in the tick after the condition clears; no further rung is emitted.
-- **Owners.** `escalate_stuck` goes to the lane's lead, `escalate_stale_pr` to the lead of the lane that owns the pull request, and `escalate_drain` to the lane's lead, taken from the lane-to-lead configuration. A lane with no configured lead gives the action the orchestrator as its owner and the reason `lead_unresolved`.
+- **Owners.** `escalate_stuck` goes to the lane's lead, `escalate_stale_pr` to the lead of the lane that owns the pull request, and `escalate_drain` to the lane's lead, taken from the lane-to-lead configuration. A lane with no configured lead gives the action the orchestrator as its owner and the reason `lead_unresolved`. `fix_source` goes to the orchestrator; nothing the tick emits is addressed to the owner.
+- **No lead for rung 2.** When the lane's lead cannot be resolved the tick does not address rung 2 to a missing recipient: at the rung 2 time it records a rung 2 row with reason `lead_unresolved` and emits rung 3 to the orchestrator in that same tick with reason `lead_unresolved_fallthrough`, instead of at 3 tick intervals. It is not emitted twice.
 - **Recording.** Every rung 0 to 3 is an `action` row with `rung`, `parent_action_id`, `target_role`, `target_addr` and `condition_started_at`; the `escalation_rung` view of [FR-039](./FR-039-fleet-ledger.md) joins it to the relay send.
 
 ### `add_lane` suppression
@@ -88,9 +89,11 @@ no tick record.
 | FR-038-AC-11 | A persisting `escalate_stuck` condition emits rung 1 to the lane, rung 2 to its lead and rung 3 to the orchestrator in the first tick at or after 1, 2 and 3 tick intervals from the first emission, each once, at a 5 minute and at a 2 minute interval; the action id and `condition_started_at` persist across a missed tick. | Test |
 | FR-038-AC-12 | A rung is emitted although the same recipient already received an earlier rung or the rung 0 action; once the condition clears no further rung is emitted; no emitted action has an owner as recipient. | Test |
 | FR-038-AC-13 | `escalate_stuck` and `escalate_stale_pr` carry the lane's lead and the pull-request lane's lead as owner; a lane with no configured lead gives owner orchestrator with reason `lead_unresolved`. | Test |
+| FR-038-AC-16 | A lane with no resolvable lead gets a rung 2 row with reason `lead_unresolved` and rung 3 to the orchestrator emitted in the same tick, not again at 3 intervals; `fix_source` is addressed to the orchestrator and no emitted action has `target_role` other than `lane`, `lead`, `orchestrator`, `planner` or `host`. | Test |
 | FR-038-AC-14 | `add_lane` is not emitted for a host in an open capacity run, a host with no recorded level, a host at its recorded level or within its cool-off, each recorded with its reason; a host below its recorded level with ready work and a free slot emits it, and a draining lane counts as neither a lane nor a free slot. | Test |
 | FR-038-AC-15 | A lane draining longer than the drain cap emits `escalate_drain` to the lane's lead and one still within the cap does not. | Test |
 
 ## Dependencies
 
+- The minder sends `escalate_drain` as a tick action; that discharges the orchestrator's drain-cap escalation (orchestrator role spec ORCH-R30), and the role spec is to be updated to say so.
 - [FR-034](./FR-034-fleet-lane-status.md), [FR-035](./FR-035-fleet-assign.md), [FR-039](./FR-039-fleet-ledger.md), [FR-041](./FR-041-fleet-saturation.md). Standing orders come from the SWM-226 configuration file. Host busy ratio and capacity come from the ix-relay watcher series (Prometheus HTTP API).

@@ -9,6 +9,8 @@ relationships:
     type: constrains
   - target: "ix://agent-ix/ix-board/FR-035"
     type: depends_on
+  - target: "ix://agent-ix/ix-board/FR-039"
+    type: depends_on
 ---
 # FR-037: Derive lane focus from hook evidence and feed drift
 
