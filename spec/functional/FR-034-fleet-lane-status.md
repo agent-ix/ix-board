@@ -28,10 +28,11 @@ The command SHALL NOT emit `UNKNOWN` as a class.
   contract: kinds `pre_tool`, `post_tool`, `prompt`, `blocked{reason}`, `idle`,
   `stop{last_class}`, `session_start`, `session_end`; fields `addr`, `harness`,
   `ts` (milliseconds, relay server time). Receipt states include `Delivered`,
-  `Acted` and `AckExpired`; ix-board derives `timed_out` as an `AckExpired` receipt with no
-  `Delivered` receipt. A receipt history that has a recording gap, a pending observation or an
-  evicted range is a source defect, and a `timed_out` order read across it is marked, because its
-  `Delivered` receipt may be lost. The lane registry is the fleet-wide registry assembled from
+  `Acted` and `AckExpired`. ix-board reads the relay's own list of expired, un-acted orders
+  (`Relay::expired_orders`): the relay applies the order deadline and says whether a `Delivered`
+  receipt came before expiry, so an order without one is `timed_out`. A list the relay reports as
+  `truncated`, rows it `skipped`, and an index that has not started (no `indexed_since_ms`) are
+  source defects. The lane registry is the fleet-wide registry assembled from
   leased per-host lists; a lane on an expired host is marked `stale`.
 - **Prometheus HTTP API:** the watcher series, namely the relay-resolved `ix_fleet_lane_blocked{reason}`
   per lane (hook and pane evidence already combined by the relay, with reasons
@@ -133,8 +134,8 @@ is authoritative for fleet decisions; the relay lane-state series is advisory.
 | FR-034-AC-19 | With Prometheus unset or unreadable, hook evidence still classes lanes with the documented relay defaults, every such row is marked `thresholds_defaulted`, and one run-level defect names the remedy; a registration on a host whose lease lapsed is `UNREACHABLE`. | Test |
 | FR-034-AC-20 | With Prometheus readable and both `ix_fleet_probe_ok` and `ix_fleet_config` absent on every host, one `series_naming_unverified` defect names the expected series; either present suppresses it. | Test |
 | FR-034-AC-21 | A host with registered lanes that never published a lane list gets one `host_lane_list_absent` defect and its lanes are UNREACHABLE; a host whose lanes have no hook event while others do gets one `host_hook_events_absent` defect. | Test |
-| FR-034-AC-22 | A receipt history with a recording gap or a pending observation adds one run-level `receipts_recording_gap` defect on `relay.receipts` and marks each `timed_out` STALE-ORDER row `receipt_gap`; an evicted range does the same only for a `timed_out` order whose `Queued` receipt is no longer retained, so a stream at its cap alone is not a gap; `AckExpired` orders whose recipient has no registered lane address add one `unreadable_source` defect per recipient listing the order ids; neither hides the rows. The live reader reads the relay's `expired_orders` list: a `truncated` list and `skipped` rows are each an `unreadable_source` defect on `relay.receipts`, and the rows stay. | Test |
-| FR-034-AC-23 | The receipt read spans the relay's whole receipt retention, follows the page cursor, and fails as an `unreadable_source` defect on a source, cursor or page-bound failure rather than reporting an empty list; the page bound is the retention event cap over the page size, plus one. | Test |
+| FR-034-AC-22 | The relay's expired-order list is mapped per lane address; a `truncated` list, `skipped` rows and an expiry index that has not started (`indexed_since_ms` empty) are each an `unreadable_source` defect on `relay.receipts` and the rows stay; an expired order whose recipient has no registered lane address adds one `unreadable_source` defect per recipient listing the order ids and hides no row. | Test |
+| FR-034-AC-23 | The expired-order read is one read-only `Relay::expired_orders` call; a failure to read it is an `unreadable_source` defect on `relay.receipts`, never an empty list. | Test |
 
 ## Dependencies
 

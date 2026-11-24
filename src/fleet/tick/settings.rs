@@ -8,10 +8,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-const KNOWN: [&str; 11] = [
+const KNOWN: [&str; 9] = [
     "stale_pr_after_secs",
     "drain_cap_secs",
-    "source_defect_age_secs",
     "orchestrator",
     "minder",
     "standing_orders_path",
@@ -19,7 +18,6 @@ const KNOWN: [&str; 11] = [
     "leads",
     "busy_targets",
     "lane_capacity",
-    "planners",
 ];
 
 /// Settings of `fleet tick` beyond the shared `[fleet]` table.
@@ -29,8 +27,6 @@ pub struct TickSettings {
     pub stale_pr_after: Duration,
     /// A lane draining this long gets `escalate_drain` (default 4h).
     pub drain_cap: Duration,
-    /// A source defect older than this becomes `fix_source` (default 30m).
-    pub source_defect_age: Duration,
     /// Address of the orchestrator session; owner of `fix_source` and rung 3.
     pub orchestrator: Option<String>,
     /// Address of the minder session, to attribute a tick to its role.
@@ -45,8 +41,6 @@ pub struct TickSettings {
     pub busy_targets: BTreeMap<String, f64>,
     /// Host (lower case) to its lane capacity, the bound of a free lane slot.
     pub lane_capacity: BTreeMap<String, u32>,
-    /// Planner project that owns `need_ready_tickets` for a host; unused until FR-041 lands.
-    pub planners: BTreeMap<String, String>,
 }
 
 impl Default for TickSettings {
@@ -54,7 +48,6 @@ impl Default for TickSettings {
         Self {
             stale_pr_after: Duration::from_secs(3 * 3600),
             drain_cap: Duration::from_secs(4 * 3600),
-            source_defect_age: Duration::from_secs(30 * 60),
             orchestrator: None,
             minder: None,
             standing_orders_path: None,
@@ -62,7 +55,6 @@ impl Default for TickSettings {
             leads: BTreeMap::new(),
             busy_targets: BTreeMap::new(),
             lane_capacity: BTreeMap::new(),
-            planners: BTreeMap::new(),
         }
     }
 }
@@ -129,7 +121,6 @@ impl TickSettings {
         }
         secs(table, "stale_pr_after_secs", &mut out.stale_pr_after)?;
         secs(table, "drain_cap_secs", &mut out.drain_cap)?;
-        secs(table, "source_defect_age_secs", &mut out.source_defect_age)?;
         out.orchestrator = text(table, "orchestrator")?;
         out.minder = text(table, "minder")?;
         out.standing_orders_path = text(table, "standing_orders_path")?.map(PathBuf::from);
@@ -155,12 +146,6 @@ impl TickSettings {
                     .and_then(|n| u32::try_from(n).ok())
                     .ok_or_else(|| bad("lane_capacity", "whole numbers"))?;
                 out.lane_capacity.insert(host.to_lowercase(), n);
-            }
-        }
-        if let Some(planners) = sub(table, "planners")? {
-            for (host, value) in planners {
-                let project = value.as_str().ok_or_else(|| bad("planners", "strings"))?;
-                out.planners.insert(host.to_lowercase(), project.to_owned());
             }
         }
         Ok(out)

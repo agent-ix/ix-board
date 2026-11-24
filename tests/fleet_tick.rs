@@ -6,7 +6,7 @@
 use ix_board::fleet::ledger::{Ledger, TickCommit, tick_metrics};
 use ix_board::fleet::tick::{
     Action, ActionKind, LanePr, ReadyWork, StandingOrders, TickFacts, TickOutput, TickSettings,
-    TickSources,
+    TickSources, Unread, caller_from,
 };
 use ix_board::fleet::{
     ClassKind, Defect, DefectKind, Evidence, FleetConfig, FleetReport, HostSummary, LaneRow,
@@ -23,6 +23,7 @@ const T0: i64 = 1_000_000_000_000;
 const LANE: &str = "h:w:1";
 const LEAD: &str = "lead:w:1";
 const ORCH: &str = "orch:w:0";
+const MINDER: &str = "minder:w:0";
 
 fn row(lane: &str, class: ClassKind, reason: Option<&str>, relay: Option<&str>) -> LaneRow {
     LaneRow {
@@ -43,7 +44,6 @@ fn row(lane: &str, class: ClassKind, reason: Option<&str>, relay: Option<&str>) 
         compile_seconds: None,
         focus: None,
         thresholds_defaulted: false,
-        receipt_gap: false,
         schema_version: 1,
     }
 }
@@ -525,10 +525,10 @@ fn a_lane_draining_past_the_cap_emits_escalate_drain_to_its_lead() {
 
 #[trace("FR-038-AC-9", "FR-038-AC-10")]
 #[test]
-fn source_defects_become_fix_source_after_their_age_and_a_stale_host_never_gets_undetermined() {
+fn source_defects_become_fix_source_in_the_tick_they_appear_and_a_stale_host_never_gets_undetermined()
+ {
     let mut rig = Rig::new(300);
     rig.assign(LANE, &["SWM-1"]);
-    let age = rig.settings.source_defect_age.as_millis() as i64;
     let rows = || vec![idle(LANE), row("u:w:1", ClassKind::Unreachable, None, None)];
     let defects = |now| {
         vec![
@@ -546,17 +546,17 @@ fn source_defects_become_fix_source_after_their_age_and_a_stale_host_never_gets_
         "the FR-034 class is kept"
     );
     assert_eq!(undetermined.detail["remaining_ticket"], "SWM-1");
-    assert!(
-        of(&out, ActionKind::FixSource).is_empty(),
-        "not yet beyond its age"
-    );
-    let out = rig.tick(&report(T0 + age, rows(), defects(T0 + age)));
-    assert!(
-        of(&out, ActionKind::FixSource).is_empty(),
-        "exactly the age is not beyond it"
-    );
-    let out = rig.tick(&report(T0 + age + 1000, rows(), defects(T0 + age + 1000)));
     let fixes = of(&out, ActionKind::FixSource);
+    let first_ids: Vec<_> = fixes.iter().map(|f| f.id).collect();
+    let again = rig.tick(&report(T0 + 1000, rows(), defects(T0 + 1000)));
+    let again_ids: Vec<_> = of(&again, ActionKind::FixSource)
+        .iter()
+        .map(|f| f.id)
+        .collect();
+    assert_eq!(
+        first_ids, again_ids,
+        "the id persists while the defect does"
+    );
     assert_eq!(fixes.len(), 3);
     assert!(
         fixes
@@ -650,9 +650,42 @@ fn rungs_ignore_earlier_messages_end_with_the_condition_and_never_address_the_ow
             );
         }
     }
-    rig.settings.orchestrator = None;
-    let out = rig.tick(&report(T0 + 10 * 300_000, vec![stuck_lane()], vec![]));
-    assert!(out.actions.iter().all(|a| a.target.role != "owner"));
+    // Plant the addresses of every non-recipient the configuration names (the minder that runs
+    // the tick) and read back every address the ledger recorded: only lanes, leads, the
+    // orchestrator and hosts may ever be recipients.
+    rig.settings.minder = Some(MINDER.to_owned());
+    rig.settings
+        .leads
+        .insert("h:w:2".to_owned(), "lead:w:2".to_owned());
+    for n in 10..=14 {
+        rig.tick(&report(
+            T0 + n * 300_000,
+            vec![
+                stuck_lane(),
+                stuck_lane_at("h:w:2"),
+                row("h:w:3", ClassKind::Dead, None, None),
+            ],
+            vec![],
+        ));
+    }
+    let addrs = rig.sql(
+        "SELECT DISTINCT target_addr FROM action WHERE target_addr IS NOT NULL",
+        |r| r.get::<_, String>(0).unwrap(),
+    );
+    let allowed = [LANE, "h:w:2", "h:w:3", LEAD, "lead:w:2", ORCH];
+    assert!(
+        addrs.iter().all(|a| allowed.contains(&a.as_str())),
+        "{addrs:?}"
+    );
+    assert!(!addrs.iter().any(|a| a == MINDER));
+    let roles = rig.sql("SELECT DISTINCT target_role FROM action", |r| {
+        r.get::<_, String>(0).unwrap()
+    });
+    assert!(
+        roles
+            .iter()
+            .all(|r| ["lane", "lead", "orchestrator", "planner", "host"].contains(&r.as_str()))
+    );
 }
 
 #[trace("FR-038-AC-13", "FR-038-AC-16")]
@@ -824,19 +857,19 @@ struct Recording {
 }
 
 impl TickSources for Recording {
-    fn assignments(&self) -> Result<BTreeMap<String, Vec<String>>, SourceError> {
+    fn assignments(&self) -> Result<BTreeMap<String, Vec<String>>, Unread> {
         self.calls.set(self.calls.get() + 1);
         Ok(BTreeMap::new())
     }
-    fn host_busy(&self) -> Result<BTreeMap<String, f64>, SourceError> {
+    fn host_busy(&self) -> Result<BTreeMap<String, f64>, Unread> {
         self.calls.set(self.calls.get() + 1);
-        Err(SourceError("down".to_owned()))
+        Err(Unread::Failed(SourceError("down".to_owned())))
     }
-    fn lane_prs(&self) -> Result<Vec<LanePr>, SourceError> {
+    fn lane_prs(&self) -> Result<Vec<LanePr>, Unread> {
         self.calls.set(self.calls.get() + 1);
-        Ok(Vec::new())
+        Err(Unread::Unwired("SWM-282"))
     }
-    fn ready_work(&self) -> Result<ReadyWork, SourceError> {
+    fn ready_work(&self) -> Result<ReadyWork, Unread> {
         self.calls.set(self.calls.get() + 1);
         Ok(ReadyWork::default())
     }
@@ -852,11 +885,448 @@ fn the_tick_reads_each_source_once_writes_only_the_ledger_and_names_an_unread_so
     };
     let facts = TickFacts::read(&sources);
     assert_eq!(sources.calls.get(), 4);
-    assert_eq!(facts.unavailable.len(), 1);
+    assert_eq!(facts.unavailable.len(), 2);
     assert_eq!(facts.unavailable[0].source, "host_busy");
+    assert!(!facts.unavailable[0].unwired, "a failed read");
+    assert_eq!(facts.unavailable[1].source, "lane_prs");
+    assert!(facts.unavailable[1].unwired, "a named seam, not a failure");
     assert!(facts.host_busy.is_none() && facts.assignments.is_some());
     let mut rig = Rig::new(300);
     rig.facts = facts;
-    let before = rig.tick(&report(T0, vec![idle(LANE)], vec![]));
-    assert_eq!(before.unavailable.len(), 1);
+    let out = rig.tick(&report(T0, vec![idle(LANE)], vec![]));
+    assert_eq!(out.unavailable.len(), 2);
+    // Only the failed read is a source defect, routed to the orchestrator in this tick.
+    assert!(!out.complete);
+    let fixes = of(&out, ActionKind::FixSource);
+    assert_eq!(fixes.len(), 1);
+    assert_eq!(fixes[0].detail["source"], "tick.host_busy");
+    assert_eq!(fixes[0].target.addr.as_deref(), Some(ORCH));
+}
+
+fn executed_of(rig: &Rig, kind: ActionKind) -> Vec<(Option<i64>, Option<i64>)> {
+    rig.sql(
+        &format!(
+            "SELECT executed_at, resolved_at FROM action WHERE kind = '{}' ORDER BY id",
+            kind.name()
+        ),
+        |r| (r.get(0).unwrap(), r.get(1).unwrap()),
+    )
+}
+
+#[trace("FR-039-AC-6")]
+#[test]
+fn executed_at_needs_positive_evidence_for_each_kind() {
+    let mut rig = Rig::new(300);
+    let file = rig.dir.path().join("orders.toml");
+    std::fs::write(&file, "").unwrap();
+    rig.orders = StandingOrders::load(Some(&file));
+    // answer_dialog: executed when the lane leaves BLOCKED after the answer was emitted.
+    rig.tick(&report(T0, vec![blocked("dialog", "permission")], vec![]));
+    rig.tick(&report(T0 + 1000, vec![working(LANE)], vec![]));
+    assert_eq!(
+        executed_of(&rig, ActionKind::AnswerDialog),
+        vec![(Some(T0 + 1000), Some(T0 + 1000))]
+    );
+    // A fallback to escalate_block (the order file vanished) is not execution.
+    rig.tick(&report(
+        T0 + 2000,
+        vec![blocked("dialog", "permission")],
+        vec![],
+    ));
+    rig.orders = StandingOrders::Missing;
+    let out = rig.tick(&report(
+        T0 + 3000,
+        vec![blocked("dialog", "permission")],
+        vec![],
+    ));
+    assert_eq!(of(&out, ActionKind::EscalateBlock).len(), 1);
+    assert_eq!(
+        executed_of(&rig, ActionKind::AnswerDialog)[1],
+        (None, Some(T0 + 3000))
+    );
+    // An escalation is aimed at a lead: no executed_at, and it resolves when the block clears.
+    rig.tick(&report(T0 + 4000, vec![working(LANE)], vec![]));
+    assert_eq!(
+        executed_of(&rig, ActionKind::EscalateBlock),
+        vec![(None, Some(T0 + 4000))]
+    );
+    // act_on_undetermined: executed once the lane's evidence is determined again.
+    let flawed = || vec![defect(DefectKind::NoEvents, Some("h"), Some(LANE), T0)];
+    rig.tick(&report(T0 + 5000, vec![idle(LANE)], flawed()));
+    rig.tick(&report(T0 + 6000, vec![working(LANE)], vec![]));
+    assert_eq!(
+        executed_of(&rig, ActionKind::ActOnUndetermined),
+        vec![(Some(T0 + 6000), Some(T0 + 6000))]
+    );
+    // ... but not when the lane merely became unreachable.
+    rig.tick(&report(T0 + 7000, vec![idle(LANE)], flawed()));
+    rig.tick(&report(
+        T0 + 8000,
+        vec![row(LANE, ClassKind::Unreachable, None, None)],
+        vec![],
+    ));
+    assert_eq!(
+        executed_of(&rig, ActionKind::ActOnUndetermined)[1],
+        (None, Some(T0 + 8000))
+    );
+    // push_next_ticket needs the lane focus and resend_order an Acted receipt; the tick reads
+    // neither yet, so a lane that merely works has no executed_at.
+    rig.assign(LANE, &["SWM-1"]);
+    rig.tick(&report(T0 + 9000, vec![idle(LANE)], vec![]));
+    rig.tick(&report(T0 + 10_000, vec![working(LANE)], vec![]));
+    assert_eq!(
+        executed_of(&rig, ActionKind::PushNextTicket),
+        vec![(None, Some(T0 + 10_000))]
+    );
+    rig.tick(&report(
+        T0 + 11_000,
+        vec![row(LANE, ClassKind::StaleOrder, Some("ack_expired"), None)],
+        vec![],
+    ));
+    rig.tick(&report(T0 + 12_000, vec![working(LANE)], vec![]));
+    assert_eq!(
+        executed_of(&rig, ActionKind::ResendOrder),
+        vec![(None, Some(T0 + 12_000))]
+    );
+}
+
+#[trace("FR-039-AC-11")]
+#[test]
+fn tick_rows_carry_ready_work_and_win_over_a_status_row_at_the_same_relay_time() {
+    let mut rig = Rig::new(300);
+    rig.assign(LANE, &["SWM-1"]);
+    rig.assign("h:w:2", &[]);
+    rig.facts.ready = Some(ReadyWork {
+        unassigned: 1,
+        lanes: BTreeSet::from(["h:w:3".to_owned()]),
+    });
+    let rows = || vec![idle(LANE), idle("h:w:2"), idle("h:w:3"), idle("h:w:4")];
+    {
+        let mut ledger = Ledger::open(&rig.path(), &rig.config).unwrap();
+        ledger.record_status(&report(T0, rows(), vec![])).unwrap();
+    }
+    rig.tick(&report(T0, rows(), vec![]));
+    let ticks = rig.sql(
+        "SELECT lane, source, remaining_assigned, ready_work_available FROM lane_tick
+         WHERE source = 'tick' ORDER BY lane",
+        |r| {
+            (
+                r.get::<_, String>(0).unwrap(),
+                r.get::<_, Option<i64>>(2).unwrap(),
+                r.get::<_, Option<i64>>(3).unwrap(),
+            )
+        },
+    );
+    assert_eq!(
+        ticks,
+        vec![
+            (LANE.to_owned(), Some(1), Some(1)),
+            ("h:w:2".to_owned(), Some(0), Some(0)),
+            ("h:w:3".to_owned(), Some(0), Some(1)),
+            ("h:w:4".to_owned(), Some(0), Some(0)),
+        ]
+    );
+    // Status and tick rows at the same relay time count once, the tick row winning.
+    let idle_ready = rig.sql(
+        "SELECT lane, source FROM idle_lane_with_ready_work_ticks ORDER BY lane",
+        |r| {
+            (
+                r.get::<_, String>(0).unwrap(),
+                r.get::<_, String>(1).unwrap(),
+            )
+        },
+    );
+    assert_eq!(
+        idle_ready,
+        vec![
+            (LANE.to_owned(), "tick".to_owned()),
+            ("h:w:3".to_owned(), "tick".to_owned())
+        ]
+    );
+    let status_rows = rig.sql(
+        "SELECT COUNT(*) FROM lane_tick_rows WHERE lane = 'h:w:4'",
+        |r| r.get::<_, i64>(0).unwrap(),
+    );
+    assert_eq!(status_rows, vec![1]);
+    // With ready work unreadable a lane without a ticket is unknown, not "no ready work".
+    let mut other = Rig::new(300);
+    other.assign(LANE, &[]);
+    other.tick(&report(T0, vec![idle(LANE)], vec![]));
+    let unknown = other.sql("SELECT ready_work_available FROM lane_tick", |r| {
+        r.get::<_, Option<i64>>(0).unwrap()
+    });
+    assert_eq!(unknown, vec![None]);
+}
+
+#[trace("FR-039-AC-14")]
+#[test]
+fn a_tick_records_its_session_address_and_configured_role() {
+    let mut rig = Rig::new(300);
+    rig.settings.minder = Some(MINDER.to_owned());
+    let run = |rig: &Rig, session: Option<&str>, at: i64| {
+        let mut ledger = Ledger::open(&rig.path(), &rig.config).unwrap();
+        ledger
+            .commit_tick(&TickCommit {
+                report: &report(at, vec![working(LANE)], vec![]),
+                settings: &rig.settings,
+                facts: &rig.facts,
+                orders: &rig.orders,
+                session,
+            })
+            .unwrap();
+    };
+    run(&rig, Some(MINDER), T0);
+    run(&rig, Some(ORCH.to_uppercase().as_str()), T0 + 1000);
+    run(&rig, Some("x:y:z"), T0 + 2000);
+    let sessions = rig.sql(
+        "SELECT session_addr, session_role FROM tick ORDER BY id",
+        |r| {
+            (
+                r.get::<_, String>(0).unwrap(),
+                r.get::<_, String>(1).unwrap(),
+            )
+        },
+    );
+    assert_eq!(sessions[0], (MINDER.to_owned(), "minder".to_owned()));
+    assert_eq!(sessions[1].1, "orchestrator");
+    assert_eq!(sessions[2], ("x:y:z".to_owned(), "other".to_owned()));
+}
+
+#[trace("FR-039-AC-14")]
+#[test]
+fn without_a_session_flag_the_caller_is_the_registration_of_this_pane_on_this_machine() {
+    let regs = vec![
+        (
+            "m1".to_owned(),
+            Some("w1:p1".to_owned()),
+            Some("m1:ws:a".to_owned()),
+        ),
+        (
+            "m2".to_owned(),
+            Some("w1:p1".to_owned()),
+            Some("m2:ws:b".to_owned()),
+        ),
+        ("m2".to_owned(), Some("w1:p2".to_owned()), None),
+    ];
+    assert_eq!(
+        caller_from(&regs, "m2", "w1:p1").as_deref(),
+        Some("m2:ws:b")
+    );
+    assert_eq!(
+        caller_from(&regs, "m1", "w1:p1").as_deref(),
+        Some("m1:ws:a")
+    );
+    assert_eq!(
+        caller_from(&regs, "m2", "w1:p2"),
+        None,
+        "no verified address"
+    );
+    assert_eq!(caller_from(&regs, "m3", "w1:p1"), None);
+}
+
+#[trace("FR-038-AC-19", "FR-038-AC-20")]
+#[test]
+fn a_dead_lane_and_an_idle_lane_with_an_empty_list_route_to_the_orchestrator() {
+    let mut rig = Rig::new(300);
+    rig.assign(LANE, &[]);
+    rig.assign("h:w:2", &["SWM-2"]);
+    let rows = || {
+        vec![
+            idle(LANE),
+            idle("h:w:2"),
+            row("h:w:3", ClassKind::Dead, None, None),
+            working("h:w:4"),
+        ]
+    };
+    let out = rig.tick(&report(T0, rows(), vec![]));
+    let idle_empty = one(&out, ActionKind::RouteIdleLane);
+    assert_eq!(idle_empty.subject, LANE);
+    assert_eq!(
+        (idle_empty.target.role, idle_empty.target.addr.as_deref()),
+        ("orchestrator", Some(ORCH))
+    );
+    let dead = one(&out, ActionKind::RouteDeadLane);
+    assert_eq!(dead.subject, "h:w:3");
+    assert_eq!(dead.target.addr.as_deref(), Some(ORCH));
+    assert_eq!(dead.rung, Some(0), "rung 0 of the ladder");
+    assert_eq!(
+        of(&out, ActionKind::PushNextTicket).len(),
+        1,
+        "the lane with a ticket is pushed"
+    );
+    // An unreadable list is not an empty one: no idle-lane route without the list.
+    let blind = Rig::new(300);
+    let out = blind.tick(&report(T0, rows(), vec![]));
+    assert!(of(&out, ActionKind::RouteIdleLane).is_empty());
+    // The ladder follows and ends with the condition.
+    let later = rig.tick(&report(T0 + 300_000, rows(), vec![]));
+    assert_eq!(
+        rungs(&later).len(),
+        3,
+        "the push, idle route and dead route each get rung 1"
+    );
+    let cleared = rig.tick(&report(
+        T0 + 600_000,
+        vec![working(LANE), working("h:w:3")],
+        vec![],
+    ));
+    assert!(of(&cleared, ActionKind::RouteDeadLane).is_empty() && rungs(&cleared).is_empty());
+}
+
+#[trace("FR-038-AC-21")]
+#[test]
+fn act_on_undetermined_never_goes_to_a_blocked_lane_but_to_its_lead() {
+    let rig = Rig::new(300);
+    let flawed = |now| vec![defect(DefectKind::NoEvents, Some("h"), Some(LANE), now)];
+    let out = rig.tick(&report(
+        T0,
+        vec![blocked("dialog", "permission")],
+        flawed(T0),
+    ));
+    let undetermined = one(&out, ActionKind::ActOnUndetermined);
+    assert_eq!(
+        (
+            undetermined.target.role,
+            undetermined.target.addr.as_deref()
+        ),
+        ("lead", Some(LEAD))
+    );
+    assert_eq!(undetermined.reason, "lane_blocked_route_to_lead");
+    let idle_out = rig.tick(&report(T0 + 1000, vec![idle(LANE)], flawed(T0 + 1000)));
+    assert_eq!(
+        one(&idle_out, ActionKind::ActOnUndetermined).target.role,
+        "lane"
+    );
+}
+
+struct FailingAssignments;
+
+impl TickSources for FailingAssignments {
+    fn assignments(&self) -> Result<BTreeMap<String, Vec<String>>, Unread> {
+        Err(Unread::Failed(SourceError("redis down".to_owned())))
+    }
+    fn host_busy(&self) -> Result<BTreeMap<String, f64>, Unread> {
+        Err(Unread::Unwired("SWM-281"))
+    }
+    fn lane_prs(&self) -> Result<Vec<LanePr>, Unread> {
+        Err(Unread::Unwired("SWM-282"))
+    }
+    fn ready_work(&self) -> Result<ReadyWork, Unread> {
+        Err(Unread::Unwired("SWM-212"))
+    }
+}
+
+#[trace("FR-038-AC-22")]
+#[test]
+fn a_failed_source_read_is_a_defect_routed_in_its_tick_and_a_named_seam_is_not() {
+    let mut rig = Rig::new(300);
+    rig.facts = TickFacts::read(&FailingAssignments);
+    let out = rig.tick(&report(T0, vec![idle(LANE)], vec![]));
+    assert!(!out.complete, "a failed read is a defect, not a clean tick");
+    let fixes = of(&out, ActionKind::FixSource);
+    assert_eq!(fixes.len(), 1, "the three seams raise nothing");
+    assert_eq!(fixes[0].detail["source"], "tick.assignments");
+    assert_eq!(fixes[0].target.addr.as_deref(), Some(ORCH));
+    assert!(of(&out, ActionKind::PushNextTicket).is_empty());
+    let defects = rig.sql(
+        "SELECT source, kind FROM defect WHERE closed_at IS NULL",
+        |r| {
+            (
+                r.get::<_, String>(0).unwrap(),
+                r.get::<_, String>(1).unwrap(),
+            )
+        },
+    );
+    assert_eq!(
+        defects,
+        vec![(
+            "tick.assignments".to_owned(),
+            "unreadable_source".to_owned()
+        )]
+    );
+    // The defect closes when the read works again.
+    rig.facts = TickFacts::default();
+    let healed = rig.tick(&report(T0 + 1000, vec![idle(LANE)], vec![]));
+    assert!(of(&healed, ActionKind::FixSource).is_empty());
+    assert_eq!(
+        rig.sql("SELECT COUNT(*) FROM defect WHERE closed_at IS NULL", |r| r
+            .get::<_, i64>(0)
+            .unwrap()),
+        vec![0]
+    );
+}
+
+#[trace("FR-038-AC-7")]
+#[test]
+fn the_metric_counts_only_emitted_actions() {
+    let mut rig = Rig::new(300);
+    rig.settings.leads.clear();
+    rig.tick(&report(T0, vec![stuck_lane()], vec![]));
+    rig.tick(&report(T0 + 300_000, vec![stuck_lane()], vec![]));
+    rig.tick(&report(T0 + 600_000, vec![stuck_lane()], vec![]));
+    // Rung 2 (no lead) is recorded and not sent; rung 3 is emitted with it.
+    let text = tick_metrics(&rig.path(), T0 + 600_000, 300_000).unwrap();
+    assert!(
+        text.contains("ix_fleet_tick_actions{kind=\"ladder_rung\"} 1"),
+        "{text}"
+    );
+}
+
+#[trace("FR-038-AC-1")]
+#[test]
+fn every_other_action_kind_is_emitted_by_its_condition_and_not_by_its_negation() {
+    // need_ready_tickets is deferred to SWM-217 and is not an ActionKind yet.
+    let mut rig = Rig::new(300);
+    rig.settings.lane_capacity.insert("h".to_owned(), 5);
+    rig.facts = host_facts(0.1, 1);
+    rig.assign(LANE, &["SWM-1"]);
+    let file = rig.dir.path().join("orders.toml");
+    std::fs::write(&file, "").unwrap();
+    rig.orders = StandingOrders::load(Some(&file));
+    let quiet = rig.tick(&report(T0, vec![working(LANE)], vec![]));
+    assert!(
+        quiet.actions.is_empty(),
+        "WORKING with no defect emits nothing: {:?}",
+        quiet.actions
+    );
+    let conn = Connection::open(rig.path()).unwrap();
+    conn.execute(
+        "INSERT INTO capacity_level(host, level, recorded_at) VALUES('h', 5, 1)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO capacity_event(host, lane, kind, at) VALUES('h', 'h:w:9', 'draining_mark', 1)",
+        [],
+    )
+    .unwrap();
+    let busy = rig.tick(&report(T0 + 1000, vec![working(LANE)], vec![]));
+    assert_eq!(of(&busy, ActionKind::AddLane).len(), 1);
+    assert_eq!(of(&busy, ActionKind::EscalateDrain).len(), 1);
+    let flawed = vec![
+        defect(DefectKind::NoEvents, Some("h"), Some(LANE), T0),
+        defect(DefectKind::UnreadableSource, None, None, T0),
+    ];
+    let out = rig.tick(&report(T0 + 2000, vec![blocked("login", "login")], flawed));
+    for kind in [
+        ActionKind::EscalateBlock,
+        ActionKind::ActOnUndetermined,
+        ActionKind::FixSource,
+    ] {
+        assert!(
+            !of(&out, kind).is_empty(),
+            "{kind:?} is emitted by its condition"
+        );
+    }
+    assert!(of(&out, ActionKind::AnswerDialog).is_empty());
+    let dialog = rig.tick(&report(
+        T0 + 3000,
+        vec![blocked("dialog", "permission")],
+        vec![],
+    ));
+    assert_eq!(of(&dialog, ActionKind::AnswerDialog).len(), 1);
+    assert!(
+        of(&dialog, ActionKind::FixSource).is_empty()
+            && of(&dialog, ActionKind::EscalateBlock).is_empty()
+    );
 }

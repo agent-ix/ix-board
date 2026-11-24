@@ -19,7 +19,6 @@ fn row(lane: &str, class: ClassKind) -> LaneRow {
         compile_seconds: None,
         focus: None,
         thresholds_defaulted: false,
-        receipt_gap: false,
         schema_version: 1,
     }
 }

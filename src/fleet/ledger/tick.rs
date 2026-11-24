@@ -108,7 +108,10 @@ fn load_capacity(tx: &Transaction<'_>) -> Result<Capacity, LedgerError> {
     Ok(capacity)
 }
 
-/// Whether the lane reached the state an action expected, so the action counts as executed.
+/// Whether positive evidence says an action was executed when its condition cleared.
+/// `answer_dialog` expects the lane out of BLOCKED; `act_on_undetermined` expects a determined
+/// class. `push_next_ticket` needs the lane focus (FR-037) and `resend_order` an `Acted` receipt
+/// (SWM-255), neither of which the tick reads yet, so they have no `executed_at`.
 fn executed(kind: ActionKind, report: &FleetReport, subject: &str) -> bool {
     let Some(row) = report
         .rows
@@ -118,8 +121,8 @@ fn executed(kind: ActionKind, report: &FleetReport, subject: &str) -> bool {
         return false;
     };
     match kind {
-        ActionKind::PushNextTicket => row.class == ClassKind::Working,
-        ActionKind::ResendOrder | ActionKind::AnswerDialog | ActionKind::ActOnUndetermined => true,
+        ActionKind::AnswerDialog => row.class != ClassKind::Blocked,
+        ActionKind::ActOnUndetermined => row.class != ClassKind::Unreachable,
         _ => false,
     }
 }
@@ -133,8 +136,20 @@ impl Ledger {
     ///
     /// A database failure; nothing of the tick is written then.
     pub fn commit_tick(&mut self, commit: &TickCommit<'_>) -> Result<TickOutput, LedgerError> {
-        let report = commit.report;
-        let run_ms = report.run_ms;
+        let run_ms = commit.report.run_ms;
+        let facts = commit.facts;
+        let failed = facts.failed_defects(run_ms);
+        let merged;
+        let report = if failed.is_empty() {
+            commit.report
+        } else {
+            let mut with = commit.report.clone();
+            with.defects.extend(failed);
+            with.defects.sort();
+            with.complete = false;
+            merged = with;
+            &merged
+        };
         let retention = millis(self.retention);
         let interval_ms = self.tick_interval_s * 1000;
         let tx = self.connection.transaction()?;
@@ -155,7 +170,6 @@ impl Ledger {
             params![run_ms, commit.session, role],
         )?;
         let tick_id = tx.last_insert_rowid();
-        let facts = commit.facts;
         {
             let mut lane = tx.prepare(
                 "INSERT INTO lane_tick(run_seq, tick_id, source, lane, host, class, reason,
@@ -168,9 +182,12 @@ impl Ledger {
                     .assignments
                     .as_ref()
                     .map(|a| a.get(&key).map_or(0, Vec::len));
+                // Unknown stays NULL: only a lane with a remaining ticket or an eligible unowned
+                // ready ticket is known to have ready work.
                 let ready = match (remaining, &facts.ready) {
                     (Some(n), Some(ready)) => Some(n > 0 || ready.lanes.contains(&key)),
-                    (Some(n), None) => Some(n > 0),
+                    (Some(n), None) if n > 0 => Some(true),
+                    (None, Some(ready)) if ready.lanes.contains(&key) => Some(true),
                     _ => None,
                 };
                 lane.execute(params![
@@ -303,20 +320,6 @@ fn insert_action(
     Ok(tx.last_insert_rowid())
 }
 
-const ALL_KINDS: [ActionKind; 11] = [
-    ActionKind::PushNextTicket,
-    ActionKind::AnswerDialog,
-    ActionKind::EscalateBlock,
-    ActionKind::EscalateStuck,
-    ActionKind::ResendOrder,
-    ActionKind::AddLane,
-    ActionKind::EscalateStalePr,
-    ActionKind::ActOnUndetermined,
-    ActionKind::LadderRung,
-    ActionKind::EscalateDrain,
-    ActionKind::FixSource,
-];
-
 /// The tick metrics of the last committed tick, in Prometheus text format, for the exporter
 /// (FR-033). Empty when no tick is committed or the last one is older than twice
 /// `tick_interval_ms` at `now_ms`, so an external alert sees a missing tick. The ledger is
@@ -352,12 +355,13 @@ pub fn tick_metrics(
     let Some(last) = last.filter(|t| now_ms.saturating_sub(*t) <= 2 * tick_interval_ms) else {
         return Ok(String::new());
     };
-    let mut counts: BTreeMap<&str, i64> = ALL_KINDS.iter().map(|k| (k.name(), 0)).collect();
+    let mut counts: BTreeMap<&str, i64> = ActionKind::ALL.iter().map(|k| (k.name(), 0)).collect();
     let mut statement = connection.prepare(
         "SELECT kind, COUNT(*) FROM action
          WHERE emitted_at <= ?1 AND tick_id IS NOT NULL
            AND ((kind <> 'ladder_rung' AND (resolved_at IS NULL OR resolved_at > ?1))
-             OR (kind = 'ladder_rung' AND emitted_at = ?1))
+             OR (kind = 'ladder_rung' AND emitted_at = ?1
+               AND NOT (rung = 2 AND target_role = 'lead' AND target_addr IS NULL)))
          GROUP BY kind",
     )?;
     let rows = statement.query_map([last], |r| {
@@ -365,7 +369,7 @@ pub fn tick_metrics(
     })?;
     for row in rows {
         let (kind, n) = row?;
-        if let Some(slot) = ALL_KINDS.iter().find(|k| k.name() == kind) {
+        if let Some(slot) = ActionKind::ALL.iter().find(|k| k.name() == kind) {
             counts.insert(slot.name(), n);
         }
     }

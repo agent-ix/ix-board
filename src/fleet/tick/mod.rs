@@ -12,7 +12,7 @@ mod live;
 mod plan;
 mod settings;
 
-pub use live::run;
+pub use live::{caller_from, run};
 pub use plan::{Capacity, OpenAction, PlanInput, plan};
 pub use settings::TickSettings;
 
@@ -48,8 +48,12 @@ pub enum ActionKind {
     LadderRung,
     /// Route a lane that drains past the cap to its lead.
     EscalateDrain,
-    /// Route a persistent source defect to the orchestrator.
+    /// Route a source defect to the orchestrator.
     FixSource,
+    /// Route a DEAD lane to the orchestrator with its status evidence.
+    RouteDeadLane,
+    /// Route an IDLE lane whose assignment list is empty to the orchestrator.
+    RouteIdleLane,
 }
 
 impl ActionKind {
@@ -67,26 +71,31 @@ impl ActionKind {
             Self::LadderRung => "ladder_rung",
             Self::EscalateDrain => "escalate_drain",
             Self::FixSource => "fix_source",
+            Self::RouteDeadLane => "route_dead_lane",
+            Self::RouteIdleLane => "route_idle_lane",
         }
     }
 
+    /// Every kind, in declaration order.
+    pub const ALL: [Self; 13] = [
+        Self::PushNextTicket,
+        Self::AnswerDialog,
+        Self::EscalateBlock,
+        Self::EscalateStuck,
+        Self::ResendOrder,
+        Self::AddLane,
+        Self::EscalateStalePr,
+        Self::ActOnUndetermined,
+        Self::LadderRung,
+        Self::EscalateDrain,
+        Self::FixSource,
+        Self::RouteDeadLane,
+        Self::RouteIdleLane,
+    ];
+
     /// The kind named in the ledger.
     pub fn from_name(name: &str) -> Option<Self> {
-        [
-            Self::PushNextTicket,
-            Self::AnswerDialog,
-            Self::EscalateBlock,
-            Self::EscalateStuck,
-            Self::ResendOrder,
-            Self::AddLane,
-            Self::EscalateStalePr,
-            Self::ActOnUndetermined,
-            Self::LadderRung,
-            Self::EscalateDrain,
-            Self::FixSource,
-        ]
-        .into_iter()
-        .find(|kind| kind.name() == name)
+        Self::ALL.into_iter().find(|kind| kind.name() == name)
     }
 
     /// Whether a condition of this kind runs the in-fleet ladder.
@@ -168,6 +177,15 @@ pub struct Suppressed {
     pub reason: String,
 }
 
+/// Why a source gave the tick nothing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Unread {
+    /// No reader exists yet; the ticket that owns it is named. Not a defect.
+    Unwired(&'static str),
+    /// The read failed. A source defect: the tick raises it and routes it to the orchestrator.
+    Failed(SourceError),
+}
+
 /// A source the tick could not read; its actions are not emitted.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Unavailable {
@@ -175,6 +193,8 @@ pub struct Unavailable {
     pub source: String,
     /// Why.
     pub reason: String,
+    /// The reader is not built yet (a named seam), as opposed to a read that failed.
+    pub unwired: bool,
 }
 
 /// A lane-owned pull request and its last activity.
@@ -204,25 +224,25 @@ pub trait TickSources {
     /// # Errors
     ///
     /// Why the lists could not be read.
-    fn assignments(&self) -> Result<BTreeMap<String, Vec<String>>, SourceError>;
+    fn assignments(&self) -> Result<BTreeMap<String, Vec<String>>, Unread>;
     /// Per host (lower case), the busy ratio from the watcher series.
     ///
     /// # Errors
     ///
     /// Why the series could not be read.
-    fn host_busy(&self) -> Result<BTreeMap<String, f64>, SourceError>;
+    fn host_busy(&self) -> Result<BTreeMap<String, f64>, Unread>;
     /// Lane-owned pull requests with their last activity.
     ///
     /// # Errors
     ///
     /// Why the pull requests could not be read.
-    fn lane_prs(&self) -> Result<Vec<LanePr>, SourceError>;
+    fn lane_prs(&self) -> Result<Vec<LanePr>, Unread>;
     /// Ready work no lane holds.
     ///
     /// # Errors
     ///
     /// Why the ready queue could not be read.
-    fn ready_work(&self) -> Result<ReadyWork, SourceError>;
+    fn ready_work(&self) -> Result<ReadyWork, Unread>;
 }
 
 /// What the tick read from [`TickSources`]; `None` is an unavailable source.
@@ -244,10 +264,15 @@ impl TickFacts {
     /// Reads every source once; a failure is recorded, never silently an empty value.
     pub fn read(sources: &dyn TickSources) -> Self {
         let mut facts = Self::default();
-        let mut note = |source: &str, error: SourceError| {
+        let mut note = |source: &str, error: Unread| {
+            let (reason, unwired) = match error {
+                Unread::Unwired(ticket) => (format!("no reader yet; owned by {ticket}"), true),
+                Unread::Failed(error) => (error.0, false),
+            };
             facts.unavailable.push(Unavailable {
                 source: source.to_owned(),
-                reason: error.0,
+                reason,
+                unwired,
             });
         };
         let assignments = sources.assignments();
@@ -354,5 +379,24 @@ impl TickOutput {
         }
         let _ = write!(out, "complete: {}", self.complete);
         out
+    }
+}
+
+impl TickFacts {
+    /// The source defects of the failed (not unwired) reads, for the ledger and `fix_source`.
+    pub fn failed_defects(&self, run_ms: i64) -> Vec<super::Defect> {
+        self.unavailable
+            .iter()
+            .filter(|u| !u.unwired)
+            .map(|u| super::Defect {
+                kind: super::DefectKind::UnreadableSource,
+                source: format!("tick.{}", u.source),
+                host: None,
+                lane: None,
+                reason: u.reason.clone(),
+                observed_ms: run_ms,
+                first_seen_ms: None,
+            })
+            .collect()
     }
 }

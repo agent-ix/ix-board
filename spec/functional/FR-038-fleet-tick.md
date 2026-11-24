@@ -37,13 +37,15 @@ its condition persists. Kinds and rules:
 | `escalate_block` | lane is BLOCKED(login), BLOCKED(usage_limit) or BLOCKED(question); or BLOCKED(dialog) with no matching standing order; or the SWM-226 file is missing or unreadable. Severity high; carries the block reason | the lane's lead |
 | `escalate_stuck` | lane is STUCK or LOOP | the lane's lead |
 | `resend_order` | the lane's order is STALE-ORDER | the lane |
-| `add_lane` | a host's busy ratio is below its target busy ratio (per-host configuration, default 0.85), ready unassigned tickets exist and a lane slot is free | the host |
-| `escalate_stale_pr` | a lane-owned pull request has had no head or review activity longer than `stale_pr_after` (configurable, default 3h) | the lane's lead |
-| `need_ready_tickets` | ready-buffer deficit greater than zero ([FR-041](./FR-041-fleet-saturation.md)) | the owning planner project |
-| `act_on_undetermined` | a reachable lane, on a host that is not `UNREACHABLE`, has a lane-scoped evidence defect: `no_events`, or a `missing_lane`, `stale_source` or `unreadable_source` defect naming that lane. Carries the defect, the lane's remaining assigned ticket if any, and `treat_as: idle` | the lane |
+| `add_lane` | a host's busy ratio is below its target busy ratio (per-host configuration, default 0.85), ready unassigned tickets exist and a lane slot is free. The busy-ratio reader is owned by SWM-281 and the ready-work reader by SWM-212; until they land the tick reports each as `unavailable` and emits no `add_lane` | the host |
+| `escalate_stale_pr` | a lane-owned pull request has had no head or review activity longer than `stale_pr_after` (configurable, default 3h). The pull-request activity reader is owned by SWM-282; until it lands the tick reports it as `unavailable` | the lane's lead |
+| `need_ready_tickets` | ready-buffer deficit greater than zero ([FR-041](./FR-041-fleet-saturation.md)). **Deferred to SWM-217**: the tick does not emit it yet | the owning planner project |
+| `act_on_undetermined` | a reachable lane, on a host that is not `UNREACHABLE`, has a lane-scoped evidence defect: `no_events`, or a `missing_lane`, `stale_source` or `unreadable_source` defect naming that lane. Carries the defect, the lane's remaining assigned ticket if any, and `treat_as: idle`. A relay message to a BLOCKED pane is pane input, so for a lane whose class is BLOCKED the action is addressed to the lane's lead instead, with reason `lane_blocked_route_to_lead` | the lane, or its lead when the lane is BLOCKED |
 | `ladder_rung` | a condition with a ladder persists past a rung time (below). Carries the parent action id, `rung` 1 to 3 and the recipient | the worker, the lane's lead or the orchestrator per rung |
 | `escalate_drain` | a lane marked draining ([FR-041](./FR-041-fleet-saturation.md)) is still draining after the drain cap (configurable, default 4h) | the lane's lead |
-| `fix_source` | a source-defect row persists beyond its configured age | the orchestrator, who fixes it or routes it to the owning repository |
+| `fix_source` | a source-defect row exists, emitted in the tick in which it first appears. A source the tick reads itself (the FR-072 assignment lists) that fails to read is such a defect (source `tick.<source>`); a source with no reader yet (a seam named above) is not | the orchestrator, who fixes it or routes it to the owning repository |
+| `route_dead_lane` | lane is DEAD; carries its status evidence | the orchestrator |
+| `route_idle_lane` | lane is IDLE and its FR-072 assignment list is readable and empty; carries its status evidence | the orchestrator |
 
 Actions are sorted by severity, lane and kind. The output for identical evidence is
 identical. A lane with an unresolved defect is not excluded. An unreadable
@@ -59,7 +61,7 @@ The machine-readable format of the SWM-226 standing-order file and its match con
 
 ### In-fleet escalation ladder
 
-The tick owns one in-fleet ladder; the owner is paged only by Alertmanager and the tick emits no action addressed to the owner, so no condition is paged twice. A condition is an action of kind `push_next_ticket`, `resend_order`, `act_on_undetermined`, `answer_dialog`, `escalate_block`, `escalate_stuck`, `escalate_stale_pr` or `escalate_drain`; its `condition_started_at` is the relay time of the tick that first emitted it, kept while its action id persists, including across a gap in ticks.
+The tick owns one in-fleet ladder; the owner is paged only by Alertmanager and the tick emits no action addressed to the owner, so no condition is paged twice. A condition is an action of kind `push_next_ticket`, `resend_order`, `act_on_undetermined`, `answer_dialog`, `escalate_block`, `escalate_stuck`, `escalate_stale_pr`, `escalate_drain`, `route_dead_lane` or `route_idle_lane`; its `condition_started_at` is the relay time of the tick that first emitted it, kept while its action id persists, including across a gap in ticks.
 
 - **Rung 0** is the condition's own action, sent to that action's target in the same tick.
 - **Rungs 1 to 3.** While the condition persists the tick emits a `ladder_rung` action to the worker (rung 1), the lane's lead (rung 2) and the orchestrator (rung 3), each in the first committed tick at or after 1, 2 and 3 tick intervals from `condition_started_at`. Each is emitted once. A condition on a lane whose class is BLOCKED skips rung 1: a relay message delivered to a blocked pane is pane input, so the tick sends no relay message to it, and rungs 2 and 3 follow at their usual times. A rung is emitted even when its recipient already received an earlier rung, and its `due_by` is the next tick interval. Its latency from the rung time is therefore at most one tick interval.
@@ -80,7 +82,7 @@ no tick record.
 
 | ID | Criteria | Verification |
 |----|----------|--------------|
-| FR-038-AC-1 | Each action kind is emitted by its fixture condition and not by its negation, with boundaries at exactly the order deadline, `stale_pr_after` and the busy-ratio target. | Test |
+| FR-038-AC-1 | Each action kind except the deferred `need_ready_tickets` is emitted by its fixture condition and not by its negation, with boundaries at exactly `stale_pr_after` and the busy-ratio target (the order deadline is the relay's: the tick acts on the relay's `AckExpired`). | Test |
 | FR-038-AC-2 | Identical inputs give byte-identical action lists in the specified order, and ids persist across two ticks while the condition persists. | Test |
 | FR-038-AC-3 | `answer_dialog` is emitted only with a matching SWM-226 standing order; no match, a missing file and an unreadable file each emit `escalate_block` and no `answer_dialog`. | Test |
 | FR-038-AC-4 | BLOCKED login, usage_limit and question emit `escalate_block` targeted at the lane's lead with severity high; STUCK and LOOP emit `escalate_stuck`. | Test |
@@ -88,8 +90,8 @@ no tick record.
 | FR-038-AC-6 | A host below its configured busy-ratio target (default 0.85) with unassigned ready work and a free slot emits `add_lane`; at the target it does not. | Test |
 | FR-038-AC-7 | The tick metric reflects the ledger's last committed tick, is omitted when older than twice the tick interval, and a failed tick commits no record. | Test |
 | FR-038-AC-8 | `tick` makes no relay, Linear or GitHub write; a recording fake sees none. | Test |
-| FR-038-AC-9 | A source defect appears as `fix_source` after its configured age and the lane's other actions are still emitted. | Test |
-| FR-038-AC-10 | A lane with a `no_events` defect on a reachable host emits one `act_on_undetermined` action targeted at the lane with `treat_as: idle`, keeps its FR-034 class, and a lane of a host with a stale registry lease emits `fix_source` and no `act_on_undetermined`. | Test |
+| FR-038-AC-9 | A source defect appears as `fix_source` in the tick in which it first appears, keeps its action id while it persists, and the lane's other actions are still emitted. | Test |
+| FR-038-AC-10 | A lane with a `no_events` defect on a reachable host emits one `act_on_undetermined` action targeted at the lane (its lead when the lane is BLOCKED, AC-21) with `treat_as: idle`, keeps its FR-034 class, and a lane of a host with a stale registry lease emits `fix_source` and no `act_on_undetermined`. | Test |
 | FR-038-AC-11 | A persisting `escalate_stuck` condition emits rung 1 to the lane, rung 2 to its lead and rung 3 to the orchestrator in the first tick at or after 1, 2 and 3 tick intervals from the first emission, each once, at a 5 minute and at a 2 minute interval; the action id and `condition_started_at` persist across a missed tick. | Test |
 | FR-038-AC-12 | A rung is emitted although the same recipient already received an earlier rung or the rung 0 action; once the condition clears no further rung is emitted; no emitted action has an owner as recipient. | Test |
 | FR-038-AC-13 | `escalate_stuck` and `escalate_stale_pr` carry the lane's lead and the pull-request lane's lead as owner; a lane with no configured lead gives owner orchestrator with reason `lead_unresolved`. | Test |
@@ -98,6 +100,10 @@ no tick record.
 | FR-038-AC-15 | A lane draining longer than the drain cap emits `escalate_drain` to the lane's lead and one still within the cap does not. | Test |
 | FR-038-AC-17 | A condition on a BLOCKED lane emits no rung 1 and no relay message to the lane, and rungs 2 and 3 are emitted at 2 and 3 tick intervals; the same condition on a lane that is not BLOCKED emits rung 1. | Test |
 | FR-038-AC-18 | BLOCKED(question) with relay reason `queued_question` emits `answer_dialog` carrying that reason when the standing-order file is readable, and `escalate_block` when it is missing or unreadable; relay reason `question` emits `escalate_block` in every case. | Test |
+| FR-038-AC-19 | A DEAD lane emits `route_dead_lane` to the orchestrator as a rung 0 action with its ladder, and a WORKING lane does not. | Test |
+| FR-038-AC-20 | An IDLE lane whose readable FR-072 list is empty emits `route_idle_lane` to the orchestrator; an IDLE lane with a ticket emits `push_next_ticket`; an unreadable list emits neither. | Test |
+| FR-038-AC-21 | `act_on_undetermined` for a BLOCKED lane is addressed to the lane's lead and never to the lane; for any other class it is addressed to the lane. | Test |
+| FR-038-AC-22 | A failed read of a source the tick reads itself is a source defect in its own tick (`complete` false, one `fix_source` to the orchestrator, closed when the read works again), and a source with no reader yet raises no defect. | Test |
 
 ## Dependencies
 

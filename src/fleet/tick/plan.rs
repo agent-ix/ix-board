@@ -113,9 +113,11 @@ fn severity_of(kind: ActionKind) -> Severity {
         | ActionKind::EscalateStuck
         | ActionKind::EscalateStalePr
         | ActionKind::EscalateDrain => Severity::High,
-        ActionKind::FixSource | ActionKind::ActOnUndetermined | ActionKind::ResendOrder => {
-            Severity::Medium
-        }
+        ActionKind::FixSource
+        | ActionKind::ActOnUndetermined
+        | ActionKind::ResendOrder
+        | ActionKind::RouteDeadLane
+        | ActionKind::RouteIdleLane => Severity::Medium,
         _ => Severity::Low,
     }
 }
@@ -155,6 +157,14 @@ impl Ctx<'_> {
                     unresolved
                 };
                 (target, reason)
+            } else if matches!(kind, ActionKind::RouteDeadLane | ActionKind::RouteIdleLane) {
+                (
+                    Target {
+                        role: "orchestrator",
+                        addr: self.input.settings.orchestrator.clone(),
+                    },
+                    reason.to_owned(),
+                )
             } else {
                 (
                     Target {
@@ -281,15 +291,31 @@ impl Ctx<'_> {
                 .as_ref()
                 .and_then(|a| a.get(&lane.to_lowercase()))
                 .and_then(|t| t.first().cloned());
+            // A relay message to a blocked pane is pane input (MIND-R19): the lead gets the action.
+            let blocked = row.is_some_and(|r| r.class == ClassKind::Blocked);
+            let (target, reason) = if blocked {
+                let (target, unresolved) = self.lead_target(&lane);
+                let reason = if unresolved.is_empty() {
+                    "lane_blocked_route_to_lead".to_owned()
+                } else {
+                    unresolved
+                };
+                (target, reason)
+            } else {
+                (
+                    Target {
+                        role: "lane",
+                        addr: Some(lane.clone()),
+                    },
+                    "lane_evidence_defective".to_owned(),
+                )
+            };
             self.push(Cond {
                 kind: ActionKind::ActOnUndetermined,
                 subject: lane.clone(),
                 lane: Some(lane.clone()),
-                target: Target {
-                    role: "lane",
-                    addr: Some(lane.clone()),
-                },
-                reason: "lane_evidence_defective".to_owned(),
+                target,
+                reason,
                 severity: severity_of(ActionKind::ActOnUndetermined),
                 evidence: defects.clone(),
                 detail: json!({
@@ -306,10 +332,6 @@ impl Ctx<'_> {
         let input = self.input;
         for (defect, seen) in input.report.defects.iter().zip(input.first_seen) {
             let Some(seen) = seen else { continue };
-            let age_ms = input.report.run_ms.saturating_sub(*seen);
-            if age_ms <= millis(input.settings.source_defect_age) {
-                continue;
-            }
             let subject = format!(
                 "defect:{:?}/{}/{}/{}",
                 defect.kind,
@@ -325,7 +347,7 @@ impl Ctx<'_> {
                     role: "orchestrator",
                     addr: input.settings.orchestrator.clone(),
                 },
-                reason: "source_defect_persists".to_owned(),
+                reason: "source_defect".to_owned(),
                 severity: severity_of(ActionKind::FixSource),
                 evidence: vec![defect.reason.clone()],
                 detail: json!({
@@ -509,17 +531,30 @@ pub fn plan(input: &PlanInput<'_>) -> Plan {
                     .as_ref()
                     .and_then(|a| a.get(&row.lane.to_lowercase()))
                     .and_then(|t| t.first().cloned());
-                if let Some(ticket) = ticket {
-                    ctx.lane_cond(
+                match (ticket, &input.facts.assignments) {
+                    (Some(ticket), _) => ctx.lane_cond(
                         ActionKind::PushNextTicket,
                         row,
                         "idle_with_assignment",
                         json!({"ticket": ticket, "assignment_list": {
                             "source": "ix-relay FR-072", "position": 0}}),
-                    );
+                    ),
+                    (None, Some(_)) => ctx.lane_cond(
+                        ActionKind::RouteIdleLane,
+                        row,
+                        "idle_assignment_list_empty",
+                        json!({"class": "IDLE"}),
+                    ),
+                    (None, None) => {}
                 }
             }
             ClassKind::Blocked => ctx.blocked(row),
+            ClassKind::Dead => ctx.lane_cond(
+                ActionKind::RouteDeadLane,
+                row,
+                "lane_dead",
+                json!({"class": "DEAD"}),
+            ),
             ClassKind::Stuck | ClassKind::Loop => {
                 let reason = if row.class == ClassKind::Stuck {
                     "stuck"

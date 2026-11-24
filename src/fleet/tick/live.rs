@@ -4,7 +4,9 @@
 //! The live `fleet tick` run: `fleet status` evidence, the FR-072 lists through relay-core, one
 //! ledger commit.
 
-use super::{LanePr, ReadyWork, StandingOrders, TickFacts, TickOutput, TickSettings, TickSources};
+use super::{
+    LanePr, ReadyWork, StandingOrders, TickFacts, TickOutput, TickSettings, TickSources, Unread,
+};
 use crate::fleet::ledger::{self, Ledger, TickCommit};
 use crate::fleet::{
     Coverage, FleetConfig, FleetError, SeriesSource, SourceError, Sources, build_report, live,
@@ -22,14 +24,12 @@ struct LiveSources {
 }
 
 impl TickSources for LiveSources {
-    fn assignments(&self) -> Result<BTreeMap<String, Vec<String>>, SourceError> {
-        let settings = load_core(CoreFlags::default()).map_err(|e| SourceError(e.to_string()))?;
-        let mut relay = Relay::connect(&settings.url.value, self.timeout)
-            .map_err(|e| SourceError(format!("relay connect: {e}")))?
-            .with_prefix(settings.prefix.value.clone());
+    fn assignments(&self) -> Result<BTreeMap<String, Vec<String>>, Unread> {
+        let failed = |e: String| Unread::Failed(SourceError(e));
+        let mut relay = connect(self.timeout).map_err(failed)?;
         let lists = relay
             .assignments()
-            .map_err(|e| SourceError(format!("relay assignment lists: {e}")))?;
+            .map_err(|e| failed(format!("relay assignment lists: {e}")))?;
         Ok(lists
             .into_iter()
             .map(|list| {
@@ -41,24 +41,60 @@ impl TickSources for LiveSources {
             .collect())
     }
 
-    fn host_busy(&self) -> Result<BTreeMap<String, f64>, SourceError> {
-        Err(SourceError(
-            "no host busy-ratio series is defined by the watcher yet".to_owned(),
-        ))
+    fn host_busy(&self) -> Result<BTreeMap<String, f64>, Unread> {
+        Err(Unread::Unwired("SWM-281"))
     }
 
-    fn lane_prs(&self) -> Result<Vec<LanePr>, SourceError> {
-        Err(SourceError(
-            "lane pull-request activity is not wired into fleet tick yet".to_owned(),
-        ))
+    fn lane_prs(&self) -> Result<Vec<LanePr>, Unread> {
+        Err(Unread::Unwired("SWM-282"))
     }
 
-    fn ready_work(&self) -> Result<ReadyWork, SourceError> {
-        Err(SourceError(
-            "ready unassigned work (FR-036 plan coverage) is not wired into fleet tick yet"
-                .to_owned(),
-        ))
+    fn ready_work(&self) -> Result<ReadyWork, Unread> {
+        Err(Unread::Unwired("SWM-212"))
     }
+}
+
+fn connect(timeout: Duration) -> Result<Relay, String> {
+    let settings = load_core(CoreFlags::default()).map_err(|e| e.to_string())?;
+    Ok(Relay::connect(&settings.url.value, timeout)
+        .map_err(|e| format!("relay connect: {e}"))?
+        .with_prefix(settings.prefix.value.clone()))
+}
+
+/// The address of the session that owns `pane` on `machine`, from the relay registrations given as
+/// `(machine, herdr pane, verified address)`.
+pub fn caller_from(
+    registrations: &[(String, Option<String>, Option<String>)],
+    machine: &str,
+    pane: &str,
+) -> Option<String> {
+    registrations
+        .iter()
+        .find(|(m, p, _)| m == machine && p.as_deref() == Some(pane))
+        .and_then(|(_, _, addr)| addr.clone())
+}
+
+/// The calling session resolved through the relay: this machine and `HERDR_PANE_ID` against the
+/// registrations. `None` when the session is not under herdr or is not registered.
+fn resolve_caller(timeout: Duration) -> Option<String> {
+    let pane = std::env::var("HERDR_PANE_ID")
+        .ok()
+        .filter(|p| !p.is_empty())?;
+    let machine = relay_core::machine_name().ok()?;
+    let mut relay = connect(timeout).ok()?;
+    let agents = relay.agents().ok()?;
+    let regs: Vec<_> = agents
+        .registrations
+        .iter()
+        .map(|r| {
+            (
+                r.machine.as_str().to_owned(),
+                r.herdr_pane.as_ref().map(|p| p.as_str().to_owned()),
+                r.full_address().map(|a| a.to_string()),
+            )
+        })
+        .collect();
+    caller_from(&regs, machine.as_str(), &pane)
 }
 
 fn host_now_ms() -> i64 {
@@ -103,6 +139,14 @@ pub fn run(file: Option<&toml::Value>, session: Option<&str>) -> Result<TickOutp
         timeout: config.host_timeout,
     });
     let orders = StandingOrders::load(settings.standing_orders_path.as_deref());
+    let resolved;
+    let session = match session {
+        Some(given) => Some(given),
+        None => {
+            resolved = resolve_caller(config.host_timeout);
+            resolved.as_deref()
+        }
+    };
     let path = ledger::resolve_path(&config).map_err(|e| FleetError::Ledger(e.to_string()))?;
     let mut ledger = Ledger::open(&path, &config).map_err(|e| FleetError::Ledger(e.to_string()))?;
     ledger
