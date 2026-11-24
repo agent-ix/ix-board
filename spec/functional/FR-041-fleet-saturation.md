@@ -54,7 +54,7 @@ action per owning planner project for a positive deficit.
 | ID | Criteria | Verification |
 |----|----------|--------------|
 | FR-041-AC-1 | Fixtures with known slots, capacity and duty yield the hand-computed `lanes_needed`, target buffer and deficit; `lanes_needed` never exceeds `lane_capacity`. | Test |
-| FR-041-AC-2 | Ready tickets assigned to a lane or started do not count toward the buffer; only ready, unassigned, unstarted tickets do. | Test |
+| FR-041-AC-2 | Ready tickets assigned to a reachable lane or started do not count toward the buffer; only ready, unassigned, unstarted tickets do. | Test |
 | FR-041-AC-8 | Tickets assigned to an UNREACHABLE lane still count in the ready buffer, while tickets assigned to a reachable lane do not. | Test |
 | FR-041-AC-9 | A host with a stale registry lease contributes zero slots and zero lane capacity to supply, and its UNREACHABLE lanes are excluded from demand and from the duty mean. | Test |
 | FR-041-AC-3 | A buffer at or above target gives deficit zero and no action; one below gives the exact shortfall. | Test |

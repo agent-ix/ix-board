@@ -60,6 +60,12 @@ failure in assign, double assignment, and concurrent ledger writers.
 | FND-009 | medium | FR-036 never mentions UNREACHABLE. Tickets in an UNREACHABLE lane's assignment count as owned, so they never appear in `unowned_ready`, and the lane can appear in `short_queues` and invite more tickets to a lane nobody can reach. The lead decision says UNREACHABLE counts as not working; coverage needs to surface its assignments, for example as `unreachable_assignments` or as unowned. | spec/functional/FR-036-fleet-plan-coverage.md:23-28 |
 | FND-010 | medium | FR-041 never mentions UNREACHABLE. The ready buffer subtracts tickets held by UNREACHABLE lanes, and supply and demand still count a stale host's `sustainable_slots`/`lane_capacity` and its lanes' duty. FR-034's "counts as not working for capacity" has no capacity rule behind it. | spec/functional/FR-041-fleet-saturation.md:25-39 |
 
+## New findings (disposition pass 3)
+
+| ID | Severity | Summary | Refs |
+| --- | --- | --- | --- |
+| FND-011 | low | FR-041-AC-2 still says ready tickets "assigned to a lane" do not count toward the buffer, while the new AC-8 says tickets assigned to an UNREACHABLE lane do count. The two ACs contradict for that case; AC-2 should say "assigned to a reachable lane". | spec/functional/FR-041-fleet-saturation.md:57 |
+
 ## Dispositions
 
 | FND | outcome | sha/reason |
@@ -72,3 +78,5 @@ failure in assign, double assignment, and concurrent ledger writers.
 | FND-006 | fixed | 0aef701: FR-039 single-writer lock, monotonic sequence, gap rule at tick cadence (default 5m); AC-2, AC-3 |
 | FND-007 | fixed | a8266e2: FR-039 writes labels for t-W at tick t, never t; FR-040-AC-9 |
 | FND-008 | fixed | a8266e2: executed_at = target lane's first transition into the action's expected state; lead/project actions have none |
+| FND-009 | fixed | ef0735f: FR-036 lists tickets held only by an UNREACHABLE lane in unowned_ready with note owner_unreachable and keeps the lane out of short_queues; AC-7 |
+| FND-010 | fixed | ef0735f: FR-041 stale hosts contribute no slots or capacity, UNREACHABLE lanes are excluded from demand and the duty mean, and their tickets are not subtracted from the buffer; AC-8, AC-9 |

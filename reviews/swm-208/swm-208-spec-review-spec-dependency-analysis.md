@@ -91,3 +91,6 @@ not exist or differ:
 | FND-010 | fixed | a8266e2: FR-034 reads relay-resolved ix_fleet_lane_blocked{reason} and holds no hook-vs-pane precedence (AC-7) |
 | FND-011 | fixed | a8266e2: max_tool_runtime and no_events_after read from relay ix.fleet.config, no local copy (AC-16) |
 | FND-012 | fixed | a8266e2: spec.md names the FR-072 list and orchestrator role; FR-035 step 4 and AC-8 cover role and host_registry_stale refusals |
+| FND-013 | fixed | ef0735f: FR-034 maps relay question and queued_question to BLOCKED(question); AC-6 |
+| FND-014 | fixed | ef0735f: AC-12 limits overrides to ix-board-owned thresholds; relay-owned values cannot be overridden |
+| FND-015 | fixed | ef0735f: AC-5 names the relay series reason wait_loop |
