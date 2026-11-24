@@ -336,6 +336,7 @@ quire validate --scope . on all nine changed files exited 0; git diff --check is
 | FND-010 | fixed | verified in fix commit 4dbc082 |
 | FND-011 | fixed | verified in fix commit 65f6b84 (round 2) |
 | FND-012 | fixed | verified in fix commit 65f6b84 (round 2) |
+| FND-013 | fixed | verified in fix commit 699c01a (round 3) |
 
 ## New findings (disposition pass 1)
 
@@ -477,6 +478,20 @@ quire validate --scope . on all nine changed files exited 0; git diff --check is
    "lines": "186",
    "excerpt": "| FR-039-AC-10 | A gap present in tick 1 and absent in tick 3 gives one `plan_coverage_gap` row with `opened_tick` 1 and `closed_tick` 3; an `unavailable` list in tick 2 neither closes nor reopens it; `open_cycles` equals `max(1, ceil((close_or_now - open) / cycle_interval))` on the evaluation clock: with a 10 minute cycle and 5 minute tick (grace 15 minutes) a gap closed at 4 minutes and one closed at 24 minutes each count 1 (the second is an orchestrator that acted in its next cycle), one closed at 26 minutes counts 2, and one still open counts by elapsed time while no `cycle_event` row is w",
    "finding": "The FND-011 fix left FR-039 inconsistent with itself. FR-039-AC-10 still states open_cycles = max(1, ceil((close_or_now - open) / cycle_interval)) with no grace, yet its examples (closed at 24 minutes counts 1, at 26 counts 2) only hold with the grace term; on its own formula 24 minutes counts 3. The prose still says 'one still open after two cycles counts 2' and that the <= 1 threshold means 'closed within one cycle', both false with a 15-minute grace (20 minutes counts 1; more than 25 is needed for 2). One sentence is also garbled: 'must read as 1, not as late and `close_or_now` is the close time'. Put the grace term in the AC formula and correct or remove the two stale prose claims."
+  }
+ ]
+}
+```
+
+## Disposition evidence (round 3)
+
+```yaml
+{
+ "dispositions": [
+  {
+   "fnd": "FND-013",
+   "outcome": "fixed",
+   "after_excerpt": "| FR-039-AC-10 | A gap present in tick 1 and absent in tick 3 gives one `plan_coverage_gap` row with `opened_tick` 1 and `closed_tick` 3; an `unavailable` list in tick 2 neither closes nor reopens it; `open_cycles` equals `max(1, ceil((close_or_now - open - grace) / cycle_interval))` on the evaluation clock: with a 10 minute cycle and grace of 15 minutes (10 minutes plus a 5 minute tick) a gap closed at 4, 24 and 25 minutes counts 1 each (the later ones are an orchestrator that acted in its next cycle), one closed at 26 minutes counts 2, one closed at 36 minutes counts 3, and one still open co"
   }
  ]
 }
