@@ -95,12 +95,11 @@ under one retention rule; the relay holds transport records of bounded age only.
   `fleet cycle` records as `interval_s`) and `grace` is one cycle of phase plus one tick of
   lag (default `cycle_interval` plus the tick interval, configurable). The grace exists because a gap
   can open just after a cycle began and the tick that reports its closing runs up to a tick after the
-  orchestrator acts; an orchestrator that acts in its next cycle must read as 1, not as late and `close_or_now` is the close time, or
+  orchestrator acts; an orchestrator that acts in its next cycle must read as 1, not as late. `close_or_now` is the close time, or
   the evaluation time while the row is open. Cycles are counted on this clock, not
   from `cycle_event` rows, so an orchestrator that stops running cycles cannot
-  hold the count down: a row closed inside its first cycle counts 1, and one
-  still open after two cycles counts 2. The role specs' thresholds of at most 1
-  cycle therefore mean "closed within one cycle". The orchestrator's own cycles
+  hold the count down: with the default 10 minute cycle and 5 minute tick (grace 15 minutes) a row closed within 25 minutes of opening counts 1 and one open for 26 minutes counts 2. The role specs' thresholds of at most 1
+  cycle therefore mean "closed within one cycle plus the grace", that is, acted on in the orchestrator's next cycle. The orchestrator's own cycles
   are still recorded as `cycle_event` rows; `fleet tick` writes a `cycle_missed`
   row when the configured orchestrator session has no `cycle_event.ended_at`
   (or, with a cycle open, no `ended_at` after `started_at`) for more than twice
@@ -183,7 +182,7 @@ in [FR-041](./FR-041-fleet-saturation.md); `answer_dialog_latency_max` and
 | FR-039-AC-7 | `fleet ledger query` returns idle minutes per lane per day and actions with time-to-action in text and JSON without writing. | Test |
 | FR-039-AC-8 | An unsupported schema version is refused with no change, retention prunes only rows older than the configured age, and replaced assignments, defects and ground-truth samples are stored with their timestamps. | Test |
 | FR-039-AC-9 | Opening a version 1 ledger migrates it to version 2 in one transaction under the writer lock with every earlier row unchanged; a crash injected mid-migration leaves the version 1 ledger intact and openable; a ledger of a later version is refused without a change. | Test |
-| FR-039-AC-10 | A gap present in tick 1 and absent in tick 3 gives one `plan_coverage_gap` row with `opened_tick` 1 and `closed_tick` 3; an `unavailable` list in tick 2 neither closes nor reopens it; `open_cycles` equals `max(1, ceil((close_or_now - open) / cycle_interval))` on the evaluation clock: with a 10 minute cycle and 5 minute tick (grace 15 minutes) a gap closed at 4 minutes and one closed at 24 minutes each count 1 (the second is an orchestrator that acted in its next cycle), one closed at 26 minutes counts 2, and one still open counts by elapsed time while no `cycle_event` row is written. | Test |
+| FR-039-AC-10 | A gap present in tick 1 and absent in tick 3 gives one `plan_coverage_gap` row with `opened_tick` 1 and `closed_tick` 3; an `unavailable` list in tick 2 neither closes nor reopens it; `open_cycles` equals `max(1, ceil((close_or_now - open - grace) / cycle_interval))` on the evaluation clock: with a 10 minute cycle and grace of 15 minutes (10 minutes plus a 5 minute tick) a gap closed at 4, 24 and 25 minutes counts 1 each (the later ones are an orchestrator that acted in its next cycle), one closed at 26 minutes counts 2, one closed at 36 minutes counts 3, and one still open counts by elapsed time while no `cycle_event` row is written. | Test |
 | FR-039-AC-16 | With the orchestrator session writing no `cycle_event.ended_at` for more than twice `interval_s`, `fleet tick` writes one `cycle_missed` row for the span and not a second on the next tick; a session that ends cycles on time writes none. | Test |
 | FR-039-AC-11 | `lane_tick` holds one row per lane per committed tick with class and `ready_work_available` true exactly when the lane has a remaining ticket or an unowned ready ticket in one of the lane's eligible teams or projects exists; an ad-hoc `fleet status` run writes no `lane_tick` row; `idle_lane_with_ready_work_ticks` and `idle_lane_episode_with_ready_work_max` equal the hand-computed values on a fixture. | Test |
 | FR-039-AC-12 | An order with `--expect-ticket` sent by the minder and one sent by `fleet assign` each get one `order_focus_at_deadline` row in the first run after the deadline, with the focus computed over the window ending at `deadline_at` (a focus change after the deadline does not alter it) and outcomes `confirmed`, `acted_not_focused`, `ack_expired` and `timed_out` matching their receipts. | Test |

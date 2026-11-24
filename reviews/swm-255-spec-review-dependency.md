@@ -104,6 +104,7 @@ quire validate --scope . on all nine changed files exited 0; git diff --check is
 | FND-001 | fixed | verified in fix commit 4dbc082 |
 | FND-002 | fixed | verified in fix commit 4dbc082 |
 | FND-003 | fixed | verified in fix commit 4dbc082 |
+| FND-004 | fixed | verified in fix commit 65f6b84 (round 2) |
 
 ## New findings (disposition pass 1)
 
@@ -150,5 +151,20 @@ quire validate --scope . on all nine changed files exited 0; git diff --check is
    "finding": "build_abort evidence assumes ix_build_builds_total carries an outcome label beginning aborted_. dev-team FR-015 (origin/main) lists the outcome label with no value set, and FR-010 defines aborted_<reason> only as an FR-005 termination reason. The coupling is unverified. Have dev-team pin the outcome values in FR-015 (ticket the enablement), or read the termination reason from the FR-005 JSON events."
   }
  ]
+}
+```
+
+## Disposition evidence (round 2)
+
+```yaml
+{
+ "dispositions": [
+  {
+   "fnd": "FND-004",
+   "outcome": "fixed",
+   "after_excerpt": "- `aborted_*` outcomes of `ix_build_builds_total{outcome}` (used as `build_abort` evidence) depend on SWM-260, which has dev-team FR-015 enumerate the outcome values; until it lands the `aborted_` prefix of dev-team FR-010 is the contract."
+  }
+ ],
+ "new_findings": []
 }
 ```
