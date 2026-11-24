@@ -96,3 +96,7 @@ fmt-check, clippy and every test pass (20/20 in `tests/fleet.rs`), then
 | FND-007 | fixed | - |
 | FND-008 | fixed | - |
 | FND-009 | deferred | Field renamed `observed_ms` and FR-034 now names it observation time; a true first-seen time needs the fleet ledger (SWM-215). |
+| FND-010 | fixed | - |
+| FND-011 | fixed | - |
+| FND-012 | fixed | - |
+| FND-013 | fixed | - |
