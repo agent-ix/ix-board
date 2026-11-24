@@ -504,6 +504,20 @@ pub fn record_status(config: &FleetConfig, report: &mut FleetReport) {
     }
 }
 
+/// Records one `fleet status` run after completing the assignment rows its commit depends on: a
+/// failure of the completion is a defect of this run and is committed with it. `fleet tick` calls
+/// this too, so a fleet that runs only ticks does not leave killed `fleet assign` rows `pending`.
+pub fn record_status_completing(
+    config: &FleetConfig,
+    report: &mut FleetReport,
+    bus: &mut impl crate::fleet::assign::AssignBus,
+) {
+    if let Err(error) = complete_pending(config, bus) {
+        report.add_ledger_defect(format!("assignment completion: {error}"));
+    }
+    record_status(config, report);
+}
+
 /// The rows `fleet ledger query` prints.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct LedgerRows {

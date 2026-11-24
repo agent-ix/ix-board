@@ -82,3 +82,26 @@ error ends the wait with a wrong result.
 - Safety: no `unsafe`, no panics on caller input (`issues[0]` is guarded by the
   non-empty check), no unbounded loop (the wait ends on the relay clock).
 - `make ci`: make ci exit 0 at ecba3db on the d3027cf pin (fmt-check, clippy -D warnings, 50 test binaries green incl. fleet_assign 8/8 on redis:7, cargo deny, unsafe audit); the merge with main is not built (FND-003).
+
+## New findings (disposition pass 1)
+
+| ID | Severity | Summary | Refs |
+| --- | --- | --- | --- |
+| FND-010 | high | Test helper restates ix-cli-kit's exit codes. `code()` in the `fleet_assign_output` tests maps `Outcome` to 0/1/3/4 by hand (`_ => 2`) instead of calling `Outcome::code()`, so the AC-5/AC-14 exit-status assertions check this copy, not the codes the binary returns; a change in ix-cli-kit's mapping would leave them green. Use `output_outcome(&output).code()`. | src/main.rs:2707-2716 |
+| FND-011 | low | Pending-row completion is wired only into `fleet status` and only tested by calling `complete_pending` directly: `complete_assignments` is not exercised through `run_fleet_status`, and its `assignment completion` defect is added after `record_status` has committed the run, so that defect never reaches the ledger's defect rows. `fleet tick` (#95, SWM-214) also commits runs and does not call it, so a fleet that runs only `tick` leaves killed rows `pending`. | src/main.rs:860-884, src/fleet/ledger/assign_rows.rs:166-171 |
+
+## Dispositions
+
+Round 1, fix head ebb3323 (rebased onto 541c6c9).
+
+| FND | Outcome | Reason |
+| --- | --- | --- |
+| FND-001 | fixed | - |
+| FND-002 | fixed | - |
+| FND-003 | fixed | - |
+| FND-004 | fixed | - |
+| FND-005 | fixed | - |
+| FND-006 | fixed | - |
+| FND-007 | fixed | - |
+| FND-008 | fixed | - |
+| FND-009 | fixed | - |

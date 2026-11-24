@@ -11,7 +11,9 @@ use ix_board::fleet::assign::{
     OrderEvidence, RegistryView, Timing, assign, decide, focus_keys,
 };
 use ix_board::fleet::focus::FocusEvent;
-use ix_board::fleet::ledger::{AssignSink, complete_pending};
+use ix_board::fleet::ledger::{AssignSink, complete_pending, record_status_completing};
+use ix_board::fleet::live::{NoWeakSignals, ReadReceipts};
+use ix_board::fleet::{FleetReport, ReceiptRead, RelaySnapshot, Sources, build_report};
 use ix_board::{Issue, IssueBatch, IssueId, ProjectId, TeamKey, WorkflowStateType};
 use ix_trace_rs::trace;
 use relay_core::assignment::{AssignWrite, AssignWriter, AssignedTicket, AssignmentList};
@@ -1215,4 +1217,99 @@ fn focus_uses_the_configured_team_keys_and_the_focus_at_the_deadline() {
     .unwrap();
     assert_eq!(late.result, AssignResult::Confirmed);
     assert_eq!(late.focus_at_deadline.as_deref(), Some("ambiguous:SWM-999"));
+}
+
+fn status_report() -> FleetReport {
+    let receipts = ReadReceipts(Ok(ReceiptRead::default()));
+    let sources = Sources {
+        relay: Ok(RelaySnapshot::default()),
+        series: None,
+        receipts: &receipts,
+        weak: &NoWeakSignals,
+    };
+    build_report(&FleetConfig::default(), &sources, 1)
+}
+
+/// Leaves the lane's order sent, its list written and its ledger row `pending`: the command was
+/// killed in the wait. Returns the deadline.
+fn leave_pending(port: u16, relay: &mut Relay, target: &Lane, ledger: &Ledger) -> i64 {
+    let acts = lane_acts(
+        port,
+        target,
+        "swm-211-fleet-assign",
+        "/w/ix-board-swm-211",
+        Duration::from_millis(300),
+    );
+    let killed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut bus = Flaky::new(relay);
+        bus.panic_in_wait = true;
+        assign(
+            &mut bus,
+            &mut ledger.sink(),
+            &request(target, &["SWM-211"], 10),
+            &batch(vec![open("SWM-211")]),
+            &orchestrator(),
+        )
+    }));
+    assert!(killed.is_err());
+    acts.join().unwrap();
+    ledger.rows()[0].deadline_at.unwrap()
+}
+
+fn count(ledger: &Ledger, sql: &str) -> i64 {
+    rusqlite::Connection::open(&ledger.path)
+        .unwrap()
+        .query_row(sql, [], |r| r.get(0))
+        .unwrap()
+}
+
+#[trace("FR-035-AC-12")]
+#[test]
+fn a_status_run_commits_the_completed_row_with_its_run() {
+    let (_c, port) = Container::start();
+    let mut relay = connect(port);
+    let target = lane(&mut relay, "s-one", "one");
+    let ledger = Ledger::new();
+    let deadline = leave_pending(port, &mut relay, &target, &ledger);
+    wait_past(&mut relay, deadline);
+    let mut report = status_report();
+    record_status_completing(&ledger.config, &mut report, &mut relay);
+    let rows = ledger.rows();
+    assert_eq!(rows[0].result, "confirmed");
+    assert_eq!(rows[0].focus_at_deadline.as_deref(), Some("SWM-211"));
+    assert_eq!(count(&ledger, "SELECT COUNT(*) FROM run"), 1);
+    assert_eq!(
+        count(
+            &ledger,
+            "SELECT COUNT(*) FROM defect WHERE kind='ledger_unwritable'"
+        ),
+        0
+    );
+}
+
+#[trace("FR-035-AC-12")]
+#[test]
+fn a_failed_completion_is_a_defect_committed_with_the_run() {
+    let (_c, port) = Container::start();
+    let mut relay = connect(port);
+    let target = lane(&mut relay, "s-one", "one");
+    let ledger = Ledger::new();
+    let deadline = leave_pending(port, &mut relay, &target, &ledger);
+    wait_past(&mut relay, deadline);
+    let mut bus = Flaky::new(&mut relay);
+    bus.armed = true;
+    bus.fail_reads = 100;
+    let mut report = status_report();
+    record_status_completing(&ledger.config, &mut report, &mut bus);
+    assert!(!report.complete);
+    assert_eq!(ledger.rows()[0].result, "pending");
+    assert_eq!(count(&ledger, "SELECT COUNT(*) FROM run"), 1);
+    assert_eq!(
+        count(
+            &ledger,
+            "SELECT COUNT(*) FROM defect WHERE kind='ledger_unwritable'"
+        ),
+        1,
+        "the completion defect is stored with the run"
+    );
 }

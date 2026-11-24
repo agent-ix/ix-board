@@ -69,3 +69,16 @@ also conflict on the confirmation window.
   replaced" is outside this repository and was not assessed.
 - Semantic review: skipped.
 - Plan completion: not assessed
+
+## Dispositions
+
+Round 1, fix head ebb3323 (rebased onto 541c6c9).
+
+| FND | Outcome | Reason |
+| --- | --- | --- |
+| FND-001 | fixed | - |
+| FND-002 | fixed | - |
+| FND-003 | fixed | - |
+| FND-004 | fixed | - |
+| FND-005 | fixed | - |
+| FND-006 | fixed | - |
