@@ -16,6 +16,7 @@ Commands:
   search         Search structured project and issue fields
   issues         Read multiple exact Linear issues in one cached workspace request
   agents         Say whether each agent in a team's herdr workspaces is working right now
+  fleet          Fleet lane commands
   drift          Render a deterministic drift report from versioned structured evidence
   focus          Resolve an inline Linear initiative/project/issue focus
   project        Update one of the two supported Linear project fields
@@ -472,6 +473,18 @@ Options:
 ```
 
 Exit status: zero when every machine was read. When some machines are missing (they time out after 45 seconds or cannot be read) but other machines returned rows, the command prints those rows, lists the missing machines in `missing_hosts` with reason and elapsed time, and exits with the partial code. When no row could be read it exits with the internal-error code.
+
+## ix-board fleet status
+
+```text
+Classify every registered agent lane from relay, Prometheus and order evidence
+
+Usage: ix-board fleet status [OPTIONS]
+```
+
+Emits one row per registered lane with one class: `WORKING`, `IDLE`, `BLOCKED(reason)`, `LOOP`, `STUCK`, `STALE-ORDER`, `DEAD` or `UNREACHABLE` (FR-034). Relay data (registry, activity, receipts) is read from Redis through relay-core using the standard ix-relay settings; watcher series are read from the Prometheus HTTP API at `IX_PROMETHEUS_URL` or `[fleet] prometheus_url`. The working window, `max_tool_runtime` and `no_events_after` come from the relay `ix.fleet.config` series and cannot be set locally. `[fleet]` also accepts `lanes`, `hosts`, `loop_stops`, `dead_after_secs`, `max_clock_skew_secs`, `push_interval_secs` and `host_timeout_secs`.
+
+Exit status: zero when no source defect exists. Any defect (`missing_lane`, `missing_host`, `no_events`, `stale_source`, `clock_skew`, `unreadable_source`, `stale_host_registry`) sets `complete` to false and exits with the partial code. When no row could be produced it exits with the internal-error code. `STALE-ORDER` reads `AckExpired` receipts, which are not yet on ix-relay main; until they are, the receipts source is reported as an `unreadable_source` defect.
 
 ## ix-board drift
 
