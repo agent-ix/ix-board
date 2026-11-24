@@ -93,6 +93,18 @@ fn serve(mut stream: TcpStream, cache: &RwLock<Cache>) -> Result<(), Error> {
     )?;
     Ok(())
 }
+/// The cached collector metrics plus the last committed `fleet tick`, when a ledger is configured.
+fn metrics_text(collector: &Collector, config: &Config, now: i64) -> Result<String, Error> {
+    let mut text = collector.metrics(now)?;
+    if let Some(path) = &config.fleet_ledger {
+        let interval = i64::try_from(config.fleet_tick_interval_seconds * 1000).unwrap_or(i64::MAX);
+        match ix_board::fleet::ledger::tick_metrics(path, now, interval) {
+            Ok(tick) => text.push_str(&tick),
+            Err(error) => eprintln!("fleet tick metrics: {error}"),
+        }
+    }
+    Ok(text)
+}
 fn run() -> Result<(), Error> {
     // SystemHost's local lifecycle transport invokes the current executable.
     // Support the same bounded, read-only protocol as the ix-board CLI.
@@ -112,7 +124,7 @@ fn run() -> Result<(), Error> {
     let listener = TcpListener::bind(config.listen)?;
     let mut collector = Collector::open(config.clone())?;
     let cache = Arc::new(RwLock::new(Cache {
-        metrics: collector.metrics(now_ms()?)?,
+        metrics: metrics_text(&collector, &config, now_ms()?)?,
         updated: Instant::now(),
     }));
     let (sender, receiver) = mpsc::sync_channel(1);
@@ -139,6 +151,7 @@ fn run() -> Result<(), Error> {
     }
     drop(sender);
     let output = Arc::clone(&cache);
+    let worker_config = config.clone();
     thread::spawn(move || {
         loop {
             let tick = Instant::now();
@@ -149,7 +162,7 @@ fn run() -> Result<(), Error> {
                 if let Err(error) = collector.activity(now_ms()?) {
                     eprintln!("activity evidence: {error}");
                 }
-                let metrics = collector.metrics(now_ms()?)?;
+                let metrics = metrics_text(&collector, &worker_config, now_ms()?)?;
                 let mut target = output
                     .write()
                     .map_err(|_| Error::Invalid("metrics cache poisoned"))?;

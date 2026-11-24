@@ -17,6 +17,8 @@ fn config(path: &std::path::Path) -> Config {
         retention_seconds: 604800,
         activity_interval_seconds: 30,
         tracker_interval_seconds: 300,
+        fleet_ledger: None,
+        fleet_tick_interval_seconds: 300,
         scopes: vec![ScopeConfig {
             team_id: "factory".into(),
             scope_id: "completion".into(),

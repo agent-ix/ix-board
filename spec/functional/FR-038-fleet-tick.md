@@ -32,8 +32,8 @@ its condition persists. Kinds and rules:
 
 | Kind | Condition | Target |
 |------|-----------|--------|
-| `push_next_ticket` | lane is IDLE with a remaining assigned ticket; carries the ticket and the `assign` command | the lane |
-| `answer_dialog` | lane is BLOCKED(dialog) and a standing order in the SWM-226 configuration file matches the dialog; carries the order id and answer | the lane |
+| `push_next_ticket` | lane is IDLE with a remaining assigned ticket; carries the first ticket of the lane's ix-relay FR-072 list and a reference to that list, leaving the list unchanged (the minder sends a plain order, not `fleet assign`) | the lane |
+| `answer_dialog` | lane is BLOCKED(dialog), or BLOCKED(question) with relay reason `queued_question`, and a standing order in the SWM-226 configuration file matches it; carries the relay reason, and the order id and answer once the file format specifies them | the lane |
 | `escalate_block` | lane is BLOCKED(login), BLOCKED(usage_limit) or BLOCKED(question); or BLOCKED(dialog) with no matching standing order; or the SWM-226 file is missing or unreadable. Severity high; carries the block reason | the lane's lead |
 | `escalate_stuck` | lane is STUCK or LOOP | the lane's lead |
 | `resend_order` | the lane's order is STALE-ORDER | the lane |
@@ -53,12 +53,16 @@ SWM-226 configuration never produces `answer_dialog`.
 
 A lane whose own evidence is missing or defective is a per-lane condition, distinct from a host-wide one. A host whose registry lease is stale keeps its lanes `UNREACHABLE` ([FR-034](./FR-034-fleet-lane-status.md)) and is handled through `fix_source`; it never produces `act_on_undetermined`. For a reachable host, a lane with a lane-scoped defect still has a class from [FR-034](./FR-034-fleet-lane-status.md), never `UNKNOWN`, and also gets one `act_on_undetermined` action, which the minder executes by treating the lane as idle. Its expected state, for `executed_at` ([FR-039](./FR-039-fleet-ledger.md)), is the lane `WORKING` or the defect cleared. The action resolves when the lane has no lane-scoped defect.
 
+### Standing-order seam
+
+The machine-readable format of the SWM-226 standing-order file and its match conditions are not yet specified. Until they are, a readable file is the match: the tick emits `answer_dialog` carrying the relay reason and no order id for a BLOCKED(dialog) or a `queued_question`, and the minder selects the order from the standing-orders reference. A missing or unreadable file emits `escalate_block`, and a free-form question (relay reason `question`) always emits `escalate_block`.
+
 ### In-fleet escalation ladder
 
 The tick owns one in-fleet ladder; the owner is paged only by Alertmanager and the tick emits no action addressed to the owner, so no condition is paged twice. A condition is an action of kind `push_next_ticket`, `resend_order`, `act_on_undetermined`, `answer_dialog`, `escalate_block`, `escalate_stuck`, `escalate_stale_pr` or `escalate_drain`; its `condition_started_at` is the relay time of the tick that first emitted it, kept while its action id persists, including across a gap in ticks.
 
 - **Rung 0** is the condition's own action, sent to that action's target in the same tick.
-- **Rungs 1 to 3.** While the condition persists the tick emits a `ladder_rung` action to the worker (rung 1), the lane's lead (rung 2) and the orchestrator (rung 3), each in the first committed tick at or after 1, 2 and 3 tick intervals from `condition_started_at`. Each is emitted once. A rung is emitted even when its recipient already received an earlier rung, and its `due_by` is the next tick interval. Its latency from the rung time is therefore at most one tick interval.
+- **Rungs 1 to 3.** While the condition persists the tick emits a `ladder_rung` action to the worker (rung 1), the lane's lead (rung 2) and the orchestrator (rung 3), each in the first committed tick at or after 1, 2 and 3 tick intervals from `condition_started_at`. Each is emitted once. A condition on a lane whose class is BLOCKED skips rung 1: a relay message delivered to a blocked pane is pane input, so the tick sends no relay message to it, and rungs 2 and 3 follow at their usual times. A rung is emitted even when its recipient already received an earlier rung, and its `due_by` is the next tick interval. Its latency from the rung time is therefore at most one tick interval.
 - **The ladder ends** in the tick after the condition clears; no further rung is emitted.
 - **Owners.** `escalate_stuck` goes to the lane's lead, `escalate_stale_pr` to the lead of the lane that owns the pull request, and `escalate_drain` to the lane's lead, taken from the lane-to-lead configuration. A lane with no configured lead gives the action the orchestrator as its owner and the reason `lead_unresolved`. `fix_source` goes to the orchestrator; nothing the tick emits is addressed to the owner.
 - **No lead for rung 2.** When the lane's lead cannot be resolved the tick does not address rung 2 to a missing recipient: at the rung 2 time it records a rung 2 row with reason `lead_unresolved` and emits rung 3 to the orchestrator in that same tick with reason `lead_unresolved_fallthrough`, instead of at 3 tick intervals. It is not emitted twice.
@@ -92,6 +96,8 @@ no tick record.
 | FR-038-AC-16 | A lane with no resolvable lead gets a rung 2 row with reason `lead_unresolved` and rung 3 to the orchestrator emitted in the same tick, not again at 3 intervals; `fix_source` is addressed to the orchestrator and no emitted action has `target_role` other than `lane`, `lead`, `orchestrator`, `planner` or `host`. | Test |
 | FR-038-AC-14 | `add_lane` is not emitted for a host in an open capacity run, a host with no recorded level, a host at its recorded level or within its cool-off, each recorded with its reason; a host below its recorded level with ready work and a free slot emits it, and a draining lane counts as neither a lane nor a free slot. | Test |
 | FR-038-AC-15 | A lane draining longer than the drain cap emits `escalate_drain` to the lane's lead and one still within the cap does not. | Test |
+| FR-038-AC-17 | A condition on a BLOCKED lane emits no rung 1 and no relay message to the lane, and rungs 2 and 3 are emitted at 2 and 3 tick intervals; the same condition on a lane that is not BLOCKED emits rung 1. | Test |
+| FR-038-AC-18 | BLOCKED(question) with relay reason `queued_question` emits `answer_dialog` carrying that reason when the standing-order file is readable, and `escalate_block` when it is missing or unreadable; relay reason `question` emits `escalate_block` in every case. | Test |
 
 ## Dependencies
 

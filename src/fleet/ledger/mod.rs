@@ -13,6 +13,7 @@ mod lock;
 mod schema;
 #[cfg(test)]
 mod tests;
+mod tick;
 
 use self::lock::WriterLock;
 use super::FleetConfig;
@@ -26,6 +27,7 @@ use thiserror::Error as ThisError;
 
 pub use assign_rows::{AssignSink, complete_pending};
 pub use schema::{QUERYABLE, VERSION};
+pub use tick::{TickCommit, tick_metrics};
 
 /// A ledger failure.
 #[derive(Debug, ThisError)]
