@@ -8,6 +8,7 @@ mod cache;
 pub mod cache_status;
 pub mod chain;
 mod drift;
+pub mod fleet;
 mod hygiene;
 mod linear;
 pub mod linear_summary;
@@ -25,6 +26,15 @@ mod scope;
 mod settings;
 mod summary_cache;
 pub mod team_metrics;
+
+/// The parsed ix-board configuration file, if one exists.
+///
+/// # Errors
+///
+/// The file exists but cannot be read or parsed.
+pub fn settings_value() -> Result<Option<toml::Value>, Error> {
+    settings::load()
+}
 pub use named_focus::{
     BatchState, CatalogEvidence, CountAvailability, InitiativeLink, InitiativeRow, LeafCounts,
     ListKind, MemberOutcome, MemberReport, NamedBatch, NamedFocusRequest, PartialReason,
@@ -244,6 +254,9 @@ pub enum Error {
     /// Reading herdr or an agent machine failed.
     #[error(transparent)]
     Agents(#[from] agents::AgentsError),
+    /// Fleet status configuration was refused.
+    #[error(transparent)]
+    Fleet(#[from] fleet::FleetError),
     /// The requested project was not present in the source snapshot.
     #[error("project not found: {identifier}")]
     ProjectNotFound { identifier: String },

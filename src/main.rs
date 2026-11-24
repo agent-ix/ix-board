@@ -101,6 +101,11 @@ enum Command {
         #[arg(long, default_value = "20m", value_parser = parse_duration)]
         idle_after: u64,
     },
+    /// Fleet lane commands.
+    Fleet {
+        #[command(subcommand)]
+        command: FleetCommand,
+    },
     /// Render a deterministic drift report from versioned structured evidence.
     Drift {
         /// JSON file containing thresholds and configured leads.
@@ -169,6 +174,12 @@ enum Command {
 #[derive(Subcommand, Debug)]
 enum CacheCommand {
     /// Show dataset freshness and shared allowance.
+    Status,
+}
+
+#[derive(Subcommand, Debug)]
+enum FleetCommand {
+    /// Classify every registered agent lane from relay, Prometheus and order evidence.
     Status,
 }
 
@@ -359,6 +370,7 @@ enum Output {
     Issues(IssueBatch),
     Drift(DriftReport),
     Agents(AgentsReport),
+    Fleet(ix_board::fleet::FleetReport),
     Retro(retro::Record),
     RetroDelta(retro::DeltaReport),
     RetroBackfill(retro::BackfillReport),
@@ -477,6 +489,7 @@ fn main() -> std::process::ExitCode {
                 | Error::DriftInputRead { .. }
                 | Error::DriftInputDecode { .. }
                 | Error::Drift(_)
+                | Error::Fleet(_)
                 | Error::Retro(_) => Outcome::Invalid,
                 Error::EmptyCredentialInput => Outcome::Invalid,
                 _ => Outcome::Internal,
@@ -491,6 +504,11 @@ fn output_outcome(output: &Output) -> Outcome {
         Output::Issues(batch) if batch.issues.is_empty() && !batch.missing.is_empty() => {
             Outcome::Invalid
         }
+        Output::Fleet(report) => match report.coverage() {
+            ix_board::fleet::Coverage::Complete => Outcome::Ok,
+            ix_board::fleet::Coverage::Partial => Outcome::Partial,
+            ix_board::fleet::Coverage::Failed => Outcome::Internal,
+        },
         Output::Agents(report) => match report.coverage() {
             ix_board::agents::Coverage::Complete => Outcome::Ok,
             ix_board::agents::Coverage::Partial => Outcome::Partial,
@@ -618,6 +636,9 @@ fn run(command: Command) -> Result<Output, Error> {
             live,
         } => run_drift(&config, evidence.as_ref(), live),
         Command::Agents { teams, idle_after } => run_agents(&teams, idle_after).map(Output::Agents),
+        Command::Fleet {
+            command: FleetCommand::Status,
+        } => run_fleet_status().map(Output::Fleet),
         Command::Retro {
             command: RetroCommand::Snapshot { config, window },
         } => run_retro_snapshot(&config, &window),
@@ -759,6 +780,39 @@ fn run(command: Command) -> Result<Output, Error> {
     }
 }
 
+fn run_fleet_status() -> Result<ix_board::fleet::FleetReport, Error> {
+    use ix_board::fleet::live;
+    let settings = ix_board::settings_value()?;
+    let config = ix_board::fleet::FleetConfig::from_toml(
+        settings.as_ref(),
+        std::env::var("IX_PROMETHEUS_URL").ok(),
+    )?;
+    let series: Option<std::sync::Arc<dyn ix_board::fleet::SeriesSource>> = config
+        .prometheus_url
+        .as_ref()
+        .map(|url| match live::PromHttp::new(url, config.host_timeout) {
+            Ok(query) => std::sync::Arc::new(live::PrometheusSeries { query })
+                as std::sync::Arc<dyn ix_board::fleet::SeriesSource>,
+            Err(error) => std::sync::Arc::new(live::UnavailablePrometheus(error.to_string())),
+        });
+    let sources = ix_board::fleet::Sources {
+        relay: live::read_relay(config.host_timeout),
+        series,
+        receipts: &live::PendingOrderReceipts,
+        weak: &live::NoWeakSignals,
+    };
+    let local_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+        });
+    Ok(ix_board::fleet::build_report(
+        &config,
+        &sources,
+        local_now_ms,
+    ))
+}
+
 fn run_agents(teams: &[String], idle_after: u64) -> Result<AgentsReport, Error> {
     let hosts = ix_board::agents::system_hosts()?;
     let mut service = None;
@@ -895,6 +949,7 @@ fn run_linear(command: Command) -> Result<Output, Error> {
         Command::Auth { .. } => unreachable!("auth commands are handled before Linear dispatch"),
         Command::AgentProbe => unreachable!("probe is handled before normal dispatch"),
         Command::Agents { .. } => unreachable!("agents is handled before Linear dispatch"),
+        Command::Fleet { .. } => unreachable!("fleet is handled before Linear dispatch"),
         Command::Retro { .. } => unreachable!("retro is handled before Linear dispatch"),
         Command::Scope { .. }
         | Command::Roadmap { .. }
@@ -1170,6 +1225,7 @@ fn render_human(output: &Output) -> String {
         }
         Output::Drift(report) => render_drift_text(report),
         Output::Agents(report) => render_text(report),
+        Output::Fleet(report) => ix_board::fleet::render_text(report),
         Output::Retro(record) => retro::render_text(record),
         Output::RetroDelta(report) => retro::render_delta_text(report),
         Output::RetroBackfill(report) => retro::render_backfill_text(report),

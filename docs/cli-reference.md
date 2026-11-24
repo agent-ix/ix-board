@@ -16,6 +16,7 @@ Commands:
   search         Search structured project and issue fields
   issues         Read multiple exact Linear issues in one cached workspace request
   agents         Say whether each agent in a team's herdr workspaces is working right now
+  fleet          Fleet lane commands
   drift          Render a deterministic drift report from versioned structured evidence
   focus          Resolve an inline Linear initiative/project/issue focus
   project        Update one of the two supported Linear project fields
@@ -472,6 +473,18 @@ Options:
 ```
 
 Exit status: zero when every machine was read. When some machines are missing (they time out after 45 seconds or cannot be read) but other machines returned rows, the command prints those rows, lists the missing machines in `missing_hosts` with reason and elapsed time, and exits with the partial code. When no row could be read it exits with the internal-error code.
+
+## ix-board fleet status
+
+```text
+Classify every registered agent lane from relay, Prometheus and order evidence
+
+Usage: ix-board fleet status [OPTIONS]
+```
+
+Emits one row per registered lane with one class: `WORKING`, `IDLE`, `BLOCKED(reason)`, `LOOP`, `STUCK`, `STALE-ORDER`, `DEAD` or `UNREACHABLE` (FR-034). Relay data (registry, activity, receipts) is read from Redis through relay-core using the standard ix-relay settings; watcher series are read from the Prometheus HTTP API at `IX_PROMETHEUS_URL` or `[fleet] prometheus_url`. The working window, `max_tool_runtime` and `no_events_after` come from the relay `ix.fleet.config` series and cannot be set locally. Without a Prometheus URL, or when it cannot be read, hook evidence still classes the lanes with the documented relay defaults (working window 10m, `max_tool_runtime` 2h, `no_events_after` 30m); those rows carry `thresholds_defaulted` and one defect names the remedy. The output also lists lanes total, working and not working (UNREACHABLE counts as not working) per host. Weak signals from herdr are not wired yet (SWM-264). `no_events` fires only for a lane whose newest event is not `stop`, `idle`, `session_end` or `blocked`. A defect `observed_ms` is the run time; first-seen time comes with the ledger (SWM-215). `[fleet]` also accepts `lanes`, `hosts`, `loop_stops`, `dead_after_secs`, `max_clock_skew_secs`, `push_interval_secs` and `host_timeout_secs`.
+
+Exit status: 0 when no source defect exists. Any defect (`missing_lane`, `missing_host`, `no_events`, `stale_source`, `clock_skew`, `unreadable_source`, `stale_host_registry`, `relay_activity_absent`, `lane_registry_absent`, `host_lane_list_absent` (the host's lanes are UNREACHABLE), `host_hook_events_absent`, `series_absent`, `series_naming_unverified`) sets `complete` to false and exits 1 (ix-cli-kit partial). When no row could be produced it exits 4 (internal error). A refused `[fleet]` configuration exits 3. `STALE-ORDER` reads `AckExpired` receipts, which are not yet on ix-relay main; until they are, the receipts source is reported as an `unreadable_source` defect.
 
 ## ix-board drift
 
