@@ -48,3 +48,17 @@ FR-034 does not state, and a 48h read bound that no requirement owns.
 - New tests: 3, all tagged FR-034-AC-12; all pass in `make ci` at 7ffbd75.
 - Reverse gap: `RelayOrderReceipts`, `read_expired_orders`, `expired_orders_from` trace to FR-034 (STALE-ORDER rule 3, AC-8, AC-12); the 48h bound does not (FND-003).
 - Semantic review: not run as a separate fan-out pass.
+
+## New findings (disposition pass 1)
+
+| ID | Severity | Summary | Refs |
+| --- | --- | --- | --- |
+| FND-004 | low | The second clause of FR-034-AC-22 (an unresolved `AckExpired` order adds an `unreadable_source` defect) is asserted only by `an_expired_order_to_an_unregistered_recipient_is_a_defect_row`, which is tagged FR-034-AC-12 and FR-034-AC-17, not AC-22. | tests/fleet.rs:1122-1147 |
+
+## Dispositions
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-001 | fixed | - |
+| FND-002 | fixed | - |
+| FND-003 | fixed | - |

@@ -154,10 +154,12 @@ fn ack_expired_orders_are_read_from_a_real_relay_with_and_without_delivery() {
         ExpiredOrder {
             addr: delivered_addr,
             delivered: true,
+            gap_spanned: false,
         },
         ExpiredOrder {
             addr: undelivered_addr,
             delivered: false,
+            gap_spanned: false,
         },
     ];
     want.sort_by(|a, b| a.addr.cmp(&b.addr));

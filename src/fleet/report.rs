@@ -122,6 +122,9 @@ pub struct ExpiredOrder {
     pub addr: String,
     /// Whether a `Delivered` receipt exists; `false` is `timed_out`.
     pub delivered: bool,
+    /// The order is `timed_out` and its `Delivered` receipt may sit in a part of the history the
+    /// relay did not record or no longer retains.
+    pub gap_spanned: bool,
 }
 
 /// An `AckExpired` receipt whose recipient queue has no registered lane address.
@@ -670,8 +673,7 @@ pub fn build_report(cfg: &FleetConfig, sources: &Sources<'_>, local_now_ms: i64)
         }
     };
     let orders = &read.orders;
-    let receipt_gaps = !read.gaps.is_empty();
-    if receipt_gaps {
+    if !read.gaps.is_empty() {
         ctx.defect(
             DefectKind::ReceiptsRecordingGap,
             "relay.receipts",
@@ -683,15 +685,22 @@ pub fn build_report(cfg: &FleetConfig, sources: &Sources<'_>, local_now_ms: i64)
             ),
         );
     }
+    let mut unresolved: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for order in &read.unresolved {
+        unresolved
+            .entry(order.target.as_str())
+            .or_default()
+            .push(order.order_id.as_str());
+    }
+    for (target, ids) in &unresolved {
         ctx.defect(
             DefectKind::UnreadableSource,
             "relay.receipts",
             None,
             None,
             format!(
-                "AckExpired order {} to {} has no registered lane address",
-                order.order_id, order.target
+                "AckExpired orders {} to {target} have no registered lane address",
+                ids.join(", ")
             ),
         );
     }
@@ -815,8 +824,9 @@ pub fn build_report(cfg: &FleetConfig, sources: &Sources<'_>, local_now_ms: i64)
             focus: None,
             thresholds_defaulted: defaulted,
             receipt_gap: result.class.kind == ClassKind::StaleOrder
-                && receipt_gaps
-                && input.expired_order == Some(false),
+                && orders
+                    .iter()
+                    .any(|o| o.addr.to_lowercase() == key && !o.delivered && o.gap_spanned),
             schema_version: SCHEMA_VERSION,
         });
     }

@@ -319,42 +319,59 @@ const RECEIPT_MAX_PAGES: usize = RECEIPT_EVENT_CAP / RECEIPT_PAGE_CAP + 1;
 /// The `AckExpired` orders in `events`, per lane address, from the relay's own receipts (FR-067,
 /// FR-071): `lanes` maps a session queue identity to its lane address. An order that has an
 /// `Acted` receipt is not expired; one with no `Delivered` receipt is `timed_out`. An expired
-/// order whose recipient is not in `lanes` is returned as unresolved. `gaps` carries the history's
-/// coverage limits through.
+/// order whose recipient is not in `lanes` is returned as unresolved.
+///
+/// `gaps` are the history's coverage limits. A recording gap or a pending observation may hide a
+/// `Delivered` receipt of any order. A count-based `retention` boundary hides only receipts older
+/// than it, so it affects an order only when its `Queued` receipt is out of view. The returned gaps
+/// hold the limits that affect at least one `timed_out` order, plus every true recording gap or
+/// pending observation.
 #[must_use]
 pub fn expired_orders_from(
     events: &[ReceiptEvent],
     lanes: &BTreeMap<String, String>,
     gaps: Vec<String>,
 ) -> ReceiptRead {
-    let mut states: BTreeMap<&str, (bool, bool)> = BTreeMap::new();
+    let mut states: BTreeMap<&str, (bool, bool, bool)> = BTreeMap::new();
     for event in events {
         let state = states.entry(event.original_id.as_str()).or_default();
         match event.outcome {
             ReceiptOutcome::Delivered => state.0 = true,
             ReceiptOutcome::Acted => state.1 = true,
+            ReceiptOutcome::Queued => state.2 = true,
             _ => {}
         }
     }
+    let hard = gaps.iter().any(|g| g != "retention");
+    let retained = gaps.iter().any(|g| g == "retention");
+    let mut retention_spans = false;
     let mut read = ReceiptRead {
-        gaps,
+        gaps: gaps.iter().filter(|g| *g != "retention").cloned().collect(),
         ..ReceiptRead::default()
     };
     for event in events {
-        let (delivered, acted) = states[event.original_id.as_str()];
+        let (delivered, acted, queued) = states[event.original_id.as_str()];
         if event.outcome != ReceiptOutcome::AckExpired || acted {
             continue;
         }
         match lanes.get(&event.target) {
-            Some(addr) => read.orders.push(ExpiredOrder {
-                addr: addr.clone(),
-                delivered,
-            }),
+            Some(addr) => {
+                let beyond_retention = retained && !queued;
+                retention_spans |= beyond_retention && !delivered;
+                read.orders.push(ExpiredOrder {
+                    addr: addr.clone(),
+                    delivered,
+                    gap_spanned: !delivered && (hard || beyond_retention),
+                });
+            }
             None => read.unresolved.push(UnresolvedOrder {
                 order_id: event.original_id.clone(),
                 target: event.target.clone(),
             }),
         }
+    }
+    if retention_spans {
+        read.gaps.push("retention".to_owned());
     }
     read
 }

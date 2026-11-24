@@ -55,3 +55,20 @@ expired, never-acted order after 48h.
 | FND-003 | medium | The 48h window is wrong at both ends. A relay order deadline runs from enqueue up to `ORDER_ACK_MAX_MS` (24h), so an `AckExpired` observed 24h to 48h ago can have its `Delivered` before `since_ms`, giving a false `timed_out`; the doc comment claims the window prevents this. And an `AckExpired` with no `Acted` older than 48h falls out of the read, so the lane stops being STALE-ORDER although the order was never acted on; FR-034 sets no such age bound. | src/fleet/live.rs:293-296, src/fleet/live.rs:372-377 |
 | FND-004 | medium | Paging cost. Every `receipt_export` call re-reads the whole stream (`XRANGE` up to 10,001 entries plus `HGETALL` of the receipt meta hash, which holds one `event:` field per retained event) in an atomic pipeline and decodes every event, then returns 1,000. A full 48h window costs up to 10 full reads per run (about 100k JSON decodes and 200k items over the wire) on the shared production relay. The reader also opens a second connection and repeats `load_core`, `agents()` and `lane_lists()` already done by `read_relay`, and `expired_orders_from` scans all events twice per `AckExpired` (O(E x A)). `RECEIPT_MAX_PAGES = 20` is unreachable given `RECEIPT_EVENT_CAP / RECEIPT_PAGE_CAP = 10`. | src/fleet/live.rs:299, src/fleet/live.rs:311-316, src/fleet/live.rs:339-346, src/fleet/live.rs:369-397 |
 | FND-005 | medium | The strict-failure and paging branches are untested: no test drives `SourceUnavailable`, `CursorEvicted`, `CursorUnavailable`, a multi-page read, or the page cap, and none covers a `RecordingGap` page. The redis test covers only one page with no coverage reasons. | src/fleet/live.rs:378-401, tests/fleet_receipts_redis.rs:110-154 |
+
+## New findings (disposition pass 1)
+
+| ID | Severity | Summary | Refs |
+| --- | --- | --- | --- |
+| FND-006 | medium | `Retention` is a run-level gap on every run once the stream has hit its 10,000-event cap. The read now starts at `now - RECEIPT_WINDOW_MS`, and relay-core raises the retention boundary to `evicted_through_ms + 1`. Any count eviction in the last 7 days therefore sets `Retention`, so `receipts_recording_gap` fires and every run is partial. On top of that, `receipt_gap` marks every `timed_out` row whenever any gap exists. The lead ruling asks to mark only lanes whose `timed_out` derivation spans the gap. Under `Retention` alone, an order whose `Queued` receipt is still in view cannot have lost its later `Delivered` to head eviction, and it is still marked. | src/fleet/live.rs:381-390, src/fleet/live.rs:416-428, src/fleet/report.rs:672-684, src/fleet/report.rs:817-819 |
+| FND-007 | low | Each unresolved expired order adds its own `unreadable_source` defect. The read now spans 7 days, so expired orders to sessions that have since restarted keep the run partial for up to 7 days, one defect row each, with no aggregation. | src/fleet/report.rs:686-697 |
+
+## Dispositions
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-001 | fixed | - |
+| FND-002 | fixed | - |
+| FND-003 | fixed | - |
+| FND-004 | deferred | The ix-board side is fixed: one shared connection, single-pass matching, page bound `RECEIPT_EVENT_CAP / RECEIPT_PAGE_CAP + 1`. The per-page full-stream re-read is in relay-core `receipt_export` and is deferred to SWM-273, a read-only expired-order reader. Measured on a throwaway redis:7 holding 10,000 events of about 300 bytes: about 1.8 ms of Redis time and about 2 MB on the wire per page. A full read is 11 pages, about 20 ms of Redis time and about 22 MB per run. At one run every 5 minutes that is about 6 GB a day. This is acceptable as an interim until SWM-273 lands. |
+| FND-005 | fixed | - |

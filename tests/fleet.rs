@@ -153,6 +153,7 @@ fn order(addr: &str, delivered: bool) -> ExpiredOrder {
     ExpiredOrder {
         addr: addr.to_owned(),
         delivered,
+        gap_spanned: false,
     }
 }
 fn class_of(report: &FleetReport, lane: &str) -> (ClassKind, Option<String>) {
@@ -1119,7 +1120,7 @@ fn recorded_ack_expired_receipts_give_expired_orders_per_lane_address() {
     assert!(read.unresolved.is_empty() && read.gaps.is_empty());
 }
 
-#[trace("FR-034-AC-12", "FR-034-AC-17")]
+#[trace("FR-034-AC-12", "FR-034-AC-17", "FR-034-AC-22")]
 #[test]
 fn an_expired_order_to_an_unregistered_recipient_is_a_defect_row() {
     let events = vec![receipt("d", ReceiptOutcome::AckExpired, "session/gone")];
@@ -1156,7 +1157,9 @@ fn a_receipt_history_gap_is_one_run_defect_and_marks_timed_out_lanes() {
         ],
         &[],
     );
-    world.receipts = Ok(vec![order("h:w:1", true), order("h:w:2", false)]);
+    let mut spanned = order("h:w:2", false);
+    spanned.gap_spanned = true;
+    world.receipts = Ok(vec![order("h:w:1", true), spanned]);
     world.read_extra.gaps = vec!["recording_gap".to_owned()];
     let report = world.run();
     let gaps: Vec<_> = report
@@ -1290,4 +1293,84 @@ fn receipt_coverage_reasons_split_into_failures_and_gaps() {
         none.is_empty(),
         "history older than instrumentation is not a gap"
     );
+}
+
+#[trace("FR-034-AC-22")]
+#[test]
+fn a_retention_boundary_spans_only_orders_whose_queued_receipt_is_out_of_view() {
+    use ReceiptOutcome::{AckExpired, Queued};
+    let lanes = lanes(&[("q1", "h:w:1"), ("q2", "h:w:2")]);
+    let retention = || vec!["retention".to_owned()];
+
+    let in_view = vec![receipt("a", Queued, "q1"), receipt("a", AckExpired, "q1")];
+    let read = live::expired_orders_from(&in_view, &lanes, retention());
+    assert_eq!(read.orders, vec![order("h:w:1", false)]);
+    assert!(read.gaps.is_empty(), "a stream at its cap is not a gap");
+    let mut world = World::one_host(&["h:w:1"], vec![raw("h:w:1", HookKind::Stop, 5)], &[]);
+    world.receipts = Ok(read.orders.clone());
+    world.read_extra = read;
+    let report = world.run();
+    assert!(!has_defect(&report, DefectKind::ReceiptsRecordingGap));
+    assert!(!report.rows[0].receipt_gap);
+
+    let out_of_view = vec![receipt("b", AckExpired, "q2")];
+    let read = live::expired_orders_from(&out_of_view, &lanes, retention());
+    assert!(read.orders[0].gap_spanned);
+    assert_eq!(read.gaps, ["retention"]);
+    let mut world = World::one_host(&["h:w:2"], vec![raw("h:w:2", HookKind::Stop, 5)], &[]);
+    world.receipts = Ok(read.orders.clone());
+    world.read_extra = read;
+    let report = world.run();
+    assert!(has_defect(&report, DefectKind::ReceiptsRecordingGap));
+    assert!(report.rows[0].receipt_gap);
+}
+
+#[trace("FR-034-AC-22")]
+#[test]
+fn a_recording_gap_spans_every_timed_out_order_and_is_a_defect_without_one() {
+    use ReceiptOutcome::{AckExpired, Delivered, Queued};
+    let lanes = lanes(&[("q1", "h:w:1"), ("q2", "h:w:2")]);
+    let gap = || vec!["recording_gap".to_owned()];
+    let events = vec![
+        receipt("a", Queued, "q1"),
+        receipt("a", AckExpired, "q1"),
+        receipt("b", Queued, "q2"),
+        receipt("b", Delivered, "q2"),
+        receipt("b", AckExpired, "q2"),
+    ];
+    let mut read = live::expired_orders_from(&events, &lanes, gap());
+    read.orders.sort_by(|x, y| x.addr.cmp(&y.addr));
+    assert!(read.orders[0].gap_spanned && !read.orders[1].gap_spanned);
+    assert_eq!(read.gaps, ["recording_gap"]);
+
+    let none = live::expired_orders_from(&[], &lanes, gap());
+    assert_eq!(none.gaps, ["recording_gap"]);
+    let mut world = World::one_host(&["h:w:1"], vec![raw("h:w:1", HookKind::Stop, 5)], &[]);
+    world.read_extra = none;
+    assert!(has_defect(&world.run(), DefectKind::ReceiptsRecordingGap));
+}
+
+#[trace("FR-034-AC-22")]
+#[test]
+fn unresolved_expired_orders_are_one_defect_per_target_listing_the_order_ids() {
+    use ReceiptOutcome::AckExpired;
+    let events = vec![
+        receipt("o1", AckExpired, "session/gone"),
+        receipt("o2", AckExpired, "session/gone"),
+        receipt("o3", AckExpired, "session/other"),
+    ];
+    let mut world = World::one_host(&["h:w:1"], vec![raw("h:w:1", HookKind::Stop, 5)], &[]);
+    world.read_extra = live::expired_orders_from(&events, &lanes(&[]), Vec::new());
+    let report = world.run();
+    let defects: Vec<_> = report
+        .defects
+        .iter()
+        .filter(|d| d.source == "relay.receipts")
+        .collect();
+    assert_eq!(defects.len(), 2);
+    let gone = defects
+        .iter()
+        .find(|d| d.reason.contains("session/gone"))
+        .unwrap();
+    assert!(gone.reason.contains("o1") && gone.reason.contains("o2"));
 }
