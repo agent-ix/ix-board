@@ -14,7 +14,7 @@ relationships:
 
 The `ix-board fleet status [--json]` command SHALL emit exactly one row for every
 registered lane, each with one class: `WORKING`, `IDLE`, `BLOCKED(reason)`, `LOOP`,
-`STUCK`, `STALE-ORDER` or `DEAD`. A lane is an agent session addressed by the relay
+`STUCK`, `STALE-ORDER`, `DEAD` or `UNREACHABLE`. A lane is an agent session addressed by the relay
 address `server:workspace:tab`. The command SHALL compute classes from structured
 evidence and SHALL NOT use an LLM or a lane's own message as primary evidence.
 The command SHALL NOT emit `UNKNOWN` as a class.
@@ -51,6 +51,9 @@ The command SHALL NOT emit `UNKNOWN` as a class.
 
 The command evaluates classes in this order and emits the first that matches:
 
+0. `UNREACHABLE`: the relay marks the lane `stale` because its host registry lease has
+   expired. The class is never IDLE, counts as not working for capacity, and the row
+   carries a `stale_host_registry` defect.
 1. `DEAD`: the latest event is `session_end`, or the lane has no event, no herdr
    pane and a registry entry older than `dead_after`.
 2. `BLOCKED(reason)`: the relay-resolved `ix_fleet_lane_blocked{reason}` for the lane
@@ -69,9 +72,6 @@ The command evaluates classes in this order and emits the first that matches:
    from distinct sources among herdr title, pane text and self-report; a single
    weak signal is never sufficient.
 7. `IDLE`: otherwise.
-
-The command SHALL emit a lane the relay marks `stale` (its host lease expired) with no class
-and a `stale_host_registry` defect, never as IDLE.
 
 When a lane's evidence is missing, stale or failed, the command SHALL class the lane
 by these rules using the evidence available and SHALL add a source-defect row naming source,
@@ -94,7 +94,7 @@ is authoritative for fleet decisions; the relay lane-state series is advisory.
 
 | ID | Criteria | Verification |
 |----|----------|--------------|
-| FR-034-AC-1 | A fixture with N registered lanes across hosts yields exactly N rows, each with one of the seven defined classes (a stale-host lane carries a defect instead of a class); no evidence combination in the matrix yields UNKNOWN. | Test |
+| FR-034-AC-1 | A fixture with N registered lanes across hosts yields exactly N rows, each with one of the eight defined classes (`WORKING`, `IDLE`, `BLOCKED(reason)`, `LOOP`, `STUCK`, `STALE-ORDER`, `DEAD`, `UNREACHABLE`); no evidence combination in the matrix yields UNKNOWN. | Test |
 | FR-034-AC-2 | A `pre_tool`, `post_tool` or `prompt` event inside the working window yields WORKING with no compile, PR or commit signal; one older than the window yields IDLE; no `IDLE(unconfirmed_activity)` subreason exists. | Test |
 | FR-034-AC-3 | A lane with no hook evidence is WORKING only with two agreeing weak signals from distinct sources; each single weak signal alone yields IDLE. | Test |
 | FR-034-AC-4 | An open `pre_tool` is WORKING until `max_tool_runtime` and STUCK after it; a matching `post_tool` closes it. | Test |
@@ -102,7 +102,7 @@ is authoritative for fleet decisions; the relay lane-state series is advisory.
 | FR-034-AC-6 | The mapping fixtures give relay `ix_fleet_lane_blocked` reasons `dialog` and `permission` BLOCKED(dialog), `question` BLOCKED(question), `login` and `usage_limit` their reasons, and a `session_end` DEAD. | Test |
 | FR-034-AC-7 | With the relay series reporting a reason that disagrees with raw hook or pane fixtures, the class follows the relay series; the code holds no hook-versus-pane precedence rule (an inspection of the source finds none). | Test |
 | FR-034-AC-8 | An order with `AckExpired` and a `Delivered` receipt, and one with `AckExpired` and no `Delivered` receipt (`timed_out`), each yield STALE-ORDER. | Test |
-| FR-034-AC-9 | A lane with no event for the relay `no_events_after` is IDLE with a `no_events` defect; a lane the relay marks `stale` is emitted with no class and a `stale_host_registry` defect, never IDLE; a failed probe, unreadable source, or a source older than twice its interval adds the matching defect while the lane is still emitted. | Test |
+| FR-034-AC-9 | A lane with no event for the relay `no_events_after` is IDLE with a `no_events` defect; a lane the relay marks `stale` is `UNREACHABLE` with a `stale_host_registry` defect, never IDLE, and counts as not working in capacity figures; a failed probe, unreadable source, or a source older than twice its interval adds the matching defect while the lane is still emitted. | Test |
 | FR-034-AC-10 | A configured lane with no registry record and a configured host with no lanes give `missing_lane`/`missing_host` defects, `complete` false and a non-zero exit. | Test |
 | FR-034-AC-11 | The working window equals the value read from the relay configuration; a fixture changing it changes classification and the code holds no second constant (an inspection of the source finds one definition). | Test |
 | FR-034-AC-16 | `max_tool_runtime` and `no_events_after` equal the relay `ix.fleet.config` values and ix-board configuration rejects local overrides of them. | Test |
