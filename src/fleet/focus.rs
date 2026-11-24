@@ -7,9 +7,6 @@
 
 use serde::Serialize;
 
-/// The default focus window.
-pub const DEFAULT_FOCUS_WINDOW_MS: i64 = 10 * 60 * 1_000;
-
 /// One hook event of a lane with the location it touched.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FocusEvent {
