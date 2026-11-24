@@ -319,3 +319,121 @@ quire validate --scope . on all nine changed files exited 0; git diff --check is
  ]
 }
 ```
+
+## Dispositions
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-001 | fixed | verified in fix commit 4dbc082 |
+| FND-002 | fixed | verified in fix commit 4dbc082 |
+| FND-003 | fixed | verified in fix commit 4dbc082 |
+| FND-004 | fixed | verified in fix commit 4dbc082 |
+| FND-005 | fixed | verified in fix commit 4dbc082 |
+| FND-006 | fixed | verified in fix commit 4dbc082 |
+| FND-007 | fixed | verified in fix commit 4dbc082 |
+| FND-008 | fixed | verified in fix commit 4dbc082 |
+| FND-009 | fixed | verified in fix commit 4dbc082 |
+| FND-010 | fixed | verified in fix commit 4dbc082 |
+
+## New findings (disposition pass 1)
+
+| ID | Severity | Summary | Refs |
+| --- | --- | --- | --- |
+| FND-011 | medium | The new elapsed-time clock counts max(1, ceil(elapsed / cycle_interval)), and the role specs threshold it at <= 1, i.e. closed within 10 minutes of being opened. The role spec allows until the end of the first cycle that ends after the condition is recorded, up to about two intervals depending on cycle phase. On top of that, the close is observed only by the next 5-minute tick. A compliant orchestrator that acts in its next cycle can therefore read 2 and fail. Allow one cycle of phase plus one tick of detection lag (e.g. ceil((elapsed - tick_interval) / cycle_interval) or nominal boundaries crossed), and add the role-spec note that cycles are now clocked, not read from cycle_event. | spec/functional/FR-039-fleet-ledger.md:92-95 |
+| FND-012 | medium | lane_count_reductions now includes lane_removed, and evidence_kind is computed from the 15 minutes before each event. A lane removed when a legitimate overload or knee drain finishes, hours after its draining_mark, will usually have empty evidence_kind and be counted as an ORCH-R12 violation. A lane that disappears for a reason other than an orchestrator decision (crash, session exit) is also counted as an orchestrator reduction via lane_change_unrecorded. Let a lane_removed that follows a draining_mark inherit that mark's evidence_kind, and classify removals not caused by the orchestrator separately. | spec/functional/FR-041-fleet-saturation.md:159 |
+
+## Disposition evidence (round 1)
+
+```yaml
+{
+ "dispositions": [
+  {
+   "fnd": "FND-001",
+   "outcome": "fixed",
+   "after_excerpt": "| `defect_rows` | `defect` rows: id, source, host, lane, kind, `first_seen_at`, `closed_at`, `routed_ticket`, `routed_at` |\n| `add_lane_action_open_cycles_max` | maximum `open_cycles` between `emitted_at` and `resolved_at` of `add_lane` actions |"
+  },
+  {
+   "fnd": "FND-002",
+   "outcome": "fixed",
+   "after_excerpt": "| `prom.throttled_hosts_without_step_down` | series `ix_fleet_capacity_throttled_without_step_down{host}` |\n| `prom.reserve_breach_or_thermal_abort_events` | series `ix_fleet_capacity_overload_events_total{host,cause}`, from `overload_event` rows |"
+  },
+  {
+   "fnd": "FND-003",
+   "outcome": "fixed",
+   "after_excerpt": "| `assignment_confirm_latency_p90`, `assignment_confirm_latency_max` | p90 and maximum of `confirm_latency_s` over `assignments_sent` whose deadline has passed. An unconfirmed row has no latency and counts as unbounded: the view returns an empty value with a non-zero `unconfirmed` count whenever the p90 rank (or, for the maximum, any row) is unconfirmed, and the evaluator treats an empty value as a violation, never as the deadline length |"
+  },
+  {
+   "fnd": "FND-004",
+   "outcome": "fixed",
+   "after_excerpt": "`open_cycles` of any row with an open time and a close time is\n  `max(1, ceil((close_or_now - open) / cycle_interval))`, where `cycle_interval`\n  is the configured orchestrator cycle (default 10 minutes, the same value\n  `fleet cycle` records as `interval_s`) and `close_or_now` is the close time, or"
+  },
+  {
+   "fnd": "FND-005",
+   "outcome": "fixed",
+   "after_excerpt": "| `unconfirmed_assignments_without_followup` | rows of `unconfirmed_assign_results` with no orchestrator action within one `cycle_interval` after `result_at`: a later `assignment_history` row for the lane (a re-assignment), or an `action_send` whose sender is the orchestrator address and whose recipient is the lane or its lead. The tick's automatic `resend_order` action is not an orchestrator action and does not count |"
+  },
+  {
+   "fnd": "FND-006",
+   "outcome": "fixed",
+   "after_excerpt": "- **Lane changes are observed, not reported.** The tick writes a `lane_added` or `lane_removed` event whenever a host's non-draining lane count in `lane_tick` rises or falls between consecutive ticks. The event carries the reason of a `fleet capacity step`, `drain` or `remove` issued within one tick interval before the change, and `lane_change_unrecorded` when there is none, so a lane changed outside `fleet capacity` is visible."
+  },
+  {
+   "fnd": "FND-007",
+   "outcome": "fixed",
+   "after_excerpt": "| `discovery_steps_judged_without_demand` | steps whose knee or level decision used an invalid window: a step that follows an invalid window with a new `step_no` instead of a repeat, a `knee_signal` set on an invalid step, and `capacity_level` rows whose `evidence_steps` include an invalid step |"
+  },
+  {
+   "fnd": "FND-008",
+   "outcome": "fixed",
+   "after_excerpt": "| `host_output_share_of_recorded_level` | latest `host_output_sample` output per hour, on the `output_basis` stored with the host's current `capacity_level` (tickets closed plus pull requests merged, or commits pushed), over `host_output_per_hour` of the step at that level, in percent |"
+  },
+  {
+   "fnd": "FND-009",
+   "outcome": "fixed",
+   "after_excerpt": "| `drains_over_cap_without_escalation` | `draining_lanes` older than the drain cap with no `action_send` for an `escalate_drain` action ([FR-038](./FR-038-fleet-tick.md)) for the lane; the tick emits `escalate_drain` and the minder sends it, which discharges the orchestrator's escalation duty (the role spec is to be updated to say so) |"
+  },
+  {
+   "fnd": "FND-010",
+   "outcome": "fixed",
+   "after_excerpt": "| `discovery_runs_without_recorded_level` | ended runs with a non-empty `found_level` and no `capacity_level` row of the same `run_id`; a run ending with no new level is excluded |"
+  }
+ ],
+ "new_findings": [
+  {
+   "fnd": "FND-011",
+   "severity": "medium",
+   "confidence": "medium",
+   "method": "spec-review/base",
+   "check": "soundness",
+   "artifact_id": "FR-039",
+   "related_ids": [
+    "ORCH-R06-E1",
+    "ORCH-R13-E1",
+    "ORCH-R27-E1",
+    "ORCH-R10-E1"
+   ],
+   "path": "spec/functional/FR-039-fleet-ledger.md",
+   "lines": "92-95",
+   "excerpt": "`open_cycles` of any row with an open time and a close time is\n  `max(1, ceil((close_or_now - open) / cycle_interval))`, where `cycle_interval`\n  is the configured orchestrator cycle (default 10 minutes, the same value\n  `fleet cycle` records as `interval_s`) and `close_or_now` is the close time, or",
+   "finding": "The new elapsed-time clock counts max(1, ceil(elapsed / cycle_interval)), and the role specs threshold it at <= 1, i.e. closed within 10 minutes of being opened. The role spec allows until the end of the first cycle that ends after the condition is recorded, up to about two intervals depending on cycle phase. On top of that, the close is observed only by the next 5-minute tick. A compliant orchestrator that acts in its next cycle can therefore read 2 and fail. Allow one cycle of phase plus one tick of detection lag (e.g. ceil((elapsed - tick_interval) / cycle_interval) or nominal boundaries crossed), and add the role-spec note that cycles are now clocked, not read from cycle_event."
+  },
+  {
+   "fnd": "FND-012",
+   "severity": "medium",
+   "confidence": "medium",
+   "method": "spec-review/base",
+   "check": "soundness",
+   "artifact_id": "FR-041",
+   "related_ids": [
+    "ORCH-R12-E1",
+    "FR-041-AC-19",
+    "FR-041-AC-20"
+   ],
+   "path": "spec/functional/FR-041-fleet-saturation.md",
+   "lines": "159",
+   "excerpt": "| `lane_reductions_without_throttle_evidence` | `lane_count_reductions` with empty `evidence_kind`, or reason `lane_change_unrecorded` |",
+   "finding": "lane_count_reductions now includes lane_removed, and evidence_kind is computed from the 15 minutes before each event. A lane removed when a legitimate overload or knee drain finishes, hours after its draining_mark, will usually have empty evidence_kind and be counted as an ORCH-R12 violation. A lane that disappears for a reason other than an orchestrator decision (crash, session exit) is also counted as an orchestrator reduction via lane_change_unrecorded. Let a lane_removed that follows a draining_mark inherit that mark's evidence_kind, and classify removals not caused by the orchestrator separately."
+  }
+ ]
+}
+```

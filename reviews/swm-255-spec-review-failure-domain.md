@@ -99,3 +99,54 @@ quire validate --scope . on all nine changed files exited 0; git diff --check is
  ]
 }
 ```
+
+## Dispositions
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-001 | fixed | verified in fix commit 4dbc082 |
+| FND-002 | fixed | verified in fix commit 4dbc082 |
+| FND-003 | fixed | verified in fix commit 4dbc082 |
+| FND-004 | fixed | verified in fix commit 4dbc082 |
+| FND-005 | fixed | verified in fix commit 4dbc082 |
+| FND-006 | fixed | verified in fix commit 4dbc082 |
+
+## Disposition evidence (round 1)
+
+```yaml
+{
+ "dispositions": [
+  {
+   "fnd": "FND-001",
+   "outcome": "fixed",
+   "after_excerpt": "`fleet cycle start --session <addr> [--interval <duration>]` writes a `cycle_event` row with a new `cycle_id`, the session address, `started_at` and `interval_s` (the configured orchestrator loop interval, default 10 minutes, when `--interval` is absent). `fleet cycle end` closes the session's open cycle with `ended_at` and `ended_reason` `ended`. A `start` while a cycle of the same session is open closes it first with `ended_at` set to the new `started_at` and `ended_reason` `superseded`. These rows record the orchestrator's own cycles. Evaluation cycle counts (`open_cycles`) are clocked by t"
+  },
+  {
+   "fnd": "FND-002",
+   "outcome": "fixed",
+   "after_excerpt": "- **Valid window.** A window is `valid` only when `saturation_sample` rows of the host cover at least 90% of the window (sample count times the tick interval over the window length) and every one shows a deficit of zero. A window with no samples, or with an unavailable deficit (which stores no value and so is not a covering sample), is invalid with reason `deficit_coverage`; a window with any positive deficit is invalid with reason `deficit_nonzero`. After an invalid window the hold repeats the step: the repeated row keeps its `step_no` and carries `repeat_of`."
+  },
+  {
+   "fnd": "FND-003",
+   "outcome": "fixed",
+   "after_excerpt": "- `violation` is `no_standing_order` when no valid order is given, and `login_input` when `lane_class_at_answer` is `BLOCKED(login)` or `BLOCKED(usage_limit)`, or when `--class` is `login` or `usage_limit`, whatever order is given (the declared class covers a lane classified up to one tick late). A row can carry both, recorded as `no_standing_order,login_input`; otherwise it is empty."
+  },
+  {
+   "fnd": "FND-004",
+   "outcome": "fixed",
+   "after_excerpt": "`fleet answer-log record --lane <addr> --action <action id> --class <dialog class> [--order <standing-order id>]` is called by the minder for each answer or keystroke it sends to a lane pane. The answer text is read from standard input and never from an argument, so it is not exposed in a process list or the minder transcript before the storage rule below applies; the command refuses a text given as an argument. It writes a `dialog_answer` row: `answer_id`, lane, `dialog_class` (`dialog`, `permission`, `question`, `login`, `usage_limit`, `other`), `action_id`, `standing_order_id` (empty when n"
+  },
+  {
+   "fnd": "FND-005",
+   "outcome": "fixed",
+   "after_excerpt": "| FR-039-AC-9 | Opening a version 1 ledger migrates it to version 2 in one transaction under the writer lock with every earlier row unchanged; a crash injected mid-migration leaves the version 1 ledger intact and openable; a ledger of a later version is refused without a change. | Test |"
+  },
+  {
+   "fnd": "FND-006",
+   "outcome": "fixed",
+   "after_excerpt": "- **Ready work per lane.** `ready_work_available` is true for a lane in a tick when\n  the lane has a remaining assigned ticket, or when an unowned ready ticket in\n  the same tick's plan-coverage report belongs to a team or project the lane is\n  eligible for (the lane's configured teams and projects; a lane with none\n  configured is eligible for all)."
+  }
+ ],
+ "new_findings": []
+}
+```

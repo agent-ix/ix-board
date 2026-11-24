@@ -314,3 +314,48 @@ quire validate --scope . on all nine changed files exited 0; git diff --check is
  ]
 }
 ```
+
+## Dispositions
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-001 | fixed | verified in fix commit 4dbc082 |
+| FND-002 | fixed | verified in fix commit 4dbc082 |
+| FND-003 | fixed | verified in fix commit 4dbc082 |
+| FND-004 | fixed | verified in fix commit 4dbc082 |
+| FND-005 | fixed | verified in fix commit 4dbc082 |
+
+## Disposition evidence (round 1)
+
+```yaml
+{
+ "dispositions": [
+  {
+   "fnd": "FND-001",
+   "outcome": "fixed",
+   "after_excerpt": "| `fix_source` | a source-defect row persists beyond its configured age | the orchestrator, who fixes it or routes it to the owning repository |"
+  },
+  {
+   "fnd": "FND-002",
+   "outcome": "fixed",
+   "after_excerpt": "| `cycle_event` | `cycle_id`, `session_addr`, `started_at`, `ended_at`, `ended_reason` (`ended`, `superseded`), `interval_s` | `fleet cycle` ([FR-044](./FR-044-fleet-cycle-and-dialog-answer-log.md)) |"
+  },
+  {
+   "fnd": "FND-003",
+   "outcome": "fixed",
+   "after_excerpt": "- **Action sends.** `action_send` rows join an action to the relay receipt of the\n  message that carried it, matched by sender address (the configured session\n  address of the executing role), recipient address and time after `emitted_at`,\n  because receipts carry no message body. One receipt satisfies at most one\n  action: when several open actions share a recipient, receipts are matched in\n  order of `emitted_at` then rung, oldest action first, so one message cannot"
+  },
+  {
+   "fnd": "FND-004",
+   "outcome": "fixed",
+   "after_excerpt": "| `lane_tick` | tick id, lane, host, class, `remaining_assigned`, `ready_work_available` | `fleet tick` only; `fleet status` writes no row |"
+  },
+  {
+   "fnd": "FND-005",
+   "outcome": "fixed",
+   "after_excerpt": "- **No lead for rung 2.** When the lane's lead cannot be resolved the tick does not address rung 2 to a missing recipient: at the rung 2 time it records a rung 2 row with reason `lead_unresolved` and emits rung 3 to the orchestrator in that same tick with reason `lead_unresolved_fallthrough`, instead of at 3 tick intervals. It is not emitted twice."
+  }
+ ],
+ "new_findings": []
+}
+```

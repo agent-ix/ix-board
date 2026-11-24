@@ -96,3 +96,59 @@ quire validate --scope . on all nine changed files exited 0; git diff --check is
  ]
 }
 ```
+
+## Dispositions
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-001 | fixed | verified in fix commit 4dbc082 |
+| FND-002 | fixed | verified in fix commit 4dbc082 |
+| FND-003 | fixed | verified in fix commit 4dbc082 |
+
+## New findings (disposition pass 1)
+
+| ID | Severity | Summary | Refs |
+| --- | --- | --- | --- |
+| FND-004 | low | build_abort evidence assumes ix_build_builds_total carries an outcome label beginning aborted_. dev-team FR-015 (origin/main) lists the outcome label with no value set, and FR-010 defines aborted_<reason> only as an FR-005 termination reason. The coupling is unverified. Have dev-team pin the outcome values in FR-015 (ticket the enablement), or read the termination reason from the FR-005 JSON events. | spec/functional/FR-041-fleet-saturation.md:112 |
+
+## Disposition evidence (round 1)
+
+```yaml
+{
+ "dispositions": [
+  {
+   "fnd": "FND-001",
+   "outcome": "fixed",
+   "after_excerpt": "- Capacity discovery reads build scheduler series from dev-team FR-010 and FR-015 (`ix_build_pause_seconds_total`, `ix_build_admission_blocked_seconds_total`, `ix_build_probe_value`, `ix_build_slots_busy`, `ix_build_slots_sustainable`, `ix_build_queue_wait_seconds`, `ix_build_builds_total{outcome}`), Linear and GitHub for host output, [FR-037](./FR-037-fleet-focus-and-drift.md) focus for per-lane attribution, and the [FR-039](./FR-039-fleet-ledger.md) ledger. `fleet tick` ([FR-038](./FR-038-fleet-tick.md)) writes `drain_done`, `overload_event`, `lane_added`, `lane_removed` and `host_output_sam"
+  },
+  {
+   "fnd": "FND-002",
+   "outcome": "fixed",
+   "after_excerpt": "- ix-relay change required by SWM-257, ticketed as SWM-259 (blocks SWM-257; SWM-257 is not dispatched before SWM-259 lands): the FR-072 list write SHALL accept an optional `order_id` and each transition record SHALL hold it (FR-072 transition records currently hold operation, lane, writer, version and ticket ids only); FR-071 `--expect-ticket` is already specified. Until it lands, `assign` cannot satisfy steps 8 to 10."
+  },
+  {
+   "fnd": "FND-003",
+   "outcome": "fixed",
+   "after_excerpt": "- Tables written under [FR-041](./FR-041-fleet-saturation.md) (`capacity_*`, `host_output_sample`) and [FR-044](./FR-044-fleet-cycle-and-dialog-answer-log.md) (`cycle_event`, `dialog_answer`) are owned by those requirements, which depend on this one; the views over them are defined there. [FR-036](./FR-036-fleet-plan-coverage.md) and [FR-037](./FR-037-fleet-focus-and-drift.md) write `plan_coverage_*` and `drift_finding` through this ledger."
+  }
+ ],
+ "new_findings": [
+  {
+   "fnd": "FND-004",
+   "severity": "low",
+   "confidence": "high",
+   "method": "spec-review/dependency",
+   "check": "other",
+   "artifact_id": "FR-041",
+   "related_ids": [
+    "dev-team FR-015",
+    "dev-team FR-010"
+   ],
+   "path": "spec/functional/FR-041-fleet-saturation.md",
+   "lines": "112",
+   "excerpt": "- **Evidence is checked, not claimed.** `evidence_kind` is set by ix-board, never taken from the command: `pause` or `admission_block` when `ix_build_pause_seconds_total` or `ix_build_admission_blocked_seconds_total` (dev-team FR-010, FR-015) grew in the 15 minutes before the event, `build_abort` when `ix_build_builds_total` gained an outcome beginning `aborted_` (an `aborted_thermal` or `aborted_memory` abort) in that period, `memory_below_reserve` when `ix_build_probe_value` for memory was below the profile reserve in it, `knee` when the host's latest valid `capacity_step` has `knee_signal`,",
+   "finding": "build_abort evidence assumes ix_build_builds_total carries an outcome label beginning aborted_. dev-team FR-015 (origin/main) lists the outcome label with no value set, and FR-010 defines aborted_<reason> only as an FR-005 termination reason. The coupling is unverified. Have dev-team pin the outcome values in FR-015 (ticket the enablement), or read the termination reason from the FR-005 JSON events."
+  }
+ ]
+}
+```
