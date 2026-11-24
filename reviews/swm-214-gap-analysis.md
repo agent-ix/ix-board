@@ -101,6 +101,12 @@ Seam ownership:
 | --- | --- | --- | --- |
 | FND-011 | high | The FR-039 Time to action text now states "`push_next_ticket` stores the pushed ticket on the action row, and a later tick within the focus window settles `executed_at`", but no code does either. The `action` table has no ticket column, and `executed()` runs only in the resolving tick against the current list head. This is a spec claim the code violates. The text must instead say that storing the pushed ticket and settling it in a later tick is deferred to SWM-255, and that until then `executed_at` is judged in the resolving tick and a real execution can be missed. | spec/functional/FR-039-fleet-ledger.md:53, src/fleet/ledger/tick.rs:119-150 |
 
+## New findings (disposition pass 4)
+
+| ID | Severity | Summary | Refs |
+| --- | --- | --- | --- |
+| FND-012 | low | The round 2 rewrite of FR-039-AC-6 introduced a new quire `ac:non-canonical-shape` warning: FR-039 on origin/main validates with no warning, and the whole spec goes from 1 such warning to 2. The AC also describes its own test ("and the test asserts that"). The fix is to restate AC-6 as direct outcome assertions, one per kind, and drop the test-referential clause. | spec/functional/FR-039-fleet-ledger.md:188 |
+
 ## Dispositions
 
 | FND | outcome | reason |
@@ -118,3 +124,5 @@ Seam ownership:
 | FND-010 | still-open | New in round 2: the paged receipt read lost its owning AC; add an FR-035 AC and tag its two tests. |
 | FND-010 | fixed | - |
 | FND-011 | still-open | New in round 3: the FR-039 body describes the unbuilt pushed-ticket storage as current behaviour; it must state the deferral to SWM-255. |
+| FND-011 | fixed | - |
+| FND-012 | still-open | New in round 4, low and not blocking: AC-6 shape warning introduced by this PR. |

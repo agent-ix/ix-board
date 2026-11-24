@@ -108,3 +108,4 @@ target/ was deleted afterwards.
 | FND-012 | deferred | SWM-255: storing the pushed ticket on the action row and settling `executed_at` in a later tick is schema work owned by SWM-255; until then a push can only be missed, never falsely credited. FR-039 must state this deferral (SR-6121 FND-011). |
 | FND-013 | fixed | - |
 | FND-014 | still-open | New in round 3, low: restore `// Copyright (C) 2026 Agent-IX` in src/fleet/ledger/mod.rs. |
+| FND-014 | fixed | - |
