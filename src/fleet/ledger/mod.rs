@@ -8,6 +8,7 @@
 //! commits each run in one transaction, so a crash leaves the previous state. Readers open the
 //! file read-only and never migrate.
 
+mod assign_rows;
 mod lock;
 mod schema;
 #[cfg(test)]
@@ -23,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error as ThisError;
 
+pub use assign_rows::{AssignSink, complete_pending};
 pub use schema::{QUERYABLE, VERSION};
 
 /// A ledger failure.

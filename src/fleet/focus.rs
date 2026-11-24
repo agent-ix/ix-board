@@ -89,7 +89,8 @@ pub fn ticket_in(text: &str, keys: &[String]) -> Option<String> {
                 .bytes()
                 .take_while(u8::is_ascii_digit)
                 .count();
-            if digits == 0 {
+            let end = after + 1 + digits;
+            if digits == 0 || bytes.get(end).is_some_and(u8::is_ascii_alphanumeric) {
                 continue;
             }
             let ticket = format!(
@@ -106,7 +107,12 @@ pub fn ticket_in(text: &str, keys: &[String]) -> Option<String> {
     best.map(|(_, ticket)| ticket)
 }
 
+/// The ticket of one event. An event whose working directory is not a git worktree (no branch)
+/// names no ticket: FR-037 reads the directory name only for a worktree.
 fn event_ticket(event: &FocusEvent, keys: &[String]) -> Option<String> {
+    if event.branch.is_empty() {
+        return None;
+    }
     ticket_in(&event.branch, keys).or_else(|| {
         event
             .cwd
@@ -115,12 +121,21 @@ fn event_ticket(event: &FocusEvent, keys: &[String]) -> Option<String> {
     })
 }
 
-/// The focus at `at_ms` over the events inside `window_ms` before it.
+/// The focus at `at_ms` over the events inside `window_ms` before it, and not before
+/// `not_before_ms` when given (confirmation of an order considers only the events after the
+/// order was sent, so a lane that left another ticket is not held ambiguous by the window).
 #[must_use]
-pub fn derive(events: &[FocusEvent], at_ms: i64, window_ms: i64, keys: &[String]) -> Focus {
+pub fn derive(
+    events: &[FocusEvent],
+    at_ms: i64,
+    window_ms: i64,
+    not_before_ms: Option<i64>,
+    keys: &[String],
+) -> Focus {
+    let floor = (at_ms - window_ms).max(not_before_ms.map_or(i64::MIN, |ms| ms - 1));
     let mut inside: Vec<&FocusEvent> = events
         .iter()
-        .filter(|e| e.server_ms <= at_ms && e.server_ms > at_ms - window_ms)
+        .filter(|e| e.server_ms <= at_ms && e.server_ms > floor)
         .collect();
     inside.sort_by_key(|e| e.server_ms);
     let mut tickets: Vec<String> = Vec::new();
@@ -132,11 +147,13 @@ pub fn derive(events: &[FocusEvent], at_ms: i64, window_ms: i64, keys: &[String]
     }
     match tickets.as_slice() {
         [] => {
-            let located = inside
-                .iter()
-                .any(|e| !e.branch.is_empty() || !e.cwd.is_empty());
+            let in_worktree = inside.iter().any(|e| !e.branch.is_empty());
             Focus::None {
-                reason: if located { "no_ticket" } else { "no_worktree" },
+                reason: if in_worktree {
+                    "no_ticket"
+                } else {
+                    "no_worktree"
+                },
             }
         }
         [one] => Focus::Ticket {
@@ -152,6 +169,7 @@ pub fn derive(events: &[FocusEvent], at_ms: i64, window_ms: i64, keys: &[String]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ix_trace_rs::trace;
 
     fn keys() -> Vec<String> {
         vec!["SWM".into()]
@@ -165,37 +183,70 @@ mod tests {
         }
     }
 
+    #[trace("FR-037-AC-1")]
     #[test]
     fn branch_beats_directory_and_words_are_bounded() {
         let e = event(5, "/w/ix-board-swm-300", "swm-211-fleet-assign");
         assert_eq!(event_ticket(&e, &keys()).as_deref(), Some("SWM-211"));
+        let by_directory = event(5, "/w/ix-board-swm-208", "main");
+        assert_eq!(
+            event_ticket(&by_directory, &keys()).as_deref(),
+            Some("SWM-208")
+        );
         assert_eq!(ticket_in("xswm-1", &keys()), None);
         assert_eq!(ticket_in("swm-", &keys()), None);
+        assert_eq!(ticket_in("swm-211abc", &keys()), None);
+        assert_eq!(ticket_in("swm-211-x", &keys()), Some("SWM-211".into()));
         assert_eq!(
             ticket_in("/w/ix-board-swm-300/src", &keys()),
             Some("SWM-300".into())
         );
     }
 
+    #[trace("FR-037-AC-2")]
     #[test]
     fn two_tickets_in_the_window_are_ambiguous_and_old_ones_drop() {
         let events = [event(1, "/w", "swm-1-a"), event(100, "/w", "swm-2-b")];
         assert!(matches!(
-            derive(&events, 100, 1_000, &keys()),
-            Focus::Ambiguous { ref recent, .. } if recent == "SWM-2"
+            derive(&events, 100, 1_000, None, &keys()),
+            Focus::Ambiguous { ref recent, ref tickets }
+                if recent == "SWM-2" && tickets == &["SWM-1", "SWM-2"]
         ));
-        assert_eq!(derive(&events, 100, 50, &keys()).ticket(), Some("SWM-2"));
         assert_eq!(
-            derive(&[event(1, "", "")], 1, 10, &keys()),
+            derive(&events, 100, 50, None, &keys()).ticket(),
+            Some("SWM-2")
+        );
+        assert_eq!(
+            derive(&[event(1, "", "")], 1, 10, None, &keys()),
             Focus::None {
                 reason: "no_worktree"
             }
         );
         assert_eq!(
-            derive(&[event(1, "/tmp", "main")], 1, 10, &keys()),
+            derive(&[event(1, "/tmp/swm-9", "")], 1, 10, None, &keys()),
+            Focus::None {
+                reason: "no_worktree"
+            }
+        );
+        assert_eq!(
+            derive(&[event(1, "/tmp", "main")], 1, 10, None, &keys()),
             Focus::None {
                 reason: "no_ticket"
             }
+        );
+    }
+
+    #[trace("FR-037-AC-2")]
+    #[test]
+    fn a_floor_clips_the_window_to_events_after_an_order() {
+        let events = [event(10, "/w", "swm-999-x"), event(200, "/w", "swm-211-y")];
+        assert!(matches!(
+            derive(&events, 300, 600_000, None, &keys()),
+            Focus::Ambiguous { .. }
+        ));
+        assert_eq!(
+            derive(&events, 300, 600_000, Some(100), &keys()).ticket(),
+            Some("SWM-211")
         );
     }
 }

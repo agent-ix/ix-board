@@ -19,7 +19,9 @@ const RELAY_OWNED: [&str; 6] = [
 ];
 /// Default orchestrator cycle, ten minutes (FR-039).
 const DEFAULT_CYCLE_SECS: u64 = 600;
-const KNOWN: [&str; 14] = [
+const KNOWN: [&str; 16] = [
+    "team_keys",
+    "focus_window_secs",
     "ledger_path",
     "ledger_retention_days",
     "ledger_lock_wait_secs",
@@ -76,6 +78,11 @@ pub struct FleetConfig {
     pub cycle_interval: Duration,
     /// Grace of `open_cycles`; unset means one cycle plus one tick.
     pub grace: Option<Duration>,
+    /// Linear team keys a ticket identifier is recognised by in branch and directory names
+    /// (FR-037). The keys of an assignment are always recognised as well.
+    pub team_keys: Vec<String>,
+    /// The focus window of FR-037; ten minutes by default.
+    pub focus_window: Duration,
 }
 
 impl Default for FleetConfig {
@@ -95,6 +102,8 @@ impl Default for FleetConfig {
             tick_interval: Duration::from_secs(300),
             cycle_interval: Duration::from_secs(DEFAULT_CYCLE_SECS),
             grace: None,
+            team_keys: Vec::new(),
+            focus_window: Duration::from_secs(10 * 60),
         }
     }
 }
@@ -158,6 +167,8 @@ impl FleetConfig {
                 .map(str::to_owned);
             config.lanes = strings(table, "lanes")?;
             config.hosts = strings(table, "hosts")?;
+            config.team_keys = strings(table, "team_keys")?;
+            secs(table, "focus_window_secs", &mut config.focus_window)?;
             if let Some(value) = table.get("loop_stops") {
                 config.loop_stops = value
                     .as_integer()

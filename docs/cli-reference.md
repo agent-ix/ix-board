@@ -486,6 +486,33 @@ Emits one row per registered lane with one class: `WORKING`, `IDLE`, `BLOCKED(re
 
 Exit status: 0 when no source defect exists. Any defect (`missing_lane`, `missing_host`, `no_events`, `stale_source`, `clock_skew`, `unreadable_source`, `stale_host_registry`, `relay_activity_absent`, `lane_registry_absent`, `host_lane_list_absent` (the host's lanes are UNREACHABLE), `host_hook_events_absent`, `series_absent`, `series_naming_unverified`, `receipts_recording_gap`, `ledger_unwritable`) sets `complete` to false and exits 1 (ix-cli-kit partial). When no row could be produced it exits 4 (internal error). A refused `[fleet]` configuration exits 3. `STALE-ORDER` reads the `AckExpired` receipts the relay recorded (ix-relay FR-067, FR-071), per lane address, across the relay's whole retained receipt stream; an order with no `Delivered` receipt is `timed_out`, and one with an `Acted` receipt is not stale. A receipt stream that cannot be read, whose cursor was evicted, or that needs more than its page bound is an `unreadable_source` defect on `relay.receipts`, as is an expired order whose recipient has no registered lane address. A recording gap or a pending observation is one `receipts_recording_gap` defect, as is an evicted range that hides the `Queued` receipt of a `timed_out` order; each `timed_out` row it may affect carries `receipt_gap`. Unresolved recipients are one defect per recipient, listing the order ids.
 
+## ix-board fleet assign
+
+```text
+Send a lane its ordered tickets as a relay order, store the list, and wait for the outcome
+
+Usage: ix-board fleet assign [OPTIONS] <LANE> <TICKETS>...
+
+Arguments:
+  <LANE>        Lane address server:workspace:tab
+  <TICKETS>...  Ticket identifiers in order; the first is the expected ticket
+
+Options:
+      --deadline <DEADLINE>  Acknowledgement deadline (for example 90s, 5m) [default: 5m]
+      --json                 Emit machine-readable JSON on stdout instead of human-readable text
+  -h, --help                 Print help
+```
+
+Reads each ticket (identifier, title, state, description with its acceptance criteria) from the Linear cache, sends the exact text to the lane as one relay order with the acknowledgement deadline and `--expect-ticket` set to the first ticket, and only after the relay accepts the order writes the ordered list for the lane address through the ix-relay assignment list (FR-072), carrying the order id. A later `assign` replaces the list. Nothing is written to `PLAN-*.md`.
+
+The caller needs the orchestrator role: `[assign] orchestrator = true` in the ix-relay `config.toml`. The command refuses, before any send: tickets that are unreadable, Done, Canceled, Duplicate, merged or named twice; a ticket another lane already holds (the lane is named); the caller's own lane; an unknown lane; a lane on a host whose registry lease expired (`host_registry_stale`); a lane without exactly one registered session (`no_recipient`); a first ticket id over 64 bytes; an order body over the relay limit of 4096 bytes (assign fewer tickets) or holding an unsafe character.
+
+The command waits until the deadline and prints one result. `confirmed`: the lane's focus, derived from the branch or worktree directory of its hook events after the order was queued (FR-037), is the first ticket before the deadline. `acted_not_focused`: the session acted but its focus is another ticket. `ack_expired`: delivered, no action by the deadline. `timed_out`: never delivered. The report carries `order_id`, `expect_ticket`, `sent_at_ms`, `deadline_at_ms`, `result`, `result_at_ms`, `confirm_latency_s` (whole seconds; absent unless confirmed), `focus_at_deadline`, `list_version`, `previous_tickets`, `list_write_error` and `defects`. Relay reads that fail while waiting are retried and reported as a `relay_read_errors` defect.
+
+Each assignment is one `assignment_history` row in the fleet ledger: written `pending` before the send, completed with the order, and completed with the result. `fleet status` completes rows left `pending` by a killed command and fills `focus_at_deadline` of rows confirmed before their deadline. `[fleet]` accepts `team_keys` (Linear team keys read from branch and directory names; the keys of the assigned tickets are always read) and `focus_window_secs` (default 600).
+
+Exit status: 0 for `confirmed`. 1 for `acted_not_focused`, `ack_expired` or `timed_out`. 3 for a refusal of the request or configuration. 4 for an operational failure: the relay cannot be connected, the send fails, the list write fails after the accepted send (the report names the order), or a ledger write fails (`ledger_unwritable`).
+
 ## ix-board fleet ledger query
 
 ```text

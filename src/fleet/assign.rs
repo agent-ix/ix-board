@@ -5,11 +5,11 @@
 //! FR-072 assignment list, and report whether the lane took up the first ticket (FR-035).
 //!
 //! The command talks to the relay through [`AssignBus`], implemented for [`Relay`], so the
-//! decision logic is exercised through relay-core's real paths. The fleet ledger (FR-039,
-//! SWM-215) is reached through [`AssignLedger`]; until it lands the result is the command's
-//! output only ([`NoLedger`]).
+//! decision logic is exercised through relay-core's real paths. The result is written to the
+//! fleet ledger (FR-039) through [`AssignLedger`] at the send and at the outcome; a run of
+//! `fleet status` completes a row whose command was killed ([`decide`] is shared by both).
 
-use super::focus::{self, Focus, FocusEvent};
+use super::focus::{self, FocusEvent};
 use crate::model::{Issue, IssueBatch, WorkflowStateType};
 use relay_core::assignment::{
     AssignWrite, AssignWriter, AssignedTicket, AssignmentList, MAX_TICKET_ID_BYTES, lane_address,
@@ -20,11 +20,8 @@ use relay_core::receipts::{
 };
 use relay_core::{ACTIVITY_MAX_EVENTS, AgentName, Message, Relay, Target, text};
 use serde::Serialize;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error as ThisError;
-
-/// Where the assign result is recorded until the fleet ledger exists.
-pub const LEDGER_SEAM: &str = "not_recorded: fleet ledger (SWM-215) is not on this build";
 
 /// A refusal or failure of `fleet assign`. The relay list is unchanged and, except for
 /// [`AssignError::Relay`] after the send, no order was sent.
@@ -84,9 +81,18 @@ pub enum AssignError {
     /// The send failed; nothing was stored.
     #[error("send failed, list unchanged: {0}")]
     Send(String),
-    /// The ledger seam refused the pending row.
+    /// The ledger refused the pending row.
     #[error("ledger: {0}")]
     Ledger(String),
+}
+
+impl AssignError {
+    /// Whether the failure is operational (the relay, the send or the ledger) and not a refusal
+    /// of the request.
+    #[must_use]
+    pub fn operational(&self) -> bool {
+        matches!(self, Self::Relay(_) | Self::Send(_) | Self::Ledger(_))
+    }
 }
 
 /// The result of one assignment (FR-035 behavior 6).
@@ -117,6 +123,29 @@ impl AssignResult {
             Self::TimedOut => "timed_out",
         }
     }
+
+    /// The result named `name`.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        [
+            Self::Pending,
+            Self::Confirmed,
+            Self::ActedNotFocused,
+            Self::AckExpired,
+            Self::TimedOut,
+        ]
+        .into_iter()
+        .find(|r| r.name() == name)
+    }
+}
+
+/// A failure the command reports instead of dropping.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct AssignDefect {
+    /// `ledger_unwritable` or `relay_read_errors`.
+    pub kind: String,
+    /// The cause.
+    pub detail: String,
 }
 
 /// The assignment as reported, and the shape of an `assignment_history` row (FR-039).
@@ -126,10 +155,12 @@ pub struct AssignReport {
     pub lane: String,
     /// The assigned ticket ids in order.
     pub tickets: Vec<String>,
-    /// The relay identity of the accepted order; empty before the relay accepts it.
+    /// The relay identity of the accepted order; absent before the relay accepts it.
     pub order_id: Option<String>,
     /// The first ticket, carried on the order.
     pub expect_ticket: String,
+    /// Relay time the command began, Unix milliseconds.
+    pub started_at_ms: i64,
     /// Relay time the order was queued, Unix milliseconds.
     pub sent_at_ms: Option<i64>,
     /// Relay time the acknowledgement deadline falls, Unix milliseconds.
@@ -138,10 +169,12 @@ pub struct AssignReport {
     pub result: AssignResult,
     /// Relay time of the result, Unix milliseconds.
     pub result_at_ms: Option<i64>,
-    /// Seconds from the send to the first event whose derived focus is the first ticket; absent
-    /// when unconfirmed.
-    pub confirm_latency_s: Option<f64>,
-    /// The derived focus at the deadline.
+    /// Whole seconds from the send to the first event whose derived focus is the first ticket;
+    /// absent when unconfirmed.
+    pub confirm_latency_s: Option<i64>,
+    /// The derived focus at the deadline. Absent while the deadline has not passed (a lane
+    /// confirmed early): the first run after the deadline fills it from the events up to the
+    /// deadline.
     pub focus_at_deadline: Option<String>,
     /// The list version the write left.
     pub list_version: Option<u64>,
@@ -149,26 +182,38 @@ pub struct AssignReport {
     pub previous_tickets: Vec<String>,
     /// Why the list write failed after the order was accepted.
     pub list_write_error: Option<String>,
-    /// Where the row was recorded.
-    pub ledger: String,
+    /// Failures that did not stop the command but make its result incomplete.
+    pub defects: Vec<AssignDefect>,
 }
 
 impl AssignReport {
     /// Whether the command exits zero.
     #[must_use]
     pub fn confirmed(&self) -> bool {
-        self.result == AssignResult::Confirmed && self.list_write_error.is_none()
+        self.result == AssignResult::Confirmed && !self.operational_failure()
     }
 
-    /// Whether the failure is an accepted order whose list was not stored.
+    /// Whether the command failed after the relay accepted the order: the list was not stored,
+    /// or the ledger could not take the result.
     #[must_use]
-    pub fn list_write_failed(&self) -> bool {
+    pub fn operational_failure(&self) -> bool {
         self.list_write_error.is_some()
+            || self.defects.iter().any(|d| d.kind == "ledger_unwritable")
+    }
+
+    fn defect(&mut self, kind: &str, detail: String) {
+        match self.defects.iter_mut().find(|d| d.kind == kind) {
+            Some(existing) => existing.detail = detail,
+            None => self.defects.push(AssignDefect {
+                kind: kind.to_owned(),
+                detail,
+            }),
+        }
     }
 }
 
-/// The fleet ledger's `assignment_history` write. Each call upserts the row keyed by
-/// `order_id` (empty before the send).
+/// The fleet ledger's `assignment_history` write. Each call upserts the row of this
+/// assignment.
 pub trait AssignLedger {
     /// Records the row as it stands.
     ///
@@ -176,13 +221,24 @@ pub trait AssignLedger {
     ///
     /// The ledger could not take the row.
     fn record(&mut self, row: &AssignReport) -> Result<(), String>;
+
+    /// Withdraws the row of an assignment whose order was never accepted.
+    ///
+    /// # Errors
+    ///
+    /// The ledger could not remove the row.
+    fn withdraw(&mut self) -> Result<(), String>;
 }
 
-/// The seam used until the fleet ledger exists: the result lives in the command output.
+/// A ledger that keeps nothing, for callers that only want the report.
 pub struct NoLedger;
 
 impl AssignLedger for NoLedger {
     fn record(&mut self, _row: &AssignReport) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn withdraw(&mut self) -> Result<(), String> {
         Ok(())
     }
 }
@@ -201,14 +257,34 @@ pub struct RegistryView {
 /// The relay operations `fleet assign` uses.
 pub trait AssignBus {
     /// The registry and the relay clock.
+    ///
+    /// # Errors
+    ///
+    /// The relay could not be read.
     fn registry(&mut self) -> Result<RegistryView, String>;
     /// Every lane's assignment list.
+    ///
+    /// # Errors
+    ///
+    /// The relay could not be read.
     fn assignments(&mut self) -> Result<Vec<AssignmentList>, String>;
     /// Sends `msg` as an order.
+    ///
+    /// # Errors
+    ///
+    /// The relay refused or could not take the order.
     fn send_order(&mut self, msg: &Message, spec: &OrderSpec) -> Result<Vec<AgentName>, String>;
     /// Receipts observed at or after `since_ms`.
+    ///
+    /// # Errors
+    ///
+    /// The receipts could not be read completely.
     fn receipts_since(&mut self, since_ms: i64) -> Result<Vec<ReceiptEvent>, String>;
     /// Replaces the lane's list, carrying `order_id`.
+    ///
+    /// # Errors
+    ///
+    /// The relay refused the write.
     fn write_list(
         &mut self,
         writer: &AssignWriter,
@@ -217,6 +293,10 @@ pub trait AssignBus {
         order_id: &str,
     ) -> Result<AssignmentList, String>;
     /// The hook events of one lane.
+    ///
+    /// # Errors
+    ///
+    /// The activity stream could not be read.
     fn lane_events(&mut self, lane: &str) -> Result<Vec<FocusEvent>, String>;
 }
 
@@ -311,6 +391,8 @@ pub struct AssignRequest {
     pub poll: Duration,
     /// The focus window in milliseconds.
     pub focus_window_ms: i64,
+    /// The configured team keys (FR-037); the keys of the assigned tickets are always added.
+    pub team_keys: Vec<String>,
 }
 
 fn closed(issue: &Issue) -> bool {
@@ -384,14 +466,132 @@ fn same_lane(a: &str, b: &str) -> bool {
     }
 }
 
-fn ticket_keys(tickets: &[String]) -> Vec<String> {
-    let mut keys: Vec<String> = tickets
+/// The team keys a focus is read with: the configured keys and the keys of `tickets`.
+#[must_use]
+pub fn focus_keys(configured: &[String], tickets: &[String]) -> Vec<String> {
+    let mut keys: Vec<String> = configured
         .iter()
-        .filter_map(|t| t.rsplit_once('-').map(|(key, _)| key.to_ascii_uppercase()))
+        .cloned()
+        .chain(
+            tickets
+                .iter()
+                .filter_map(|t| t.rsplit_once('-').map(|(key, _)| key.to_owned())),
+        )
+        .map(|key| key.to_ascii_uppercase())
         .collect();
     keys.sort();
     keys.dedup();
     keys
+}
+
+/// What the receipts show about one order.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OrderEvidence {
+    /// A `Delivered` receipt exists.
+    pub delivered: bool,
+    /// An `Acted` receipt exists.
+    pub acted: bool,
+    /// An `AckExpired` receipt exists.
+    pub expired: bool,
+}
+
+impl OrderEvidence {
+    /// Folds in the receipts of `order_id`.
+    pub fn absorb(&mut self, receipts: &[ReceiptEvent], order_id: &str) {
+        for event in receipts.iter().filter(|e| e.original_id == order_id) {
+            match event.outcome {
+                ReceiptOutcome::Delivered => self.delivered = true,
+                ReceiptOutcome::Acted => self.acted = true,
+                ReceiptOutcome::AckExpired => self.expired = true,
+                _ => {}
+            }
+        }
+    }
+}
+
+/// A decided assignment outcome.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Decision {
+    /// The result; never `Pending`.
+    pub result: AssignResult,
+    /// Relay time of the result, Unix milliseconds.
+    pub result_at_ms: i64,
+    /// Whole seconds from the send to the confirming event.
+    pub confirm_latency_s: Option<i64>,
+    /// The focus at the deadline, once the deadline has passed.
+    pub focus_at_deadline: Option<String>,
+}
+
+/// The inputs of [`decide`] besides the evidence.
+#[derive(Clone, Copy, Debug)]
+pub struct Timing {
+    /// Relay time the order was queued.
+    pub sent_at_ms: i64,
+    /// Relay time of the acknowledgement deadline.
+    pub deadline_at_ms: i64,
+    /// Relay time now.
+    pub now_ms: i64,
+    /// The focus window.
+    pub focus_window_ms: i64,
+}
+
+/// Decides the outcome of an order from the lane's events and the order's receipts, or `None`
+/// while it is open. `Confirmed` needs an event after `sent_at` and up to the deadline whose
+/// derived focus (over the events after `sent_at` only) is `first`; after the deadline, or on an
+/// `AckExpired` receipt, the result is `acted_not_focused` (acted), `ack_expired` (delivered) or
+/// `timed_out`.
+#[must_use]
+pub fn decide(
+    events: &[FocusEvent],
+    evidence: OrderEvidence,
+    timing: Timing,
+    keys: &[String],
+    first: &str,
+) -> Option<Decision> {
+    let Timing {
+        sent_at_ms,
+        deadline_at_ms,
+        now_ms,
+        focus_window_ms,
+    } = timing;
+    let past = now_ms >= deadline_at_ms;
+    let at_deadline =
+        || past.then(|| focus::derive(events, deadline_at_ms, focus_window_ms, None, keys).label());
+    let mut moments: Vec<i64> = events
+        .iter()
+        .map(|e| e.server_ms)
+        .filter(|ms| (sent_at_ms..=deadline_at_ms).contains(ms))
+        .collect();
+    moments.sort_unstable();
+    let confirmed = moments.into_iter().find(|ms| {
+        focus::derive(events, *ms, focus_window_ms, Some(sent_at_ms), keys).ticket() == Some(first)
+    });
+    if let Some(at) = confirmed {
+        return Some(Decision {
+            result: AssignResult::Confirmed,
+            result_at_ms: at,
+            confirm_latency_s: Some((at - sent_at_ms) / 1_000),
+            focus_at_deadline: at_deadline(),
+        });
+    }
+    if !(evidence.expired || past) {
+        return None;
+    }
+    let result = if evidence.acted {
+        AssignResult::ActedNotFocused
+    } else if evidence.delivered {
+        AssignResult::AckExpired
+    } else {
+        AssignResult::TimedOut
+    };
+    Some(Decision {
+        result,
+        result_at_ms: now_ms.min(deadline_at_ms.max(sent_at_ms)).max(sent_at_ms),
+        confirm_latency_s: None,
+        focus_at_deadline: Some(
+            focus::derive(events, deadline_at_ms, focus_window_ms, None, keys).label(),
+        ),
+    })
 }
 
 /// Assigns `request.tickets` to the lane and waits for the outcome.
@@ -407,7 +607,7 @@ pub fn assign(
     batch: &IssueBatch,
     writer: &AssignWriter,
 ) -> Result<AssignReport, AssignError> {
-    let relay = |e: String| AssignError::Relay(e);
+    let relay = AssignError::Relay;
     let issues = validate_tickets(request, batch)?;
     let ids: Vec<String> = issues.iter().map(|i| i.identifier.clone()).collect();
     let first = ids[0].clone();
@@ -454,7 +654,7 @@ pub fn assign(
         )));
     };
     let recipient = (*recipient).clone();
-    let held = bus.assignments().map_err(relay)?;
+    let held = bus.assignments().map_err(AssignError::Relay)?;
     let mut previous_tickets = Vec::new();
     for list in &held {
         if same_lane(&list.lane, &lane) {
@@ -490,11 +690,13 @@ pub fn assign(
         .as_ref()
         .map_or_else(|| "ix-board".parse(), |lane| lane.to_string().parse())
         .map_err(|e: relay_core::Error| AssignError::Order(e.to_string()))?;
+    let before_ms = registry.now_ms;
     let mut report = AssignReport {
         lane: lane.clone(),
         tickets: ids.clone(),
         order_id: None,
         expect_ticket: first.clone(),
+        started_at_ms: before_ms,
         sent_at_ms: None,
         deadline_at_ms: None,
         result: AssignResult::Pending,
@@ -504,11 +706,10 @@ pub fn assign(
         list_version: None,
         previous_tickets,
         list_write_error: None,
-        ledger: LEDGER_SEAM.to_owned(),
+        defects: Vec::new(),
     };
     ledger.record(&report).map_err(AssignError::Ledger)?;
 
-    let before_ms = registry.now_ms;
     let message = Message {
         from: sender.clone(),
         to: Target::Agent(recipient.clone()),
@@ -516,29 +717,35 @@ pub fn assign(
         sent_at_ms: before_ms,
         forwarded: false,
     };
-    bus.send_order(&message, &spec).map_err(AssignError::Send)?;
+    if let Err(error) = bus.send_order(&message, &spec) {
+        let withdrawn = ledger
+            .withdraw()
+            .err()
+            .map_or_else(String::new, |e| format!("; ledger row not withdrawn: {e}"));
+        return Err(AssignError::Send(format!("{error}{withdrawn}")));
+    }
 
     let queued = bus
         .receipts_since(before_ms.saturating_sub(1_000))
-        .map_err(relay);
-    let queued = queued.and_then(|events| {
-        events
-            .into_iter()
-            .rfind(|e| {
-                e.outcome == ReceiptOutcome::Queued
-                    && e.sender == sender.as_str()
-                    && e.target == recipient.as_str()
-                    && e.observed_at_ms >= before_ms
-            })
-            .ok_or_else(|| {
-                AssignError::Relay("the accepted order has no Queued receipt".to_owned())
-            })
-    });
+        .map_err(AssignError::Relay)
+        .and_then(|events| {
+            events
+                .into_iter()
+                .rfind(|e| {
+                    e.outcome == ReceiptOutcome::Queued
+                        && e.sender == sender.as_str()
+                        && e.target == recipient.as_str()
+                        && e.observed_at_ms >= before_ms
+                })
+                .ok_or_else(|| {
+                    AssignError::Relay("the accepted order has no Queued receipt".to_owned())
+                })
+        });
     let queued = match queued {
         Ok(event) => event,
         Err(error) => {
             report.list_write_error = Some(format!("order accepted but not identified: {error}"));
-            let _ = ledger.record(&report);
+            record_after_send(ledger, &mut report);
             return Ok(report);
         }
     };
@@ -562,77 +769,83 @@ pub fn assign(
             report.list_write_error = Some(format!(
                 "order {order_id} was accepted by the relay but the list write failed: {error}"
             ));
-            let _ = ledger.record(&report);
+            record_after_send(ledger, &mut report);
             return Ok(report);
         }
     }
-    let _ = ledger.record(&report);
+    record_after_send(ledger, &mut report);
 
-    wait_for_outcome(bus, request, &mut report, &order_id, &first);
-    let _ = ledger.record(&report);
+    let keys = focus_keys(&request.team_keys, &ids);
+    wait_for_outcome(bus, request, &mut report, &order_id, &keys);
+    record_after_send(ledger, &mut report);
     Ok(report)
 }
 
+fn record_after_send(ledger: &mut impl AssignLedger, report: &mut AssignReport) {
+    if let Err(error) = ledger.record(report) {
+        report.defect("ledger_unwritable", error);
+    }
+}
+
+/// Polls until the outcome is decided. A read that fails is retried on the next poll and is
+/// reported as a `relay_read_errors` defect; the relay clock is carried forward locally while
+/// it cannot be read, and the outcome is decided at the deadline from what was read.
 fn wait_for_outcome(
     bus: &mut impl AssignBus,
     request: &AssignRequest,
     report: &mut AssignReport,
     order_id: &str,
-    first: &str,
+    keys: &[String],
 ) {
     let (sent_at, deadline_at) = (
         report.sent_at_ms.unwrap_or_default(),
         report.deadline_at_ms.unwrap_or_default(),
     );
-    let keys = ticket_keys(&report.tickets);
-    let mut seen_receipts = (false, false, false);
-    loop {
-        let now = bus.registry().map_or(deadline_at, |r| r.now_ms);
-        if let Ok(receipts) = bus.receipts_since(sent_at.saturating_sub(1_000)) {
-            for event in receipts.iter().filter(|e| e.original_id == order_id) {
-                match event.outcome {
-                    ReceiptOutcome::Delivered => seen_receipts.0 = true,
-                    ReceiptOutcome::Acted => seen_receipts.1 = true,
-                    ReceiptOutcome::AckExpired => seen_receipts.2 = true,
-                    _ => {}
-                }
+    let mut known_now = (sent_at, Instant::now());
+    let mut evidence = OrderEvidence::default();
+    let mut events: Vec<FocusEvent> = Vec::new();
+    let mut errors = 0_u32;
+    let mut last_error = String::new();
+    let decision = loop {
+        let mut failed = false;
+        match bus.registry() {
+            Ok(view) => known_now = (view.now_ms, Instant::now()),
+            Err(error) => (failed, errors, last_error) = (true, errors + 1, error),
+        }
+        match bus.receipts_since(sent_at.saturating_sub(1_000)) {
+            Ok(receipts) => evidence.absorb(&receipts, order_id),
+            Err(error) => (failed, errors, last_error) = (true, errors + 1, error),
+        }
+        match bus.lane_events(&report.lane) {
+            Ok(read) => events = read,
+            Err(error) => (failed, errors, last_error) = (true, errors + 1, error),
+        }
+        let elapsed = i64::try_from(known_now.1.elapsed().as_millis()).unwrap_or(i64::MAX);
+        let now_ms = known_now.0.saturating_add(elapsed);
+        let timing = Timing {
+            sent_at_ms: sent_at,
+            deadline_at_ms: deadline_at,
+            now_ms,
+            focus_window_ms: request.focus_window_ms,
+        };
+        if let Some(decision) = decide(&events, evidence, timing, keys, &report.expect_ticket) {
+            // A failed read before the deadline may hide the evidence that decides otherwise.
+            if !failed || now_ms >= deadline_at {
+                break decision;
             }
         }
-        let events = bus.lane_events(&report.lane).unwrap_or_default();
-        let mut moments: Vec<i64> = events
-            .iter()
-            .map(|e| e.server_ms)
-            .filter(|ms| (sent_at..=deadline_at).contains(ms))
-            .collect();
-        moments.sort_unstable();
-        let confirmed = moments.into_iter().find(|ms| {
-            focus::derive(&events, *ms, request.focus_window_ms, &keys).ticket() == Some(first)
-        });
-        if let Some(at) = confirmed {
-            report.result = AssignResult::Confirmed;
-            report.result_at_ms = Some(at);
-            report.confirm_latency_s = Some((at - sent_at) as f64 / 1_000.0);
-            report.focus_at_deadline =
-                Some(focus_label(&events, deadline_at.min(now), request, &keys));
-            return;
-        }
-        if seen_receipts.2 || now >= deadline_at {
-            report.result = match seen_receipts {
-                (_, true, _) => AssignResult::ActedNotFocused,
-                (true, false, _) => AssignResult::AckExpired,
-                (false, false, _) => AssignResult::TimedOut,
-            };
-            report.result_at_ms = Some(now);
-            report.focus_at_deadline = Some(focus_label(&events, deadline_at, request, &keys));
-            return;
-        }
         std::thread::sleep(request.poll);
+    };
+    if errors > 0 {
+        report.defect(
+            "relay_read_errors",
+            format!("{errors} relay read(s) failed while waiting; last: {last_error}"),
+        );
     }
-}
-
-fn focus_label(events: &[FocusEvent], at: i64, request: &AssignRequest, keys: &[String]) -> String {
-    let focus: Focus = focus::derive(events, at, request.focus_window_ms, keys);
-    focus.label()
+    report.result = decision.result;
+    report.result_at_ms = Some(decision.result_at_ms);
+    report.confirm_latency_s = decision.confirm_latency_s;
+    report.focus_at_deadline = decision.focus_at_deadline;
 }
 
 /// The plain-text rendering of a report.
@@ -657,6 +870,8 @@ pub fn render_text(report: &AssignReport) -> String {
     if let Some(error) = &report.list_write_error {
         lines.push(format!("error: {error}"));
     }
-    lines.push(format!("ledger: {}", report.ledger));
+    for defect in &report.defects {
+        lines.push(format!("defect: {} {}", defect.kind, defect.detail));
+    }
     lines.join("\n")
 }
