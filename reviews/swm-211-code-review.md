@@ -105,3 +105,10 @@ Round 1, fix head ebb3323 (rebased onto 541c6c9).
 | FND-007 | fixed | - |
 | FND-008 | fixed | - |
 | FND-009 | fixed | - |
+
+Round 2, fix head aaa4e1e.
+
+| FND | Outcome | Reason |
+| --- | --- | --- |
+| FND-010 | fixed | - |
+| FND-011 | fixed | - |
