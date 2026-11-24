@@ -83,9 +83,9 @@ impl SeriesSource for FakeSeries {
     }
 }
 
-struct Receipts(Result<Vec<OrderReceipt>, SourceError>);
+struct Receipts(Result<Vec<ExpiredOrder>, SourceError>);
 impl OrderReceipts for Receipts {
-    fn orders(&self) -> Result<Vec<OrderReceipt>, SourceError> {
+    fn expired_orders(&self) -> Result<Vec<ExpiredOrder>, SourceError> {
         self.0.clone()
     }
 }
@@ -100,7 +100,7 @@ impl WeakSignals for Weak {
 struct World {
     relay: RelaySnapshot,
     series: FakeSeries,
-    receipts: Result<Vec<OrderReceipt>, SourceError>,
+    receipts: Result<Vec<ExpiredOrder>, SourceError>,
     weak: BTreeMap<String, Vec<WeakSource>>,
     cfg: FleetConfig,
 }
@@ -141,23 +141,12 @@ impl World {
     }
 }
 
-fn order(
-    addr: &str,
-    delivered_ms: Option<i64>,
-    acted_ms: Option<i64>,
-    deadline_secs: u64,
-    ack_expired: bool,
-) -> OrderReceipt {
-    OrderReceipt {
+fn order(addr: &str, delivered: bool) -> ExpiredOrder {
+    ExpiredOrder {
         addr: addr.to_owned(),
-        enqueued_ms: delivered_ms.map_or(NOW - 5000, |d| d - 1000),
-        delivered_ms,
-        deadline: Duration::from_secs(deadline_secs),
-        acted_ms,
-        ack_expired,
+        delivered,
     }
 }
-
 fn class_of(report: &FleetReport, lane: &str) -> (ClassKind, Option<String>) {
     let row = report
         .rows
@@ -368,10 +357,7 @@ fn ack_expired_orders_are_stale_with_or_without_a_delivered_receipt() {
         ],
         &[],
     );
-    world.receipts = Ok(vec![
-        order("h:w:1", Some(NOW - 5000), None, 300, true),
-        order("h:w:2", None, None, 300, true),
-    ]);
+    world.receipts = Ok(vec![order("h:w:1", true), order("h:w:2", false)]);
     let report = world.run();
     assert_eq!(
         class_of(&report, "h:w:1"),
@@ -388,7 +374,7 @@ fn ack_expired_orders_are_stale_with_or_without_a_delivered_receipt() {
 fn unavailable_order_receipts_are_a_defect_not_an_empty_list() {
     let mut world = World::one_host(&["h:w:1"], vec![raw("h:w:1", HookKind::Stop, 5)], &[]);
     let pending = ix_board::fleet::live::PendingOrderReceipts;
-    world.receipts = pending.orders();
+    world.receipts = pending.expired_orders();
     let report = world.run();
     assert!(has_defect(&report, DefectKind::UnreadableSource));
     assert!(!report.complete);
@@ -732,53 +718,34 @@ fn stored_relay_events_parse_and_unreadable_ones_are_refused() {
 
 #[trace("FR-034-AC-12", "FR-034-AC-8")]
 #[test]
-fn the_order_deadline_boundary_runs_from_delivery_or_enqueue_on_relay_time() {
-    let deadline = 300u64;
-    let delivered = NOW - 300_000;
-    // Exactly at the deadline is not expired; one second beyond is.
-    assert_eq!(
-        order_expired(&order("a", Some(delivered), None, deadline, false), NOW),
-        None
-    );
-    assert_eq!(
-        order_expired(
-            &order("a", Some(delivered), None, deadline, false),
-            NOW + 1000
-        ),
-        Some(true)
-    );
-    // An order never delivered runs from enqueue and is `timed_out`.
-    let undelivered = order("a", None, None, deadline, false);
-    let at = undelivered.enqueued_ms + 300_000;
-    assert_eq!(order_expired(&undelivered, at), None);
-    assert_eq!(order_expired(&undelivered, at + 1000), Some(false));
-    // `Acted` before the deadline cancels it; a recorded AckExpired always counts.
-    assert_eq!(
-        order_expired(
-            &order("a", Some(delivered), Some(NOW - 1000), deadline, false),
-            NOW + 60_000
-        ),
-        None
-    );
-    assert_eq!(
-        order_expired(
-            &order("a", Some(delivered), None, deadline, true),
-            NOW - 250_000
-        ),
-        Some(true)
-    );
-    // The boundary reaches the class.
+fn stale_order_follows_only_the_relay_recorded_ack_expired() {
+    // The relay applies the order deadline. With no recorded AckExpired an order is never
+    // stale, however old; with one recorded it is, and `delivered` picks the reason.
     let mut world = World::one_host(&["h:w:1"], vec![raw("h:w:1", HookKind::Stop, 5)], &[]);
-    world.receipts = Ok(vec![order("h:w:1", Some(delivered), None, deadline, false)]);
+    world.receipts = Ok(Vec::new());
     assert_ne!(class_of(&world.run(), "h:w:1").0, ClassKind::StaleOrder);
-    world.receipts = Ok(vec![order(
-        "h:w:1",
-        Some(delivered - 1000),
-        None,
-        deadline,
-        false,
-    )]);
-    assert_eq!(class_of(&world.run(), "h:w:1").0, ClassKind::StaleOrder);
+    world.receipts = Ok(vec![order("h:w:1", true)]);
+    assert_eq!(
+        class_of(&world.run(), "h:w:1"),
+        (ClassKind::StaleOrder, Some("ack_expired".to_owned()))
+    );
+    world.receipts = Ok(vec![order("h:w:1", false)]);
+    assert_eq!(
+        class_of(&world.run(), "h:w:1"),
+        (ClassKind::StaleOrder, Some("timed_out".to_owned()))
+    );
+    let sources = [
+        include_str!("../src/fleet/classify.rs"),
+        include_str!("../src/fleet/report.rs"),
+    ]
+    .concat();
+    let code = sources
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"));
+    assert!(
+        code.into_iter().all(|l| !l.contains("deadline")),
+        "ix-board recomputes no order deadline"
+    );
 }
 
 #[trace("FR-034-AC-4")]
@@ -993,4 +960,99 @@ fn empty_prometheus_results_mark_the_required_series_absent_under_one_set_of_nam
         series::COMPILE_SECONDS,
         "ix_fleet_lane_compile_seconds_total"
     );
+}
+
+#[trace("FR-034-AC-20")]
+#[test]
+fn a_readable_prometheus_without_the_always_present_series_raises_one_naming_defect() {
+    use ix_board::fleet::live::series;
+    let mut world = World::one_host(&["h:w:1", "g:w:1"], vec![], &[]);
+    let mut wrong = series(WINDOW, &[]);
+    wrong.absent = vec![series::PROBE_OK.to_owned(), series::CONFIG.to_owned()];
+    world.series.hosts.insert("h".to_owned(), Ok(wrong.clone()));
+    world.series.hosts.insert("g".to_owned(), Ok(wrong));
+    let report = world.run();
+    let naming: Vec<_> = report
+        .defects
+        .iter()
+        .filter(|d| d.kind == DefectKind::SeriesNamingUnverified)
+        .collect();
+    assert_eq!(naming.len(), 1);
+    assert!(
+        naming[0].reason.contains(series::PROBE_OK) && naming[0].reason.contains(series::CONFIG)
+    );
+    assert!(!has_defect(&report, DefectKind::SeriesAbsent));
+    // One of the two series present on any host: no naming defect.
+    let mut partial = series(WINDOW, &[]);
+    partial.absent = vec![series::PROBE_OK.to_owned()];
+    world.series.hosts.insert("h".to_owned(), Ok(partial));
+    assert!(!has_defect(
+        &world.run(),
+        DefectKind::SeriesNamingUnverified
+    ));
+    // An unreadable Prometheus is not a naming problem.
+    world
+        .series
+        .hosts
+        .insert("h".to_owned(), Err(SourceError("503".to_owned())));
+    world
+        .series
+        .hosts
+        .insert("g".to_owned(), Err(SourceError("503".to_owned())));
+    assert!(!has_defect(
+        &world.run(),
+        DefectKind::SeriesNamingUnverified
+    ));
+}
+
+#[trace("FR-034-AC-21")]
+#[test]
+fn per_host_absence_is_visible_even_when_other_hosts_have_data() {
+    let mut world = World::one_host(
+        &["h:w:1", "g:w:1"],
+        vec![raw("h:w:1", HookKind::Prompt, 5)],
+        &[],
+    );
+    // Host `n` has a registration and no published lane list; host `g` has a list and lanes
+    // with no hook event while `h` has events.
+    world.relay.lists.push(list("g", &["g:w:1"]));
+    world
+        .relay
+        .lists
+        .retain(|l| l.machine.as_str() != "h" || !l.lanes.is_empty());
+    world.relay.registrations = vec![RegInfo {
+        addr: "n:w:1".to_owned(),
+        last_seen_ms: NOW - 1000,
+        has_pane: true,
+    }];
+    world
+        .series
+        .hosts
+        .insert("n".to_owned(), Ok(series(WINDOW, &[])));
+    world
+        .series
+        .hosts
+        .insert("g".to_owned(), Ok(series(WINDOW, &[])));
+    let report = world.run();
+    assert_eq!(class_of(&report, "n:w:1").0, ClassKind::Unreachable);
+    let on = |kind, host: &str| {
+        report
+            .defects
+            .iter()
+            .filter(|d| d.kind == kind && d.host.as_deref() == Some(host))
+            .count()
+    };
+    assert_eq!(on(DefectKind::HostLaneListAbsent, "n"), 1);
+    assert_eq!(on(DefectKind::HostHookEventsAbsent, "g"), 1);
+    assert_eq!(on(DefectKind::HostHookEventsAbsent, "n"), 1);
+    assert_eq!(on(DefectKind::HostHookEventsAbsent, "h"), 0);
+    assert_eq!(on(DefectKind::HostLaneListAbsent, "h"), 0);
+    assert_eq!(class_of(&report, "h:w:1").0, ClassKind::Working);
+    // With the whole stream absent only the run-level defect is raised, not one per host.
+    world.relay.activity_absent = true;
+    assert_eq!(on_count(&world.run(), DefectKind::HostHookEventsAbsent), 0);
+}
+
+fn on_count(report: &FleetReport, kind: DefectKind) -> usize {
+    report.defects.iter().filter(|d| d.kind == kind).count()
 }

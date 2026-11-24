@@ -9,6 +9,7 @@ use super::classify::{
 use super::config::{
     RELAY_DEFAULT_MAX_TOOL_RUNTIME, RELAY_DEFAULT_NO_EVENTS_AFTER, RELAY_DEFAULT_WORKING_WINDOW,
 };
+use super::live::series;
 use super::{FleetConfig, SourceError};
 use relay_core::fleet::{HostLaneList, fleet_registry};
 use serde::Serialize;
@@ -111,40 +112,14 @@ pub struct HostSeries {
     pub absent: Vec<String>,
 }
 
-/// One order to a lane as the relay receipts record it (FR-067, FR-071).
+/// An order whose `AckExpired` receipt the relay recorded (FR-067, FR-071). The relay applies the
+/// order deadline; ix-board recomputes none.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OrderReceipt {
+pub struct ExpiredOrder {
     /// Recipient lane address.
     pub addr: String,
-    /// Relay time the order was enqueued.
-    pub enqueued_ms: i64,
-    /// Relay time of the `Delivered` receipt, if any.
-    pub delivered_ms: Option<i64>,
-    /// The acknowledgement deadline the order carries.
-    pub deadline: Duration,
-    /// Relay time of the `Acted` receipt, if any.
-    pub acted_ms: Option<i64>,
-    /// An `AckExpired` receipt is recorded.
-    pub ack_expired: bool,
-}
-
-/// Whether `order` is expired at `now_ms`: `Some(true)` when a `Delivered` receipt exists
-/// (`ack_expired`), `Some(false)` when it has none (`timed_out`), `None` when not expired.
-///
-/// The deadline runs from `Delivered`, or from enqueue for an order never delivered, on relay
-/// time. A recorded `AckExpired` always counts; otherwise an elapsed deadline with no `Acted`
-/// counts, which covers the watcher's scan lag. Exactly at the deadline is not yet expired.
-pub fn order_expired(order: &OrderReceipt, now_ms: i64) -> Option<bool> {
-    let delivered = order.delivered_ms.is_some();
-    if order.ack_expired {
-        return Some(delivered);
-    }
-    if order.acted_ms.is_some() {
-        return None;
-    }
-    let start = order.delivered_ms.unwrap_or(order.enqueued_ms);
-    let deadline = i64::try_from(order.deadline.as_millis()).unwrap_or(i64::MAX);
-    (now_ms > start.saturating_add(deadline)).then_some(delivered)
+    /// Whether a `Delivered` receipt exists; `false` is `timed_out`.
+    pub delivered: bool,
 }
 
 /// Watcher series by host (Prometheus HTTP API).
@@ -159,12 +134,12 @@ pub trait SeriesSource: Send + Sync {
 
 /// The FR-035 order receipts (`Acted`, `AckExpired`) read from the relay.
 pub trait OrderReceipts {
-    /// Recent orders with their receipt states.
+    /// Orders with a recorded `AckExpired` receipt.
     ///
     /// # Errors
     ///
     /// The reason the receipts could not be read.
-    fn orders(&self) -> Result<Vec<OrderReceipt>, SourceError>;
+    fn expired_orders(&self) -> Result<Vec<ExpiredOrder>, SourceError>;
 }
 
 /// Weak signals (herdr title, pane text, self-report) that a lane is working.
@@ -201,6 +176,12 @@ pub enum DefectKind {
     LaneRegistryAbsent,
     /// A queried Prometheus series returned nothing on any host.
     SeriesAbsent,
+    /// Prometheus is readable but the always-present series are absent under the assumed names.
+    SeriesNamingUnverified,
+    /// A host never published a lane list.
+    HostLaneListAbsent,
+    /// A host has registered lanes but no hook event from any of them.
+    HostHookEventsAbsent,
     /// A source is older than twice its push interval.
     StaleSource,
     /// The relay and ix-board clocks differ by more than `max_clock_skew`.
@@ -467,11 +448,32 @@ fn absence_defects(ctx: &mut Ctx<'_>, relay: &RelaySnapshot, reads: &HostReads) 
     if read.is_empty() {
         return;
     }
+    // The always-present series prove the naming scheme: when neither exists on any readable
+    // host, the names are suspect, and one defect says so instead of a row per series.
+    let always = [series::PROBE_OK, series::CONFIG];
+    let missing = |name: &str| read.iter().all(|s| s.absent.iter().any(|a| a == name));
+    let naming_unverified = always.iter().all(|name| missing(name));
+    if naming_unverified {
+        ctx.defect(
+            DefectKind::SeriesNamingUnverified,
+            "prometheus",
+            None,
+            None,
+            format!(
+                "Prometheus is readable but none of {} exists; the assumed OTLP translation of \
+                 the series names may be wrong",
+                always.join(", ")
+            ),
+        );
+    }
     let mut names: BTreeSet<&String> = BTreeSet::new();
     for series in &read {
         names.extend(series.absent.iter());
     }
     for name in names {
+        if naming_unverified && always.contains(&name.as_str()) {
+            continue;
+        }
         if read.iter().all(|series| series.absent.contains(name)) {
             ctx.defect(
                 DefectKind::SeriesAbsent,
@@ -626,7 +628,7 @@ pub fn build_report(cfg: &FleetConfig, sources: &Sources<'_>, local_now_ms: i64)
         host_defects(&mut ctx, host, read);
     }
     absence_defects(&mut ctx, relay, &reads);
-    let orders = match sources.receipts.orders() {
+    let orders = match sources.receipts.expired_orders() {
         Ok(orders) => orders,
         Err(error) => {
             ctx.defect(
@@ -646,11 +648,40 @@ pub fn build_report(cfg: &FleetConfig, sources: &Sources<'_>, local_now_ms: i64)
             .or_default()
             .push(raw.event);
     }
+    let published: BTreeSet<String> = relay
+        .lists
+        .iter()
+        .map(|l| l.machine.as_str().to_lowercase())
+        .collect();
+    let no_list_hosts: BTreeSet<String> = lane_hosts.difference(&published).cloned().collect();
+    for host in &no_list_hosts {
+        ctx.defect(
+            DefectKind::HostLaneListAbsent,
+            "relay.registry",
+            Some(host),
+            None,
+            "the host never published a lane list; its lanes are unreachable",
+        );
+    }
+    if !relay.activity_absent {
+        let hosts_with_events: BTreeSet<String> =
+            relay.events.iter().map(|raw| host_of(&raw.addr)).collect();
+        for host in lane_hosts.difference(&hosts_with_events) {
+            ctx.defect(
+                DefectKind::HostHookEventsAbsent,
+                "relay.activity",
+                Some(host),
+                None,
+                "no hook event from any lane of the host; hooks are not installed or failing",
+            );
+        }
+    }
     let mut rows = Vec::new();
     for lane in &registry {
         let key = lane.address.to_lowercase();
         let host = host_of(&lane.address);
-        let stale = lane.stale || lease_lapsed(relay, &lane.address);
+        let lapsed = lane.stale || lease_lapsed(relay, &lane.address);
+        let stale = lapsed || no_list_hosts.contains(&host);
         let mut lane_events = events.remove(&key).unwrap_or_default();
         lane_events.sort();
         lane_events.dedup();
@@ -671,12 +702,13 @@ pub fn build_report(cfg: &FleetConfig, sources: &Sources<'_>, local_now_ms: i64)
             expired_order: orders
                 .iter()
                 .filter(|o| o.addr.to_lowercase() == key)
-                .find_map(|o| order_expired(o, relay.now_ms)),
+                .map(|o| o.delivered)
+                .next(),
             weak: sources.weak.signals(&lane.address),
         };
         let result = classify(&input, &th, relay.now_ms);
         let last = input.events.last().copied();
-        if stale {
+        if lapsed {
             ctx.defect(
                 DefectKind::StaleHostRegistry,
                 "relay.registry",

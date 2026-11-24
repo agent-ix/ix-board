@@ -73,3 +73,26 @@ means a pane exists.
 `CARGO_BUILD_JOBS=4 CARGO_TARGET_DIR=<worktree>/target make ci` exit 2:
 fmt-check, clippy and every test pass (20/20 in `tests/fleet.rs`), then
 `deny` fails on BSL-1.0 (FND-004).
+
+## New findings (disposition pass 1)
+
+| ID | Severity | Summary | Refs |
+| --- | --- | --- | --- |
+| FND-010 | medium | The naming scheme is never verified as such. `ix_fleet_lane_blocked_ratio` is rightly exempt from `series_absent`, because it is empty while no lane is blocked. Nothing then checks, each run, that the always-present series (`ix_fleet_probe_ok_ratio`, `ix_fleet_config_seconds`) exist under the assumed names, or raises one `series_naming_unverified` defect when they do not. A wrong blocked name surfaces only as a side effect of generic `series_absent` rows. Lead ruling: the guard is required. | src/fleet/report.rs:438-485, src/fleet/live.rs:165-181 |
+| FND-011 | medium | Per-host absence is still silent once any host has data. A host that never published a lane list is not covered by `lease_lapsed` (it needs an expired list), so its registered lanes read IDLE. Once the activity stream is non-empty, a host whose lanes have no hook event at all (hooks not installed or failing) gets no defect: `no_events` now skips lanes with no event. Only the all-hosts cases (`lane_registry_absent`, `relay_activity_absent`) are reported. | src/fleet/report.rs:488-504, src/fleet/report.rs:700-718, src/fleet/live.rs:52 |
+| FND-012 | medium | `order_expired` re-derives expiry from the deadline: "otherwise an elapsed deadline with no Acted counts". Lead ruling: STALE-ORDER uses only the relay-recorded `AckExpired` as the single source of truth, and ix-board must not compute deadline expiry. | src/fleet/report.rs:130-148 |
+| FND-013 | medium | FR-034 now contradicts itself. Inputs still says ix-board "SHALL NOT hold its own constant" for the working window and "SHALL hold no local copy" of `max_tool_runtime`/`no_events_after`. The new behaviour paragraph and AC-19 require documented relay defaults, held in `RELAY_DEFAULT_*` in config.rs. | spec/functional/FR-034-fleet-lane-status.md:40-44, src/fleet/config.rs:31-38 |
+
+## Dispositions
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-001 | fixed | - |
+| FND-002 | fixed | - |
+| FND-003 | fixed | - |
+| FND-004 | fixed | - |
+| FND-005 | fixed | - |
+| FND-006 | fixed | - |
+| FND-007 | fixed | - |
+| FND-008 | fixed | - |
+| FND-009 | deferred | Field renamed `observed_ms` and FR-034 now names it observation time; a true first-seen time needs the fleet ledger (SWM-215). |

@@ -38,10 +38,12 @@ The command SHALL NOT emit `UNKNOWN` as a class.
 - **herdr and git/GitHub:** herdr agent state and title, and pull-request head
   movements and commits on the branch of the lane's worktree.
 - The [FR-018](./FR-018-agent-activity-verdicts.md) agent verdict where readable.
-- **Working window.** ix-board SHALL read the working window from the ix-relay
-  configuration (default 10m, configured once) and SHALL NOT hold its own constant.
-  ix-board SHALL likewise read `max_tool_runtime` (default 2h) and `no_events_after`
-  from the relay `ix.fleet.config` and SHALL hold no local copy of either.
+- **Working window.** ix-board SHALL read the working window, `max_tool_runtime` and
+  `no_events_after` from the relay `ix.fleet.config` and SHALL accept no local override of
+  them. The documented relay defaults (working window 10m, `max_tool_runtime` 2h,
+  `no_events_after` 30m) are defined once in ix-board and used only for a host whose relay
+  configuration cannot be read; every row classed with a default carries
+  `thresholds_defaulted` and a defect names the cause (FR-034-AC-19).
   Other thresholds are ix-board configuration with defaults: `loop_stops` 3,
   `dead_after` 15m, `max_clock_skew` 30s.
 - **Time.** The command SHALL use relay server time for every event comparison.
@@ -80,7 +82,10 @@ fleet ledger of [FR-039](./FR-039-fleet-ledger.md)). The defect kinds are `missi
 `missing_host`, `no_events` (a registered lane whose newest event is not `stop`, `idle`,
 `session_end` or `blocked`, matching the relay `ix.fleet.lane.no_events`, and that has emitted no
 event for `no_events_after`; a quiet lane never carries it),
-`relay_activity_absent` (the relay holds no activity stream), `lane_registry_absent` (no host
+`relay_activity_absent` (the relay holds no activity stream), `host_lane_list_absent` (a host in the registry or
+registrations never published a lane list; its lanes are `UNREACHABLE`), `host_hook_events_absent` (a host has registered
+lanes and no hook event from any of them), `series_naming_unverified` (Prometheus is readable but the
+always-present `ix_fleet_probe_ok` and `ix_fleet_config` series are both absent under the assumed names), `lane_registry_absent` (no host
 lane list exists), `series_absent` (a queried watcher series that must exist returned nothing on
 any host), a registration with no resolvable address or that does not decode (an
 `unreadable_source` row naming its id),
@@ -117,13 +122,15 @@ is authoritative for fleet decisions; the relay lane-state series is advisory.
 | FR-034-AC-10 | A configured lane with no registry record and a configured host with no lanes give `missing_lane`/`missing_host` defects, `complete` false and a non-zero exit. | Test |
 | FR-034-AC-11 | The working window equals the value read from the relay configuration; a fixture changing it changes classification and the code holds no second constant (an inspection of the source finds one definition). | Test |
 | FR-034-AC-16 | `max_tool_runtime` and `no_events_after` equal the relay `ix.fleet.config` values and ix-board configuration rejects local overrides of them. | Test |
-| FR-034-AC-12 | Boundary fixtures at exactly and one second beyond the working window, relay-configured `max_tool_runtime`, `dead_after` and the order deadline classify as specified; configured values override the defaults of the ix-board-owned thresholds (`loop_stops`, `dead_after`, `max_clock_skew`) only, and the relay-owned values (working window, `max_tool_runtime`, `no_events_after`) are read from the relay and cannot be overridden. | Test |
+| FR-034-AC-12 | Boundary fixtures at exactly and one second beyond the working window, relay-configured `max_tool_runtime` and `dead_after` classify as specified, and an order is STALE-ORDER only when the relay recorded `AckExpired` (ix-board recomputes no order deadline); configured values override the defaults of the ix-board-owned thresholds (`loop_stops`, `dead_after`, `max_clock_skew`) only, and the relay-owned values (working window, `max_tool_runtime`, `no_events_after`) are read from the relay and cannot be overridden. | Test |
 | FR-034-AC-13 | A relay-to-ix-board clock difference above `max_clock_skew` raises `clock_skew` and every age is still computed from relay server time; host-local timestamps never enter an age. | Test |
 | FR-034-AC-14 | One host timing out leaves other hosts' rows unchanged and adds an `unreadable_source` defect within the per-host bound. | Test |
 | FR-034-AC-15 | Text and `--json` carry the same rows, defects and `complete`; two runs on identical evidence give identical JSON once run-time-dependent fields (run timestamp and state ages) are masked. | Test |
 | FR-034-AC-17 | A missing activity stream, a missing lane registry, a registration with no resolvable address or that does not decode, and a watcher series absent on every host each add a run-level defect naming the source, and the run is not complete. | Test |
 | FR-034-AC-18 | The report carries per-host lanes total, working and not working, with `UNREACHABLE` lanes counted as not working. | Test |
 | FR-034-AC-19 | With Prometheus unset or unreadable, hook evidence still classes lanes with the documented relay defaults, every such row is marked `thresholds_defaulted`, and one run-level defect names the remedy; a registration on a host whose lease lapsed is `UNREACHABLE`. | Test |
+| FR-034-AC-20 | With Prometheus readable and both `ix_fleet_probe_ok` and `ix_fleet_config` absent on every host, one `series_naming_unverified` defect names the expected series; either present suppresses it. | Test |
+| FR-034-AC-21 | A host with registered lanes that never published a lane list gets one `host_lane_list_absent` defect and its lanes are UNREACHABLE; a host whose lanes have no hook event while others do gets one `host_hook_events_absent` defect. | Test |
 
 ## Dependencies
 

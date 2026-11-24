@@ -23,9 +23,9 @@ pub use config::{
 };
 pub use render::render_text;
 pub use report::{
-    Coverage, Defect, DefectKind, FleetReport, HostSeries, HostSummary, LaneRow, OrderReceipt,
+    Coverage, Defect, DefectKind, ExpiredOrder, FleetReport, HostSeries, HostSummary, LaneRow,
     OrderReceipts, ProbeReading, RawEvent, RegInfo, RelayConfig, RelaySnapshot, SCHEMA_VERSION,
-    SeriesSource, Sources, WeakSignals, build_report, order_expired, parse_event,
+    SeriesSource, Sources, WeakSignals, build_report, parse_event,
 };
 
 use thiserror::Error as ThisError;

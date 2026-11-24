@@ -38,3 +38,13 @@ own; the blocking defects are in SR-6112.
 | FND-003 | medium | The `no_events` defect fires for every lane silent past `no_events_after`, including quiet idle lanes whose last event is `stop` or `idle`. The relay's own `ix.fleet.lane.no_events` (ix-relay FR-045) excludes quiet lanes. In steady state most idle lanes will carry the defect, and every run exits partial. This is a FR-034 spec/relay divergence, not only a code gap. | src/fleet/report.rs:540-552 |
 | FND-004 | low | AC-12 names the order deadline among its boundary fixtures, but receipts are faked as already expired, so no test exercises a deadline boundary. | tests/fleet.rs:342-372 |
 | FND-005 | low | AC-15 is tested by serialising the struct and rendering text in-process; no test runs the CLI with `--json`. | tests/fleet.rs:575-620 |
+
+## Dispositions
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-001 | deferred | Live weak signals are SWM-264, documented in the NoWeakSignals seam and the CLI reference. The git/PR, FR-018 verdict and busy-ratio inputs belong to the fleet evidence producers spec (SWM-252..258, #88). |
+| FND-002 | fixed | - |
+| FND-003 | fixed | - |
+| FND-004 | fixed | - |
+| FND-005 | fixed | - |

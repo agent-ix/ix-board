@@ -7,7 +7,7 @@
 use super::SourceError;
 use super::classify::WeakSource;
 use super::report::{
-    HostSeries, OrderReceipt, OrderReceipts, ProbeReading, RegInfo, RelayConfig, RelaySnapshot,
+    ExpiredOrder, HostSeries, OrderReceipts, ProbeReading, RegInfo, RelayConfig, RelaySnapshot,
     SeriesSource, WeakSignals, parse_event,
 };
 use relay_core::config::{CoreFlags, load_core};
@@ -291,7 +291,7 @@ impl<Q: PromQuery> SeriesSource for PrometheusSeries<Q> {
 pub struct PendingOrderReceipts;
 
 impl OrderReceipts for PendingOrderReceipts {
-    fn orders(&self) -> Result<Vec<OrderReceipt>, SourceError> {
+    fn expired_orders(&self) -> Result<Vec<ExpiredOrder>, SourceError> {
         Err(SourceError(
             "AckExpired receipts are not on ix-relay main (ix-relay PR #56); STALE-ORDER unavailable"
                 .to_owned(),
