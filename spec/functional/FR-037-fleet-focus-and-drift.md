@@ -23,7 +23,7 @@ evidence as live inputs to `ix-board drift` ([FR-008](./FR-008-drift-signals.md)
 
 ## Behavior
 
-1. **Focus.** The focus window is configurable (default 10m). The focus of a lane is the ticket identifier parsed from the branch, else from the worktree directory name, of its most recent hook event with a `cwd` inside a git worktree, using the configured team keys. When events inside the window show two or more distinct tickets, the lane is `ambiguous`: the report carries the most recent ticket and the full list, and the drift rules are not evaluated for it. No ticket, or a `cwd` outside a worktree, yields no focus with reason `no_ticket` or `no_worktree`. A parsed identifier absent from the ix-board cache is `unresolved`. Focus is computed on read; ix-board keeps no focus store.
+1. **Focus.** The focus window is configurable (default 10m). The focus of a lane is the ticket identifier parsed from the branch, else from the worktree directory name, of its most recent hook event with a `cwd` inside a git worktree, using the configured team keys. When events inside the window show two or more distinct tickets, the lane is `ambiguous`: the report carries the most recent ticket and the full list, and the drift rules are not evaluated for it. No ticket, or a `cwd` outside a worktree, yields no focus with reason `no_ticket` or `no_worktree`; an event whose hook record names no checked-out branch is outside a worktree, and its directory name is not read. The window is the one the confirmation of [FR-035](./FR-035-fleet-assign.md) clips at the order send time. A parsed identifier absent from the ix-board cache is `unresolved`. Focus is computed on read; ix-board keeps no focus store.
 2. **Drift** is one or more of: `not_assigned` (focus not in the lane's
    assignment), `not_in_plan` (focus not in any lane's assignment or the ready
    queue), `priority_inversion` (lane WORKING while a higher-ranked assigned ticket
@@ -54,4 +54,5 @@ evidence as live inputs to `ix-board drift` ([FR-008](./FR-008-drift-signals.md)
 
 ## Dependencies
 
+- Delivery split. The focus derivation of behavior 1 (`ambiguous`, `no_ticket`, `no_worktree`, branch before directory; AC-1 and the derivation part of AC-2) is built by SWM-211 in `fleet::focus` and is read by `fleet assign`. The `unresolved` check against the cache (part of AC-6), drift (behavior 2), live inputs (3), `focus_mismatch` (4), drift history (5) and AC-3 to AC-8 are owned by SWM-213 and are not built.
 - [FR-034](./FR-034-fleet-lane-status.md) hook events and [FR-035](./FR-035-fleet-assign.md) assignments. ix-relay PR #52 SHALL provide hook events carrying `cwd` and `branch` through relay-core (target contract, ix-relay PR #52).

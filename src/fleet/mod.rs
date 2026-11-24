@@ -7,8 +7,10 @@
 //! per-host Prometheus series and the order receipts through the traits below, so every source
 //! can be faked. Time is the relay server clock: no host-local timestamp enters an age.
 
+pub mod assign;
 mod classify;
 mod config;
+pub mod focus;
 pub mod ledger;
 pub mod live;
 mod render;

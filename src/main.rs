@@ -181,6 +181,17 @@ enum CacheCommand {
 enum FleetCommand {
     /// Classify every registered agent lane from relay, Prometheus and order evidence.
     Status,
+    /// Send a lane its ordered tickets as a relay order, store the list, and wait for the outcome.
+    Assign {
+        /// Lane address server:workspace:tab.
+        lane: String,
+        /// Ticket identifiers in order; the first is the expected ticket.
+        #[arg(required = true, num_args = 1..)]
+        tickets: Vec<String>,
+        /// Acknowledgement deadline (for example 90s, 5m).
+        #[arg(long, default_value = "5m", value_parser = parse_duration)]
+        deadline: u64,
+    },
     /// Read the fleet ledger.
     Ledger {
         #[command(subcommand)]
@@ -389,6 +400,7 @@ enum Output {
     Agents(AgentsReport),
     Fleet(ix_board::fleet::FleetReport),
     FleetLedger(ix_board::fleet::ledger::LedgerRows),
+    FleetAssign(ix_board::fleet::assign::AssignReport),
     Retro(retro::Record),
     RetroDelta(retro::DeltaReport),
     RetroBackfill(retro::BackfillReport),
@@ -495,6 +507,7 @@ fn main() -> std::process::ExitCode {
                 emit_diagnostic(diagnostics, "error", &format_cli_error(&error));
             }
             std::process::ExitCode::from(match error {
+                Error::Assign(ref assign) if assign.operational() => Outcome::Internal,
                 Error::InvalidTeam
                 | Error::InvalidQuery
                 | Error::ProjectNotFound { .. }
@@ -508,6 +521,7 @@ fn main() -> std::process::ExitCode {
                 | Error::DriftInputDecode { .. }
                 | Error::Drift(_)
                 | Error::Fleet(_)
+                | Error::Assign(_)
                 | Error::Retro(_) => Outcome::Invalid,
                 Error::EmptyCredentialInput => Outcome::Invalid,
                 _ => Outcome::Internal,
@@ -527,6 +541,9 @@ fn output_outcome(output: &Output) -> Outcome {
             ix_board::fleet::Coverage::Partial => Outcome::Partial,
             ix_board::fleet::Coverage::Failed => Outcome::Internal,
         },
+        Output::FleetAssign(report) if report.confirmed() => Outcome::Ok,
+        Output::FleetAssign(report) if report.operational_failure() => Outcome::Internal,
+        Output::FleetAssign(_) => Outcome::Partial,
         Output::Agents(report) => match report.coverage() {
             ix_board::agents::Coverage::Complete => Outcome::Ok,
             ix_board::agents::Coverage::Partial => Outcome::Partial,
@@ -657,6 +674,14 @@ fn run(command: Command) -> Result<Output, Error> {
         Command::Fleet {
             command: FleetCommand::Status,
         } => run_fleet_status().map(Output::Fleet),
+        Command::Fleet {
+            command:
+                FleetCommand::Assign {
+                    lane,
+                    tickets,
+                    deadline,
+                },
+        } => run_fleet_assign(lane, tickets, deadline).map(Output::FleetAssign),
         Command::Fleet {
             command:
                 FleetCommand::Ledger {
@@ -832,8 +857,27 @@ fn run_fleet_status() -> Result<ix_board::fleet::FleetReport, Error> {
             i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
         });
     let mut report = ix_board::fleet::build_report(&config, &sources, local_now_ms);
-    ix_board::fleet::ledger::record_status(&config, &mut report);
+    record_run(&config, &mut report);
     Ok(report)
+}
+
+/// Commits the run, completing the `assignment_history` rows a killed `fleet assign` left pending, or
+/// confirmed before their deadline, in the same pass (FR-035 behavior 10). A relay that cannot be
+/// reached is already a defect of the report, and the run is recorded without the completion.
+fn record_run(config: &ix_board::fleet::FleetConfig, report: &mut ix_board::fleet::FleetReport) {
+    let relay = relay_core::config::load_core(relay_core::config::CoreFlags::default())
+        .ok()
+        .and_then(|settings| {
+            let relay =
+                relay_core::Relay::connect(&settings.url.value, config.host_timeout).ok()?;
+            Some(relay.with_prefix(settings.prefix.value.clone()))
+        });
+    match relay {
+        Some(mut relay) => {
+            ix_board::fleet::ledger::record_status_completing(config, report, &mut relay);
+        }
+        None => ix_board::fleet::ledger::record_status(config, report),
+    }
 }
 
 fn run_fleet_ledger_query(
@@ -849,6 +893,53 @@ fn run_fleet_ledger_query(
     let path = ledger::resolve_path(&config).map_err(|e| FleetError::Ledger(e.to_string()))?;
     ledger::query(&path, view, since.map(std::time::Duration::from_secs))
         .map_err(|e| Error::Fleet(FleetError::Ledger(e.to_string())))
+}
+
+fn run_fleet_assign(
+    lane: String,
+    tickets: Vec<String>,
+    deadline_secs: u64,
+) -> Result<ix_board::fleet::assign::AssignReport, Error> {
+    use ix_board::fleet::{assign, live};
+    let config_error = |e: String| Error::Fleet(ix_board::fleet::FleetError::Config(e));
+    let file = relay_core::config::load_file()
+        .map_err(|e| config_error(e.to_string()))?
+        .unwrap_or(relay_core::config::FileConfig::default());
+    let settings = relay_core::config::load_core(relay_core::config::CoreFlags::default())
+        .map_err(|e| config_error(e.to_string()))?;
+    let board = ix_board::settings_value()?;
+    let fleet = ix_board::fleet::FleetConfig::from_toml(board.as_ref(), None)?;
+    let source = LinearGraphQlSource::from_env()?;
+    let mut service = ReadService::open_default(source)?;
+    let batch = service.issues(&tickets)?;
+    let mut relay =
+        relay_core::Relay::connect(&settings.url.value, std::time::Duration::from_secs(5))
+            .map_err(|e| assign::AssignError::Relay(format!("connect: {e}")))?
+            .with_prefix(settings.prefix.value.clone());
+    let caller = if file.assign.is_orchestrator().unwrap_or(false) {
+        live::caller_lane(&mut relay, &settings.machine.value)
+    } else {
+        None
+    };
+    let writer = relay_core::assignment::AssignWriter::from_config(
+        &file.assign,
+        &settings.machine.value,
+        caller,
+    )
+    .map_err(config_error)?;
+    let request = assign::AssignRequest {
+        lane,
+        tickets,
+        deadline: std::time::Duration::from_secs(deadline_secs),
+        poll: std::time::Duration::from_secs(2),
+        focus_window_ms: i64::try_from(fleet.focus_window.as_millis()).unwrap_or(i64::MAX),
+        team_keys: fleet.team_keys.clone(),
+    };
+    let mut sink = ix_board::fleet::ledger::AssignSink::resolve(&fleet)
+        .map_err(|e| assign::AssignError::Ledger(e.to_string()))?;
+    Ok(assign::assign(
+        &mut relay, &mut sink, &request, &batch, &writer,
+    )?)
 }
 
 fn run_agents(teams: &[String], idle_after: u64) -> Result<AgentsReport, Error> {
@@ -1264,6 +1355,7 @@ fn render_human(output: &Output) -> String {
         Output::Drift(report) => render_drift_text(report),
         Output::Agents(report) => render_text(report),
         Output::Fleet(report) => ix_board::fleet::render_text(report),
+        Output::FleetAssign(report) => ix_board::fleet::assign::render_text(report),
         Output::FleetLedger(rows) => rows.render_text(),
         Output::Retro(record) => retro::render_text(record),
         Output::RetroDelta(report) => retro::render_delta_text(report),
@@ -2581,5 +2673,79 @@ mod tests {
             ])
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod fleet_assign_output {
+    use super::*;
+    use ix_board::fleet::assign::{AssignDefect, AssignReport, AssignResult};
+    use ix_trace_rs::trace;
+
+    fn report(result: AssignResult) -> AssignReport {
+        AssignReport {
+            lane: "terra:SWM:one".into(),
+            tickets: vec!["SWM-211".into()],
+            order_id: Some("order-1".into()),
+            expect_ticket: "SWM-211".into(),
+            started_at_ms: 1,
+            sent_at_ms: Some(2),
+            deadline_at_ms: Some(3),
+            result,
+            result_at_ms: Some(3),
+            confirm_latency_s: None,
+            focus_at_deadline: Some("SWM-999".into()),
+            list_version: Some(1),
+            previous_tickets: vec![],
+            list_write_error: None,
+            defects: vec![],
+        }
+    }
+
+    #[trace("FR-035-AC-5")]
+    #[test]
+    fn only_confirmed_prints_confirmed_and_exits_zero() {
+        let confirmed = report(AssignResult::Confirmed);
+        assert!(render_human(&Output::FleetAssign(confirmed.clone())).starts_with("confirmed "));
+        assert_eq!(
+            output_outcome(&Output::FleetAssign(confirmed.clone())).code(),
+            0
+        );
+        let acted = report(AssignResult::ActedNotFocused);
+        assert!(
+            render_human(&Output::FleetAssign(acted.clone())).starts_with("acted_not_focused ")
+        );
+        assert_eq!(
+            output_outcome(&Output::FleetAssign(acted.clone())).code(),
+            1
+        );
+        for result in [AssignResult::AckExpired, AssignResult::TimedOut] {
+            let row = report(result);
+            assert!(render_human(&Output::FleetAssign(row.clone())).starts_with(result.name()));
+            assert_eq!(output_outcome(&Output::FleetAssign(row.clone())).code(), 1);
+        }
+    }
+
+    #[trace("FR-035-AC-3")]
+    #[trace("FR-035-AC-14")]
+    #[test]
+    fn a_list_or_ledger_failure_after_the_send_exits_with_the_internal_code() {
+        let mut failed = report(AssignResult::Confirmed);
+        failed.list_write_error = Some("order order-1 was accepted".into());
+        assert_eq!(
+            output_outcome(&Output::FleetAssign(failed.clone())).code(),
+            4
+        );
+        assert!(render_human(&Output::FleetAssign(failed)).contains("error: order order-1"));
+        let mut ledger = report(AssignResult::Confirmed);
+        ledger.defects.push(AssignDefect {
+            kind: "ledger_unwritable".into(),
+            detail: "disk".into(),
+        });
+        assert_eq!(
+            output_outcome(&Output::FleetAssign(ledger.clone())).code(),
+            4
+        );
+        assert!(render_human(&Output::FleetAssign(ledger)).contains("defect: ledger_unwritable"));
     }
 }

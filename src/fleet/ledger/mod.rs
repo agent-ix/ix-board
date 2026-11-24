@@ -8,6 +8,7 @@
 //! commits each run in one transaction, so a crash leaves the previous state. Readers open the
 //! file read-only and never migrate.
 
+mod assign_rows;
 mod lock;
 mod schema;
 #[cfg(test)]
@@ -23,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error as ThisError;
 
+pub use assign_rows::{AssignSink, complete_pending};
 pub use schema::{QUERYABLE, VERSION};
 
 /// A ledger failure.
@@ -500,6 +502,20 @@ pub fn record_status(config: &FleetConfig, report: &mut FleetReport) {
         }
         Err(error) => report.add_ledger_defect(error.to_string()),
     }
+}
+
+/// Records one `fleet status` run after completing the assignment rows its commit depends on: a
+/// failure of the completion is a defect of this run and is committed with it. `fleet tick` calls
+/// this too, so a fleet that runs only ticks does not leave killed `fleet assign` rows `pending`.
+pub fn record_status_completing(
+    config: &FleetConfig,
+    report: &mut FleetReport,
+    bus: &mut impl crate::fleet::assign::AssignBus,
+) {
+    if let Err(error) = complete_pending(config, bus) {
+        report.add_ledger_defect(format!("assignment completion: {error}"));
+    }
+    record_status(config, report);
 }
 
 /// The rows `fleet ledger query` prints.

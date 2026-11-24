@@ -464,3 +464,28 @@ impl WeakSignals for NoWeakSignals {
         Vec::new()
     }
 }
+
+/// The lane of the calling session when its harness session id (`CODEX_THREAD_ID`,
+/// `CLAUDE_CODE_SESSION_ID` or `CLAUDE_SESSION_ID`) matches a registration with a verified place.
+/// `None` when the caller is not a registered lane, so the own-lane guard has nothing to compare.
+pub fn caller_lane(relay: &mut Relay, machine: &relay_core::MachineName) -> Option<Address> {
+    let session = [
+        "CODEX_THREAD_ID",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_SESSION_ID",
+    ]
+    .iter()
+    .find_map(|name| std::env::var(name).ok())?;
+    relay
+        .agents()
+        .ok()?
+        .registrations
+        .into_iter()
+        .find(|r| {
+            r.machine == *machine
+                && r.session_id
+                    .as_ref()
+                    .is_some_and(|s| s.to_string() == session)
+        })
+        .and_then(|r| r.verified_place().map(|p| p.address(&r.machine)))
+}

@@ -257,6 +257,9 @@ pub enum Error {
     /// Fleet status configuration was refused.
     #[error(transparent)]
     Fleet(#[from] fleet::FleetError),
+    /// `fleet assign` was refused or failed.
+    #[error(transparent)]
+    Assign(#[from] fleet::assign::AssignError),
     /// The requested project was not present in the source snapshot.
     #[error("project not found: {identifier}")]
     ProjectNotFound { identifier: String },
