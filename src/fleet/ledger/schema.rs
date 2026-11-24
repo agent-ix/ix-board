@@ -1,0 +1,266 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Agent-IX
+
+//! The ledger schema (FR-039): version 1 tables, the additive version 2 migration, the views.
+//!
+//! Times are relay server milliseconds. Tables whose writers are other tickets are created
+//! empty so the schema is one unit under one migration.
+
+/// The schema version this build writes.
+pub const VERSION: i64 = 2;
+
+pub const V1: &str = "
+CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE run(
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, relay_ms INTEGER NOT NULL);
+CREATE TABLE tick(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, started_at INTEGER NOT NULL, committed_at INTEGER);
+CREATE TABLE lane_interval(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, lane TEXT NOT NULL, host TEXT NOT NULL,
+  class TEXT NOT NULL, reason TEXT, started_at INTEGER NOT NULL, ended_at INTEGER, focus TEXT);
+CREATE TABLE action(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, tick_id INTEGER, kind TEXT NOT NULL, lane TEXT,
+  emitted_at INTEGER NOT NULL, executed_at INTEGER, resolved_at INTEGER);
+CREATE TABLE defect(
+  defect_id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, host TEXT, lane TEXT,
+  kind TEXT NOT NULL, first_seen_at INTEGER NOT NULL);
+CREATE TABLE assignment_history(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, lane TEXT NOT NULL, ticket TEXT,
+  assigned_at INTEGER NOT NULL, replaced_at INTEGER);
+CREATE TABLE ground_truth_sample(
+  lane TEXT NOT NULL, at INTEGER NOT NULL, active INTEGER NOT NULL, PRIMARY KEY(lane, at));
+CREATE TABLE calibration_run(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, started_at INTEGER NOT NULL, ended_at INTEGER,
+  detail TEXT);
+CREATE TABLE audit_sample(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, lane TEXT, detail TEXT);
+CREATE TABLE saturation_sample(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, tick_id INTEGER, host TEXT NOT NULL,
+  at INTEGER NOT NULL, deficit INTEGER);
+";
+
+/// Version 2 statements, applied one by one inside one transaction. The migration is additive:
+/// it adds columns and tables and never rewrites a row.
+pub const V2: &[&str] = &[
+    "ALTER TABLE defect ADD COLUMN closed_at INTEGER",
+    "ALTER TABLE defect ADD COLUMN routed_ticket TEXT",
+    "ALTER TABLE defect ADD COLUMN routed_at INTEGER",
+    "ALTER TABLE action ADD COLUMN severity TEXT",
+    "ALTER TABLE action ADD COLUMN due_by INTEGER",
+    "ALTER TABLE action ADD COLUMN target_role TEXT",
+    "ALTER TABLE action ADD COLUMN target_addr TEXT",
+    "ALTER TABLE action ADD COLUMN condition_started_at INTEGER",
+    "ALTER TABLE action ADD COLUMN parent_action_id INTEGER",
+    "ALTER TABLE action ADD COLUMN rung INTEGER",
+    "ALTER TABLE assignment_history ADD COLUMN order_id TEXT",
+    "ALTER TABLE assignment_history ADD COLUMN expect_ticket TEXT",
+    "ALTER TABLE assignment_history ADD COLUMN sent_at INTEGER",
+    "ALTER TABLE assignment_history ADD COLUMN deadline_at INTEGER",
+    "ALTER TABLE assignment_history ADD COLUMN result TEXT CHECK(result IS NULL OR result IN \
+     ('pending','confirmed','acted_not_focused','ack_expired','timed_out'))",
+    "ALTER TABLE assignment_history ADD COLUMN result_at INTEGER",
+    "ALTER TABLE assignment_history ADD COLUMN confirm_latency_s INTEGER",
+    "ALTER TABLE assignment_history ADD COLUMN focus_at_deadline TEXT",
+    "ALTER TABLE tick ADD COLUMN session_addr TEXT",
+    "ALTER TABLE tick ADD COLUMN session_role TEXT",
+    "CREATE TABLE lane_tick(
+       id INTEGER PRIMARY KEY AUTOINCREMENT,
+       run_seq INTEGER NOT NULL REFERENCES run(sequence),
+       tick_id INTEGER,
+       lane TEXT NOT NULL, host TEXT NOT NULL, class TEXT NOT NULL, reason TEXT,
+       remaining_assigned INTEGER, ready_work_available INTEGER,
+       observed_ms INTEGER NOT NULL, last_event_ms INTEGER, evidence TEXT NOT NULL)",
+    "CREATE INDEX lane_tick_lane_time ON lane_tick(lane, observed_ms)",
+    "CREATE TABLE host_tick(
+       run_seq INTEGER NOT NULL REFERENCES run(sequence), host TEXT NOT NULL,
+       observed_ms INTEGER NOT NULL, lanes INTEGER NOT NULL, working INTEGER NOT NULL,
+       not_working INTEGER NOT NULL, PRIMARY KEY(run_seq, host))",
+    "CREATE TABLE plan_coverage_tick(
+       tick_id INTEGER PRIMARY KEY, unowned_ready_count INTEGER, short_queue_count INTEGER,
+       stale_assignment_count INTEGER, unavailable_lists TEXT)",
+    "CREATE TABLE plan_coverage_gap(
+       gap_id INTEGER PRIMARY KEY AUTOINCREMENT,
+       kind TEXT NOT NULL CHECK(kind IN ('unowned_ready','short_queue','stale_assignment')),
+       subject TEXT NOT NULL, detail TEXT, opened_tick INTEGER NOT NULL, opened_at INTEGER NOT NULL,
+       closed_tick INTEGER, closed_at INTEGER)",
+    "CREATE TABLE drift_finding(
+       finding_id INTEGER PRIMARY KEY AUTOINCREMENT, lane TEXT NOT NULL, rule TEXT NOT NULL,
+       focus TEXT, opened_tick INTEGER, opened_at INTEGER NOT NULL, closed_at INTEGER,
+       evidence_times TEXT)",
+    "CREATE TABLE order_focus_at_deadline(
+       order_id TEXT PRIMARY KEY,
+       sender_role TEXT NOT NULL CHECK(sender_role IN ('orchestrator','minder')),
+       sender_addr TEXT NOT NULL, lane TEXT NOT NULL, expect_ticket TEXT NOT NULL,
+       deadline_at INTEGER NOT NULL, focus_ticket TEXT, focus_state TEXT,
+       outcome TEXT NOT NULL CHECK(outcome IN
+         ('confirmed','acted_not_focused','ack_expired','timed_out')),
+       followup_at INTEGER)",
+    "CREATE TABLE action_send(
+       action_id INTEGER NOT NULL, sent_at INTEGER NOT NULL, sender_addr TEXT NOT NULL,
+       recipient_addr TEXT NOT NULL, receipt_id TEXT NOT NULL, PRIMARY KEY(action_id, receipt_id))",
+    "CREATE TABLE session_turn(
+       session_addr TEXT NOT NULL, session_role TEXT NOT NULL, started_at INTEGER NOT NULL,
+       PRIMARY KEY(session_addr, started_at))",
+    "CREATE TABLE cycle_event(
+       cycle_id INTEGER PRIMARY KEY AUTOINCREMENT, session_addr TEXT NOT NULL,
+       started_at INTEGER NOT NULL, ended_at INTEGER,
+       ended_reason TEXT CHECK(ended_reason IS NULL OR ended_reason IN ('ended','superseded')),
+       interval_s INTEGER NOT NULL)",
+    "CREATE TABLE cycle_missed(
+       session_addr TEXT NOT NULL, last_ended_at INTEGER NOT NULL, expected_by INTEGER NOT NULL,
+       detected_at INTEGER NOT NULL, PRIMARY KEY(session_addr, last_ended_at))",
+    "CREATE TABLE dialog_answer(
+       answer_id INTEGER PRIMARY KEY AUTOINCREMENT, lane TEXT NOT NULL,
+       dialog_class TEXT NOT NULL CHECK(dialog_class IN
+         ('dialog','permission','question','login','usage_limit','other')),
+       action_id INTEGER, standing_order_id TEXT, answered_at INTEGER NOT NULL,
+       lane_class_at_answer TEXT, answer_text TEXT, answer_len INTEGER NOT NULL, violation TEXT)",
+    "CREATE TABLE capacity_run(
+       run_id INTEGER PRIMARY KEY AUTOINCREMENT, host TEXT NOT NULL, trigger TEXT,
+       started_at INTEGER NOT NULL, ended_at INTEGER,
+       end_reason TEXT CHECK(end_reason IS NULL OR end_reason IN
+         ('knee','build_slots_saturated','step_bound','inconclusive_no_demand','throttled')),
+       found_level INTEGER)",
+    "CREATE TABLE capacity_step(
+       run_id INTEGER NOT NULL, step_no INTEGER NOT NULL, repeat_of INTEGER, host TEXT NOT NULL,
+       lanes INTEGER, window_start INTEGER, window_end INTEGER, rampup_end INTEGER, valid INTEGER,
+       inconclusive_reason TEXT CHECK(inconclusive_reason IS NULL OR inconclusive_reason IN
+         ('deficit_nonzero','deficit_coverage')),
+       deficit_coverage REAL, deficit_zero_throughout INTEGER, host_output_per_hour REAL,
+       tickets_closed INTEGER, prs_merged INTEGER, commits_pushed INTEGER,
+       output_basis TEXT CHECK(output_basis IS NULL OR output_basis IN ('tickets_prs','commits')),
+       queue_wait_p90_s REAL, throttled_share REAL, memory_headroom_min REAL,
+       thermal_headroom_min REAL, slots_busy_equals_sustainable INTEGER, knee_signal INTEGER,
+       knee_reason TEXT CHECK(knee_reason IS NULL OR knee_reason IN ('output_gain','throttle')))",
+    "CREATE TABLE capacity_step_lane_output(
+       run_id INTEGER NOT NULL, step_no INTEGER NOT NULL, lane TEXT NOT NULL,
+       tickets_closed INTEGER, prs_merged INTEGER, commits_pushed INTEGER)",
+    "CREATE TABLE capacity_level(
+       host TEXT NOT NULL, level INTEGER NOT NULL,
+       output_basis TEXT CHECK(output_basis IS NULL OR output_basis IN ('tickets_prs','commits')),
+       recorded_at INTEGER NOT NULL, run_id INTEGER, reason TEXT, evidence_steps TEXT,
+       superseded_at INTEGER)",
+    "CREATE TABLE capacity_event(
+       event_id INTEGER PRIMARY KEY AUTOINCREMENT, host TEXT NOT NULL, lane TEXT,
+       kind TEXT NOT NULL CHECK(kind IN ('lane_added','draining_mark','drain_done',
+         'lane_removed','lane_lost','step_down','overload_event')),
+       reason TEXT, evidence_kind TEXT, cycle_id INTEGER, at INTEGER NOT NULL, ceiling_until INTEGER)",
+    "CREATE TABLE host_output_sample(
+       host TEXT NOT NULL, at INTEGER NOT NULL, lanes INTEGER, tickets_closed INTEGER,
+       prs_merged INTEGER, commits_pushed INTEGER, PRIMARY KEY(host, at))",
+];
+
+/// Millisecond values read from `meta`, with the FR-039 defaults.
+const TICK_MS: &str =
+    "(COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='tick_interval_s'),300)*1000)";
+const CYCLE_MS: &str =
+    "(COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='cycle_interval_s'),600)*1000)";
+const GRACE_MS: &str = "(COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='grace_s'),\
+     COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='cycle_interval_s'),600)\
+     +COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='tick_interval_s'),300))*1000)";
+
+/// The `open_cycles` formula of FR-039, `max(1, ceil((end - start - grace) / cycle))`, in
+/// integer milliseconds.
+pub fn open_cycles_sql(start: &str, end: &str) -> String {
+    format!("max(1, (({end}) - ({start}) - {GRACE_MS} + {CYCLE_MS} - 1) / {CYCLE_MS})")
+}
+
+/// Views over `lane_tick` and `defect`. Each view with a time carries it as `at_ms`, which
+/// `--since` filters on.
+pub fn views() -> Vec<String> {
+    let episode_cycles = open_cycles_sql("start_ms", "end_ms");
+    vec![
+        "CREATE VIEW lanes_with_ready_work AS
+           SELECT *, observed_ms AS at_ms FROM lane_tick WHERE ready_work_available = 1"
+            .to_owned(),
+        "CREATE VIEW idle_lane_with_ready_work_ticks AS
+           SELECT *, observed_ms AS at_ms FROM lane_tick
+           WHERE class = 'IDLE' AND ready_work_available = 1"
+            .to_owned(),
+        format!(
+            "CREATE VIEW idle_lane_episodes_with_ready_work AS
+               WITH o AS (
+                 SELECT lane, observed_ms, class, ready_work_available AS ready,
+                        ROW_NUMBER() OVER (PARTITION BY lane ORDER BY observed_ms, run_seq) AS rn
+                 FROM lane_tick),
+               q AS (
+                 SELECT lane, observed_ms,
+                        rn - ROW_NUMBER() OVER (PARTITION BY lane ORDER BY rn) AS grp
+                 FROM o WHERE class = 'IDLE' AND ready = 1),
+               e AS (
+                 SELECT lane, MIN(observed_ms) AS start_ms,
+                        MAX(observed_ms) + {TICK_MS} AS end_ms, COUNT(*) AS ticks
+                 FROM q GROUP BY lane, grp)
+               SELECT lane, start_ms, end_ms, ticks, {episode_cycles} AS open_cycles,
+                      start_ms AS at_ms
+               FROM e"
+        ),
+        "CREATE VIEW idle_lane_episode_with_ready_work_max AS
+           SELECT MAX(open_cycles) AS open_cycles FROM idle_lane_episodes_with_ready_work"
+            .to_owned(),
+        "CREATE VIEW lane_span AS
+               SELECT lane, host, class, ready_work_available AS ready, observed_ms AS start_ms,
+                      LEAD(observed_ms) OVER (PARTITION BY lane ORDER BY observed_ms, run_seq)
+                        AS end_ms
+               FROM lane_tick"
+            .to_owned(),
+        format!(
+            "CREATE VIEW idle_minutes AS
+               SELECT lane, host, date(start_ms / 1000, 'unixepoch') AS day, class,
+                      SUM(end_ms - start_ms) / 60000.0 AS minutes,
+                      SUM(CASE WHEN ready = 1 THEN end_ms - start_ms ELSE 0 END) / 60000.0
+                        AS minutes_with_ready_work,
+                      CAST(strftime('%s', date(start_ms / 1000, 'unixepoch')) AS INTEGER) * 1000
+                        AS at_ms
+               FROM lane_span
+               WHERE class <> 'WORKING' AND end_ms IS NOT NULL
+                 AND end_ms - start_ms <= 2 * {TICK_MS}
+               GROUP BY lane, host, day, class"
+        ),
+        "CREATE VIEW defect_rows AS
+           SELECT defect_id, source, host, lane, kind, first_seen_at, closed_at, routed_ticket,
+                  routed_at, first_seen_at AS at_ms
+           FROM defect"
+            .to_owned(),
+    ]
+}
+
+/// Views readable through `fleet ledger query`.
+pub const QUERYABLE: &[&str] = &[
+    "lanes_with_ready_work",
+    "idle_lane_with_ready_work_ticks",
+    "idle_lane_episodes_with_ready_work",
+    "idle_lane_episode_with_ready_work_max",
+    "idle_minutes",
+    "defect_rows",
+];
+
+/// Views without an `at_ms` column, which refuse `--since`.
+pub const UNDATED: &[&str] = &["idle_lane_episode_with_ready_work_max"];
+
+/// `(table, time column)` pairs that retention prunes by age. A defect is pruned only once
+/// closed.
+pub const PRUNE: &[(&str, &str)] = &[
+    ("lane_tick", "observed_ms"),
+    ("host_tick", "observed_ms"),
+    ("defect", "closed_at"),
+    ("action", "emitted_at"),
+    ("lane_interval", "started_at"),
+    ("assignment_history", "assigned_at"),
+    ("ground_truth_sample", "at"),
+    ("audit_sample", "at"),
+    ("saturation_sample", "at"),
+    ("plan_coverage_gap", "opened_at"),
+    ("drift_finding", "opened_at"),
+    ("order_focus_at_deadline", "deadline_at"),
+    ("action_send", "sent_at"),
+    ("session_turn", "started_at"),
+    ("cycle_event", "started_at"),
+    ("cycle_missed", "detected_at"),
+    ("dialog_answer", "answered_at"),
+    ("capacity_run", "started_at"),
+    ("capacity_level", "recorded_at"),
+    ("capacity_event", "at"),
+    ("host_output_sample", "at"),
+    ("tick", "started_at"),
+];

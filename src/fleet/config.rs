@@ -17,7 +17,15 @@ const RELAY_OWNED: [&str; 6] = [
     "no_events_after",
     "no_events_after_secs",
 ];
-const KNOWN: [&str; 8] = [
+/// Default orchestrator cycle, ten minutes (FR-039).
+const DEFAULT_CYCLE_SECS: u64 = 600;
+const KNOWN: [&str; 14] = [
+    "ledger_path",
+    "ledger_retention_days",
+    "ledger_lock_wait_secs",
+    "tick_interval_secs",
+    "cycle_interval_secs",
+    "grace_secs",
     "prometheus_url",
     "lanes",
     "hosts",
@@ -56,6 +64,18 @@ pub struct FleetConfig {
     pub push_interval: Duration,
     /// Longest one host may take to read.
     pub host_timeout: Duration,
+    /// Ledger file; unset means the user state directory.
+    pub ledger_path: Option<std::path::PathBuf>,
+    /// Rows older than this are pruned from the ledger.
+    pub ledger_retention: Duration,
+    /// Longest a writer waits for the ledger lock.
+    pub ledger_lock_wait: Duration,
+    /// Interval of `fleet tick`; a span with no tick for twice this is a gap.
+    pub tick_interval: Duration,
+    /// Orchestrator cycle interval used by `open_cycles`.
+    pub cycle_interval: Duration,
+    /// Grace of `open_cycles`; unset means one cycle plus one tick.
+    pub grace: Option<Duration>,
 }
 
 impl Default for FleetConfig {
@@ -69,6 +89,12 @@ impl Default for FleetConfig {
             max_clock_skew: Duration::from_secs(30),
             push_interval: Duration::from_secs(30),
             host_timeout: Duration::from_secs(20),
+            ledger_path: None,
+            ledger_retention: Duration::from_secs(30 * 86_400),
+            ledger_lock_wait: Duration::from_secs(10),
+            tick_interval: Duration::from_secs(300),
+            cycle_interval: Duration::from_secs(DEFAULT_CYCLE_SECS),
+            grace: None,
         }
     }
 }
@@ -145,6 +171,23 @@ impl FleetConfig {
             secs(table, "max_clock_skew_secs", &mut config.max_clock_skew)?;
             secs(table, "push_interval_secs", &mut config.push_interval)?;
             secs(table, "host_timeout_secs", &mut config.host_timeout)?;
+            secs(table, "ledger_lock_wait_secs", &mut config.ledger_lock_wait)?;
+            secs(table, "tick_interval_secs", &mut config.tick_interval)?;
+            secs(table, "cycle_interval_secs", &mut config.cycle_interval)?;
+            if table.contains_key("grace_secs") {
+                let mut grace = Duration::ZERO;
+                secs(table, "grace_secs", &mut grace)?;
+                config.grace = Some(grace);
+            }
+            if table.contains_key("ledger_retention_days") {
+                let mut days = Duration::ZERO;
+                secs(table, "ledger_retention_days", &mut days)?;
+                config.ledger_retention = days * 86_400;
+            }
+            config.ledger_path = table
+                .get("ledger_path")
+                .and_then(toml::Value::as_str)
+                .map(std::path::PathBuf::from);
         }
         if let Some(url) = env_prometheus.filter(|url| !url.trim().is_empty()) {
             config.prometheus_url = Some(url);

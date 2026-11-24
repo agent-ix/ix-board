@@ -181,6 +181,23 @@ enum CacheCommand {
 enum FleetCommand {
     /// Classify every registered agent lane from relay, Prometheus and order evidence.
     Status,
+    /// Read the fleet ledger.
+    Ledger {
+        #[command(subcommand)]
+        command: LedgerCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum LedgerCommand {
+    /// Print the rows of one ledger view without writing.
+    Query {
+        /// View name, for example idle_minutes or defect_rows.
+        view: String,
+        /// Only rows within this window before the newest run (for example 90s, 20m, 4h).
+        #[arg(long, value_parser = parse_duration)]
+        since: Option<u64>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -371,6 +388,7 @@ enum Output {
     Drift(DriftReport),
     Agents(AgentsReport),
     Fleet(ix_board::fleet::FleetReport),
+    FleetLedger(ix_board::fleet::ledger::LedgerRows),
     Retro(retro::Record),
     RetroDelta(retro::DeltaReport),
     RetroBackfill(retro::BackfillReport),
@@ -639,6 +657,12 @@ fn run(command: Command) -> Result<Output, Error> {
         Command::Fleet {
             command: FleetCommand::Status,
         } => run_fleet_status().map(Output::Fleet),
+        Command::Fleet {
+            command:
+                FleetCommand::Ledger {
+                    command: LedgerCommand::Query { view, since },
+                },
+        } => run_fleet_ledger_query(&view, since).map(Output::FleetLedger),
         Command::Retro {
             command: RetroCommand::Snapshot { config, window },
         } => run_retro_snapshot(&config, &window),
@@ -807,11 +831,24 @@ fn run_fleet_status() -> Result<ix_board::fleet::FleetReport, Error> {
         .map_or(0, |elapsed| {
             i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
         });
-    Ok(ix_board::fleet::build_report(
-        &config,
-        &sources,
-        local_now_ms,
-    ))
+    let mut report = ix_board::fleet::build_report(&config, &sources, local_now_ms);
+    ix_board::fleet::ledger::record_status(&config, &mut report);
+    Ok(report)
+}
+
+fn run_fleet_ledger_query(
+    view: &str,
+    since: Option<u64>,
+) -> Result<ix_board::fleet::ledger::LedgerRows, Error> {
+    use ix_board::fleet::{FleetError, ledger};
+    let settings = ix_board::settings_value()?;
+    let config = ix_board::fleet::FleetConfig::from_toml(
+        settings.as_ref(),
+        std::env::var("IX_PROMETHEUS_URL").ok(),
+    )?;
+    let path = ledger::resolve_path(&config).map_err(|e| FleetError::Ledger(e.to_string()))?;
+    ledger::query(&path, view, since.map(std::time::Duration::from_secs))
+        .map_err(|e| Error::Fleet(FleetError::Ledger(e.to_string())))
 }
 
 fn run_agents(teams: &[String], idle_after: u64) -> Result<AgentsReport, Error> {
@@ -1227,6 +1264,7 @@ fn render_human(output: &Output) -> String {
         Output::Drift(report) => render_drift_text(report),
         Output::Agents(report) => render_text(report),
         Output::Fleet(report) => ix_board::fleet::render_text(report),
+        Output::FleetLedger(rows) => rows.render_text(),
         Output::Retro(record) => retro::render_text(record),
         Output::RetroDelta(report) => retro::render_delta_text(report),
         Output::RetroBackfill(report) => retro::render_backfill_text(report),

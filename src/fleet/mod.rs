@@ -9,6 +9,7 @@
 
 mod classify;
 mod config;
+pub mod ledger;
 pub mod live;
 mod render;
 mod report;
@@ -36,6 +37,9 @@ pub enum FleetError {
     /// The `[fleet]` configuration was refused.
     #[error("invalid fleet configuration: {0}")]
     Config(String),
+    /// The ledger could not be read.
+    #[error("fleet ledger: {0}")]
+    Ledger(String),
 }
 
 /// A source that could not be read; the text is the defect reason.
