@@ -88,7 +88,7 @@ with the last successful report for that focus.
   records in a schema-versioned append-only store outside every git work tree,
   and compare them with the previous snapshot and a baseline. Unreadable
   metrics are reported unavailable, never zero (FR-024 through FR-028).
-- `fleet status`, `assign`, `plan-coverage`, `tick`, `saturation`, `calibrate`, `replay` and the fleet ledger classify every registered agent lane from fused hook, host, git and relay evidence, keep lanes fed, and measure detector accuracy against hook ground truth (FR-034 through FR-043, SWM-208); `agents` UNKNOWN causes are fixed in FR-018 (SWM-210).
+- `fleet status`, `assign`, `plan-coverage`, `tick`, `saturation`, `calibrate`, `replay` and the fleet ledger classify every registered agent lane from fused hook, host, git and relay evidence, keep lanes fed, and measure detector accuracy against hook ground truth (FR-034 through FR-044, SWM-208, SWM-252, SWM-255 to SWM-258); `agents` UNKNOWN causes are fixed in FR-018 (SWM-210).
 
 ### Out of Scope
 
@@ -182,7 +182,7 @@ Functional acceptance criteria include fixture checks for each drift signal,
 queue rules, and cache behavior; NFR-001 specifies a lightweight warm-cache
 fixture benchmark.
 
-SWM-208 adds US-011 and FR-034 through FR-043: FR-034 lane classes and source defects, FR-035 assign, FR-036 plan coverage, FR-037 hook-derived focus and drift inputs (constraining FR-008), FR-038 tick actions, FR-039 ledger, FR-040 calibration, FR-041 saturation, FR-042 replay, FR-043 script replacement. FR-018 gains the SWM-210 evidence-completeness rules and FR-033 serves the fleet gauges.
+SWM-208 adds US-011 and FR-034 through FR-043: FR-034 lane classes and source defects, FR-035 assign, FR-036 plan coverage, FR-037 hook-derived focus and drift inputs (constraining FR-008), FR-038 tick actions, FR-039 ledger, FR-040 calibration, FR-041 saturation, FR-042 replay, FR-043 script replacement. SWM-252, SWM-255, SWM-256, SWM-257 and SWM-258 extend FR-035 to FR-039 and FR-041 with the evidence the dev-team orchestrator and minder role specs evaluate (ledger version 2, capacity discovery history, tick ladder and undetermined action, assign order id) and add FR-044 for cycle events and the dialog answer log. FR-018 gains the SWM-210 evidence-completeness rules and FR-033 serves the fleet gauges.
 
 ## References
 

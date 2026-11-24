@@ -23,6 +23,8 @@ relationships:
     type: traces_to
   - target: "ix://agent-ix/ix-board/FR-043"
     type: traces_to
+  - target: "ix://agent-ix/ix-board/FR-044"
+    type: traces_to
 ---
 # US-011: Keep every agent lane working and fed from outside any agent session
 

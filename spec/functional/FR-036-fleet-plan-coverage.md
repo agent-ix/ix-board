@@ -32,6 +32,8 @@ list that depends on it is `unavailable` with a reason, never empty. The text an
 JSON outputs agree. The command exits zero only when all three lists are empty and
 available; this is the zero-gap state.
 
+**Persistence.** Each `fleet tick` SHALL record its plan-coverage report in the ledger ([FR-039](./FR-039-fleet-ledger.md)): one `plan_coverage_tick` row with the three counts and the names of any `unavailable` lists, and one `plan_coverage_gap` row per gap, opened by the first tick that reports it (an unowned ready ticket, a short queue with its remaining count and minimum, a stale assignment with its reason) and closed by the first later tick that does not. A gap row records the tick and relay time of each. Gap age is the time since `opened_at`, so a gap that persists across ticks keeps one row. An ad-hoc `plan-coverage` run writes nothing.
+
 ## Acceptance Criteria
 
 | ID | Criteria | Verification |
@@ -43,6 +45,8 @@ available; this is the zero-gap state.
 | FR-036-AC-5 | An unreadable ready queue yields `unavailable` for `unowned_ready` with a reason and a non-zero exit, not an empty list. | Test |
 | FR-036-AC-7 | A ready ticket assigned only to an UNREACHABLE lane appears in `unowned_ready` with note `owner_unreachable`, and that lane is absent from `short_queues` even with fewer than the minimum remaining. | Test |
 | FR-036-AC-6 | Text and JSON carry identical entries. | Test |
+| FR-036-AC-8 | Two ticks reporting the same unowned ready ticket give one `plan_coverage_gap` row with `opened_tick` the first and no close; a third tick without it sets `closed_tick` and `closed_at`; the `plan_coverage_tick` counts of each tick equal that tick's lists. | Test |
+| FR-036-AC-9 | A tick whose queue source is unreadable records `unavailable_lists` naming `unowned_ready`, opens and closes no `unowned_ready` row, and an ad-hoc `plan-coverage` run writes no ledger row. | Test |
 
 ## Dependencies
 

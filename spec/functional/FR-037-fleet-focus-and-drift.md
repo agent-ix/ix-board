@@ -35,6 +35,8 @@ evidence as live inputs to `ix-board drift` ([FR-008](./FR-008-drift-signals.md)
 4. A lead whose focus is derivable has that focus set from this evidence; a lead
    with a manually configured focus has the conflict reported as `focus_mismatch`.
 
+5. **Drift history.** Each `fleet tick` SHALL record every drift finding in the ledger ([FR-039](./FR-039-fleet-ledger.md)) as a `drift_finding` row (lane, rule, focus, evidence times), opened by the first tick that reports it and closed by the first later tick in which the lane has no finding of that rule for that focus. A lane whose focus is `ambiguous` or without focus has its open findings left open and gains none. The lane-minutes with a finding are those between `opened_at` and `closed_at` in which the lane's ledger interval is `WORKING`.
+
 ## Acceptance Criteria
 
 | ID | Criteria | Verification |
@@ -45,6 +47,8 @@ evidence as live inputs to `ix-board drift` ([FR-008](./FR-008-drift-signals.md)
 | FR-037-AC-4 | Self-reported focus text in a message or pane never changes the derived focus. | Test |
 | FR-037-AC-5 | A `drift` fixture run supplies lane busy state and branch/PR/commit evidence from fleet evidence, and signal output matches the same fixture supplied through the existing explicit inputs. | Test |
 | FR-037-AC-6 | A parsed ticket not in the cache gives `unresolved`; a configured focus differing from derived focus gives `focus_mismatch`; no focus store is created or written. | Test |
+| FR-037-AC-7 | A `not_assigned` finding present in ticks 1 and 2 and absent in tick 3 gives one `drift_finding` row opened at tick 1 and closed at tick 3; a different rule or focus on the same lane gives its own row. | Test |
+| FR-037-AC-8 | A lane that becomes `ambiguous` keeps its open finding open and gains no new row; the drift lane-minutes share over a fixture equals the hand-computed value counting only `WORKING` minutes. | Test |
 
 ## Dependencies
 
