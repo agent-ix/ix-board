@@ -218,6 +218,8 @@ pub enum DefectKind {
     StaleHostRegistry,
     /// The relay receipt history has a recording gap, a pending observation or an evicted range.
     ReceiptsRecordingGap,
+    /// The fleet ledger could not be opened or written; the rest of the report stands.
+    LedgerUnwritable,
 }
 
 /// A source-defect row.
@@ -233,9 +235,12 @@ pub struct Defect {
     pub lane: Option<String>,
     /// Why.
     pub reason: String,
-    /// Relay server time of the run that observed it. Not a first-seen time: that needs the
-    /// fleet ledger (SWM-215), which persists defects across runs.
+    /// Relay server time of the run that observed it.
     pub observed_ms: i64,
+    /// Relay server time of the run that first observed it, from the ledger; absent when the
+    /// ledger could not be written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_seen_ms: Option<i64>,
 }
 
 /// One lane row.
@@ -308,9 +313,28 @@ pub struct FleetReport {
     pub hosts: Vec<HostSummary>,
     /// Source defects.
     pub defects: Vec<Defect>,
+    /// The relay could not be read, so `run_ms` is the host clock, not relay time. Not part of
+    /// the wire report.
+    #[serde(skip)]
+    pub relay_unavailable: bool,
 }
 
 impl FleetReport {
+    /// Adds the `ledger_unwritable` defect for a run whose ledger write failed.
+    pub fn add_ledger_defect(&mut self, reason: String) {
+        self.defects.push(Defect {
+            kind: DefectKind::LedgerUnwritable,
+            source: "ledger".to_owned(),
+            host: None,
+            lane: None,
+            reason,
+            observed_ms: self.run_ms,
+            first_seen_ms: None,
+        });
+        self.defects.sort();
+        self.complete = false;
+    }
+
     /// The coverage that sets the exit status.
     pub fn coverage(&self) -> Coverage {
         if self.defects.is_empty() {
@@ -388,6 +412,7 @@ impl Ctx<'_> {
             lane: lane.map(str::to_owned),
             reason: reason.into(),
             observed_ms: self.now_ms,
+            first_seen_ms: None,
         });
     }
 }
@@ -578,7 +603,9 @@ pub fn build_report(cfg: &FleetConfig, sources: &Sources<'_>, local_now_ms: i64)
                 None,
                 error.0.clone(),
             );
-            return finish(local_now_ms, Vec::new(), ctx.defects);
+            let mut report = finish(local_now_ms, Vec::new(), ctx.defects);
+            report.relay_unavailable = true;
+            return report;
         }
     };
     let mut ctx = Ctx {
@@ -862,5 +889,6 @@ fn finish(run_ms: i64, mut rows: Vec<LaneRow>, mut defects: Vec<Defect>) -> Flee
         hosts: summarize(&rows),
         rows,
         defects,
+        relay_unavailable: false,
     }
 }

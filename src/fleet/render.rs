@@ -23,13 +23,17 @@ fn defect_text(defect: &Defect) -> String {
         Ok(serde_json::Value::String(kind)) => kind,
         _ => String::new(),
     };
+    let first_seen = defect
+        .first_seen_ms
+        .map_or_else(String::new, |ms| format!(" first_seen_ms={ms}"));
     format!(
-        "{} source={} host={} lane={} observed_ms={} {}",
+        "{} source={} host={} lane={} observed_ms={}{} {}",
         kind,
         defect.source,
         defect.host.as_deref().unwrap_or("-"),
         defect.lane.as_deref().unwrap_or("-"),
         defect.observed_ms,
+        first_seen,
         defect.reason
     )
 }
