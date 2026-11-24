@@ -1410,6 +1410,8 @@ fn herdr_done_is_not_idle_with_an_active_worker_or_attributed_process() {
     assert_eq!(running_build, Verdict::Working);
 }
 
+/// Larger than the 64 MiB limit under which a rollout is read whole.
+const LARGE: usize = 65 * 1024 * 1024;
 fn json_line(value: &Value) -> String {
     format!("{value}\n")
 }
@@ -1452,8 +1454,9 @@ fn a_child_rollout_over_the_first_window_keeps_its_identity_and_header() {
             .as_str(),
     );
     let mut child = format!("{}\n", codex_header("a", Some("root"), "/root/a"));
+    child.push_str(&fillers(LARGE));
     child.push_str(&event("task_started", "2026-10-18T10:00:01Z", "t"));
-    child.push_str(&fillers(2 * 1024 * 1024));
+    child.push_str(&fillers(1536 * 1024));
     child.push_str(&event("task_complete", "2026-10-18T10:00:09Z", "t"));
     write(home.path(), ".codex/sessions/rollout-test-a.jsonl", &child);
     let probe = collect_probe(home.path(), &request(HarnessKind::Codex)).unwrap();
@@ -1474,7 +1477,7 @@ fn a_child_rollout_over_the_first_window_keeps_its_identity_and_header() {
 fn the_tail_replay_starts_at_the_latest_turn_start_even_when_the_window_would_start_mid_turn() {
     let home = tempfile::tempdir().unwrap();
     let mut text = format!("{}\n", codex_header("root", None, "/root"));
-    text.push_str(&fillers(3 * 1024 * 1024));
+    text.push_str(&fillers(LARGE));
     text.push_str(&event("task_started", "2026-10-18T10:00:01Z", "t"));
     text.push_str(&fillers(1536 * 1024));
     text.push_str(&event("collab_waiting_begin", "2026-10-18T10:00:02Z", "t"));
@@ -1495,10 +1498,11 @@ fn the_tail_replay_starts_at_the_latest_turn_start_even_when_the_window_would_st
 #[trace("FR-018-AC-28")]
 #[test]
 fn a_turn_start_exactly_on_the_scan_floor_boundary_is_not_dropped() {
-    const LIMIT: usize = 64 * 1024 * 1024;
+    // The deepest backward scan: the transcript limit less the header reserve.
+    const LIMIT: usize = 64 * 1024 * 1024 - 1024 * 1024 - 2;
     let home = tempfile::tempdir().unwrap();
     let mut text = format!("{}\n", codex_header("root", None, "/root"));
-    text.push_str(&filler_line(100_000));
+    text.push_str(&fillers(1536 * 1024));
     let started = event("task_started", "2026-10-18T10:00:01Z", "t");
     let complete = event("task_complete", "2026-10-18T10:00:09Z", "t");
     // The scan covers exactly the last 64 MiB, which begins at the start record.
@@ -1536,4 +1540,35 @@ fn missing_hosts_alone_make_coverage_partial_and_a_total_loss_failed() {
     assert_eq!(healthy.coverage(), Coverage::Partial);
     healthy.agents.clear();
     assert_eq!(healthy.coverage(), Coverage::Failed);
+}
+
+#[trace("FR-018-AC-28")]
+#[test]
+fn a_rollout_within_the_replay_limit_keeps_spawns_from_earlier_turns() {
+    let home = tempfile::tempdir().unwrap();
+    let mut text = format!("{}\n", codex_header("root", None, "/root"));
+    text.push_str(&event("task_started", "2026-10-18T10:00:01Z", "t1"));
+    text.push_str(&json_line(
+        &json!({"type":"response_item","timestamp":"2026-10-18T10:00:02Z","payload":{"type":"function_call","name":"spawn_agent","call_id":"spawn","arguments":"{}"}}),
+    ));
+    text.push_str(&json_line(
+        &json!({"type":"response_item","timestamp":"2026-10-18T10:00:03Z","payload":{"type":"function_call_output","call_id":"spawn","output":"{\"task_name\":\"/root/child\"}"}}),
+    ));
+    text.push_str(&event("task_complete", "2026-10-18T10:00:04Z", "t1"));
+    text.push_str(&event("task_started", "2026-10-18T10:00:05Z", "t2"));
+    write(
+        home.path(),
+        ".codex/sessions/rollout-test-root.jsonl",
+        &text,
+    );
+    let probe = collect_probe(home.path(), &request(HarnessKind::Codex)).unwrap();
+    let files = &probe.sessions["root"];
+    assert!(
+        files
+            .lifecycle_availability
+            .reasons
+            .contains(&"referenced_child_missing_or_ambiguous".into()),
+        "{:?}",
+        files.lifecycle_availability
+    );
 }

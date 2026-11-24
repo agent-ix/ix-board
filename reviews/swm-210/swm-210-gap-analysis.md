@@ -43,3 +43,11 @@ check its own preconditions.
 - Stubs and coverage inflation: none in the diff.
 - Semantic review: skipped. It was not requested by the dispatch.
 - Plan completion: not assessed
+
+## Dispositions
+
+| FND | Outcome | Reason |
+| --- | --- | --- |
+| FND-001 | fixed | missing_hosts_alone_make_coverage_partial_and_a_total_loss_failed tests coverage(), and output_outcome maps Partial to exit 1. a_slow_machine... asserts Coverage::Partial. |
+| FND-002 | fixed | Added tests for a child over 1 MiB, a mid-turn window start, and a turn start on the scan-floor boundary. |
+| FND-003 | fixed | herdr_done_is_not_idle_with_an_active_worker_or_attributed_process covers the worker and process exclusions. |

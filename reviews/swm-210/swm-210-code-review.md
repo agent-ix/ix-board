@@ -59,3 +59,21 @@ Checked and clean:
 | FND-005 | low | A missing host maps to Outcome::Internal, the same code as a total failure. Outcome::Partial exists and would let callers keep healthy rows. | src/main.rs:494-496 |
 | FND-006 | low | The first-line skip throws away a complete record when the window starts exactly on a record boundary. In the final 64 MiB window this can drop the only lifecycle record. | src/agents/collect.rs:247-266 |
 | FND-007 | low | Growing windows re-read overlapping ranges. One transcript can be charged 85 MiB (170 MiB with the retry) against the 256 MiB collection budget, so a few large rollouts can starve every other session. | src/agents/collect.rs:290-304 |
+
+## New findings (disposition pass 1)
+
+| ID | Severity | Summary | Refs |
+| --- | --- | --- | --- |
+| FND-008 | medium | Every Codex rollout with more than one turn now replays only from its latest turn start, small files included. Spawns from earlier turns are lost, so a missing child spawned in an earlier turn is no longer reported `referenced_child_missing_or_ambiguous` and the graph reads complete. Reproduced. | src/agents/collect.rs:369-379 |
+
+## Dispositions
+
+| FND | Outcome | Reason |
+| --- | --- | --- |
+| FND-001 | fixed | Replay is seeded from the session_meta header. A 2 MiB child now keeps parent_id and agent_path with no issues (re-run at 7d159df). |
+| FND-002 | fixed | Replay starts at the latest task_started/turn_started. The mid-turn collab_waiting repro now gives state Completed with no issues. The loss of earlier-turn spawns is tracked separately as FND-008. |
+| FND-003 | fixed | AGENTS_DEADLINE is now HOST_TIMEOUT + 5 s, and metrics mark agent metrics unavailable naming the missing host, as the lead accepted. The exporter marks coverage incomplete when hosts are missing. |
+| FND-004 | fixed | The timeout arm now also pushes `<host>: timed out after Ns` to errors. |
+| FND-005 | fixed | AgentsReport::coverage() maps a missing host with usable rows to Outcome::Partial (exit 1) and a total loss to Internal. |
+| FND-006 | fixed | The backward scan reads one look-behind byte, so a record that starts exactly at the window start is kept. |
+| FND-007 | still-open | The overlapping window re-reads are gone, but the backward scan and the forward replay now charge the same bytes twice. The worst case is about 128 MiB per transcript (256 MiB with the retry) against the 256 MiB collection budget, compared with 64 MiB on main. |
