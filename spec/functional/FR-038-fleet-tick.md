@@ -46,7 +46,7 @@ Actions are sorted by severity, lane and kind. The output for identical evidence
 identical. A lane with an unresolved defect is not excluded. An unreadable
 SWM-226 configuration never produces `answer_dialog`.
 
-The exporter ([FR-033](./FR-033-team-flow-effort-export.md)) SHALL read the last committed tick in the ledger as the source of the metrics `ix_fleet_tick_timestamp_seconds` and `ix_fleet_tick_actions{kind}`, and SHALL omit them when
+The exporter ([FR-033](./FR-033-team-flow-effort-export.md)) SHALL read the last committed tick in the ledger as the source of the metrics `ix_fleet_tick_timestamp_seconds` and `ix_fleet_tick_actions{kind}`, and omits them when
 the last tick is older than twice the configured tick interval, so an external alert sees a missing tick. A tick that cannot evaluate emits an error and commits
 no tick record.
 
