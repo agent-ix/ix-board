@@ -1095,8 +1095,21 @@ fn utilization(out: &mut Out<'_>, sources: &Sources<'_>) {
                 out.unavailable("agents_working_share", reason.clone());
                 out.unavailable("agents_idle_minutes_max", reason);
             }
-            Ok(report) if !report.errors.is_empty() => {
-                let reason = format!("herdr unavailable: {}", report.errors.join("; "));
+            Ok(report) if !report.errors.is_empty() || !report.missing_hosts.is_empty() => {
+                let mut reasons = report.errors.clone();
+                reasons.extend(
+                    report
+                        .missing_hosts
+                        .iter()
+                        .filter(|missing| {
+                            !reasons
+                                .iter()
+                                .any(|error| error.starts_with(&format!("{}:", missing.machine)))
+                        })
+                        .map(|missing| format!("{}: {}", missing.machine, missing.reason))
+                        .collect::<Vec<_>>(),
+                );
+                let reason = format!("herdr unavailable: {}", reasons.join("; "));
                 out.unavailable("agents_working_share", reason.clone());
                 out.unavailable("agents_idle_minutes_max", reason);
             }

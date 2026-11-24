@@ -121,6 +121,8 @@ The [agents example](examples/agents-v2.json) shows nullable worker counts and
 source availability. [JSON Schema](schema/agents-report.schema.json) describes
 the complete report contract.
 
+A herdr `done` pane with no prompt, question, worker or running build is `IDLE` (`RECENT` inside `--idle-after`). Codex rollouts are read from the tail. Each machine is read under its own 45 second timeout; a machine that fails or times out is listed in `missing_hosts` with its reason and elapsed time, the other machines still report, and the exit status is non-zero.
+
 ## drift
 
 ```bash

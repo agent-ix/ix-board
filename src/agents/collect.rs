@@ -226,11 +226,212 @@ fn claude_identity(path: &Path, budget: &mut Budget) -> Result<Lifecycle, &'stat
         ..Lifecycle::default()
     })
 }
+/// Bytes read per backward step when looking for the latest turn start.
+const TAIL_WINDOW: u64 = 1024 * 1024;
+/// Deepest backward scan. With one look-behind byte and a header read of at most
+/// `MAX_RECORD` bytes, the whole tail read stays within `MAX_TRANSCRIPT`.
+const TAIL_SCAN_LIMIT: u64 = MAX_TRANSCRIPT - MAX_RECORD - 2;
+
+fn starts_turn(line: &[u8]) -> bool {
+    let mentions = |needle: &[u8]| line.windows(needle.len()).any(|w| w == needle);
+    if !(mentions(b"task_started") || mentions(b"turn_started")) {
+        return false;
+    }
+    serde_json::from_slice::<Value>(line).is_ok_and(|value| {
+        value["type"] == "event_msg"
+            && matches!(
+                value["payload"]["type"].as_str(),
+                Some("task_started" | "turn_started")
+            )
+    })
+}
+
+/// The records from the latest turn start to the end of the file, as the scanned chunks.
+struct TailRegion {
+    /// File offset of the first record, a record boundary.
+    offset: u64,
+    /// Scanned chunks, earliest last so they can be popped and freed in order.
+    chunks: Vec<Vec<u8>>,
+    /// Bytes of the earliest chunk that precede the first record.
+    skip: usize,
+}
+
+/// Scans backward once over each byte for the latest turn start.
+///
+/// The bytes read are kept, so the forward replay needs no second read and each
+/// byte is charged once. When the whole file is covered without a turn start the
+/// region is the whole file. Fails when `TAIL_SCAN_LIMIT` bytes are scanned
+/// without finding one.
+fn read_tail_region(
+    path: &Path,
+    extent: u64,
+    budget: &mut Budget,
+) -> Result<TailRegion, &'static str> {
+    use std::io::Seek;
+    let mut file = File::open(path).map_err(|_| "transcript_unreadable")?;
+    let floor = extent.saturating_sub(TAIL_SCAN_LIMIT);
+    let mut pos = extent;
+    // Chunks hold [start, pos) for each step, latest first. Each is sized exactly, so they
+    // total at most `TAIL_SCAN_LIMIT` bytes; the replay frees them as it goes.
+    let mut chunks: Vec<Vec<u8>> = Vec::new();
+    // Head of the line that begins at `pos`, kept until its start is read.
+    let mut carry: Vec<u8> = Vec::new();
+    loop {
+        let start = pos.saturating_sub(TAIL_WINDOW).max(floor);
+        // Only the last step needs a look-behind byte, to tell whether `floor` is a boundary.
+        let last = start == floor;
+        let from = if last { start.saturating_sub(1) } else { start };
+        budget.take(pos - from)?;
+        file.seek(std::io::SeekFrom::Start(from))
+            .map_err(|_| "transcript_unreadable")?;
+        let len = usize::try_from(pos - from).map_err(|_| "transcript_size_limit")?;
+        let mut buf = vec![0; len];
+        file.read_exact(&mut buf)
+            .map_err(|_| "transcript_unreadable")?;
+        let skip = usize::try_from(start - from).unwrap_or(0);
+        chunks.push(buf[skip..].to_vec());
+        buf.extend_from_slice(&carry);
+        let first_newline = |from_index: usize| {
+            buf[from_index..]
+                .iter()
+                .position(|b| *b == b'\n')
+                .map(|at| at + from_index)
+        };
+        // Index in `buf` where the first complete line begins.
+        let line_begin = if start == 0 {
+            Some(0)
+        } else if last && skip == 1 && buf[0] == b'\n' {
+            Some(1)
+        } else {
+            first_newline(skip).map(|at| at + 1)
+        };
+        let Some(line_begin) = line_begin else {
+            if u64::try_from(buf.len()).unwrap_or(u64::MAX) > MAX_RECORD {
+                return Err("record_size_limit");
+            }
+            if last {
+                return Err("lifecycle_not_found_within_limit");
+            }
+            carry = buf.split_off(skip);
+            pos = start;
+            continue;
+        };
+        let mut offset = line_begin;
+        let mut latest = None;
+        for line in buf[line_begin..].split(|b| *b == b'\n') {
+            if u64::try_from(line.len()).unwrap_or(u64::MAX) > MAX_RECORD {
+                return Err("record_size_limit");
+            }
+            if starts_turn(line) {
+                latest = Some(offset);
+            }
+            offset += line.len() + 1;
+        }
+        let found = match latest {
+            Some(at) => Some(from + at as u64),
+            None if start == 0 => Some(0),
+            None => None,
+        };
+        if let Some(found) = found {
+            return Ok(TailRegion {
+                offset: found,
+                chunks,
+                skip: usize::try_from(found - start).unwrap_or(0),
+            });
+        }
+        if last {
+            return Err("lifecycle_not_found_within_limit");
+        }
+        // The unprocessed head of this step belongs to the next one.
+        carry = buf[skip..line_begin].to_vec();
+        pos = start;
+    }
+}
+
+/// Replays the region's records chunk by chunk, freeing each chunk once replayed.
+///
+/// Memory stays at the scanned region: nothing is concatenated, and a record that
+/// spans chunks is joined in `pending`, which holds at most `MAX_RECORD` bytes.
+fn replay_region(
+    mut region: TailRegion,
+    adapter: &dyn Harness,
+    mut life: Lifecycle,
+    budget: &Budget,
+) -> Result<Lifecycle, &'static str> {
+    let mut observe = |line: &[u8]| -> Result<(), &'static str> {
+        budget.check()?;
+        if line.iter().all(u8::is_ascii_whitespace) {
+            return Ok(());
+        }
+        let value = serde_json::from_slice(line).map_err(|_| "malformed_transcript_record")?;
+        adapter.observe_record(&value, &mut life);
+        Ok(())
+    };
+    let mut pending: Vec<u8> = Vec::new();
+    let mut skip = region.skip;
+    while let Some(chunk) = region.chunks.pop() {
+        let mut data = &chunk[skip..];
+        skip = 0;
+        while let Some(end) = data.iter().position(|b| *b == b'\n') {
+            if u64::try_from(pending.len() + end).unwrap_or(u64::MAX) > MAX_RECORD {
+                return Err("record_size_limit");
+            }
+            if pending.is_empty() {
+                observe(&data[..end])?;
+            } else {
+                pending.extend_from_slice(&data[..end]);
+                observe(&pending)?;
+                pending.clear();
+            }
+            data = &data[end + 1..];
+        }
+        pending.extend_from_slice(data);
+        if u64::try_from(pending.len()).unwrap_or(u64::MAX) > MAX_RECORD {
+            return Err("record_size_limit");
+        }
+    }
+    observe(&pending)?;
+    Ok(life)
+}
+
+/// Reads the latest lifecycle state from the end of a transcript larger than
+/// `MAX_TRANSCRIPT`.
+///
+/// The replay starts at the latest turn start and is seeded from the
+/// `session_meta` header so identity and ancestry survive.
+fn read_transcript_tail(
+    path: &Path,
+    adapter: &dyn Harness,
+    budget: &mut Budget,
+) -> Result<Lifecycle, &'static str> {
+    retry_sample(|| {
+        let before = stamp(path)?;
+        let result = (|| {
+            let region = read_tail_region(path, before.0, budget)?;
+            let mut seed = Lifecycle::default();
+            if region.offset > 0 {
+                let header = first_record(path, budget)?;
+                if header["type"] == "session_meta" {
+                    adapter.observe_record(&header, &mut seed);
+                }
+            }
+            replay_region(region, adapter, seed, budget)
+        })();
+        if before != stamp(path)? {
+            return Ok(None);
+        }
+        result.map(Some)
+    })
+}
 fn read_transcript(
     path: &Path,
     adapter: &dyn Harness,
     budget: &mut Budget,
 ) -> Result<Lifecycle, &'static str> {
+    // A rollout within the replay limit is read whole, so earlier turns' spawns are kept.
+    if adapter.kind() == HarnessKind::Codex && stamp(path)?.0 > MAX_TRANSCRIPT {
+        return read_transcript_tail(path, adapter, budget);
+    }
     retry_sample(|| {
         let before = stamp(path)?;
         if before.0 > MAX_TRANSCRIPT {
@@ -932,6 +1133,53 @@ fn collect_processes(probe: &mut Probe, budget: &mut Budget) {
 mod tests {
     use super::*;
     use ix_trace_rs::trace;
+    #[trace("FR-018-AC-28")]
+    #[test]
+    fn the_tail_read_charges_each_scanned_byte_once_and_stays_within_the_transcript_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let line = |kind: &str, pad: usize| {
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"response_item","timestamp":"2026-10-18T10:00:00Z","payload":{"type":kind,"pad":"x".repeat(pad)}})
+            )
+        };
+        let event = |kind: &str, at: &str| {
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"event_msg","timestamp":at,"payload":{"type":kind,"turn_id":"t"}})
+            )
+        };
+        let mut text = format!(
+            "{}\n",
+            serde_json::json!({"type":"session_meta","timestamp":"2026-10-18T10:00:00Z","payload":{"id":"root","source":"cli"}})
+        );
+        let filler = line("other", 900);
+        for _ in 0..(MAX_TRANSCRIPT as usize / filler.len() + 1) {
+            text.push_str(&filler);
+        }
+        text.push_str(&event("task_started", "2026-10-18T10:00:01Z"));
+        let in_turn = 10 * 1024 * 1024;
+        for _ in 0..(in_turn / filler.len()) {
+            text.push_str(&filler);
+        }
+        text.push_str(&event("task_complete", "2026-10-18T10:00:09Z"));
+        fs::write(&path, &text).unwrap();
+        let mut budget = Budget {
+            remaining: MAX_READ_BYTES,
+            deadline: Instant::now() + Duration::from_secs(120),
+        };
+        let life = read_transcript_tail(&path, adapter_for("codex").unwrap(), &mut budget).unwrap();
+        assert_eq!(life.state, WorkerState::Completed);
+        let charged = MAX_READ_BYTES - budget.remaining;
+        assert!(charged <= MAX_TRANSCRIPT, "{charged}");
+        // A scan of the 10 MiB turn plus one window and the header read; a second pass over
+        // the region would charge about twice that.
+        assert!(
+            charged <= in_turn as u64 + TAIL_WINDOW + 16 * 1024,
+            "{charged}"
+        );
+    }
     #[trace("FR-018-AC-20")]
     #[test]
     fn changing_sample_retries_once_then_reports_uncertainty() {

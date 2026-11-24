@@ -602,9 +602,11 @@ impl GithubSource for LiveGithub {
     }
 }
 
-/// Longest the herdr read may take before the agent metrics are unavailable. An unreachable
-/// machine otherwise holds the whole snapshot for the detector's two 60-second calls.
-const AGENTS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(25);
+/// Longest the herdr read may take before the agent metrics are unavailable. It outlasts the
+/// detector's per-machine timeout, so a slow machine is reported missing with the healthy
+/// machines' rows rather than dropping the whole read.
+const AGENTS_DEADLINE: std::time::Duration =
+    crate::agents::HOST_TIMEOUT.saturating_add(std::time::Duration::from_secs(5));
 
 type AgentsResult = Result<AgentsReport, String>;
 
