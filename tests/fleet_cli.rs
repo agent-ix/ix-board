@@ -63,14 +63,12 @@ fn status_writes_the_ledger_and_query_reads_the_defect_without_writing() {
     std::fs::write(ledger.with_extension("toml"), "").unwrap();
     let first = fleet_status_with(true, &ledger);
     let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
-    let seen = first["defects"][0]["first_seen_ms"].as_i64().unwrap();
-    assert_eq!(first["defects"][0]["observed_ms"].as_i64().unwrap(), seen);
+    // The relay is unreachable, so the run carries only host time: no relay first-seen exists.
+    let seen = first["defects"][0]["observed_ms"].as_i64().unwrap();
+    assert!(first["defects"][0].get("first_seen_ms").is_none());
     let second = fleet_status_with(true, &ledger);
     let second: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
-    assert_eq!(
-        second["defects"][0]["first_seen_ms"].as_i64().unwrap(),
-        seen
-    );
+    assert!(second["defects"][0].get("first_seen_ms").is_none());
     let before = std::fs::read(&ledger).unwrap();
     let out = ledger_query(&ledger, "defect_rows");
     assert_eq!(out.status.code(), Some(0));
@@ -78,7 +76,11 @@ fn status_writes_the_ledger_and_query_reads_the_defect_without_writing() {
     assert_eq!(value["view"], "defect_rows");
     assert_eq!(value["rows"].as_array().unwrap().len(), 1);
     assert_eq!(value["rows"][0]["source"], "relay");
-    assert_eq!(value["rows"][0]["first_seen_at"].as_i64().unwrap(), seen);
+    assert!(value["rows"][0]["first_seen_at"].is_null());
+    assert_eq!(
+        value["rows"][0]["first_seen_host_ms"].as_i64().unwrap(),
+        seen
+    );
     assert_eq!(std::fs::read(&ledger).unwrap(), before);
     let none = dir.path().join("none.sqlite3");
     std::fs::write(none.with_extension("toml"), "").unwrap();

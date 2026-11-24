@@ -33,7 +33,7 @@ class, and minutes while ready work existed), `action` (id, tick id, kind, lane,
 emitted_at, executed_at, resolved_at), `defect`, `assignment_history`,
 `ground_truth_sample` (lane, time, active or inactive, derived from hook events; at tick `t` the command writes labels for `t-W` and never for `t`, because truth at a time needs events up to `W` later; [FR-040](./FR-040-fleet-calibrate.md)), `calibration_run`,
 `audit_sample`, `saturation_sample` ([FR-041](./FR-041-fleet-saturation.md)),
-`tick` (id, started_at, committed_at) and `run` (sequence, kind, relay time).
+`tick` (id, started_at, committed_at), `run` (sequence, kind, `relay_ms`, `host_ms`, `relay_unavailable`, and the `tick_interval_s`, `cycle_interval_s` and `grace_s` in force) and `host_tick` (run sequence, host, relay time, lanes, working and not working lanes: the per-host figures of [FR-034](./FR-034-fleet-lane-status.md), written by every run that reads the relay). A run whose relay read failed stores the host clock in `host_ms` with `relay_unavailable` set and `relay_ms` empty, writes no `lane_tick` or `host_tick` row, closes no defect and prunes nothing, so host time never enters a relay-time column. The interval and grace are stored per run so views score each run with the configuration that was in force when it was written.
 
 - **Writers.** A writer SHALL hold an exclusive single-writer lock and assign a
   monotonic sequence number to its run; a concurrent run waits up to a bounded time
@@ -72,7 +72,7 @@ under one retention rule; the relay holds transport records of bounded age only.
 |-------|---------|------------|
 | `plan_coverage_tick` | tick id, `unowned_ready_count`, `short_queue_count`, `stale_assignment_count`, `unavailable_lists` | `fleet tick` ([FR-036](./FR-036-fleet-plan-coverage.md)) |
 | `plan_coverage_gap` | gap id, `kind` (`unowned_ready`, `short_queue`, `stale_assignment`), subject (ticket or lane), detail, `opened_tick`, `opened_at`, `closed_tick`, `closed_at` | `fleet tick` ([FR-036](./FR-036-fleet-plan-coverage.md)) |
-| `lane_tick` | tick id, lane, host, class, `remaining_assigned`, `ready_work_available` | `fleet tick` only; `fleet status` writes no row |
+| `lane_tick` | run sequence, `source` (`status` or `tick`), tick id (empty for a `status` row), lane, host, class, reason, `remaining_assigned`, `ready_work_available`, `observed_ms` (relay time of the run), evidence | `fleet tick` and `fleet status`; a `status` row leaves `remaining_assigned` and `ready_work_available` empty |
 | `drift_finding` | finding id, lane, rule, focus, `opened_tick`, `opened_at`, `closed_at`, evidence times | `fleet tick` ([FR-037](./FR-037-fleet-focus-and-drift.md)) |
 | `assignment_history` (extended) | adds `order_id`, `expect_ticket`, `sent_at`, `deadline_at`, `result` (`pending`, `confirmed`, `acted_not_focused`, `ack_expired`, `timed_out`), `result_at`, `confirm_latency_s` (empty for an unconfirmed result), `focus_at_deadline` | `fleet assign` ([FR-035](./FR-035-fleet-assign.md)) |
 | `order_focus_at_deadline` | `order_id`, `sender_role` (`orchestrator`, `minder`), `sender_addr`, lane, `expect_ticket`, `deadline_at`, `focus_ticket`, `focus_state`, `outcome` (`confirmed`, `acted_not_focused`, `ack_expired`, `timed_out`), `followup_at` | `fleet tick` and `fleet status` |
@@ -82,7 +82,7 @@ under one retention rule; the relay holds transport records of bounded age only.
 | `session_turn` | `session_addr`, `session_role`, `started_at` | `fleet tick` and `fleet status`, from hook `prompt` events of the configured minder and orchestrator addresses |
 | `cycle_event` | `cycle_id`, `session_addr`, `started_at`, `ended_at`, `ended_reason` (`ended`, `superseded`), `interval_s` | `fleet cycle` ([FR-044](./FR-044-fleet-cycle-and-dialog-answer-log.md)) |
 | `cycle_missed` | `session_addr`, `last_ended_at`, `expected_by`, `detected_at` | `fleet tick` (below) |
-| `defect` (existing, columns fixed) | `defect_id`, `source`, `host`, `lane`, `kind`, `first_seen_at`, `closed_at`, `routed_ticket`, `routed_at` | `fleet status` and `fleet tick` |
+| `defect` (existing, columns fixed) | `defect_id`, `source`, `host`, `lane`, `kind`, `first_seen_at`, `closed_at`, `routed_ticket`, `routed_at`; `first_seen_at` is relay time and is empty for a defect first seen in a run without relay time, whose host clock is kept in `first_seen_host_ms` | `fleet status` and `fleet tick` |
 | `dialog_answer` | see [FR-044](./FR-044-fleet-cycle-and-dialog-answer-log.md) | `fleet answer-log record` |
 | `capacity_run`, `capacity_step`, `capacity_step_lane_output`, `capacity_level`, `capacity_event`, `host_output_sample` | see [FR-041](./FR-041-fleet-saturation.md) | `fleet capacity` and `fleet tick` |
 
@@ -110,8 +110,7 @@ under one retention rule; the relay holds transport records of bounded age only.
   the same tick's plan-coverage report belongs to a team or project the lane is
   eligible for (the lane's configured teams and projects; a lane with none
   configured is eligible for all).
-- **Tick rows only.** `lane_tick` rows are written by committed `fleet tick` runs
-  only, so ad-hoc `fleet status` runs cannot split or pad an idle episode.
+- **Run rows.** `lane_tick` rows are written by every committed `fleet status` and `fleet tick` run with the run's `source`. The views read `lane_tick_rows`, which keeps one row per lane per `observed_ms`, a `tick` row winning over a `status` row of the same relay time, so a status run and a tick at the same time never count twice. A `status` row leaves `ready_work_available` empty, so it never counts as ready work. Retention prunes an interval-like row (a gap, finding, action, cycle or capacity level) by the time it closed, so a row that is still open is never pruned.
 - **Order focus at the deadline.** For every relay order carrying
   `--expect-ticket`, whoever sent it, the first committed run after its deadline
   passes records one `order_focus_at_deadline` row. `focus_ticket` is the lane's
@@ -159,6 +158,12 @@ in [FR-041](./FR-041-fleet-saturation.md); `answer_dialog_latency_max` and
 | `escalation_rung_send_latency_max` | maximum of `sent_at - emitted_at` over `escalation_rung`, in tick intervals, an unsent row measured to the evaluation time |
 | `escalation_rungs_suppressed` | `escalation_rung` rows with no `sent_at` after `due_by` |
 | `defect_rows` | `defect` rows: id, source, host, lane, kind, `first_seen_at`, `closed_at`, `routed_ticket`, `routed_at` |
+| `idle_lane_episodes_with_ready_work` | one row per episode counted by `idle_lane_episode_with_ready_work_max`: lane, `start_ms`, `end_ms`, ticks and `open_cycles`, computed with the interval and grace of the run that ended the episode |
+| `lane_tick_rows` | `lane_tick` rows deduplicated by relay time as in the Run rows rule, with the interval and grace of their run; the base of the `lane_tick` views |
+| `lane_span` | each `lane_tick_rows` row with the relay time of the lane's next row, the span `idle_minutes` sums; a span longer than twice the run's tick interval is a gap and yields no minutes |
+| `idle_lane_episodes_with_ready_work` | one row per episode of `idle_lane_episode_with_ready_work_max`: lane, `start_ms`, `end_ms`, ticks and `open_cycles`, computed with the interval and grace of the run that ended the episode |
+| `lane_tick_rows` | `lane_tick` rows deduplicated by relay time as in the Run rows rule, with the interval and grace of their run; the base of the `lane_tick` views |
+| `lane_span` | each `lane_tick_rows` row with the relay time of the lane's next row, the span `idle_minutes` sums; a span longer than twice the run's tick interval is a gap and yields no minutes |
 | `add_lane_action_open_cycles_max` | maximum `open_cycles` between `emitted_at` and `resolved_at` of `add_lane` actions |
 | `cycle_missed` | `cycle_missed` rows |
 | `act_on_undetermined_actions`, `push_next_ticket_actions`, `answer_dialog_actions`, `escalate_block_actions`, `add_lane_actions` | `action` rows of that `kind` |
@@ -184,7 +189,7 @@ in [FR-041](./FR-041-fleet-saturation.md); `answer_dialog_latency_max` and
 | FR-039-AC-9 | Opening a version 1 ledger migrates it to version 2 in one transaction under the writer lock with every earlier row unchanged; a crash injected mid-migration leaves the version 1 ledger intact and openable; a ledger of a later version is refused without a change. | Test |
 | FR-039-AC-10 | A gap present in tick 1 and absent in tick 3 gives one `plan_coverage_gap` row with `opened_tick` 1 and `closed_tick` 3; an `unavailable` list in tick 2 neither closes nor reopens it; `open_cycles` equals `max(1, ceil((close_or_now - open - grace) / cycle_interval))` on the evaluation clock: with a 10 minute cycle and grace of 15 minutes (10 minutes plus a 5 minute tick) a gap closed at 4, 24 and 25 minutes counts 1 each (the later ones are an orchestrator that acted in its next cycle), one closed at 26 minutes counts 2, one closed at 36 minutes counts 3, and one still open counts by elapsed time while no `cycle_event` row is written. | Test |
 | FR-039-AC-16 | With the orchestrator session writing no `cycle_event.ended_at` for more than twice `interval_s`, `fleet tick` writes one `cycle_missed` row for the span and not a second on the next tick; a session that ends cycles on time writes none. | Test |
-| FR-039-AC-11 | `lane_tick` holds one row per lane per committed tick with class and `ready_work_available` true exactly when the lane has a remaining ticket or an unowned ready ticket in one of the lane's eligible teams or projects exists; an ad-hoc `fleet status` run writes no `lane_tick` row; `idle_lane_with_ready_work_ticks` and `idle_lane_episode_with_ready_work_max` equal the hand-computed values on a fixture. | Test |
+| FR-039-AC-11 | `lane_tick` holds one row per lane per committed `fleet status` or `fleet tick` run with its `source`, class and `ready_work_available` (true exactly when the lane has a remaining ticket or an unowned ready ticket in one of the lane's eligible teams or projects exists, written by `fleet tick`; empty on a `status` row); a status row and a tick row at the same relay time count once in the views, the tick row winning; `idle_lane_with_ready_work_ticks` and `idle_lane_episode_with_ready_work_max` equal the hand-computed values on a fixture. | Test |
 | FR-039-AC-12 | An order with `--expect-ticket` sent by the minder and one sent by `fleet assign` each get one `order_focus_at_deadline` row in the first run after the deadline, with the focus computed over the window ending at `deadline_at` (a focus change after the deadline does not alter it) and outcomes `confirmed`, `acted_not_focused`, `ack_expired` and `timed_out` matching their receipts. | Test |
 | FR-039-AC-13 | A relay send from the configured minder address to an action's target after `emitted_at` produces one `action_send` row, a repeated run does not add a second, and a send before `emitted_at`, from another sender or to another recipient produces none, and one receipt never satisfies two open actions to the same recipient (the older action takes it). | Test |
 | FR-039-AC-14 | A tick run with `--session` records that address and its configured role; without it the relay-resolved caller address is recorded; an unconfigured address records role `other`; a minder `session_turn` with no tick within one interval appears in `minder_turns_without_committed_tick`. | Test |

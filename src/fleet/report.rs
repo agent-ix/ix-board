@@ -313,6 +313,10 @@ pub struct FleetReport {
     pub hosts: Vec<HostSummary>,
     /// Source defects.
     pub defects: Vec<Defect>,
+    /// The relay could not be read, so `run_ms` is the host clock, not relay time. Not part of
+    /// the wire report.
+    #[serde(skip)]
+    pub relay_unavailable: bool,
 }
 
 impl FleetReport {
@@ -599,7 +603,9 @@ pub fn build_report(cfg: &FleetConfig, sources: &Sources<'_>, local_now_ms: i64)
                 None,
                 error.0.clone(),
             );
-            return finish(local_now_ms, Vec::new(), ctx.defects);
+            let mut report = finish(local_now_ms, Vec::new(), ctx.defects);
+            report.relay_unavailable = true;
+            return report;
         }
     };
     let mut ctx = Ctx {
@@ -883,5 +889,6 @@ fn finish(run_ms: i64, mut rows: Vec<LaneRow>, mut defects: Vec<Defect>) -> Flee
         hosts: summarize(&rows),
         rows,
         defects,
+        relay_unavailable: false,
     }
 }

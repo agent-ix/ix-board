@@ -8,17 +8,19 @@
 //! commits each run in one transaction, so a crash leaves the previous state. Readers open the
 //! file read-only and never migrate.
 
+mod lock;
 mod schema;
 #[cfg(test)]
 mod tests;
 
+use self::lock::WriterLock;
 use super::FleetConfig;
 use super::classify::ClassKind;
 use super::report::{Defect, FleetReport};
 use rusqlite::{Connection, OpenFlags, params};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use thiserror::Error as ThisError;
 
 pub use schema::{QUERYABLE, VERSION};
@@ -48,6 +50,17 @@ pub enum LedgerError {
     /// The file is a database but not a fleet ledger.
     #[error("{0}: not a fleet ledger")]
     NotALedger(PathBuf),
+    /// The ledger directory is on a filesystem that cannot lock a database safely.
+    #[error(
+        "{path}: the ledger is on a network filesystem ({kind}); SQLite locking is unsafe there, \
+         set IX_BOARD_LEDGER_PATH to a local disk"
+    )]
+    NetworkFilesystem {
+        /// Ledger file.
+        path: PathBuf,
+        /// Filesystem type or kind.
+        kind: String,
+    },
     /// The writer lock was not free within the bound.
     #[error("{path}: another writer holds the ledger lock (waited {waited:?})")]
     LockTimeout {
@@ -87,14 +100,20 @@ pub enum LedgerError {
 ///
 /// [`LedgerError::NoStateDir`] when neither `XDG_STATE_HOME` nor a home directory exists.
 pub fn default_path() -> Result<PathBuf, LedgerError> {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
+    default_path_from(
+        std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from),
+    )
+}
+
+fn default_path_from(xdg: Option<PathBuf>, home: Option<PathBuf>) -> Result<PathBuf, LedgerError> {
+    let base = xdg
         .filter(|path| path.is_absolute())
         .or_else(|| {
-            std::env::var_os("HOME")
-                .or_else(|| std::env::var_os("USERPROFILE"))
-                .filter(|home| !home.is_empty())
-                .map(|home| PathBuf::from(home).join(".local").join("state"))
+            home.filter(|home| !home.as_os_str().is_empty())
+                .map(|home| home.join(".local").join("state"))
         })
         .ok_or(LedgerError::NoStateDir)?;
     Ok(base.join("ix-board").join("fleet-ledger.sqlite3"))
@@ -149,93 +168,6 @@ fn millis(duration: Duration) -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }
 
-/// The exclusive writer lock; released when dropped.
-struct WriterLock {
-    #[cfg(unix)]
-    _file: std::fs::File,
-    #[cfg(not(unix))]
-    path: PathBuf,
-}
-
-impl WriterLock {
-    #[cfg(unix)]
-    fn acquire(ledger: &Path, wait: Duration) -> Result<Self, LedgerError> {
-        use rustix::fs::{FlockOperation, flock};
-        let path = lock_path(ledger);
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
-            .map_err(|source| LedgerError::Io {
-                path: path.clone(),
-                source,
-            })?;
-        let started = Instant::now();
-        loop {
-            match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-                Ok(()) => return Ok(Self { _file: file }),
-                Err(rustix::io::Errno::WOULDBLOCK) if started.elapsed() < wait => {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Err(rustix::io::Errno::WOULDBLOCK) => {
-                    return Err(LedgerError::LockTimeout {
-                        path: ledger.to_owned(),
-                        waited: started.elapsed(),
-                    });
-                }
-                Err(errno) => {
-                    return Err(LedgerError::Io {
-                        path,
-                        source: errno.into(),
-                    });
-                }
-            }
-        }
-    }
-
-    #[cfg(not(unix))]
-    fn acquire(ledger: &Path, wait: Duration) -> Result<Self, LedgerError> {
-        let path = lock_path(ledger);
-        let started = Instant::now();
-        loop {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(_) => return Ok(Self { path }),
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::AlreadyExists
-                        && started.elapsed() < wait =>
-                {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    return Err(LedgerError::LockTimeout {
-                        path: ledger.to_owned(),
-                        waited: started.elapsed(),
-                    });
-                }
-                Err(source) => return Err(LedgerError::Io { path, source }),
-            }
-        }
-    }
-}
-
-#[cfg(not(unix))]
-impl Drop for WriterLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-fn lock_path(ledger: &Path) -> PathBuf {
-    let mut name = ledger.as_os_str().to_owned();
-    name.push(".lock");
-    PathBuf::from(name)
-}
-
 fn user_version(connection: &Connection) -> Result<i64, LedgerError> {
     Ok(connection.pragma_query_value(None, "user_version", |r| r.get(0))?)
 }
@@ -271,6 +203,9 @@ pub struct Ledger {
     path: PathBuf,
     connection: Connection,
     retention: Duration,
+    tick_interval_s: i64,
+    cycle_interval_s: i64,
+    grace_s: i64,
     _lock: WriterLock,
 }
 
@@ -299,6 +234,7 @@ impl Ledger {
                 source,
             })?;
         }
+        lock::refuse_network(path)?;
         let lock = WriterLock::acquire(path, config.ledger_lock_wait)?;
         let mut connection = Connection::open(path)?;
         connection.pragma_update(None, "journal_mode", "DELETE")?;
@@ -327,32 +263,19 @@ impl Ledger {
                 });
             }
         }
-        let ledger = Self {
-            path: path.to_owned(),
-            connection,
-            retention: config.ledger_retention,
-            _lock: lock,
-        };
-        ledger.write_meta(config)?;
-        Ok(ledger)
-    }
-
-    fn write_meta(&self, config: &FleetConfig) -> Result<(), LedgerError> {
+        let secs = |d: Duration| i64::try_from(d.as_secs()).unwrap_or(i64::MAX);
         let grace = config
             .grace
             .unwrap_or(config.cycle_interval + config.tick_interval);
-        for (key, value) in [
-            ("tick_interval_s", config.tick_interval.as_secs()),
-            ("cycle_interval_s", config.cycle_interval.as_secs()),
-            ("grace_s", grace.as_secs()),
-        ] {
-            self.connection.execute(
-                "INSERT INTO meta(key,value) VALUES(?1,?2)
-                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                params![key, value.to_string()],
-            )?;
-        }
-        Ok(())
+        Ok(Self {
+            path: path.to_owned(),
+            connection,
+            retention: config.ledger_retention,
+            tick_interval_s: secs(config.tick_interval),
+            cycle_interval_s: secs(config.cycle_interval),
+            grace_s: secs(grace),
+            _lock: lock,
+        })
     }
 
     /// The ledger file.
@@ -362,12 +285,17 @@ impl Ledger {
 
     /// Appends one `fleet status` run: the run record, one `lane_tick` row per lane, the
     /// per-host figures and the defect rows, then prunes by retention. Returns each report
-    /// defect's first-seen time, in report order. The whole run commits or nothing does.
+    /// defect's first-seen time in relay milliseconds, in report order; a defect first seen in a
+    /// run whose relay read failed has none. The whole run commits or nothing does.
+    ///
+    /// A run whose relay read failed records the host clock in `run.host_ms` and
+    /// `relay_unavailable`, writes no lane rows, closes no defect and prunes nothing: host time
+    /// never enters a relay-time column.
     ///
     /// # Errors
     ///
     /// A database failure; the previous state is intact.
-    pub fn record_status(&mut self, report: &FleetReport) -> Result<Vec<i64>, LedgerError> {
+    pub fn record_status(&mut self, report: &FleetReport) -> Result<Vec<Option<i64>>, LedgerError> {
         self.record_inner(report, false)
     }
 
@@ -375,19 +303,33 @@ impl Ledger {
         &mut self,
         report: &FleetReport,
         crash_before_commit: bool,
-    ) -> Result<Vec<i64>, LedgerError> {
+    ) -> Result<Vec<Option<i64>>, LedgerError> {
+        let unavailable = report.relay_unavailable;
         let run_ms = report.run_ms;
         let retention = millis(self.retention);
+        let (relay_ms, host_ms) = if unavailable {
+            (None, Some(run_ms))
+        } else {
+            (Some(run_ms), None)
+        };
         let tx = self.connection.transaction()?;
         tx.execute(
-            "INSERT INTO run(kind, relay_ms) VALUES('status', ?1)",
-            [run_ms],
+            "INSERT INTO run(kind, relay_ms, host_ms, relay_unavailable, tick_interval_s,
+               cycle_interval_s, grace_s) VALUES('status', ?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                relay_ms,
+                host_ms,
+                unavailable,
+                self.tick_interval_s,
+                self.cycle_interval_s,
+                self.grace_s
+            ],
         )?;
         let sequence = tx.last_insert_rowid();
-        {
+        if !unavailable {
             let mut lane = tx.prepare(
-                "INSERT INTO lane_tick(run_seq, lane, host, class, reason, observed_ms,
-                   last_event_ms, evidence) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                "INSERT INTO lane_tick(run_seq, source, lane, host, class, reason, observed_ms,
+                   last_event_ms, evidence) VALUES(?1,'status',?2,?3,?4,?5,?6,?7,?8)",
             )?;
             for row in &report.rows {
                 lane.execute(params![
@@ -416,11 +358,13 @@ impl Ledger {
                 ])?;
             }
         }
-        let first_seen = reconcile_defects(&tx, &report.defects, run_ms)?;
+        let first_seen = reconcile_defects(&tx, &report.defects, run_ms, unavailable)?;
         if crash_before_commit {
             return Err(LedgerError::Sqlite(rusqlite::Error::ExecuteReturnedResults));
         }
-        prune(&tx, run_ms.saturating_sub(retention))?;
+        if !unavailable {
+            prune(&tx, run_ms.saturating_sub(retention))?;
+        }
         tx.commit()?;
         Ok(first_seen)
     }
@@ -452,14 +396,16 @@ fn defect_key(defect: &Defect) -> DefectKey {
     )
 }
 
-/// Opens a row for each defect not already open, closes the open rows no longer present, and
-/// returns the first-seen time of every defect.
+/// Opens a row for each defect not already open and returns the first-seen time of every
+/// defect. When the relay was readable it also closes the open rows no longer present; a run
+/// without the relay observed nothing about the other sources, so it closes nothing.
 fn reconcile_defects(
     tx: &rusqlite::Transaction<'_>,
     defects: &[Defect],
     run_ms: i64,
-) -> Result<Vec<i64>, LedgerError> {
-    let mut open: BTreeMap<DefectKey, (i64, i64)> = BTreeMap::new();
+    unavailable: bool,
+) -> Result<Vec<Option<i64>>, LedgerError> {
+    let mut open: BTreeMap<DefectKey, (i64, Option<i64>)> = BTreeMap::new();
     {
         let mut statement = tx.prepare(
             "SELECT defect_id, source, host, lane, kind, first_seen_at
@@ -468,7 +414,7 @@ fn reconcile_defects(
         let rows = statement.query_map([], |r| {
             Ok((
                 (r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?),
-                (r.get::<_, i64>(0)?, r.get::<_, i64>(5)?),
+                (r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(5)?),
             ))
         })?;
         for row in rows {
@@ -477,7 +423,7 @@ fn reconcile_defects(
         }
     }
     let mut first_seen = Vec::with_capacity(defects.len());
-    let mut present: BTreeMap<DefectKey, i64> = BTreeMap::new();
+    let mut present: BTreeMap<DefectKey, Option<i64>> = BTreeMap::new();
     for defect in defects {
         let key = defect_key(defect);
         if let Some(seen) = present.get(&key) {
@@ -487,28 +433,37 @@ fn reconcile_defects(
         let seen = if let Some((_, seen)) = open.get(&key) {
             *seen
         } else {
+            let (relay, host) = if unavailable {
+                (None, Some(run_ms))
+            } else {
+                (Some(run_ms), None)
+            };
             tx.execute(
-                "INSERT INTO defect(source, host, lane, kind, first_seen_at)
-                 VALUES(?1,?2,?3,?4,?5)",
-                params![key.0, key.1, key.2, key.3, run_ms],
+                "INSERT INTO defect(source, host, lane, kind, first_seen_at, first_seen_host_ms)
+                 VALUES(?1,?2,?3,?4,?5,?6)",
+                params![key.0, key.1, key.2, key.3, relay, host],
             )?;
-            run_ms
+            relay
         };
         present.insert(key, seen);
         first_seen.push(seen);
     }
-    for (key, (id, _)) in &open {
-        if !present.contains_key(key) {
-            tx.execute(
-                "UPDATE defect SET closed_at=?1 WHERE defect_id=?2",
-                params![run_ms, id],
-            )?;
+    if !unavailable {
+        for (key, (id, _)) in &open {
+            if !present.contains_key(key) {
+                tx.execute(
+                    "UPDATE defect SET closed_at=?1 WHERE defect_id=?2",
+                    params![run_ms, id],
+                )?;
+            }
         }
     }
     Ok(first_seen)
 }
 
-/// Deletes rows older than `cutoff`; runs go last so no row outlives its run.
+/// Deletes rows closed or recorded before `cutoff`; open rows stay. Runs go last so no row
+/// outlives its run, and a run with no relay time goes with the runs before the oldest
+/// relay-timed one (sequence order, never a clock comparison).
 fn prune(tx: &rusqlite::Transaction<'_>, cutoff: i64) -> Result<(), LedgerError> {
     for (table, column) in schema::PRUNE {
         tx.execute(
@@ -516,7 +471,17 @@ fn prune(tx: &rusqlite::Transaction<'_>, cutoff: i64) -> Result<(), LedgerError>
             [cutoff],
         )?;
     }
+    tx.execute(
+        "DELETE FROM capacity_step_lane_output
+         WHERE run_id NOT IN (SELECT run_id FROM capacity_run)",
+        [],
+    )?;
     tx.execute("DELETE FROM run WHERE relay_ms < ?1", [cutoff])?;
+    tx.execute(
+        "DELETE FROM run WHERE relay_ms IS NULL
+           AND sequence < COALESCE((SELECT MIN(sequence) FROM run WHERE relay_ms IS NOT NULL), 0)",
+        [],
+    )?;
     Ok(())
 }
 
@@ -530,7 +495,7 @@ pub fn record_status(config: &FleetConfig, report: &mut FleetReport) {
     match written {
         Ok(first_seen) => {
             for (defect, seen) in report.defects.iter_mut().zip(first_seen) {
-                defect.first_seen_ms = Some(seen);
+                defect.first_seen_ms = seen;
             }
         }
         Err(error) => report.add_ledger_defect(error.to_string()),

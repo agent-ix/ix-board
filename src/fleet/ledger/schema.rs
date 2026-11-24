@@ -10,9 +10,8 @@
 pub const VERSION: i64 = 2;
 
 pub const V1: &str = "
-CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE run(
-  sequence INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, relay_ms INTEGER NOT NULL);
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, relay_ms INTEGER);
 CREATE TABLE tick(
   id INTEGER PRIMARY KEY AUTOINCREMENT, started_at INTEGER NOT NULL, committed_at INTEGER);
 CREATE TABLE lane_interval(
@@ -23,7 +22,7 @@ CREATE TABLE action(
   emitted_at INTEGER NOT NULL, executed_at INTEGER, resolved_at INTEGER);
 CREATE TABLE defect(
   defect_id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, host TEXT, lane TEXT,
-  kind TEXT NOT NULL, first_seen_at INTEGER NOT NULL);
+  kind TEXT NOT NULL, first_seen_at INTEGER);
 CREATE TABLE assignment_history(
   id INTEGER PRIMARY KEY AUTOINCREMENT, lane TEXT NOT NULL, ticket TEXT,
   assigned_at INTEGER NOT NULL, replaced_at INTEGER);
@@ -42,6 +41,12 @@ CREATE TABLE saturation_sample(
 /// Version 2 statements, applied one by one inside one transaction. The migration is additive:
 /// it adds columns and tables and never rewrites a row.
 pub const V2: &[&str] = &[
+    "ALTER TABLE run ADD COLUMN host_ms INTEGER",
+    "ALTER TABLE run ADD COLUMN relay_unavailable INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE run ADD COLUMN tick_interval_s INTEGER",
+    "ALTER TABLE run ADD COLUMN cycle_interval_s INTEGER",
+    "ALTER TABLE run ADD COLUMN grace_s INTEGER",
+    "ALTER TABLE defect ADD COLUMN first_seen_host_ms INTEGER",
     "ALTER TABLE defect ADD COLUMN closed_at INTEGER",
     "ALTER TABLE defect ADD COLUMN routed_ticket TEXT",
     "ALTER TABLE defect ADD COLUMN routed_at INTEGER",
@@ -67,14 +72,18 @@ pub const V2: &[&str] = &[
        id INTEGER PRIMARY KEY AUTOINCREMENT,
        run_seq INTEGER NOT NULL REFERENCES run(sequence),
        tick_id INTEGER,
+       source TEXT NOT NULL DEFAULT 'status' CHECK(source IN ('status','tick')),
        lane TEXT NOT NULL, host TEXT NOT NULL, class TEXT NOT NULL, reason TEXT,
        remaining_assigned INTEGER, ready_work_available INTEGER,
        observed_ms INTEGER NOT NULL, last_event_ms INTEGER, evidence TEXT NOT NULL)",
     "CREATE INDEX lane_tick_lane_time ON lane_tick(lane, observed_ms)",
+    "CREATE INDEX lane_tick_time ON lane_tick(observed_ms)",
+    "CREATE INDEX run_relay_ms ON run(relay_ms)",
     "CREATE TABLE host_tick(
        run_seq INTEGER NOT NULL REFERENCES run(sequence), host TEXT NOT NULL,
        observed_ms INTEGER NOT NULL, lanes INTEGER NOT NULL, working INTEGER NOT NULL,
        not_working INTEGER NOT NULL, PRIMARY KEY(run_seq, host))",
+    "CREATE INDEX host_tick_time ON host_tick(observed_ms)",
     "CREATE TABLE plan_coverage_tick(
        tick_id INTEGER PRIMARY KEY, unowned_ready_count INTEGER, short_queue_count INTEGER,
        stale_assignment_count INTEGER, unavailable_lists TEXT)",
@@ -150,46 +159,59 @@ pub const V2: &[&str] = &[
        prs_merged INTEGER, commits_pushed INTEGER, PRIMARY KEY(host, at))",
 ];
 
-/// Millisecond values read from `meta`, with the FR-039 defaults.
-const TICK_MS: &str =
-    "(COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='tick_interval_s'),300)*1000)";
-const CYCLE_MS: &str =
-    "(COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='cycle_interval_s'),600)*1000)";
-const GRACE_MS: &str = "(COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='grace_s'),\
-     COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='cycle_interval_s'),600)\
-     +COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='tick_interval_s'),300))*1000)";
-
 /// The `open_cycles` formula of FR-039, `max(1, ceil((end - start - grace) / cycle))`, in
-/// integer milliseconds.
-pub fn open_cycles_sql(start: &str, end: &str) -> String {
-    format!("max(1, (({end}) - ({start}) - {GRACE_MS} + {CYCLE_MS} - 1) / {CYCLE_MS})")
+/// integer milliseconds. The arguments are SQL expressions.
+pub fn open_cycles_sql(start: &str, end: &str, grace_ms: &str, cycle_ms: &str) -> String {
+    format!("max(1, (({end}) - ({start}) - ({grace_ms}) + ({cycle_ms}) - 1) / ({cycle_ms}))")
 }
 
+/// The base columns of `lane_tick` that views expose.
+const LANE_TICK_COLUMNS: &str = "id, run_seq, tick_id, source, lane, host, class, reason, \
+     remaining_assigned, ready_work_available, observed_ms, last_event_ms, evidence, at_ms";
+
 /// Views over `lane_tick` and `defect`. Each view with a time carries it as `at_ms`, which
-/// `--since` filters on.
+/// `--since` filters on. `lane_tick_rows` keeps one row per lane per run time (a `tick` row wins
+/// over a `status` row) and carries the interval and grace of the run that wrote it, so a
+/// changed configuration never re-scores history.
 pub fn views() -> Vec<String> {
-    let episode_cycles = open_cycles_sql("start_ms", "end_ms");
+    let episode_cycles = open_cycles_sql("start_ms", "end_ms", "grace_ms", "cycle_ms");
     vec![
-        "CREATE VIEW lanes_with_ready_work AS
-           SELECT *, observed_ms AS at_ms FROM lane_tick WHERE ready_work_available = 1"
+        "CREATE VIEW lane_tick_rows AS
+           SELECT t.*, t.observed_ms AS at_ms,
+                  COALESCE(r.tick_interval_s, 300) * 1000 AS tick_ms,
+                  COALESCE(r.cycle_interval_s, 600) * 1000 AS cycle_ms,
+                  COALESCE(r.grace_s,
+                           COALESCE(r.cycle_interval_s, 600) + COALESCE(r.tick_interval_s, 300))
+                    * 1000 AS grace_ms
+           FROM lane_tick t JOIN run r ON r.sequence = t.run_seq
+           WHERE t.id = (SELECT x.id FROM lane_tick x
+                         WHERE x.lane = t.lane AND x.observed_ms = t.observed_ms
+                         ORDER BY (x.source = 'tick') DESC, x.id LIMIT 1)"
             .to_owned(),
-        "CREATE VIEW idle_lane_with_ready_work_ticks AS
-           SELECT *, observed_ms AS at_ms FROM lane_tick
-           WHERE class = 'IDLE' AND ready_work_available = 1"
-            .to_owned(),
+        format!(
+            "CREATE VIEW lanes_with_ready_work AS
+               SELECT {LANE_TICK_COLUMNS} FROM lane_tick_rows WHERE ready_work_available = 1"
+        ),
+        format!(
+            "CREATE VIEW idle_lane_with_ready_work_ticks AS
+               SELECT {LANE_TICK_COLUMNS} FROM lane_tick_rows
+               WHERE class = 'IDLE' AND ready_work_available = 1"
+        ),
         format!(
             "CREATE VIEW idle_lane_episodes_with_ready_work AS
                WITH o AS (
                  SELECT lane, observed_ms, class, ready_work_available AS ready,
+                        tick_ms, cycle_ms, grace_ms,
                         ROW_NUMBER() OVER (PARTITION BY lane ORDER BY observed_ms, run_seq) AS rn
-                 FROM lane_tick),
+                 FROM lane_tick_rows),
                q AS (
-                 SELECT lane, observed_ms,
+                 SELECT lane, observed_ms, tick_ms, cycle_ms, grace_ms,
                         rn - ROW_NUMBER() OVER (PARTITION BY lane ORDER BY rn) AS grp
                  FROM o WHERE class = 'IDLE' AND ready = 1),
                e AS (
                  SELECT lane, MIN(observed_ms) AS start_ms,
-                        MAX(observed_ms) + {TICK_MS} AS end_ms, COUNT(*) AS ticks
+                        MAX(observed_ms) + tick_ms AS end_ms, COUNT(*) AS ticks,
+                        cycle_ms, grace_ms
                  FROM q GROUP BY lane, grp)
                SELECT lane, start_ms, end_ms, ticks, {episode_cycles} AS open_cycles,
                       start_ms AS at_ms
@@ -199,27 +221,26 @@ pub fn views() -> Vec<String> {
            SELECT MAX(open_cycles) AS open_cycles FROM idle_lane_episodes_with_ready_work"
             .to_owned(),
         "CREATE VIEW lane_span AS
-               SELECT lane, host, class, ready_work_available AS ready, observed_ms AS start_ms,
-                      LEAD(observed_ms) OVER (PARTITION BY lane ORDER BY observed_ms, run_seq)
-                        AS end_ms
-               FROM lane_tick"
+           SELECT lane, host, class, ready_work_available AS ready, observed_ms AS start_ms,
+                  tick_ms,
+                  LEAD(observed_ms) OVER (PARTITION BY lane ORDER BY observed_ms, run_seq)
+                    AS end_ms
+           FROM lane_tick_rows"
             .to_owned(),
-        format!(
-            "CREATE VIEW idle_minutes AS
-               SELECT lane, host, date(start_ms / 1000, 'unixepoch') AS day, class,
-                      SUM(end_ms - start_ms) / 60000.0 AS minutes,
-                      SUM(CASE WHEN ready = 1 THEN end_ms - start_ms ELSE 0 END) / 60000.0
-                        AS minutes_with_ready_work,
-                      CAST(strftime('%s', date(start_ms / 1000, 'unixepoch')) AS INTEGER) * 1000
-                        AS at_ms
-               FROM lane_span
-               WHERE class <> 'WORKING' AND end_ms IS NOT NULL
-                 AND end_ms - start_ms <= 2 * {TICK_MS}
-               GROUP BY lane, host, day, class"
-        ),
+        "CREATE VIEW idle_minutes AS
+           SELECT lane, host, date(start_ms / 1000, 'unixepoch') AS day, class,
+                  SUM(end_ms - start_ms) / 60000.0 AS minutes,
+                  SUM(CASE WHEN ready = 1 THEN end_ms - start_ms ELSE 0 END) / 60000.0
+                    AS minutes_with_ready_work,
+                  CAST(strftime('%s', date(start_ms / 1000, 'unixepoch')) AS INTEGER) * 1000
+                    AS at_ms
+           FROM lane_span
+           WHERE class <> 'WORKING' AND end_ms IS NOT NULL AND end_ms - start_ms <= 2 * tick_ms
+           GROUP BY lane, host, day, class"
+            .to_owned(),
         "CREATE VIEW defect_rows AS
-           SELECT defect_id, source, host, lane, kind, first_seen_at, closed_at, routed_ticket,
-                  routed_at, first_seen_at AS at_ms
+           SELECT defect_id, source, host, lane, kind, first_seen_at, first_seen_host_ms,
+                  closed_at, routed_ticket, routed_at, first_seen_at AS at_ms
            FROM defect"
             .to_owned(),
     ]
@@ -238,29 +259,32 @@ pub const QUERYABLE: &[&str] = &[
 /// Views without an `at_ms` column, which refuse `--since`.
 pub const UNDATED: &[&str] = &["idle_lane_episode_with_ready_work_max"];
 
-/// `(table, time column)` pairs that retention prunes by age. A defect is pruned only once
-/// closed.
+/// `(table, column)` pairs that retention prunes by age: a row goes once `column` is set and
+/// older than the cutoff. Interval-like rows are keyed on the time they close, so a row that is
+/// still open (a gap, a finding, an unresolved action, an open cycle, the current capacity
+/// level) is never pruned however old it is.
 pub const PRUNE: &[(&str, &str)] = &[
     ("lane_tick", "observed_ms"),
     ("host_tick", "observed_ms"),
     ("defect", "closed_at"),
-    ("action", "emitted_at"),
-    ("lane_interval", "started_at"),
-    ("assignment_history", "assigned_at"),
+    ("action", "resolved_at"),
+    ("lane_interval", "ended_at"),
+    ("assignment_history", "replaced_at"),
     ("ground_truth_sample", "at"),
     ("audit_sample", "at"),
     ("saturation_sample", "at"),
-    ("plan_coverage_gap", "opened_at"),
-    ("drift_finding", "opened_at"),
+    ("plan_coverage_gap", "closed_at"),
+    ("drift_finding", "closed_at"),
     ("order_focus_at_deadline", "deadline_at"),
     ("action_send", "sent_at"),
     ("session_turn", "started_at"),
-    ("cycle_event", "started_at"),
+    ("cycle_event", "ended_at"),
     ("cycle_missed", "detected_at"),
     ("dialog_answer", "answered_at"),
-    ("capacity_run", "started_at"),
-    ("capacity_level", "recorded_at"),
+    ("capacity_run", "ended_at"),
+    ("capacity_step", "window_end"),
+    ("capacity_level", "superseded_at"),
     ("capacity_event", "at"),
     ("host_output_sample", "at"),
-    ("tick", "started_at"),
+    ("tick", "committed_at"),
 ];
