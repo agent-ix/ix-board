@@ -39,6 +39,7 @@ categories. Missing or stale dependent facts omit current numeric values.
 Workers share the default coordinated Linear cache and persisted quota gate.
 Stale back-off fallback snapshots cannot certify a fresh tracker population;
 last-success timestamps retain the actual successful source-sync time.
+The exporter surface also serves the bounded fleet gauges defined by [FR-038](./FR-038-fleet-tick.md) and [FR-041](./FR-041-fleet-saturation.md) (`ix_fleet_tick_timestamp_seconds`, `ix_fleet_tick_actions{kind}`, `ix_fleet_ready_buffer_deficit`), omitting a value whose source is unavailable.
 The initial configuration permits four scopes and 1,000 output series. Individual
 evidence is retained for at most seven days within a 64 MiB SQLite file limit.
 
@@ -59,6 +60,7 @@ evidence is retained for at most seven days within a 64 MiB SQLite file limit.
 | FR-033-AC-11 | A read-only local quota frontier gauge counts unexpired observations without creating or changing the quota database or sending API traffic; missing, stale or future observations omit the count and report unavailable monitoring. | Test |
 | FR-033-AC-12 | Every exporter GitHub read uses shared persistent admission and response caching. A rolling-hour hard ceiling of 40 sends and 1,000 pessimistically reserved GraphQL points survives concurrent workers and restarts. Per-PR REST polling and cache-miss fallbacks are prohibited; historical links use batches of at most 25, with at most 50 older links per repository per collection. Every actual HTTP attempt is admitted once with automatic redirects/retries disabled. Debits and leases use the current admission clock; Retry-After uses the response receipt clock. Server reset/Retry-After cooldowns survive HTTP errors and restart; cooldown or exhausted budget admits zero sends. Unsupported expensive department and commit/check evidence remains explicitly unavailable. | Test |
 | FR-033-AC-13 | Repository state uses at most four 50-row pages per open/recent cohort; incomplete, malformed, absent or stale evidence cannot certify an empty, clean or unmerged population. Required nullable native fields must be present and PR state/timestamps consistent. Cache representations bind the provider and effective credential; unknown credentials cannot reuse private bodies. Cache hits retain source observation times, conditional 304 responses require an existing valid representation, and stale values are omitted after 15 minutes. Query/output/time and shared SQLite storage limits are enforced: 16 KiB requests, 1 MiB response bodies, 20-second transport deadlines and a 45-second collection admission deadline; response storage is at most one eighth of the journal ceiling capped at 4 MiB and 128 entries, retained at most seven days. | Test |
+| FR-033-AC-14 | The exporter serves the fleet tick and ready-buffer-deficit gauges with bounded labels, and omits each when its source is unavailable or stale. | Test |
 
 ## Dependencies
 

@@ -42,6 +42,7 @@ without an LLM or prose interpretation. The read SHALL not mutate any source.
 - GitHub PR creation and merge events, including PRs opened before the window
   and merged inside it, plus branch/title ticket identifiers; commit events
   with ticket identifiers; per-lead herdr busy state and OTel spending events.
+- When the [FR-037](./FR-037-fleet-focus-and-drift.md) lane evidence is available, per-lane busy state and branch/PR/commit attribution derived from hook events MAY supply the herdr, OpenTelemetry and GitHub inputs above; an input fleet evidence does not carry stays absent.
 - Zero or more `priority_goals`, each identifying a Linear project or
   milestone by its exact identifier/name, or explicit issue IDs when no
   project or milestone identifies the goal. Each goal SHALL have a positive
@@ -208,6 +209,7 @@ without an LLM or prose interpretation. The read SHALL not mutate any source.
 | FR-008-AC-14 | A fixture with complete history groups all advancing issues from other projects by team and project in `crowding_out`, including all ticket IDs across teams; cross-team tickets assigned to a counted goal worker also appear in `out_of_team_activity`. Goal issues and blockers are excluded, and grouping/order is deterministic. | Test |
 | FR-008-AC-15 | Missing current issue/assignee, goal-membership, blocker, or relevant history pages make dependent counts/timestamps unavailable and produce explicit missing-source reasons; status is `unknown` unless a positive finding is already proven, in which case it is `flagged`. Partial crowding evidence is retained, but partial evidence never yields `on_track`, `flagged=false`, or a complete empty list. | Test |
 | FR-008-AC-16 | With complete evidence showing every goal issue is terminal, the report has no staffing-shortfall finding and returns `on_track`; with an open goal issue, the configured worker minimum applies. | Test |
+| FR-008-AC-17 | A fixture supplying busy state and branch/PR/commit attribution through fleet lane evidence produces the same drift signals as the same data through explicit inputs, and an input absent from fleet evidence remains absent rather than defaulted. | Test |
 
 ## Dependencies
 

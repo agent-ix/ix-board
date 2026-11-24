@@ -88,6 +88,7 @@ with the last successful report for that focus.
   records in a schema-versioned append-only store outside every git work tree,
   and compare them with the previous snapshot and a baseline. Unreadable
   metrics are reported unavailable, never zero (FR-024 through FR-028).
+- `fleet status`, `assign`, `plan-coverage`, `tick`, `saturation`, `calibrate`, `replay` and the fleet ledger classify every registered agent lane from fused hook, host, git and relay evidence, keep lanes fed, and measure detector accuracy against hook ground truth (FR-034 through FR-043, SWM-208); `agents` UNKNOWN causes are fixed in FR-018 (SWM-210).
 
 ### Out of Scope
 
@@ -96,6 +97,9 @@ with the last successful report for that focus.
 - Mutating Linear fields other than project status and priority, or mutating
   GitHub data. The retro store (FR-025) is local state outside every repository,
   not Linear or GitHub data.
+- Writing Linear or relay data from `fleet tick`, `plan-coverage`, `saturation` and `calibrate`; only `fleet assign` writes (relay `work agent`), and defect tickets are emitted for the caller to file.
+- Collecting hook events and host probes, and the relay `Acted` receipt: owned by ix-relay (SWM-201). The build scheduler that supplies sustainable slots is a separate tool.
+
 - Combining retro metrics into a single health score, and scoring subjective
   qualities such as brief clarity or role discipline; the retro commands report
   structured measures only.
@@ -177,6 +181,8 @@ They reuse the readers behind FR-018, FR-021, FR-022 and FR-023.
 Functional acceptance criteria include fixture checks for each drift signal,
 queue rules, and cache behavior; NFR-001 specifies a lightweight warm-cache
 fixture benchmark.
+
+SWM-208 adds US-011 and FR-034 through FR-043: FR-034 lane classes and source defects, FR-035 assign, FR-036 plan coverage, FR-037 hook-derived focus and drift inputs (constraining FR-008), FR-038 tick actions, FR-039 ledger, FR-040 calibration, FR-041 saturation, FR-042 replay, FR-043 script replacement. FR-018 gains the SWM-210 evidence-completeness rules and FR-033 serves the fleet gauges.
 
 ## References
 
