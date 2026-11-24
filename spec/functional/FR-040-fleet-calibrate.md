@@ -41,7 +41,8 @@ sample count is below a configured minimum (default 30) the result is
 error rate above 20% over a sufficient sample, the command emits a `defect_ticket`
 record (title, evidence, rates, window) for the caller to file; ix-board writes no
 tracker data. The command reports whether the 24-hour WORKING-precision target
-(error under 10%) is met. Calibration output also reports ground-truth coverage
+(error under 10%) is met. The command SHALL detect hook-history truncation (the relay stream keeps at most 20,000 events and 24h): when the oldest retrieved event is newer than the window start, or the stream is at its bound, the affected span reports `unavailable: history_truncated` and is never treated as a gap or as inactive. Ground-truth labels persisted by each tick ([FR-039](./FR-039-fleet-ledger.md) `ground_truth_sample`) serve windows beyond relay retention. Event times are relay server time.
+Calibration output also reports ground-truth coverage
 per host so a host without hook events is visible.
 
 ## Acceptance Criteria
@@ -55,7 +56,8 @@ per host so a host without hook events is visible.
 | FR-040-AC-5 | Audit samples added with `calibrate audit add` are validated, stored, and drive the fused WORKING precision; a malformed audit is refused. | Test |
 | FR-040-AC-6 | The report states whether WORKING error is under 10% over 24h and shows per-host ground-truth coverage. | Test |
 | FR-040-AC-7 | Boundary fixtures at `W` seconds around the sample time classify truth as specified. | Test |
+| FR-040-AC-8 | When the retrieved history starts after the window start or the stream is at its bound, the span reports `unavailable: history_truncated` and contributes no samples; persisted tick labels cover the older span. | Test |
 
 ## Dependencies
 
-- Hook events with stop and idle-prompt kinds from ix-relay SWM-201 (assumed). Defect filing is performed by the executing agent, not by ix-board.
+- Hook events with stop and idle-prompt kinds from ix-relay PR #52 (target contract). Defect filing is performed by the executing agent, not by ix-board.

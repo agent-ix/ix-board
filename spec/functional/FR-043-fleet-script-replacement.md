@@ -14,7 +14,7 @@ relationships:
 
 ## Description
 
-Every fleet monitoring function SHALL be implemented in Rust. The `_lead-bin`
+The ix-board fleet commands SHALL implement every fleet monitoring function in Rust. The `_lead-bin`
 scripts `monitor.sh`, `calibrate.sh`, `util.sh`, probes, `lane-status.sh`,
 `hosts-status.sh`, `host-probe.sh`, `watchdog.sh` and `qsl-lane-check` SHALL be
 removed only after their replacement is live. ix-board SHALL NOT contain Python or
@@ -26,7 +26,7 @@ Replacement map: `monitor.sh` and `qsl-lane-check` become `fleet status` and
 `fleet tick`; `calibrate.sh` becomes `fleet calibrate`; `watchdog.sh` becomes the
 tick metric of [FR-038](./FR-038-fleet-tick.md) with an external alert; `util.sh`, probes,
 `lane-status.sh`, `hosts-status.sh` and `host-probe.sh` become the ix-relay
-relay-watcher collector (ix-relay SWM-201) read through [FR-034](./FR-034-fleet-lane-status.md).
+relay-watcher collector (ix-relay PR #52) read through [FR-034](./FR-034-fleet-lane-status.md).
 The stopgap `monitor.sh` is stopped only after `fleet status` has produced a
 complete report for the configured lanes and its ticks are observed by the tick
 metric. Makefile targets call Rust binaries only.
@@ -42,4 +42,4 @@ metric. Makefile targets call Rust binaries only.
 
 ## Dependencies
 
-- ix-relay SWM-201 collector (assumed) for host and pane evidence.
+- ix-relay PR #52 collector (assumed) for host and pane evidence.
