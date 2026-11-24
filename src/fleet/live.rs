@@ -12,8 +12,8 @@ use super::report::{
 };
 use relay_core::config::{CoreFlags, load_core};
 use relay_core::receipts::{
-    RECEIPT_EVENT_CAP, RECEIPT_PAGE_CAP, RECEIPT_WINDOW_MS, ReceiptCoverageReason, ReceiptEvent,
-    ReceiptExport, ReceiptOutcome, ReceiptRequest,
+    ExpiredOrders, RECEIPT_EVENT_CAP, RECEIPT_PAGE_CAP, ReceiptCoverageReason, ReceiptEvent,
+    ReceiptExport, ReceiptOutcome,
 };
 use relay_core::{ACTIVITY_MAX_EVENTS, Address, Relay};
 use std::collections::BTreeMap;
@@ -425,25 +425,45 @@ pub fn collect_receipts(
 
 fn read_receipts(
     relay: &mut Relay,
-    now_ms: i64,
+    _now_ms: i64,
     registrations: &[RegInfo],
 ) -> Result<ReceiptRead, SourceError> {
-    let lanes: BTreeMap<String, String> = registrations
-        .iter()
-        .map(|reg| (reg.queue.clone(), reg.addr.clone()))
-        .collect();
-    let (events, gaps) = collect_receipts(|after| {
-        relay
-            .receipt_export(&ReceiptRequest {
-                since_ms: now_ms - RECEIPT_WINDOW_MS,
-                until_ms: now_ms,
-                now_ms,
-                page_size: RECEIPT_PAGE_CAP,
-                after,
-            })
-            .map_err(|e| SourceError(format!("relay receipts: {e}")))
-    })?;
-    Ok(expired_orders_from(&events, &lanes, gaps))
+    let listed = relay
+        .expired_orders()
+        .map_err(|e| SourceError(format!("relay expired orders: {e}")))?;
+    let addrs: Vec<String> = registrations.iter().map(|reg| reg.addr.clone()).collect();
+    Ok(receipt_read_from(&listed, &addrs))
+}
+
+/// Maps the relay's read-only expired-order list (`Relay::expired_orders`) to the report's
+/// receipt read. The relay applies the deadline and reports whether a `Delivered` receipt came
+/// before expiry, so no order is `gap_spanned`; `truncated` and `skipped` are carried to the
+/// report as defects. A recipient that is not a registered lane address is unresolved.
+#[must_use]
+pub fn receipt_read_from(listed: &ExpiredOrders, lanes: &[String]) -> ReceiptRead {
+    let mut read = ReceiptRead {
+        truncated: listed.truncated,
+        skipped: listed.skipped,
+        ..ReceiptRead::default()
+    };
+    for order in &listed.orders {
+        let recipient: Option<Address> = order.recipient.parse().ok();
+        let lane = lanes
+            .iter()
+            .find(|lane| lane.parse::<Address>().ok() == recipient && recipient.is_some());
+        match lane {
+            Some(addr) => read.orders.push(ExpiredOrder {
+                addr: addr.clone(),
+                delivered: order.delivered_before_expiry,
+                gap_spanned: false,
+            }),
+            None => read.unresolved.push(UnresolvedOrder {
+                order_id: order.original_id.clone(),
+                target: order.recipient.clone(),
+            }),
+        }
+    }
+    read
 }
 
 /// The receipts read together with the relay snapshot, handed to the report as its order source.

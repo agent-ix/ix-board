@@ -146,6 +146,11 @@ pub struct ReceiptRead {
     /// Coverage limits of the history (recording gap, pending observation, evicted range). A
     /// `timed_out` derived while any exists may be a lost `Delivered` receipt.
     pub gaps: Vec<String>,
+    /// The relay says qualifying expired orders may be missing from `orders` (more exist than it
+    /// returned, its scan bound was hit or its index dropped live rows).
+    pub truncated: bool,
+    /// Rows the relay could not decode; they are not in `orders`.
+    pub skipped: u64,
 }
 
 /// Watcher series by host (Prometheus HTTP API).
@@ -709,6 +714,28 @@ pub fn build_report(cfg: &FleetConfig, sources: &Sources<'_>, local_now_ms: i64)
             format!(
                 "receipt history is not complete ({}); a timed_out order may have lost its Delivered receipt",
                 read.gaps.join(", ")
+            ),
+        );
+    }
+    if read.truncated {
+        ctx.defect(
+            DefectKind::UnreadableSource,
+            "relay.receipts",
+            None,
+            None,
+            "the relay's expired-order list is truncated; a STALE-ORDER lane may be missing"
+                .to_owned(),
+        );
+    }
+    if read.skipped > 0 {
+        ctx.defect(
+            DefectKind::UnreadableSource,
+            "relay.receipts",
+            None,
+            None,
+            format!(
+                "{} expired-order rows could not be decoded by the relay; a STALE-ORDER lane may be missing",
+                read.skipped
             ),
         );
     }

@@ -1374,3 +1374,44 @@ fn unresolved_expired_orders_are_one_defect_per_target_listing_the_order_ids() {
         .unwrap();
     assert!(gone.reason.contains("o1") && gone.reason.contains("o2"));
 }
+
+#[trace("FR-034-AC-22")]
+#[test]
+fn a_truncated_or_skipped_expired_order_list_is_a_defect_and_keeps_the_rows() {
+    use relay_core::receipts::{ExpiredOrderState, ExpiredOrders, OrderEscalationState};
+    let order = |id: &str, recipient: &str, delivered: bool| ExpiredOrderState {
+        original_id: id.to_owned(),
+        recipient: recipient.to_owned(),
+        expect_ticket: None,
+        enqueued_at_ms: 1,
+        deadline_ms: 2,
+        expired_at_ms: 3,
+        delivered_before_expiry: delivered,
+        last_state: "Queued".to_owned(),
+        escalation: OrderEscalationState::Pending,
+    };
+    let listed = ExpiredOrders {
+        orders: vec![order("o1", "h:w:1", true), order("o2", "H:W:9", false)],
+        skipped: 2,
+        indexed_since_ms: Some(1),
+        truncated: true,
+    };
+    let read = live::receipt_read_from(&listed, &["h:w:1".to_owned()]);
+    assert_eq!(read.orders, vec![self::order("h:w:1", true)]);
+    assert_eq!(read.unresolved.len(), 1);
+    assert!(read.truncated && read.skipped == 2);
+    let mut world = World::one_host(&["h:w:1"], vec![raw("h:w:1", HookKind::Stop, 5)], &[]);
+    world.receipts = Ok(read.orders.clone());
+    world.read_extra = read;
+    let report = world.run();
+    assert_eq!(class_of(&report, "h:w:1").0, ClassKind::StaleOrder);
+    let reasons: Vec<_> = report
+        .defects
+        .iter()
+        .filter(|d| d.source == "relay.receipts")
+        .map(|d| d.reason.as_str())
+        .collect();
+    assert!(reasons.iter().any(|r| r.contains("truncated")));
+    assert!(reasons.iter().any(|r| r.contains("2 expired-order rows")));
+    assert!(!report.complete);
+}
