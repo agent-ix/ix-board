@@ -1489,3 +1489,44 @@ fn a_tick_completes_pending_assignments_and_reads_focus_through_the_shared_commi
         vec![(Some(T0 + 300_000), Some(T0 + 300_000))]
     );
 }
+
+/// A rig writes the ledger its configuration names; `IX_BOARD_LEDGER_PATH` is read only when
+/// the command loads its configuration, so an exported value never redirects an in-process rig.
+#[test]
+fn a_hand_built_config_resolves_to_its_own_ledger_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let own = dir.path().join("own.sqlite3");
+    let config = FleetConfig {
+        ledger_path: Some(own.clone()),
+        ..FleetConfig::default()
+    };
+    assert_eq!(ix_board::fleet::ledger::resolve_path(&config).unwrap(), own);
+}
+
+/// The command line still honors `IX_BOARD_LEDGER_PATH` over `[fleet] ledger_path`.
+#[test]
+fn the_cli_ledger_environment_beats_the_configured_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let env_ledger = dir.path().join("env.sqlite3");
+    let file_ledger = dir.path().join("file.sqlite3");
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[fleet]\nledger_path = {:?}\n",
+            file_ledger.display().to_string()
+        ),
+    )
+    .unwrap();
+    let _ = assert_cmd::Command::cargo_bin("ix-board")
+        .unwrap()
+        .env("IX_BOARD_CONFIG_PATH", &config)
+        .env("IX_RELAY_URL", "redis://127.0.0.1:1")
+        .env("IX_BOARD_LEDGER_PATH", &env_ledger)
+        .env_remove("IX_PROMETHEUS_URL")
+        .args(["--json", "fleet", "status"])
+        .output()
+        .unwrap();
+    assert!(env_ledger.exists());
+    assert!(!file_ledger.exists());
+}

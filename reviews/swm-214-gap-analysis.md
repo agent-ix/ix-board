@@ -89,6 +89,12 @@ Seam ownership:
 | --- | --- | --- | --- |
 | FND-009 | medium | FR-039-AC-6 still requires `push_next_ticket` `executed_at` on "WORKING with matching focus", but the amended FR-039 body defers push and resend to SWM-255. `executed_at_needs_positive_evidence_for_each_kind` is tagged AC-6 and asserts push stays NULL on WORKING, the opposite of the AC's push clause. The AC must be amended to mark the deferral, or the focus join wired once #94 lands. | spec/functional/FR-039-fleet-ledger.md:187, tests/fleet_tick.rs:916-985 |
 
+## New findings (disposition pass 2)
+
+| ID | Severity | Summary | Refs |
+| --- | --- | --- | --- |
+| FND-010 | medium | The paged receipt read (`collect_receipts`, `RECEIPT_MAX_PAGES`) is live again: `fleet assign` and assignment completion use it. It has no owning acceptance criterion, because FR-034-AC-23 was rewritten to the `expired_orders` read. Its tests `receipt_pages_are_followed_by_cursor_and_the_read_is_bounded` and `receipt_coverage_reasons_split_into_failures_and_gaps` carry no trace tag. Add an FR-035 AC and tag both tests to it. The AC should say the read spans the relay retention, follows the cursor, is bounded at the event cap over the page size plus one, and fails on a strict coverage reason. | src/fleet/live.rs:314-363, tests/fleet.rs:1261-1330, spec/functional/FR-035-fleet-assign.md |
+
 ## Dispositions
 
 | FND | outcome | reason |
@@ -102,3 +108,5 @@ Seam ownership:
 | FND-007 | fixed | - |
 | FND-008 | fixed | - |
 | FND-009 | still-open | New in round 1: AC-6 text contradicts the deferral and the test tagged to it. |
+| FND-009 | fixed | - |
+| FND-010 | still-open | New in round 2: the paged receipt read lost its owning AC; add an FR-035 AC and tag its two tests. |

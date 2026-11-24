@@ -1259,6 +1259,7 @@ fn page(
 }
 
 /// The paged receipt read `fleet assign` and the assignment completion use.
+#[trace("FR-035-AC-16")]
 #[test]
 fn receipt_pages_are_followed_by_cursor_and_the_read_is_bounded() {
     let mut cursors = Vec::new();
@@ -1294,6 +1295,7 @@ fn receipt_pages_are_followed_by_cursor_and_the_read_is_bounded() {
     assert!(error.0.contains(&bound.to_string()));
 }
 
+#[trace("FR-035-AC-16")]
 #[test]
 fn receipt_coverage_reasons_split_into_failures_and_gaps() {
     use ReceiptCoverageReason::{

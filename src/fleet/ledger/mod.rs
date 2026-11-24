@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (C) 2026 Agent-IX
+// Coyright (C) 2026 Agent-IX
 
 //! The fleet ledger (FR-039): a schema-versioned SQLite store outside git, written under a
 //! single-writer lock with the atomic-commit discipline of the team-metrics journal.
@@ -123,15 +123,13 @@ fn default_path_from(xdg: Option<PathBuf>, home: Option<PathBuf>) -> Result<Path
     Ok(base.join("ix-board").join("fleet-ledger.sqlite3"))
 }
 
-/// Resolves the ledger path: `IX_BOARD_LEDGER_PATH`, then the configured path, then the default.
+/// Resolves the ledger path: the configured path (which `IX_BOARD_LEDGER_PATH` fills at
+/// configuration load, see [`FleetConfig::from_toml`]), then the default.
 ///
 /// # Errors
 ///
 /// [`LedgerError::NoStateDir`] when there is no default.
 pub fn resolve_path(config: &FleetConfig) -> Result<PathBuf, LedgerError> {
-    if let Some(path) = std::env::var_os("IX_BOARD_LEDGER_PATH").filter(|p| !p.is_empty()) {
-        return Ok(PathBuf::from(path));
-    }
     match &config.ledger_path {
         Some(path) => Ok(path.clone()),
         None => default_path(),

@@ -73,6 +73,13 @@ target/ was deleted afterwards.
 | FND-010 | medium | The fix round corrupted the SPDX header of `src/fleet/report.rs` to `AGPL-3.0-r-later`, which is not a valid SPDX identifier, so the file loses its machine-readable licence tag. `cargo deny` does not check file headers, so the gate stays green. | src/fleet/report.rs:1 |
 | FND-011 | low | The tick's own `tick.assignments` defect is closed by any `fleet status` run in between, because `record_status` reconciles away every open defect it did not see itself. It is then reopened by the next tick with a new `first_seen_at`, so the defect rows churn and the defect's age is lost. The `fix_source` id persists because its subject is unchanged. | src/fleet/ledger/mod.rs:452-461, src/fleet/tick/mod.rs:387-401 |
 
+## New findings (disposition pass 2)
+
+| ID | Severity | Summary | Refs |
+| --- | --- | --- | --- |
+| FND-012 | low | `push_next_ticket` `executed_at` is judged only in the tick where its condition resolves, against that tick's list head. If `fleet assign` rewrites the list between push and resolution, or FR-037 focus is not yet derivable in that one tick, a real execution stays NULL. There is no false positive. The fix is to record the pushed ticket on the action row and let a later tick inside the focus window set `executed_at` (SWM-255 schema work). | src/fleet/ledger/tick.rs:119-150, src/fleet/tick/live.rs:167-200 |
+| FND-013 | low | `resolve_path` prefers `IX_BOARD_LEDGER_PATH` over `FleetConfig.ledger_path`. Tests that go through it (`commit_completing` in tests/fleet_tick.rs, `record_status_completing` in tests/fleet_assign.rs) would write to that path if a developer's shell exports it. With it unset, every test ledger is in a tempdir, and nothing was written under ~/.local/state/ix-board. | src/fleet/ledger/mod.rs:131-139, tests/fleet_tick.rs:1475 |
+
 ## Dispositions
 
 | FND | outcome | reason |
@@ -88,3 +95,7 @@ target/ was deleted afterwards.
 | FND-009 | fixed | - |
 | FND-010 | still-open | New in round 1: SPDX header corrupted by the fix commit 792f28e; restore `AGPL-3.0-or-later`. |
 | FND-011 | still-open | New in round 1: either keep `tick.*` defects out of the status reconcile or scope reconcile per source owner. |
+| FND-010 | fixed | - |
+| FND-011 | fixed | - |
+| FND-012 | still-open | New in round 2, low and not blocking: store the pushed ticket on the action row (SWM-255) so that a list change or late focus cannot drop a real execution. |
+| FND-013 | still-open | New in round 2, low and not blocking: tests that pass a tempdir `ledger_path` still yield to an exported `IX_BOARD_LEDGER_PATH`. |
