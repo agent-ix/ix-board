@@ -72,3 +72,5 @@ expired, never-acted order after 48h.
 | FND-003 | fixed | - |
 | FND-004 | deferred | The ix-board side is fixed: one shared connection, single-pass matching, page bound `RECEIPT_EVENT_CAP / RECEIPT_PAGE_CAP + 1`. The per-page full-stream re-read is in relay-core `receipt_export` and is deferred to SWM-273, a read-only expired-order reader. Measured on a throwaway redis:7 holding 10,000 events of about 300 bytes: about 1.8 ms of Redis time and about 2 MB on the wire per page. A full read is 11 pages, about 20 ms of Redis time and about 22 MB per run. At one run every 5 minutes that is about 6 GB a day. This is acceptable as an interim until SWM-273 lands. |
 | FND-005 | fixed | - |
+| FND-006 | fixed | - |
+| FND-007 | fixed | - |

@@ -62,3 +62,4 @@ FR-034 does not state, and a 48h read bound that no requirement owns.
 | FND-001 | fixed | - |
 | FND-002 | fixed | - |
 | FND-003 | fixed | - |
+| FND-004 | fixed | - |
