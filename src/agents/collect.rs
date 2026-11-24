@@ -226,11 +226,97 @@ fn claude_identity(path: &Path, budget: &mut Budget) -> Result<Lifecycle, &'stat
         ..Lifecycle::default()
     })
 }
+/// First tail window; later windows grow by `TAIL_GROWTH` up to `MAX_TRANSCRIPT`.
+const TAIL_WINDOW: u64 = 1024 * 1024;
+const TAIL_GROWTH: u64 = 4;
+
+/// Replays one window of complete records ending at `extent`, starting at or after `start`.
+fn replay_window(
+    path: &Path,
+    adapter: &dyn Harness,
+    start: u64,
+    extent: u64,
+    budget: &mut Budget,
+) -> Result<Lifecycle, &'static str> {
+    use std::io::Seek;
+    budget.take((extent - start).saturating_add(1))?;
+    let mut file = File::open(path).map_err(|_| "transcript_unreadable")?;
+    file.seek(std::io::SeekFrom::Start(start))
+        .map_err(|_| "transcript_unreadable")?;
+    let mut reader = BufReader::new(file.take(extent - start));
+    let mut life = Lifecycle::default();
+    let mut first = start > 0;
+    loop {
+        budget.check()?;
+        let mut bytes = Vec::new();
+        let n = reader
+            .by_ref()
+            .take(MAX_RECORD + 1)
+            .read_until(b'\n', &mut bytes)
+            .map_err(|_| "transcript_unreadable")?;
+        if n == 0 {
+            return Ok(life);
+        }
+        if first {
+            // The window began inside a record; resume at the next one.
+            first = false;
+            if bytes.last() != Some(&b'\n') && u64::try_from(n).unwrap_or(0) > MAX_RECORD {
+                return Err("record_size_limit");
+            }
+            continue;
+        }
+        if u64::try_from(n).unwrap_or(u64::MAX) > MAX_RECORD {
+            return Err("record_size_limit");
+        }
+        if bytes.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let value = serde_json::from_slice(&bytes).map_err(|_| "malformed_transcript_record")?;
+        adapter.observe_record(&value, &mut life);
+    }
+}
+
+/// Reads the latest lifecycle state from the end of a transcript.
+///
+/// The window starts at `TAIL_WINDOW` bytes and extends backward until a
+/// lifecycle record is found, the whole file is covered, or `MAX_TRANSCRIPT`
+/// is reached.
+fn read_transcript_tail(
+    path: &Path,
+    adapter: &dyn Harness,
+    budget: &mut Budget,
+) -> Result<Lifecycle, &'static str> {
+    retry_sample(|| {
+        let before = stamp(path)?;
+        let mut window = TAIL_WINDOW;
+        let result = loop {
+            let start = before.0.saturating_sub(window);
+            let life = match replay_window(path, adapter, start, before.0, budget) {
+                Ok(life) => life,
+                Err(reason) => break Err(reason),
+            };
+            if life.state_changed_at.is_some() || start == 0 {
+                break Ok(life);
+            }
+            if window >= MAX_TRANSCRIPT {
+                break Err("lifecycle_not_found_within_limit");
+            }
+            window = window.saturating_mul(TAIL_GROWTH).min(MAX_TRANSCRIPT);
+        };
+        if before != stamp(path)? {
+            return Ok(None);
+        }
+        result.map(Some)
+    })
+}
 fn read_transcript(
     path: &Path,
     adapter: &dyn Harness,
     budget: &mut Budget,
 ) -> Result<Lifecycle, &'static str> {
+    if adapter.kind() == HarnessKind::Codex {
+        return read_transcript_tail(path, adapter, budget);
+    }
     retry_sample(|| {
         let before = stamp(path)?;
         if before.0 > MAX_TRANSCRIPT {

@@ -37,6 +37,9 @@ use serde::{Deserialize, Serialize};
 /// Lifecycle report schema.
 pub const AGENTS_SCHEMA_VERSION: u32 = 2;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 use thiserror::Error as ThisError;
 
 /// A background wait with no activity for this many seconds is stuck.
@@ -172,6 +175,7 @@ pub fn decide(e: &Evidence<'_>) -> Verdict {
         return Verdict::Prompt;
     }
     let terminal = life.execution_ended_at.is_some();
+    let finished = e.herdr == HerdrState::Done;
     let awaiting = life.state == WorkerState::Waiting
         || e.tail
             .is_some_and(|tail| tail.to_lowercase().contains("waiting for background agent"));
@@ -230,12 +234,17 @@ pub fn decide(e: &Evidence<'_>) -> Verdict {
         return Verdict::Unknown;
     }
     // An old open task is not proof of live execution or established quiet.
-    if terminal && let Some(age) = life.last_activity_at.and_then(|at| e.now.checked_sub(at)) {
+    if (terminal || finished)
+        && let Some(age) = life.last_activity_at.and_then(|at| e.now.checked_sub(at))
+    {
         return if age < e.idle_after {
             Verdict::Recent
         } else {
             Verdict::Idle
         };
+    }
+    if finished {
+        return Verdict::Idle;
     }
     Verdict::Unknown
 }
@@ -366,8 +375,23 @@ pub struct AgentsReport {
     pub missing_teams: Vec<String>,
     /// Machines or reads that failed.
     pub errors: Vec<String>,
+    /// Enabled machines whose rows could not be read, with reason and elapsed time.
+    #[serde(default)]
+    pub missing_hosts: Vec<MissingHost>,
     /// Why `IDLE` rows carry no next ticket, when the queue was unreadable.
     pub ready_queue_error: Option<String>,
+}
+
+/// One enabled machine whose rows could not be read.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MissingHost {
+    /// Machine label.
+    pub machine: String,
+    /// Why the machine could not be read.
+    pub reason: String,
+    /// Milliseconds spent on the machine before giving up.
+    pub elapsed_ms: u64,
 }
 
 /// Looks up a team's next ready ticket; an `Err` is a reason, not a verdict.
@@ -377,55 +401,94 @@ struct HostResult {
     rows: Vec<AgentRow>,
     found: BTreeSet<String>,
     errors: Vec<String>,
+    missing: Option<String>,
 }
 
+/// Longest one machine may take before it is reported missing; below the per-call limit.
+pub const HOST_TIMEOUT: Duration = Duration::from_secs(45);
+
 /// The local machine plus every enabled saved herdr machine.
-pub fn system_hosts() -> Result<Vec<Box<dyn Host>>, AgentsError> {
+pub fn system_hosts() -> Result<Vec<Arc<dyn Host>>, AgentsError> {
     let local = SystemHost::local();
     let machines = parse_machines(&local.herdr(&["machine", "list", "--json"])?)?;
-    let mut hosts: Vec<Box<dyn Host>> = vec![Box::new(local)];
+    let mut hosts: Vec<Arc<dyn Host>> = vec![Arc::new(local)];
     hosts.extend(
         machines
             .into_iter()
             .filter(|machine| machine.enabled)
             .map(|machine| {
-                Box::new(SystemHost::remote(machine.label, machine.target)) as Box<dyn Host>
+                Arc::new(SystemHost::remote(machine.label, machine.target)) as Arc<dyn Host>
             }),
     );
     Ok(hosts)
 }
 
-/// Reads every host in parallel and builds the report.
+/// Reads every host in parallel, each under [`HOST_TIMEOUT`], and builds the report.
 pub fn build_report(
-    hosts: &[Box<dyn Host>],
+    hosts: &[Arc<dyn Host>],
     teams: &[String],
     idle_after_secs: u64,
     ready: &mut ReadyLookup<'_>,
 ) -> AgentsReport {
-    let results: Vec<HostResult> = std::thread::scope(|scope| {
-        let handles: Vec<_> = hosts
-            .iter()
-            .map(|host| scope.spawn(|| gather_host(host.as_ref(), teams, idle_after_secs)))
-            .collect();
-        handles
-            .into_iter()
-            .zip(hosts)
-            .map(|(handle, host)| {
-                handle.join().unwrap_or_else(|_| HostResult {
-                    rows: Vec::new(),
-                    found: BTreeSet::new(),
-                    errors: vec![format!("{}: reader thread panicked", host.label())],
-                })
-            })
-            .collect()
-    });
+    build_report_with_timeout(hosts, teams, idle_after_secs, HOST_TIMEOUT, ready)
+}
+
+/// [`build_report`] with an explicit per-machine timeout.
+///
+/// A machine that exceeds it is abandoned and listed in `missing_hosts`; the
+/// other machines' rows are unaffected.
+pub fn build_report_with_timeout(
+    hosts: &[Arc<dyn Host>],
+    teams: &[String],
+    idle_after_secs: u64,
+    host_timeout: Duration,
+    ready: &mut ReadyLookup<'_>,
+) -> AgentsReport {
+    let started = Instant::now();
+    let receivers: Vec<_> = hosts
+        .iter()
+        .map(|host| {
+            let (sender, receiver) = mpsc::channel();
+            let host = Arc::clone(host);
+            let teams = teams.to_vec();
+            std::thread::spawn(move || {
+                let began = Instant::now();
+                let result = gather_host(host.as_ref(), &teams, idle_after_secs);
+                let _ = sender.send((result, began.elapsed()));
+            });
+            receiver
+        })
+        .collect();
     let mut agents = Vec::new();
     let mut found = BTreeSet::new();
     let mut errors = Vec::new();
-    for result in results {
-        agents.extend(result.rows);
-        found.extend(result.found);
-        errors.extend(result.errors);
+    let mut missing_hosts = Vec::new();
+    for (receiver, host) in receivers.into_iter().zip(hosts) {
+        let remaining = host_timeout.saturating_sub(started.elapsed());
+        let (reason, elapsed) = match receiver.recv_timeout(remaining) {
+            Ok((result, elapsed)) => {
+                agents.extend(result.rows);
+                found.extend(result.found);
+                errors.extend(result.errors);
+                match result.missing {
+                    Some(reason) => (reason, elapsed),
+                    None => continue,
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => (
+                format!("timed out after {}s", host_timeout.as_secs()),
+                started.elapsed(),
+            ),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                errors.push(format!("{}: reader thread panicked", host.label()));
+                ("reader thread panicked".to_owned(), started.elapsed())
+            }
+        };
+        missing_hosts.push(MissingHost {
+            machine: host.label().to_owned(),
+            reason,
+            elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+        });
     }
     let order = |team: &str| {
         teams
@@ -449,6 +512,7 @@ pub fn build_report(
         agents,
         missing_teams,
         errors,
+        missing_hosts,
         ready_queue_error,
     }
 }
@@ -474,6 +538,7 @@ fn gather_host(host: &dyn Host, teams: &[String], idle_after: u64) -> HostResult
         rows: Vec::new(),
         found: BTreeSet::new(),
         errors: Vec::new(),
+        missing: None,
     };
     let label = host.label();
     let listed = host
@@ -487,6 +552,7 @@ fn gather_host(host: &dyn Host, teams: &[String], idle_after: u64) -> HostResult
         Ok(listed) => listed,
         Err(error) => {
             result.errors.push(format!("{label}: {error}"));
+            result.missing = Some(error.to_string());
             return result;
         }
     };
@@ -815,6 +881,12 @@ pub fn render_text(report: &AgentsReport) -> String {
     }
     for error in &report.errors {
         lines.push(format!("Error: {error}"));
+    }
+    for missing in &report.missing_hosts {
+        lines.push(format!(
+            "Missing host: {} ({}, {}ms)",
+            missing.machine, missing.reason, missing.elapsed_ms
+        ));
     }
     if let Some(reason) = &report.ready_queue_error {
         lines.push(format!("Ready queue unavailable: {reason}"));

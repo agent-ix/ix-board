@@ -8,6 +8,8 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
 const NOW: u64 = 1_800_000_000;
 const IDLE: u64 = 1200;
@@ -173,7 +175,7 @@ fn shared_classifier_thresholds_and_pending_wait_precedence() {
         );
         assert_eq!(
             verdict(&running, &empty, HerdrState::Done, at + 3600),
-            Verdict::Unknown,
+            Verdict::Idle,
             "{harness}"
         );
         let active = counts(&[worker("child", "root", WorkerState::Running)]);
@@ -529,7 +531,7 @@ fn report(machines: Vec<Machine>) -> AgentsReport {
     build_report(
         &machines
             .into_iter()
-            .map(|h| Box::new(h) as Box<dyn Host>)
+            .map(|h| Arc::new(h) as Arc<dyn Host>)
             .collect::<Vec<_>>(),
         &["team".into(), "missing".into()],
         IDLE,
@@ -608,7 +610,7 @@ fn unavailable_sources_are_partial_nullable_and_do_not_fabricate_zero() {
 #[trace("FR-018-AC-6")]
 #[test]
 fn unreadable_queue_is_reported_once_and_does_not_change_idle() {
-    let hosts: Vec<Box<dyn Host>> = vec![Box::new(machine()), Box::new(machine())];
+    let hosts: Vec<Arc<dyn Host>> = vec![Arc::new(machine()), Arc::new(machine())];
     let mut calls = 0;
     let r = build_report(&hosts, &["Team".into()], IDLE, &mut |_| {
         calls += 1;
@@ -752,7 +754,8 @@ fn oversized_records_and_permission_sources_never_become_complete_empty_graphs()
 fn writes_do_not_prove_execution_and_active_worker_waits_do_not_become_stuck() {
     let mut m = machine();
     m.probe.sessions.get_mut("root").unwrap().parent_lifecycle = Lifecycle::default();
-    assert_eq!(report(vec![m.clone()]).agents[0].verdict, Verdict::Unknown);
+    // A done pane with no lifecycle record is idle, not unknown.
+    assert_eq!(report(vec![m.clone()]).agents[0].verdict, Verdict::Idle);
     m.probe
         .sessions
         .get_mut("root")
@@ -1073,7 +1076,7 @@ fn both_harnesses_decode_all_eight_verdicts_thresholds_and_wait_precedence_from_
         ("waiting", MissingMetadata, "working", 900, Verdict::Unknown),
         ("done", Empty, "done", 1199, Verdict::Recent),
         ("done", Empty, "done", 1200, Verdict::Idle),
-        ("running", Empty, "done", 3600, Verdict::Unknown),
+        ("running", Empty, "done", 3600, Verdict::Idle),
     ];
     for harness in ["claude", "codex"] {
         let mut seen = Vec::new();
@@ -1229,4 +1232,155 @@ fn codex_late_wait_events_cannot_reopen_completed_or_stopped_generations() {
             .issues
             .contains(&"execution_after_terminal_without_assignment".into())
     );
+}
+
+#[trace("FR-018-AC-27")]
+#[test]
+fn herdr_done_without_prompt_question_or_work_is_idle_or_recent() {
+    let none = counts(&[]);
+    let blank = Lifecycle::default();
+    assert_eq!(verdict(&blank, &none, HerdrState::Done, NOW), Verdict::Idle);
+    let recent = Lifecycle {
+        last_activity_at: Some(NOW - 10),
+        ..Lifecycle::default()
+    };
+    assert_eq!(
+        verdict(&recent, &none, HerdrState::Done, NOW),
+        Verdict::Recent
+    );
+    let old = Lifecycle {
+        last_activity_at: Some(NOW - IDLE - 1),
+        ..Lifecycle::default()
+    };
+    assert_eq!(verdict(&old, &none, HerdrState::Done, NOW), Verdict::Idle);
+    let asking = Lifecycle {
+        assistant: Some("Should I merge this?".into()),
+        ..Lifecycle::default()
+    };
+    assert_eq!(
+        verdict(&asking, &none, HerdrState::Done, NOW),
+        Verdict::Asking
+    );
+    let prompt = decide(&Evidence {
+        herdr: HerdrState::Done,
+        tail: Some("Allow once\nesc to cancel"),
+        lifecycle: &blank,
+        workers: &none,
+        active_processes: 0,
+        processes_complete: true,
+        transcript_complete: true,
+        now: NOW,
+        idle_after: IDLE,
+    });
+    assert_eq!(prompt, Verdict::Prompt);
+    let pane: HerdrAgent = serde_json::from_value(json!({
+        "pane_id":"w:p","agent":"codex","agent_status":"done"
+    }))
+    .unwrap();
+    assert_eq!(pane.state(), HerdrState::Done);
+}
+
+fn codex_rollout(filler_bytes: usize, events: &str) -> String {
+    let filler = json!({
+        "type":"response_item",
+        "timestamp":"2026-10-18T10:00:00Z",
+        "payload":{"type":"message","role":"user","content":"x".repeat(900)}
+    })
+    .to_string();
+    let lines = filler_bytes / (filler.len() + 1);
+    let mut text = format!("{}\n", codex_header("root", None, "/root"));
+    for _ in 0..lines {
+        text.push_str(&filler);
+        text.push('\n');
+    }
+    text.push_str(events);
+    text
+}
+
+#[trace("FR-018-AC-28")]
+#[test]
+fn codex_rollout_larger_than_the_first_window_yields_its_tail_state() {
+    let home = tempfile::tempdir().unwrap();
+    let events = include_str!("fixtures/agents/codex_done.jsonl")
+        .lines()
+        .skip(1)
+        .collect::<Vec<_>>()
+        .join("\n");
+    write(
+        home.path(),
+        ".codex/sessions/rollout-test-root.jsonl",
+        &codex_rollout(5 * 1024 * 1024, &events),
+    );
+    let probe = collect_probe(home.path(), &request(HarnessKind::Codex)).unwrap();
+    let files = &probe.sessions["root"];
+    assert!(files.lifecycle_availability.complete, "{files:?}");
+    assert_eq!(files.parent_lifecycle.state, WorkerState::Completed);
+    assert!(files.parent_lifecycle.execution_ended_at.is_some());
+}
+
+#[trace("FR-018-AC-28")]
+#[test]
+fn codex_rollout_without_a_lifecycle_record_within_the_limit_is_unavailable_with_reason() {
+    let home = tempfile::tempdir().unwrap();
+    write(
+        home.path(),
+        ".codex/sessions/rollout-test-root.jsonl",
+        &codex_rollout(66 * 1024 * 1024, ""),
+    );
+    let probe = collect_probe(home.path(), &request(HarnessKind::Codex)).unwrap();
+    let files = &probe.sessions["root"];
+    assert!(!files.lifecycle_availability.complete);
+    assert!(
+        files
+            .lifecycle_availability
+            .reasons
+            .contains(&"lifecycle_not_found_within_limit".into()),
+        "{:?}",
+        files.lifecycle_availability
+    );
+}
+
+struct SlowHost(Machine);
+impl Host for SlowHost {
+    fn label(&self) -> &str {
+        self.0.label
+    }
+    fn herdr(&self, args: &[&str]) -> Result<String, AgentsError> {
+        std::thread::sleep(Duration::from_secs(3));
+        self.0.herdr(args)
+    }
+    fn probe(&self, request: &ProbeRequest) -> Result<Probe, AgentsError> {
+        self.0.probe(request)
+    }
+}
+
+#[trace("FR-018-AC-29")]
+#[test]
+fn a_slow_machine_is_listed_missing_while_healthy_machines_still_report() {
+    let mut slow = machine();
+    slow.label = "luna";
+    let hosts: Vec<Arc<dyn Host>> = vec![Arc::new(machine()), Arc::new(SlowHost(slow))];
+    let started = std::time::Instant::now();
+    let r = build_report_with_timeout(
+        &hosts,
+        &["team".into()],
+        IDLE,
+        Duration::from_millis(300),
+        &mut |_| Ok(None),
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(r.agents.len(), 1);
+    assert_eq!(r.agents[0].machine, "local");
+    assert_eq!(r.agents[0].verdict, Verdict::Idle);
+    assert_eq!(r.missing_hosts.len(), 1);
+    let missing = &r.missing_hosts[0];
+    assert_eq!(missing.machine, "luna");
+    assert!(missing.reason.contains("timed out"));
+    assert!(missing.elapsed_ms >= 250 && missing.elapsed_ms < 2000);
+    assert!(render_text(&r).contains("Missing host: luna"));
+    let mut down = machine();
+    down.label = "down";
+    down.fail = true;
+    let r = report(vec![machine(), down]);
+    assert_eq!(r.missing_hosts[0].machine, "down");
 }

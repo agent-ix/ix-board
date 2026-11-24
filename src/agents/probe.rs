@@ -23,7 +23,7 @@ pub const PROBE_VERSION: u32 = 2;
 pub const MAX_PROTOCOL_BYTES: usize = 16 * 1024 * 1024;
 
 /// A machine the detector can read: herdr state plus one batched file probe.
-pub trait Host: Sync {
+pub trait Host: Send + Sync {
     /// Machine label shown in output.
     fn label(&self) -> &str;
 

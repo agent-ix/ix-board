@@ -491,7 +491,9 @@ fn output_outcome(output: &Output) -> Outcome {
         Output::Issues(batch) if batch.issues.is_empty() && !batch.missing.is_empty() => {
             Outcome::Invalid
         }
-        Output::Agents(report) if !report.errors.is_empty() => Outcome::Internal,
+        Output::Agents(report) if !report.errors.is_empty() || !report.missing_hosts.is_empty() => {
+            Outcome::Internal
+        }
         Output::ProgramScopeCheck(report) if !report.is_valid() => Outcome::Partial,
         _ => Outcome::Ok,
     }

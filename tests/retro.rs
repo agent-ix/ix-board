@@ -446,6 +446,7 @@ fn agents_report(rows: Vec<AgentRow>) -> AgentsReport {
         agents: rows,
         missing_teams: Vec::new(),
         errors: Vec::new(),
+        missing_hosts: Vec::new(),
         ready_queue_error: None,
     }
 }

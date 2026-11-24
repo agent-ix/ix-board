@@ -24,6 +24,14 @@
       "format": "uint64",
       "minimum": 0
     },
+    "missing_hosts": {
+      "description": "Enabled machines whose rows could not be read, with reason and elapsed time.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/MissingHost"
+      }
+    },
     "missing_teams": {
       "description": "Teams that matched no workspace on any machine.",
       "type": "array",
@@ -361,6 +369,32 @@
         }
       },
       "additionalProperties": false
+    },
+    "MissingHost": {
+      "description": "One enabled machine whose rows could not be read.",
+      "type": "object",
+      "properties": {
+        "elapsed_ms": {
+          "description": "Milliseconds spent on the machine before giving up.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "machine": {
+          "description": "Machine label.",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why the machine could not be read.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "machine",
+        "reason",
+        "elapsed_ms"
+      ]
     },
     "ReadyTicket": {
       "description": "The next ready ticket of a team.",
