@@ -350,8 +350,8 @@ impl OrderReceipts for RelayOrderReceipts {
 ///
 /// # Errors
 ///
-/// The reason the receipts or registrations could not be read, or why the receipt history is
-/// known to be incomplete.
+/// The reason the receipts or registrations could not be read, or that the receipt pages were
+/// evicted. A recording gap does not hide an `AckExpired` receipt, which the relay watcher writes.
 pub fn read_expired_orders(relay: &mut Relay) -> Result<Vec<ExpiredOrder>, SourceError> {
     let fail = |what: &str, e: relay_core::Error| SourceError(format!("relay {what}: {e}"));
     let lanes: BTreeMap<String, String> = relay
@@ -383,7 +383,6 @@ pub fn read_expired_orders(relay: &mut Relay) -> Result<Vec<ExpiredOrder>, Sourc
             matches!(
                 r,
                 ReceiptCoverageReason::SourceUnavailable
-                    | ReceiptCoverageReason::RecordingGap
                     | ReceiptCoverageReason::CursorEvicted
                     | ReceiptCoverageReason::CursorUnavailable
             )
