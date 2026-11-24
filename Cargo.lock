@@ -1795,7 +1795,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "relay-core"
 version = "0.3.4"
-source = "git+https://github.com/agent-ix/ix-relay?rev=0ef4efc1f0fae9de8aeabeeb656a679a81df0a33#0ef4efc1f0fae9de8aeabeeb656a679a81df0a33"
+source = "git+https://github.com/agent-ix/ix-relay?rev=28297d419eff76beaaa7247698fd164a854dc02c#28297d419eff76beaaa7247698fd164a854dc02c"
 dependencies = [
  "gethostname",
  "ix-cli-kit",
@@ -1812,7 +1812,7 @@ dependencies = [
 [[package]]
 name = "relay-work-wire"
 version = "0.3.4"
-source = "git+https://github.com/agent-ix/ix-relay?rev=0ef4efc1f0fae9de8aeabeeb656a679a81df0a33#0ef4efc1f0fae9de8aeabeeb656a679a81df0a33"
+source = "git+https://github.com/agent-ix/ix-relay?rev=28297d419eff76beaaa7247698fd164a854dc02c#28297d419eff76beaaa7247698fd164a854dc02c"
 dependencies = [
  "serde",
 ]

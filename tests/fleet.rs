@@ -3,10 +3,13 @@
 
 //! Fleet lane status acceptance tests over fake relay data and fake Prometheus responses.
 
-use ix_board::fleet::live::{PromQuery, PrometheusSeries};
+use ix_board::fleet::live::{self, PromQuery, PrometheusSeries};
 use ix_board::fleet::*;
 use ix_trace_rs::trace;
 use relay_core::fleet::HostLaneList;
+use relay_core::receipts::{
+    OrderedReceipt, ReceiptCoverageReason, ReceiptEvent, ReceiptExport, ReceiptOutcome,
+};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -83,10 +86,13 @@ impl SeriesSource for FakeSeries {
     }
 }
 
-struct Receipts(Result<Vec<ExpiredOrder>, SourceError>);
+struct Receipts(Result<Vec<ExpiredOrder>, SourceError>, ReceiptRead);
 impl OrderReceipts for Receipts {
-    fn expired_orders(&self) -> Result<Vec<ExpiredOrder>, SourceError> {
-        self.0.clone()
+    fn expired_orders(&self) -> Result<ReceiptRead, SourceError> {
+        self.0.clone().map(|orders| ReceiptRead {
+            orders,
+            ..self.1.clone()
+        })
     }
 }
 
@@ -101,6 +107,7 @@ struct World {
     relay: RelaySnapshot,
     series: FakeSeries,
     receipts: Result<Vec<ExpiredOrder>, SourceError>,
+    read_extra: ReceiptRead,
     weak: BTreeMap<String, Vec<WeakSource>>,
     cfg: FleetConfig,
 }
@@ -119,6 +126,7 @@ impl World {
             },
             series: FakeSeries { hosts, slow: None },
             receipts: Ok(Vec::new()),
+            read_extra: ReceiptRead::default(),
             weak: BTreeMap::new(),
             cfg: FleetConfig::default(),
         }
@@ -129,7 +137,7 @@ impl World {
     }
 
     fn run_at(&self, local_now_ms: i64) -> FleetReport {
-        let receipts = Receipts(self.receipts.clone());
+        let receipts = Receipts(self.receipts.clone(), self.read_extra.clone());
         let weak = Weak(self.weak.clone());
         let sources = Sources {
             relay: Ok(self.relay.clone()),
@@ -145,6 +153,7 @@ fn order(addr: &str, delivered: bool) -> ExpiredOrder {
     ExpiredOrder {
         addr: addr.to_owned(),
         delivered,
+        gap_spanned: false,
     }
 }
 fn class_of(report: &FleetReport, lane: &str) -> (ClassKind, Option<String>) {
@@ -184,6 +193,7 @@ fn n_registered_lanes_across_hosts_give_n_rows_with_a_defined_class() {
         },
         series: FakeSeries { hosts, slow: None },
         receipts: Ok(Vec::new()),
+        read_extra: ReceiptRead::default(),
         weak: BTreeMap::new(),
         cfg: FleetConfig::default(),
     };
@@ -373,8 +383,7 @@ fn ack_expired_orders_are_stale_with_or_without_a_delivered_receipt() {
 #[test]
 fn unavailable_order_receipts_are_a_defect_not_an_empty_list() {
     let mut world = World::one_host(&["h:w:1"], vec![raw("h:w:1", HookKind::Stop, 5)], &[]);
-    let pending = ix_board::fleet::live::PendingOrderReceipts;
-    world.receipts = pending.expired_orders();
+    world.receipts = Err(SourceError("relay receipts: connection refused".to_owned()));
     let report = world.run();
     assert!(has_defect(&report, DefectKind::UnreadableSource));
     assert!(!report.complete);
@@ -508,6 +517,7 @@ fn dead_after_and_loop_stops_boundaries_classify_as_specified() {
         let mut world = World::one_host(&["h:w:1"], vec![], &[]);
         world.relay.registrations = vec![RegInfo {
             addr: "h:w:1".to_owned(),
+            queue: String::new(),
             last_seen_ms: ms_ago(age_secs),
             has_pane: false,
         }];
@@ -563,6 +573,7 @@ fn one_slow_host_is_a_defect_within_the_bound_and_leaves_other_rows_alone() {
         },
         series: FakeSeries { hosts, slow: None },
         receipts: Ok(Vec::new()),
+        read_extra: ReceiptRead::default(),
         weak: BTreeMap::new(),
         cfg: FleetConfig::default(),
     };
@@ -689,7 +700,7 @@ fn prometheus_responses_become_host_series_with_relay_thresholds() {
 #[trace("FR-034-AC-9")]
 #[test]
 fn a_failed_relay_read_is_a_defect_with_no_rows() {
-    let receipts = Receipts(Ok(Vec::new()));
+    let receipts = Receipts(Ok(Vec::new()), ReceiptRead::default());
     let weak = Weak(BTreeMap::new());
     let sources = Sources {
         relay: Err(SourceError("connection refused".to_owned())),
@@ -870,7 +881,7 @@ fn an_unreadable_prometheus_keeps_hook_evidence_with_marked_default_thresholds()
     ];
     let mut world = World::one_host(&["h:w:1", "h:w:2"], events, &[]);
     // Unset URL: one run-level defect with the remedy, no per-host defects.
-    let receipts = Receipts(Ok(Vec::new()));
+    let receipts = Receipts(Ok(Vec::new()), ReceiptRead::default());
     let weak = Weak(BTreeMap::new());
     let sources = Sources {
         relay: Ok(world.relay.clone()),
@@ -922,6 +933,7 @@ fn a_registration_does_not_override_a_lapsed_host_list() {
     });
     world.relay.registrations = vec![RegInfo {
         addr: "old:w:1".to_owned(),
+        queue: String::new(),
         last_seen_ms: NOW - 1000,
         has_pane: true,
     }];
@@ -1022,6 +1034,7 @@ fn per_host_absence_is_visible_even_when_other_hosts_have_data() {
         .retain(|l| l.machine.as_str() != "h" || !l.lanes.is_empty());
     world.relay.registrations = vec![RegInfo {
         addr: "n:w:1".to_owned(),
+        queue: String::new(),
         last_seen_ms: NOW - 1000,
         has_pane: true,
     }];
@@ -1055,4 +1068,309 @@ fn per_host_absence_is_visible_even_when_other_hosts_have_data() {
 
 fn on_count(report: &FleetReport, kind: DefectKind) -> usize {
     report.defects.iter().filter(|d| d.kind == kind).count()
+}
+
+fn receipt(id: &str, outcome: ReceiptOutcome, queue: &str) -> ReceiptEvent {
+    ReceiptEvent {
+        event_id: format!("{id}/{outcome:?}"),
+        original_id: id.to_owned(),
+        attempt_id: None,
+        outcome,
+        sender: "s".to_owned(),
+        target: queue.to_owned(),
+        event_time_ms: Some(1),
+        observed_at_ms: 1,
+        evidence: None,
+        reason: None,
+        session: None,
+        expect_ticket: None,
+        delivered_at_ms: None,
+    }
+}
+
+fn lanes(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+    pairs
+        .iter()
+        .map(|(q, a)| ((*q).to_owned(), (*a).to_owned()))
+        .collect()
+}
+
+#[trace("FR-034-AC-12")]
+#[test]
+fn recorded_ack_expired_receipts_give_expired_orders_per_lane_address() {
+    use ReceiptOutcome::{AckExpired, Acted, Delivered, Queued};
+    let events = vec![
+        receipt("a", Queued, "q1"),
+        receipt("a", Delivered, "q1"),
+        receipt("a", AckExpired, "q1"),
+        receipt("b", Queued, "q2"),
+        receipt("b", AckExpired, "q2"),
+        receipt("c", Queued, "q3"),
+        receipt("c", Delivered, "q3"),
+        receipt("c", Acted, "q3"),
+        receipt("c", AckExpired, "q3"),
+    ];
+    let lanes = lanes(&[("q1", "h:w:1"), ("q2", "h:w:2"), ("q3", "h:w:3")]);
+    let mut read = live::expired_orders_from(&events, &lanes, Vec::new());
+    read.orders.sort_by(|x, y| x.addr.cmp(&y.addr));
+    assert_eq!(
+        read.orders,
+        vec![order("h:w:1", true), order("h:w:2", false)]
+    );
+    assert!(read.unresolved.is_empty() && read.gaps.is_empty());
+}
+
+#[trace("FR-034-AC-12", "FR-034-AC-17", "FR-034-AC-22")]
+#[test]
+fn an_expired_order_to_an_unregistered_recipient_is_a_defect_row() {
+    let events = vec![receipt("d", ReceiptOutcome::AckExpired, "session/gone")];
+    let read = live::expired_orders_from(&events, &lanes(&[("q1", "h:w:1")]), Vec::new());
+    assert!(read.orders.is_empty());
+    assert_eq!(
+        read.unresolved,
+        vec![UnresolvedOrder {
+            order_id: "d".to_owned(),
+            target: "session/gone".to_owned()
+        }]
+    );
+    let mut world = World::one_host(&["h:w:1"], vec![raw("h:w:1", HookKind::Stop, 5)], &[]);
+    world.read_extra = read;
+    let report = world.run();
+    assert!(!report.complete);
+    let defect = report
+        .defects
+        .iter()
+        .find(|d| d.source == "relay.receipts")
+        .expect("receipts defect");
+    assert_eq!(defect.kind, DefectKind::UnreadableSource);
+    assert!(defect.reason.contains('d') && defect.reason.contains("session/gone"));
+}
+
+#[trace("FR-034-AC-22")]
+#[test]
+fn a_receipt_history_gap_is_one_run_defect_and_marks_timed_out_lanes() {
+    let mut world = World::one_host(
+        &["h:w:1", "h:w:2"],
+        vec![
+            raw("h:w:1", HookKind::Stop, 5),
+            raw("h:w:2", HookKind::Stop, 5),
+        ],
+        &[],
+    );
+    let mut spanned = order("h:w:2", false);
+    spanned.gap_spanned = true;
+    world.receipts = Ok(vec![order("h:w:1", true), spanned]);
+    world.read_extra.gaps = vec!["recording_gap".to_owned()];
+    let report = world.run();
+    let gaps: Vec<_> = report
+        .defects
+        .iter()
+        .filter(|d| d.kind == DefectKind::ReceiptsRecordingGap)
+        .collect();
+    assert_eq!(gaps.len(), 1);
+    assert!(gaps[0].reason.contains("recording_gap") && !report.complete);
+    let marked = |lane: &str| {
+        report
+            .rows
+            .iter()
+            .find(|r| r.lane == lane)
+            .unwrap()
+            .receipt_gap
+    };
+    assert!(
+        !marked("h:w:1"),
+        "a delivered order does not depend on the gap"
+    );
+    assert!(
+        marked("h:w:2"),
+        "a timed_out order may have lost its Delivered receipt"
+    );
+}
+
+#[trace("FR-034-AC-12")]
+#[test]
+fn an_undelivered_order_without_an_expiry_receipt_is_never_stale() {
+    let events = vec![
+        receipt("a", ReceiptOutcome::Queued, "q1"),
+        receipt("a", ReceiptOutcome::TimedOut, "q1"),
+    ];
+    let read = live::expired_orders_from(&events, &lanes(&[("q1", "h:w:1")]), Vec::new());
+    assert!(read.orders.is_empty() && read.unresolved.is_empty());
+    let source = include_str!("../src/fleet/live.rs");
+    assert!(!source.contains("ack_deadline") && !source.contains("deadline_ms"));
+}
+
+fn page(
+    events: Vec<ReceiptEvent>,
+    reasons: Vec<ReceiptCoverageReason>,
+    next: Option<&str>,
+) -> ReceiptExport {
+    ReceiptExport {
+        requested_since_ms: 0,
+        requested_until_ms: 0,
+        covered_since_ms: None,
+        covered_until_ms: None,
+        instrumentation_start_ms: None,
+        retention_boundary_ms: 0,
+        complete: reasons.is_empty(),
+        reasons,
+        events: events
+            .into_iter()
+            .map(|event| OrderedReceipt {
+                cursor: "1-0".to_owned(),
+                event,
+            })
+            .collect(),
+        next_cursor: next.map(str::to_owned),
+        has_more: next.is_some(),
+    }
+}
+
+#[trace("FR-034-AC-23")]
+#[test]
+fn receipt_pages_are_followed_by_cursor_and_the_read_is_bounded() {
+    let mut cursors = Vec::new();
+    let (events, gaps) = live::collect_receipts(|after| {
+        cursors.push(after.clone());
+        Ok(match after.as_deref() {
+            None => page(
+                vec![receipt("a", ReceiptOutcome::Queued, "q")],
+                vec![],
+                Some("c1"),
+            ),
+            Some(_) => page(
+                vec![receipt("b", ReceiptOutcome::Queued, "q")],
+                vec![],
+                None,
+            ),
+        })
+    })
+    .unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(gaps.is_empty());
+    assert_eq!(cursors, vec![None, Some("c1".to_owned())]);
+
+    let mut reads = 0;
+    let error = live::collect_receipts(|_| {
+        reads += 1;
+        Ok(page(vec![], vec![], Some("more")))
+    })
+    .unwrap_err();
+    let bound =
+        relay_core::receipts::RECEIPT_EVENT_CAP / relay_core::receipts::RECEIPT_PAGE_CAP + 1;
+    assert_eq!(reads, bound);
+    assert!(error.0.contains(&bound.to_string()));
+}
+
+#[trace("FR-034-AC-22")]
+#[test]
+fn receipt_coverage_reasons_split_into_failures_and_gaps() {
+    use ReceiptCoverageReason::{
+        BeforeInstrumentation, CursorEvicted, CursorUnavailable, ObservationPending, RecordingGap,
+        Retention, SourceUnavailable,
+    };
+    for strict in [SourceUnavailable, CursorEvicted, CursorUnavailable] {
+        let error = live::collect_receipts(|_| Ok(page(vec![], vec![strict], None))).unwrap_err();
+        assert!(error.0.contains(&format!("{strict:?}")), "{}", error.0);
+    }
+    let (_, gaps) = live::collect_receipts(|_| {
+        Ok(page(
+            vec![],
+            vec![
+                BeforeInstrumentation,
+                RecordingGap,
+                ObservationPending,
+                Retention,
+            ],
+            None,
+        ))
+    })
+    .unwrap();
+    assert_eq!(gaps, ["recording_gap", "observation_pending", "retention"]);
+    let (_, none) =
+        live::collect_receipts(|_| Ok(page(vec![], vec![BeforeInstrumentation], None))).unwrap();
+    assert!(
+        none.is_empty(),
+        "history older than instrumentation is not a gap"
+    );
+}
+
+#[trace("FR-034-AC-22")]
+#[test]
+fn a_retention_boundary_spans_only_orders_whose_queued_receipt_is_out_of_view() {
+    use ReceiptOutcome::{AckExpired, Queued};
+    let lanes = lanes(&[("q1", "h:w:1"), ("q2", "h:w:2")]);
+    let retention = || vec!["retention".to_owned()];
+
+    let in_view = vec![receipt("a", Queued, "q1"), receipt("a", AckExpired, "q1")];
+    let read = live::expired_orders_from(&in_view, &lanes, retention());
+    assert_eq!(read.orders, vec![order("h:w:1", false)]);
+    assert!(read.gaps.is_empty(), "a stream at its cap is not a gap");
+    let mut world = World::one_host(&["h:w:1"], vec![raw("h:w:1", HookKind::Stop, 5)], &[]);
+    world.receipts = Ok(read.orders.clone());
+    world.read_extra = read;
+    let report = world.run();
+    assert!(!has_defect(&report, DefectKind::ReceiptsRecordingGap));
+    assert!(!report.rows[0].receipt_gap);
+
+    let out_of_view = vec![receipt("b", AckExpired, "q2")];
+    let read = live::expired_orders_from(&out_of_view, &lanes, retention());
+    assert!(read.orders[0].gap_spanned);
+    assert_eq!(read.gaps, ["retention"]);
+    let mut world = World::one_host(&["h:w:2"], vec![raw("h:w:2", HookKind::Stop, 5)], &[]);
+    world.receipts = Ok(read.orders.clone());
+    world.read_extra = read;
+    let report = world.run();
+    assert!(has_defect(&report, DefectKind::ReceiptsRecordingGap));
+    assert!(report.rows[0].receipt_gap);
+}
+
+#[trace("FR-034-AC-22")]
+#[test]
+fn a_recording_gap_spans_every_timed_out_order_and_is_a_defect_without_one() {
+    use ReceiptOutcome::{AckExpired, Delivered, Queued};
+    let lanes = lanes(&[("q1", "h:w:1"), ("q2", "h:w:2")]);
+    let gap = || vec!["recording_gap".to_owned()];
+    let events = vec![
+        receipt("a", Queued, "q1"),
+        receipt("a", AckExpired, "q1"),
+        receipt("b", Queued, "q2"),
+        receipt("b", Delivered, "q2"),
+        receipt("b", AckExpired, "q2"),
+    ];
+    let mut read = live::expired_orders_from(&events, &lanes, gap());
+    read.orders.sort_by(|x, y| x.addr.cmp(&y.addr));
+    assert!(read.orders[0].gap_spanned && !read.orders[1].gap_spanned);
+    assert_eq!(read.gaps, ["recording_gap"]);
+
+    let none = live::expired_orders_from(&[], &lanes, gap());
+    assert_eq!(none.gaps, ["recording_gap"]);
+    let mut world = World::one_host(&["h:w:1"], vec![raw("h:w:1", HookKind::Stop, 5)], &[]);
+    world.read_extra = none;
+    assert!(has_defect(&world.run(), DefectKind::ReceiptsRecordingGap));
+}
+
+#[trace("FR-034-AC-22")]
+#[test]
+fn unresolved_expired_orders_are_one_defect_per_target_listing_the_order_ids() {
+    use ReceiptOutcome::AckExpired;
+    let events = vec![
+        receipt("o1", AckExpired, "session/gone"),
+        receipt("o2", AckExpired, "session/gone"),
+        receipt("o3", AckExpired, "session/other"),
+    ];
+    let mut world = World::one_host(&["h:w:1"], vec![raw("h:w:1", HookKind::Stop, 5)], &[]);
+    world.read_extra = live::expired_orders_from(&events, &lanes(&[]), Vec::new());
+    let report = world.run();
+    let defects: Vec<_> = report
+        .defects
+        .iter()
+        .filter(|d| d.source == "relay.receipts")
+        .collect();
+    assert_eq!(defects.len(), 2);
+    let gone = defects
+        .iter()
+        .find(|d| d.reason.contains("session/gone"))
+        .unwrap();
+    assert!(gone.reason.contains("o1") && gone.reason.contains("o2"));
 }

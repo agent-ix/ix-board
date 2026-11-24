@@ -795,10 +795,11 @@ fn run_fleet_status() -> Result<ix_board::fleet::FleetReport, Error> {
                 as std::sync::Arc<dyn ix_board::fleet::SeriesSource>,
             Err(error) => std::sync::Arc::new(live::UnavailablePrometheus(error.to_string())),
         });
+    let (relay, receipts) = live::read_relay(config.host_timeout);
     let sources = ix_board::fleet::Sources {
-        relay: live::read_relay(config.host_timeout),
+        relay,
         series,
-        receipts: &live::PendingOrderReceipts,
+        receipts: &receipts,
         weak: &live::NoWeakSignals,
     };
     let local_now_ms = std::time::SystemTime::now()

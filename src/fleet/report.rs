@@ -25,6 +25,8 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub struct RegInfo {
     /// `server:workspace:tab`.
     pub addr: String,
+    /// The relay queue identity of the session.
+    pub queue: String,
     /// Relay-clock milliseconds the registration was last seen.
     pub last_seen_ms: i64,
     /// Whether a herdr pane hosts it.
@@ -120,6 +122,30 @@ pub struct ExpiredOrder {
     pub addr: String,
     /// Whether a `Delivered` receipt exists; `false` is `timed_out`.
     pub delivered: bool,
+    /// The order is `timed_out` and its `Delivered` receipt may sit in a part of the history the
+    /// relay did not record or no longer retains.
+    pub gap_spanned: bool,
+}
+
+/// An `AckExpired` receipt whose recipient queue has no registered lane address.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnresolvedOrder {
+    /// The order's original message identity.
+    pub order_id: String,
+    /// The recipient queue identity the receipt names.
+    pub target: String,
+}
+
+/// What one read of the relay receipt history found.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ReceiptRead {
+    /// Orders with a recorded `AckExpired` receipt, per lane address.
+    pub orders: Vec<ExpiredOrder>,
+    /// Expired orders whose recipient has no lane address.
+    pub unresolved: Vec<UnresolvedOrder>,
+    /// Coverage limits of the history (recording gap, pending observation, evicted range). A
+    /// `timed_out` derived while any exists may be a lost `Delivered` receipt.
+    pub gaps: Vec<String>,
 }
 
 /// Watcher series by host (Prometheus HTTP API).
@@ -134,12 +160,12 @@ pub trait SeriesSource: Send + Sync {
 
 /// The FR-035 order receipts (`Acted`, `AckExpired`) read from the relay.
 pub trait OrderReceipts {
-    /// Orders with a recorded `AckExpired` receipt.
+    /// The orders with a recorded `AckExpired` receipt and the limits of the history read.
     ///
     /// # Errors
     ///
     /// The reason the receipts could not be read.
-    fn expired_orders(&self) -> Result<Vec<ExpiredOrder>, SourceError>;
+    fn expired_orders(&self) -> Result<ReceiptRead, SourceError>;
 }
 
 /// Weak signals (herdr title, pane text, self-report) that a lane is working.
@@ -190,6 +216,8 @@ pub enum DefectKind {
     UnreadableSource,
     /// A lane's host registry lease expired.
     StaleHostRegistry,
+    /// The relay receipt history has a recording gap, a pending observation or an evicted range.
+    ReceiptsRecordingGap,
 }
 
 /// A source-defect row.
@@ -233,6 +261,9 @@ pub struct LaneRow {
     pub focus: Option<String>,
     /// The class used the documented relay defaults because the relay thresholds were not read.
     pub thresholds_defaulted: bool,
+    /// The lane is `STALE-ORDER` as `timed_out` while the receipt history has a coverage gap, so
+    /// a `Delivered` receipt may have been lost.
+    pub receipt_gap: bool,
     /// Evidence schema version.
     pub schema_version: u32,
 }
@@ -628,8 +659,8 @@ pub fn build_report(cfg: &FleetConfig, sources: &Sources<'_>, local_now_ms: i64)
         host_defects(&mut ctx, host, read);
     }
     absence_defects(&mut ctx, relay, &reads);
-    let orders = match sources.receipts.expired_orders() {
-        Ok(orders) => orders,
+    let read = match sources.receipts.expired_orders() {
+        Ok(read) => read,
         Err(error) => {
             ctx.defect(
                 DefectKind::UnreadableSource,
@@ -638,9 +669,41 @@ pub fn build_report(cfg: &FleetConfig, sources: &Sources<'_>, local_now_ms: i64)
                 None,
                 error.0,
             );
-            Vec::new()
+            ReceiptRead::default()
         }
     };
+    let orders = &read.orders;
+    if !read.gaps.is_empty() {
+        ctx.defect(
+            DefectKind::ReceiptsRecordingGap,
+            "relay.receipts",
+            None,
+            None,
+            format!(
+                "receipt history is not complete ({}); a timed_out order may have lost its Delivered receipt",
+                read.gaps.join(", ")
+            ),
+        );
+    }
+    let mut unresolved: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for order in &read.unresolved {
+        unresolved
+            .entry(order.target.as_str())
+            .or_default()
+            .push(order.order_id.as_str());
+    }
+    for (target, ids) in &unresolved {
+        ctx.defect(
+            DefectKind::UnreadableSource,
+            "relay.receipts",
+            None,
+            None,
+            format!(
+                "AckExpired orders {} to {target} have no registered lane address",
+                ids.join(", ")
+            ),
+        );
+    }
     let mut events: BTreeMap<String, Vec<HookEvent>> = BTreeMap::new();
     for raw in &relay.events {
         events
@@ -760,6 +823,10 @@ pub fn build_report(cfg: &FleetConfig, sources: &Sources<'_>, local_now_ms: i64)
             compile_seconds: series.and_then(|s| s.compile_seconds.get(&key).copied()),
             focus: None,
             thresholds_defaulted: defaulted,
+            receipt_gap: result.class.kind == ClassKind::StaleOrder
+                && orders
+                    .iter()
+                    .any(|o| o.addr.to_lowercase() == key && !o.delivered && o.gap_spanned),
             schema_version: SCHEMA_VERSION,
         });
     }

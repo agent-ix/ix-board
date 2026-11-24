@@ -2,29 +2,55 @@
 // Copyright (C) 2026 Agent-IX
 
 //! Live readers: relay Redis through relay-core, Prometheus over its HTTP API, and the order
-//! receipt and weak-signal seams.
+//! receipt reader and the weak-signal seam.
 
 use super::SourceError;
 use super::classify::WeakSource;
 use super::report::{
-    ExpiredOrder, HostSeries, OrderReceipts, ProbeReading, RegInfo, RelayConfig, RelaySnapshot,
-    SeriesSource, WeakSignals, parse_event,
+    ExpiredOrder, HostSeries, OrderReceipts, ProbeReading, ReceiptRead, RegInfo, RelayConfig,
+    RelaySnapshot, SeriesSource, UnresolvedOrder, WeakSignals, parse_event,
 };
 use relay_core::config::{CoreFlags, load_core};
+use relay_core::receipts::{
+    RECEIPT_EVENT_CAP, RECEIPT_PAGE_CAP, RECEIPT_WINDOW_MS, ReceiptCoverageReason, ReceiptEvent,
+    ReceiptExport, ReceiptOutcome, ReceiptRequest,
+};
 use relay_core::{ACTIVITY_MAX_EVENTS, Address, Relay};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
-/// Reads the relay snapshot with one bounded connection. The URL and key prefix resolve like
-/// every ix-relay binary (`IX_RELAY_URL`, then `~/.ix/relay/config.toml`).
-///
-/// # Errors
-///
-/// The reason the relay could not be read.
-pub fn read_relay(timeout: Duration) -> Result<RelaySnapshot, SourceError> {
-    let settings = load_core(CoreFlags::default()).map_err(|e| SourceError(e.to_string()))?;
-    let mut relay = Relay::connect(&settings.url.value, timeout)
-        .map_err(|e| SourceError(format!("relay connect: {e}")))?
-        .with_prefix(settings.prefix.value.clone());
+/// Reads the relay snapshot and the order receipts over one bounded connection. The URL and key
+/// prefix resolve like every ix-relay binary (`IX_RELAY_URL`, then `~/.ix/relay/config.toml`).
+/// The receipts are matched against the snapshot's registrations, so neither is read twice.
+pub fn read_relay(timeout: Duration) -> (Result<RelaySnapshot, SourceError>, ReadReceipts) {
+    let connected = load_core(CoreFlags::default())
+        .map_err(|e| SourceError(e.to_string()))
+        .and_then(|settings| {
+            Ok(Relay::connect(&settings.url.value, timeout)
+                .map_err(|e| SourceError(format!("relay connect: {e}")))?
+                .with_prefix(settings.prefix.value.clone()))
+        });
+    let mut relay = match connected {
+        Ok(relay) => relay,
+        Err(error) => return (Err(error.clone()), ReadReceipts(Err(error))),
+    };
+    read_relay_on(&mut relay, timeout)
+}
+
+/// [`read_relay`] over a connection the caller made.
+pub fn read_relay_on(
+    relay: &mut Relay,
+    timeout: Duration,
+) -> (Result<RelaySnapshot, SourceError>, ReadReceipts) {
+    let snapshot = read_snapshot(relay, timeout);
+    let receipts = match &snapshot {
+        Ok(s) => read_receipts(relay, s.now_ms, &s.registrations),
+        Err(error) => Err(error.clone()),
+    };
+    (snapshot, ReadReceipts(receipts))
+}
+
+fn read_snapshot(relay: &mut Relay, timeout: Duration) -> Result<RelaySnapshot, SourceError> {
     let fail = |what: &str, e: relay_core::Error| SourceError(format!("relay {what}: {e}"));
     let lists = relay.lane_lists().map_err(|e| fail("lane lists", e))?;
     let agents = relay.agents().map_err(|e| fail("registrations", e))?;
@@ -34,6 +60,7 @@ pub fn read_relay(timeout: Duration) -> Result<RelaySnapshot, SourceError> {
         match reg.full_address() {
             Some(addr) => registrations.push(RegInfo {
                 addr: addr.to_string(),
+                queue: reg.name.as_str().to_owned(),
                 last_seen_ms: reg.last_seen_ms,
                 has_pane: reg.herdr_pane.is_some(),
             }),
@@ -285,17 +312,146 @@ impl<Q: PromQuery> SeriesSource for PrometheusSeries<Q> {
     }
 }
 
-/// The seam for the FR-035 order receipt states. ix-relay main (0ef4efc) records `Delivered` and
-/// `TimedOut` lease outcomes but no `Acted` or `AckExpired` (ix-relay PR #56), so the live
-/// reader reports the receipts unavailable instead of an empty list.
-pub struct PendingOrderReceipts;
+/// The most pages the retained receipt history can fill: its event cap over the page size, plus
+/// the final partial page.
+const RECEIPT_MAX_PAGES: usize = RECEIPT_EVENT_CAP / RECEIPT_PAGE_CAP + 1;
 
-impl OrderReceipts for PendingOrderReceipts {
-    fn expired_orders(&self) -> Result<Vec<ExpiredOrder>, SourceError> {
-        Err(SourceError(
-            "AckExpired receipts are not on ix-relay main (ix-relay PR #56); STALE-ORDER unavailable"
-                .to_owned(),
-        ))
+/// The `AckExpired` orders in `events`, per lane address, from the relay's own receipts (FR-067,
+/// FR-071): `lanes` maps a session queue identity to its lane address. An order that has an
+/// `Acted` receipt is not expired; one with no `Delivered` receipt is `timed_out`. An expired
+/// order whose recipient is not in `lanes` is returned as unresolved.
+///
+/// `gaps` are the history's coverage limits. A recording gap or a pending observation may hide a
+/// `Delivered` receipt of any order. A count-based `retention` boundary hides only receipts older
+/// than it, so it affects an order only when its `Queued` receipt is out of view. The returned gaps
+/// hold the limits that affect at least one `timed_out` order, plus every true recording gap or
+/// pending observation.
+#[must_use]
+pub fn expired_orders_from(
+    events: &[ReceiptEvent],
+    lanes: &BTreeMap<String, String>,
+    gaps: Vec<String>,
+) -> ReceiptRead {
+    let mut states: BTreeMap<&str, (bool, bool, bool)> = BTreeMap::new();
+    for event in events {
+        let state = states.entry(event.original_id.as_str()).or_default();
+        match event.outcome {
+            ReceiptOutcome::Delivered => state.0 = true,
+            ReceiptOutcome::Acted => state.1 = true,
+            ReceiptOutcome::Queued => state.2 = true,
+            _ => {}
+        }
+    }
+    let hard = gaps.iter().any(|g| g != "retention");
+    let retained = gaps.iter().any(|g| g == "retention");
+    let mut retention_spans = false;
+    let mut read = ReceiptRead {
+        gaps: gaps.iter().filter(|g| *g != "retention").cloned().collect(),
+        ..ReceiptRead::default()
+    };
+    for event in events {
+        let (delivered, acted, queued) = states[event.original_id.as_str()];
+        if event.outcome != ReceiptOutcome::AckExpired || acted {
+            continue;
+        }
+        match lanes.get(&event.target) {
+            Some(addr) => {
+                let beyond_retention = retained && !queued;
+                retention_spans |= beyond_retention && !delivered;
+                read.orders.push(ExpiredOrder {
+                    addr: addr.clone(),
+                    delivered,
+                    gap_spanned: !delivered && (hard || beyond_retention),
+                });
+            }
+            None => read.unresolved.push(UnresolvedOrder {
+                order_id: event.original_id.clone(),
+                target: event.target.clone(),
+            }),
+        }
+    }
+    if retention_spans {
+        read.gaps.push("retention".to_owned());
+    }
+    read
+}
+
+/// Reads every retained receipt through `fetch`, which returns the page after a cursor. The
+/// request spans the relay's whole receipt retention, so an expired order stays visible while the
+/// relay retains it and its `Delivered` receipt is in view.
+///
+/// # Errors
+///
+/// The page could not be read or continued, or the history needs more pages than it can hold.
+pub fn collect_receipts(
+    mut fetch: impl FnMut(Option<String>) -> Result<ReceiptExport, SourceError>,
+) -> Result<(Vec<ReceiptEvent>, Vec<String>), SourceError> {
+    let mut events = Vec::new();
+    let mut gaps: Vec<String> = Vec::new();
+    let mut after = None;
+    for _ in 0..RECEIPT_MAX_PAGES {
+        let page = fetch(after.take())?;
+        for reason in &page.reasons {
+            let name = match reason {
+                ReceiptCoverageReason::SourceUnavailable
+                | ReceiptCoverageReason::CursorEvicted
+                | ReceiptCoverageReason::CursorUnavailable => {
+                    return Err(SourceError(format!(
+                        "relay receipts incomplete: {reason:?}"
+                    )));
+                }
+                ReceiptCoverageReason::BeforeInstrumentation => continue,
+                ReceiptCoverageReason::RecordingGap => "recording_gap",
+                ReceiptCoverageReason::ObservationPending => "observation_pending",
+                ReceiptCoverageReason::Retention => "retention",
+            };
+            if !gaps.iter().any(|g| g == name) {
+                gaps.push(name.to_owned());
+            }
+        }
+        if !page.complete && page.reasons.is_empty() && !gaps.iter().any(|g| g == "incomplete") {
+            gaps.push("incomplete".to_owned());
+        }
+        events.extend(page.events.into_iter().map(|row| row.event));
+        if !page.has_more {
+            return Ok((events, gaps));
+        }
+        after = page.next_cursor;
+    }
+    Err(SourceError(format!(
+        "relay receipts exceed {RECEIPT_MAX_PAGES} pages"
+    )))
+}
+
+fn read_receipts(
+    relay: &mut Relay,
+    now_ms: i64,
+    registrations: &[RegInfo],
+) -> Result<ReceiptRead, SourceError> {
+    let lanes: BTreeMap<String, String> = registrations
+        .iter()
+        .map(|reg| (reg.queue.clone(), reg.addr.clone()))
+        .collect();
+    let (events, gaps) = collect_receipts(|after| {
+        relay
+            .receipt_export(&ReceiptRequest {
+                since_ms: now_ms - RECEIPT_WINDOW_MS,
+                until_ms: now_ms,
+                now_ms,
+                page_size: RECEIPT_PAGE_CAP,
+                after,
+            })
+            .map_err(|e| SourceError(format!("relay receipts: {e}")))
+    })?;
+    Ok(expired_orders_from(&events, &lanes, gaps))
+}
+
+/// The receipts read together with the relay snapshot, handed to the report as its order source.
+pub struct ReadReceipts(pub Result<ReceiptRead, SourceError>);
+
+impl OrderReceipts for ReadReceipts {
+    fn expired_orders(&self) -> Result<ReceiptRead, SourceError> {
+        self.0.clone()
     }
 }
 
