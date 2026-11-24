@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Coyright (C) 2026 Agent-IX
+// Copyright (C) 2026 Agent-IX
 
 //! The fleet ledger (FR-039): a schema-versioned SQLite store outside git, written under a
 //! single-writer lock with the atomic-commit discipline of the team-metrics journal.

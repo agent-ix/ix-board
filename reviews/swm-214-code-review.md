@@ -80,6 +80,12 @@ target/ was deleted afterwards.
 | FND-012 | low | `push_next_ticket` `executed_at` is judged only in the tick where its condition resolves, against that tick's list head. If `fleet assign` rewrites the list between push and resolution, or FR-037 focus is not yet derivable in that one tick, a real execution stays NULL. There is no false positive. The fix is to record the pushed ticket on the action row and let a later tick inside the focus window set `executed_at` (SWM-255 schema work). | src/fleet/ledger/tick.rs:119-150, src/fleet/tick/live.rs:167-200 |
 | FND-013 | low | `resolve_path` prefers `IX_BOARD_LEDGER_PATH` over `FleetConfig.ledger_path`. Tests that go through it (`commit_completing` in tests/fleet_tick.rs, `record_status_completing` in tests/fleet_assign.rs) would write to that path if a developer's shell exports it. With it unset, every test ledger is in a tempdir, and nothing was written under ~/.local/state/ix-board. | src/fleet/ledger/mod.rs:131-139, tests/fleet_tick.rs:1475 |
 
+## New findings (disposition pass 3)
+
+| ID | Severity | Summary | Refs |
+| --- | --- | --- | --- |
+| FND-014 | low | Fix commit bbb9aab corrupted the copyright line of `src/fleet/ledger/mod.rs` to `// Coyright (C) 2026 Agent-IX`. This is the second header corruption introduced by a fix round, after the SPDX line in round 1. | src/fleet/ledger/mod.rs:2 |
+
 ## Dispositions
 
 | FND | outcome | reason |
@@ -99,3 +105,6 @@ target/ was deleted afterwards.
 | FND-011 | fixed | - |
 | FND-012 | still-open | New in round 2, low and not blocking: store the pushed ticket on the action row (SWM-255) so that a list change or late focus cannot drop a real execution. |
 | FND-013 | still-open | New in round 2, low and not blocking: tests that pass a tempdir `ledger_path` still yield to an exported `IX_BOARD_LEDGER_PATH`. |
+| FND-012 | deferred | SWM-255: storing the pushed ticket on the action row and settling `executed_at` in a later tick is schema work owned by SWM-255; until then a push can only be missed, never falsely credited. FR-039 must state this deferral (SR-6121 FND-011). |
+| FND-013 | fixed | - |
+| FND-014 | still-open | New in round 3, low: restore `// Copyright (C) 2026 Agent-IX` in src/fleet/ledger/mod.rs. |

@@ -50,7 +50,7 @@ emitted_at, executed_at, resolved_at), `defect`, `assignment_history`,
   `answer_dialog` action was emitted (a fallback to `escalate_block` is not execution) and
   `act_on_undetermined` expects the lane's class to be determined again. Only positive evidence sets
   `executed_at`: a `push_next_ticket` is executed when the lane is WORKING with its derived focus on the
-  pushed ticket (the head of its FR-072 list), never for any WORKING lane. `push_next_ticket` stores the pushed ticket on the action row, and a later tick within the focus window settles `executed_at`. `resend_order` is deferred to SWM-255 (the `Acted` receipt join): until it lands a
+  pushed ticket (the head of its FR-072 list), never for any WORKING lane. Storing the pushed ticket on the action row and settling `executed_at` in a later tick within the focus window is deferred to SWM-255; until then a push is judged only in the tick its condition resolves, against the list head of that tick, so an execution can be missed but is never falsely credited. `resend_order` is deferred to SWM-255 (the `Acted` receipt join): until it lands a
   `resend_order` has no `executed_at`.
   A lane already in the expected state at emission does not count. An action aimed
   at a lead or a project (`escalate_*`, `need_ready_tickets`, `fix_source`) has no
