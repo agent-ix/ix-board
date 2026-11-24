@@ -5,8 +5,8 @@
 //! path. Needs `docker`; the container is removed at the end of the test.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use ix_board::fleet::ExpiredOrder;
-use ix_board::fleet::live::read_expired_orders;
+use ix_board::fleet::live::read_relay_on;
+use ix_board::fleet::{ExpiredOrder, OrderReceipts};
 use ix_trace_rs::trace;
 use relay_core::receipts::{DeliveryEvidence, OrderSpec};
 use relay_core::{
@@ -103,6 +103,12 @@ fn order_to(relay: &mut Relay, name: &AgentName) {
         .unwrap();
 }
 
+fn expired(relay: &mut Relay) -> ix_board::fleet::ReceiptRead {
+    let (snapshot, receipts) = read_relay_on(relay, Duration::from_secs(2));
+    snapshot.unwrap();
+    receipts.expired_orders().unwrap()
+}
+
 #[trace("FR-034-AC-12")]
 #[test]
 fn ack_expired_orders_are_read_from_a_real_relay_with_and_without_delivery() {
@@ -134,13 +140,15 @@ fn ack_expired_orders_are_read_from_a_real_relay_with_and_without_delivery() {
         .unwrap();
 
     assert!(
-        read_expired_orders(&mut relay).unwrap().is_empty(),
+        expired(&mut relay).orders.is_empty(),
         "no order has expired before the relay records it"
     );
     std::thread::sleep(Duration::from_secs(11));
     relay.expire_orders(Now::Server).unwrap();
 
-    let mut orders = read_expired_orders(&mut relay).unwrap();
+    let read = expired(&mut relay);
+    assert!(read.gaps.is_empty() && read.unresolved.is_empty());
+    let mut orders = read.orders;
     orders.sort_by(|a, b| a.addr.cmp(&b.addr));
     let mut want = vec![
         ExpiredOrder {

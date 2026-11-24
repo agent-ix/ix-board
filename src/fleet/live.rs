@@ -7,29 +7,50 @@
 use super::SourceError;
 use super::classify::WeakSource;
 use super::report::{
-    ExpiredOrder, HostSeries, OrderReceipts, ProbeReading, RegInfo, RelayConfig, RelaySnapshot,
-    SeriesSource, WeakSignals, parse_event,
+    ExpiredOrder, HostSeries, OrderReceipts, ProbeReading, ReceiptRead, RegInfo, RelayConfig,
+    RelaySnapshot, SeriesSource, UnresolvedOrder, WeakSignals, parse_event,
 };
 use relay_core::config::{CoreFlags, load_core};
 use relay_core::receipts::{
-    ORDER_ACK_MAX_MS, RECEIPT_PAGE_CAP, ReceiptCoverageReason, ReceiptEvent, ReceiptOutcome,
-    ReceiptRequest,
+    RECEIPT_EVENT_CAP, RECEIPT_PAGE_CAP, RECEIPT_WINDOW_MS, ReceiptCoverageReason, ReceiptEvent,
+    ReceiptExport, ReceiptOutcome, ReceiptRequest,
 };
 use relay_core::{ACTIVITY_MAX_EVENTS, Address, Relay};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-/// Reads the relay snapshot with one bounded connection. The URL and key prefix resolve like
-/// every ix-relay binary (`IX_RELAY_URL`, then `~/.ix/relay/config.toml`).
-///
-/// # Errors
-///
-/// The reason the relay could not be read.
-pub fn read_relay(timeout: Duration) -> Result<RelaySnapshot, SourceError> {
-    let settings = load_core(CoreFlags::default()).map_err(|e| SourceError(e.to_string()))?;
-    let mut relay = Relay::connect(&settings.url.value, timeout)
-        .map_err(|e| SourceError(format!("relay connect: {e}")))?
-        .with_prefix(settings.prefix.value.clone());
+/// Reads the relay snapshot and the order receipts over one bounded connection. The URL and key
+/// prefix resolve like every ix-relay binary (`IX_RELAY_URL`, then `~/.ix/relay/config.toml`).
+/// The receipts are matched against the snapshot's registrations, so neither is read twice.
+pub fn read_relay(timeout: Duration) -> (Result<RelaySnapshot, SourceError>, ReadReceipts) {
+    let connected = load_core(CoreFlags::default())
+        .map_err(|e| SourceError(e.to_string()))
+        .and_then(|settings| {
+            Ok(Relay::connect(&settings.url.value, timeout)
+                .map_err(|e| SourceError(format!("relay connect: {e}")))?
+                .with_prefix(settings.prefix.value.clone()))
+        });
+    let mut relay = match connected {
+        Ok(relay) => relay,
+        Err(error) => return (Err(error.clone()), ReadReceipts(Err(error))),
+    };
+    read_relay_on(&mut relay, timeout)
+}
+
+/// [`read_relay`] over a connection the caller made.
+pub fn read_relay_on(
+    relay: &mut Relay,
+    timeout: Duration,
+) -> (Result<RelaySnapshot, SourceError>, ReadReceipts) {
+    let snapshot = read_snapshot(relay, timeout);
+    let receipts = match &snapshot {
+        Ok(s) => read_receipts(relay, s.now_ms, &s.registrations),
+        Err(error) => Err(error.clone()),
+    };
+    (snapshot, ReadReceipts(receipts))
+}
+
+fn read_snapshot(relay: &mut Relay, timeout: Duration) -> Result<RelaySnapshot, SourceError> {
     let fail = |what: &str, e: relay_core::Error| SourceError(format!("relay {what}: {e}"));
     let lists = relay.lane_lists().map_err(|e| fail("lane lists", e))?;
     let agents = relay.agents().map_err(|e| fail("registrations", e))?;
@@ -39,6 +60,7 @@ pub fn read_relay(timeout: Duration) -> Result<RelaySnapshot, SourceError> {
         match reg.full_address() {
             Some(addr) => registrations.push(RegInfo {
                 addr: addr.to_string(),
+                queue: reg.name.as_str().to_owned(),
                 last_seen_ms: reg.last_seen_ms,
                 has_pane: reg.herdr_pane.is_some(),
             }),
@@ -290,116 +312,130 @@ impl<Q: PromQuery> SeriesSource for PrometheusSeries<Q> {
     }
 }
 
-/// How far back the live reader asks the relay for receipts. This bounds the read only: whether an
-/// order expired is the relay's `AckExpired` record, never a deadline computed here. Twice the
-/// longest order ack deadline, so a `Delivered` receipt that precedes a recorded expiry is in view.
-const RECEIPT_WINDOW_MS: i64 = 2 * ORDER_ACK_MAX_MS;
+/// The most pages the retained receipt history can fill: its event cap over the page size, plus
+/// the final partial page.
+const RECEIPT_MAX_PAGES: usize = RECEIPT_EVENT_CAP / RECEIPT_PAGE_CAP + 1;
 
-/// Most receipt pages one run reads.
-const RECEIPT_MAX_PAGES: usize = 20;
-
-/// Orders with a recorded `AckExpired` receipt (FR-067, FR-071), read from the relay's receipt
-/// stream for the lanes in `lanes`, a map from a session queue identity to its lane address.
-///
-/// An order that later has an `Acted` receipt is not expired. An order with no `Delivered` receipt
-/// is `timed_out` (`delivered` false).
+/// The `AckExpired` orders in `events`, per lane address, from the relay's own receipts (FR-067,
+/// FR-071): `lanes` maps a session queue identity to its lane address. An order that has an
+/// `Acted` receipt is not expired; one with no `Delivered` receipt is `timed_out`. An expired
+/// order whose recipient is not in `lanes` is returned as unresolved. `gaps` carries the history's
+/// coverage limits through.
 #[must_use]
 pub fn expired_orders_from(
     events: &[ReceiptEvent],
     lanes: &BTreeMap<String, String>,
-) -> Vec<ExpiredOrder> {
-    let seen = |id: &str, outcome: ReceiptOutcome| {
-        events
-            .iter()
-            .any(|e| e.original_id == id && e.outcome == outcome)
-    };
-    let mut orders = Vec::new();
+    gaps: Vec<String>,
+) -> ReceiptRead {
+    let mut states: BTreeMap<&str, (bool, bool)> = BTreeMap::new();
     for event in events {
-        if event.outcome != ReceiptOutcome::AckExpired
-            || seen(&event.original_id, ReceiptOutcome::Acted)
-        {
+        let state = states.entry(event.original_id.as_str()).or_default();
+        match event.outcome {
+            ReceiptOutcome::Delivered => state.0 = true,
+            ReceiptOutcome::Acted => state.1 = true,
+            _ => {}
+        }
+    }
+    let mut read = ReceiptRead {
+        gaps,
+        ..ReceiptRead::default()
+    };
+    for event in events {
+        let (delivered, acted) = states[event.original_id.as_str()];
+        if event.outcome != ReceiptOutcome::AckExpired || acted {
             continue;
         }
-        if let Some(addr) = lanes.get(&event.target) {
-            orders.push(ExpiredOrder {
+        match lanes.get(&event.target) {
+            Some(addr) => read.orders.push(ExpiredOrder {
                 addr: addr.clone(),
-                delivered: seen(&event.original_id, ReceiptOutcome::Delivered),
-            });
+                delivered,
+            }),
+            None => read.unresolved.push(UnresolvedOrder {
+                order_id: event.original_id.clone(),
+                target: event.target.clone(),
+            }),
         }
     }
-    orders
+    read
 }
 
-/// The order receipts read from the relay Redis through relay-core with one bounded connection.
-pub struct RelayOrderReceipts {
-    /// The connect and read bound.
-    pub timeout: Duration,
-}
-
-impl OrderReceipts for RelayOrderReceipts {
-    fn expired_orders(&self) -> Result<Vec<ExpiredOrder>, SourceError> {
-        let settings = load_core(CoreFlags::default()).map_err(|e| SourceError(e.to_string()))?;
-        let mut relay = Relay::connect(&settings.url.value, self.timeout)
-            .map_err(|e| SourceError(format!("relay connect: {e}")))?
-            .with_prefix(settings.prefix.value.clone());
-        read_expired_orders(&mut relay)
-    }
-}
-
-/// Reads the `AckExpired` orders of every registered lane from `relay`.
+/// Reads every retained receipt through `fetch`, which returns the page after a cursor. The
+/// request spans the relay's whole receipt retention, so an expired order stays visible while the
+/// relay retains it and its `Delivered` receipt is in view.
 ///
 /// # Errors
 ///
-/// The reason the receipts or registrations could not be read, or that the receipt pages were
-/// evicted. A recording gap does not hide an `AckExpired` receipt, which the relay watcher writes.
-pub fn read_expired_orders(relay: &mut Relay) -> Result<Vec<ExpiredOrder>, SourceError> {
-    let fail = |what: &str, e: relay_core::Error| SourceError(format!("relay {what}: {e}"));
-    let lanes: BTreeMap<String, String> = relay
-        .agents()
-        .map_err(|e| fail("registrations", e))?
-        .registrations
-        .iter()
-        .filter_map(|reg| {
-            Some((
-                reg.name.as_str().to_owned(),
-                reg.full_address()?.to_string(),
-            ))
-        })
-        .collect();
-    let now_ms = relay.lane_lists().map_err(|e| fail("clock", e))?.now_ms;
+/// The page could not be read or continued, or the history needs more pages than it can hold.
+pub fn collect_receipts(
+    mut fetch: impl FnMut(Option<String>) -> Result<ReceiptExport, SourceError>,
+) -> Result<(Vec<ReceiptEvent>, Vec<String>), SourceError> {
     let mut events = Vec::new();
+    let mut gaps: Vec<String> = Vec::new();
     let mut after = None;
     for _ in 0..RECEIPT_MAX_PAGES {
-        let page = relay
-            .receipt_export(&ReceiptRequest {
-                since_ms: now_ms - RECEIPT_WINDOW_MS,
-                until_ms: now_ms,
-                now_ms,
-                page_size: RECEIPT_PAGE_CAP,
-                after: after.take(),
-            })
-            .map_err(|e| fail("receipts", e))?;
-        if let Some(reason) = page.reasons.iter().find(|r| {
-            matches!(
-                r,
+        let page = fetch(after.take())?;
+        for reason in &page.reasons {
+            let name = match reason {
                 ReceiptCoverageReason::SourceUnavailable
-                    | ReceiptCoverageReason::CursorEvicted
-                    | ReceiptCoverageReason::CursorUnavailable
-            )
-        }) {
-            return Err(SourceError(format!(
-                "relay receipts incomplete: {reason:?}"
-            )));
+                | ReceiptCoverageReason::CursorEvicted
+                | ReceiptCoverageReason::CursorUnavailable => {
+                    return Err(SourceError(format!(
+                        "relay receipts incomplete: {reason:?}"
+                    )));
+                }
+                ReceiptCoverageReason::BeforeInstrumentation => continue,
+                ReceiptCoverageReason::RecordingGap => "recording_gap",
+                ReceiptCoverageReason::ObservationPending => "observation_pending",
+                ReceiptCoverageReason::Retention => "retention",
+            };
+            if !gaps.iter().any(|g| g == name) {
+                gaps.push(name.to_owned());
+            }
+        }
+        if !page.complete && page.reasons.is_empty() && !gaps.iter().any(|g| g == "incomplete") {
+            gaps.push("incomplete".to_owned());
         }
         events.extend(page.events.into_iter().map(|row| row.event));
         if !page.has_more {
-            return Ok(expired_orders_from(&events, &lanes));
+            return Ok((events, gaps));
         }
         after = page.next_cursor;
     }
     Err(SourceError(format!(
         "relay receipts exceed {RECEIPT_MAX_PAGES} pages"
     )))
+}
+
+fn read_receipts(
+    relay: &mut Relay,
+    now_ms: i64,
+    registrations: &[RegInfo],
+) -> Result<ReceiptRead, SourceError> {
+    let lanes: BTreeMap<String, String> = registrations
+        .iter()
+        .map(|reg| (reg.queue.clone(), reg.addr.clone()))
+        .collect();
+    let (events, gaps) = collect_receipts(|after| {
+        relay
+            .receipt_export(&ReceiptRequest {
+                since_ms: now_ms - RECEIPT_WINDOW_MS,
+                until_ms: now_ms,
+                now_ms,
+                page_size: RECEIPT_PAGE_CAP,
+                after,
+            })
+            .map_err(|e| SourceError(format!("relay receipts: {e}")))
+    })?;
+    Ok(expired_orders_from(&events, &lanes, gaps))
+}
+
+/// The receipts read together with the relay snapshot, handed to the report as its order source.
+pub struct ReadReceipts(pub Result<ReceiptRead, SourceError>);
+
+impl OrderReceipts for ReadReceipts {
+    fn expired_orders(&self) -> Result<ReceiptRead, SourceError> {
+        self.0.clone()
+    }
 }
 
 /// The seam for herdr weak signals (title, pane text). The live command wires none yet, so only

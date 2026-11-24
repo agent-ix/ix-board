@@ -46,7 +46,7 @@ pub fn render_text(report: &FleetReport) -> String {
             .map_or_else(|| "-".to_owned(), |ms| ms.to_string());
         let _ = writeln!(
             out,
-            "{}  {}  {}  age={}  last_event_ms={}{}",
+            "{}  {}  {}  age={}  last_event_ms={}{}{}",
             row.lane,
             row.host,
             class_text(row),
@@ -56,7 +56,8 @@ pub fn render_text(report: &FleetReport) -> String {
                 "  thresholds_defaulted"
             } else {
                 ""
-            }
+            },
+            if row.receipt_gap { "  receipt_gap" } else { "" }
         );
     }
     for host in &report.hosts {
