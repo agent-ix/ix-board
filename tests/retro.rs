@@ -3386,3 +3386,19 @@ fn configured_native_http_and_export_file_flow_through_snapshot_store_and_missin
         Some(Value::Scalar(1.0))
     );
 }
+
+/// Trace: FR-018-AC-29
+#[test]
+fn a_missing_host_names_itself_in_the_unavailable_agent_metrics() {
+    let mut rig = base_rig();
+    let mut report = agents_report(vec![agent_row(Verdict::Working, Some(0))]);
+    report.missing_hosts.push(ix_board::agents::MissingHost {
+        machine: "luna".into(),
+        reason: "timed out after 45s".into(),
+        elapsed_ms: 45_000,
+    });
+    rig.agents = Some(Ok(report));
+    let record = snapshot(&rig);
+    assert_eq!(value(&record, "agents_working_share"), None);
+    assert!(reason(&record, "agents_working_share").contains("luna: timed out after 45s"));
+}

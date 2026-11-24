@@ -190,8 +190,17 @@ impl Collector {
             eprintln!("lifecycle evidence: {error}");
         }
         let mut samples = Vec::new();
-        let complete = result.is_ok();
+        // A missing machine keeps the healthy machines' rows but makes coverage partial.
+        let complete = result
+            .as_ref()
+            .is_ok_and(|report| report.missing_hosts.is_empty());
         if let Ok(report) = result {
+            for missing in &report.missing_hosts {
+                eprintln!(
+                    "lifecycle evidence: host {} missing: {}",
+                    missing.machine, missing.reason
+                );
+            }
             for row in report.agents.iter().filter(|r| !r.partial) {
                 // Agent reports label this host "local". Resolve that alias
                 // only through an exact native session AND pane match to a

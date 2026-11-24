@@ -1378,9 +1378,162 @@ fn a_slow_machine_is_listed_missing_while_healthy_machines_still_report() {
     assert!(missing.reason.contains("timed out"));
     assert!(missing.elapsed_ms >= 250 && missing.elapsed_ms < 2000);
     assert!(render_text(&r).contains("Missing host: luna"));
+    assert!(r.errors.iter().any(|e| e.starts_with("luna:")));
+    assert_eq!(r.coverage(), Coverage::Partial);
     let mut down = machine();
     down.label = "down";
     down.fail = true;
     let r = report(vec![machine(), down]);
     assert_eq!(r.missing_hosts[0].machine, "down");
+}
+
+#[trace("FR-018-AC-27")]
+#[test]
+fn herdr_done_is_not_idle_with_an_active_worker_or_attributed_process() {
+    let blank = Lifecycle::default();
+    let active = counts(&[worker("child", "root", WorkerState::Running)]);
+    assert_eq!(
+        verdict(&blank, &active, HerdrState::Done, NOW),
+        Verdict::Waiting
+    );
+    let running_build = decide(&Evidence {
+        herdr: HerdrState::Done,
+        tail: Some("❯"),
+        lifecycle: &blank,
+        workers: &counts(&[]),
+        active_processes: 1,
+        processes_complete: true,
+        transcript_complete: true,
+        now: NOW,
+        idle_after: IDLE,
+    });
+    assert_eq!(running_build, Verdict::Working);
+}
+
+fn json_line(value: &Value) -> String {
+    format!("{value}\n")
+}
+fn filler_line(total_len: usize) -> String {
+    let line = |pad: usize| {
+        json_line(
+            &json!({"type":"response_item","timestamp":"2026-10-18T10:00:00Z","payload":{"type":"message","role":"user","content":"x".repeat(pad)}}),
+        )
+    };
+    let line = line(total_len - line(0).len());
+    assert_eq!(line.len(), total_len);
+    line
+}
+fn fillers(total: usize) -> String {
+    let count = total / 1000;
+    let mut text = String::new();
+    for _ in 1..count {
+        text.push_str(&filler_line(1000));
+    }
+    text.push_str(&filler_line(total - (count - 1) * 1000));
+    text
+}
+fn event(kind: &str, at: &str, turn: &str) -> String {
+    json_line(&json!({"type":"event_msg","timestamp":at,"payload":{"type":kind,"turn_id":turn}}))
+}
+
+#[trace("FR-018-AC-28")]
+#[test]
+fn a_child_rollout_over_the_first_window_keeps_its_identity_and_header() {
+    let home = tempfile::tempdir().unwrap();
+    codex_file(
+        home.path(),
+        "root",
+        codex_header("root", None, "/root"),
+        include_str!("fixtures/agents/codex_done.jsonl")
+            .lines()
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .as_str(),
+    );
+    let mut child = format!("{}\n", codex_header("a", Some("root"), "/root/a"));
+    child.push_str(&event("task_started", "2026-10-18T10:00:01Z", "t"));
+    child.push_str(&fillers(2 * 1024 * 1024));
+    child.push_str(&event("task_complete", "2026-10-18T10:00:09Z", "t"));
+    write(home.path(), ".codex/sessions/rollout-test-a.jsonl", &child);
+    let probe = collect_probe(home.path(), &request(HarnessKind::Codex)).unwrap();
+    let files = &probe.sessions["root"];
+    let child = files
+        .workers
+        .iter()
+        .find(|w| w.id.0 == "a")
+        .expect("child worker");
+    assert_eq!(child.parent_id, Some(AgentId("root".into())));
+    assert_eq!(child.agent_path.as_deref(), Some("/root/a"));
+    assert_eq!(child.state, WorkerState::Completed);
+    assert!(child.issues.is_empty(), "{:?}", child.issues);
+}
+
+#[trace("FR-018-AC-28")]
+#[test]
+fn the_tail_replay_starts_at_the_latest_turn_start_even_when_the_window_would_start_mid_turn() {
+    let home = tempfile::tempdir().unwrap();
+    let mut text = format!("{}\n", codex_header("root", None, "/root"));
+    text.push_str(&fillers(3 * 1024 * 1024));
+    text.push_str(&event("task_started", "2026-10-18T10:00:01Z", "t"));
+    text.push_str(&fillers(1536 * 1024));
+    text.push_str(&event("collab_waiting_begin", "2026-10-18T10:00:02Z", "t"));
+    text.push_str(&event("collab_waiting_end", "2026-10-18T10:00:03Z", "t"));
+    text.push_str(&event("task_complete", "2026-10-18T10:00:09Z", "t"));
+    write(
+        home.path(),
+        ".codex/sessions/rollout-test-root.jsonl",
+        &text,
+    );
+    let probe = collect_probe(home.path(), &request(HarnessKind::Codex)).unwrap();
+    let life = &probe.sessions["root"].parent_lifecycle;
+    assert!(life.issues.is_empty(), "{:?}", life.issues);
+    assert_eq!(life.state, WorkerState::Completed);
+    assert!(probe.sessions["root"].lifecycle_availability.complete);
+}
+
+#[trace("FR-018-AC-28")]
+#[test]
+fn a_turn_start_exactly_on_the_scan_floor_boundary_is_not_dropped() {
+    const LIMIT: usize = 64 * 1024 * 1024;
+    let home = tempfile::tempdir().unwrap();
+    let mut text = format!("{}\n", codex_header("root", None, "/root"));
+    text.push_str(&filler_line(100_000));
+    let started = event("task_started", "2026-10-18T10:00:01Z", "t");
+    let complete = event("task_complete", "2026-10-18T10:00:09Z", "t");
+    // The scan covers exactly the last 64 MiB, which begins at the start record.
+    let middle = LIMIT - started.len() - complete.len();
+    let chunk = 1000 * 1000;
+    text.push_str(&started);
+    let full = middle / chunk;
+    for _ in 0..full {
+        text.push_str(&filler_line(chunk));
+    }
+    text.push_str(&filler_line(middle - full * chunk));
+    text.push_str(&complete);
+    write(
+        home.path(),
+        ".codex/sessions/rollout-test-root.jsonl",
+        &text,
+    );
+    let probe = collect_probe(home.path(), &request(HarnessKind::Codex)).unwrap();
+    let files = &probe.sessions["root"];
+    assert!(files.lifecycle_availability.complete, "{files:?}");
+    assert_eq!(files.parent_lifecycle.state, WorkerState::Completed);
+}
+
+#[trace("FR-018-AC-29")]
+#[test]
+fn missing_hosts_alone_make_coverage_partial_and_a_total_loss_failed() {
+    let mut healthy = report(vec![machine()]);
+    assert_eq!(healthy.coverage(), Coverage::Complete);
+    healthy.missing_hosts.push(MissingHost {
+        machine: "luna".into(),
+        reason: "timed out after 45s".into(),
+        elapsed_ms: 45_000,
+    });
+    assert!(healthy.errors.is_empty());
+    assert_eq!(healthy.coverage(), Coverage::Partial);
+    healthy.agents.clear();
+    assert_eq!(healthy.coverage(), Coverage::Failed);
 }

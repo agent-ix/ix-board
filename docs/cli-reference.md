@@ -471,6 +471,8 @@ Options:
   -h, --help                         Print help
 ```
 
+Exit status: zero when every machine was read. When some machines are missing (they time out after 45 seconds or cannot be read) but other machines returned rows, the command prints those rows, lists the missing machines in `missing_hosts` with reason and elapsed time, and exits with the partial code. When no row could be read it exits with the internal-error code.
+
 ## ix-board drift
 
 ```text

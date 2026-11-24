@@ -226,26 +226,112 @@ fn claude_identity(path: &Path, budget: &mut Budget) -> Result<Lifecycle, &'stat
         ..Lifecycle::default()
     })
 }
-/// First tail window; later windows grow by `TAIL_GROWTH` up to `MAX_TRANSCRIPT`.
+/// Bytes read per backward step when looking for the latest turn start.
 const TAIL_WINDOW: u64 = 1024 * 1024;
-const TAIL_GROWTH: u64 = 4;
 
-/// Replays one window of complete records ending at `extent`, starting at or after `start`.
-fn replay_window(
+fn starts_turn(line: &[u8]) -> bool {
+    let mentions = |needle: &[u8]| line.windows(needle.len()).any(|w| w == needle);
+    if !(mentions(b"task_started") || mentions(b"turn_started")) {
+        return false;
+    }
+    serde_json::from_slice::<Value>(line).is_ok_and(|value| {
+        value["type"] == "event_msg"
+            && matches!(
+                value["payload"]["type"].as_str(),
+                Some("task_started" | "turn_started")
+            )
+    })
+}
+
+/// Finds the offset of the latest turn start, scanning backward once over each byte.
+///
+/// Returns 0 when the whole file is covered without one. Fails when
+/// `MAX_TRANSCRIPT` bytes are scanned without finding a start.
+fn find_latest_turn_start(
+    path: &Path,
+    extent: u64,
+    budget: &mut Budget,
+) -> Result<u64, &'static str> {
+    use std::io::Seek;
+    let mut file = File::open(path).map_err(|_| "transcript_unreadable")?;
+    let floor = extent.saturating_sub(MAX_TRANSCRIPT);
+    let mut pos = extent;
+    // Head of the line that begins at `pos`, kept until its start is read.
+    let mut carry: Vec<u8> = Vec::new();
+    loop {
+        let start = pos.saturating_sub(TAIL_WINDOW).max(floor);
+        // One look-behind byte tells whether `start` is a record boundary.
+        let from = start.saturating_sub(1);
+        budget.take((pos - from).saturating_add(1))?;
+        file.seek(std::io::SeekFrom::Start(from))
+            .map_err(|_| "transcript_unreadable")?;
+        let len = usize::try_from(pos - from).map_err(|_| "transcript_size_limit")?;
+        let mut buf = vec![0; len];
+        file.read_exact(&mut buf)
+            .map_err(|_| "transcript_unreadable")?;
+        buf.extend_from_slice(&carry);
+        let line_begin = if start == 0 || buf[0] == b'\n' {
+            usize::from(start > 0)
+        } else {
+            match buf[1..].iter().position(|b| *b == b'\n') {
+                Some(at) => at + 2,
+                None => {
+                    if u64::try_from(buf.len()).unwrap_or(u64::MAX) > MAX_RECORD {
+                        return Err("record_size_limit");
+                    }
+                    carry = buf.split_off(1);
+                    pos = start;
+                    if start == floor {
+                        return Err("lifecycle_not_found_within_limit");
+                    }
+                    continue;
+                }
+            }
+        };
+        let mut offset = line_begin;
+        let mut latest = None;
+        for line in buf[line_begin..].split(|b| *b == b'\n') {
+            if u64::try_from(line.len()).unwrap_or(u64::MAX) > MAX_RECORD {
+                return Err("record_size_limit");
+            }
+            if starts_turn(line) {
+                latest = Some(offset);
+            }
+            offset += line.len() + 1;
+        }
+        if let Some(at) = latest {
+            return Ok(from + at as u64);
+        }
+        if start == 0 {
+            return Ok(0);
+        }
+        if start == floor {
+            return Err("lifecycle_not_found_within_limit");
+        }
+        carry = if line_begin > 1 {
+            buf[1..line_begin].to_vec()
+        } else {
+            Vec::new()
+        };
+        pos = start;
+    }
+}
+
+/// Replays complete records from `offset` (a record boundary) to `extent`.
+fn replay_from(
     path: &Path,
     adapter: &dyn Harness,
-    start: u64,
+    offset: u64,
     extent: u64,
+    mut life: Lifecycle,
     budget: &mut Budget,
 ) -> Result<Lifecycle, &'static str> {
     use std::io::Seek;
-    budget.take((extent - start).saturating_add(1))?;
+    budget.take((extent - offset).saturating_add(1))?;
     let mut file = File::open(path).map_err(|_| "transcript_unreadable")?;
-    file.seek(std::io::SeekFrom::Start(start))
+    file.seek(std::io::SeekFrom::Start(offset))
         .map_err(|_| "transcript_unreadable")?;
-    let mut reader = BufReader::new(file.take(extent - start));
-    let mut life = Lifecycle::default();
-    let mut first = start > 0;
+    let mut reader = BufReader::new(file.take(extent - offset));
     loop {
         budget.check()?;
         let mut bytes = Vec::new();
@@ -256,14 +342,6 @@ fn replay_window(
             .map_err(|_| "transcript_unreadable")?;
         if n == 0 {
             return Ok(life);
-        }
-        if first {
-            // The window began inside a record; resume at the next one.
-            first = false;
-            if bytes.last() != Some(&b'\n') && u64::try_from(n).unwrap_or(0) > MAX_RECORD {
-                return Err("record_size_limit");
-            }
-            continue;
         }
         if u64::try_from(n).unwrap_or(u64::MAX) > MAX_RECORD {
             return Err("record_size_limit");
@@ -278,9 +356,9 @@ fn replay_window(
 
 /// Reads the latest lifecycle state from the end of a transcript.
 ///
-/// The window starts at `TAIL_WINDOW` bytes and extends backward until a
-/// lifecycle record is found, the whole file is covered, or `MAX_TRANSCRIPT`
-/// is reached.
+/// The replay starts at the latest turn start, found by one backward scan of
+/// at most `MAX_TRANSCRIPT` bytes, and is seeded from the `session_meta`
+/// header so identity and ancestry survive.
 fn read_transcript_tail(
     path: &Path,
     adapter: &dyn Harness,
@@ -288,21 +366,17 @@ fn read_transcript_tail(
 ) -> Result<Lifecycle, &'static str> {
     retry_sample(|| {
         let before = stamp(path)?;
-        let mut window = TAIL_WINDOW;
-        let result = loop {
-            let start = before.0.saturating_sub(window);
-            let life = match replay_window(path, adapter, start, before.0, budget) {
-                Ok(life) => life,
-                Err(reason) => break Err(reason),
-            };
-            if life.state_changed_at.is_some() || start == 0 {
-                break Ok(life);
+        let result = (|| {
+            let offset = find_latest_turn_start(path, before.0, budget)?;
+            let mut seed = Lifecycle::default();
+            if offset > 0 {
+                let header = first_record(path, budget)?;
+                if header["type"] == "session_meta" {
+                    adapter.observe_record(&header, &mut seed);
+                }
             }
-            if window >= MAX_TRANSCRIPT {
-                break Err("lifecycle_not_found_within_limit");
-            }
-            window = window.saturating_mul(TAIL_GROWTH).min(MAX_TRANSCRIPT);
-        };
+            replay_from(path, adapter, offset, before.0, seed, budget)
+        })();
         if before != stamp(path)? {
             return Ok(None);
         }

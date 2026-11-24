@@ -394,6 +394,30 @@ pub struct MissingHost {
     pub elapsed_ms: u64,
 }
 
+/// How completely an `agents` run read the fleet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Coverage {
+    /// Every machine was read.
+    Complete,
+    /// Some machines are missing but other machines' rows are usable.
+    Partial,
+    /// Reads failed and no row is usable.
+    Failed,
+}
+
+impl AgentsReport {
+    /// Classifies the run for exit status and consumers.
+    pub fn coverage(&self) -> Coverage {
+        if self.errors.is_empty() && self.missing_hosts.is_empty() {
+            Coverage::Complete
+        } else if !self.missing_hosts.is_empty() && !self.agents.is_empty() {
+            Coverage::Partial
+        } else {
+            Coverage::Failed
+        }
+    }
+}
+
 /// Looks up a team's next ready ticket; an `Err` is a reason, not a verdict.
 pub type ReadyLookup<'a> = dyn FnMut(&str) -> Result<Option<ReadyTicket>, String> + 'a;
 
@@ -475,10 +499,11 @@ pub fn build_report_with_timeout(
                     None => continue,
                 }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => (
-                format!("timed out after {}s", host_timeout.as_secs()),
-                started.elapsed(),
-            ),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let reason = format!("timed out after {}s", host_timeout.as_secs());
+                errors.push(format!("{}: {reason}", host.label()));
+                (reason, started.elapsed())
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 errors.push(format!("{}: reader thread panicked", host.label()));
                 ("reader thread panicked".to_owned(), started.elapsed())
