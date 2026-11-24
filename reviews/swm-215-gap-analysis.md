@@ -51,3 +51,22 @@ and four tagged criteria are tagged by tests that cover only part of them.
 - Stubs: none on live paths; placeholder tables have no writer or reader.
 - Semantic review: skipped.
 - Plan completion: not assessed
+
+## New findings (disposition pass 1)
+
+| ID | Severity | Summary | Refs |
+| --- | --- | --- | --- |
+| FND-006 | low | The FR-039 view table lists `idle_lane_episodes_with_ready_work`, `lane_tick_rows` and `lane_span` twice (identical or near-identical rows 161-163 and 164-166). | spec/functional/FR-039-fleet-ledger.md:161-166 |
+| FND-007 | low | The follow-up mapping leaves three deferrals without a ticket: AC-8's ground-truth samples go to "FR-040 owner" (no SWM ticket found for calibrate), AC-6 (`executed_at`) and AC-16 (`cycle_missed`) are listed as "not in this PR" with no ticket. SWM-214 (tick) and SWM-255 (which lists orchestrator cycle events) are the natural owners of AC-6 and AC-16. | spec/functional/FR-039-fleet-ledger.md:181-191 |
+
+## Dispositions
+
+Round 1, fix head 69af642.
+
+| FND | Outcome | Reason |
+| --- | --- | --- |
+| FND-001 | fixed | FR-039 amended: `lane_tick` has `source` (`status`, `tick`) with a CHECK, AC-11 and the Run rows rule say both commands write it, and `lane_tick_rows` keeps one row per lane per `observed_ms` with the tick row winning; `lane_tick_source_and_dedup_use_one_row_per_run_time` covers the dedup. |
+| FND-002 | deferred | AC-1, 6, 8, 10, 11, 12-16 are untagged until their writers land: SWM-214 (tick, actions, time-to-action), SWM-211 (assign), SWM-212 (plan coverage), SWM-213 (drift), SWM-255 (ledger persistence of coverage, drift, assign results, rungs, cycles), SWM-252 (capacity), SWM-258 (answer log). The AC-10 formula examples are now asserted by `open_cycles_matches_the_fr_039_examples`. |
+| FND-003 | still-open | The unit-test partial tags are removed, but tests/fleet_cli.rs:58 still tags `status_writes_the_ledger_and_query_reads_the_defect_without_writing` with FR-039-AC-7, which reads `defect_rows` only, not idle minutes or actions with time-to-action; the matrix still reports AC-7 tagged. Remove that tag (or test idle minutes and actions) to match the PR body. |
+| FND-004 | fixed | `the_default_path_is_under_the_state_directory_and_outside_any_work_tree` checks both XDG and HOME defaults pass `refuse_inside_git`, the real default is outside the checkout, and a state dir inside a work tree is refused. |
+| FND-005 | fixed | FR-039 now names `host_tick` and the run columns in Behavior and lists `idle_lane_episodes_with_ready_work`, `lane_tick_rows` and `lane_span` in the view table (duplicated, see FND-006). |

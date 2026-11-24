@@ -73,3 +73,18 @@ compile time), and the CLI reference does not document the new command.
 | FND-006 | low | Retention prune is a full scan of `lane_tick` every run: the only index is `(lane, observed_ms)`, which cannot serve `observed_ms < ?` (EXPLAIN: SCAN lane_tick). At 52 lanes x 8640 runs (5 min, 30 days) the table is 449,280 rows and 155 MB, mostly evidence JSON; a run with prune measured 40-100 ms warm and the `lane_span` window ~1 s. Bounded, but it grows with lanes and retention, and `host_tick` and `run` have no time index either. | src/fleet/ledger/schema.rs:73, src/fleet/ledger/mod.rs:512-520 |
 | FND-007 | low | The lock has no stale or network-filesystem handling. On non-Unix the lock is a `create_new` file removed only in `Drop`; after a crash it stays and every later writer times out forever. On NFS or WSL drvfs, flock may be local-only or fail; failure surfaces as `ledger_unwritable`, but a flock that succeeds without cross-client exclusion is silent, and SQLite itself is unsafe on NFS. Neither case is documented or refused. | src/fleet/ledger/mod.rs:197-228 |
 | FND-008 | low | `write_meta` overwrites `tick_interval_s`, `cycle_interval_s` and `grace_s` from the current config on every open, and the views read them at query time, so changing the cycle or tick interval silently re-scores every stored episode's `open_cycles` and the `idle_minutes` gap rule over the whole history. | src/fleet/ledger/mod.rs:340-356, src/fleet/ledger/schema.rs:152-160 |
+
+## Dispositions
+
+Round 1, fix head 69af642 (rebased onto main with #90).
+
+| FND | Outcome | Reason |
+| --- | --- | --- |
+| FND-001 | fixed | `build_report` sets `relay_unavailable`; such a run stores the host clock only in `run.host_ms`, leaves `relay_ms` and `first_seen_at` empty, writes no lane or host rows and skips prune (src/fleet/report.rs:606-608, src/fleet/ledger/mod.rs:306-367); covered by `a_relay_unavailable_run_keeps_host_time_out_of_relay_columns_and_closes_nothing`. |
+| FND-002 | fixed | `reconcile_defects` closes absent defects only when the relay was read (src/fleet/ledger/mod.rs:451-461); the same test asserts the Prometheus defect stays open. |
+| FND-003 | fixed | PRUNE keys gaps, findings, actions, intervals, cycles, capacity runs and levels and ticks on their close time (src/fleet/ledger/schema.rs:266-290); `retention_never_prunes_open_rows` covers it. |
+| FND-004 | fixed | Branch rebased onto origin/main 5af3141; origin/main is an ancestor, GitHub reports MERGEABLE, and `make ci` exits 0 at 69af642 with `LaneRow.receipt_gap` in place. |
+| FND-005 | fixed | docs/cli-reference.md documents `fleet ledger query`, the views, `--since`, the ledger path resolution and keys, network refusal, `ledger_unwritable` and `first_seen_ms`. |
+| FND-006 | fixed | New indexes `lane_tick_time`, `run_relay_ms`, `host_tick_time` serve the prune predicates (src/fleet/ledger/schema.rs:80-86). |
+| FND-007 | fixed | src/fleet/ledger/lock.rs refuses network filesystems (Linux mountinfo and WSL `/mnt/<drive>`, macOS statfs, Windows UNC) and breaks a non-Unix lock whose pid is gone; the Windows branch is not compiled or run on this host. |
+| FND-008 | fixed | `meta` is gone; each run stores `tick_interval_s`, `cycle_interval_s` and `grace_s` and `lane_tick_rows` joins them per run; `views_score_history_with_the_config_in_force_for_each_run` covers it. |

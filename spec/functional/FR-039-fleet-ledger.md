@@ -161,9 +161,6 @@ in [FR-041](./FR-041-fleet-saturation.md); `answer_dialog_latency_max` and
 | `idle_lane_episodes_with_ready_work` | one row per episode counted by `idle_lane_episode_with_ready_work_max`: lane, `start_ms`, `end_ms`, ticks and `open_cycles`, computed with the interval and grace of the run that ended the episode |
 | `lane_tick_rows` | `lane_tick` rows deduplicated by relay time as in the Run rows rule, with the interval and grace of their run; the base of the `lane_tick` views |
 | `lane_span` | each `lane_tick_rows` row with the relay time of the lane's next row, the span `idle_minutes` sums; a span longer than twice the run's tick interval is a gap and yields no minutes |
-| `idle_lane_episodes_with_ready_work` | one row per episode of `idle_lane_episode_with_ready_work_max`: lane, `start_ms`, `end_ms`, ticks and `open_cycles`, computed with the interval and grace of the run that ended the episode |
-| `lane_tick_rows` | `lane_tick` rows deduplicated by relay time as in the Run rows rule, with the interval and grace of their run; the base of the `lane_tick` views |
-| `lane_span` | each `lane_tick_rows` row with the relay time of the lane's next row, the span `idle_minutes` sums; a span longer than twice the run's tick interval is a gap and yields no minutes |
 | `add_lane_action_open_cycles_max` | maximum `open_cycles` between `emitted_at` and `resolved_at` of `add_lane` actions |
 | `cycle_missed` | `cycle_missed` rows |
 | `act_on_undetermined_actions`, `push_next_ticket_actions`, `answer_dialog_actions`, `escalate_block_actions`, `add_lane_actions` | `action` rows of that `kind` |

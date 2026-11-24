@@ -55,7 +55,6 @@ fn ledger_query(ledger: &std::path::Path, view: &str) -> std::process::Output {
         .unwrap()
 }
 
-#[trace("FR-039-AC-7")]
 #[test]
 fn status_writes_the_ledger_and_query_reads_the_defect_without_writing() {
     let dir = tempfile::tempdir().unwrap();
