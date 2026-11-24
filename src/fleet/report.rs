@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-r-later
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Agent-IX
 
 //! Source traits, the report model and the builder that joins the sources on the lane address.

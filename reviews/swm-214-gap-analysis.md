@@ -82,3 +82,23 @@ Seam ownership:
   `unavailable` (FND-005).
 - Semantic review: skipped (not requested).
 - Plan completion: not assessed
+
+## New findings (disposition pass 1)
+
+| ID | Severity | Summary | Refs |
+| --- | --- | --- | --- |
+| FND-009 | medium | FR-039-AC-6 still requires `push_next_ticket` `executed_at` on "WORKING with matching focus", but the amended FR-039 body defers push and resend to SWM-255. `executed_at_needs_positive_evidence_for_each_kind` is tagged AC-6 and asserts push stays NULL on WORKING, the opposite of the AC's push clause. The AC must be amended to mark the deferral, or the focus join wired once #94 lands. | spec/functional/FR-039-fleet-ledger.md:187, tests/fleet_tick.rs:916-985 |
+
+## Dispositions
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-001 | fixed | - |
+| FND-002 | fixed | - |
+| FND-003 | fixed | - |
+| FND-004 | fixed | - |
+| FND-005 | fixed | - |
+| FND-006 | fixed | - |
+| FND-007 | fixed | - |
+| FND-008 | fixed | - |
+| FND-009 | still-open | New in round 1: AC-6 text contradicts the deferral and the test tagged to it. |

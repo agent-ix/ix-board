@@ -7,7 +7,10 @@ use ix_board::fleet::live::{self, PromQuery, PrometheusSeries};
 use ix_board::fleet::*;
 use ix_trace_rs::trace;
 use relay_core::fleet::HostLaneList;
-use relay_core::receipts::{ExpiredOrderState, ExpiredOrders, OrderEscalationState};
+use relay_core::receipts::{
+    ExpiredOrderState, ExpiredOrders, OrderEscalationState, OrderedReceipt, ReceiptCoverageReason,
+    ReceiptEvent, ReceiptExport, ReceiptOutcome,
+};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1209,5 +1212,116 @@ fn a_truncated_skipped_or_unstarted_expired_order_list_is_a_defect_and_keeps_the
             .defects
             .iter()
             .all(|d| d.source != "relay.receipts")
+    );
+}
+fn receipt(id: &str, outcome: ReceiptOutcome, queue: &str) -> ReceiptEvent {
+    ReceiptEvent {
+        event_id: format!("{id}/{outcome:?}"),
+        original_id: id.to_owned(),
+        attempt_id: None,
+        outcome,
+        sender: "s".to_owned(),
+        target: queue.to_owned(),
+        event_time_ms: Some(1),
+        observed_at_ms: 1,
+        evidence: None,
+        reason: None,
+        session: None,
+        expect_ticket: None,
+        delivered_at_ms: None,
+    }
+}
+
+fn page(
+    events: Vec<ReceiptEvent>,
+    reasons: Vec<ReceiptCoverageReason>,
+    next: Option<&str>,
+) -> ReceiptExport {
+    ReceiptExport {
+        requested_since_ms: 0,
+        requested_until_ms: 0,
+        covered_since_ms: None,
+        covered_until_ms: None,
+        instrumentation_start_ms: None,
+        retention_boundary_ms: 0,
+        complete: reasons.is_empty(),
+        reasons,
+        events: events
+            .into_iter()
+            .map(|event| OrderedReceipt {
+                cursor: "1-0".to_owned(),
+                event,
+            })
+            .collect(),
+        next_cursor: next.map(str::to_owned),
+        has_more: next.is_some(),
+    }
+}
+
+/// The paged receipt read `fleet assign` and the assignment completion use.
+#[test]
+fn receipt_pages_are_followed_by_cursor_and_the_read_is_bounded() {
+    let mut cursors = Vec::new();
+    let (events, gaps) = live::collect_receipts(|after| {
+        cursors.push(after.clone());
+        Ok(match after.as_deref() {
+            None => page(
+                vec![receipt("a", ReceiptOutcome::Queued, "q")],
+                vec![],
+                Some("c1"),
+            ),
+            Some(_) => page(
+                vec![receipt("b", ReceiptOutcome::Queued, "q")],
+                vec![],
+                None,
+            ),
+        })
+    })
+    .unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(gaps.is_empty());
+    assert_eq!(cursors, vec![None, Some("c1".to_owned())]);
+
+    let mut reads = 0;
+    let error = live::collect_receipts(|_| {
+        reads += 1;
+        Ok(page(vec![], vec![], Some("more")))
+    })
+    .unwrap_err();
+    let bound =
+        relay_core::receipts::RECEIPT_EVENT_CAP / relay_core::receipts::RECEIPT_PAGE_CAP + 1;
+    assert_eq!(reads, bound);
+    assert!(error.0.contains(&bound.to_string()));
+}
+
+#[test]
+fn receipt_coverage_reasons_split_into_failures_and_gaps() {
+    use ReceiptCoverageReason::{
+        BeforeInstrumentation, CursorEvicted, CursorUnavailable, ObservationPending, RecordingGap,
+        Retention, SourceUnavailable,
+    };
+    for strict in [SourceUnavailable, CursorEvicted, CursorUnavailable] {
+        let error = live::collect_receipts(|_| Ok(page(vec![], vec![strict], None))).unwrap_err();
+        assert!(error.0.contains(&format!("{strict:?}")), "{}", error.0);
+    }
+    let (_, gaps) = live::collect_receipts(|_| {
+        Ok(page(
+            vec![],
+            vec![
+                BeforeInstrumentation,
+                RecordingGap,
+                ObservationPending,
+                Retention,
+            ],
+            None,
+        ))
+    })
+    .unwrap();
+    assert_eq!(gaps, ["recording_gap", "observation_pending", "retention"]);
+    let (_, none) =
+        live::collect_receipts(|_| Ok(page(vec![], vec![BeforeInstrumentation], None))).unwrap();
+    assert!(
+        none.is_empty(),
+        "history older than instrumentation is not a gap"
     );
 }

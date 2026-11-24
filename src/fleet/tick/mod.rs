@@ -12,7 +12,7 @@ mod live;
 mod plan;
 mod settings;
 
-pub use live::{caller_from, run};
+pub use live::{TickInputs, caller_from, commit_completing, run};
 pub use plan::{Capacity, OpenAction, PlanInput, plan};
 pub use settings::TickSettings;
 

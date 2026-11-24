@@ -65,3 +65,26 @@ adjacent additive lines in `src/main.rs` (`FleetCommand`, `Output`,
 `CARGO_BUILD_JOBS=4 CARGO_TARGET_DIR=<worktree>/target make ci` at f950ed4,
 with docker `redis:7` available for `tests/fleet_receipts_redis.rs`: exit 0, 50 test binaries green, including the docker redis:7 receipts test.
 target/ was deleted afterwards.
+
+## New findings (disposition pass 1)
+
+| ID | Severity | Summary | Refs |
+| --- | --- | --- | --- |
+| FND-010 | medium | The fix round corrupted the SPDX header of `src/fleet/report.rs` to `AGPL-3.0-r-later`, which is not a valid SPDX identifier, so the file loses its machine-readable licence tag. `cargo deny` does not check file headers, so the gate stays green. | src/fleet/report.rs:1 |
+| FND-011 | low | The tick's own `tick.assignments` defect is closed by any `fleet status` run in between, because `record_status` reconciles away every open defect it did not see itself. It is then reopened by the next tick with a new `first_seen_at`, so the defect rows churn and the defect's age is lost. The `fix_source` id persists because its subject is unchanged. | src/fleet/ledger/mod.rs:452-461, src/fleet/tick/mod.rs:387-401 |
+
+## Dispositions
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-001 | fixed | - |
+| FND-002 | fixed | - |
+| FND-003 | fixed | - |
+| FND-004 | fixed | - |
+| FND-005 | fixed | - |
+| FND-006 | fixed | - |
+| FND-007 | fixed | - |
+| FND-008 | fixed | - |
+| FND-009 | fixed | - |
+| FND-010 | still-open | New in round 1: SPDX header corrupted by the fix commit 792f28e; restore `AGPL-3.0-or-later`. |
+| FND-011 | still-open | New in round 1: either keep `tick.*` defects out of the status reconcile or scope reconcile per source owner. |

@@ -362,7 +362,8 @@ impl Ledger {
                 ])?;
             }
         }
-        let first_seen = reconcile_defects(&tx, &report.defects, run_ms, unavailable)?;
+        let first_seen =
+            reconcile_defects(&tx, &report.defects, run_ms, unavailable, Reader::Status)?;
         if crash_before_commit {
             return Err(LedgerError::Sqlite(rusqlite::Error::ExecuteReturnedResults));
         }
@@ -400,14 +401,31 @@ fn defect_key(defect: &Defect) -> DefectKey {
     )
 }
 
+/// Which run reconciles defects. A defect belongs to the run that reads its source: `fleet status`
+/// does not read the sources `fleet tick` reads itself (source prefix `tick.`), so it never closes
+/// them; a tick reads everything a status run reads and its own sources.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Reader {
+    Status,
+    Tick,
+}
+
+impl Reader {
+    fn read(self, source: &str) -> bool {
+        self == Self::Tick || !source.starts_with("tick.")
+    }
+}
+
 /// Opens a row for each defect not already open and returns the first-seen time of every
-/// defect. When the relay was readable it also closes the open rows no longer present; a run
-/// without the relay observed nothing about the other sources, so it closes nothing.
+/// defect. When the relay was readable it also closes the open rows no longer present whose source
+/// this run reads; a run without the relay observed nothing about the other sources, so it closes
+/// nothing.
 fn reconcile_defects(
     tx: &rusqlite::Transaction<'_>,
     defects: &[Defect],
     run_ms: i64,
     unavailable: bool,
+    reader: Reader,
 ) -> Result<Vec<Option<i64>>, LedgerError> {
     let mut open: BTreeMap<DefectKey, (i64, Option<i64>)> = BTreeMap::new();
     {
@@ -454,7 +472,7 @@ fn reconcile_defects(
     }
     if !unavailable {
         for (key, (id, _)) in &open {
-            if !present.contains_key(key) {
+            if !present.contains_key(key) && reader.read(&key.0) {
                 tx.execute(
                     "UPDATE defect SET closed_at=?1 WHERE defect_id=?2",
                     params![run_ms, id],
@@ -514,10 +532,20 @@ pub fn record_status_completing(
     report: &mut FleetReport,
     bus: &mut impl crate::fleet::assign::AssignBus,
 ) {
+    complete_assignments(config, report, bus);
+    record_status(config, report);
+}
+
+/// Completes the pending assignment rows ahead of a ledger commit. A failure is a defect of the
+/// run about to commit, never silent. `fleet status` and `fleet tick` share this step.
+pub fn complete_assignments(
+    config: &FleetConfig,
+    report: &mut FleetReport,
+    bus: &mut impl crate::fleet::assign::AssignBus,
+) {
     if let Err(error) = complete_pending(config, bus) {
         report.add_ledger_defect(format!("assignment completion: {error}"));
     }
-    record_status(config, report);
 }
 
 /// The rows `fleet ledger query` prints.

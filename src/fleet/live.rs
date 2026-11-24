@@ -11,7 +11,10 @@ use super::report::{
     RelaySnapshot, SeriesSource, UnresolvedOrder, WeakSignals, parse_event,
 };
 use relay_core::config::{CoreFlags, load_core};
-use relay_core::receipts::ExpiredOrders;
+use relay_core::receipts::{
+    ExpiredOrders, RECEIPT_EVENT_CAP, RECEIPT_PAGE_CAP, ReceiptCoverageReason, ReceiptEvent,
+    ReceiptExport,
+};
 use relay_core::{ACTIVITY_MAX_EVENTS, Address, Relay};
 use std::time::Duration;
 
@@ -306,6 +309,57 @@ impl<Q: PromQuery> SeriesSource for PrometheusSeries<Q> {
         series.sample_age = ages.into_iter().filter_map(|(_, value)| secs(value)).max();
         Ok(series)
     }
+}
+
+/// The most pages the retained receipt history can fill: its event cap over the page size, plus
+/// the final partial page.
+const RECEIPT_MAX_PAGES: usize = RECEIPT_EVENT_CAP / RECEIPT_PAGE_CAP + 1;
+
+/// Reads every retained receipt through `fetch`, which returns the page after a cursor. The
+/// request spans the relay's whole receipt retention. `fleet assign` and the assignment
+/// completion read receipts through it.
+///
+/// # Errors
+///
+/// The page could not be read or continued, or the history needs more pages than it can hold.
+pub fn collect_receipts(
+    mut fetch: impl FnMut(Option<String>) -> Result<ReceiptExport, SourceError>,
+) -> Result<(Vec<ReceiptEvent>, Vec<String>), SourceError> {
+    let mut events = Vec::new();
+    let mut gaps: Vec<String> = Vec::new();
+    let mut after = None;
+    for _ in 0..RECEIPT_MAX_PAGES {
+        let page = fetch(after.take())?;
+        for reason in &page.reasons {
+            let name = match reason {
+                ReceiptCoverageReason::SourceUnavailable
+                | ReceiptCoverageReason::CursorEvicted
+                | ReceiptCoverageReason::CursorUnavailable => {
+                    return Err(SourceError(format!(
+                        "relay receipts incomplete: {reason:?}"
+                    )));
+                }
+                ReceiptCoverageReason::BeforeInstrumentation => continue,
+                ReceiptCoverageReason::RecordingGap => "recording_gap",
+                ReceiptCoverageReason::ObservationPending => "observation_pending",
+                ReceiptCoverageReason::Retention => "retention",
+            };
+            if !gaps.iter().any(|g| g == name) {
+                gaps.push(name.to_owned());
+            }
+        }
+        if !page.complete && page.reasons.is_empty() && !gaps.iter().any(|g| g == "incomplete") {
+            gaps.push("incomplete".to_owned());
+        }
+        events.extend(page.events.into_iter().map(|row| row.event));
+        if !page.has_more {
+            return Ok((events, gaps));
+        }
+        after = page.next_cursor;
+    }
+    Err(SourceError(format!(
+        "relay receipts exceed {RECEIPT_MAX_PAGES} pages"
+    )))
 }
 
 fn read_receipts(relay: &mut Relay, registrations: &[RegInfo]) -> Result<ReceiptRead, SourceError> {

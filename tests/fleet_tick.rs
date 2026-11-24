@@ -96,6 +96,7 @@ struct Rig {
     settings: TickSettings,
     orders: StandingOrders,
     facts: TickFacts,
+    focus: BTreeMap<String, String>,
 }
 
 impl Rig {
@@ -105,16 +106,19 @@ impl Rig {
             ..TickSettings::default()
         };
         settings.leads.insert(LANE.to_owned(), LEAD.to_owned());
+        let dir = tempfile::tempdir().unwrap();
         let config = FleetConfig {
             tick_interval: Duration::from_secs(interval_secs),
+            ledger_path: Some(dir.path().join("ledger.sqlite3")),
             ..FleetConfig::default()
         };
         Self {
-            dir: tempfile::tempdir().unwrap(),
+            dir,
             config,
             settings,
             orders: StandingOrders::Missing,
             facts: TickFacts::default(),
+            focus: BTreeMap::new(),
         }
     }
 
@@ -141,6 +145,7 @@ impl Rig {
                 facts: &self.facts,
                 orders: &self.orders,
                 session: None,
+                focus: &self.focus,
             })
             .unwrap()
     }
@@ -969,24 +974,35 @@ fn executed_at_needs_positive_evidence_for_each_kind() {
         executed_of(&rig, ActionKind::ActOnUndetermined)[1],
         (None, Some(T0 + 8000))
     );
-    // push_next_ticket needs the lane focus and resend_order an Acted receipt; the tick reads
-    // neither yet, so a lane that merely works has no executed_at.
+    // push_next_ticket: executed when the lane WORKS with its focus on the pushed ticket, never
+    // for any WORKING lane.
     rig.assign(LANE, &["SWM-1"]);
     rig.tick(&report(T0 + 9000, vec![idle(LANE)], vec![]));
+    rig.focus.insert(LANE.to_owned(), "SWM-9".to_owned());
     rig.tick(&report(T0 + 10_000, vec![working(LANE)], vec![]));
     assert_eq!(
         executed_of(&rig, ActionKind::PushNextTicket),
-        vec![(None, Some(T0 + 10_000))]
+        vec![(None, Some(T0 + 10_000))],
+        "working on another ticket is not execution"
     );
+    rig.tick(&report(T0 + 10_500, vec![idle(LANE)], vec![]));
+    rig.focus.insert(LANE.to_owned(), "swm-1".to_owned());
+    rig.tick(&report(T0 + 11_000, vec![working(LANE)], vec![]));
+    assert_eq!(
+        executed_of(&rig, ActionKind::PushNextTicket)[1],
+        (Some(T0 + 11_000), Some(T0 + 11_000))
+    );
+    // resend_order needs an Acted receipt join (deferred to SWM-255): no executed_at.
+    rig.focus.clear();
     rig.tick(&report(
-        T0 + 11_000,
+        T0 + 12_000,
         vec![row(LANE, ClassKind::StaleOrder, Some("ack_expired"), None)],
         vec![],
     ));
-    rig.tick(&report(T0 + 12_000, vec![working(LANE)], vec![]));
+    rig.tick(&report(T0 + 13_000, vec![working(LANE)], vec![]));
     assert_eq!(
         executed_of(&rig, ActionKind::ResendOrder),
-        vec![(None, Some(T0 + 12_000))]
+        vec![(None, Some(T0 + 13_000))]
     );
 }
 
@@ -1072,6 +1088,7 @@ fn a_tick_records_its_session_address_and_configured_role() {
                 facts: &rig.facts,
                 orders: &rig.orders,
                 session,
+                focus: &rig.focus,
             })
             .unwrap();
     };
@@ -1328,5 +1345,147 @@ fn every_other_action_kind_is_emitted_by_its_condition_and_not_by_its_negation()
     assert!(
         of(&dialog, ActionKind::FixSource).is_empty()
             && of(&dialog, ActionKind::EscalateBlock).is_empty()
+    );
+}
+
+#[trace("FR-038-AC-22")]
+#[test]
+fn a_status_run_between_two_ticks_neither_closes_nor_resets_a_tick_owned_defect() {
+    let mut rig = Rig::new(300);
+    rig.facts = TickFacts::read(&FailingAssignments);
+    rig.tick(&report(T0, vec![idle(LANE)], vec![]));
+    let first = |rig: &Rig| {
+        rig.sql(
+            "SELECT first_seen_at, closed_at FROM defect WHERE source = 'tick.assignments'",
+            |r| {
+                (
+                    r.get::<_, Option<i64>>(0).unwrap(),
+                    r.get::<_, Option<i64>>(1).unwrap(),
+                )
+            },
+        )
+    };
+    assert_eq!(first(&rig), vec![(Some(T0), None)]);
+    // A status run does not read the tick's sources, so it must leave their defects alone.
+    {
+        let mut ledger = Ledger::open(&rig.path(), &rig.config).unwrap();
+        ledger
+            .record_status(&report(T0 + 1000, vec![idle(LANE)], vec![]))
+            .unwrap();
+    }
+    assert_eq!(
+        first(&rig),
+        vec![(Some(T0), None)],
+        "status left the tick defect open"
+    );
+    let again = rig.tick(&report(T0 + 2000, vec![idle(LANE)], vec![]));
+    assert_eq!(of(&again, ActionKind::FixSource).len(), 1);
+    assert_eq!(
+        first(&rig),
+        vec![(Some(T0), None)],
+        "first_seen_at survives"
+    );
+    // A status-owned defect is still closed by a status run that no longer sees it.
+    let seen = vec![defect(DefectKind::StaleSource, None, None, T0 + 3000)];
+    {
+        let mut ledger = Ledger::open(&rig.path(), &rig.config).unwrap();
+        ledger
+            .record_status(&report(T0 + 3000, vec![idle(LANE)], seen))
+            .unwrap();
+        ledger
+            .record_status(&report(T0 + 4000, vec![idle(LANE)], vec![]))
+            .unwrap();
+    }
+    let closed = rig.sql("SELECT closed_at FROM defect WHERE source = 'relay'", |r| {
+        r.get::<_, Option<i64>>(0).unwrap()
+    });
+    assert_eq!(closed, vec![Some(T0 + 4000)]);
+}
+
+struct FakeBus {
+    events: Vec<ix_board::fleet::focus::FocusEvent>,
+}
+
+impl ix_board::fleet::assign::AssignBus for FakeBus {
+    fn registry(&mut self) -> Result<ix_board::fleet::assign::RegistryView, String> {
+        Ok(ix_board::fleet::assign::RegistryView {
+            now_ms: T0 + 60_000_000,
+            lanes: Vec::new(),
+            registrations: Vec::new(),
+        })
+    }
+    fn assignments(&mut self) -> Result<Vec<relay_core::assignment::AssignmentList>, String> {
+        Ok(Vec::new())
+    }
+    fn send_order(
+        &mut self,
+        _: &relay_core::Message,
+        _: &relay_core::receipts::OrderSpec,
+    ) -> Result<Vec<relay_core::AgentName>, String> {
+        Err("a tick sends nothing".to_owned())
+    }
+    fn receipts_since(
+        &mut self,
+        _: i64,
+    ) -> Result<Vec<relay_core::receipts::ReceiptEvent>, String> {
+        Ok(Vec::new())
+    }
+    fn write_list(
+        &mut self,
+        _: &relay_core::assignment::AssignWriter,
+        _: &str,
+        _: Vec<relay_core::assignment::AssignedTicket>,
+        _: &str,
+    ) -> Result<relay_core::assignment::AssignmentList, String> {
+        Err("a tick writes no list".to_owned())
+    }
+    fn lane_events(&mut self, _: &str) -> Result<Vec<ix_board::fleet::focus::FocusEvent>, String> {
+        Ok(self.events.clone())
+    }
+}
+
+#[trace("FR-039-AC-6")]
+#[test]
+fn a_tick_completes_pending_assignments_and_reads_focus_through_the_shared_commit() {
+    let mut rig = Rig::new(300);
+    rig.assign(LANE, &["SWM-1"]);
+    rig.tick(&report(T0, vec![idle(LANE)], vec![]));
+    Connection::open(rig.path())
+        .unwrap()
+        .execute(
+            "INSERT INTO assignment_history(lane, ticket, assigned_at, order_id, expect_ticket,
+               sent_at, deadline_at, result) VALUES(?1, 'SWM-1', 1, 'o-1', 'SWM-1', 1, 2, 'pending')",
+            [LANE],
+        )
+        .unwrap();
+    let mut bus = FakeBus {
+        events: vec![ix_board::fleet::focus::FocusEvent {
+            server_ms: T0 + 200_000,
+            cwd: "/w/ix-board-swm-1".to_owned(),
+            branch: "swm-1-thing".to_owned(),
+        }],
+    };
+    let mut status = report(T0 + 300_000, vec![working(LANE)], vec![]);
+    let inputs = ix_board::fleet::tick::TickInputs {
+        settings: &rig.settings,
+        facts: &rig.facts,
+        orders: &rig.orders,
+        session: None,
+    };
+    let out = ix_board::fleet::tick::commit_completing(&rig.config, &mut status, &inputs, &mut bus)
+        .unwrap();
+    assert!(out.actions.is_empty());
+    let result = rig.sql("SELECT result FROM assignment_history", |r| {
+        r.get::<_, String>(0).unwrap()
+    });
+    assert_ne!(
+        result,
+        vec!["pending".to_owned()],
+        "the tick completed the pending row"
+    );
+    // The pushed lane works on the pushed ticket by derived focus: executed.
+    assert_eq!(
+        executed_of(&rig, ActionKind::PushNextTicket),
+        vec![(Some(T0 + 300_000), Some(T0 + 300_000))]
     );
 }

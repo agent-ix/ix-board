@@ -49,8 +49,9 @@ emitted_at, executed_at, resolved_at), `defect`, `assignment_history`,
   `Acted` receipt for the resent order, `answer_dialog` expects the lane out of BLOCKED after an
   `answer_dialog` action was emitted (a fallback to `escalate_block` is not execution) and
   `act_on_undetermined` expects the lane's class to be determined again. Only positive evidence sets
-  `executed_at`: until the tick reads lane focus and the `Acted` receipt join (SWM-255), `push_next_ticket` and
-  `resend_order` have none.
+  `executed_at`: a `push_next_ticket` is executed when the lane is WORKING with its derived focus on the
+  pushed ticket (the head of its FR-072 list), never for any WORKING lane. `resend_order` is deferred to SWM-255 (the `Acted` receipt join): until it lands a
+  `resend_order` has no `executed_at`.
   A lane already in the expected state at emission does not count. An action aimed
   at a lead or a project (`escalate_*`, `need_ready_tickets`, `fix_source`) has no
   `executed_at` and resolves when its condition clears. Time-to-action is the elapsed time from a lane entering a
@@ -184,7 +185,7 @@ in [FR-041](./FR-041-fleet-saturation.md); `answer_dialog_latency_max` and
 | FR-039-AC-3 | Two concurrent writers serialize under the lock with strictly increasing sequence numbers; a writer that cannot take the lock in the bound fails without writing. | Test |
 | FR-039-AC-4 | A simulated crash between interval write and cursor update leaves the previous committed state. | Test |
 | FR-039-AC-5 | A ledger path inside a git work tree is refused, and the default path is outside any work tree. | Test |
-| FR-039-AC-6 | `executed_at` equals the first transition of the target lane into the expected state (push_next_ticket: WORKING with matching focus); a lane already in that state at emission yields none until a later transition; an action aimed at a lead or project has none and resolves when its condition clears. | Test |
+| FR-039-AC-6 | `executed_at` equals the first transition of the target lane into the expected state (`push_next_ticket`: WORKING with focus on the pushed ticket, and not for WORKING on another ticket; `answer_dialog`: out of BLOCKED after an emitted answer, not after an `escalate_block` fallback; `act_on_undetermined`: class determined again); a lane already in that state at emission yields none until a later transition; an action aimed at a lead or project has none and resolves when its condition clears. `resend_order` is deferred to SWM-255 (it needs the `Acted` receipt join): until then it has no `executed_at`, and the test asserts that. | Test |
 | FR-039-AC-7 | `fleet ledger query` returns idle minutes per lane per day and actions with time-to-action in text and JSON without writing. | Test |
 | FR-039-AC-8 | An unsupported schema version is refused with no change, retention prunes only rows older than the configured age, and replaced assignments, defects and ground-truth samples are stored with their timestamps. | Test |
 | FR-039-AC-9 | Opening a version 1 ledger migrates it to version 2 in one transaction under the writer lock with every earlier row unchanged; a crash injected mid-migration leaves the version 1 ledger intact and openable; a ledger of a later version is refused without a change. | Test |

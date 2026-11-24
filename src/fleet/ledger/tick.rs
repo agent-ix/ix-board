@@ -6,7 +6,7 @@
 //! FR-039).
 
 use super::{
-    Ledger, LedgerError, class_name, count, millis, prune, reconcile_defects, user_version,
+    Ledger, LedgerError, Reader, class_name, count, millis, prune, reconcile_defects, user_version,
 };
 use crate::fleet::tick::{
     Action, ActionKind, Capacity, OpenAction, PlanInput, StandingOrders, TICK_SCHEMA_VERSION,
@@ -29,6 +29,9 @@ pub struct TickCommit<'a> {
     pub orders: &'a StandingOrders,
     /// The session address that ran the tick.
     pub session: Option<&'a str>,
+    /// Lane (lower case) to the ticket its derived focus names (FR-037), for lanes with an open
+    /// `push_next_ticket` condition.
+    pub focus: &'a BTreeMap<String, String>,
 }
 
 fn load_open(tx: &Transaction<'_>) -> Result<Vec<OpenAction>, LedgerError> {
@@ -110,9 +113,11 @@ fn load_capacity(tx: &Transaction<'_>) -> Result<Capacity, LedgerError> {
 
 /// Whether positive evidence says an action was executed when its condition cleared.
 /// `answer_dialog` expects the lane out of BLOCKED; `act_on_undetermined` expects a determined
-/// class. `push_next_ticket` needs the lane focus (FR-037) and `resend_order` an `Acted` receipt
-/// (SWM-255), neither of which the tick reads yet, so they have no `executed_at`.
-fn executed(kind: ActionKind, report: &FleetReport, subject: &str) -> bool {
+/// class; `push_next_ticket` expects the lane WORKING with its FR-037 focus on the pushed ticket,
+/// the head of its FR-072 list (the tick leaves the list unchanged). `resend_order` needs an
+/// `Acted` receipt join, deferred to SWM-255, so it has no `executed_at`.
+fn executed(commit: &TickCommit<'_>, kind: ActionKind, subject: &str) -> bool {
+    let report = commit.report;
     let Some(row) = report
         .rows
         .iter()
@@ -123,11 +128,43 @@ fn executed(kind: ActionKind, report: &FleetReport, subject: &str) -> bool {
     match kind {
         ActionKind::AnswerDialog => row.class != ClassKind::Blocked,
         ActionKind::ActOnUndetermined => row.class != ClassKind::Unreachable,
+        ActionKind::PushNextTicket => {
+            let key = subject.to_lowercase();
+            let pushed = commit
+                .facts
+                .assignments
+                .as_ref()
+                .and_then(|a| a.get(&key))
+                .and_then(|tickets| tickets.first());
+            row.class == ClassKind::Working
+                && pushed.is_some_and(|ticket| {
+                    commit
+                        .focus
+                        .get(&key)
+                        .is_some_and(|focus| focus.eq_ignore_ascii_case(ticket))
+                })
+        }
         _ => false,
     }
 }
 
 impl Ledger {
+    /// Lanes (lower case) that have an unresolved `push_next_ticket` action.
+    ///
+    /// # Errors
+    ///
+    /// A database failure.
+    pub fn open_push_lanes(&self) -> Result<Vec<String>, LedgerError> {
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT lane FROM action
+             WHERE kind = 'push_next_ticket' AND resolved_at IS NULL AND lane IS NOT NULL",
+        )?;
+        let lanes = statement
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(lanes.into_iter().map(|l| l.to_lowercase()).collect())
+    }
+
     /// Commits one `fleet tick`: the run, the tick, a `lane_tick` row per lane, the defects,
     /// the planned actions and ladder rows, and the resolution of cleared conditions, all in
     /// one transaction. Returns the action list with its ledger ids.
@@ -219,7 +256,7 @@ impl Ledger {
                 ])?;
             }
         }
-        let first_seen = reconcile_defects(&tx, &report.defects, run_ms, false)?;
+        let first_seen = reconcile_defects(&tx, &report.defects, run_ms, false, Reader::Tick)?;
         let open = load_open(&tx)?;
         let capacity = load_capacity(&tx)?;
         let planned = plan(&PlanInput {
@@ -253,7 +290,7 @@ impl Ledger {
             }
         }
         for open in &planned.resolved {
-            let done = executed(open.kind, report, &open.subject);
+            let done = executed(commit, open.kind, &open.subject);
             tx.execute(
                 "UPDATE action SET resolved_at = ?1,
                    executed_at = CASE WHEN ?2 THEN ?1 ELSE executed_at END WHERE id = ?3",
