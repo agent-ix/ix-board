@@ -182,6 +182,23 @@ SHALL accompany evidence so remote clock skew cannot fabricate activity ages
 or a consistent snapshot. Missing permissions and unsupported platform sources
 remain explicit availability results.
 
+### Evidence completeness (SWM-210)
+
+A herdr state of `done` SHALL be treated as an ended-execution observation: with no
+prompt, question, active worker or attributed process it classifies as `IDLE`
+(or `RECENT` inside `--idle-after`) and never as `UNKNOWN`. The Codex adapter SHALL
+read each rollout by bounded tail: it reads the last bounded window of the file
+and extends backward in bounded steps up to the enumeration limit until the latest
+lifecycle record is found, so a rollout larger than the byte limit yields its latest
+state rather than unavailable evidence. Only when the limit is reached without a
+lifecycle record is the evidence unavailable, with that reason.
+
+Each machine SHALL be read in isolation under its own timeout; one machine timing
+out or failing SHALL NOT delay, drop or fail another machine's rows. The report
+SHALL carry `missing_hosts`: every enabled machine whose rows could not be read,
+with reason and elapsed time. A configured team workspace on a missing host is a
+missing-host entry, never silent absence.
+
 ### Consumers
 
 The working-share metric in [FR-024](./FR-024-retro-snapshot.md) SHALL count only
@@ -226,6 +243,9 @@ instead of treating a partial or failed command as a complete zero-worker report
 | FR-018-AC-24 | Retro working-share counts only WORKING, becomes unavailable for unresolved relevant rows/population, and changes query provenance so comparison with the previous definition reports definition change rather than a numeric delta. | Test |
 | FR-018-AC-25 | Minder fixtures observe WAITING/RECENT without nudging, accept null corrected counts/alias, and preserve failed/partial command status, errors and coverage. | Test |
 | FR-018-AC-26 | macOS and Linux smoke runs demonstrate the shared Rust probe and supported lifecycle collection; inaccessible remote/platform sources are recorded as unavailable with reasons rather than claimed successful. | Demonstration |
+| FR-018-AC-27 | A herdr `done` pane with no prompt, question, worker or attributed process is IDLE (RECENT within idle-after) and not UNKNOWN; with a pending prompt or question PROMPT/ASKING still take precedence. | Test |
+| FR-018-AC-28 | A Codex rollout larger than the byte limit yields the latest lifecycle state from its tail; when no lifecycle record is found within the limit the evidence is unavailable with a reason and the row is partial. | Test |
+| FR-018-AC-29 | With one machine timing out and others healthy, the healthy machines' rows are returned unchanged within the per-machine timeout, `missing_hosts` lists the failed machine with reason and elapsed time, and the exit status is non-zero. | Test |
 
 ## Dependencies
 
