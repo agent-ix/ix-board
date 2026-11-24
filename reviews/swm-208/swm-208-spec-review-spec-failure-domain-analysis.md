@@ -53,6 +53,13 @@ failure in assign, double assignment, and concurrent ledger writers.
 | FND-007 | medium | FR-039 `ground_truth_sample` is labelled at each tick, but FR-040 truth at `t` needs events up to `t+W` (active in [t-W,t+W]; inactive when no tool-use follows within W). A label written at tick time `t` cannot see that future, so persisted labels for spans beyond relay retention are premature or wrong. Label sample `t-W` at tick `t` instead. | spec/functional/FR-039-fleet-ledger.md:28-30; spec/functional/FR-040-fleet-calibrate.md:27-29 |
 | FND-008 | low | `executed_at` = first `post_tool` on the target lane after emission. That fires at once on a lane that is already working, and for lead-targeted actions (`escalate_*`, `escalate_stale_pr`) the lane's tool use is unrelated to the lead acting, so time-to-action reads near zero. | spec/functional/FR-039-fleet-ledger.md:45-48 |
 
+## New findings (disposition pass 2)
+
+| ID | Severity | Summary | Refs |
+| --- | --- | --- | --- |
+| FND-009 | medium | FR-036 never mentions UNREACHABLE. Tickets in an UNREACHABLE lane's assignment count as owned, so they never appear in `unowned_ready`, and the lane can appear in `short_queues` and invite more tickets to a lane nobody can reach. The lead decision says UNREACHABLE counts as not working; coverage needs to surface its assignments, for example as `unreachable_assignments` or as unowned. | spec/functional/FR-036-fleet-plan-coverage.md:23-28 |
+| FND-010 | medium | FR-041 never mentions UNREACHABLE. The ready buffer subtracts tickets held by UNREACHABLE lanes, and supply and demand still count a stale host's `sustainable_slots`/`lane_capacity` and its lanes' duty. FR-034's "counts as not working for capacity" has no capacity rule behind it. | spec/functional/FR-041-fleet-saturation.md:25-39 |
+
 ## Dispositions
 
 | FND | outcome | sha/reason |
@@ -63,3 +70,5 @@ failure in assign, double assignment, and concurrent ledger writers.
 | FND-004 | fixed | 0aef701: FR-035 stores the list only after the relay accepts the order; a send failure writes no list. Lead decision: no rollback after an accepted send; exit non-zero and record the order (step 4, AC-3) |
 | FND-005 | fixed | 0aef701: FR-035 step 2 refuses a ticket in another lane's assignment and names that lane; AC-4 |
 | FND-006 | fixed | 0aef701: FR-039 single-writer lock, monotonic sequence, gap rule at tick cadence (default 5m); AC-2, AC-3 |
+| FND-007 | fixed | a8266e2: FR-039 writes labels for t-W at tick t, never t; FR-040-AC-9 |
+| FND-008 | fixed | a8266e2: executed_at = target lane's first transition into the action's expected state; lead/project actions have none |

@@ -58,7 +58,7 @@ The command evaluates classes in this order and emits the first that matches:
    pane and a registry entry older than `dead_after`.
 2. `BLOCKED(reason)`: the relay-resolved `ix_fleet_lane_blocked{reason}` for the lane
    gives the reason: `dialog` (relay reasons `dialog` and `permission`), `login`,
-   `usage_limit` or `question`. ix-board SHALL NOT apply its own precedence between
+   `usage_limit` or `question` (relay reasons `question` and `queued_question`). ix-board SHALL NOT apply its own precedence between
    hook and pane evidence; the relay resolution is the single source of truth.
 3. `STALE-ORDER`: an order to the lane has an `AckExpired` receipt, including
    `timed_out` (no `Delivered` receipt).
@@ -98,15 +98,15 @@ is authoritative for fleet decisions; the relay lane-state series is advisory.
 | FR-034-AC-2 | A `pre_tool`, `post_tool` or `prompt` event inside the working window yields WORKING with no compile, PR or commit signal; one older than the window yields IDLE; no `IDLE(unconfirmed_activity)` subreason exists. | Test |
 | FR-034-AC-3 | A lane with no hook evidence is WORKING only with two agreeing weak signals from distinct sources; each single weak signal alone yields IDLE. | Test |
 | FR-034-AC-4 | An open `pre_tool` is WORKING until `max_tool_runtime` and STUCK after it; a matching `post_tool` closes it. | Test |
-| FR-034-AC-5 | Pane `wait_loop`, and `loop_stops` stop events with no tool event between them, each yield LOOP; fewer stops or an interleaved `pre_tool` do not. | Test |
-| FR-034-AC-6 | The mapping fixtures give relay `ix_fleet_lane_blocked` reasons `dialog` and `permission` BLOCKED(dialog), `question` BLOCKED(question), `login` and `usage_limit` their reasons, and a `session_end` DEAD. | Test |
+| FR-034-AC-5 | The relay series reason `wait_loop`, and `loop_stops` stop events with no tool event between them, each yield LOOP; fewer stops or an interleaved `pre_tool` do not. | Test |
+| FR-034-AC-6 | The mapping fixtures give relay `ix_fleet_lane_blocked` reasons `dialog` and `permission` BLOCKED(dialog), `question` and `queued_question` BLOCKED(question), `login` and `usage_limit` their reasons, and a `session_end` DEAD. | Test |
 | FR-034-AC-7 | With the relay series reporting a reason that disagrees with raw hook or pane fixtures, the class follows the relay series; the code holds no hook-versus-pane precedence rule (an inspection of the source finds none). | Test |
 | FR-034-AC-8 | An order with `AckExpired` and a `Delivered` receipt, and one with `AckExpired` and no `Delivered` receipt (`timed_out`), each yield STALE-ORDER. | Test |
 | FR-034-AC-9 | A lane with no event for the relay `no_events_after` is IDLE with a `no_events` defect; a lane the relay marks `stale` is `UNREACHABLE` with a `stale_host_registry` defect, never IDLE, and counts as not working in capacity figures; a failed probe, unreadable source, or a source older than twice its interval adds the matching defect while the lane is still emitted. | Test |
 | FR-034-AC-10 | A configured lane with no registry record and a configured host with no lanes give `missing_lane`/`missing_host` defects, `complete` false and a non-zero exit. | Test |
 | FR-034-AC-11 | The working window equals the value read from the relay configuration; a fixture changing it changes classification and the code holds no second constant (an inspection of the source finds one definition). | Test |
 | FR-034-AC-16 | `max_tool_runtime` and `no_events_after` equal the relay `ix.fleet.config` values and ix-board configuration rejects local overrides of them. | Test |
-| FR-034-AC-12 | Boundary fixtures at exactly and one second beyond the working window, relay-configured `max_tool_runtime`, `dead_after` and the order deadline classify as specified; configured thresholds override defaults. | Test |
+| FR-034-AC-12 | Boundary fixtures at exactly and one second beyond the working window, relay-configured `max_tool_runtime`, `dead_after` and the order deadline classify as specified; configured values override the defaults of the ix-board-owned thresholds (`loop_stops`, `dead_after`, `max_clock_skew`) only, and the relay-owned values (working window, `max_tool_runtime`, `no_events_after`) are read from the relay and cannot be overridden. | Test |
 | FR-034-AC-13 | A relay-to-ix-board clock difference above `max_clock_skew` raises `clock_skew` and every age is still computed from relay server time; host-local timestamps never enter an age. | Test |
 | FR-034-AC-14 | One host timing out leaves other hosts' rows unchanged and adds an `unreadable_source` defect within the per-host bound. | Test |
 | FR-034-AC-15 | Text and `--json` carry the same rows, defects and `complete`; two runs on identical evidence give identical JSON once run-time-dependent fields (run timestamp and state ages) are masked. | Test |

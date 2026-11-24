@@ -67,6 +67,14 @@ not exist or differ:
 | FND-011 | low | FR-034 keeps `max_tool_runtime` (2h) as ix-board configuration, while PR52 configures it in relay `[fleet]` and exports it in `ix.fleet.config` next to `working_window` and `no_events_after`. This is the duplicate-constant pattern fixed for the working window; ix-board `no_events` also differs from relay `no_events_after`. | spec/functional/FR-034-fleet-lane-status.md:40-41 |
 | FND-012 | low | spec.md out-of-scope still says `fleet assign` writes "relay `work agent`", but the write target is now the PR52 FR-072 assignment list. FR-072 also accepts writes only from a caller with the orchestrator role, a prerequisite FR-035 does not state. | spec/spec.md:100 |
 
+## New findings (disposition pass 2)
+
+| ID | Severity | Summary | Refs |
+| --- | --- | --- | --- |
+| FND-013 | medium | Relay `ix_fleet_lane_blocked` reasons are `permission`, `dialog`, `login`, `usage_limit`, `question`, `queued_question` and `wait_loop` (ix-relay PR52 FR-045 at 2d4ba5c / a680c33). The rewritten FR-034 BLOCKED rule and AC-6 map every reason except `queued_question`, which round 1 mapped to BLOCKED(question). A lane with queued follow-up input now falls through to WORKING or IDLE. | spec/functional/FR-034-fleet-lane-status.md:59-62,102 |
+| FND-014 | low | FR-034-AC-12 still says "configured thresholds override defaults" for a list that includes relay-configured `max_tool_runtime`, while AC-16 says ix-board rejects local overrides of it. | spec/functional/FR-034-fleet-lane-status.md:109 |
+| FND-015 | low | FR-034-AC-5 still says "Pane `wait_loop`", but rule 5 now reads the relay series reason `wait_loop`, and AC-7 forbids ix-board from using raw pane evidence. | spec/functional/FR-034-fleet-lane-status.md:101 |
+
 ## Dispositions
 
 | FND | outcome | sha/reason |
@@ -79,3 +87,7 @@ not exist or differ:
 | FND-006 | fixed | 0aef701 + PR52: relay lane.state has no unknown; one working window read from relay config; relay series advisory |
 | FND-007 | fixed | 0aef701: join key is the relay address; Redis via relay-core and Prometheus HTTP API named; stale_source defect |
 | FND-008 | fixed | 0aef701: FR-041 interim supply (server-capacity) and duty (watcher compile seconds); AC-5 |
+| FND-009 | fixed | a8266e2: timed_out derived as AckExpired with no Delivered; TimedOut removed from FR-034, FR-035 and spec.md |
+| FND-010 | fixed | a8266e2: FR-034 reads relay-resolved ix_fleet_lane_blocked{reason} and holds no hook-vs-pane precedence (AC-7) |
+| FND-011 | fixed | a8266e2: max_tool_runtime and no_events_after read from relay ix.fleet.config, no local copy (AC-16) |
+| FND-012 | fixed | a8266e2: spec.md names the FR-072 list and orchestrator role; FR-035 step 4 and AC-8 cover role and host_registry_stale refusals |

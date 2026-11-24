@@ -22,9 +22,12 @@ Canceled or merged ticket. Ready work SHALL come from the [FR-001](./FR-001-read
 ## Behavior
 
 The report has three lists: `unowned_ready` (ticket, team, project, queue
-position), `short_queues` (lane, remaining count, minimum) and `stale_assignments`
-(lane, ticket, reason `done`, `canceled` or `merged`). A lane's remaining queue
-excludes finished tickets. When the queue or assignment source is unreadable the
+position, optional note), `short_queues` (lane, remaining count, minimum) and
+`stale_assignments` (lane, ticket, reason `done`, `canceled` or `merged`). A lane's
+remaining queue excludes finished tickets. A ticket held only by an `UNREACHABLE`
+lane ([FR-034](./FR-034-fleet-lane-status.md)) is not owned: it appears in
+`unowned_ready` with the note `owner_unreachable`. An `UNREACHABLE` lane never
+appears in `short_queues`. When the queue or assignment source is unreadable the
 list that depends on it is `unavailable` with a reason, never empty. The text and
 JSON outputs agree. The command exits zero only when all three lists are empty and
 available; this is the zero-gap state.
@@ -38,6 +41,7 @@ available; this is the zero-gap state.
 | FR-036-AC-3 | An assignment containing a Done, Canceled or merged ticket is listed with the matching reason. | Test |
 | FR-036-AC-4 | In the zero-gap fixture all three lists are empty, available, and the exit status is zero. | Test |
 | FR-036-AC-5 | An unreadable ready queue yields `unavailable` for `unowned_ready` with a reason and a non-zero exit, not an empty list. | Test |
+| FR-036-AC-7 | A ready ticket assigned only to an UNREACHABLE lane appears in `unowned_ready` with note `owner_unreachable`, and that lane is absent from `short_queues` even with fewer than the minimum remaining. | Test |
 | FR-036-AC-6 | Text and JSON carry identical entries. | Test |
 
 ## Dependencies
