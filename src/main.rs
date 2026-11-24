@@ -181,6 +181,17 @@ enum CacheCommand {
 enum FleetCommand {
     /// Classify every registered agent lane from relay, Prometheus and order evidence.
     Status,
+    /// Send a lane its ordered tickets as a relay order, store the list, and wait for the outcome.
+    Assign {
+        /// Lane address server:workspace:tab.
+        lane: String,
+        /// Ticket identifiers in order; the first is the expected ticket.
+        #[arg(required = true, num_args = 1..)]
+        tickets: Vec<String>,
+        /// Acknowledgement deadline (for example 90s, 5m).
+        #[arg(long, default_value = "5m", value_parser = parse_duration)]
+        deadline: u64,
+    },
     /// Read the fleet ledger.
     Ledger {
         #[command(subcommand)]
@@ -389,6 +400,7 @@ enum Output {
     Agents(AgentsReport),
     Fleet(ix_board::fleet::FleetReport),
     FleetLedger(ix_board::fleet::ledger::LedgerRows),
+    FleetAssign(ix_board::fleet::assign::AssignReport),
     Retro(retro::Record),
     RetroDelta(retro::DeltaReport),
     RetroBackfill(retro::BackfillReport),
@@ -508,6 +520,7 @@ fn main() -> std::process::ExitCode {
                 | Error::DriftInputDecode { .. }
                 | Error::Drift(_)
                 | Error::Fleet(_)
+                | Error::Assign(_)
                 | Error::Retro(_) => Outcome::Invalid,
                 Error::EmptyCredentialInput => Outcome::Invalid,
                 _ => Outcome::Internal,
@@ -527,6 +540,9 @@ fn output_outcome(output: &Output) -> Outcome {
             ix_board::fleet::Coverage::Partial => Outcome::Partial,
             ix_board::fleet::Coverage::Failed => Outcome::Internal,
         },
+        Output::FleetAssign(report) if report.confirmed() => Outcome::Ok,
+        Output::FleetAssign(report) if report.list_write_failed() => Outcome::Internal,
+        Output::FleetAssign(_) => Outcome::Partial,
         Output::Agents(report) => match report.coverage() {
             ix_board::agents::Coverage::Complete => Outcome::Ok,
             ix_board::agents::Coverage::Partial => Outcome::Partial,
@@ -657,6 +673,14 @@ fn run(command: Command) -> Result<Output, Error> {
         Command::Fleet {
             command: FleetCommand::Status,
         } => run_fleet_status().map(Output::Fleet),
+        Command::Fleet {
+            command:
+                FleetCommand::Assign {
+                    lane,
+                    tickets,
+                    deadline,
+                },
+        } => run_fleet_assign(lane, tickets, deadline).map(Output::FleetAssign),
         Command::Fleet {
             command:
                 FleetCommand::Ledger {
@@ -849,6 +873,52 @@ fn run_fleet_ledger_query(
     let path = ledger::resolve_path(&config).map_err(|e| FleetError::Ledger(e.to_string()))?;
     ledger::query(&path, view, since.map(std::time::Duration::from_secs))
         .map_err(|e| Error::Fleet(FleetError::Ledger(e.to_string())))
+}
+
+fn run_fleet_assign(
+    lane: String,
+    tickets: Vec<String>,
+    deadline_secs: u64,
+) -> Result<ix_board::fleet::assign::AssignReport, Error> {
+    use ix_board::fleet::{assign, live};
+    let config_error = |e: String| Error::Fleet(ix_board::fleet::FleetError::Config(e));
+    let file = relay_core::config::load_file()
+        .map_err(|e| config_error(e.to_string()))?
+        .unwrap_or(relay_core::config::FileConfig::default());
+    let settings = relay_core::config::load_core(relay_core::config::CoreFlags::default())
+        .map_err(|e| config_error(e.to_string()))?;
+    let source = LinearGraphQlSource::from_env()?;
+    let mut service = ReadService::open_default(source)?;
+    let batch = service.issues(&tickets)?;
+    let mut relay =
+        relay_core::Relay::connect(&settings.url.value, std::time::Duration::from_secs(5))
+            .map_err(|e| config_error(format!("relay connect: {e}")))?
+            .with_prefix(settings.prefix.value.clone());
+    let caller = if file.assign.is_orchestrator().unwrap_or(false) {
+        live::caller_lane(&mut relay, &settings.machine.value)
+    } else {
+        None
+    };
+    let writer = relay_core::assignment::AssignWriter::from_config(
+        &file.assign,
+        &settings.machine.value,
+        caller,
+    )
+    .map_err(config_error)?;
+    let request = assign::AssignRequest {
+        lane,
+        tickets,
+        deadline: std::time::Duration::from_secs(deadline_secs),
+        poll: std::time::Duration::from_secs(2),
+        focus_window_ms: ix_board::fleet::focus::DEFAULT_FOCUS_WINDOW_MS,
+    };
+    Ok(assign::assign(
+        &mut relay,
+        &mut assign::NoLedger,
+        &request,
+        &batch,
+        &writer,
+    )?)
 }
 
 fn run_agents(teams: &[String], idle_after: u64) -> Result<AgentsReport, Error> {
@@ -1264,6 +1334,7 @@ fn render_human(output: &Output) -> String {
         Output::Drift(report) => render_drift_text(report),
         Output::Agents(report) => render_text(report),
         Output::Fleet(report) => ix_board::fleet::render_text(report),
+        Output::FleetAssign(report) => ix_board::fleet::assign::render_text(report),
         Output::FleetLedger(rows) => rows.render_text(),
         Output::Retro(record) => retro::render_text(record),
         Output::RetroDelta(report) => retro::render_delta_text(report),
