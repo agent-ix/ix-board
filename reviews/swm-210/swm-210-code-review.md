@@ -66,6 +66,12 @@ Checked and clean:
 | --- | --- | --- | --- |
 | FND-008 | medium | Every Codex rollout with more than one turn now replays only from its latest turn start, small files included. Spawns from earlier turns are lost, so a missing child spawned in an earlier turn is no longer reported `referenced_child_missing_or_ambiguous` and the graph reads complete. Reproduced. | src/agents/collect.rs:369-379 |
 
+## New findings (disposition pass 2)
+
+| ID | Severity | Summary | Refs |
+| --- | --- | --- | --- |
+| FND-009 | low | Peak memory for a Codex rollout over 64 MiB rose from about 1 MiB of streamed records on main to about 130-190 MiB per probe process. The scan keeps up to ~63 MiB of chunks, then copies them into an unreserved Vec that can double its capacity while every chunk is still alive. It is bounded and single-threaded per probe process, but concurrent ix-board runs multiply it. | src/agents/collect.rs:331-341, src/agents/collect.rs:288 |
+
 ## Dispositions
 
 | FND | Outcome | Reason |
@@ -77,3 +83,5 @@ Checked and clean:
 | FND-005 | fixed | AgentsReport::coverage() maps a missing host with usable rows to Outcome::Partial (exit 1) and a total loss to Internal. |
 | FND-006 | fixed | The backward scan reads one look-behind byte, so a record that starts exactly at the window start is kept. |
 | FND-007 | still-open | The overlapping window re-reads are gone, but the backward scan and the forward replay now charge the same bytes twice. The worst case is about 128 MiB per transcript (256 MiB with the retry) against the 256 MiB collection budget, compared with 64 MiB on main. |
+| FND-007 | fixed | The scan keeps its chunks and the replay runs from memory, so each byte is charged once. The tail read is capped at TAIL_SCAN_LIMIT plus a header read of at most MAX_RECORD, within MAX_TRANSCRIPT. A budget unit test asserts this. |
+| FND-008 | fixed | Codex rollouts of at most 64 MiB are read whole again (read_transcript dispatches to the tail only above MAX_TRANSCRIPT), and a new test covers a spawn from an earlier turn. Above 64 MiB, only the latest turn is replayed, as FR-018-AC-28 sanctions; main reported those files unavailable. |

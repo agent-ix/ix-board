@@ -246,11 +246,14 @@ fn starts_turn(line: &[u8]) -> bool {
     })
 }
 
-/// The records from the latest turn start to the end of the file.
+/// The records from the latest turn start to the end of the file, as the scanned chunks.
 struct TailRegion {
-    /// File offset of the first byte of `bytes`, a record boundary.
+    /// File offset of the first record, a record boundary.
     offset: u64,
-    bytes: Vec<u8>,
+    /// Scanned chunks, earliest last so they can be popped and freed in order.
+    chunks: Vec<Vec<u8>>,
+    /// Bytes of the earliest chunk that precede the first record.
+    skip: usize,
 }
 
 /// Scans backward once over each byte for the latest turn start.
@@ -268,7 +271,8 @@ fn read_tail_region(
     let mut file = File::open(path).map_err(|_| "transcript_unreadable")?;
     let floor = extent.saturating_sub(TAIL_SCAN_LIMIT);
     let mut pos = extent;
-    // Chunks hold [start, pos) for each step, latest first.
+    // Chunks hold [start, pos) for each step, latest first. Each is sized exactly, so they
+    // total at most `TAIL_SCAN_LIMIT` bytes; the replay frees them as it goes.
     let mut chunks: Vec<Vec<u8>> = Vec::new();
     // Head of the line that begins at `pos`, kept until its start is read.
     let mut carry: Vec<u8> = Vec::new();
@@ -329,15 +333,10 @@ fn read_tail_region(
             None => None,
         };
         if let Some(found) = found {
-            let skip_in_concat = usize::try_from(found - start).unwrap_or(0);
-            let mut bytes = Vec::new();
-            for chunk in chunks.iter().rev() {
-                bytes.extend_from_slice(chunk);
-            }
-            bytes.drain(..skip_in_concat);
             return Ok(TailRegion {
                 offset: found,
-                bytes,
+                chunks,
+                skip: usize::try_from(found - start).unwrap_or(0),
             });
         }
         if last {
@@ -349,24 +348,49 @@ fn read_tail_region(
     }
 }
 
-/// Replays complete records from memory into `life`.
-fn replay_bytes(
-    bytes: &[u8],
+/// Replays the region's records chunk by chunk, freeing each chunk once replayed.
+///
+/// Memory stays at the scanned region: nothing is concatenated, and a record that
+/// spans chunks is joined in `pending`, which holds at most `MAX_RECORD` bytes.
+fn replay_region(
+    mut region: TailRegion,
     adapter: &dyn Harness,
     mut life: Lifecycle,
     budget: &Budget,
 ) -> Result<Lifecycle, &'static str> {
-    for line in bytes.split(|b| *b == b'\n') {
+    let mut observe = |line: &[u8]| -> Result<(), &'static str> {
         budget.check()?;
-        if u64::try_from(line.len()).unwrap_or(u64::MAX) > MAX_RECORD {
-            return Err("record_size_limit");
-        }
         if line.iter().all(u8::is_ascii_whitespace) {
-            continue;
+            return Ok(());
         }
         let value = serde_json::from_slice(line).map_err(|_| "malformed_transcript_record")?;
         adapter.observe_record(&value, &mut life);
+        Ok(())
+    };
+    let mut pending: Vec<u8> = Vec::new();
+    let mut skip = region.skip;
+    while let Some(chunk) = region.chunks.pop() {
+        let mut data = &chunk[skip..];
+        skip = 0;
+        while let Some(end) = data.iter().position(|b| *b == b'\n') {
+            if u64::try_from(pending.len() + end).unwrap_or(u64::MAX) > MAX_RECORD {
+                return Err("record_size_limit");
+            }
+            if pending.is_empty() {
+                observe(&data[..end])?;
+            } else {
+                pending.extend_from_slice(&data[..end]);
+                observe(&pending)?;
+                pending.clear();
+            }
+            data = &data[end + 1..];
+        }
+        pending.extend_from_slice(data);
+        if u64::try_from(pending.len()).unwrap_or(u64::MAX) > MAX_RECORD {
+            return Err("record_size_limit");
+        }
     }
+    observe(&pending)?;
     Ok(life)
 }
 
@@ -391,7 +415,7 @@ fn read_transcript_tail(
                     adapter.observe_record(&header, &mut seed);
                 }
             }
-            replay_bytes(&region.bytes, adapter, seed, budget)
+            replay_region(region, adapter, seed, budget)
         })();
         if before != stamp(path)? {
             return Ok(None);
