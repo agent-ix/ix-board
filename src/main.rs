@@ -1816,6 +1816,12 @@ fn run_retro_eval(
         &config.repos,
         &window,
     ));
+    current_adapters.extend(retro::eval::linear_gate_record_adapters(
+        &specs,
+        &config.repos,
+        config.gate_log.as_deref(),
+        &window,
+    ));
     current_adapters.extend(retro::eval::gate_log_adapters(
         &specs,
         config.gate_log.as_deref(),
@@ -1860,6 +1866,12 @@ fn run_retro_eval(
     previous_adapters.extend(retro::eval::linear_merged_prs_without_review_adapters(
         &specs,
         &config.repos,
+        &previous_window,
+    ));
+    previous_adapters.extend(retro::eval::linear_gate_record_adapters(
+        &specs,
+        &config.repos,
+        config.gate_log.as_deref(),
         &previous_window,
     ));
     previous_adapters.extend(retro::eval::gate_log_adapters(

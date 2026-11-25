@@ -1378,6 +1378,161 @@ pub fn linear_merged_prs_without_review_adapters(
     )])
 }
 
+/// Evaluates code-lead gate records against the append-only gate log.
+pub fn linear_gate_record_adapters(
+    specs: &[RoleSpec],
+    repositories: &[String],
+    gate_log: Option<&Path>,
+    window: &EvalWindow,
+) -> BTreeMap<String, QueryValue> {
+    let queries = ["linear.gate_records", "linear.gate_runs_without_record"];
+    let needed = queries
+        .into_iter()
+        .filter(|query| {
+            specs
+                .iter()
+                .flat_map(|spec| &spec.rules)
+                .any(|rule| rule.method == "deterministic" && rule.query_or_rubric == *query)
+        })
+        .collect::<BTreeSet<_>>();
+    if needed.is_empty() {
+        return BTreeMap::new();
+    }
+    let results = read_linear_gate_record_metrics(repositories, gate_log, window);
+    needed
+        .into_iter()
+        .map(|query| {
+            let value = match &results {
+                Ok(values) => {
+                    values
+                        .get(query)
+                        .cloned()
+                        .unwrap_or_else(|| QueryValue::Unavailable {
+                            reason: format!("gate-record adapter did not register {query}"),
+                            evidence_refs: Vec::new(),
+                        })
+                }
+                Err(reason) => QueryValue::Unavailable {
+                    reason: reason.clone(),
+                    evidence_refs: Vec::new(),
+                },
+            };
+            (query.to_owned(), value)
+        })
+        .collect()
+}
+
+fn read_linear_gate_record_metrics(
+    repositories: &[String],
+    gate_log: Option<&Path>,
+    window: &EvalWindow,
+) -> Result<BTreeMap<String, QueryValue>, String> {
+    if repositories.is_empty() {
+        return Err("retro config has no repositories for Linear gate records".to_owned());
+    }
+    let linear = crate::LinearGraphQlSource::from_env().map_err(|error| error.to_string())?;
+    let mut comments = Vec::new();
+    for repository in repositories {
+        comments.extend(linear.fetch_marker_comments(
+            "<!-- lead-record ",
+            &format!("repo={repository} "),
+            None,
+        )?);
+    }
+    let start_secs = window.start_ms as f64 / 1000.0;
+    let end_secs = window.end_ms as f64 / 1000.0;
+    let mut gate_records = Vec::new();
+    let mut record_evidence = Vec::new();
+    let mut recorded_finished = BTreeSet::new();
+    for comment in &comments {
+        let Some(("lead-record", fields)) =
+            lead_record_fields(comment.body.lines().next().unwrap_or(""))
+        else {
+            continue;
+        };
+        if fields.get("kind") != Some(&"gate") {
+            continue;
+        }
+        let finished = fields
+            .get("finished")
+            .ok_or_else(|| "gate record has no finished time".to_owned())?;
+        let finished_at = crate::drift::timestamp_epoch(finished)
+            .map_err(|error| format!("gate record finished time is invalid: {error}"))?;
+        let repo = fields
+            .get("repo")
+            .ok_or_else(|| "gate record has no repo".to_owned())?;
+        recorded_finished.insert(((*repo).to_owned(), (finished_at * 1000.0).round() as i64));
+        let created = comment
+            .created_at
+            .as_deref()
+            .ok_or_else(|| "gate record has no source creation time".to_owned())?;
+        let created_at =
+            crate::drift::timestamp_epoch(created).map_err(|error| error.to_string())?;
+        if created_at >= start_secs && created_at < end_secs {
+            gate_records.push(comment);
+            if let Some(id) = comment.id.as_deref() {
+                record_evidence.push(format!("linear-comment:{id}"));
+            }
+        }
+    }
+    record_evidence.sort();
+    record_evidence.dedup();
+
+    let gate_log = gate_log.ok_or_else(|| "retro config has no gate_log path".to_owned())?;
+    use super::GateLogSource;
+    let lines = super::live::FileGateLog
+        .lines(gate_log)
+        .map_err(|error| format!("gate log is unavailable: {error}"))?;
+    let unrecorded = lines
+        .iter()
+        .filter(|line| !line.repin && line.finished_at >= start_secs && line.finished_at < end_secs)
+        .filter(|line| {
+            let finished_ms = (line.finished_at * 1000.0).round() as i64;
+            !recorded_finished
+                .iter()
+                .any(|(repo, finished)| line.pr.starts_with(repo) && *finished == finished_ms)
+        })
+        .collect::<Vec<_>>();
+    let unrecorded_evidence = unrecorded
+        .iter()
+        .map(|line| {
+            format!(
+                "gate-log:{}:{}",
+                line.pr,
+                crate::drift::format_timestamp(line.finished_at)
+            )
+        })
+        .collect::<Vec<_>>();
+    Ok(BTreeMap::from([
+        (
+            "linear.gate_records".into(),
+            QueryValue::Value {
+                value: gate_records.len() as f64,
+                evidence_refs: record_evidence,
+            },
+        ),
+        (
+            "linear.gate_runs_without_record".into(),
+            QueryValue::Value {
+                value: unrecorded.len() as f64,
+                evidence_refs: unrecorded_evidence,
+            },
+        ),
+    ]))
+}
+
+fn lead_record_fields(line: &str) -> Option<(&str, BTreeMap<&str, &str>)> {
+    let inner = line
+        .trim()
+        .strip_prefix("<!--")?
+        .trim_end()
+        .strip_suffix("-->")?;
+    let mut tokens = inner.split_whitespace();
+    let kind = tokens.next()?;
+    let fields = tokens.filter_map(|token| token.split_once('=')).collect();
+    Some((kind, fields))
+}
+
 #[implements("FR-047-AC-1")]
 fn read_merged_prs_without_review(
     repositories: &[String],
@@ -2443,6 +2598,21 @@ mod tests {
         let (count, evidence) = pr_methods_count(&comments, &allowed).unwrap();
         assert_eq!(count, 1);
         assert_eq!(evidence.len(), 3);
+    }
+
+    #[test]
+    #[ix_trace_rs::trace("FR-047-AC-1")]
+    fn lead_gate_record_marker_requires_a_kind_and_parses_fields() {
+        let (kind, fields) = lead_record_fields(
+            "<!-- lead-record kind=gate repo=agent-ix/ix-board finished=2026-11-24T08:30:00Z -->",
+        )
+        .unwrap();
+        assert_eq!(kind, "lead-record");
+        assert_eq!(fields.get("kind"), Some(&"gate"));
+        assert_eq!(fields.get("repo"), Some(&"agent-ix/ix-board"));
+        assert_eq!(fields.get("finished"), Some(&"2026-11-24T08:30:00Z"));
+        assert!(lead_record_fields("<!-- reviewer repo=agent-ix/ix-board -->").is_some());
+        assert!(lead_record_fields("not a marker").is_none());
     }
 
     #[test]
