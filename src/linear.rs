@@ -4,6 +4,7 @@
 //! Linear GraphQL transport for selected reads and project status/priority writes.
 
 use ix_cli_kit::secrets::{AppScope, CredentialBackend, SecretKey, SecretStore, SecretValue};
+use ix_trace_rs::implements;
 
 use crate::{
     CatalogEvidence, Clock, Deadline, DriftConfig, DriftEvidence, DriftTicket, Error,
@@ -813,6 +814,7 @@ impl LinearGraphQlSource {
     }
 
     /// Reads native state names for exact configured-state transitions.
+    #[implements("FR-047-AC-1")]
     pub fn fetch_named_state_changes(
         &self,
         issue_id: &str,

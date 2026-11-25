@@ -3,6 +3,7 @@
 
 //! Deterministic role-rule evaluation primitives (FR-047).
 
+use ix_trace_rs::implements;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -137,6 +138,7 @@ pub struct EvalReport {
 }
 
 /// Keeps only session rows selected for presentation.
+#[implements("FR-047-AC-7")]
 pub fn filter_sessions(
     mut sessions: Vec<SessionResult>,
     session_filter: Option<&str>,
@@ -148,6 +150,8 @@ pub fn filter_sessions(
 }
 
 /// Builds session rows only for relay turns with explicit role attribution.
+#[implements("FR-047-AC-5")]
+#[implements("FR-047-AC-7")]
 pub fn evaluate_sessions(
     specs: &[RoleSpec],
     role_adapters: &BTreeMap<String, QueryValue>,
@@ -225,15 +229,18 @@ pub fn evaluate_sessions(
     sessions
 }
 
+#[implements("FR-047-AC-5")]
 fn role_sessions_count(roles: &BTreeMap<String, BTreeSet<String>>, role: &str) -> usize {
     roles.get(role).map_or(0, BTreeSet::len)
 }
 
+#[implements("FR-047-AC-4")]
 fn default_review_age_limit_hours() -> u64 {
     1
 }
 impl EvalSettings {
     /// Gate command words configured for one repository, with FR-017's default.
+    #[implements("FR-047-AC-4")]
     pub fn gate_commands_for(&self, repository: &str) -> Vec<String> {
         self.gate_commands
             .get(repository)
@@ -243,6 +250,7 @@ impl EvalSettings {
 }
 
 /// Parses the role's evaluation table and rejects malformed rules instead of omitting them.
+#[implements("FR-047-AC-1")]
 pub fn parse_role_spec(path: &Path, markdown: &str) -> Result<RoleSpec, String> {
     let role = path
         .file_stem()
@@ -336,6 +344,7 @@ pub fn parse_role_spec(path: &Path, markdown: &str) -> Result<RoleSpec, String> 
 }
 
 /// Loads every markdown role spec in stable path order.
+#[implements("FR-047-AC-1")]
 pub fn read_role_specs(directory: &Path) -> Result<Vec<RoleSpec>, String> {
     let mut paths = std::fs::read_dir(directory)
         .map_err(|error| format!("{}: {error}", directory.display()))?
@@ -358,6 +367,7 @@ pub fn read_role_specs(directory: &Path) -> Result<Vec<RoleSpec>, String> {
 }
 
 /// One bounded query result per rule, retaining unknown query references as unavailable rows.
+#[implements("FR-047-AC-1")]
 pub fn evaluate_rules(
     rules: &[EvaluationRule],
     adapters: &BTreeMap<String, QueryValue>,
@@ -446,6 +456,7 @@ pub fn evaluate_rules(
 }
 
 /// Computes a pass rate from only complete deterministic pass/fail results.
+#[implements("FR-047-AC-2")]
 pub fn score(results: &[RuleResult]) -> Score {
     let passed = results
         .iter()
@@ -463,6 +474,7 @@ pub fn score(results: &[RuleResult]) -> Score {
 }
 
 /// Reports a score only when every deterministic rule has complete evidence.
+#[implements("FR-047-AC-3")]
 pub fn complete_score(results: &[RuleResult]) -> Option<Score> {
     let deterministic = results
         .iter()
@@ -479,6 +491,7 @@ pub fn complete_score(results: &[RuleResult]) -> Option<Score> {
 }
 
 /// Maps complete retro catalog values whose snapshot time falls inside the evaluation window.
+#[implements("FR-047-AC-1")]
 pub fn retro_adapters(
     specs: &[RoleSpec],
     records: Result<&[super::Record], &str>,
@@ -543,6 +556,7 @@ pub fn retro_adapters(
 }
 
 /// Adapts an in-memory, read-only retro collection without appending it to the store.
+#[implements("FR-047-AC-1")]
 pub fn retro_record_adapters(
     specs: &[RoleSpec],
     record: Result<&super::Record, &str>,
@@ -599,6 +613,7 @@ pub fn retro_record_adapters(
 }
 
 /// Reads the fleet ready-buffer gauge as a time-weighted mean over an explicit window.
+#[implements("FR-047-AC-1")]
 pub fn prometheus_adapters(
     specs: &[RoleSpec],
     prometheus_url: Option<&str>,
@@ -633,6 +648,7 @@ pub fn prometheus_adapters(
 }
 
 /// Counts distinct PRs with a reviewer marker or a merge in the selected window.
+#[implements("FR-047-AC-1")]
 pub fn linear_reviewed_prs_adapters(
     specs: &[RoleSpec],
     repositories: &[String],
@@ -686,6 +702,7 @@ pub fn linear_reviewed_prs_adapters(
 }
 
 /// Computes direct reviewer-marker metrics from the source comments' event times.
+#[implements("FR-047-AC-1")]
 pub fn linear_marker_adapters(
     specs: &[RoleSpec],
     repositories: &[String],
@@ -735,6 +752,7 @@ pub fn linear_marker_adapters(
         .collect()
 }
 
+#[implements("FR-047-AC-1")]
 fn read_linear_marker_metrics(
     repositories: &[String],
     window: &EvalWindow,
@@ -771,6 +789,7 @@ fn read_linear_marker_metrics(
     Ok(metrics)
 }
 
+#[implements("FR-047-AC-1")]
 fn parse_linear_marker_metrics(
     comments: &[crate::MarkerComment],
     start_secs: f64,
@@ -926,6 +945,7 @@ fn parse_linear_marker_metrics(
     ])
 }
 
+#[implements("FR-047-AC-1")]
 fn marker_data_complete(kind: &str, data: &serde_json::Value) -> bool {
     let has_fields = |row: &serde_json::Value, fields: &[&str]| {
         fields.iter().all(|field| row.get(*field).is_some())
@@ -986,6 +1006,7 @@ fn marker_data_complete(kind: &str, data: &serde_json::Value) -> bool {
     }
 }
 
+#[implements("FR-047-AC-1")]
 fn yaml_data_block(body: &str) -> Result<serde_json::Value, String> {
     let mut active = false;
     let mut width = 0;
@@ -1236,6 +1257,7 @@ fn normalize_pr_key(repo: &str, pr: &str) -> Result<String, String> {
 }
 
 /// Counts merged pull requests whose native merge time falls in the selected window.
+#[implements("FR-047-AC-1")]
 pub fn github_merged_prs_adapters(
     specs: &[RoleSpec],
     repositories: &[String],
@@ -1265,6 +1287,7 @@ pub fn github_merged_prs_adapters(
 }
 
 /// Counts merged pull requests for which Linear has no review marker naming the PR.
+#[implements("FR-047-AC-1")]
 pub fn linear_merged_prs_without_review_adapters(
     specs: &[RoleSpec],
     repositories: &[String],
@@ -1294,6 +1317,7 @@ pub fn linear_merged_prs_without_review_adapters(
     )])
 }
 
+#[implements("FR-047-AC-1")]
 fn read_merged_prs_without_review(
     repositories: &[String],
     window: &EvalWindow,
@@ -1318,6 +1342,7 @@ fn read_merged_prs_without_review(
     merged_prs_without_review_count(&prs, &comments, window)
 }
 
+#[implements("FR-047-AC-1")]
 fn merged_prs_without_review_count(
     prs: &[super::sources::PullRequest],
     comments: &[crate::MarkerComment],
@@ -1356,6 +1381,7 @@ fn merged_prs_without_review_count(
 }
 
 /// Reads the SWM-261 fleet-ledger views without opening the store for writes.
+#[implements("FR-047-AC-1")]
 pub fn ledger_adapters(
     specs: &[RoleSpec],
     ledger_path: Option<&Path>,
@@ -1419,6 +1445,7 @@ pub fn ledger_adapters(
     values
 }
 
+#[implements("FR-047-AC-1")]
 fn read_need_ready_tickets_unanswered(
     ledger_path: Option<&Path>,
     ready_state: Option<&str>,
@@ -1544,6 +1571,7 @@ fn read_need_ready_tickets_unanswered(
     Ok((unanswered, evidence))
 }
 
+#[implements("FR-047-AC-1")]
 fn ready_ticket_after_action(
     events: &[crate::linear::NamedStateChange],
     emitted_at_ms: i64,
@@ -1560,6 +1588,7 @@ fn ready_ticket_after_action(
     })
 }
 
+#[implements("FR-047-AC-1")]
 fn read_ledger_view(
     ledger_path: Option<&Path>,
     view: &str,
@@ -1637,6 +1666,7 @@ fn merged_prs_count(
 }
 
 /// Counts recorded aggregate-gate log lines completed in the selected window.
+#[implements("FR-047-AC-1")]
 pub fn gate_log_adapters(
     specs: &[RoleSpec],
     gate_log: Option<&Path>,
@@ -1796,6 +1826,7 @@ fn ready_buffer_mean_from_response(body: &str, window: &EvalWindow) -> Result<f6
 ///
 /// Retro and live-source adapters are added by their readers. Remaining references are kept as
 /// unavailable with a source-specific reason; they are never silently omitted or scored as zero.
+#[implements("FR-047-AC-1")]
 pub fn declared_adapters(specs: &[RoleSpec]) -> BTreeMap<String, QueryValue> {
     let mut values = BTreeMap::new();
     for rule in specs.iter().flat_map(|spec| &spec.rules) {
@@ -1834,6 +1865,7 @@ pub fn declared_adapters(specs: &[RoleSpec]) -> BTreeMap<String, QueryValue> {
     values
 }
 
+#[implements("FR-047-AC-1")]
 fn unavailable_source_reason(query: &str) -> &'static str {
     match query.split_once('.') {
         Some(("github", _)) => "GitHub evidence is unavailable for this evaluation window",
@@ -1847,6 +1879,7 @@ fn unavailable_source_reason(query: &str) -> &'static str {
     }
 }
 
+#[implements("FR-047-AC-1")]
 fn compare(value: f64, comparator: &str, target: f64) -> Option<bool> {
     match comparator {
         "=" => Some(value == target),
@@ -1860,6 +1893,7 @@ fn compare(value: f64, comparator: &str, target: f64) -> Option<bool> {
 }
 
 /// Root path of TEAM_RETRO_HOME, falling back to the user's local state directory.
+#[implements("FR-047-AC-4")]
 pub fn settings_root() -> PathBuf {
     std::env::var_os("TEAM_RETRO_HOME")
         .map(PathBuf::from)
@@ -1870,11 +1904,13 @@ pub fn settings_root() -> PathBuf {
 }
 
 /// Loads evaluator-only settings from the selected team's `eval.json`.
+#[implements("FR-047-AC-4")]
 pub fn load_settings(team: &str) -> Result<EvalSettings, String> {
     let path = settings_root().join(team).join("eval.json");
     load_settings_file(&path)
 }
 
+#[implements("FR-047-AC-4")]
 fn load_settings_file(path: &Path) -> Result<EvalSettings, String> {
     let contents =
         std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
@@ -1890,6 +1926,7 @@ fn load_settings_file(path: &Path) -> Result<EvalSettings, String> {
 }
 
 /// Joins a relative role-spec directory to the evaluator settings directory.
+#[implements("FR-047-AC-4")]
 pub fn resolve_role_spec_dir(team: &str, settings: &EvalSettings) -> PathBuf {
     if settings.role_spec_dir.is_absolute() {
         settings.role_spec_dir.clone()
@@ -1899,6 +1936,7 @@ pub fn resolve_role_spec_dir(team: &str, settings: &EvalSettings) -> PathBuf {
 }
 
 /// Renders the same per-rule statuses and values used by the JSON document.
+#[implements("FR-047-AC-7")]
 pub fn render_text(report: &EvalReport) -> String {
     report
         .roles
@@ -1926,6 +1964,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ix_trace_rs::trace("FR-047-AC-1")]
     fn parse_and_evaluate_every_rule_including_unknown_queries() {
         let markdown = "## Evaluations\n| ID | Rule | Evidence source | Trigger | Method | Query or rubric | Evaluator | Comparator | Value | Unit | Cadence |\n|---|---|---|---|---|---|---|---|---|---|---|\n| R-1 | r | transcript | hooks.role_turns | deterministic | known.query | evaluator | = | 0 | runs | end |\n| R-2 | r | transcript | hooks.role_turns | deterministic | unknown.query | evaluator | = | 0 | runs | end |\n| R-3 | r | transcript | hooks.role_turns | judgement | rubric@1#x | team-retro | >= | 2 | score | daily |\n";
         let spec = parse_role_spec(Path::new("coder.md"), markdown).unwrap();
@@ -1952,6 +1991,8 @@ mod tests {
     }
 
     #[test]
+    #[ix_trace_rs::trace("FR-047-AC-2")]
+    #[ix_trace_rs::trace("FR-047-AC-3")]
     fn incomplete_and_not_applicable_rules_do_not_change_denominator() {
         let mk = |id: &str, status| RuleResult {
             id: id.into(),
@@ -1979,6 +2020,7 @@ mod tests {
     }
 
     #[test]
+    #[ix_trace_rs::trace("FR-047-AC-4")]
     fn evaluator_settings_keep_defaults_and_scope_gate_commands_by_repository() {
         let settings: EvalSettings = serde_json::from_str(
             r#"{"role_spec_dir":"roles","gate_commands":{"agent-ix/ix-board":["cargo","test"]}}"#,
@@ -1997,6 +2039,7 @@ mod tests {
     }
 
     #[test]
+    #[ix_trace_rs::trace("FR-047-AC-4")]
     fn evaluator_settings_are_loaded_from_eval_json_only() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("eval.json");
@@ -2012,6 +2055,7 @@ mod tests {
     }
 
     #[test]
+    #[ix_trace_rs::trace("FR-047-AC-1")]
     fn retro_metric_adapter_uses_only_snapshots_inside_the_window() {
         let record: super::super::Record = serde_json::from_str(
             r#"{"schema_version":1,"kind":"snapshot","taken_at":"2023-11-14T22:13:20Z","team":"TEST","window":"24h","metrics":{"prs_oversize":{"id":"prs_oversize","status":"ok","value":2,"unit":"pull_requests","direction":"down","source":"github","query":"open pull requests","class":"flow","department_class":"throughput"}}}"#,
@@ -2070,6 +2114,7 @@ mod tests {
     }
 
     #[test]
+    #[ix_trace_rs::trace("FR-047-AC-1")]
     fn build_pause_metric_is_not_applicable_without_a_producer() {
         let spec = RoleSpec {
             role: "orchestrator".into(),
@@ -2093,6 +2138,7 @@ mod tests {
     }
 
     #[test]
+    #[ix_trace_rs::trace("FR-047-AC-1")]
     fn every_deterministic_rule_has_an_explicit_registry_result() {
         let specs = [RoleSpec {
             role: "planner".into(),
@@ -2142,6 +2188,7 @@ mod tests {
     }
 
     #[test]
+    #[ix_trace_rs::trace("FR-047-AC-1")]
     fn prometheus_ready_buffer_mean_is_time_weighted_and_rejects_gaps() {
         let window = EvalWindow {
             start_ms: 0,
@@ -2160,6 +2207,7 @@ mod tests {
     }
 
     #[test]
+    #[ix_trace_rs::trace("FR-047-AC-1")]
     fn linear_reviewed_prs_deduplicates_markers_and_merges_in_window() {
         let prs = [
             super::super::sources::PullRequest {
@@ -2211,6 +2259,7 @@ mod tests {
     }
 
     #[test]
+    #[ix_trace_rs::trace("FR-047-AC-1")]
     fn merged_pull_requests_without_review_markers_are_reported_by_native_merge_time() {
         let pr = |number| super::super::sources::PullRequest {
             repo: "owner/repo".into(),
@@ -2248,6 +2297,7 @@ mod tests {
     }
 
     #[test]
+    #[ix_trace_rs::trace("FR-047-AC-1")]
     fn github_merged_prs_uses_merge_time_and_deduplicates() {
         let pr = super::super::sources::PullRequest {
             repo: "owner/repo".into(),
@@ -2274,6 +2324,7 @@ mod tests {
     }
 
     #[test]
+    #[ix_trace_rs::trace("FR-047-AC-1")]
     fn gate_log_runs_use_finished_time_and_exclude_repins() {
         let lines = [
             super::super::GateLine {
@@ -2311,6 +2362,7 @@ mod tests {
     }
 
     #[test]
+    #[ix_trace_rs::trace("FR-047-AC-1")]
     fn reviewer_method_runs_count_only_distinct_runs_for_reviewed_prs() {
         let comment = |id: &str, run: &str, pr: &str| crate::MarkerComment {
             id: Some(id.into()),
@@ -2333,6 +2385,7 @@ mod tests {
     }
 
     #[test]
+    #[ix_trace_rs::trace("FR-047-AC-1")]
     fn fleet_ledger_due_action_adapter_uses_due_time_and_action_id() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("ledger.sqlite3");
@@ -2385,6 +2438,7 @@ mod tests {
     }
 
     #[test]
+    #[ix_trace_rs::trace("FR-047-AC-1")]
     fn lane_order_ledger_view_accepts_text_order_id() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("ledger.sqlite3");
@@ -2418,6 +2472,7 @@ mod tests {
     }
 
     #[test]
+    #[ix_trace_rs::trace("FR-047-AC-1")]
     fn need_ready_action_counts_only_named_state_entries_in_its_following_day() {
         let events = [
             crate::linear::NamedStateChange {
@@ -2446,6 +2501,7 @@ mod tests {
     }
 
     #[test]
+    #[ix_trace_rs::trace("FR-047-AC-1")]
     fn linear_marker_metrics_parse_review_data_and_disposition_rounds() {
         let comments = [
             crate::MarkerComment {
@@ -2501,6 +2557,7 @@ mod tests {
     }
 
     #[test]
+    #[ix_trace_rs::trace("FR-047-AC-7")]
     fn session_filter_keeps_only_the_requested_session_row() {
         let session = |id: &str| SessionResult {
             id: id.into(),
@@ -2524,6 +2581,7 @@ mod tests {
     }
 
     #[test]
+    #[ix_trace_rs::trace("FR-047-AC-5")]
     fn session_metrics_require_one_role_session_for_team_level_values() {
         let spec = RoleSpec {
             role: "coder".into(),

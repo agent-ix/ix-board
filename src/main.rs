@@ -726,6 +726,7 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+#[implements("FR-047-AC-7")]
 fn encode_output_json(output: &Output) -> Result<String, String> {
     match output {
         Output::RetroEval(report) => {
@@ -1728,6 +1729,10 @@ fn run_retro_backfill(
     )?)
 }
 
+#[implements("FR-047-AC-1")]
+#[implements("FR-047-AC-2")]
+#[implements("FR-047-AC-3")]
+#[implements("FR-047-AC-7")]
 fn run_retro_eval(
     config_path: &std::path::Path,
     team_override: Option<&str>,
@@ -1923,6 +1928,7 @@ fn run_retro_eval(
     })
 }
 
+#[implements("FR-047-AC-1")]
 fn collect_eval_retro_record(
     config: &retro::RetroConfig,
     window: &retro::eval::EvalWindow,
@@ -3241,6 +3247,7 @@ mod tests {
     use ix_cli_kit::exit::Outcome;
     use ix_trace_rs::trace;
 
+    #[trace("FR-047-AC-7")]
     #[test]
     fn retro_eval_json_is_the_report_object_not_an_enum_wrapper() {
         let report = ix_board::retro::eval::EvalReport {
