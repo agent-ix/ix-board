@@ -1887,20 +1887,40 @@ fn run_retro_eval(
     ));
     let session_ledger_rows = fleet_ledger_path
         .as_deref()
-        .and_then(|path| ix_board::fleet::ledger::query(path, "session_turn", None).ok())
-        .map_or_else(Vec::new, |rows| rows.rows);
+        .ok_or_else(|| "fleet ledger path is unavailable for session_turn".to_owned())
+        .and_then(|path| {
+            ix_board::fleet::ledger::query(path, "session_turn", None)
+                .map(|rows| rows.rows)
+                .map_err(|error| error.to_string())
+        });
+    let session_rows = session_ledger_rows
+        .as_ref()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
     let sessions = retro::eval::evaluate_sessions(
         &specs,
         &current_adapters,
-        &session_ledger_rows,
+        session_rows,
         &window,
         session_filter,
     );
     let roles = specs
         .into_iter()
         .map(|spec| {
-            let rules = retro::eval::evaluate_rules(&spec.rules, &current_adapters);
-            let previous_rules = retro::eval::evaluate_rules(&spec.rules, &previous_adapters);
+            let mut current_role_adapters = current_adapters.clone();
+            current_role_adapters.extend(retro::eval::session_turn_adapters(
+                &spec,
+                session_ledger_rows.as_deref().map_err(String::as_str),
+                &window,
+            ));
+            let mut previous_role_adapters = previous_adapters.clone();
+            previous_role_adapters.extend(retro::eval::session_turn_adapters(
+                &spec,
+                session_ledger_rows.as_deref().map_err(String::as_str),
+                &previous_window,
+            ));
+            let rules = retro::eval::evaluate_rules(&spec.rules, &current_role_adapters);
+            let previous_rules = retro::eval::evaluate_rules(&spec.rules, &previous_role_adapters);
             let score = retro::eval::score(&rules);
             let previous_score = retro::eval::score(&previous_rules);
             let trend = retro::eval::complete_score(&rules)

@@ -149,6 +149,51 @@ pub fn filter_sessions(
     sessions
 }
 
+/// Reads the `hooks.role_turns` rule from session-attributed relay prompt rows.
+pub fn session_turn_adapters(
+    spec: &RoleSpec,
+    rows: Result<&[serde_json::Map<String, serde_json::Value>], &str>,
+    window: &EvalWindow,
+) -> BTreeMap<String, QueryValue> {
+    let query = "hooks.role_turns";
+    if !spec
+        .rules
+        .iter()
+        .any(|rule| rule.method == "deterministic" && rule.query_or_rubric == query)
+    {
+        return BTreeMap::new();
+    }
+    let value = match rows {
+        Ok(rows) => {
+            let matching = rows
+                .iter()
+                .filter_map(|row| {
+                    let started_at = row.get("started_at").and_then(serde_json::Value::as_i64)?;
+                    let (Some(address), Some(role)) = (
+                        row.get("session_addr").and_then(serde_json::Value::as_str),
+                        row.get("session_role").and_then(serde_json::Value::as_str),
+                    ) else {
+                        return None;
+                    };
+                    (role == spec.role
+                        && started_at >= window.start_ms
+                        && started_at < window.end_ms)
+                        .then(|| format!("fleet-ledger:session_turn:{address}:{started_at}"))
+                })
+                .collect::<Vec<_>>();
+            QueryValue::Value {
+                value: matching.len() as f64,
+                evidence_refs: matching,
+            }
+        }
+        Err(reason) => QueryValue::Unavailable {
+            reason: format!("session_turn ledger view unavailable: {reason}"),
+            evidence_refs: Vec::new(),
+        },
+    };
+    BTreeMap::from([(query.to_owned(), value)])
+}
+
 /// Builds session rows only for relay turns with explicit role attribution.
 #[implements("FR-047-AC-5")]
 #[implements("FR-047-AC-7")]
@@ -3009,6 +3054,56 @@ mod tests {
                 "fleet-ledger:session_turn:test:workspace:minder:110",
                 "fleet-ledger:session_turn:test:workspace:minder:120",
             ]
+        );
+    }
+
+    #[test]
+    #[ix_trace_rs::trace("FR-047-AC-5")]
+    fn role_turn_adapter_reports_count_or_source_error() {
+        let spec = RoleSpec {
+            role: "minder".into(),
+            rules: vec![EvaluationRule {
+                id: "MIND-R7".into(),
+                rule: "turns".into(),
+                evidence_source: "hooks".into(),
+                trigger: "hooks.role_turns".into(),
+                method: "deterministic".into(),
+                query_or_rubric: "hooks.role_turns".into(),
+                comparator: "=".into(),
+                target: 1.0,
+                unit: "turns".into(),
+            }],
+        };
+        let row = serde_json::Map::from_iter([
+            (
+                "session_addr".into(),
+                serde_json::Value::String("test:workspace:minder".into()),
+            ),
+            (
+                "session_role".into(),
+                serde_json::Value::String("minder".into()),
+            ),
+            ("started_at".into(), serde_json::Value::from(150_i64)),
+        ]);
+        let window = EvalWindow {
+            start_ms: 100,
+            end_ms: 200,
+        };
+        let adapters = session_turn_adapters(&spec, Ok(std::slice::from_ref(&row)), &window);
+        assert_eq!(
+            adapters["hooks.role_turns"],
+            QueryValue::Value {
+                value: 1.0,
+                evidence_refs: vec!["fleet-ledger:session_turn:test:workspace:minder:150".into()],
+            }
+        );
+        let unavailable = session_turn_adapters(&spec, Err("view missing"), &window);
+        assert_eq!(
+            unavailable["hooks.role_turns"],
+            QueryValue::Unavailable {
+                reason: "session_turn ledger view unavailable: view missing".into(),
+                evidence_refs: Vec::new(),
+            }
         );
     }
 }
