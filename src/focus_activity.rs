@@ -14,6 +14,8 @@ use crate::model::{
 pub const DEFAULT_CLOSED_SINCE_SECONDS: u64 = 48 * 60 * 60;
 const RECENTLY_CLOSED_CAP: usize = 50;
 const ACTIVITY_CAP: usize = 200;
+/// Clock skew tolerated between Linear or GitHub timestamps and the local clock.
+const FORWARD_SKEW_SECONDS: i64 = 5 * 60;
 
 fn epoch(value: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(value)
@@ -37,9 +39,10 @@ impl ActivityWindow {
     }
 
     fn contains(self, timestamp: Option<&str>) -> bool {
+        let latest = self.now.saturating_add(FORWARD_SKEW_SECONDS);
         timestamp
             .and_then(epoch)
-            .is_some_and(|at| at >= self.cutoff() && at <= self.now)
+            .is_some_and(|at| at >= self.cutoff() && at <= latest)
     }
 }
 

@@ -1539,12 +1539,7 @@ impl LinearGraphQlSource {
                     updated_at: raw.updated_at,
                     started_at: raw.started_at,
                     completed_at: raw.completed_at,
-                    pull_requests: raw
-                        .attachments
-                        .iter()
-                        .flat_map(|attachments| attachments.nodes.iter())
-                        .filter_map(pull_request_fact)
-                        .collect(),
+                    pull_requests: pull_request_facts(raw.attachments.as_ref()),
                     attachments_complete: raw
                         .attachments
                         .as_ref()
@@ -2290,6 +2285,17 @@ fn parse_pull_url(url: &str) -> Option<(String, u64)> {
     }
     let number = parts.next()?.parse().ok()?;
     Some((repo.to_owned(), number))
+}
+
+/// Pull-request facts from a connection, keeping the first attachment of each URL.
+fn pull_request_facts(attachments: Option<&Connection<RawAttachment>>) -> Vec<PullRequestFact> {
+    let mut seen = BTreeSet::new();
+    attachments
+        .into_iter()
+        .flat_map(|attachments| attachments.nodes.iter())
+        .filter_map(pull_request_fact)
+        .filter(|fact| seen.insert(fact.url.clone()))
+        .collect()
 }
 
 fn pull_request_fact(attachment: &RawAttachment) -> Option<PullRequestFact> {
@@ -3492,9 +3498,13 @@ mod tests {
         assert_eq!(closed.started_at.as_deref(), Some("2026-11-24T10:00:00Z"));
         assert_eq!(closed.completed_at.as_deref(), Some("2026-11-24T10:05:00Z"));
         assert!(closed.attachments_complete);
-        assert_eq!(closed.attachment_urls.len(), 6);
+        assert_eq!(closed.attachment_urls.len(), 7);
         let prs = &closed.pull_requests;
-        assert_eq!(prs.len(), 4, "only GitHub pull attachments become PR facts");
+        assert_eq!(
+            prs.len(),
+            4,
+            "only GitHub pull attachments become PR facts, once per URL"
+        );
         assert_eq!(
             (
                 prs[0].status,

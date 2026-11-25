@@ -299,3 +299,19 @@ fn focus_issues_carry_assignee_lifecycle_times_and_pull_requests_as_json() {
     assert_eq!(in_progress["prs"], serde_json::json!([]));
     assert_eq!(in_progress["completed_at"], serde_json::Value::Null);
 }
+
+/// Trace: FR-045-AC-1
+#[test]
+fn a_timestamp_slightly_ahead_of_the_clock_is_still_inside_the_window() {
+    let status = status_with(
+        vec![project_fixture()],
+        vec![issue(1, Some(-0.02)), issue(2, Some(-1.0))],
+        HOURS_48,
+    );
+    let ids: Vec<_> = status.projects[0]
+        .recently_closed
+        .iter()
+        .map(|issue| issue.identifier.as_str())
+        .collect();
+    assert_eq!(ids, ["SWM-1"]);
+}

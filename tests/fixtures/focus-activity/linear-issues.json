@@ -40,6 +40,11 @@
                 }
               },
               {
+                "url": "https://github.com/agent-ix/filament-examples/pull/128",
+                "sourceType": "github",
+                "metadata": {"number": 128, "repoName": "filament-examples", "status": "open"}
+              },
+              {
                 "url": "https://github.com/agent-ix/ix-board/pull/7",
                 "sourceType": "github",
                 "metadata": {
