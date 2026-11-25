@@ -28,6 +28,7 @@ If this plugin is not initialized or an Agent IX command fails, read [the ix-boa
    the current UTC time. If the timestamp is absent, malformed, or unavailable,
    state that age cannot be determined.
 5. Include command failures and unavailable or partial data explicitly. A missing or failed source is not a clear result. Preserve the command's diagnostic and exit status when it cannot produce a report.
+6. Read `warnings` and `outside_projects` when the result carries them (terminal output: `Warnings:` and `Outside any available project:`). Each warning names an issue that references an unavailable milestone, project, parent or blocker; report every one. `outside_projects` counts focus issues that no project row holds, so the focus total is the project rows plus that group. Never report project rows alone as the whole focus when the group is present.
 
 ## Report format
 
@@ -36,7 +37,9 @@ Present:
 - Selected focus and selectors.
 - Project and milestone status as returned. A `partial_focus` project row counts only selected focus members, so label its totals as partial project progress.
 - Each milestone's and the no-milestone group's `done`/`total` leaf counts when ix-board returns them; preserve absent or incomplete counts as unavailable evidence.
-- Blockers, including their returned root identifiers and layers.
+- Blockers, including their returned root identifiers and layers. A layer can have no rows when its prerequisite has no record; the matching warning names it.
+- The `outside_projects` group and its counts, when returned.
+- Every returned warning.
 - Ready queue in ix-board order.
 - Source fetch timestamp and data age, or why age is unavailable.
 - Any errors, unavailable sections, or partial results.

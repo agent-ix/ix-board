@@ -55,6 +55,18 @@ pub enum ReferenceWarning {
     },
 }
 
+impl ReferenceWarning {
+    /// The warning's `kind` as it appears in JSON and in diagnostics.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::UnavailableMilestone { .. } => "unavailable_milestone",
+            Self::UnavailableProject { .. } => "unavailable_project",
+            Self::UnavailableParent { .. } => "unavailable_parent",
+            Self::UnavailableBlocker { .. } => "unavailable_blocker",
+        }
+    }
+}
+
 impl Display for ReferenceWarning {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {

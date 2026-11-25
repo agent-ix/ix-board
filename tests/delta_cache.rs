@@ -265,7 +265,7 @@ fn unfiltered_paged_baseline_replaces_poisoned_model_partition_without_resetting
     db.execute(
         "INSERT INTO summary_snapshot VALUES(?1,?2,?3,?3)",
         rusqlite::params![
-            format!("{poisoned}:summary:v1"),
+            format!("{poisoned}:summary:v2"),
             serde_json::to_vec(&ix_board::linear_summary::SummarySnapshot::default())
                 .expect("empty summary"),
             clock.now_epoch_seconds()
@@ -611,4 +611,65 @@ fn failed_detail_page_preserves_watermark_records_and_costs_then_retry_and_daily
             "no null lower-bound predicate in full queries"
         );
     }
+}
+
+/// Linear does not move a project's `updatedAt` when a milestone is added to it.
+///
+/// Trace: FR-030-AC-7
+#[trace("FR-030-AC-7")]
+#[test]
+fn a_delta_adds_a_milestone_that_only_a_changed_issue_names() {
+    let mut moved = issue("A");
+    moved["projectMilestone"] = json!({
+        "id":"milestone-new","name":"New milestone","sortOrder":2.0,
+        "targetDate":"2026-12-01","project":{"id":"p1"}
+    });
+    let (endpoint, requests) = fixture(vec![
+        projects(json!([project("p1")])),
+        issues(json!([issue("A")])),
+        projects(json!([])),
+        issues(json!([moved])),
+        initiatives(),
+    ]);
+    let cache = tempfile::tempdir().expect("isolated cache");
+    let clock = ManualClock::new();
+    let mut reader = ReadService::with_clock(
+        source(&endpoint, "milestone-fixture"),
+        &cache.path().join("linear.sqlite3"),
+        clock.clone(),
+    )
+    .expect("reader");
+    let baseline = reader.workspace_snapshot().expect("complete baseline");
+    assert!(baseline.projects[0].milestones.is_empty());
+    clock.advance(1000);
+    let delta = reader.force_refresh_workspace().expect("delta");
+    let milestones = &delta.projects[0].milestones;
+    assert_eq!(milestones.len(), 1);
+    assert_eq!(milestones[0].id, "milestone-new");
+    assert_eq!(milestones[0].name, "New milestone");
+    assert_eq!(milestones[0].target_date.as_deref(), Some("2026-12-01"));
+
+    let expansion = reader
+        .focus_expand(&ix_board::FocusSelection {
+            milestones: vec!["New milestone".to_owned()],
+            ..Default::default()
+        })
+        .expect("the new milestone resolves");
+    assert_eq!(expansion.focus_issues.len(), 1);
+    assert!(expansion.warnings.is_empty());
+    assert_eq!(
+        expansion.projects[0].milestones[0].issues[0].identifier,
+        "A"
+    );
+
+    let requests = requests
+        .recv_timeout(Duration::from_secs(5))
+        .expect("no request beyond the ordinary delta");
+    assert_eq!(requests.len(), 5);
+    assert!(
+        requests[3]["query"]
+            .as_str()
+            .expect("issue query")
+            .contains("projectMilestone { id name sortOrder targetDate project { id } }")
+    );
 }

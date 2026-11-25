@@ -164,7 +164,8 @@ category. It introduces no second calculator and no store.
 - **Failures.** A snapshot that is incomplete, a parent cycle, or a dependency
   cycle returns the existing explicit error for the whole batch and no partial
   result. An unavailable record is an [FR-046](FR-046-dangling-references.md)
-  warning on the batch. A failed or timed-out read
+  warning on the batch, and a selection that depends on it is `incomplete`.
+  A failed or timed-out read
   returns the FR-004 error and no result. The library keeps no last-good result
   and no revision cache; the caller keeps any last-good result with its original
   fetch time.

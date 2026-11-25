@@ -148,7 +148,8 @@ records through Linear GraphQL and caches read results locally.
 ## Requirements Architecture
 
 SWM-295 adds [FR-046](./functional/FR-046-dangling-references.md): reads complete
-over references to unavailable Linear records and report typed warnings. SWM-296
+over references to unavailable Linear records and report typed warnings, and
+FR-030 keeps new milestones in an incremental detail refresh. SWM-296
 adds identifiers, initiative membership and cached leaf counts to the FR-020
 roadmap.
 

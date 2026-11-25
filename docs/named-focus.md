@@ -84,7 +84,10 @@ ordered by key, and teams by team key.
   usual error.
 - **Unavailable references.** A missing parent, prerequisite, project or milestone
   record does not fail the batch. Its `warnings` member lists them, as in
-  [focus reads](focus.md#unavailable-references).
+  [focus reads](focus.md#unavailable-references). A selection that depends on a
+  missing parent, prerequisite or project is `incomplete` with
+  `unavailable_references` under `unknown_facts`. So is a selection with a ticket
+  member while any issue of its team has a missing parent.
 
 ### What is known
 
@@ -100,7 +103,7 @@ A selection state tells you how much to trust the counts:
 | --- | --- |
 | `empty` | `include` is empty. The result is exactly zero. |
 | `complete` | Every member resolved. |
-| `incomplete` | A member did not resolve. Counts cover resolved members only (`partial`). |
+| `incomplete` | A member did not resolve, or a fact the counts depend on is unknown. Counts are `partial`. |
 | `unavailable` | Nothing could be established, such as a team that appears nowhere. Zeros mean unknown. |
 
 A batch with no selections has `state: none` and no totals. A team union is

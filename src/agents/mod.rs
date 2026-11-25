@@ -380,6 +380,10 @@ pub struct AgentsReport {
     pub missing_hosts: Vec<MissingHost>,
     /// Why `IDLE` rows carry no next ticket, when the queue was unreadable.
     pub ready_queue_error: Option<String>,
+    /// Unavailable references met while reading the ready queue, which can keep work out
+    /// of it; omitted when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ready_queue_warnings: Vec<crate::ReferenceWarning>,
 }
 
 /// One enabled machine whose rows could not be read.
@@ -539,6 +543,7 @@ pub fn build_report_with_timeout(
         errors,
         missing_hosts,
         ready_queue_error,
+        ready_queue_warnings: Vec::new(),
     }
 }
 
@@ -915,6 +920,9 @@ pub fn render_text(report: &AgentsReport) -> String {
     }
     if let Some(reason) = &report.ready_queue_error {
         lines.push(format!("Ready queue unavailable: {reason}"));
+    }
+    for warning in &report.ready_queue_warnings {
+        lines.push(format!("Ready queue warning: {warning}"));
     }
     lines.join("\n")
 }

@@ -53,7 +53,7 @@ Terminal output lists, under each project, a "Closed in window" section with eac
 | FR-045-AC-1 | `recently_closed` for a project, a milestone and the no-milestone group holds exactly the completed issues of that group with `completed_at` inside the window; issues outside it, not completed, or canceled are omitted, and a narrower `--closed-since` shrinks the list. | Test |
 | FR-045-AC-2 | `recently_closed` is ordered by `completed_at`, newest first. | Test |
 | FR-045-AC-3 | With more than 50 qualifying issues `recently_closed` holds the 50 newest, and `activity` holds at most 200 events. | Test |
-| FR-045-AC-4 | `activity` holds `merged`, `opened` and `closed` events only when their timestamp is inside the window, newest first, with the project name, and `pr` null for `closed`. | Test |
+| FR-045-AC-4 | `activity` holds `merged`, `opened` and `closed` events only when their timestamp is inside the window, newest first, with the project name (the FR-046 text for an issue outside every project row), and `pr` null for `closed`. | Test |
 | FR-045-AC-5 | Duplicate attachments of one pull request, and any other repeat of the same kind, issue and pull-request URL, produce one event. | Test |
 | FR-045-AC-6 | Each `FocusIssue` serializes `assignee`, `started_at`, `completed_at` and `prs`, with `prs` an empty array when there are none. | Test |
 | FR-045-AC-7 | A GitHub pull attachment's metadata sets `status` (`merged`, `draft`, `open`), `draft`, `created_at`, `merged_at`, `number` and `repo`. | Test |

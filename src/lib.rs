@@ -1478,7 +1478,7 @@ fn unresolved_blockers_within(
         }
         let Some(blocker) = issues.get(&blocker_id) else {
             // A prerequisite with no record is not proven Completed (FR-046).
-            unresolved.insert(format!("{} (unavailable)", blocker_id.0));
+            unresolved.insert(unavailable_label(&blocker_id.0));
             continue;
         };
         if blocker.state_type != WorkflowStateType::Completed {
@@ -1487,6 +1487,14 @@ fn unresolved_blockers_within(
         pending.extend(blocker.blocked_by.iter().cloned());
     }
     Ok(unresolved)
+}
+
+/// Project name of an activity event whose issue has no project.
+const NO_PROJECT_LABEL: &str = "no project";
+
+/// How a prerequisite or project without a record is named in place of an identifier.
+fn unavailable_label(id: &str) -> String {
+    format!("{id} (unavailable)")
 }
 
 fn canonical_selectors(
@@ -1577,8 +1585,10 @@ fn make_project_chunk(
             blocked_by: issue
                 .blocked_by
                 .iter()
-                .filter_map(|id| issues.get(id))
-                .map(|dependency| dependency.identifier.clone())
+                .map(|id| match issues.get(id) {
+                    Some(dependency) => dependency.identifier.clone(),
+                    None => unavailable_label(&id.0),
+                })
                 .collect(),
         })
         .collect::<Vec<_>>();
@@ -1877,6 +1887,18 @@ fn make_focus_status(
                     .is_some_and(|id| row_ids.contains(id))
         })
         .collect::<Vec<_>>();
+    // They belong to no project row, but their events are still focus activity (FR-045).
+    for issue in &outside {
+        let project = match &issue.project_id {
+            Some(id) => unavailable_label(&id.0),
+            None => NO_PROJECT_LABEL.to_owned(),
+        };
+        events.extend(project_events(
+            &project,
+            std::slice::from_ref(issue),
+            window,
+        ));
+    }
     let outside_projects =
         (!outside.is_empty()).then(|| unmilestoned_status(&outside, &leaf_ids, window));
 
@@ -2477,15 +2499,11 @@ fn focus_blocker_layers_within(
         .map(|layer| {
             layer
                 .into_iter()
-                .map(|id| {
+                // A prerequisite without a record has no row; its layer stays, so its
+                // dependents keep their depth (FR-046).
+                .filter_map(|id| issues.get(&id).copied().map(|issue| (id, issue)))
+                .map(|(id, issue)| {
                     budget.check()?;
-                    let issue =
-                        issues
-                            .get(&id)
-                            .copied()
-                            .ok_or_else(|| Error::MissingDependency {
-                                issue: id.0.clone(),
-                            })?;
                     let classification = match issue.state_type {
                         WorkflowStateType::Completed => FocusIssueClassification::Completed,
                         WorkflowStateType::Canceled => FocusIssueClassification::Canceled,
@@ -2550,20 +2568,18 @@ fn dependency_layers(
         .iter()
         .map(|issue| (&issue.id, issue))
         .collect();
-    layers
+    Ok(layers
         .into_iter()
         .map(|layer| {
             layer
                 .into_iter()
-                .map(|id| {
-                    issues
-                        .get(&id)
-                        .map(|issue| issue.identifier.clone())
-                        .ok_or_else(|| Error::MissingDependency { issue: id.0 })
+                .map(|id| match issues.get(&id) {
+                    Some(issue) => issue.identifier.clone(),
+                    None => unavailable_label(&id.0),
                 })
                 .collect()
         })
-        .collect()
+        .collect())
 }
 
 fn dependency_layer_ids(
@@ -2594,28 +2610,20 @@ fn dependency_layers_within(
         if !closure.insert(id.clone()) {
             continue;
         }
-        let Some(issue) = issues.get(&id) else {
-            return Err(Error::MissingDependency { issue: id.0 });
-        };
-        // Prerequisites with no record stay out of the closure (FR-046).
-        pending.extend(
-            issue
-                .blocked_by
-                .iter()
-                .filter(|blocker| issues.contains_key(blocker))
-                .cloned(),
-        );
+        // A prerequisite without a record stays in the closure with no prerequisites
+        // of its own, so its dependents never fall into layer zero (FR-046).
+        if let Some(issue) = issues.get(&id) {
+            pending.extend(issue.blocked_by.iter().cloned());
+        }
     }
     let mut indegree: BTreeMap<IssueId, usize> =
         closure.iter().cloned().map(|id| (id, 0)).collect();
     let mut dependents: BTreeMap<IssueId, Vec<IssueId>> = BTreeMap::new();
     for issue_id in &closure {
         budget.check()?;
-        let issue = issues
-            .get(issue_id)
-            .ok_or_else(|| Error::MissingDependency {
-                issue: issue_id.0.clone(),
-            })?;
+        let Some(issue) = issues.get(issue_id) else {
+            continue;
+        };
         for blocker in &issue.blocked_by {
             if closure.contains(blocker) {
                 *indegree.entry(issue_id.clone()).or_default() += 1;
@@ -2638,9 +2646,6 @@ fn dependency_layers_within(
         let mut ordered_layer = Vec::with_capacity(current.len());
         for id in &current {
             budget.check()?;
-            let _issue = issues.get(id).ok_or_else(|| Error::MissingDependency {
-                issue: id.0.clone(),
-            })?;
             ordered_layer.push(id.clone());
             emitted += 1;
             if let Some(children) = dependents.get(id) {

@@ -25,9 +25,10 @@ use ix_board::{
 use ix_cli_kit::exit::Outcome;
 use ix_cli_kit::secrets::{AppScope, SecretKey, SecretStore, SecretValue};
 use ix_cli_kit::streams::{
-    ColorChoice, Diagnostics, DiagnosticsFormat, emit_diagnostic, emit_result,
+    ColorChoice, Diagnostics, DiagnosticsFormat, emit_diagnostic, emit_result, emit_warning,
 };
 use serde::Serialize;
+use std::collections::BTreeSet;
 use std::io::Read;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -379,6 +380,36 @@ enum ProjectCommand {
     },
 }
 
+/// The ready queue. Its JSON is the bare list of rows; the warnings are diagnostics.
+#[derive(Serialize)]
+#[serde(transparent)]
+struct ReadyQueue {
+    items: Vec<ReadyItem>,
+    #[serde(skip)]
+    warnings: Vec<ReferenceWarning>,
+}
+
+/// The ready-queue warnings of a result, whether or not it is labeled cached.
+fn queue_warnings(output: &Output) -> &[ReferenceWarning] {
+    match output {
+        Output::Cached { result, .. } => queue_warnings(result),
+        Output::Queue(queue) => &queue.warnings,
+        _ => &[],
+    }
+}
+
+/// The first ready row of one team's queue read, keeping the read's warnings.
+fn first_ready(
+    (queue, warnings): (Vec<ReadyItem>, Vec<ReferenceWarning>),
+    collected: &mut BTreeSet<ReferenceWarning>,
+) -> Option<ReadyTicket> {
+    collected.extend(warnings);
+    queue.into_iter().next().map(|item| ReadyTicket {
+        identifier: item.identifier,
+        title: item.title,
+    })
+}
+
 #[derive(Serialize)]
 #[serde(untagged)]
 enum Output {
@@ -393,7 +424,7 @@ enum Output {
         status: String,
         source: Option<String>,
     },
-    Queue(Vec<ReadyItem>),
+    Queue(ReadyQueue),
     Chunk(ProjectChunk),
     Focus(FocusExpansion),
     FocusStatus(FocusStatus),
@@ -480,6 +511,9 @@ fn main() -> std::process::ExitCode {
                 && let Some(reason) = &freshness.failure_reason
             {
                 eprintln!("{reason}");
+            }
+            for warning in queue_warnings(&output) {
+                emit_warning(diagnostics, warning.kind(), &warning.to_string());
             }
             let rendered = if cli.json {
                 ix_cli_kit::json::encode_canonical(&output, true).map_err(|error| error.to_string())
@@ -972,22 +1006,22 @@ fn run_fleet_assign(
 fn run_agents(teams: &[String], idle_after: u64) -> Result<AgentsReport, Error> {
     let hosts = ix_board::agents::system_hosts()?;
     let mut service = None;
+    let mut warnings = BTreeSet::new();
     let mut next_ready = |team: &str| -> Result<Option<ReadyTicket>, String> {
         if service.is_none() {
             let source = LinearGraphQlSource::from_env().map_err(|error| error.to_string())?;
             service = Some(ReadService::open_default(source).map_err(|error| error.to_string())?);
         }
-        let queue = service
+        let read = service
             .as_mut()
             .ok_or_else(|| "ready queue unavailable".to_owned())?
-            .next(team)
+            .next_with_warnings(team)
             .map_err(|error| error.to_string())?;
-        Ok(queue.into_iter().next().map(|item| ReadyTicket {
-            identifier: item.identifier,
-            title: item.title,
-        }))
+        Ok(first_ready(read, &mut warnings))
     };
-    Ok(build_report(&hosts, teams, idle_after, &mut next_ready))
+    let mut report = build_report(&hosts, teams, idle_after, &mut next_ready);
+    report.ready_queue_warnings = warnings.into_iter().collect();
+    Ok(report)
 }
 
 fn run_retro_snapshot(config_path: &std::path::Path, window: &str) -> Result<Output, Error> {
@@ -1116,13 +1150,10 @@ fn run_linear(command: Command) -> Result<Output, Error> {
         Command::Orphans { .. } => {
             unreachable!("program review commands are handled before Linear dispatch")
         }
-        // The queue's JSON is a bare list, so its warnings go to stderr (FR-046).
-        Command::Next { team } => service.next_with_warnings(&team).map(|(queue, warnings)| {
-            for warning in warnings {
-                eprintln!("warning: {warning}");
-            }
-            Output::Queue(queue)
-        }),
+        // The queue's JSON is a bare list, so its warnings are diagnostics (FR-046).
+        Command::Next { team } => service
+            .next_with_warnings(&team)
+            .map(|(items, warnings)| Output::Queue(ReadyQueue { items, warnings })),
         Command::ProjectChunk { project } => service.project_chunk(&project).map(Output::Chunk),
         Command::Search { query } => service.search(&query).map(Output::Search),
         Command::Issues { identifiers } => service.issues(&identifiers).map(Output::Issues),
@@ -1347,7 +1378,7 @@ fn render_human(output: &Output) -> String {
             Some(source) => format!("Linear credential {status} ({source})"),
             None => format!("Linear credential {status}"),
         },
-        Output::Queue(items) => render_queue(items),
+        Output::Queue(queue) => render_queue(&queue.items),
         Output::Chunk(chunk) => render_chunk(chunk),
         Output::Focus(expansion) => render_focus(expansion),
         Output::FocusStatus(status) => render_focus_status(status),
@@ -2300,7 +2331,10 @@ mod tests {
     #[test]
     fn fallback_json_and_text_preserve_unknown_age_cooldown_and_failure() {
         let output = Output::Cached {
-            result: Box::new(Output::Queue(Vec::new())),
+            result: Box::new(Output::Queue(crate::ReadyQueue {
+                items: Vec::new(),
+                warnings: Vec::new(),
+            })),
             freshness: ix_board::CacheFreshness {
                 last_successful_sync: None,
                 last_full_reconciliation: None,
@@ -2340,6 +2374,26 @@ mod tests {
             )
         );
     }
+    /// Trace: FR-046-AC-10
+    #[test]
+    fn the_agents_queue_lookup_keeps_each_warning_once_across_teams() {
+        let warning = |issue: &str| ix_board::ReferenceWarning::UnavailableBlocker {
+            issue: issue.to_owned(),
+            blocker: "gone".to_owned(),
+        };
+        let mut collected = std::collections::BTreeSet::new();
+        let empty = crate::first_ready((Vec::new(), vec![warning("ENG-2")]), &mut collected);
+        assert!(empty.is_none());
+        crate::first_ready(
+            (Vec::new(), vec![warning("ENG-2"), warning("ENG-1")]),
+            &mut collected,
+        );
+        assert_eq!(
+            collected.into_iter().collect::<Vec<_>>(),
+            [warning("ENG-1"), warning("ENG-2")]
+        );
+    }
+
     /// Trace: FR-046-AC-6
     #[test]
     fn focus_status_text_lists_warnings_and_the_outside_group() {

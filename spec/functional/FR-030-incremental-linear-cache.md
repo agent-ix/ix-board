@@ -44,6 +44,13 @@ with the complete merged dataset only after every required page succeeds. Relate
 data whose changes cannot be enumerated SHALL be refreshed or explicitly marked
 unavailable; a partial delta SHALL NOT certify a complete fresh workspace.
 
+Adding a milestone does not move its project's `updatedAt`. The detailed issue
+query SHALL therefore read each issue milestone's name, order, target date and
+owning project, and a detail refresh SHALL add to a held project each referenced
+milestone it lacks, without an additional request. The added record has no
+description until its project is next read. A renamed or removed milestone is
+observed when its project is next read.
+
 The coordinator SHALL perform a full authoritative reconciliation for an absent or
 incompatible baseline and when the last full reconciliation is at least 24 hours
 old. A full reconciliation SHALL remove IDs missing from the accessible source
@@ -62,6 +69,7 @@ data is requested; a summary-only command SHALL reconcile only summary catalogs.
 | FR-030-AC-4 | Cold roadmap and scope-check fixtures request no issue pages or histories; requesting a ticket-dependent report loads detail, subsequent reports reuse it, and a summary refresh never advances detail freshness. | Test |
 | FR-030-AC-5 | Two retro workers sharing a fixture cache reuse the centrally coordinated snapshot/delta without each probing and forcing a full workspace fetch; ticket/history requests remain covered by the shared quota meter. | Test |
 | FR-030-AC-6 | Fixtures independently change source endpoint, workspace, credential-derived authorization identity, cache-model/schema version, and dataset coverage while retaining overlapping stable record IDs; each mismatch (or absent compatibility metadata) requires a full baseline, never merges or returns the old partition as fallback, and a failed/blocked baseline exposes no old-partition records. An exact partition match permits incremental reuse; changing credentials does not reset the shared quota allowance. | Test |
+| FR-030-AC-7 | Given a delta whose changed issue names a milestone created after its project's `updatedAt`, with no project in the delta, the held project gains the milestone, a milestone selector resolves it without warnings, and the refresh sends only the ordinary delta requests. | Test |
 
 ## Dependencies
 

@@ -55,7 +55,8 @@ including blocker-only, completed, and canceled issues, SHALL participate in
 the layer calculation. The layer of a node with no blocker prerequisites in the
 closure SHALL be 0. The layer of every other node SHALL be one plus the maximum
 layer of its blocker prerequisites in the closure; this is the longest-path
-depth from a node without prerequisites. ix-board SHALL emit only open focus
+depth from a node without prerequisites. A prerequisite without a record
+(FR-046) SHALL count as a node of layer 0. ix-board SHALL emit only open focus
 issues as rows.
 
 The command SHALL order rows by this complete tuple, in ascending order:
@@ -126,7 +127,7 @@ produce explicit errors and no partial chunk.
 | FR-014-AC-5 | Given descriptions with a matching Acceptance Criteria Markdown heading, the excerpt is the trimmed section body through the next heading, limited to 280 Unicode scalar values with `…` only when truncated; absent headings or empty bodies yield null, and description text does not change focus membership or readiness. | Test |
 | FR-014-AC-6 | Given identical complete Linear records and size, repeated calls return identical rows, readiness reasons, unblocks, excerpts, ordering, and source fetch timestamp; a dependency cycle, incomplete input, or empty focus returns an explicit error without partial rows. | Test |
 | FR-014-AC-7 | The operation uses only structured Linear reads and makes no GitHub Issues request or mutation. | Inspection |
-| FR-014-AC-8 | Given one focus issue with prerequisite paths of unequal lengths in its complete blocker closure and another focus issue on a shorter path, each node receives layer zero when it has no blocker prerequisites and otherwise one plus its deepest prerequisite layer; the longer path's focus issue sorts after the shorter-path issue regardless of milestone order. | Test |
+| FR-014-AC-8 | Given one focus issue with prerequisite paths of unequal lengths in its complete blocker closure and another focus issue on a shorter path, each node receives layer zero when it has no blocker prerequisites and otherwise one plus its deepest prerequisite layer, a prerequisite without a record counting as one in layer zero; the longer path's focus issue sorts after the shorter-path issue regardless of milestone order. | Test |
 | FR-014-AC-9 | Given unmilestoned and milestone-assigned open focus issues across projects, dependency layer sorts first, FR-001 project priority/manual order/project identifier sorts next, and within each project milestone-assigned rows follow Linear milestone order before its unmilestoned rows; stable issue identifier resolves remaining ties. | Test |
 | FR-014-AC-10 | Given a work-milestone filter, the chunk includes selected open work and open focus-member prerequisites from its blocker closure, excludes unrelated later work, preserves dependency order, and rejects unknown milestones. | Test |
 | FR-014-AC-11 | An open `Todo` issue with a running project and completed blockers remains in the handoff with `ready=false`; its reasons call it open, identify that Todo is outside the Backlog/Specify/Specced new-work states, and never call it eligible. | Test |

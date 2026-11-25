@@ -7,10 +7,11 @@
 use ix_board::linear_summary::{InitiativeSummary, ProjectSummary, SummarySnapshot};
 use ix_board::program_review::build_summary_roadmap;
 use ix_board::{
-    CatalogEvidence, Clock, Error, FocusExpansion, FocusSelection, FocusStatus, Initiative, Issue,
-    IssueId, Milestone, NamedFocusRequest, NamedMember, NamedSelection, Project, ProjectId,
-    ProjectStatusCategory, ReadService, ReferenceWarning, ScopeSelection, TeamKey,
-    WorkflowStateType, WorkspaceSnapshot, WorkspaceSource, evaluate_named_batch, select_scope,
+    CatalogEvidence, Clock, CountAvailability, Error, FocusExpansion, FocusSelection, FocusStatus,
+    Initiative, Issue, IssueId, Milestone, NamedBatch, NamedFocusRequest, NamedMember,
+    NamedSelection, Project, ProjectId, ProjectStatusCategory, ReadService, ReferenceWarning,
+    ScopeSelection, SelectionState, TeamKey, UnknownFact, WorkflowStateType, WorkspaceSnapshot,
+    WorkspaceSource, evaluate_named_batch, select_scope,
 };
 use ix_trace_rs::trace;
 use std::sync::Arc;
@@ -324,7 +325,7 @@ fn an_unavailable_milestone_counts_at_project_level_in_every_focus_read() {
     );
 }
 
-#[trace("FR-046-AC-2", "FR-046-AC-3")]
+#[trace("FR-046-AC-2", "FR-046-AC-3", "FR-045-AC-4")]
 #[test]
 fn issues_outside_every_project_row_are_counted_and_warned() {
     let mut snapshot = dangling();
@@ -338,6 +339,12 @@ fn issues_outside_every_project_row_are_counted_and_warned() {
     assert_eq!((outside.progress.done, outside.progress.total), (1, 2));
     assert_eq!(outside.recently_closed.len(), 1);
     assert_eq!(outside.recently_closed[0].identifier, "SWM-6");
+    let activity = status
+        .activity
+        .iter()
+        .map(|event| (event.identifier.as_str(), event.project.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(activity, [("SWM-6", "ghost (unavailable)")]);
     assert_eq!(status.projects.len(), 1);
     assert_eq!(
         status.warnings,
@@ -434,17 +441,23 @@ fn an_unavailable_blocker_blocks_its_dependents_without_failing_any_read() {
     let selection = tickets(&["SWM-9"]);
 
     let expansion = fixture.reads.focus_expand(&selection).expect("expand");
+    // The unavailable prerequisite holds layer zero, so nothing that waits on it does.
     assert_eq!(
         expansion.blocker_layers,
-        [vec!["SWM-8".to_owned()], vec!["SWM-9".to_owned()]]
+        [
+            vec!["archived-blocker (unavailable)".to_owned()],
+            vec!["SWM-8".to_owned()],
+            vec!["SWM-9".to_owned()]
+        ]
     );
     assert_eq!(expansion.warnings, std::slice::from_ref(&expected));
 
     let status = fixture.reads.focus_status(&selection).expect("status");
     assert_counts_match_scope(&snapshot, &selection, &status);
     assert!(status.ready_queue.is_empty());
-    assert_eq!(status.blocker_layers.len(), 2);
-    assert_eq!(status.blocker_layers[0][0].focus_root_ids, ["SWM-9"]);
+    assert_eq!(status.blocker_layers.len(), 3);
+    assert!(status.blocker_layers[0].is_empty());
+    assert_eq!(status.blocker_layers[1][0].focus_root_ids, ["SWM-9"]);
     assert_eq!(status.warnings, std::slice::from_ref(&expected));
 
     let chunk = fixture
@@ -459,13 +472,36 @@ fn an_unavailable_blocker_blocks_its_dependents_without_failing_any_read() {
             .any(|reason| reason.contains("archived-blocker (unavailable)"))
     );
     assert_eq!(chunk.issues[0].unblocks, ["SWM-9"]);
+    let layers = chunk
+        .issues
+        .iter()
+        .map(|row| (row.identifier.as_str(), row.dependency_layer))
+        .collect::<Vec<_>>();
+    assert_eq!(layers, [("SWM-8", 1), ("SWM-9", 2)]);
 
     let project = fixture.reads.project_chunk("p2").expect("project chunk");
     assert_eq!(
         project.blocker_layers,
         [
-            vec!["SWM-4".to_owned(), "SWM-8".to_owned()],
+            vec![
+                "archived-blocker (unavailable)".to_owned(),
+                "SWM-4".to_owned()
+            ],
+            vec!["SWM-8".to_owned()],
             vec!["SWM-9".to_owned()]
+        ]
+    );
+    let blocked_by = project
+        .open_tickets
+        .iter()
+        .map(|ticket| (ticket.identifier.as_str(), ticket.blocked_by.clone()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        blocked_by,
+        [
+            ("SWM-4", vec![]),
+            ("SWM-8", vec!["archived-blocker (unavailable)".to_owned()]),
+            ("SWM-9", vec!["SWM-8".to_owned()]),
         ]
     );
     assert_eq!(
@@ -503,6 +539,99 @@ fn an_unavailable_blocker_blocks_its_dependents_without_failing_any_read() {
     let counts = &batch.selections[0].counts;
     assert_eq!((counts.total, counts.ready, counts.blocked), (3, 1, 2));
     assert!(batch.warnings.contains(&expected));
+}
+
+#[trace("FR-046-AC-5", "FR-014-AC-8")]
+#[test]
+fn a_bounded_plan_chunk_offers_unblocked_work_before_work_behind_an_unavailable_blocker() {
+    // The blocked identifier sorts first, so only its layer can put it second.
+    let mut fixture = fixture(snapshot(vec![
+        blocked_by(issue("SWM-20", Some("p1")), "archived-blocker"),
+        issue("SWM-21", Some("p1")),
+    ]));
+    let chunk = fixture
+        .reads
+        .focus_plan_chunk(&projects(&["p1"]), std::num::NonZeroUsize::new(1))
+        .expect("plan chunk");
+    assert_eq!(chunk.issues.len(), 1);
+    assert_eq!(chunk.issues[0].identifier, "SWM-21");
+    assert!(chunk.issues[0].ready);
+}
+
+fn batch_of(snapshot: &WorkspaceSnapshot, members: Vec<(&str, NamedMember)>) -> NamedBatch {
+    let requests = members
+        .into_iter()
+        .map(|(key, member)| NamedFocusRequest {
+            key: key.to_owned(),
+            selection: NamedSelection::new(TeamKey("SWM".to_owned()), vec![member], Vec::new()),
+        })
+        .collect::<Vec<_>>();
+    let evidence = CatalogEvidence {
+        initiative_links: true,
+        ..CatalogEvidence::default()
+    };
+    evaluate_named_batch(snapshot, &evidence, &requests).expect("batch")
+}
+
+fn assert_incomplete(batch: &NamedBatch, key: &str) {
+    let selection = batch
+        .selections
+        .iter()
+        .find(|selection| selection.key == key)
+        .expect("selection");
+    assert_eq!(selection.state, SelectionState::Incomplete, "{key}");
+    assert_eq!(selection.counts_availability, CountAvailability::Partial);
+    assert_eq!(
+        selection.unknown_facts,
+        [UnknownFact::UnavailableReferences]
+    );
+    let team = &batch.teams[0];
+    assert_eq!(team.state, SelectionState::Incomplete);
+    assert_eq!(team.counts_availability, CountAvailability::Partial);
+    assert!(team.causes.iter().any(|cause| {
+        cause.key == key && cause.unknown_facts == [UnknownFact::UnavailableReferences]
+    }));
+}
+
+#[trace("FR-046-AC-9", "FR-012-AC-17")]
+#[test]
+fn a_named_selection_that_depends_on_an_unavailable_record_is_never_complete() {
+    let project = |id: &str| NamedMember::Project { id: id.to_owned() };
+    let ticket = |id: &str| NamedMember::Issue { id: id.to_owned() };
+    for (name, issues) in [
+        (
+            "blocker",
+            vec![blocked_by(issue("SWM-1", Some("p1")), "gone")],
+        ),
+        ("parent", vec![child_of(issue("SWM-1", Some("p1")), "gone")]),
+    ] {
+        let batch = batch_of(&snapshot(issues), vec![(name, project("p1"))]);
+        assert_incomplete(&batch, name);
+    }
+    // A selection of a ticket's descendants cannot tell what a missing parent hides.
+    let batch = batch_of(
+        &snapshot(vec![
+            issue("SWM-1", Some("p1")),
+            child_of(issue("SWM-2", Some("p2")), "gone"),
+        ]),
+        vec![("ticket", ticket("SWM-1"))],
+    );
+    assert_incomplete(&batch, "ticket");
+    assert!(batch.warnings.is_empty());
+
+    // The affected selection does not taint another one, and a milestone reference
+    // changes no count.
+    let batch = batch_of(
+        &snapshot(vec![
+            in_milestone(issue("SWM-1", Some("p1")), "gone"),
+            blocked_by(issue("SWM-2", Some("p2")), "gone"),
+        ]),
+        vec![("clean", project("p1")), ("dirty", project("p2"))],
+    );
+    assert_eq!(batch.selections[0].state, SelectionState::Complete);
+    assert!(batch.selections[0].unknown_facts.is_empty());
+    assert_incomplete(&batch, "dirty");
+    assert_eq!(batch.teams[0].causes.len(), 1);
 }
 
 #[trace("FR-046-AC-6", "FR-046-AC-1")]

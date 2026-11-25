@@ -22,6 +22,7 @@ If this plugin is not initialized or an Agent IX command fails, read [the ix-boa
 3. Present all returned findings, available and unavailable groups, each unavailable reason, and the diff from the most recent successful report.
 4. Preserve ix-board's availability and diff result. If the diff is missing, incomplete, or unavailable, report that condition and its reason when provided. Never describe unavailable evidence as clean or claim that an unavailable diff is empty.
 5. Include command failures, diagnostics, and partial data explicitly. Do not recreate hygiene checks or compare prior reports yourself.
+6. When the report carries `warnings` (terminal output: `Warnings:`), list every one. Each names an issue that references an unavailable milestone, project, parent or blocker, so the focus is not clean.
 
 ## Report format
 

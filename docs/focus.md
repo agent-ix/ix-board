@@ -33,8 +33,9 @@ graph. The closure includes blockers from other projects and teams, and blockers
 that are completed or canceled. Layer 0 holds issues without blockers. Every
 other issue is one layer above its deepest blocker. Blockers that are not part of
 the focus stay visible and are marked as blocker-only. A blocker without a record
-has no row (see [unavailable references](#unavailable-references)). A dependency
-cycle is an error.
+still takes layer 0, so nothing that waits on it is in layer 0 (see
+[unavailable references](#unavailable-references)). A dependency cycle is an
+error.
 
 ## Unavailable references
 
@@ -50,6 +51,10 @@ each such reference.
 | `unavailable_parent` | Ancestry ends at the issue |
 | `unavailable_blocker` | The issue and its dependents are not ready |
 
+A blocker without a record appears as `<uuid> (unavailable)` in the layers of
+`expand` and `project-chunk` and in `project-chunk`'s `blocked_by`. `status`
+keeps its layer without a row.
+
 ```json
 "warnings": [
   {
@@ -64,13 +69,16 @@ each such reference.
 The `warnings` member is omitted when there is nothing to report, and terminal
 output lists the same entries under `Warnings:`. `status` counts the selected
 issues that no project row holds, including issues without a project, in
-`outside_projects`, so project rows plus that group equal the whole focus.
-`next` prints its warnings to standard error. A parent cycle or a dependency
-cycle is still an error.
+`outside_projects`, so project rows plus that group equal the whole focus. Their
+activity events name the project `<uuid> (unavailable)` or `no project`. `next`
+prints its warnings as diagnostics on standard error, in the format set by
+`--diagnostics-format`, and `agents` lists them in `ready_queue_warnings`. A
+parent cycle or a dependency cycle is still an error.
 
-A milestone created recently can be reported as unavailable until the next full
-reconciliation of the cache, because an incremental refresh reads only the
-projects that Linear marks as updated.
+Linear does not mark a project as updated when a milestone is added to it. An
+incremental refresh therefore adds a new milestone from the changed issues that
+name it. A cache that missed a milestone before this behavior keeps reporting it
+until one of its issues changes or the daily full reconciliation runs.
 
 ## Work milestones
 

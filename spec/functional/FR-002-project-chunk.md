@@ -28,8 +28,10 @@ and prerequisites in `Completed` or `Canceled` states. The command orders layers
 topologically, with prerequisites before their dependents, and orders entries
 within each layer by stable Linear issue identifier. A prerequisite absent from
 the structured source data is reported as an
-[FR-046](FR-046-dangling-references.md) warning, and the command reports a
-dependency-cycle error if the closure contains a cycle.
+[FR-046](FR-046-dangling-references.md) warning; it takes layer zero and appears
+there, and in `blocked_by`, as `<uuid> (unavailable)`, ahead of identified
+issues. The command reports a dependency-cycle error if the closure contains a
+cycle.
 
 ## Inputs
 
@@ -52,7 +54,7 @@ dependency-cycle error if the closure contains a cycle.
 | FR-002-AC-4 | Given identical structured project input, repeated calls return the same categories and dependency relationships. | Test |
 | FR-002-AC-5 | Given open issues in the requested project, `blocker_layers` contains their full transitive `blocked_by` closure, including prerequisites in other projects or teams and prerequisites in `Completed` or `Canceled` states. | Test |
 | FR-002-AC-6 | Given a dependency graph for the closure, layers place prerequisites before dependents and order entries within each layer by stable Linear issue identifier. | Test |
-| FR-002-AC-7 | Given a `blocked_by` reference in the closure to an issue absent from the structured source data, `project-chunk` returns the chunk with the available layers and an `unavailable_blocker` warning (FR-046). | Test |
+| FR-002-AC-7 | Given a `blocked_by` reference in the closure to an issue absent from the structured source data, `project-chunk` returns the chunk with that prerequisite named `<uuid> (unavailable)` in the dependent's `blocked_by` and in the layer below it, and an `unavailable_blocker` warning (FR-046). | Test |
 | FR-002-AC-8 | Given a cycle in the dependency closure, `project-chunk` reports a dependency-cycle error. | Test |
 | FR-002-AC-9 | An exact project name resolves case-insensitively to the same chunk as its identifier; duplicate matching names fail explicitly rather than choosing one. | Test |
 
