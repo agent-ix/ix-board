@@ -935,6 +935,7 @@ struct PrometheusSample {
     value: f64,
 }
 
+#[implements("FR-033-AC-16")]
 fn read_prometheus_status(teams: &BTreeSet<String>) -> Result<PrometheusLeadStatus, String> {
     let base = std::env::var("IX_PROMETHEUS_URL")
         .unwrap_or_else(|_| "http://prometheus.luna.ix".to_owned());
@@ -961,6 +962,7 @@ fn read_prometheus_status(teams: &BTreeSet<String>) -> Result<PrometheusLeadStat
     })
 }
 
+#[implements("FR-033-AC-16")]
 fn regex_escape(value: &str) -> String {
     value
         .chars()
@@ -974,6 +976,7 @@ fn regex_escape(value: &str) -> String {
         .collect()
 }
 
+#[implements("FR-033-AC-16")]
 fn parse_prometheus_samples(body: &str) -> Result<Vec<PrometheusSample>, String> {
     let value: serde_json::Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
     if value.get("status").and_then(serde_json::Value::as_str) != Some("success") {
@@ -1023,6 +1026,7 @@ fn parse_prometheus_samples(body: &str) -> Result<Vec<PrometheusSample>, String>
         .collect()
 }
 
+#[implements("FR-033-AC-16")]
 fn status_is_fresh(sample: &PrometheusSample, now_ms: i64) -> bool {
     let Some(sample_ms) = (sample.timestamp_seconds * 1000.0)
         .is_finite()
@@ -1034,6 +1038,7 @@ fn status_is_fresh(sample: &PrometheusSample, now_ms: i64) -> bool {
     (0..=90_000).contains(&age)
 }
 
+#[implements("FR-033-AC-16")]
 fn classify_execution_leads(
     expected: &[String],
     no_pane: &BTreeSet<String>,
@@ -1075,6 +1080,7 @@ fn classify_execution_leads(
     (observed, working)
 }
 
+#[implements("FR-033-AC-16")]
 fn host_feed_is_fresh(machine: &str, status: &PrometheusLeadStatus, now_ms: i64) -> bool {
     status.pane_info.iter().any(|sample| {
         status_is_fresh(sample, now_ms)
@@ -1085,6 +1091,7 @@ fn host_feed_is_fresh(machine: &str, status: &PrometheusLeadStatus, now_ms: i64)
     })
 }
 
+#[implements("FR-033-AC-16")]
 fn observed_pane_status(
     lead: &str,
     status: &PrometheusLeadStatus,
@@ -1132,6 +1139,7 @@ fn observed_pane_status(
     ))
 }
 
+#[implements("FR-033-AC-16")]
 fn observed_lane_status(
     lead: &str,
     status: &PrometheusLeadStatus,
@@ -1596,6 +1604,7 @@ mod revision_tests {
         assert_eq!(state.totals["scope_revisions"], 1.0);
     }
 
+    #[trace("FR-033-AC-16")]
     #[test]
     fn current_pane_lane_and_fresh_empty_host_feeds_classify_lead_coverage() {
         let now_ms = 1_000_000;

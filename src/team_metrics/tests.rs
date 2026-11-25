@@ -427,6 +427,7 @@ fn daily_velocity_emits_seven_days_with_day_labels_and_coverage() {
     ));
 }
 
+#[trace("FR-033-AC-16")]
 #[test]
 fn effort_emits_after_23h55_of_complete_forward_coverage() {
     let dir = tempfile::tempdir().unwrap();
