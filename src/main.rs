@@ -2337,14 +2337,14 @@ mod tests {
             },
         });
         status.warnings = vec![ix_board::ReferenceWarning::UnavailableMilestone {
-            issue: "QSL-3236".to_owned(),
+            issue: "ENG-44".to_owned(),
             milestone: "m-gone".to_owned(),
             project: Some("p-1".to_owned()),
         }];
         let text = render_focus_status(&status);
         assert!(text.contains("Outside any available project:\n  Progress: 1/2 leaf tasks"));
         assert!(text.ends_with(
-            "Warnings:\n  issue QSL-3236 references unavailable milestone m-gone in project p-1"
+            "Warnings:\n  issue ENG-44 references unavailable milestone m-gone in project p-1"
         ));
     }
 
