@@ -73,6 +73,8 @@ pub struct RelaySnapshot {
     pub registration_defects: Vec<String>,
     /// The activity stream is absent or empty.
     pub activity_absent: bool,
+    /// The bounded relay activity read reached its event cap, so history may be incomplete.
+    pub activity_stream_capped: bool,
     /// No host lane list exists.
     pub lane_registry_absent: bool,
 }
@@ -325,6 +327,21 @@ pub struct FleetReport {
 }
 
 impl FleetReport {
+    /// Records a source defect without misclassifying it as a ledger write failure.
+    pub fn add_unreadable_source(&mut self, source: &str, reason: String) {
+        self.defects.push(Defect {
+            kind: DefectKind::UnreadableSource,
+            source: source.to_owned(),
+            host: None,
+            lane: None,
+            reason,
+            observed_ms: self.run_ms,
+            first_seen_ms: None,
+        });
+        self.defects.sort();
+        self.complete = false;
+    }
+
     /// Adds the `ledger_unwritable` defect for a run whose ledger write failed.
     pub fn add_ledger_defect(&mut self, reason: String) {
         self.defects.push(Defect {

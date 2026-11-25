@@ -1169,15 +1169,27 @@ fn version_three_ledger_migrates_additively_to_resumable_windows() {
     drop(Ledger::open(&path, &config).unwrap());
     {
         let connection = Connection::open(&path).unwrap();
-        for statement in crate::fleet::ledger::schema::CAPACITY_VIEWS {
-            let view = statement.split_whitespace().nth(2).unwrap();
+        for view in crate::fleet::ledger::schema::QUERYABLE {
+            if *view == "cycle_missed" {
+                continue;
+            }
             connection
                 .execute_batch(&format!("DROP VIEW {view}"))
                 .unwrap();
         }
         connection
             .execute_batch(
-                "ALTER TABLE capacity_step DROP COLUMN build_slots_busy;
+                "ALTER TABLE action_send DROP COLUMN sender_role;
+             DROP INDEX action_send_receipt_unique;
+             ALTER TABLE assignment_history DROP COLUMN sender_role;
+             ALTER TABLE assignment_history DROP COLUMN sender_addr;
+             ALTER TABLE cycle_missed DROP COLUMN at_ms;
+             DROP TABLE lane_lead;
+             DROP TABLE failed_probe_tick;
+             DROP TABLE relay_order;
+             DROP TABLE relay_order_snapshot;
+             DROP TABLE host_build_pause_interval;
+             ALTER TABLE capacity_step DROP COLUMN build_slots_busy;
              ALTER TABLE capacity_step DROP COLUMN build_slots_sustainable;
              ALTER TABLE capacity_step DROP COLUMN measurement_values;
              ALTER TABLE action DROP COLUMN project;

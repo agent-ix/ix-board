@@ -86,10 +86,11 @@ fn read_snapshot(relay: &mut Relay, timeout: Duration) -> Result<RelaySnapshot, 
         registration_defects,
         ..RelaySnapshot::default()
     };
-    snapshot.activity_absent = relay
+    let activity_len = relay
         .activity_len()
-        .map_err(|e| fail("activity length", e))?
-        == 0;
+        .map_err(|e| fail("activity length", e))?;
+    snapshot.activity_absent = activity_len == 0;
+    snapshot.activity_stream_capped = activity_len >= ACTIVITY_MAX_EVENTS;
     let stream = relay
         .activity_events(ACTIVITY_MAX_EVENTS)
         .map_err(|e| fail("activity stream", e))?;
@@ -413,6 +414,7 @@ const RECEIPT_MAX_PAGES: usize = RECEIPT_EVENT_CAP / RECEIPT_PAGE_CAP + 1;
 /// # Errors
 ///
 /// The page could not be read or continued, or the history needs more pages than it can hold.
+#[implements("FR-039-AC-12")]
 pub fn collect_receipts(
     mut fetch: impl FnMut(Option<String>) -> Result<ReceiptExport, SourceError>,
 ) -> Result<(Vec<ReceiptEvent>, Vec<String>), SourceError> {
@@ -430,7 +432,7 @@ pub fn collect_receipts(
                         "relay receipts incomplete: {reason:?}"
                     )));
                 }
-                ReceiptCoverageReason::BeforeInstrumentation => continue,
+                ReceiptCoverageReason::BeforeInstrumentation => "before_instrumentation",
                 ReceiptCoverageReason::RecordingGap => "recording_gap",
                 ReceiptCoverageReason::ObservationPending => "observation_pending",
                 ReceiptCoverageReason::Retention => "retention",

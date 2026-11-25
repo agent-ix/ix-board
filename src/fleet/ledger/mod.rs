@@ -10,7 +10,9 @@
 
 mod assign_rows;
 pub mod capacity;
+mod cycle;
 mod lock;
+mod role_metrics;
 mod schema;
 #[cfg(test)]
 mod tests;
@@ -31,6 +33,7 @@ pub use assign_rows::{AssignSink, complete_pending};
 pub use capacity::{
     CapacityEvent, CapacityHost, CapacityLevel, CapacityRun, CapacityStatus, CapacityStep,
 };
+pub use cycle::ActivityCoverage;
 pub use schema::{QUERYABLE, VERSION};
 pub use tick::{TickCommit, tick_metrics};
 
@@ -193,12 +196,7 @@ fn has_tables(connection: &Connection) -> Result<bool, LedgerError> {
 /// Applies the version 2 statements and views in the open transaction, failing at statement
 /// `fail_at` when given (the crash injection of the migration test).
 fn apply_v2(tx: &rusqlite::Transaction<'_>, fail_at: Option<usize>) -> Result<(), LedgerError> {
-    let views = schema::views();
-    let statements = schema::V2
-        .iter()
-        .copied()
-        .chain(views.iter().map(String::as_str));
-    for (index, statement) in statements.enumerate() {
+    for (index, statement) in schema::V2.iter().enumerate() {
         if fail_at == Some(index) {
             return Err(LedgerError::Sqlite(rusqlite::Error::ExecuteReturnedResults));
         }
@@ -258,10 +256,48 @@ fn apply_v6(tx: &rusqlite::Transaction<'_>) -> Result<(), LedgerError> {
         }
         tx.execute_batch(statement)?;
     }
+    tx.pragma_update(None, "user_version", 6)?;
+    Ok(())
+}
+
+#[implements("FR-039-AC-15")]
+fn apply_v7(tx: &rusqlite::Transaction<'_>) -> Result<(), LedgerError> {
+    for statement in schema::V7 {
+        tx.execute_batch(statement)?;
+    }
+    let cycle_missed_has_at_ms = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('cycle_missed') WHERE name='at_ms')",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !cycle_missed_has_at_ms {
+        tx.execute_batch(
+            "ALTER TABLE cycle_missed ADD COLUMN at_ms INTEGER NOT NULL DEFAULT 0;
+             UPDATE cycle_missed SET at_ms=detected_at;",
+        )?;
+    }
+    for name in schema::V7_DROP_VIEWS {
+        tx.execute_batch(&format!("DROP VIEW IF EXISTS {name}"))?;
+    }
+    for name in schema::QUERYABLE {
+        if *name == "cycle_missed" {
+            continue;
+        }
+        tx.execute_batch(&format!("DROP VIEW IF EXISTS {name}"))?;
+    }
+    for statement in schema::CAPACITY_VIEWS {
+        let view = statement.split_whitespace().nth(2).ok_or_else(|| {
+            LedgerError::Capacity("invalid capacity view definition".to_owned())
+        })?;
+        tx.execute_batch(&format!("DROP VIEW IF EXISTS {view}"))?;
+    }
+    for statement in schema::views() {
+        tx.execute_batch(&statement)?;
+    }
     for statement in schema::CAPACITY_VIEWS {
         tx.execute_batch(statement)?;
     }
-    tx.pragma_update(None, "user_version", 6)?;
+    tx.pragma_update(None, "user_version", schema::VERSION)?;
     Ok(())
 }
 
@@ -520,6 +556,7 @@ impl Ledger {
                 apply_v4(&tx)?;
                 apply_v5(&tx)?;
                 apply_v6(&tx)?;
+                apply_v7(&tx)?;
                 tx.commit()?;
             }
             1 => {
@@ -529,6 +566,7 @@ impl Ledger {
                 apply_v4(&tx)?;
                 apply_v5(&tx)?;
                 apply_v6(&tx)?;
+                apply_v7(&tx)?;
                 tx.commit()?;
             }
             2 => {
@@ -537,6 +575,7 @@ impl Ledger {
                 apply_v4(&tx)?;
                 apply_v5(&tx)?;
                 apply_v6(&tx)?;
+                apply_v7(&tx)?;
                 tx.commit()?;
             }
             3 => {
@@ -544,24 +583,29 @@ impl Ledger {
                 apply_v4(&tx)?;
                 apply_v5(&tx)?;
                 apply_v6(&tx)?;
+                apply_v7(&tx)?;
                 tx.commit()?;
             }
             4 => {
                 let tx = connection.transaction()?;
                 apply_v5(&tx)?;
                 apply_v6(&tx)?;
+                apply_v7(&tx)?;
                 tx.commit()?;
             }
             5 => {
                 let tx = connection.transaction()?;
                 apply_v6(&tx)?;
+                apply_v7(&tx)?;
                 tx.commit()?;
             }
             6 => {
                 let tx = connection.transaction()?;
                 refresh_v6_host_output_view(&tx)?;
+                apply_v7(&tx)?;
                 tx.commit()?;
             }
+            7 => {}
             found => {
                 return Err(LedgerError::UnsupportedVersion {
                     path: path.to_owned(),
@@ -587,6 +631,26 @@ impl Ledger {
     /// The ledger file.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Records an open probe defect's ticket route at relay time, once.
+    #[implements("FR-039-AC-20")]
+    pub fn record_defect_route(
+        &mut self,
+        defect_id: i64,
+        ticket: &str,
+        routed_at_ms: i64,
+    ) -> Result<(), LedgerError> {
+        let changed = self.connection.execute(
+            "UPDATE defect SET routed_ticket=?1, routed_at=?2
+             WHERE defect_id=?3 AND source LIKE 'probe:%' AND routed_ticket IS NULL
+               AND closed_at IS NULL AND first_seen_at IS NOT NULL AND ?2 >= first_seen_at",
+            params![ticket, routed_at_ms, defect_id],
+        )?;
+        if changed != 1 {
+            return Err(LedgerError::Sqlite(rusqlite::Error::QueryReturnedNoRows));
+        }
+        Ok(())
     }
 
     /// Appends one `fleet status` run: the run record, one `lane_tick` row per lane, the
@@ -666,6 +730,7 @@ impl Ledger {
         }
         let first_seen =
             reconcile_defects(&tx, &report.defects, run_ms, unavailable, Reader::Status)?;
+        record_failed_probe_ticks(&tx, &report.defects, None, run_ms, unavailable)?;
         if crash_before_commit {
             return Err(LedgerError::Sqlite(rusqlite::Error::ExecuteReturnedResults));
         }
@@ -785,6 +850,41 @@ fn reconcile_defects(
     Ok(first_seen)
 }
 
+#[implements("FR-039-AC-20")]
+fn record_failed_probe_ticks(
+    tx: &rusqlite::Transaction<'_>,
+    defects: &[Defect],
+    tick_id: Option<i64>,
+    at_ms: i64,
+    unavailable: bool,
+) -> Result<(), LedgerError> {
+    if unavailable {
+        return Ok(());
+    }
+    for defect in defects
+        .iter()
+        .filter(|defect| defect.source.starts_with("probe:"))
+    {
+        let key = defect_key(defect);
+        let defect_id: Option<i64> = tx
+            .query_row(
+                "SELECT defect_id FROM defect WHERE source=?1 AND host IS ?2 AND lane IS ?3
+                   AND kind=?4 AND closed_at IS NULL ORDER BY defect_id DESC LIMIT 1",
+                params![key.0, key.1, key.2, key.3],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(defect_id) = defect_id {
+            tx.execute(
+                "INSERT OR IGNORE INTO failed_probe_tick(defect_id,source,host,tick_id,at_ms)
+                 VALUES(?1,?2,?3,?4,?5)",
+                params![defect_id, defect.source, defect.host, tick_id, at_ms],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Deletes rows closed or recorded before `cutoff`; open rows stay. Runs go last so no row
 /// outlives its run, and a run with no relay time goes with the runs before the oldest
 /// relay-timed one (sequence order, never a clock comparison).
@@ -831,10 +931,11 @@ pub fn record_status(config: &FleetConfig, report: &mut FleetReport) {
 /// this too, so a fleet that runs only ticks does not leave killed `fleet assign` rows `pending`.
 pub fn record_status_completing(
     config: &FleetConfig,
+    settings: &crate::fleet::tick::TickSettings,
     report: &mut FleetReport,
     bus: &mut impl crate::fleet::assign::AssignBus,
 ) {
-    complete_assignments(config, report, bus);
+    complete_assignments(config, settings, report, bus);
     record_status(config, report);
 }
 
@@ -842,11 +943,15 @@ pub fn record_status_completing(
 /// run about to commit, never silent. `fleet status` and `fleet tick` share this step.
 pub fn complete_assignments(
     config: &FleetConfig,
+    settings: &crate::fleet::tick::TickSettings,
     report: &mut FleetReport,
     bus: &mut impl crate::fleet::assign::AssignBus,
 ) {
-    if let Err(error) = complete_pending(config, bus) {
-        report.add_ledger_defect(format!("assignment completion: {error}"));
+    if let Err(error) = complete_pending(config, settings, bus) {
+        report.add_unreadable_source(
+            "relay:order_history",
+            format!("assignment completion: {error}"),
+        );
     }
 }
 

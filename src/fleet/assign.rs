@@ -11,15 +11,18 @@
 
 use super::focus::{self, FocusEvent};
 use crate::model::{Issue, IssueBatch, WorkflowStateType};
+use ix_trace_rs::implements;
 use relay_core::assignment::{
     AssignWrite, AssignWriter, AssignedTicket, AssignmentList, MAX_TICKET_ID_BYTES, lane_address,
 };
 use relay_core::fleet::{FleetLane, fleet_registry};
 use relay_core::receipts::{
-    OrderSpec, RECEIPT_PAGE_CAP, ReceiptEvent, ReceiptOutcome, ReceiptRequest,
+    OrderListRequest, OrderPage, OrderSpec, RECEIPT_PAGE_CAP, ReceiptEvent, ReceiptOutcome,
+    ReceiptRequest,
 };
 use relay_core::{ACTIVITY_MAX_EVENTS, AgentName, Message, Relay, Target, text};
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 use thiserror::Error as ThisError;
 
@@ -151,6 +154,10 @@ pub struct AssignDefect {
 /// The assignment as reported, and the shape of an `assignment_history` row (FR-039).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct AssignReport {
+    /// Role authorized to send this order.
+    pub sender_role: String,
+    /// Relay identity that sent this order.
+    pub sender_addr: String,
     /// The lane address as the registry spells it.
     pub lane: String,
     /// The assigned ticket ids in order.
@@ -280,6 +287,23 @@ pub trait AssignBus {
     ///
     /// The receipts could not be read completely.
     fn receipts_since(&mut self, since_ms: i64) -> Result<Vec<ReceiptEvent>, String>;
+    /// Orders for which the relay has recorded `AckExpired`, including the source deadline.
+    fn expired_orders(&mut self) -> Result<relay_core::receipts::ExpiredOrders, String> {
+        Ok(relay_core::receipts::ExpiredOrders::default())
+    }
+    /// Reads a bounded page of every retained order outcome.
+    ///
+    /// # Errors
+    ///
+    /// The relay page could not be read completely.
+    fn orders(&mut self, request: &OrderListRequest) -> Result<OrderPage, String> {
+        let _ = request;
+        Err("relay all-orders source is unavailable".to_owned())
+    }
+    /// Returns the relay-time boundary confirmed by the operator, if present.
+    fn orders_complete_since(&mut self) -> Result<Option<i64>, String> {
+        Err("relay all-order coverage is not confirmed".to_owned())
+    }
     /// Replaces the lane's list, carrying `order_id`.
     ///
     /// # Errors
@@ -298,6 +322,32 @@ pub trait AssignBus {
     ///
     /// The activity stream could not be read.
     fn lane_events(&mut self, lane: &str) -> Result<Vec<FocusEvent>, String>;
+
+    /// Hook events for several lanes from one source read when available.
+    fn lane_events_for(
+        &mut self,
+        lanes: &[String],
+    ) -> Result<BTreeMap<String, Vec<FocusEvent>>, String> {
+        lanes
+            .iter()
+            .map(|lane| Ok((lane.to_lowercase(), self.lane_events(lane)?)))
+            .collect()
+    }
+}
+
+#[implements("FR-039-AC-12")]
+fn require_complete_receipt_history(
+    events: Vec<ReceiptEvent>,
+    gaps: Vec<String>,
+) -> Result<Vec<ReceiptEvent>, String> {
+    if gaps.is_empty() {
+        Ok(events)
+    } else {
+        Err(format!(
+            "relay receipt history is incomplete: {}",
+            gaps.join(", ")
+        ))
+    }
 }
 
 impl AssignBus for Relay {
@@ -328,9 +378,10 @@ impl AssignBus for Relay {
         self.send_as(msg, Some(spec)).map_err(|e| e.to_string())
     }
 
+    #[implements("FR-039-AC-12")]
     fn receipts_since(&mut self, since_ms: i64) -> Result<Vec<ReceiptEvent>, String> {
         let now_ms = self.lane_lists().map_err(|e| e.to_string())?.now_ms;
-        let (events, _gaps) = super::live::collect_receipts(|after| {
+        let (events, gaps) = super::live::collect_receipts(|after| {
             self.receipt_export(&ReceiptRequest {
                 since_ms,
                 until_ms: now_ms,
@@ -341,7 +392,22 @@ impl AssignBus for Relay {
             .map_err(|e| super::SourceError(format!("relay receipts: {e}")))
         })
         .map_err(|e| e.to_string())?;
-        Ok(events)
+        require_complete_receipt_history(events, gaps)
+    }
+
+    #[implements("FR-039-AC-12")]
+    fn expired_orders(&mut self) -> Result<relay_core::receipts::ExpiredOrders, String> {
+        Relay::expired_orders(self).map_err(|error| error.to_string())
+    }
+
+    #[implements("FR-039-AC-12")]
+    fn orders(&mut self, request: &OrderListRequest) -> Result<OrderPage, String> {
+        Relay::orders(self, request).map_err(|error| error.to_string())
+    }
+
+    #[implements("FR-039-AC-12")]
+    fn orders_complete_since(&mut self) -> Result<Option<i64>, String> {
+        Relay::orders_complete_since(self).map_err(|error| error.to_string())
     }
 
     fn write_list(
@@ -376,6 +442,44 @@ impl AssignBus for Relay {
             })
             .collect())
     }
+
+    fn lane_events_for(
+        &mut self,
+        lanes: &[String],
+    ) -> Result<BTreeMap<String, Vec<FocusEvent>>, String> {
+        let wanted = lanes
+            .iter()
+            .map(|lane| lane.to_lowercase())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut events = wanted
+            .iter()
+            .map(|lane| (lane.clone(), Vec::new()))
+            .collect::<BTreeMap<_, _>>();
+        for line in self
+            .activity_events(ACTIVITY_MAX_EVENTS)
+            .map_err(|error| error.to_string())?
+        {
+            let Some((lane, event)) = parse_focus_event(&line) else {
+                continue;
+            };
+            if let Some(rows) = events.get_mut(&lane.to_lowercase()) {
+                rows.push(event);
+            }
+        }
+        Ok(events)
+    }
+}
+
+fn parse_focus_event(line: &str) -> Option<(String, FocusEvent)> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    Some((
+        value.get("addr")?.as_str()?.to_owned(),
+        FocusEvent {
+            server_ms: value.get("server_ms")?.as_i64()?,
+            cwd: value["cwd"].as_str().unwrap_or_default().to_owned(),
+            branch: value["branch"].as_str().unwrap_or_default().to_owned(),
+        },
+    ))
 }
 
 /// One `fleet assign` request.
@@ -600,6 +704,7 @@ pub fn decide(
 ///
 /// A refusal before any send, or a failed send, as [`AssignError`]. A list-write failure after
 /// an accepted send is an `Ok` report whose `list_write_error` is set.
+#[implements("FR-039-AC-12")]
 pub fn assign(
     bus: &mut impl AssignBus,
     ledger: &mut impl AssignLedger,
@@ -692,6 +797,8 @@ pub fn assign(
         .map_err(|e: relay_core::Error| AssignError::Order(e.to_string()))?;
     let before_ms = registry.now_ms;
     let mut report = AssignReport {
+        sender_role: "orchestrator".to_owned(),
+        sender_addr: sender.to_string(),
         lane: lane.clone(),
         tickets: ids.clone(),
         order_id: None,
@@ -874,4 +981,38 @@ pub fn render_text(report: &AssignReport) -> String {
         lines.push(format!("defect: {} {}", defect.kind, defect.detail));
     }
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod receipt_coverage_tests {
+    use super::*;
+    use ix_trace_rs::trace;
+    use relay_core::receipts::ReceiptOutcome;
+
+    #[trace("FR-039-AC-12")]
+    #[test]
+    fn receipt_history_with_any_coverage_gap_is_not_used_as_complete() {
+        let event = ReceiptEvent {
+            event_id: "event-1".to_owned(),
+            original_id: "order-1".to_owned(),
+            attempt_id: None,
+            outcome: ReceiptOutcome::Queued,
+            sender: "minder:ix-relay:main".to_owned(),
+            target: "session/74657374/636f646572".to_owned(),
+            event_time_ms: Some(10),
+            observed_at_ms: 10,
+            evidence: None,
+            reason: None,
+            session: None,
+            expect_ticket: Some("SWM-1".to_owned()),
+            delivered_at_ms: None,
+        };
+        assert_eq!(
+            require_complete_receipt_history(vec![event.clone()], Vec::new()).unwrap(),
+            vec![event.clone()]
+        );
+        let error = require_complete_receipt_history(vec![event], vec!["retention".to_owned()])
+            .unwrap_err();
+        assert!(error.contains("retention"));
+    }
 }

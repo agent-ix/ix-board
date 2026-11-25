@@ -32,7 +32,7 @@ pub struct TickCommit<'a> {
     pub session: Option<&'a str>,
     /// Lane (lower case) to the ticket its derived focus names (FR-037), for lanes with an open
     /// `push_next_ticket` condition.
-    pub focus: &'a BTreeMap<String, String>,
+    pub focus: &'a BTreeMap<String, crate::fleet::focus::Focus>,
 }
 
 #[implements("FR-038-AC-24")]
@@ -113,6 +113,22 @@ fn load_capacity(tx: &Transaction<'_>) -> Result<Capacity, LedgerError> {
     Ok(capacity)
 }
 
+#[implements("FR-039-AC-15")]
+fn record_lane_leads(
+    tx: &Transaction<'_>,
+    observed_at: i64,
+    leads: &BTreeMap<String, String>,
+) -> Result<(), LedgerError> {
+    for (lane, lead) in leads {
+        tx.execute(
+            "INSERT INTO lane_lead(lane,lead_addr,observed_at) VALUES(?1,?2,?3)
+             ON CONFLICT(lane,observed_at) DO UPDATE SET lead_addr=excluded.lead_addr",
+            params![lane.to_ascii_lowercase(), lead, observed_at],
+        )?;
+    }
+    Ok(())
+}
+
 /// Whether positive evidence says an action was executed when its condition cleared.
 /// `answer_dialog` expects the lane out of BLOCKED; `act_on_undetermined` expects a determined
 /// class; `push_next_ticket` expects the lane WORKING with its FR-037 focus on the pushed ticket,
@@ -143,6 +159,7 @@ fn executed(commit: &TickCommit<'_>, kind: ActionKind, subject: &str) -> bool {
                     commit
                         .focus
                         .get(&key)
+                        .and_then(crate::fleet::focus::Focus::ticket)
                         .is_some_and(|focus| focus.eq_ignore_ascii_case(ticket))
                 })
         }
@@ -212,6 +229,8 @@ impl Ledger {
             params![run_ms, commit.session, role],
         )?;
         let tick_id = tx.last_insert_rowid();
+        record_lane_leads(&tx, run_ms, &commit.settings.leads)?;
+        super::cycle::record_missed_cycle(&tx, commit.settings.orchestrator.as_deref(), run_ms)?;
         record_lane_capacity_events(&tx, report)?;
         for event in &facts.drain_done {
             tx.execute(
@@ -312,7 +331,6 @@ impl Ledger {
                 // ready ticket is known to have ready work.
                 let ready = match (remaining, &facts.ready) {
                     (Some(n), Some(ready)) => Some(n > 0 || ready.lanes.contains(&key)),
-                    (Some(n), None) if n > 0 => Some(true),
                     (None, Some(ready)) if ready.lanes.contains(&key) => Some(true),
                     _ => None,
                 };
@@ -345,7 +363,17 @@ impl Ledger {
                 ])?;
             }
         }
+        super::role_metrics::record_plan_coverage(&tx, tick_id, run_ms, report, facts)?;
+        super::role_metrics::record_drift_findings(
+            &tx,
+            tick_id,
+            run_ms,
+            report,
+            facts,
+            commit.focus,
+        )?;
         let first_seen = reconcile_defects(&tx, &report.defects, run_ms, false, Reader::Tick)?;
+        super::record_failed_probe_ticks(&tx, &report.defects, Some(tick_id), run_ms, false)?;
         let open = load_open(&tx)?;
         let capacity = load_capacity(&tx)?;
         let planned = plan(&PlanInput {

@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Agent-IX
 
-//! The ledger schema (FR-039): version 1 tables, the additive version 2 migration, the views.
+//! The ledger schema (FR-039): versioned tables, additive migrations, and read-only views.
 //!
 //! Times are relay server milliseconds. Tables whose writers are other tickets are created
 //! empty so the schema is one unit under one migration.
 
+use ix_trace_rs::implements;
+
 /// The schema version this build writes.
-pub const VERSION: i64 = 6;
+pub const VERSION: i64 = 7;
 
 pub const V1: &str = "
 CREATE TABLE run(
@@ -158,6 +160,111 @@ pub const V2: &[&str] = &[
     "CREATE TABLE host_output_sample(
        host TEXT NOT NULL, at INTEGER NOT NULL, lanes INTEGER, tickets_closed INTEGER,
        prs_merged INTEGER, commits_pushed INTEGER, PRIMARY KEY(host, at))",
+];
+
+/// Version 7 adds order/session attribution and role-spec metric producer tables.
+pub const V7: &[&str] = &[
+    "ALTER TABLE order_focus_at_deadline RENAME TO order_focus_at_deadline_v2",
+    "CREATE TABLE order_focus_at_deadline(
+       order_id TEXT PRIMARY KEY,
+       sender_role TEXT NOT NULL CHECK(sender_role IN ('orchestrator','minder','other')),
+       sender_addr TEXT NOT NULL, lane TEXT NOT NULL, expect_ticket TEXT NOT NULL,
+       sent_at INTEGER,
+       deadline_at INTEGER NOT NULL, focus_ticket TEXT, focus_state TEXT,
+       outcome TEXT NOT NULL CHECK(outcome IN
+         ('confirmed','acted_not_focused','ack_expired','timed_out')),
+       followup_at INTEGER)",
+    "INSERT INTO order_focus_at_deadline(
+       order_id,sender_role,sender_addr,lane,expect_ticket,deadline_at,focus_ticket,focus_state,
+       outcome,followup_at)
+     SELECT order_id,sender_role,sender_addr,lane,expect_ticket,deadline_at,focus_ticket,focus_state,
+       outcome,followup_at FROM order_focus_at_deadline_v2",
+    "DROP TABLE order_focus_at_deadline_v2",
+    "ALTER TABLE action_send ADD COLUMN sender_role TEXT",
+    "CREATE TABLE lane_lead(
+       lane TEXT NOT NULL, lead_addr TEXT NOT NULL, observed_at INTEGER NOT NULL,
+       PRIMARY KEY(lane, observed_at))",
+    "CREATE TABLE failed_probe_tick(
+       defect_id INTEGER NOT NULL, source TEXT NOT NULL, host TEXT, tick_id INTEGER,
+       at_ms INTEGER NOT NULL, PRIMARY KEY(defect_id, at_ms))",
+    "CREATE TABLE relay_order_snapshot(
+       snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT, observed_at INTEGER NOT NULL,
+       window_since INTEGER NOT NULL, window_until INTEGER NOT NULL,
+       oldest_available_at INTEGER, available INTEGER NOT NULL CHECK(available IN (0,1)),
+       unavailable_reason TEXT, skipped INTEGER NOT NULL DEFAULT 0)",
+    "CREATE TABLE relay_order(
+       snapshot_id INTEGER NOT NULL REFERENCES relay_order_snapshot(snapshot_id),
+       order_id TEXT NOT NULL, sender TEXT NOT NULL, recipient TEXT NOT NULL,
+       receipt_target TEXT NOT NULL, expect_ticket TEXT, ack_ms INTEGER NOT NULL,
+       deadline_at INTEGER NOT NULL, enqueued_at INTEGER NOT NULL,
+       delivered_at INTEGER, acted_at INTEGER, state TEXT NOT NULL, expired INTEGER NOT NULL,
+       PRIMARY KEY(snapshot_id, order_id))",
+    "CREATE INDEX relay_order_snapshot_deadline ON relay_order(snapshot_id, deadline_at)",
+    "ALTER TABLE assignment_history ADD COLUMN sender_role TEXT",
+    "ALTER TABLE assignment_history ADD COLUMN sender_addr TEXT",
+    "CREATE UNIQUE INDEX action_send_receipt_unique ON action_send(receipt_id)",
+    "CREATE TABLE host_build_pause_interval(
+       id INTEGER PRIMARY KEY AUTOINCREMENT, host TEXT NOT NULL,
+       start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL CHECK(end_ms >= start_ms))",
+    "CREATE INDEX host_build_pause_interval_host_time
+       ON host_build_pause_interval(host, start_ms, end_ms)",
+];
+
+/// Views replaced when installing the version 7 definitions.
+pub const V7_DROP_VIEWS: &[&str] = &[
+    "lane_tick_rows",
+    "lanes_with_ready_work",
+    "idle_lane_with_ready_work_ticks",
+    "idle_lane_episodes_with_ready_work",
+    "idle_lane_episode_with_ready_work_max",
+    "lane_span",
+    "idle_minutes",
+    "defect_rows",
+    "idle_capacity_minutes_with_ready_work",
+    "time_to_action_p90",
+    "missed_idle_minutes",
+    "detection_to_action_p90",
+    "assignment_confirm_latency_p90",
+    "drift_lane_minutes_share",
+    "blocked_lane_minutes",
+    "idle_lane_minutes_during_build_pause",
+    "need_ready_tickets_actions",
+    "need_ready_tickets_due",
+    "need_ready_tickets_without_planner_order",
+    "lane_orders_due",
+    "lane_orders_not_taken_up",
+    "failed_probe_ticks",
+    "probe_failure_without_routed_defect",
+    "plan_coverage_gap_rows",
+    "plan_coverage_gap_open_cycles_max",
+    "short_queue_open_cycles_max",
+    "drift_findings",
+    "drift_finding_open_cycles_max",
+    "assignments_sent",
+    "unconfirmed_assign_results",
+    "unconfirmed_assignments_without_followup",
+    "assignment_confirm_latency_max",
+    "ladder_rungs_emitted",
+    "escalation_rung",
+    "orchestrator_rungs_emitted",
+    "orchestrator_rung_open_cycles_max",
+    "escalation_rung_send_latency_max",
+    "escalation_rungs_suppressed",
+    "add_lane_action_open_cycles_max",
+    "act_on_undetermined_actions",
+    "push_next_ticket_actions",
+    "answer_dialog_actions",
+    "escalate_block_actions",
+    "add_lane_actions",
+    "act_on_undetermined_unexecuted_ticks",
+    "minder_addressed_actions",
+    "tick_actions_unexecuted_by_minder",
+    "minder_turns_without_committed_tick",
+    "minder_orders_unconfirmed_at_deadline",
+    "unconfirmed_orders_not_resent_or_escalated",
+    "cycle_events",
+    "dialog_answer_violations",
+    "answer_dialog_latency_max",
 ];
 
 /// Version 3 adds source provenance for every recorded capacity-step measurement.
@@ -487,6 +594,7 @@ const LANE_TICK_COLUMNS: &str = "id, run_seq, tick_id, source, lane, host, class
 /// `--since` filters on. `lane_tick_rows` keeps one row per lane per run time (a `tick` row wins
 /// over a `status` row) and carries the interval and grace of the run that wrote it, so a
 /// changed configuration never re-scores history.
+#[implements("FR-039-AC-15")]
 pub fn views() -> Vec<String> {
     let episode_cycles = open_cycles_sql("start_ms", "end_ms", "grace_ms", "cycle_ms");
     vec![
@@ -535,11 +643,25 @@ pub fn views() -> Vec<String> {
            SELECT MAX(open_cycles) AS open_cycles FROM idle_lane_episodes_with_ready_work"
             .to_owned(),
         "CREATE VIEW lane_span AS
-           SELECT lane, host, class, ready_work_available AS ready, observed_ms AS start_ms,
-                  tick_ms,
-                  LEAD(observed_ms) OVER (PARTITION BY lane ORDER BY observed_ms, run_seq)
+           SELECT t.lane, t.host, t.class,
+                  COALESCE(t.ready_work_available,(
+                    SELECT p.ready_work_available FROM lane_tick_rows p
+                    WHERE p.lane=t.lane AND p.observed_ms<t.observed_ms
+                      AND p.ready_work_available IS NOT NULL
+                      AND t.observed_ms-p.observed_ms<=2*p.tick_ms
+                    ORDER BY p.observed_ms DESC,p.run_seq DESC LIMIT 1)) AS ready,
+                  t.observed_ms AS start_ms,
+                  COALESCE(t.remaining_assigned,(
+                    SELECT p.remaining_assigned FROM lane_tick_rows p
+                    WHERE p.lane=t.lane AND p.observed_ms<t.observed_ms
+                      AND p.remaining_assigned IS NOT NULL
+                      AND t.observed_ms-p.observed_ms<=2*p.tick_ms
+                    ORDER BY p.observed_ms DESC,p.run_seq DESC LIMIT 1)) AS remaining_assigned,
+                  t.tick_ms,
+                  observed_ms AS at_ms,
+                  LEAD(t.observed_ms) OVER (PARTITION BY t.lane ORDER BY t.observed_ms, t.run_seq)
                     AS end_ms
-           FROM lane_tick_rows"
+           FROM lane_tick_rows t"
             .to_owned(),
         "CREATE VIEW idle_minutes AS
            SELECT lane, host, date(start_ms / 1000, 'unixepoch') AS day, class,
@@ -549,13 +671,476 @@ pub fn views() -> Vec<String> {
                   CAST(strftime('%s', date(start_ms / 1000, 'unixepoch')) AS INTEGER) * 1000
                     AS at_ms
            FROM lane_span
-           WHERE class <> 'WORKING' AND end_ms IS NOT NULL AND end_ms - start_ms <= 2 * tick_ms
+           WHERE class NOT IN ('WORKING','UNREACHABLE') AND end_ms IS NOT NULL
+             AND end_ms - start_ms <= 2 * tick_ms
            GROUP BY lane, host, day, class"
             .to_owned(),
         "CREATE VIEW defect_rows AS
            SELECT defect_id, source, host, lane, kind, first_seen_at, first_seen_host_ms,
                   closed_at, routed_ticket, routed_at, first_seen_at AS at_ms
            FROM defect"
+            .to_owned(),
+        "CREATE VIEW idle_capacity_minutes_with_ready_work AS
+           WITH spans AS (
+             SELECT date(start_ms / 1000, 'unixepoch') AS day, ready,
+                    end_ms-start_ms AS duration_ms,
+                    CAST(strftime('%s', date(start_ms / 1000, 'unixepoch')) AS INTEGER) * 1000
+                      AS at_ms
+             FROM lane_span WHERE class='IDLE' AND end_ms IS NOT NULL
+               AND end_ms-start_ms<=2*tick_ms),
+           totals AS (
+             SELECT day,MAX(at_ms) AS at_ms,
+                    SUM(CASE WHEN ready IS NULL THEN 1 ELSE 0 END) AS unknown_count,
+                    SUM(CASE WHEN ready=1 THEN duration_ms ELSE 0 END)/60000.0 AS known_minutes
+             FROM spans GROUP BY day)
+           SELECT day,at_ms,
+                  CASE WHEN unknown_count=0 THEN known_minutes END AS slot_minutes,
+                  CASE WHEN unknown_count=0 THEN 1 ELSE 0 END AS available,
+                  CASE WHEN unknown_count=0 THEN NULL ELSE 'ready work source unavailable' END
+                    AS unavailable_reason
+           FROM totals"
+            .to_owned(),
+        "CREATE VIEW missed_idle_minutes AS
+           WITH spans AS (
+             SELECT lane,host,date(start_ms/1000,'unixepoch') AS day,remaining_assigned,
+                    end_ms-start_ms AS duration_ms,
+                    CAST(strftime('%s', date(start_ms / 1000, 'unixepoch')) AS INTEGER) * 1000
+                      AS at_ms
+             FROM lane_span WHERE class='IDLE' AND end_ms IS NOT NULL
+               AND end_ms-start_ms<=2*tick_ms),
+           totals AS (
+             SELECT lane,host,day,MAX(at_ms) AS at_ms,
+                    SUM(CASE WHEN remaining_assigned IS NULL THEN 1 ELSE 0 END) AS unknown_count,
+                    SUM(CASE WHEN remaining_assigned>0 THEN duration_ms ELSE 0 END)/60000.0
+                      AS known_minutes
+             FROM spans GROUP BY lane,host,day)
+           SELECT lane,host,day,at_ms,
+                  CASE WHEN unknown_count=0 THEN known_minutes END AS minutes,
+                  CASE WHEN unknown_count=0 THEN 1 ELSE 0 END AS available,
+                  CASE WHEN unknown_count=0 THEN NULL ELSE 'assignment source unavailable' END
+                    AS unavailable_reason
+           FROM totals"
+            .to_owned(),
+        "CREATE VIEW blocked_lane_minutes AS
+           SELECT lane, host, date(start_ms / 1000, 'unixepoch') AS day,
+                  CAST(strftime('%s', date(start_ms / 1000, 'unixepoch')) AS INTEGER) * 1000
+                    AS at_ms,
+                  SUM(end_ms - start_ms) / 60000.0 AS minutes
+           FROM lane_span
+           WHERE class = 'BLOCKED' AND end_ms IS NOT NULL
+             AND end_ms - start_ms <= 2 * tick_ms
+           GROUP BY lane, host, day"
+            .to_owned(),
+        "CREATE VIEW time_to_action_p90 AS
+           WITH marked AS (
+             SELECT lane, observed_ms, tick_ms, class,
+                    CASE WHEN class = 'WORKING' THEN 1 ELSE 0 END AS working,
+                    LAG(CASE WHEN class = 'WORKING' THEN 1 ELSE 0 END)
+                      OVER (PARTITION BY lane ORDER BY observed_ms, run_seq) AS prior_working
+             FROM lane_tick_rows),
+           grouped AS (
+             SELECT lane, observed_ms, tick_ms, class, working,
+                    SUM(CASE WHEN prior_working IS NULL OR prior_working <> working
+                             THEN 1 ELSE 0 END)
+                      OVER (PARTITION BY lane ORDER BY observed_ms) AS episode
+             FROM marked),
+           episodes AS (
+             SELECT lane, episode, MIN(working) AS working,
+                    MIN(observed_ms) AS start_ms, MAX(observed_ms) AS last_ms,
+                    MAX(tick_ms) AS tick_ms
+             FROM grouped GROUP BY lane, episode),
+           transitions AS (
+             SELECT lane, episode, working, start_ms, last_ms, tick_ms,
+                    LEAD(working) OVER (PARTITION BY lane ORDER BY episode) AS next_working,
+                    LEAD(start_ms) OVER (PARTITION BY lane ORDER BY episode) AS next_start
+             FROM episodes),
+           samples AS (
+             SELECT date(start_ms / 1000, 'unixepoch') AS day,
+                    CAST(strftime('%s', date(start_ms / 1000, 'unixepoch')) AS INTEGER) * 1000
+                      AS at_ms,
+                    (next_start - start_ms) / 60000.0 AS minutes,
+                    CASE WHEN next_start IS NULL THEN 1 ELSE 0 END AS unbounded
+             FROM transitions
+             WHERE working = 0 AND (next_working = 1 OR next_start IS NULL)
+               AND (next_start IS NULL OR next_start - start_ms <= 2 * tick_ms)),
+           ranked AS (
+             SELECT day, at_ms, minutes, unbounded,
+                    ROW_NUMBER() OVER (PARTITION BY day ORDER BY minutes) AS rank
+             FROM samples),
+           totals AS (
+             SELECT day, MAX(at_ms) AS at_ms, COUNT(*) AS sample_count,
+                    SUM(unbounded) AS unbounded_count,
+                    SUM(CASE WHEN unbounded=0 THEN 1 ELSE 0 END) AS bounded_count
+             FROM samples GROUP BY day),
+           percentile AS (
+             SELECT r.day, r.minutes FROM ranked r JOIN totals t USING(day)
+             WHERE r.unbounded=0 AND r.rank=(9 * t.sample_count + 9) / 10)
+           SELECT totals.day, totals.at_ms,
+                  CASE WHEN totals.unbounded_count = 0 THEN percentile.minutes END AS p90_minutes,
+                  totals.sample_count, totals.unbounded_count
+           FROM totals LEFT JOIN percentile USING(day)"
+            .to_owned(),
+        "CREATE VIEW detection_to_action_p90 AS
+           WITH samples AS (
+             SELECT date(emitted_at / 1000, 'unixepoch') AS day,
+                    CAST(strftime('%s', date(emitted_at / 1000, 'unixepoch')) AS INTEGER) * 1000
+                      AS at_ms,
+                    CASE WHEN executed_at >= emitted_at
+                         THEN (executed_at - emitted_at) / 60000.0 END AS minutes,
+                    CASE WHEN executed_at >= emitted_at THEN 0 ELSE 1 END AS unbounded
+             FROM action WHERE lane IS NOT NULL),
+           ranked AS (
+             SELECT day, at_ms, minutes, unbounded,
+                    ROW_NUMBER() OVER (PARTITION BY day ORDER BY minutes) AS rank
+             FROM samples WHERE unbounded = 0),
+           totals AS (
+             SELECT day, MAX(at_ms) AS at_ms, COUNT(*) AS sample_count,
+                    SUM(unbounded) AS unbounded_count,
+                    SUM(CASE WHEN unbounded=0 THEN 1 ELSE 0 END) AS bounded_count
+             FROM samples GROUP BY day),
+           percentile AS (
+             SELECT r.day, r.minutes FROM ranked r JOIN totals t USING(day)
+             WHERE r.rank = (9 * t.sample_count + 9) / 10)
+           SELECT totals.day, totals.at_ms,
+                  CASE WHEN totals.unbounded_count = 0 THEN percentile.minutes END AS p90_minutes,
+                  totals.sample_count, totals.unbounded_count
+           FROM totals LEFT JOIN percentile USING(day)"
+            .to_owned(),
+        "CREATE VIEW assignment_confirm_latency_p90 AS
+           WITH samples AS (
+             SELECT date(sent_at / 1000, 'unixepoch') AS day,
+                    CAST(strftime('%s', date(sent_at / 1000, 'unixepoch')) AS INTEGER) * 1000
+                      AS at_ms,
+                    CASE WHEN result = 'confirmed' AND result_at IS NOT NULL
+                                  AND confirm_latency_s IS NOT NULL
+                         THEN confirm_latency_s / 60.0 END AS minutes,
+                    CASE WHEN result = 'confirmed' AND result_at IS NOT NULL
+                                  AND confirm_latency_s IS NOT NULL THEN 0 ELSE 1 END AS unbounded
+             FROM assignment_history
+             WHERE sent_at IS NOT NULL
+               AND deadline_at <= COALESCE((SELECT MAX(relay_ms) FROM run), 0)),
+           ranked AS (
+             SELECT day, minutes,
+                    ROW_NUMBER() OVER (PARTITION BY day ORDER BY minutes) AS rank
+             FROM samples WHERE unbounded = 0),
+           totals AS (
+             SELECT day, MAX(at_ms) AS at_ms, COUNT(*) AS sample_count,
+                    SUM(unbounded) AS unbounded_count,
+                    SUM(CASE WHEN unbounded=0 THEN 1 ELSE 0 END) AS bounded_count
+             FROM samples GROUP BY day),
+           percentile AS (
+             SELECT r.day, r.minutes FROM ranked r JOIN totals t USING(day)
+             WHERE r.rank = (9 * t.sample_count + 9) / 10)
+           SELECT totals.day, totals.at_ms,
+                  CASE WHEN totals.unbounded_count = 0 THEN percentile.minutes END AS p90_minutes,
+                  totals.sample_count, totals.unbounded_count
+           FROM totals LEFT JOIN percentile USING(day)"
+            .to_owned(),
+        "CREATE VIEW drift_lane_minutes_share AS
+           WITH RECURSIVE spans AS (
+             SELECT ROW_NUMBER() OVER (ORDER BY lane, host, start_ms) AS span_id,
+                    lane, host, start_ms, end_ms, tick_ms
+             FROM lane_span
+             WHERE class = 'WORKING' AND end_ms IS NOT NULL AND end_ms > start_ms
+               AND end_ms - start_ms <= 2 * tick_ms),
+           days(span_id,lane,start_ms,end_ms,tick_ms,day_start_ms) AS (
+             SELECT span_id,lane,start_ms,end_ms,tick_ms,
+                    CAST(strftime('%s', date(start_ms / 1000, 'unixepoch')) AS INTEGER) * 1000
+             FROM spans
+             UNION ALL
+             SELECT span_id,lane,start_ms,end_ms,tick_ms,day_start_ms + 86400000
+             FROM days WHERE day_start_ms + 86400000 < end_ms),
+           segments AS (
+             SELECT span_id,lane,start_ms,end_ms,tick_ms,day_start_ms,
+                    max(start_ms,day_start_ms) AS segment_start,
+                    min(end_ms,day_start_ms + 86400000) AS segment_end
+             FROM days),
+           daily_working AS (
+             SELECT day_start_ms, SUM(segment_end - segment_start) AS working_ms
+             FROM segments GROUP BY day_start_ms),
+           drift_intervals AS (
+             SELECT s.span_id,s.day_start_ms,
+                    max(s.segment_start,d.opened_at) AS drift_start,
+                    min(s.segment_end,COALESCE(d.closed_at,s.segment_end)) AS drift_end
+             FROM segments s JOIN drift_finding d ON d.lane = s.lane
+             WHERE d.rule IN ('not_assigned','not_in_plan','priority_inversion')
+               AND d.opened_at < s.segment_end
+               AND COALESCE(d.closed_at,s.segment_end) > s.segment_start),
+           ordered_drift AS (
+             SELECT span_id,day_start_ms,drift_start,drift_end,
+                    MAX(drift_end) OVER (
+                      PARTITION BY span_id,day_start_ms ORDER BY drift_start,drift_end
+                      ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS previous_end
+             FROM drift_intervals),
+           daily_drift AS (
+             SELECT day_start_ms,
+                    SUM(max(0,drift_end - max(drift_start,COALESCE(previous_end,drift_start))))
+                      AS drift_ms
+             FROM ordered_drift GROUP BY day_start_ms)
+           SELECT date(w.day_start_ms / 1000, 'unixepoch') AS day,
+                  w.day_start_ms AS at_ms,
+                  w.working_ms / 60000.0 AS working_minutes,
+                  COALESCE(d.drift_ms,0) / 60000.0 AS drift_minutes,
+                  100.0 * COALESCE(d.drift_ms,0) / w.working_ms AS share_percent
+           FROM daily_working w LEFT JOIN daily_drift d USING(day_start_ms)"
+            .to_owned(),
+        "CREATE VIEW idle_lane_minutes_during_build_pause AS
+           SELECT NULL AS lane, NULL AS host, NULL AS day, NULL AS at_ms, NULL AS minutes,
+                  0 AS available, 'no pause producer' AS unavailable_reason"
+            .to_owned(),
+        "CREATE VIEW need_ready_tickets_actions AS
+           SELECT id AS action_id, tick_id, emitted_at, resolved_at, project, requested_count,
+                  target_role, target_addr
+           FROM action WHERE kind = 'need_ready_tickets'"
+            .to_owned(),
+        "CREATE VIEW need_ready_tickets_due AS
+           SELECT action_id, tick_id, project, requested_count, emitted_at, resolved_at,
+                  emitted_at + 86400000 AS at_ms, target_role, target_addr
+           FROM need_ready_tickets_actions"
+            .to_owned(),
+        "CREATE VIEW need_ready_tickets_without_planner_order AS
+           SELECT a.id AS action_id, a.tick_id, a.emitted_at AS at_ms, a.target_addr
+           FROM action a WHERE a.kind = 'need_ready_tickets' AND NOT EXISTS (
+             SELECT 1 FROM action_send s WHERE s.action_id = a.id
+               AND s.recipient_addr = a.target_addr)"
+            .to_owned(),
+        "CREATE VIEW plan_coverage_gap_rows AS
+           SELECT gap_id,kind,subject,detail,opened_tick,opened_at,closed_tick,closed_at,
+                  COALESCE(closed_at,opened_at) AS at_ms,
+                  max(1, (COALESCE(closed_at,(SELECT MAX(relay_ms) FROM run)) - opened_at -
+                    COALESCE((SELECT grace_s FROM run ORDER BY sequence DESC LIMIT 1),
+                      COALESCE((SELECT cycle_interval_s FROM run ORDER BY sequence DESC LIMIT 1),600) +
+                      COALESCE((SELECT tick_interval_s FROM run ORDER BY sequence DESC LIMIT 1),300))*1000 +
+                    COALESCE((SELECT cycle_interval_s FROM run ORDER BY sequence DESC LIMIT 1),600)*1000 - 1) /
+                    (COALESCE((SELECT cycle_interval_s FROM run ORDER BY sequence DESC LIMIT 1),600)*1000))
+                    AS open_cycles
+           FROM plan_coverage_gap"
+            .to_owned(),
+        "CREATE VIEW plan_coverage_gap_open_cycles_max AS
+           SELECT MAX(open_cycles) AS open_cycles, MAX(at_ms) AS at_ms
+           FROM plan_coverage_gap_rows"
+            .to_owned(),
+        "CREATE VIEW short_queue_open_cycles_max AS
+           SELECT MAX(open_cycles) AS open_cycles, MAX(at_ms) AS at_ms
+           FROM plan_coverage_gap_rows WHERE kind='short_queue'"
+            .to_owned(),
+        "CREATE VIEW drift_findings AS
+           SELECT finding_id,lane,rule,focus,opened_tick,opened_at,closed_at,evidence_times,
+                  COALESCE(closed_at,opened_at) AS at_ms,
+                  max(1, (COALESCE(closed_at,(SELECT MAX(relay_ms) FROM run)) - opened_at -
+                    COALESCE((SELECT grace_s FROM run ORDER BY sequence DESC LIMIT 1),
+                      COALESCE((SELECT cycle_interval_s FROM run ORDER BY sequence DESC LIMIT 1),600) +
+                      COALESCE((SELECT tick_interval_s FROM run ORDER BY sequence DESC LIMIT 1),300))*1000 +
+                    COALESCE((SELECT cycle_interval_s FROM run ORDER BY sequence DESC LIMIT 1),600)*1000 - 1) /
+                    (COALESCE((SELECT cycle_interval_s FROM run ORDER BY sequence DESC LIMIT 1),600)*1000))
+                    AS open_cycles
+           FROM drift_finding"
+            .to_owned(),
+        "CREATE VIEW drift_finding_open_cycles_max AS
+           SELECT MAX(open_cycles) AS open_cycles, MAX(at_ms) AS at_ms FROM drift_findings"
+            .to_owned(),
+        "CREATE VIEW assignments_sent AS
+           SELECT id AS assignment_id,lane,ticket,order_id,expect_ticket,sent_at,deadline_at,result,
+                  result_at,confirm_latency_s,focus_at_deadline,sender_role,sender_addr,
+                  sent_at AS at_ms
+           FROM assignment_history WHERE sent_at IS NOT NULL"
+            .to_owned(),
+        "CREATE VIEW unconfirmed_assign_results AS
+           SELECT * FROM assignments_sent
+           WHERE result IN ('acted_not_focused','ack_expired','timed_out')"
+            .to_owned(),
+        "CREATE VIEW unconfirmed_assignments_without_followup AS
+           SELECT u.assignment_id,u.lane,u.order_id,u.result_at AS at_ms,u.result,
+                  CASE WHEN EXISTS (SELECT 1 FROM lane_lead ll WHERE ll.lane=u.lane
+                    AND ll.observed_at <= u.result_at) THEN 1 ELSE 0 END AS available,
+                  CASE WHEN EXISTS (SELECT 1 FROM lane_lead ll WHERE ll.lane=u.lane
+                    AND ll.observed_at <= u.result_at) THEN NULL
+                    ELSE 'lane lead mapping unavailable' END AS unavailable_reason
+           FROM unconfirmed_assign_results u
+           WHERE NOT EXISTS (SELECT 1 FROM lane_lead ll WHERE ll.lane=u.lane
+               AND ll.observed_at <= u.result_at) OR (NOT EXISTS (
+             SELECT 1 FROM assignment_history later
+             WHERE later.lane=u.lane AND later.sent_at > u.result_at
+               AND later.sent_at <= u.result_at +
+                 COALESCE((SELECT cycle_interval_s FROM run ORDER BY sequence DESC LIMIT 1),600)*1000)
+             AND NOT EXISTS (
+             SELECT 1 FROM action_send s JOIN action a ON a.id=s.action_id
+             WHERE s.sender_role='orchestrator' AND s.sent_at > u.result_at
+               AND s.sent_at <= u.result_at +
+                 COALESCE((SELECT cycle_interval_s FROM run ORDER BY sequence DESC LIMIT 1),600)*1000
+               AND (s.recipient_addr=u.lane OR EXISTS (
+                 SELECT 1 FROM lane_lead ll WHERE ll.lane=u.lane
+                   AND ll.lead_addr=s.recipient_addr AND ll.observed_at <= s.sent_at
+                   AND ll.observed_at=(SELECT MAX(ll2.observed_at) FROM lane_lead ll2
+                     WHERE ll2.lane=u.lane AND ll2.observed_at <= s.sent_at)))))"
+            .to_owned(),
+        "CREATE VIEW assignment_confirm_latency_max AS
+           WITH population AS (
+             SELECT confirm_latency_s / 60.0 AS minutes,
+                    CASE WHEN result='confirmed' AND confirm_latency_s IS NOT NULL
+                         THEN 0 ELSE 1 END AS unbounded,
+                    sent_at AS at_ms
+             FROM assignments_sent
+             WHERE deadline_at <= COALESCE((SELECT MAX(relay_ms) FROM run),0))
+           SELECT CASE WHEN SUM(unbounded)=0 THEN MAX(minutes) END AS max_minutes,
+                  COUNT(*) AS sample_count,COALESCE(SUM(unbounded),0) AS unbounded_count,
+                  MAX(at_ms) AS at_ms
+           FROM population"
+            .to_owned(),
+        "CREATE VIEW ladder_rungs_emitted AS
+           SELECT a.id AS action_id,a.tick_id,a.kind,a.lane,a.emitted_at,a.resolved_at,
+                  a.due_by,a.rung,a.target_role,a.target_addr,a.condition_started_at,
+                  a.emitted_at AS at_ms
+           FROM action a
+           WHERE a.rung BETWEEN 1 AND 3 OR (a.rung=0 AND a.kind IN
+             ('act_on_undetermined','push_next_ticket','answer_dialog','escalate_block','resend_order'))"
+            .to_owned(),
+        "CREATE VIEW escalation_rung AS
+           SELECT a.*,s.sent_at,s.sender_addr AS send_sender_addr,
+                  COALESCE(s.sent_at,a.emitted_at) AS at_ms
+           FROM ladder_rungs_emitted a LEFT JOIN action_send s ON s.action_id=a.action_id"
+            .to_owned(),
+        "CREATE VIEW orchestrator_rungs_emitted AS
+           SELECT * FROM ladder_rungs_emitted WHERE target_role='orchestrator'"
+            .to_owned(),
+        "CREATE VIEW orchestrator_rung_open_cycles_max AS
+           SELECT MAX(max(1,(COALESCE(resolved_at,(SELECT MAX(relay_ms) FROM run))-emitted_at+
+             COALESCE((SELECT cycle_interval_s FROM run ORDER BY sequence DESC LIMIT 1),600)*1000-1)/
+             (COALESCE((SELECT cycle_interval_s FROM run ORDER BY sequence DESC LIMIT 1),600)*1000)))
+             AS open_cycles, MAX(COALESCE(resolved_at,emitted_at)) AS at_ms
+           FROM orchestrator_rungs_emitted"
+            .to_owned(),
+        "CREATE VIEW escalation_rung_send_latency_max AS
+           SELECT CASE WHEN COUNT(*)=0 THEN NULL ELSE MAX(
+                    CASE WHEN sent_at IS NULL THEN
+                      (COALESCE((SELECT MAX(relay_ms) FROM run),emitted_at)-emitted_at) /
+                      (COALESCE((SELECT cycle_interval_s FROM run ORDER BY sequence DESC LIMIT 1),600)*1000.0)
+                    ELSE (sent_at-emitted_at) /
+                      (COALESCE((SELECT cycle_interval_s FROM run ORDER BY sequence DESC LIMIT 1),600)*1000.0)
+                    END) END AS max_cycles,
+                  COUNT(*) AS sample_count,MAX(COALESCE(sent_at,emitted_at)) AS at_ms
+           FROM escalation_rung"
+            .to_owned(),
+        "CREATE VIEW escalation_rungs_suppressed AS
+           SELECT * FROM escalation_rung
+           WHERE sent_at IS NULL AND due_by IS NOT NULL
+             AND due_by <= COALESCE((SELECT MAX(relay_ms) FROM run),0)"
+            .to_owned(),
+        "CREATE VIEW add_lane_action_open_cycles_max AS
+           SELECT MAX(max(1,(COALESCE(resolved_at,(SELECT MAX(relay_ms) FROM run))-emitted_at+
+             COALESCE((SELECT cycle_interval_s FROM run ORDER BY sequence DESC LIMIT 1),600)*1000-1)/
+             (COALESCE((SELECT cycle_interval_s FROM run ORDER BY sequence DESC LIMIT 1),600)*1000)))
+             AS open_cycles,MAX(COALESCE(resolved_at,emitted_at)) AS at_ms
+           FROM action WHERE kind='add_lane'"
+            .to_owned(),
+        "CREATE VIEW act_on_undetermined_actions AS
+           SELECT *,emitted_at AS at_ms FROM action WHERE kind='act_on_undetermined'"
+            .to_owned(),
+        "CREATE VIEW push_next_ticket_actions AS
+           SELECT *,emitted_at AS at_ms FROM action WHERE kind='push_next_ticket'"
+            .to_owned(),
+        "CREATE VIEW answer_dialog_actions AS
+           SELECT *,emitted_at AS at_ms FROM action WHERE kind='answer_dialog'"
+            .to_owned(),
+        "CREATE VIEW escalate_block_actions AS
+           SELECT *,emitted_at AS at_ms FROM action WHERE kind='escalate_block'"
+            .to_owned(),
+        "CREATE VIEW add_lane_actions AS
+           SELECT *,emitted_at AS at_ms FROM action WHERE kind='add_lane'"
+            .to_owned(),
+        "CREATE VIEW act_on_undetermined_unexecuted_ticks AS
+           SELECT a.id AS action_id,a.lane,a.emitted_at AS at_ms,COUNT(later.id) AS unexecuted_ticks
+           FROM action a LEFT JOIN action later ON later.kind=a.kind AND later.lane=a.lane
+             AND later.condition_started_at=a.condition_started_at AND later.id>a.id
+             AND later.executed_at IS NULL
+             AND NOT EXISTS (SELECT 1 FROM action_send s WHERE s.action_id=later.id)
+           WHERE a.kind='act_on_undetermined' GROUP BY a.id"
+            .to_owned(),
+        "CREATE VIEW minder_addressed_actions AS
+           SELECT *,emitted_at AS at_ms FROM action WHERE target_role IN ('lane','lead')"
+            .to_owned(),
+        "CREATE VIEW tick_actions_unexecuted_by_minder AS
+           SELECT a.id AS action_id,a.kind,a.lane,a.due_by AS at_ms,a.target_role,a.target_addr
+           FROM minder_addressed_actions a
+           WHERE a.due_by <= COALESCE((SELECT MAX(relay_ms) FROM run),0)
+             AND NOT EXISTS (SELECT 1 FROM action_send s WHERE s.action_id=a.id)
+             AND (a.kind<>'answer_dialog' OR NOT EXISTS (
+               SELECT 1 FROM dialog_answer d WHERE d.action_id=a.id))"
+            .to_owned(),
+        "CREATE VIEW minder_turns_without_committed_tick AS
+           SELECT s.session_addr,s.session_role,s.started_at AS at_ms
+           FROM session_turn s
+           WHERE s.session_role='minder' AND NOT EXISTS (
+             SELECT 1 FROM tick t WHERE t.session_addr=s.session_addr
+               AND t.committed_at >= s.started_at
+               AND t.committed_at <= s.started_at +
+                 COALESCE((SELECT tick_interval_s FROM run ORDER BY sequence DESC LIMIT 1),300)*1000)
+             AND s.started_at <= COALESCE((SELECT MAX(relay_ms) FROM run),0) -
+                 COALESCE((SELECT tick_interval_s FROM run ORDER BY sequence DESC LIMIT 1),300)*1000"
+            .to_owned(),
+        "CREATE VIEW session_turn_rows AS
+           SELECT session_addr,session_role,started_at,started_at AS at_ms FROM session_turn"
+            .to_owned(),
+        "CREATE VIEW minder_orders_unconfirmed_at_deadline AS
+           SELECT *,deadline_at AS at_ms FROM order_focus_at_deadline
+           WHERE sender_role='minder' AND outcome<>'confirmed'"
+            .to_owned(),
+        "CREATE VIEW unconfirmed_orders_not_resent_or_escalated AS
+           SELECT * FROM minder_orders_unconfirmed_at_deadline
+           WHERE followup_at IS NULL OR followup_at > deadline_at +
+             COALESCE((SELECT tick_interval_s FROM run ORDER BY sequence DESC LIMIT 1),300)*1000"
+            .to_owned(),
+        "CREATE VIEW cycle_events AS
+           SELECT cycle_id,session_addr,started_at,ended_at,ended_reason,interval_s,
+                  COALESCE(ended_at,started_at) AS at_ms FROM cycle_event"
+            .to_owned(),
+        "CREATE VIEW dialog_answer_violations AS
+           SELECT *,answered_at AS at_ms FROM dialog_answer WHERE COALESCE(violation,'')<>''"
+            .to_owned(),
+        "CREATE VIEW answer_dialog_latency_max AS
+           SELECT CASE WHEN COUNT(*)=0 THEN NULL ELSE MAX(
+                    (COALESCE(d.answered_at,(SELECT MAX(relay_ms) FROM run))-a.emitted_at) /
+                    (COALESCE((SELECT tick_interval_s FROM run ORDER BY sequence DESC LIMIT 1),300)*1000.0))
+                    END AS max_cycles,
+                  COUNT(*) AS sample_count,MAX(COALESCE(d.answered_at,a.emitted_at)) AS at_ms
+           FROM action a LEFT JOIN dialog_answer d ON d.action_id=a.id
+           WHERE a.kind='answer_dialog'"
+            .to_owned(),
+        "CREATE VIEW lane_orders_due AS
+           WITH latest AS (SELECT * FROM relay_order_snapshot
+                           ORDER BY observed_at DESC,snapshot_id DESC LIMIT 1)
+           SELECT o.order_id, o.recipient AS lane, o.expect_ticket, o.deadline_at AS at_ms,
+                  o.deadline_at, o.enqueued_at AS sent_at, o.acted_at, o.state, o.expired,
+                  NULL AS focus_ticket, NULL AS focus_state, NULL AS outcome,
+                  1 AS available, NULL AS unavailable_reason
+           FROM relay_order o JOIN latest s USING(snapshot_id)
+           WHERE s.available=1 AND o.deadline_at<=s.observed_at
+             AND NOT EXISTS (
+               SELECT 1 FROM relay_order later
+               WHERE later.snapshot_id=o.snapshot_id AND later.recipient=o.recipient
+                 AND (later.enqueued_at,later.order_id)>(o.enqueued_at,o.order_id)
+                 AND later.enqueued_at<=o.deadline_at)
+           UNION ALL
+           SELECT NULL,NULL,NULL,s.observed_at,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+                  0,s.unavailable_reason FROM latest s WHERE s.available=0
+           UNION ALL
+           SELECT NULL,NULL,NULL,(SELECT MAX(relay_ms) FROM run),NULL,NULL,NULL,NULL,NULL,
+                  NULL,NULL,NULL,0,'relay all-orders source has not been read'
+           WHERE NOT EXISTS (SELECT 1 FROM relay_order_snapshot)"
+            .to_owned(),
+        "CREATE VIEW lane_orders_not_taken_up AS
+           SELECT * FROM lane_orders_due WHERE available=0
+           UNION ALL
+           SELECT order_id,lane,expect_ticket,at_ms,deadline_at,sent_at,acted_at,state,expired,
+                  focus_ticket,focus_state,outcome,available,unavailable_reason
+           FROM lane_orders_due WHERE available=1 AND expired=1 AND acted_at IS NULL"
+            .to_owned(),
+        "CREATE VIEW failed_probe_ticks AS
+           SELECT defect_id,host,source,tick_id,at_ms FROM failed_probe_tick"
+            .to_owned(),
+        "CREATE VIEW probe_failure_without_routed_defect AS
+           SELECT defect_id, host, source, first_seen_at AS at_ms, routed_ticket, routed_at
+           FROM defect WHERE source LIKE 'probe:%' AND routed_ticket IS NULL AND closed_at IS NULL"
             .to_owned(),
     ]
 }
@@ -568,6 +1153,55 @@ pub const QUERYABLE: &[&str] = &[
     "idle_lane_episode_with_ready_work_max",
     "idle_minutes",
     "defect_rows",
+    "idle_capacity_minutes_with_ready_work",
+    "time_to_action_p90",
+    "missed_idle_minutes",
+    "detection_to_action_p90",
+    "assignment_confirm_latency_p90",
+    "drift_lane_minutes_share",
+    "blocked_lane_minutes",
+    "idle_lane_minutes_during_build_pause",
+    "need_ready_tickets_actions",
+    "need_ready_tickets_due",
+    "need_ready_tickets_without_planner_order",
+    "lane_orders_due",
+    "lane_orders_not_taken_up",
+    "failed_probe_ticks",
+    "probe_failure_without_routed_defect",
+    "plan_coverage_gap_rows",
+    "plan_coverage_gap_open_cycles_max",
+    "short_queue_open_cycles_max",
+    "drift_findings",
+    "drift_finding_open_cycles_max",
+    "assignments_sent",
+    "unconfirmed_assign_results",
+    "unconfirmed_assignments_without_followup",
+    "assignment_confirm_latency_max",
+    "ladder_rungs_emitted",
+    "escalation_rung",
+    "orchestrator_rungs_emitted",
+    "orchestrator_rung_open_cycles_max",
+    "escalation_rung_send_latency_max",
+    "escalation_rungs_suppressed",
+    "add_lane_action_open_cycles_max",
+    "act_on_undetermined_actions",
+    "push_next_ticket_actions",
+    "answer_dialog_actions",
+    "escalate_block_actions",
+    "add_lane_actions",
+    "act_on_undetermined_unexecuted_ticks",
+    "minder_addressed_actions",
+    "tick_actions_unexecuted_by_minder",
+    "minder_turns_without_committed_tick",
+    "session_turn_rows",
+    "minder_orders_unconfirmed_at_deadline",
+    "unconfirmed_orders_not_resent_or_escalated",
+    "cycle_events",
+    "dialog_answer_violations",
+    "answer_dialog_latency_max",
+    "lane_tick_rows",
+    "lane_span",
+    "cycle_missed",
     "discovery_steps",
     "discovery_steps_violating_ramp",
     "discovery_steps_judged_without_demand",
@@ -625,7 +1259,14 @@ pub const PRUNE: &[(&str, &str)] = &[
     ("session_turn", "started_at"),
     ("cycle_event", "ended_at"),
     ("cycle_missed", "detected_at"),
+    ("lane_lead", "observed_at"),
     ("dialog_answer", "answered_at"),
+    ("capacity_run", "ended_at"),
+    ("capacity_step", "window_end"),
+    ("capacity_level", "superseded_at"),
+    ("capacity_event", "at"),
+    ("host_output_sample", "at"),
+    ("host_build_pause_interval", "end_ms"),
     ("capacity_throttle_sample", "at"),
     ("tick", "committed_at"),
 ];
