@@ -852,6 +852,12 @@ fn parse_linear_marker_metrics(
         };
         if required.iter().any(|key| !fields.contains_key(key)) {
             missing_fields += 1;
+            if let Some(id) = comment.id.as_deref() {
+                evidence
+                    .entry("linear.review_markers_missing_fields")
+                    .or_default()
+                    .push(format!("linear-comment:{id}"));
+            }
         }
         let data = yaml_data_block(&comment.body);
         let data_valid = data
@@ -859,6 +865,12 @@ fn parse_linear_marker_metrics(
             .is_ok_and(|value| marker_data_complete(kind, value));
         if required.iter().any(|key| !fields.contains_key(key)) || !data_valid {
             unparseable += 1;
+            if let Some(id) = comment.id.as_deref() {
+                evidence
+                    .entry("linear.review_comments_unparseable_or_incomplete")
+                    .or_default()
+                    .push(format!("linear-comment:{id}"));
+            }
         }
         let Some(data) = data.ok().filter(|_| data_valid) else {
             continue;
@@ -873,6 +885,12 @@ fn parse_linear_marker_metrics(
                         continue;
                     };
                     findings.insert(((*repo).to_owned(), (*id).to_owned(), fnd.to_owned()));
+                    if let Some(comment_id) = comment.id.as_deref() {
+                        evidence
+                            .entry("linear.review_findings")
+                            .or_default()
+                            .push(format!("linear-comment:{comment_id}"));
+                    }
                     let path = finding
                         .get("path")
                         .and_then(serde_json::Value::as_str)
@@ -887,6 +905,12 @@ fn parse_linear_marker_metrics(
                         .unwrap_or("");
                     if (path.is_empty() && lines.is_empty()) || text.is_empty() {
                         locationless.insert(((*repo).to_owned(), (*id).to_owned(), fnd.to_owned()));
+                        if let Some(comment_id) = comment.id.as_deref() {
+                            evidence
+                                .entry("linear.findings_without_location_or_scenario")
+                                .or_default()
+                                .push(format!("linear-comment:{comment_id}"));
+                        }
                     }
                 }
             }
@@ -897,6 +921,12 @@ fn parse_linear_marker_metrics(
                 && let Some(pr) = artifact_prs.get(&((*repo).to_owned(), (*id).to_owned()))
             {
                 rounds.insert((pr.clone(), round));
+                if let Some(comment_id) = comment.id.as_deref() {
+                    evidence
+                        .entry("linear.disposition_rounds")
+                        .or_default()
+                        .push(format!("linear-comment:{comment_id}"));
+                }
             }
             if let Some(rows) = data
                 .get("new_findings")
@@ -930,17 +960,48 @@ fn parse_linear_marker_metrics(
         ),
         (
             "linear.review_markers_missing_fields".into(),
-            value(missing_fields, &[]),
+            value(
+                missing_fields,
+                evidence
+                    .get("linear.review_markers_missing_fields")
+                    .map_or(&[], Vec::as_slice),
+            ),
         ),
-        ("linear.disposition_rounds".into(), value(rounds.len(), &[])),
-        ("linear.review_findings".into(), value(findings.len(), &[])),
+        (
+            "linear.disposition_rounds".into(),
+            value(
+                rounds.len(),
+                evidence
+                    .get("linear.disposition_rounds")
+                    .map_or(&[], Vec::as_slice),
+            ),
+        ),
+        (
+            "linear.review_findings".into(),
+            value(
+                findings.len(),
+                evidence
+                    .get("linear.review_findings")
+                    .map_or(&[], Vec::as_slice),
+            ),
+        ),
         (
             "linear.findings_without_location_or_scenario".into(),
-            value(locationless.len(), &[]),
+            value(
+                locationless.len(),
+                evidence
+                    .get("linear.findings_without_location_or_scenario")
+                    .map_or(&[], Vec::as_slice),
+            ),
         ),
         (
             "linear.review_comments_unparseable_or_incomplete".into(),
-            value(unparseable, &[]),
+            value(
+                unparseable,
+                evidence
+                    .get("linear.review_comments_unparseable_or_incomplete")
+                    .map_or(&[], Vec::as_slice),
+            ),
         ),
     ])
 }
@@ -2530,21 +2591,21 @@ mod tests {
             metrics["linear.disposition_rounds"],
             QueryValue::Value {
                 value: 1.0,
-                evidence_refs: vec![]
+                evidence_refs: vec!["linear-comment:disposition".into()]
             }
         );
         assert_eq!(
             metrics["linear.review_findings"],
             QueryValue::Value {
                 value: 1.0,
-                evidence_refs: vec![]
+                evidence_refs: vec!["linear-comment:review".into()]
             }
         );
         assert_eq!(
             metrics["linear.findings_without_location_or_scenario"],
             QueryValue::Value {
                 value: 1.0,
-                evidence_refs: vec![]
+                evidence_refs: vec!["linear-comment:review".into()]
             }
         );
         assert_eq!(
