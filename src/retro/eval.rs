@@ -1559,6 +1559,7 @@ fn lead_record_fields(line: &str) -> Option<(&str, BTreeMap<&str, &str>)> {
     Some((kind, fields))
 }
 
+#[implements("FR-047-AC-6")]
 fn has_gate_record(line: &super::GateLine, records: &BTreeSet<(String, i64)>) -> bool {
     let finished_ms = (line.finished_at * 1000.0).round() as i64;
     records.contains(&(line.pr.clone(), finished_ms))
