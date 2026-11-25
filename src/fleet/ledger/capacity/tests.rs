@@ -73,6 +73,35 @@ fn capacity_config() -> FleetConfig {
     config
 }
 
+#[trace("FR-041-AC-17")]
+#[test]
+fn unrecorded_hosts_with_demand_excludes_zero_deficit_and_recorded_hosts() {
+    let (_dir, path) = path();
+    let ledger = Ledger::open(&path, &FleetConfig::default()).unwrap();
+    ledger
+        .connection
+        .execute_batch(
+            "INSERT INTO saturation_sample(host,at,deficit) VALUES
+               ('demanding',100,2),('no-demand',100,0),('recorded',100,3);
+             INSERT INTO capacity_level(host,level,recorded_at)
+               VALUES('recorded',1,50);",
+        )
+        .unwrap();
+
+    let observed = ledger
+        .connection
+        .prepare("SELECT host,deficit FROM unrecorded_hosts_with_demand ORDER BY host")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert_eq!(observed, vec![("demanding".to_owned(), 2)]);
+}
+
 fn sample(request: &WindowRequest) -> WindowMeasurements {
     let at = request.end_ms;
     let output_basis = value("tickets_prs".to_owned(), "ix-board.capacity", at);
