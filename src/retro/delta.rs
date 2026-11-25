@@ -55,6 +55,12 @@ pub struct Comparison {
 pub struct MetricDelta {
     /// Metric id.
     pub id: String,
+    /// Stable catalog class, resolved from the catalog when producing a delta.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
+    /// Department catalog class when this metric has a department definition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub department_class: Option<String>,
     /// Unit of the value.
     pub unit: String,
     /// Good direction.
@@ -165,6 +171,9 @@ pub(crate) fn compare_records(
                 });
             MetricDelta {
                 id: metric.id.clone(),
+                class: super::catalog::definition(&metric.id).map(|def| def.family.to_owned()),
+                department_class: super::department::definition(&metric.id)
+                    .map(|def| def.class.to_owned()),
                 unit: metric.unit.clone(),
                 direction: metric.direction,
                 status: metric.status,

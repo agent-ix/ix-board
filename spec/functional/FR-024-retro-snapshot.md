@@ -108,7 +108,8 @@ existing id (see [FR-025](./FR-025-retro-store.md)).
 | FR-024-AC-18 | A missing threshold makes only the metrics that use it `unavailable` with reason `not configured`, and `slot_process` without `orphan_slot_hours`, or `relay_leads` without `message_stale_minutes`, (and the reverse) makes its metric `unavailable` with reason `not configured`. | Test |
 | FR-024-AC-12 | The command makes no Linear mutation, no GitHub write and no repository write; test source doubles that record writes see none. | Test |
 | FR-024-AC-13 | Each source is read with one paginated pass per run, and a source read that does not reach its last page makes dependent metrics unavailable ([FR-026](./FR-026-retro-unavailable-not-zero.md)). | Test |
-| FR-024-AC-14 | `--json` output exposes every metric with id, value, unit, direction, status, source and query; text output prints one line per metric. | Test |
+| FR-024-AC-14 | `--json` output exposes every metric with id, value, unit, direction, status, source, query and its FR-024 catalog family as `class`; it includes the FR-029 department class as `department_class` when defined. These class fields are output-only and are never written to the append-only store. Text output prints one line per metric. | Test |
+| FR-024-AC-19 | `ix-board::retro::decode_saved_report` accepts the record payload of `retro snapshot --json` containing these class fields; older pinned readers that reject unknown metric fields reject this output. This acceptance covers the record payload only, excluding stale-cache freshness keys added by the CLI wrapper. | Test |
 
 ## Dependencies
 

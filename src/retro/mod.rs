@@ -22,7 +22,8 @@ use thiserror::Error as ThisError;
 
 pub use backfill::{BackfillReport, parse_day, render_backfill_text, run_backfill};
 pub use catalog::{
-    CATALOG, Direction, Metric, MetricDef, Record, RecordKind, SCHEMA_VERSION, Status,
+    CATALOG, Direction, Metric, MetricDef, Record, RecordKind, SCHEMA_VERSION, SnapshotOutput,
+    Status,
 };
 pub use config::{ConfigError, DEFAULT_WINDOW, RetroConfig, format_window, parse_window};
 pub use delta::{DeltaReport, render_delta_text, run_delta};
@@ -40,6 +41,9 @@ pub enum RetroError {
     /// Store problem.
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// A snapshot output was requested for a metric outside the fixed catalog.
+    #[error("metric {0:?} is not in the retro catalog")]
+    UnknownMetricDefinition(String),
     /// `baseline_taken_at` matches no stored record.
     #[error("baseline_taken_at {0:?} matches no record in the store")]
     BaselineNotFound(String),

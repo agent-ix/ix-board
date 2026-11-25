@@ -25,6 +25,13 @@ an error naming the value, before it checks the number of snapshot records. When
 fewer than two snapshot records exist, the command SHALL
 report that no delta exists and exit zero.
 
+The `ix-board retro delta` command SHALL include each metric's family from the
+FR-024 catalog as `class` in the delta output, and SHALL include the FR-029
+department catalog class as `department_class` when that metric has a department
+definition, resolving these output fields from the current catalogs. The
+`ix-board::retro::decode_saved_report` reader SHALL accept earlier delta JSON
+that omits `class` and `department_class`.
+
 For a metric with direction `up` or `down`, the command SHALL set `regressing`
 when the change since the previous record moved against the direction in each of
 the latest two consecutive comparisons between snapshot records, which needs three
@@ -47,6 +54,8 @@ print no single combined health score.
 | FR-027-AC-6 | The command makes no network request: it is run with source readers that fail the test if invoked, and still succeeds from the store alone. | Test |
 | FR-027-AC-7 | A backfill run after a snapshot leaves the snapshot as the latest record, and a backfilled record can serve as the baseline. | Test |
 | FR-027-AC-8 | A `baseline_taken_at` matching no record stops the command with an error naming the value. | Test |
+| FR-027-AC-9 | `ix-board retro delta` output includes each metric's FR-024 catalog family as `class` and the FR-029 department class as `department_class` where defined, resolving both from catalogs. | Test |
+| FR-027-AC-10 | `ix-board::retro::decode_saved_report` decodes delta JSON written before the `class` and `department_class` output fields existed. | Test |
 
 ## Dependencies
 
