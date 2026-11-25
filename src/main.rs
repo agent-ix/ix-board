@@ -1733,6 +1733,7 @@ fn run_retro_backfill(
 #[implements("FR-047-AC-2")]
 #[implements("FR-047-AC-3")]
 #[implements("FR-047-AC-7")]
+#[implements("FR-047-AC-9")]
 fn run_retro_eval(
     config_path: &std::path::Path,
     team_override: Option<&str>,
@@ -1954,6 +1955,7 @@ fn run_retro_eval(
     })
 }
 
+#[implements("FR-047-AC-9")]
 fn retro_eval_stage<T>(name: &str, operation: impl FnOnce() -> T) -> T {
     let started = std::time::Instant::now();
     eprintln!("[retro-eval] stage={name} status=started");
@@ -1966,6 +1968,7 @@ fn retro_eval_stage<T>(name: &str, operation: impl FnOnce() -> T) -> T {
 }
 
 #[implements("FR-047-AC-1")]
+#[implements("FR-047-AC-9")]
 fn collect_eval_retro_record(
     config: &retro::RetroConfig,
     window: &retro::eval::EvalWindow,
@@ -3285,6 +3288,7 @@ mod tests {
     use ix_trace_rs::trace;
 
     #[trace("FR-047-AC-7")]
+    #[trace("FR-047-AC-9")]
     #[test]
     fn retro_eval_json_is_the_report_object_not_an_enum_wrapper() {
         let report = ix_board::retro::eval::EvalReport {

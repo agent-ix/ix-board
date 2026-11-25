@@ -34,6 +34,7 @@ pub struct RequestCountSnapshot {
 }
 
 /// Captures current source request counters before evaluation begins.
+#[implements("FR-047-AC-9")]
 pub fn request_count_snapshot() -> RequestCountSnapshot {
     let (github_cli_calls, github_pages_observed) = super::live::github_request_counts();
     RequestCountSnapshot {
@@ -45,6 +46,7 @@ pub fn request_count_snapshot() -> RequestCountSnapshot {
 }
 
 /// Returns source request totals made since `start`.
+#[implements("FR-047-AC-9")]
 pub fn request_counts_since(start: RequestCountSnapshot) -> SourceRequestCounts {
     let end = request_count_snapshot();
     SourceRequestCounts {
@@ -713,6 +715,7 @@ pub fn retro_adapters(
 
 /// Adapts an in-memory, read-only retro collection without appending it to the store.
 #[implements("FR-047-AC-1")]
+#[implements("FR-047-AC-9")]
 pub fn retro_record_adapters(
     specs: &[RoleSpec],
     record: Result<&super::Record, &str>,
@@ -2624,6 +2627,7 @@ mod tests {
 
     #[test]
     #[ix_trace_rs::trace("FR-047-AC-1")]
+    #[ix_trace_rs::trace("FR-047-AC-9")]
     fn retro_metric_adapter_uses_only_snapshots_inside_the_window() {
         let record: super::super::Record = serde_json::from_str(
             r#"{"schema_version":1,"kind":"snapshot","taken_at":"2023-11-14T22:13:20Z","team":"TEST","window":"24h","metrics":{"prs_oversize":{"id":"prs_oversize","status":"ok","value":2,"unit":"pull_requests","direction":"down","source":"github","query":"open pull requests","class":"flow","department_class":"throughput"}}}"#,

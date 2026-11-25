@@ -195,6 +195,7 @@ struct TransportMetrics {
 static EVAL_REQUESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Number of Linear GraphQL requests attempted by this process.
+#[implements("FR-047-AC-9")]
 pub(crate) fn request_count() -> u64 {
     EVAL_REQUESTS.load(std::sync::atomic::Ordering::Relaxed)
 }

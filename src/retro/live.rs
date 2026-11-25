@@ -31,6 +31,7 @@ static GITHUB_CLI_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 static GITHUB_PAGES_OBSERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `gh api` command count and observed response page count for this process.
+#[implements("FR-047-AC-9")]
 pub(crate) fn github_request_counts() -> (u64, u64) {
     (
         GITHUB_CLI_CALLS.load(Ordering::Relaxed),
@@ -38,6 +39,7 @@ pub(crate) fn github_request_counts() -> (u64, u64) {
     )
 }
 
+#[implements("FR-047-AC-9")]
 fn github_pages(args: &[String], stdout: &[u8]) -> u64 {
     if args.iter().any(|arg| arg == "--paginate") && args.iter().any(|arg| arg == "--slurp") {
         serde_json::from_slice::<serde_json::Value>(stdout)
@@ -54,6 +56,7 @@ fn github_pages(args: &[String], stdout: &[u8]) -> u64 {
     }
 }
 
+#[implements("FR-047-AC-9")]
 fn read_bounded(mut reader: impl Read, limit: usize) -> std::io::Result<(Vec<u8>, bool)> {
     let mut bytes = Vec::new();
     let mut chunk = [0_u8; 8192];
@@ -76,6 +79,7 @@ mod eval_request_tests {
     use ix_trace_rs::trace;
 
     #[test]
+    #[trace("FR-047-AC-9")]
     fn github_request_counter_counts_paginated_api_pages() {
         let args = ["api", "--paginate", "--slurp"]
             .into_iter()
@@ -312,6 +316,7 @@ fn run(program: &str, args: &[String]) -> Result<String, String> {
     String::from_utf8(output.stdout).map_err(|error| format!("{program}: {error}"))
 }
 
+#[implements("FR-047-AC-9")]
 fn run_github(args: &[String]) -> Result<String, String> {
     let mut child = Command::new("gh")
         .args(args)
