@@ -80,3 +80,10 @@ Round 1, head 336d282879937eb6ddb49566bb27b7b0f55679d8.
 | FND-004 | fixed | The second read is gone; the tick uses the ratio from the bounded `read_hosts` read. |
 | FND-005 | fixed | Live run with no URL: one `prometheus` fix_source, no `tick.host_busy`. |
 | FND-006 | fixed | The doc comment describes the busy map. |
+
+Round 2, head ba5546dbe9224ffb67dcbca130089df242ce1a24.
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-007 | still-open: the staleness bound is still written separately | The predicate is now one function, `usable_busy_ratio`. Both callers still compute `cfg.push_interval.saturating_mul(2)` themselves (src/fleet/report.rs:482 and 917), beside `stale_after = push_interval * 2` at 463. Mutation: changing only the bound at 917 to 3 leaves lib (255), fleet (37) and fleet_tick (30) passing. Define the bound once, for example by passing `FleetConfig` to the function. |
+| FND-008 | fixed | The test module is declared last with its body in live_tests.rs; the allow is gone. |

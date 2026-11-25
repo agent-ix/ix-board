@@ -803,9 +803,12 @@ fn report_with_busy_reading(reading: HostSeries) -> FleetReport {
 #[test]
 fn stale_busy_ratio_is_a_host_defect_and_not_used_by_the_tick() {
     let mut world = World::one_host(&["h:w:1"], vec![], &[]);
+    world.cfg.push_interval = Duration::from_secs(30);
     let reading = world.series.hosts.get_mut("h").unwrap().as_mut().unwrap();
     reading.busy_ratio = Some(0.2);
-    reading.busy_sample_age = Some(Duration::from_secs(121));
+    // This falls between the configured threshold (60s) and a mismatched 120s
+    // threshold, so both the defect and report output must use the same bound.
+    reading.busy_sample_age = Some(Duration::from_secs(90));
 
     let report = world.run();
 

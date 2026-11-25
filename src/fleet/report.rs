@@ -358,9 +358,13 @@ fn host_of(addr: &str) -> String {
 
 type HostReads = BTreeMap<String, Result<HostSeries, SourceError>>;
 
+fn host_series_stale_after(config: &FleetConfig) -> Duration {
+    config.push_interval.saturating_mul(2)
+}
+
 fn usable_busy_ratio(
     series: &HostSeries,
-    stale_after: Duration,
+    config: &FleetConfig,
 ) -> Result<f64, (DefectKind, String)> {
     if let Some(reason) = &series.busy_ratio_error {
         return Err((DefectKind::UnreadableSource, reason.clone()));
@@ -377,7 +381,7 @@ fn usable_busy_ratio(
             "busy ratio sample age is unavailable".to_owned(),
         ));
     };
-    if age > stale_after {
+    if age > host_series_stale_after(config) {
         return Err((
             DefectKind::StaleSource,
             format!("busy ratio sample is {}s old", age.as_secs()),
@@ -460,7 +464,7 @@ fn host_defects(ctx: &mut Ctx<'_>, host: &str, read: &Result<HostSeries, SourceE
             error.0.clone(),
         ),
         Ok(series) => {
-            let stale_after = ctx.cfg.push_interval * 2;
+            let stale_after = host_series_stale_after(ctx.cfg);
             match series.sample_age {
                 None => ctx.defect(
                     DefectKind::StaleSource,
@@ -478,9 +482,7 @@ fn host_defects(ctx: &mut Ctx<'_>, host: &str, read: &Result<HostSeries, SourceE
                 ),
                 Some(_) => {}
             }
-            if let Err((kind, reason)) =
-                usable_busy_ratio(series, ctx.cfg.push_interval.saturating_mul(2))
-            {
+            if let Err((kind, reason)) = usable_busy_ratio(series, ctx.cfg) {
                 ctx.defect(kind, "prometheus.host_busy", Some(host), None, reason);
             }
             for probe in series.probes.iter().filter(|p| !p.ok) {
@@ -914,7 +916,7 @@ pub fn build_report(cfg: &FleetConfig, sources: &Sources<'_>, local_now_ms: i64)
     let mut report = finish(relay.now_ms, rows, ctx.defects);
     for (host, reading) in &reads {
         if let Ok(reading) = reading
-            && let Ok(ratio) = usable_busy_ratio(reading, cfg.push_interval.saturating_mul(2))
+            && let Ok(ratio) = usable_busy_ratio(reading, cfg)
         {
             report.host_busy.insert(host.to_lowercase(), ratio);
         }

@@ -70,3 +70,10 @@ Round 1, head 336d282879937eb6ddb49566bb27b7b0f55679d8.
 | FND-004 | fixed | The CLI reference describes the reader and the host-scoped defect. |
 | FND-005 | fixed | The replacement test asserts the `add_lane` result and is tagged AC-6 and AC-23. |
 | FND-006 | fixed | The fake returns an empty map. |
+
+Round 2, head ba5546dbe9224ffb67dcbca130089df242ce1a24.
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-002 | fixed | Out-of-range 1.5 and the invalid and missing defects are asserted. Mutations dropping the range check or the host_busy defect now fail the fleet tests. |
+| FND-007 | fixed | Blocked reason, probe and working window are asserted beside an invalid sample. A mutation returning early after the invalid sample now fails. |
