@@ -1740,12 +1740,14 @@ fn run_retro_eval(
     role_filter: Option<&str>,
     session_filter: Option<&str>,
 ) -> Result<retro::eval::EvalReport, Error> {
-    let config = retro::RetroConfig::load(config_path).map_err(retro::RetroError::from)?;
+    let request_start = retro::eval::request_count_snapshot();
+    let config = retro_eval_stage("configuration", || retro::RetroConfig::load(config_path))
+        .map_err(retro::RetroError::from)?;
     let team = team_override.unwrap_or(&config.team);
     let settings = retro::eval::load_settings(team).map_err(retro::RetroError::Evaluation)?;
     let specs_dir = retro::eval::resolve_role_spec_dir(team, &settings);
-    let mut specs =
-        retro::eval::read_role_specs(&specs_dir).map_err(retro::RetroError::Evaluation)?;
+    let mut specs = retro_eval_stage("role_specs", || retro::eval::read_role_specs(&specs_dir))
+        .map_err(retro::RetroError::Evaluation)?;
     let duration = retro::parse_window(since).map_err(retro::RetroError::from)?;
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1764,15 +1766,18 @@ fn run_retro_eval(
     if let Some(role) = role_filter {
         specs.retain(|spec| spec.role == role);
     }
-    let store_read = retro::Store::from_env(team)
-        .and_then(|store| store.read_all())
-        .map_err(|error| error.to_string());
+    let store_read = retro_eval_stage("retro_store", || {
+        retro::Store::from_env(team)
+            .and_then(|store| store.read_all())
+            .map_err(|error| error.to_string())
+    });
     let records = store_read
         .as_ref()
         .map(Vec::as_slice)
         .map_err(String::as_str);
-    let current_live_record = collect_eval_retro_record(&config, &window);
-    let previous_live_record = collect_eval_retro_record(&config, &previous_window);
+    let current_live_record = retro_eval_stage("current.live_retro_record", || {
+        collect_eval_retro_record(&config, &window)
+    });
     let fleet_settings = ix_board::settings_value().ok().flatten();
     let fleet_config = ix_board::fleet::FleetConfig::from_toml(
         fleet_settings.as_ref(),
@@ -1791,110 +1796,100 @@ fn run_retro_eval(
         &specs,
         current_live_record.as_ref().map_err(String::as_str),
     ));
-    current_adapters.extend(retro::eval::prometheus_adapters(
-        &specs,
-        prometheus_url,
-        &window,
+    current_adapters.extend(retro_eval_stage("current.prometheus", || {
+        retro::eval::prometheus_adapters(&specs, prometheus_url, &window)
+    }));
+    current_adapters.extend(retro_eval_stage("current.linear_reviewed_prs", || {
+        retro::eval::linear_reviewed_prs_adapters(&specs, &config.repos, &window)
+    }));
+    current_adapters.extend(retro_eval_stage("current.linear_markers", || {
+        retro::eval::linear_marker_adapters(&specs, &config.repos, &window)
+    }));
+    current_adapters.extend(retro_eval_stage("current.github_merged_prs", || {
+        retro::eval::github_merged_prs_adapters(&specs, &config.repos, &window)
+    }));
+    current_adapters.extend(retro_eval_stage(
+        "current.linear_merge_without_review",
+        || retro::eval::linear_merged_prs_without_review_adapters(&specs, &config.repos, &window),
     ));
-    current_adapters.extend(retro::eval::linear_reviewed_prs_adapters(
-        &specs,
-        &config.repos,
-        &window,
-    ));
-    current_adapters.extend(retro::eval::linear_marker_adapters(
-        &specs,
-        &config.repos,
-        &window,
-    ));
-    current_adapters.extend(retro::eval::github_merged_prs_adapters(
-        &specs,
-        &config.repos,
-        &window,
-    ));
-    current_adapters.extend(retro::eval::linear_merged_prs_without_review_adapters(
-        &specs,
-        &config.repos,
-        &window,
-    ));
-    current_adapters.extend(retro::eval::linear_gate_record_adapters(
-        &specs,
-        &config.repos,
-        config.gate_log.as_deref(),
-        &window,
-    ));
-    current_adapters.extend(retro::eval::gate_log_adapters(
-        &specs,
-        config.gate_log.as_deref(),
-        &window,
-    ));
-    current_adapters.extend(retro::eval::ledger_adapters(
-        &specs,
-        fleet_ledger_path.as_deref(),
-        settings.ready_state.as_deref(),
-        &config.projects,
-        &window,
-    ));
+    current_adapters.extend(retro_eval_stage("current.linear_gate_records", || {
+        retro::eval::linear_gate_record_adapters(
+            &specs,
+            &config.repos,
+            config.gate_log.as_deref(),
+            &window,
+        )
+    }));
+    current_adapters.extend(retro_eval_stage("current.gate_log", || {
+        retro::eval::gate_log_adapters(&specs, config.gate_log.as_deref(), &window)
+    }));
+    current_adapters.extend(retro_eval_stage("current.fleet_ledger", || {
+        retro::eval::ledger_adapters(
+            &specs,
+            fleet_ledger_path.as_deref(),
+            settings.ready_state.as_deref(),
+            &config.projects,
+            &window,
+        )
+    }));
     let mut previous_adapters = retro::eval::declared_adapters(&specs);
     previous_adapters.extend(retro::eval::retro_adapters(
         &specs,
         records,
         &previous_window,
     ));
-    previous_adapters.extend(retro::eval::retro_record_adapters(
-        &specs,
-        previous_live_record.as_ref().map_err(String::as_str),
+    previous_adapters.extend(retro_eval_stage("previous.prometheus", || {
+        retro::eval::prometheus_adapters(&specs, prometheus_url, &previous_window)
+    }));
+    previous_adapters.extend(retro_eval_stage("previous.linear_reviewed_prs", || {
+        retro::eval::linear_reviewed_prs_adapters(&specs, &config.repos, &previous_window)
+    }));
+    previous_adapters.extend(retro_eval_stage("previous.linear_markers", || {
+        retro::eval::linear_marker_adapters(&specs, &config.repos, &previous_window)
+    }));
+    previous_adapters.extend(retro_eval_stage("previous.github_merged_prs", || {
+        retro::eval::github_merged_prs_adapters(&specs, &config.repos, &previous_window)
+    }));
+    previous_adapters.extend(retro_eval_stage(
+        "previous.linear_merge_without_review",
+        || {
+            retro::eval::linear_merged_prs_without_review_adapters(
+                &specs,
+                &config.repos,
+                &previous_window,
+            )
+        },
     ));
-    previous_adapters.extend(retro::eval::prometheus_adapters(
-        &specs,
-        prometheus_url,
-        &previous_window,
-    ));
-    previous_adapters.extend(retro::eval::linear_reviewed_prs_adapters(
-        &specs,
-        &config.repos,
-        &previous_window,
-    ));
-    previous_adapters.extend(retro::eval::linear_marker_adapters(
-        &specs,
-        &config.repos,
-        &previous_window,
-    ));
-    previous_adapters.extend(retro::eval::github_merged_prs_adapters(
-        &specs,
-        &config.repos,
-        &previous_window,
-    ));
-    previous_adapters.extend(retro::eval::linear_merged_prs_without_review_adapters(
-        &specs,
-        &config.repos,
-        &previous_window,
-    ));
-    previous_adapters.extend(retro::eval::linear_gate_record_adapters(
-        &specs,
-        &config.repos,
-        config.gate_log.as_deref(),
-        &previous_window,
-    ));
-    previous_adapters.extend(retro::eval::gate_log_adapters(
-        &specs,
-        config.gate_log.as_deref(),
-        &previous_window,
-    ));
-    previous_adapters.extend(retro::eval::ledger_adapters(
-        &specs,
-        fleet_ledger_path.as_deref(),
-        settings.ready_state.as_deref(),
-        &config.projects,
-        &previous_window,
-    ));
-    let session_ledger_rows = fleet_ledger_path
-        .as_deref()
-        .ok_or_else(|| "fleet ledger path is unavailable for session_turn".to_owned())
-        .and_then(|path| {
-            ix_board::fleet::ledger::query(path, "session_turn", None)
-                .map(|rows| rows.rows)
-                .map_err(|error| error.to_string())
-        });
+    previous_adapters.extend(retro_eval_stage("previous.linear_gate_records", || {
+        retro::eval::linear_gate_record_adapters(
+            &specs,
+            &config.repos,
+            config.gate_log.as_deref(),
+            &previous_window,
+        )
+    }));
+    previous_adapters.extend(retro_eval_stage("previous.gate_log", || {
+        retro::eval::gate_log_adapters(&specs, config.gate_log.as_deref(), &previous_window)
+    }));
+    previous_adapters.extend(retro_eval_stage("previous.fleet_ledger", || {
+        retro::eval::ledger_adapters(
+            &specs,
+            fleet_ledger_path.as_deref(),
+            settings.ready_state.as_deref(),
+            &config.projects,
+            &previous_window,
+        )
+    }));
+    let session_ledger_rows = retro_eval_stage("session_turn_ledger", || {
+        fleet_ledger_path
+            .as_deref()
+            .ok_or_else(|| "fleet ledger path is unavailable for session_turn".to_owned())
+            .and_then(|path| {
+                ix_board::fleet::ledger::query(path, "session_turn", None)
+                    .map(|rows| rows.rows)
+                    .map_err(|error| error.to_string())
+            })
+    });
     let session_rows = session_ledger_rows
         .as_ref()
         .map(Vec::as_slice)
@@ -1955,7 +1950,19 @@ fn run_retro_eval(
         previous_window,
         roles,
         sessions,
+        source_requests: retro::eval::request_counts_since(request_start),
     })
+}
+
+fn retro_eval_stage<T>(name: &str, operation: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    eprintln!("[retro-eval] stage={name} status=started");
+    let result = operation();
+    eprintln!(
+        "[retro-eval] stage={name} status=finished duration_ms={}",
+        started.elapsed().as_millis()
+    );
+    result
 }
 
 #[implements("FR-047-AC-1")]
@@ -3310,12 +3317,22 @@ mod tests {
                 session_ids: Vec::new(),
             }],
             sessions: Vec::new(),
+            source_requests: ix_board::retro::eval::SourceRequestCounts {
+                linear_http_requests: 4,
+                github_cli_calls: 2,
+                github_pages_observed: 3,
+                prometheus_http_requests: 1,
+            },
         };
         let encoded = encode_output_json(&Output::RetroEval(report)).unwrap();
         let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
         assert_eq!(value["team"], "TEST");
         assert_eq!(value["schema_version"], 1);
         assert_eq!(value["roles"][0]["trend_matched_rules"], 3);
+        assert_eq!(value["source_requests"]["linear_http_requests"], 4);
+        assert_eq!(value["source_requests"]["github_cli_calls"], 2);
+        assert_eq!(value["source_requests"]["github_pages_observed"], 3);
+        assert_eq!(value["source_requests"]["prometheus_http_requests"], 1);
         assert!(value.get("RetroEval").is_none());
     }
 

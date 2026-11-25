@@ -6,11 +6,13 @@
 //! Each one only reads: Linear queries, `gh api` GET calls, `herdr` reads, `git worktree list`,
 //! `ps`, a file read and `redis-cli LRANGE` (which does not dequeue).
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use ix_trace_rs::implements;
 use serde::Deserialize;
 
 use super::sources::{
@@ -23,6 +25,66 @@ use crate::{LinearGraphQlSource, ReadService, WorkspaceSnapshot};
 
 /// Most state-history reads in flight at once.
 const HISTORY_CONCURRENCY: usize = 6;
+const GITHUB_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+static GITHUB_CLI_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GITHUB_PAGES_OBSERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `gh api` command count and observed response page count for this process.
+pub(crate) fn github_request_counts() -> (u64, u64) {
+    (
+        GITHUB_CLI_CALLS.load(Ordering::Relaxed),
+        GITHUB_PAGES_OBSERVED.load(Ordering::Relaxed),
+    )
+}
+
+fn github_pages(args: &[String], stdout: &[u8]) -> u64 {
+    if args.iter().any(|arg| arg == "--paginate") && args.iter().any(|arg| arg == "--slurp") {
+        serde_json::from_slice::<serde_json::Value>(stdout)
+            .ok()
+            .and_then(|value| {
+                value
+                    .as_array()
+                    .and_then(|pages| u64::try_from(pages.len()).ok())
+            })
+            .filter(|pages| *pages > 0)
+            .unwrap_or(1)
+    } else {
+        1
+    }
+}
+
+fn read_bounded(mut reader: impl Read, limit: usize) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    let mut truncated = false;
+    loop {
+        let read = reader.read(&mut chunk)?;
+        if read == 0 {
+            return Ok((bytes, truncated));
+        }
+        let available = limit.saturating_sub(bytes.len());
+        let accepted = available.min(read);
+        bytes.extend_from_slice(&chunk[..accepted]);
+        truncated |= accepted < read;
+    }
+}
+
+#[cfg(test)]
+mod eval_request_tests {
+    use super::github_pages;
+    use ix_trace_rs::trace;
+
+    #[test]
+    fn github_request_counter_counts_paginated_api_pages() {
+        let args = ["api", "--paginate", "--slurp"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(github_pages(&args, br#"[{"page":1},{"page":2}]"#), 2);
+        assert_eq!(github_pages(&args, b"invalid"), 1);
+    }
+}
 
 /// Runs `read` over `inputs` with at most [`HISTORY_CONCURRENCY`] reads in flight, keeping the
 /// order of `inputs`. A read that never ran is an error, not a missing value.
@@ -233,6 +295,9 @@ impl LinearSource for LiveLinear {
 }
 
 fn run(program: &str, args: &[String]) -> Result<String, String> {
+    if program == "gh" {
+        return run_github(args);
+    }
     let output = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
@@ -245,6 +310,78 @@ fn run(program: &str, args: &[String]) -> Result<String, String> {
         ));
     }
     String::from_utf8(output.stdout).map_err(|error| format!("{program}: {error}"))
+}
+
+fn run_github(args: &[String]) -> Result<String, String> {
+    let mut child = Command::new("gh")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("gh: {error}"))?;
+    GITHUB_CLI_CALLS.fetch_add(1, Ordering::Relaxed);
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "gh stdout pipe was not created".to_owned())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "gh stderr pipe was not created".to_owned())?;
+    let stdout_reader = std::thread::spawn(move || read_bounded(stdout, 8 * 1024 * 1024));
+    let stderr_reader = std::thread::spawn(move || read_bounded(stderr, 64 * 1024));
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < GITHUB_COMMAND_TIMEOUT => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(format!(
+                    "gh request timed out after {}s",
+                    GITHUB_COMMAND_TIMEOUT.as_secs()
+                ));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(format!("gh process status: {error}"));
+            }
+        }
+    };
+    let (stdout, stdout_truncated) = stdout_reader
+        .join()
+        .map_err(|_| "gh stdout reader panicked".to_owned())?
+        .map_err(|error| format!("gh stdout: {error}"))?;
+    let (stderr, stderr_truncated) = stderr_reader
+        .join()
+        .map_err(|_| "gh stderr reader panicked".to_owned())?
+        .map_err(|error| format!("gh stderr: {error}"))?;
+    if status.success() {
+        if stdout_truncated {
+            return Err("gh response exceeded the 8 MiB read limit".to_owned());
+        }
+        GITHUB_PAGES_OBSERVED.fetch_add(github_pages(args, &stdout), Ordering::Relaxed);
+    } else {
+        let suffix = if stderr_truncated {
+            " [stderr truncated]"
+        } else {
+            ""
+        };
+        return Err(format!(
+            "gh failed: {}{suffix}",
+            String::from_utf8_lossy(&stderr).trim(),
+        ));
+    }
+    String::from_utf8(stdout).map_err(|error| format!("gh: {error}"))
 }
 
 fn strings(args: &[&str]) -> Vec<String> {

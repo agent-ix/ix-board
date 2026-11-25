@@ -65,7 +65,10 @@ or partial evidence and SHALL NOT write to source systems.
   matched rules. `trend_matched_rules` reports that intersection size. Trend is
   unavailable only when no rule is scored in both windows.
 - The JSON document has `schema_version`, `team`, `window`, `previous_window`,
-  `roles`, and `sessions`. A role row has `role`, `score`, `previous_score`,
+  `roles`, `sessions`, and `source_requests`. The request object reports the
+  Linear and Prometheus HTTP attempts plus GitHub CLI calls and observed
+  response pages for the invocation; GitHub CLI retries can make page counts a
+  lower bound. A role row has `role`, `score`, `previous_score`,
   `trend`, `trend_matched_rules`, `rules`,
   `failing_rules`, and its session ids. A rule row has `id`, `query`, `status`,
   `value`, `comparator`, `target`, `evidence_refs`, and optional `reason` or
@@ -73,6 +76,10 @@ or partial evidence and SHALL NOT write to source systems.
   `failing_rules`.
 - Text and JSON render the same evaluations. `--role` and `--session` filter
   presentation only; they do not alter source populations or rule semantics.
+- The evaluator reads stored retro records once for both event-time windows and
+  makes at most one additional live retro snapshot for the current window. It
+  emits stage start and elapsed-time messages to stderr. Source failures are
+  represented by unavailable rule rows with reasons, preserving partial JSON.
 
 ## Acceptance Criteria
 
@@ -86,6 +93,7 @@ or partial evidence and SHALL NOT write to source systems.
 | FR-047-AC-6 | Every role evaluation query in the configured role specs resolves to a registered source adapter; every unknown source or query returns an unavailable row with a diagnostic and no panic. | Test |
 | FR-047-AC-7 | `--team`, `--role`, `--session`, `--since` and `--json` produce the documented scope and stable JSON schema; text and JSON carry the same values and statuses. | Test |
 | FR-047-AC-8 | Evaluation is read-only: a run does not modify retro snapshots, the fleet ledger, tracker, GitHub, relay, hook events or transcripts. | Test |
+| FR-047-AC-9 | Evaluation reuses stored retro records across windows, reports attempted Linear/GitHub/Prometheus request counts in JSON, and writes stage timings to stderr while preserving partial results when a source is unavailable. | Test |
 
 ## Dependencies
 

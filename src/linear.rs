@@ -192,6 +192,13 @@ struct TransportMetrics {
     reported_requests: std::sync::atomic::AtomicU64,
 }
 
+static EVAL_REQUESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Number of Linear GraphQL requests attempted by this process.
+pub(crate) fn request_count() -> u64 {
+    EVAL_REQUESTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl LinearGraphQlSource {
     pub(crate) fn metrics_start(&self) -> (u64, u64, u64, u64, std::time::Instant) {
         use std::sync::atomic::Ordering;
@@ -1202,6 +1209,7 @@ impl LinearGraphQlSource {
         let quota = crate::quota::QuotaGate::open_within(&self.quota_path, &config, deadline)?;
         const ESTIMATED_COMPLEXITY: u64 = 10_000;
         let reservation = quota.reserve_evaluated(ESTIMATED_COMPLEXITY, deadline)?;
+        EVAL_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.metrics
             .requests
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

@@ -9,6 +9,58 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+static PROMETHEUS_REQUESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Request totals reported by one `retro eval` invocation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct SourceRequestCounts {
+    /// Linear GraphQL HTTP requests attempted.
+    pub linear_http_requests: u64,
+    /// `gh api` commands spawned; the CLI may retry an HTTP request internally.
+    pub github_cli_calls: u64,
+    /// GitHub page responses observed; failed paginated commands can leave this as a lower bound.
+    pub github_pages_observed: u64,
+    /// Prometheus HTTP requests attempted.
+    pub prometheus_http_requests: u64,
+}
+
+/// Snapshot of process request counters used to report one evaluation's source cost.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RequestCountSnapshot {
+    linear_http_requests: u64,
+    github_cli_calls: u64,
+    github_pages_observed: u64,
+    prometheus_http_requests: u64,
+}
+
+/// Captures current source request counters before evaluation begins.
+pub fn request_count_snapshot() -> RequestCountSnapshot {
+    let (github_cli_calls, github_pages_observed) = super::live::github_request_counts();
+    RequestCountSnapshot {
+        linear_http_requests: crate::linear::request_count(),
+        github_cli_calls,
+        github_pages_observed,
+        prometheus_http_requests: PROMETHEUS_REQUESTS.load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+/// Returns source request totals made since `start`.
+pub fn request_counts_since(start: RequestCountSnapshot) -> SourceRequestCounts {
+    let end = request_count_snapshot();
+    SourceRequestCounts {
+        linear_http_requests: end
+            .linear_http_requests
+            .saturating_sub(start.linear_http_requests),
+        github_cli_calls: end.github_cli_calls.saturating_sub(start.github_cli_calls),
+        github_pages_observed: end
+            .github_pages_observed
+            .saturating_sub(start.github_pages_observed),
+        prometheus_http_requests: end
+            .prometheus_http_requests
+            .saturating_sub(start.prometheus_http_requests),
+    }
+}
+
 /// A parsed deterministic or judgement-only rule from a role specification.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EvaluationRule {
@@ -136,6 +188,8 @@ pub struct EvalReport {
     pub previous_window: EvalWindow,
     pub roles: Vec<RoleResult>,
     pub sessions: Vec<SessionResult>,
+    /// Number of Linear, GitHub and Prometheus requests attempted during evaluation.
+    pub source_requests: SourceRequestCounts,
 }
 
 /// Keeps only session rows selected for presentation.
@@ -2211,6 +2265,7 @@ fn read_ready_buffer_mean(url: &str, window: &EvalWindow) -> Result<f64, String>
         .build()
         .map_err(|error| format!("Prometheus client: {error}"))?;
     let base = url.trim_end_matches('/');
+    PROMETHEUS_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let response = client
         .get(format!("{base}/api/v1/query_range"))
         .query(&[
