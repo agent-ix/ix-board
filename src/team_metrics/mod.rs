@@ -12,6 +12,7 @@ mod quota_frontier;
 mod render;
 mod reviews;
 mod timeline;
+pub(crate) use github::guarded_graphql;
 pub(crate) use relay_work_wire as wire;
 
 pub use collect::Collector;

@@ -1734,6 +1734,8 @@ fn run_retro_backfill(
 #[implements("FR-047-AC-3")]
 #[implements("FR-047-AC-7")]
 #[implements("FR-047-AC-9")]
+#[implements("FR-047-AC-2")]
+#[implements("FR-047-AC-4")]
 fn run_retro_eval(
     config_path: &std::path::Path,
     team_override: Option<&str>,
@@ -1742,11 +1744,12 @@ fn run_retro_eval(
     session_filter: Option<&str>,
 ) -> Result<retro::eval::EvalReport, Error> {
     let request_start = retro::eval::request_count_snapshot();
-    let config = retro_eval_stage("configuration", || retro::RetroConfig::load(config_path))
+    let mut config = retro_eval_stage("configuration", || retro::RetroConfig::load(config_path))
         .map_err(retro::RetroError::from)?;
-    let team = team_override.unwrap_or(&config.team);
-    let settings = retro::eval::load_settings(team).map_err(retro::RetroError::Evaluation)?;
-    let specs_dir = retro::eval::resolve_role_spec_dir(team, &settings);
+    let team = team_override.unwrap_or(&config.team).to_owned();
+    config.team = team.clone();
+    let settings = retro::eval::load_settings(&team).map_err(retro::RetroError::Evaluation)?;
+    let specs_dir = retro::eval::resolve_role_spec_dir(&team, &settings);
     let mut specs = retro_eval_stage("role_specs", || retro::eval::read_role_specs(&specs_dir))
         .map_err(retro::RetroError::Evaluation)?;
     let duration = retro::parse_window(since).map_err(retro::RetroError::from)?;
@@ -1765,10 +1768,17 @@ fn run_retro_eval(
         end_ms: window.start_ms,
     };
     if let Some(role) = role_filter {
+        if !specs.iter().any(|spec| spec.role == role) {
+            return Err(retro::RetroError::Evaluation(format!(
+                "unknown role {role:?}; no matching role specification"
+            ))
+            .into());
+        }
         specs.retain(|spec| spec.role == role);
     }
+    let source_specs = retro::eval::specs_with_objective_metric_queries(&specs);
     let store_read = retro_eval_stage("retro_store", || {
-        retro::Store::from_env(team)
+        retro::Store::from_env(&team)
             .and_then(|store| store.read_all())
             .map_err(|error| error.to_string())
     });
@@ -1777,7 +1787,7 @@ fn run_retro_eval(
         .map(Vec::as_slice)
         .map_err(String::as_str);
     let current_live_record = retro_eval_stage("current.live_retro_record", || {
-        collect_eval_retro_record(&config, &window)
+        collect_eval_retro_record(&config, &window, &source_specs, &settings)
     });
     let fleet_settings = ix_board::settings_value().ok().flatten();
     let fleet_config = ix_board::fleet::FleetConfig::from_toml(
@@ -1791,117 +1801,114 @@ fn run_retro_eval(
     let fleet_ledger_path = fleet_config
         .as_ref()
         .and_then(|config| ix_board::fleet::ledger::resolve_path(config).ok());
-    let mut current_adapters = retro::eval::declared_adapters(&specs);
-    current_adapters.extend(retro::eval::retro_adapters(&specs, records, &window));
-    current_adapters.extend(retro::eval::retro_record_adapters(
-        &specs,
-        current_live_record.as_ref().map_err(String::as_str),
-    ));
+    let mut current_adapters = retro::eval::declared_adapters(&source_specs);
+    current_adapters.extend(retro::eval::retro_adapters(&source_specs, records, &window));
+    if let Ok(record) = &current_live_record {
+        current_adapters.extend(retro::eval::retro_record_adapters(
+            &source_specs,
+            Ok(record),
+        ));
+    }
     current_adapters.extend(retro_eval_stage("current.prometheus", || {
-        retro::eval::prometheus_adapters(&specs, prometheus_url, &window)
+        retro::eval::prometheus_adapters(&source_specs, prometheus_url, &window)
     }));
     current_adapters.extend(retro_eval_stage("current.linear_reviewed_prs", || {
-        retro::eval::linear_reviewed_prs_adapters(&specs, &config.repos, &window)
+        retro::eval::linear_reviewed_prs_adapters(
+            &source_specs,
+            &config.repos,
+            &window,
+            settings.github_guard_state_path.as_deref(),
+            settings.github_guard_max_bytes,
+        )
     }));
     current_adapters.extend(retro_eval_stage("current.linear_markers", || {
-        retro::eval::linear_marker_adapters(&specs, &config.repos, &window)
+        retro::eval::linear_marker_adapters(&source_specs, &config.repos, &window)
     }));
     current_adapters.extend(retro_eval_stage("current.github_merged_prs", || {
-        retro::eval::github_merged_prs_adapters(&specs, &config.repos, &window)
+        retro::eval::github_merged_prs_adapters(
+            &source_specs,
+            &config.repos,
+            &window,
+            settings.github_guard_state_path.as_deref(),
+            settings.github_guard_max_bytes,
+        )
     }));
     current_adapters.extend(retro_eval_stage(
         "current.linear_merge_without_review",
-        || retro::eval::linear_merged_prs_without_review_adapters(&specs, &config.repos, &window),
+        || {
+            retro::eval::linear_merged_prs_without_review_adapters(
+                &source_specs,
+                &config.repos,
+                &window,
+                settings.github_guard_state_path.as_deref(),
+                settings.github_guard_max_bytes,
+            )
+        },
     ));
     current_adapters.extend(retro_eval_stage("current.linear_gate_records", || {
         retro::eval::linear_gate_record_adapters(
-            &specs,
+            &source_specs,
             &config.repos,
             config.gate_log.as_deref(),
             &window,
         )
     }));
     current_adapters.extend(retro_eval_stage("current.gate_log", || {
-        retro::eval::gate_log_adapters(&specs, config.gate_log.as_deref(), &window)
+        retro::eval::gate_log_adapters(&source_specs, config.gate_log.as_deref(), &window)
     }));
     current_adapters.extend(retro_eval_stage("current.fleet_ledger", || {
         retro::eval::ledger_adapters(
-            &specs,
+            &source_specs,
             fleet_ledger_path.as_deref(),
             settings.ready_state.as_deref(),
             &config.projects,
             &window,
         )
     }));
-    let mut previous_adapters = retro::eval::declared_adapters(&specs);
+    let mut previous_adapters = retro::eval::declared_adapters(&source_specs);
     previous_adapters.extend(retro::eval::retro_adapters(
-        &specs,
+        &source_specs,
         records,
         &previous_window,
     ));
-    previous_adapters.extend(retro_eval_stage("previous.prometheus", || {
-        retro::eval::prometheus_adapters(&specs, prometheus_url, &previous_window)
-    }));
-    previous_adapters.extend(retro_eval_stage("previous.linear_reviewed_prs", || {
-        retro::eval::linear_reviewed_prs_adapters(&specs, &config.repos, &previous_window)
-    }));
-    previous_adapters.extend(retro_eval_stage("previous.linear_markers", || {
-        retro::eval::linear_marker_adapters(&specs, &config.repos, &previous_window)
-    }));
-    previous_adapters.extend(retro_eval_stage("previous.github_merged_prs", || {
-        retro::eval::github_merged_prs_adapters(&specs, &config.repos, &previous_window)
-    }));
-    previous_adapters.extend(retro_eval_stage(
-        "previous.linear_merge_without_review",
-        || {
-            retro::eval::linear_merged_prs_without_review_adapters(
-                &specs,
-                &config.repos,
-                &previous_window,
-            )
-        },
-    ));
-    previous_adapters.extend(retro_eval_stage("previous.linear_gate_records", || {
-        retro::eval::linear_gate_record_adapters(
-            &specs,
-            &config.repos,
-            config.gate_log.as_deref(),
-            &previous_window,
-        )
-    }));
-    previous_adapters.extend(retro_eval_stage("previous.gate_log", || {
-        retro::eval::gate_log_adapters(&specs, config.gate_log.as_deref(), &previous_window)
-    }));
-    previous_adapters.extend(retro_eval_stage("previous.fleet_ledger", || {
-        retro::eval::ledger_adapters(
-            &specs,
-            fleet_ledger_path.as_deref(),
-            settings.ready_state.as_deref(),
-            &config.projects,
-            &previous_window,
-        )
-    }));
+    // Previous-window source evidence is never recomputed from today's live state. Only the
+    // append-only retro store can supply prior-window values; other sources stay unavailable.
     let session_ledger_rows = retro_eval_stage("session_turn_ledger", || {
         fleet_ledger_path
             .as_deref()
             .ok_or_else(|| "fleet ledger path is unavailable for session_turn".to_owned())
             .and_then(|path| {
-                ix_board::fleet::ledger::query(path, "session_turn", None)
-                    .map(|rows| rows.rows)
-                    .map_err(|error| error.to_string())
+                let source_window = retro::eval::EvalWindow {
+                    start_ms: previous_window.start_ms,
+                    end_ms: window.end_ms,
+                };
+                retro::eval::session_turn_rows(path, &source_window)
             })
     });
     let session_rows = session_ledger_rows
         .as_ref()
         .map(Vec::as_slice)
         .unwrap_or_default();
-    let sessions = retro::eval::evaluate_sessions(
-        &specs,
-        &current_adapters,
-        session_rows,
-        &window,
-        session_filter,
-    );
+    let mut sessions =
+        retro::eval::evaluate_sessions(&specs, &current_adapters, session_rows, &window, None);
+    let mut role_session_counts = std::collections::BTreeMap::<String, usize>::new();
+    for session in &sessions {
+        *role_session_counts.entry(session.role.clone()).or_default() += 1;
+    }
+    for session in &mut sessions {
+        let Some(spec) = specs.iter().find(|spec| spec.role == session.role) else {
+            continue;
+        };
+        session.objective_metrics = if role_session_counts.get(&session.role) == Some(&1) {
+            retro::eval::evaluate_objective_metrics(&spec.metrics, &current_adapters)
+        } else {
+            retro::eval::unavailable_objective_metrics(
+                &spec.metrics,
+                "team-level objective metric is ambiguous for this role session",
+            )
+        };
+    }
+    let sessions = retro::eval::filter_sessions(sessions, session_filter);
     let roles = specs
         .into_iter()
         .map(|spec| {
@@ -1927,9 +1934,12 @@ fn run_retro_eval(
                 .filter(|rule| rule.status == retro::eval::RuleStatus::Fail)
                 .map(|rule| rule.id.clone())
                 .collect();
+            let objective_metrics =
+                retro::eval::evaluate_objective_metrics(&spec.metrics, &current_role_adapters);
             let role_name = spec.role;
             retro::eval::RoleResult {
                 role: role_name.clone(),
+                objective_metrics,
                 previous_score,
                 score,
                 trend,
@@ -1946,7 +1956,7 @@ fn run_retro_eval(
         .collect::<Vec<_>>();
     Ok(retro::eval::EvalReport {
         schema_version: 1,
-        team: team.to_owned(),
+        team,
         window,
         previous_window,
         roles,
@@ -1972,7 +1982,19 @@ fn retro_eval_stage<T>(name: &str, operation: impl FnOnce() -> T) -> T {
 fn collect_eval_retro_record(
     config: &retro::RetroConfig,
     window: &retro::eval::EvalWindow,
+    specs: &[retro::eval::RoleSpec],
+    settings: &retro::eval::EvalSettings,
 ) -> Result<retro::Record, String> {
+    let requested = specs
+        .iter()
+        .flat_map(|spec| &spec.rules)
+        .filter(|rule| rule.method == "deterministic")
+        .filter_map(|rule| rule.query_or_rubric.strip_prefix("retro."))
+        .map(str::to_owned)
+        .collect::<std::collections::BTreeSet<_>>();
+    if requested.is_empty() {
+        return Err("no retro catalog query is selected for the current window".to_owned());
+    }
     let window_secs = u64::try_from(window.end_ms.saturating_sub(window.start_ms) / 1000)
         .map_err(|_| "evaluation window has a negative duration".to_owned())?;
     let frame = retro::Frame {
@@ -1982,15 +2004,30 @@ fn collect_eval_retro_record(
     };
     let linear = retro::live::linear_or_unreadable();
     let agents = retro::live::LiveAgents::start(config.herdr_teams.clone());
+    let github = retro::eval::guarded_retro_github_source(
+        settings.github_guard_state_path.clone(),
+        settings.github_guard_max_bytes,
+    );
     let sources = retro::Sources {
         linear: linear.as_ref(),
-        github: &retro::live::LiveGithub,
+        github: &github,
         agents: &agents,
         gate_log: &retro::live::FileGateLog,
         relay: &retro::live::RedisCliRelay,
         local: &retro::live::SystemLocal,
     };
-    retro::collect_snapshot(config, frame, &sources, None, None).map_err(|error| error.to_string())
+    let metrics = retro::metrics::collect_selected(config, frame, &sources, &requested);
+    Ok(retro::Record {
+        schema_version: retro::SCHEMA_VERSION,
+        kind: retro::RecordKind::Snapshot,
+        taken_at: chrono::DateTime::<chrono::Utc>::from_timestamp(frame.now.floor() as i64, 0)
+            .ok_or_else(|| "retro evaluation timestamp is out of range".to_owned())?
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        team: config.team.clone(),
+        window: retro::format_window(window_secs),
+        metrics,
+        department: None,
+    })
 }
 
 fn run_auth(command: AuthCommand) -> Result<Output, Error> {
@@ -3304,6 +3341,7 @@ mod tests {
             },
             roles: vec![ix_board::retro::eval::RoleResult {
                 role: "coder".into(),
+                objective_metrics: Vec::new(),
                 score: ix_board::retro::eval::Score {
                     passed: 2,
                     evaluated: 3,
@@ -3325,6 +3363,7 @@ mod tests {
                 linear_http_requests: 4,
                 github_cli_calls: 2,
                 github_pages_observed: 3,
+                github_guard_calls: 5,
                 prometheus_http_requests: 1,
             },
         };
@@ -3333,9 +3372,14 @@ mod tests {
         assert_eq!(value["team"], "TEST");
         assert_eq!(value["schema_version"], 1);
         assert_eq!(value["roles"][0]["trend_matched_rules"], 3);
+        assert_eq!(
+            value["roles"][0]["objective_metrics"],
+            serde_json::json!([])
+        );
         assert_eq!(value["source_requests"]["linear_http_requests"], 4);
         assert_eq!(value["source_requests"]["github_cli_calls"], 2);
         assert_eq!(value["source_requests"]["github_pages_observed"], 3);
+        assert_eq!(value["source_requests"]["github_guard_calls"], 5);
         assert_eq!(value["source_requests"]["prometheus_http_requests"], 1);
         assert!(value.get("RetroEval").is_none());
     }

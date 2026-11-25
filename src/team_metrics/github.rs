@@ -43,6 +43,29 @@ impl Request {
         Ok(body)
     }
 }
+
+/// Executes one bounded, quota-admitted GraphQL query through the shared GitHub
+/// journal. Callers must include a `repository` field in the returned `data`.
+/// The query and variables are part of the shared cache key; response validation,
+/// timeout, rolling-hour admission and cooldown are handled by `Guard`.
+pub(crate) fn guarded_graphql(
+    state_path: &std::path::Path,
+    max_bytes: u64,
+    query: &str,
+    variables: BTreeMap<String, String>,
+) -> Result<serde_json::Value, String> {
+    if query.is_empty() || query.len() > MAX_QUERY || variables.len() > 16 {
+        return Err("GitHub query exceeds bounded request shape".into());
+    }
+    let request = Request {
+        query: query.to_owned(),
+        variables,
+        conditional: false,
+    };
+    let guard = Guard::open_storage(state_path, max_bytes, Http::local()?)?;
+    let cached = guard.request(&request, |body, _| graph_body(body).map(|_| ()))?;
+    serde_json::from_str(&cached.body).map_err(|_| "GitHub response is not valid JSON".into())
+}
 pub(super) struct Response {
     pub(super) status: u16,
     pub(super) headers: BTreeMap<String, String>,
@@ -73,15 +96,35 @@ struct Guard<T> {
 }
 impl<T: Transport> Guard<T> {
     fn open(config: &Config, transport: T) -> Result<Self, String> {
-        Self::with_clock(config, transport, Arc::new(SystemClock))
+        Self::with_storage(
+            &config.state_path,
+            config.max_bytes,
+            transport,
+            Arc::new(SystemClock),
+        )
+    }
+    fn open_storage(
+        state_path: &std::path::Path,
+        max_bytes: u64,
+        transport: T,
+    ) -> Result<Self, String> {
+        Self::with_storage(state_path, max_bytes, transport, Arc::new(SystemClock))
     }
     fn with_clock(config: &Config, transport: T, clock: Arc<dyn Clock>) -> Result<Self, String> {
+        Self::with_storage(&config.state_path, config.max_bytes, transport, clock)
+    }
+    fn with_storage(
+        state_path: &std::path::Path,
+        max_bytes: u64,
+        transport: T,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self, String> {
         if transport.namespace().is_empty() || transport.namespace().len() > 256 {
             return Err("GitHub credential namespace unavailable".into());
         }
         // Use the journal itself: two workers and restarted processes share admission,
         // response leases and the configured SQLite page ceiling, with no new quota file.
-        let db = Connection::open(&config.state_path).map_err(|e| e.to_string())?;
+        let db = Connection::open(state_path).map_err(|e| e.to_string())?;
         db.busy_timeout(Duration::from_millis(250))
             .map_err(|e| e.to_string())?;
         let version: i64 = db
@@ -96,10 +139,10 @@ impl<T: Transport> Guard<T> {
         let pages: u64 = db
             .pragma_query_value(None, "page_count", |r| r.get(0))
             .map_err(|e| e.to_string())?;
-        if pages.saturating_mul(page_size) > config.max_bytes {
+        if pages.saturating_mul(page_size) > max_bytes {
             return Err("GitHub shared journal exceeds storage ceiling".into());
         }
-        db.pragma_update(None, "max_page_count", config.max_bytes / page_size)
+        db.pragma_update(None, "max_page_count", max_bytes / page_size)
             .map_err(|e| e.to_string())?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS github_gate(id INTEGER PRIMARY KEY CHECK(id=1), cooldown INTEGER NOT NULL, lease INTEGER NOT NULL); INSERT OR IGNORE INTO github_gate VALUES(1,0,0); CREATE TABLE IF NOT EXISTS github_clock(id INTEGER PRIMARY KEY CHECK(id=1), at INTEGER NOT NULL); INSERT OR IGNORE INTO github_clock VALUES(1,0); CREATE TABLE IF NOT EXISTS github_sends(at INTEGER NOT NULL, cost INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS github_responses(key TEXT PRIMARY KEY, body TEXT NOT NULL, etag TEXT, at INTEGER NOT NULL);").map_err(|e| e.to_string())?;
         db.execute("UPDATE github_clock SET at=max(at,coalesce((SELECT max(at) FROM github_sends),0),coalesce((SELECT max(at) FROM github_responses),0)) WHERE id=1", []).map_err(|e| e.to_string())?;
@@ -107,7 +150,7 @@ impl<T: Transport> Guard<T> {
             db: RefCell::new(db),
             transport,
             clock,
-            cache_bytes: i64::try_from(config.max_bytes / 8)
+            cache_bytes: i64::try_from(max_bytes / 8)
                 .map_err(|_| "cache budget overflow")?
                 .min(CACHE_BYTES),
         })

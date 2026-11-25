@@ -7,7 +7,17 @@ use ix_trace_rs::implements;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+
+#[path = "eval/github.rs"]
+mod github;
+#[path = "eval/ledger.rs"]
+mod ledger;
+#[path = "eval/linear.rs"]
+mod linear;
+#[path = "eval/relay.rs"]
+pub mod relay;
+#[path = "eval/transcript.rs"]
+pub mod transcript;
 
 static PROMETHEUS_REQUESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -20,6 +30,8 @@ pub struct SourceRequestCounts {
     pub github_cli_calls: u64,
     /// GitHub page responses observed; failed paginated commands can leave this as a lower bound.
     pub github_pages_observed: u64,
+    /// Queries submitted through the shared team-metrics GitHub guard.
+    pub github_guard_calls: u64,
     /// Prometheus HTTP requests attempted.
     pub prometheus_http_requests: u64,
 }
@@ -30,6 +42,7 @@ pub struct RequestCountSnapshot {
     linear_http_requests: u64,
     github_cli_calls: u64,
     github_pages_observed: u64,
+    github_guard_calls: u64,
     prometheus_http_requests: u64,
 }
 
@@ -41,6 +54,7 @@ pub fn request_count_snapshot() -> RequestCountSnapshot {
         linear_http_requests: crate::linear::request_count(),
         github_cli_calls,
         github_pages_observed,
+        github_guard_calls: github::request_count(),
         prometheus_http_requests: PROMETHEUS_REQUESTS.load(std::sync::atomic::Ordering::Relaxed),
     }
 }
@@ -57,6 +71,9 @@ pub fn request_counts_since(start: RequestCountSnapshot) -> SourceRequestCounts 
         github_pages_observed: end
             .github_pages_observed
             .saturating_sub(start.github_pages_observed),
+        github_guard_calls: end
+            .github_guard_calls
+            .saturating_sub(start.github_guard_calls),
         prometheus_http_requests: end
             .prometheus_http_requests
             .saturating_sub(start.prometheus_http_requests),
@@ -77,10 +94,21 @@ pub struct EvaluationRule {
     pub unit: String,
 }
 
+/// An objective metric declaration from a role specification's Metrics table.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObjectiveMetricSpec {
+    pub id: String,
+    pub query: String,
+    pub unit: String,
+    pub target: f64,
+    pub direction: String,
+}
+
 /// A role and all rules in its `Evaluations` table.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RoleSpec {
     pub role: String,
+    pub metrics: Vec<ObjectiveMetricSpec>,
     pub rules: Vec<EvaluationRule>,
 }
 
@@ -142,6 +170,7 @@ pub struct Score {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvalSettings {
+    #[serde(default = "default_role_spec_dir")]
     pub role_spec_dir: PathBuf,
     #[serde(default = "default_review_age_limit_hours")]
     pub review_age_limit_hours: u64,
@@ -149,6 +178,30 @@ pub struct EvalSettings {
     pub gate_commands: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub ready_state: Option<String>,
+    /// Shared team-metrics GitHub journal used to enforce the exporter quota.
+    #[serde(default)]
+    pub github_guard_state_path: Option<PathBuf>,
+    /// Maximum bytes allowed for the shared GitHub journal.
+    #[serde(default = "default_github_guard_max_bytes")]
+    pub github_guard_max_bytes: u64,
+}
+
+#[implements("FR-047-AC-4")]
+fn default_github_guard_max_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+
+impl Default for EvalSettings {
+    fn default() -> Self {
+        Self {
+            role_spec_dir: default_role_spec_dir(),
+            review_age_limit_hours: default_review_age_limit_hours(),
+            gate_commands: BTreeMap::new(),
+            ready_state: None,
+            github_guard_state_path: None,
+            github_guard_max_bytes: default_github_guard_max_bytes(),
+        }
+    }
 }
 
 /// The start and exclusive end of an event-time window, in Unix milliseconds.
@@ -162,6 +215,7 @@ pub struct EvalWindow {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct RoleResult {
     pub role: String,
+    pub objective_metrics: Vec<ObjectiveMetricResult>,
     pub score: Score,
     pub previous_score: Score,
     pub trend: Option<f64>,
@@ -176,9 +230,23 @@ pub struct RoleResult {
 pub struct SessionResult {
     pub id: String,
     pub role: String,
+    pub objective_metrics: Vec<ObjectiveMetricResult>,
     pub score: Score,
     pub rules: Vec<RuleResult>,
     pub failing_rules: Vec<String>,
+}
+
+/// Evaluated objective metric included in a role or session row.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ObjectiveMetricResult {
+    pub id: String,
+    pub query: String,
+    pub value: Option<f64>,
+    pub status: RuleStatus,
+    pub unit: String,
+    pub evidence_refs: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// JSON contract for `retro eval`.
@@ -343,6 +411,7 @@ pub fn evaluate_sessions(
             sessions.push(SessionResult {
                 id: session_id,
                 role: spec.role.clone(),
+                objective_metrics: Vec::new(),
                 score: score(&rules),
                 failing_rules: rules
                     .iter()
@@ -379,6 +448,7 @@ impl EvalSettings {
 
 /// Parses the role's evaluation table and rejects malformed rules instead of omitting them.
 #[implements("FR-047-AC-1")]
+#[implements("FR-047-AC-2")]
 pub fn parse_role_spec(path: &Path, markdown: &str) -> Result<RoleSpec, String> {
     let role = path
         .file_stem()
@@ -388,13 +458,83 @@ pub fn parse_role_spec(path: &Path, markdown: &str) -> Result<RoleSpec, String> 
     let mut in_table = false;
     let mut header_seen = false;
     let mut rules = Vec::new();
+    let mut in_metrics = false;
+    let mut metric_header_seen = false;
+    let mut metrics = Vec::new();
     for (line_index, line) in markdown.lines().enumerate() {
+        if line.trim() == "## Metrics" {
+            in_metrics = true;
+            metric_header_seen = false;
+            continue;
+        }
         if line.trim() == "## Evaluations" {
             in_table = true;
+            in_metrics = false;
             continue;
         }
         if in_table && line.starts_with("## ") {
             break;
+        }
+        if in_metrics && line.starts_with("## ") {
+            in_metrics = false;
+        }
+        if in_metrics && line.trim_start().starts_with('|') {
+            let cells = line
+                .trim()
+                .trim_matches('|')
+                .split('|')
+                .map(str::trim)
+                .collect::<Vec<_>>();
+            if !metric_header_seen {
+                metric_header_seen = true;
+                continue;
+            }
+            if cells
+                .iter()
+                .all(|cell| cell.chars().all(|ch| ch == '-' || ch == ':'))
+            {
+                continue;
+            }
+            if cells.len() != 7 {
+                return Err(format!(
+                    "{}:{}: metric row has {} cells, expected 7",
+                    path.display(),
+                    line_index + 1,
+                    cells.len()
+                ));
+            }
+            let target = cells[5].parse::<f64>().map_err(|_| {
+                format!(
+                    "{}:{}: invalid metric target {:?}",
+                    path.display(),
+                    line_index + 1,
+                    cells[5]
+                )
+            })?;
+            if !target.is_finite() {
+                return Err(format!(
+                    "{}:{}: metric target must be finite",
+                    path.display(),
+                    line_index + 1
+                ));
+            }
+            let direction = cells[6].to_ascii_lowercase();
+            if direction != "higher" && direction != "lower" {
+                return Err(format!(
+                    "{}:{}: unknown metric direction {:?}",
+                    path.display(),
+                    line_index + 1,
+                    cells[6]
+                ));
+            }
+            metrics.push(ObjectiveMetricSpec {
+                id: cells[0].to_owned(),
+                query: cells[3].to_owned(),
+                unit: cells[4].to_owned(),
+                target,
+                direction,
+            });
+            continue;
         }
         if !in_table || !line.trim_start().starts_with('|') {
             continue;
@@ -468,7 +608,11 @@ pub fn parse_role_spec(path: &Path, markdown: &str) -> Result<RoleSpec, String> 
             path.display()
         ));
     }
-    Ok(RoleSpec { role, rules })
+    Ok(RoleSpec {
+        role,
+        metrics,
+        rules,
+    })
 }
 
 /// Loads every markdown role spec in stable path order.
@@ -583,6 +727,151 @@ pub fn evaluate_rules(
         .collect()
 }
 
+/// Produces objective metric rows with an explicit value or source reason.
+#[implements("FR-047-AC-2")]
+pub fn evaluate_objective_metrics(
+    metrics: &[ObjectiveMetricSpec],
+    adapters: &BTreeMap<String, QueryValue>,
+) -> Vec<ObjectiveMetricResult> {
+    metrics
+        .iter()
+        .map(|metric| {
+            let (value, status, evidence_refs, reason) = match adapters.get(&metric.query) {
+                Some(QueryValue::Value {
+                    value,
+                    evidence_refs,
+                }) if value.is_finite() => {
+                    let passed = match metric.direction.as_str() {
+                        "higher" => *value >= metric.target,
+                        "lower" => *value <= metric.target,
+                        _ => false,
+                    };
+                    (
+                        Some(*value),
+                        if passed {
+                            RuleStatus::Pass
+                        } else {
+                            RuleStatus::Fail
+                        },
+                        evidence_refs.clone(),
+                        None,
+                    )
+                }
+                Some(QueryValue::Value { .. }) => (
+                    None,
+                    RuleStatus::Unavailable,
+                    Vec::new(),
+                    Some("objective metric producer returned a non-finite value".to_owned()),
+                ),
+                Some(QueryValue::NotApplicable {
+                    reason,
+                    evidence_refs,
+                }) => (
+                    None,
+                    RuleStatus::NotApplicable,
+                    evidence_refs.clone(),
+                    Some(reason.clone()),
+                ),
+                Some(QueryValue::Unavailable {
+                    reason,
+                    evidence_refs,
+                }) => (
+                    None,
+                    RuleStatus::Unavailable,
+                    evidence_refs.clone(),
+                    Some(reason.clone()),
+                ),
+                None => (
+                    None,
+                    RuleStatus::Unavailable,
+                    Vec::new(),
+                    Some(format!(
+                        "{}: objective metric query has no registered source adapter",
+                        metric.query
+                    )),
+                ),
+            };
+            ObjectiveMetricResult {
+                id: metric.id.clone(),
+                query: metric.query.clone(),
+                value,
+                status,
+                unit: metric.unit.clone(),
+                evidence_refs,
+                reason,
+            }
+        })
+        .collect()
+}
+
+/// Marks role-level objective metrics unavailable when their value cannot be attributed to one
+/// session without ambiguity.
+pub fn unavailable_objective_metrics(
+    metrics: &[ObjectiveMetricSpec],
+    reason: &str,
+) -> Vec<ObjectiveMetricResult> {
+    metrics
+        .iter()
+        .map(|metric| ObjectiveMetricResult {
+            id: metric.id.clone(),
+            query: metric.query.clone(),
+            value: None,
+            status: RuleStatus::Unavailable,
+            unit: metric.unit.clone(),
+            evidence_refs: Vec::new(),
+            reason: Some(reason.to_owned()),
+        })
+        .collect()
+}
+
+/// Adds objective metric queries to a clone of the source-selection specs.
+#[implements("FR-047-AC-6")]
+pub fn specs_with_objective_metric_queries(specs: &[RoleSpec]) -> Vec<RoleSpec> {
+    specs
+        .iter()
+        .map(|spec| {
+            let mut output = spec.clone();
+            for metric in &spec.metrics {
+                if output
+                    .rules
+                    .iter()
+                    .any(|rule| rule.query_or_rubric == metric.query)
+                {
+                    continue;
+                }
+                output.rules.push(EvaluationRule {
+                    id: format!("{}_objective", metric.id),
+                    rule: "Objective metric source selection".into(),
+                    evidence_source: "objective metric".into(),
+                    trigger: "objective metric".into(),
+                    method: "deterministic".into(),
+                    query_or_rubric: metric.query.clone(),
+                    comparator: if metric.direction == "higher" {
+                        ">=".into()
+                    } else {
+                        "<=".into()
+                    },
+                    target: metric.target,
+                    unit: metric.unit.clone(),
+                });
+            }
+            output
+        })
+        .collect()
+}
+
+/// Creates the quota-guarded GitHub source used by the targeted retro snapshot reader.
+#[implements("FR-047-AC-1")]
+pub fn guarded_retro_github_source(
+    state_path: Option<PathBuf>,
+    max_bytes: u64,
+) -> impl super::sources::GithubSource {
+    github::GuardedRetroGithub {
+        state_path,
+        max_bytes,
+    }
+}
+
 /// Computes a pass rate from only complete deterministic pass/fail results.
 #[implements("FR-047-AC-2")]
 pub fn score(results: &[RuleResult]) -> Score {
@@ -681,26 +970,7 @@ pub fn retro_adapters(
                     if at_ms < window.start_ms || at_ms >= window.end_ms {
                         return None;
                     }
-                    let metric = record.metrics.get(metric_id)?;
-                    if metric.status != super::Status::Ok {
-                        return Some(QueryValue::Unavailable {
-                            reason: metric
-                                .reason
-                                .clone()
-                                .unwrap_or_else(|| "retro metric is unavailable".to_owned()),
-                            evidence_refs: vec![format!("retro:{}:{}", metric.id, record.taken_at)],
-                        });
-                    }
-                    Some(match metric.value {
-                        Some(value) => QueryValue::Value {
-                            value,
-                            evidence_refs: vec![format!("retro:{}:{}", metric.id, record.taken_at)],
-                        },
-                        None => QueryValue::Unavailable {
-                            reason: "retro metric has no numeric value".to_owned(),
-                            evidence_refs: vec![format!("retro:{}:{}", metric.id, record.taken_at)],
-                        },
-                    })
+                    Some(retro_record_value(record, metric_id))
                 });
                 found.unwrap_or_else(|| QueryValue::Unavailable {
                     reason: format!("no {metric_id} snapshot falls inside this event-time window"),
@@ -735,40 +1005,110 @@ pub fn retro_record_adapters(
                 },
                 Ok(record) => {
                     let metric_id = query.strip_prefix("retro.").unwrap_or_default();
-                    match record.metrics.get(metric_id) {
-                        Some(metric) if metric.status == super::Status::Ok => match metric.value {
-                            Some(value) => QueryValue::Value {
-                                value,
-                                evidence_refs: vec![format!(
-                                    "retro:{}:{}",
-                                    metric.id, record.taken_at
-                                )],
-                            },
-                            None => QueryValue::Unavailable {
-                                reason: "retro metric has no numeric value".to_owned(),
-                                evidence_refs: vec![format!(
-                                    "retro:{}:{}",
-                                    metric.id, record.taken_at
-                                )],
-                            },
-                        },
-                        Some(metric) => QueryValue::Unavailable {
-                            reason: metric
-                                .reason
-                                .clone()
-                                .unwrap_or_else(|| "retro metric is unavailable".to_owned()),
-                            evidence_refs: vec![format!("retro:{}:{}", metric.id, record.taken_at)],
-                        },
-                        None => QueryValue::Unavailable {
-                            reason: format!("retro catalog has no metric {metric_id:?}"),
-                            evidence_refs: vec![format!("retro:observed:{}", record.taken_at)],
-                        },
-                    }
+                    retro_record_value(record, metric_id)
                 }
             };
             (query, result)
         })
         .collect()
+}
+
+#[implements("FR-047-AC-1")]
+fn retro_record_value(record: &super::Record, metric_id: &str) -> QueryValue {
+    if let Some(metric) = record.metrics.get(metric_id) {
+        let evidence_refs = vec![format!("retro:{}:{}", metric.id, record.taken_at)];
+        return match (metric.status, metric.value) {
+            (super::Status::Ok, Some(value)) if value.is_finite() => QueryValue::Value {
+                value,
+                evidence_refs,
+            },
+            (super::Status::Ok, Some(_)) => QueryValue::Unavailable {
+                reason: "retro metric is non-finite".into(),
+                evidence_refs,
+            },
+            (super::Status::Ok, None) => QueryValue::Unavailable {
+                reason: "retro metric has no numeric value".into(),
+                evidence_refs,
+            },
+            (super::Status::Unavailable, _) => QueryValue::Unavailable {
+                reason: metric
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "retro metric is unavailable".to_owned()),
+                evidence_refs,
+            },
+        };
+    }
+    if metric_id == "order_flip_loop" {
+        let evidence_ref = format!("retro:department-loop:order_flip_loop:{}", record.taken_at);
+        return match record
+            .department
+            .as_ref()
+            .and_then(|department| department.loops.get("order_flip_loop"))
+        {
+            Some(loop_report) if loop_report.status == super::Status::Ok => QueryValue::Value {
+                value: loop_report.findings.len() as f64,
+                evidence_refs: vec![evidence_ref],
+            },
+            Some(loop_report) => QueryValue::Unavailable {
+                reason: loop_report
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "department loop detector is unavailable".to_owned()),
+                evidence_refs: vec![evidence_ref],
+            },
+            None => QueryValue::Unavailable {
+                reason: "retro department report has no order_flip_loop detector".into(),
+                evidence_refs: vec![format!("retro:observed:{}", record.taken_at)],
+            },
+        };
+    }
+    let (department_id, max_keyed) = metric_id
+        .strip_suffix("_max")
+        .map_or((metric_id, false), |id| (id, true));
+    let evidence_ref = format!("retro:department:{}:{}", department_id, record.taken_at);
+    let measurement = record
+        .department
+        .as_ref()
+        .and_then(|department| department.measurements.get(department_id));
+    match measurement {
+        Some(measurement) if measurement.status == super::Status::Ok => {
+            let value = match measurement.value.as_ref() {
+                Some(super::department::Value::Scalar(value)) if !max_keyed => Some(*value),
+                Some(super::department::Value::Keyed(values)) if max_keyed => {
+                    values.values().copied().reduce(f64::max)
+                }
+                Some(super::department::Value::Durations(values)) if max_keyed => values
+                    .values()
+                    .map(|distribution| distribution.p90)
+                    .reduce(f64::max),
+                _ => None,
+            };
+            match value.filter(|value| value.is_finite()) {
+                Some(value) => QueryValue::Value {
+                    value,
+                    evidence_refs: vec![evidence_ref],
+                },
+                None => QueryValue::Unavailable {
+                    reason: format!(
+                        "department metric {department_id} has no numeric value for query {metric_id}"
+                    ),
+                    evidence_refs: vec![evidence_ref],
+                },
+            }
+        }
+        Some(measurement) => QueryValue::Unavailable {
+            reason: measurement
+                .reason
+                .clone()
+                .unwrap_or_else(|| "department metric is unavailable".to_owned()),
+            evidence_refs: vec![evidence_ref],
+        },
+        None => QueryValue::Unavailable {
+            reason: format!("retro catalog and department report have no metric {metric_id:?}"),
+            evidence_refs: vec![format!("retro:observed:{}", record.taken_at)],
+        },
+    }
 }
 
 /// Reads the fleet ready-buffer gauge as a time-weighted mean over an explicit window.
@@ -812,6 +1152,8 @@ pub fn linear_reviewed_prs_adapters(
     specs: &[RoleSpec],
     repositories: &[String],
     window: &EvalWindow,
+    github_guard_state_path: Option<&Path>,
+    github_guard_max_bytes: u64,
 ) -> BTreeMap<String, QueryValue> {
     let queries = specs
         .iter()
@@ -826,7 +1168,12 @@ pub fn linear_reviewed_prs_adapters(
     }
     let mut values = BTreeMap::new();
     if needs_reviewed_prs {
-        let value = read_reviewed_prs(repositories, window);
+        let value = read_reviewed_prs(
+            repositories,
+            window,
+            github_guard_state_path,
+            github_guard_max_bytes,
+        );
         values.insert(
             "linear.reviewed_prs".to_owned(),
             match value {
@@ -842,7 +1189,12 @@ pub fn linear_reviewed_prs_adapters(
         );
     }
     if needs_methods {
-        let value = read_pr_methods_with_multiple_runs(repositories, window);
+        let value = read_pr_methods_with_multiple_runs(
+            repositories,
+            window,
+            github_guard_state_path,
+            github_guard_max_bytes,
+        );
         values.insert(
             "linear.pr_methods_with_multiple_runs".to_owned(),
             match value {
@@ -921,7 +1273,6 @@ fn read_linear_marker_metrics(
     }
     let linear = crate::LinearGraphQlSource::from_env().map_err(|error| error.to_string())?;
     let start_secs = window.start_ms as f64 / 1000.0;
-    let end_secs = window.end_ms as f64 / 1000.0;
     let mut comments = Vec::new();
     for repository in repositories {
         for (kind, prefix) in [
@@ -944,8 +1295,7 @@ fn read_linear_marker_metrics(
         crate::drift::timestamp_epoch(created_at)
             .map_err(|error| format!("Linear marker creation time is invalid: {error}"))?;
     }
-    let metrics = parse_linear_marker_metrics(&comments, start_secs, end_secs);
-    Ok(metrics)
+    linear::review_marker_metrics(&comments, window)
 }
 
 #[implements("FR-047-AC-1")]
@@ -1267,21 +1617,26 @@ fn yaml_data_block(body: &str) -> Result<serde_json::Value, String> {
         .ok_or_else(|| "review marker has no structured data".to_owned())
 }
 
+#[implements("FR-047-AC-1")]
 fn read_reviewed_prs(
     repositories: &[String],
     window: &EvalWindow,
+    github_guard_state_path: Option<&Path>,
+    github_guard_max_bytes: u64,
 ) -> Result<(usize, Vec<String>), String> {
     if repositories.is_empty() {
         return Err("retro config has no repositories for Linear review evidence".to_owned());
     }
     let linear = crate::LinearGraphQlSource::from_env().map_err(|error| error.to_string())?;
-    use super::sources::GithubSource;
-    let github = super::live::LiveGithub;
     let start_secs = window.start_ms as f64 / 1000.0;
     let mut prs = Vec::new();
     let mut comments = Vec::new();
     for repository in repositories {
-        prs.extend(github.pull_requests(repository, start_secs)?);
+        prs.extend(guarded_pull_requests(
+            repository,
+            github_guard_state_path,
+            github_guard_max_bytes,
+        )?);
         comments.extend(linear.fetch_marker_comments(
             "<!-- reviewer ",
             &format!("repo={repository} "),
@@ -1300,87 +1655,35 @@ fn reviewed_prs_count(
     comments: &[crate::MarkerComment],
     window: &EvalWindow,
 ) -> Result<(usize, Vec<String>), String> {
-    let start_secs = window.start_ms as f64 / 1000.0;
-    let end_secs = window.end_ms as f64 / 1000.0;
-    let mut reviewed = std::collections::BTreeSet::new();
-    let mut evidence = Vec::new();
-    for comment in comments {
-        let at = comment
-            .created_at
-            .as_deref()
-            .ok_or_else(|| "review marker has no source timestamp".to_owned())
-            .and_then(|value| crate::drift::timestamp_epoch(value).map_err(|e| e.to_string()))?;
-        if at < start_secs || at >= end_secs {
-            continue;
-        }
-        let first_line = comment.body.lines().next().unwrap_or_default();
-        let Some(("reviewer", fields)) = super::marker_fields(first_line) else {
-            return Err("Linear returned an unsupported reviewer marker".into());
-        };
-        let repo = fields
-            .get("repo")
-            .ok_or_else(|| "reviewer marker has no repo".to_owned())?;
-        let pr = fields
-            .get("pr")
-            .ok_or_else(|| "reviewer marker has no PR".to_owned())?;
-        let short_repo = repo.rsplit('/').next().unwrap_or(repo);
-        let number = if pr.starts_with(&format!("{repo}#")) {
-            pr.strip_prefix(&format!("{repo}#"))
-        } else {
-            pr.strip_prefix(&format!("{short_repo}#"))
-        }
-        .and_then(|number| number.parse::<u64>().ok())
-        .ok_or_else(|| "reviewer marker PR does not match its repo".to_owned())?;
-        let key = format!("{repo}#{number}");
-        if reviewed.insert(key.clone()) {
-            evidence.push(format!(
-                "linear-comment:{}",
-                comment.id.as_deref().unwrap_or("unknown")
-            ));
-        }
-    }
-    for pr in prs {
-        if pr
-            .merged_at
-            .is_some_and(|at| at >= start_secs && at < end_secs)
-        {
-            let key = format!("{}#{}", pr.repo, pr.number);
-            if reviewed.insert(key.clone()) {
-                evidence.push(format!("github-pr:{key}:merged"));
-            }
-        }
-    }
-    evidence.sort();
-    Ok((reviewed.len(), evidence))
+    linear::reviewed_prs_count(prs, comments, window)
 }
 
+#[implements("FR-047-AC-1")]
 fn read_pr_methods_with_multiple_runs(
     repositories: &[String],
     window: &EvalWindow,
+    github_guard_state_path: Option<&Path>,
+    github_guard_max_bytes: u64,
 ) -> Result<(usize, Vec<String>), String> {
     if repositories.is_empty() {
         return Err("retro config has no repositories for Linear review evidence".to_owned());
     }
     let linear = crate::LinearGraphQlSource::from_env().map_err(|error| error.to_string())?;
-    use super::sources::GithubSource;
-    let github = super::live::LiveGithub;
-    let start_secs = window.start_ms as f64 / 1000.0;
     let mut prs = Vec::new();
     let mut comments = Vec::new();
     for repository in repositories {
-        prs.extend(github.pull_requests(repository, start_secs)?);
+        prs.extend(guarded_pull_requests(
+            repository,
+            github_guard_state_path,
+            github_guard_max_bytes,
+        )?);
         comments.extend(linear.fetch_marker_comments(
             "<!-- reviewer ",
             &format!("repo={repository} "),
             None,
         )?);
     }
-    let (reviewed_count, _) = reviewed_prs_count(&prs, &comments, window)?;
-    if reviewed_count == 0 {
-        return Ok((0, Vec::new()));
-    }
-    let reviewed = reviewed_pr_ids(&prs, &comments, window)?;
-    pr_methods_count(&comments, &reviewed)
+    linear::pr_methods_with_multiple_runs(&prs, &comments, window)
 }
 
 fn reviewed_pr_ids(
@@ -1482,6 +1785,8 @@ pub fn github_merged_prs_adapters(
     specs: &[RoleSpec],
     repositories: &[String],
     window: &EvalWindow,
+    github_guard_state_path: Option<&Path>,
+    github_guard_max_bytes: u64,
 ) -> BTreeMap<String, QueryValue> {
     let needed = specs
         .iter()
@@ -1490,7 +1795,12 @@ pub fn github_merged_prs_adapters(
     if !needed {
         return BTreeMap::new();
     }
-    let value = read_merged_prs(repositories, window);
+    let value = read_merged_prs(
+        repositories,
+        window,
+        github_guard_state_path,
+        github_guard_max_bytes,
+    );
     BTreeMap::from([(
         "github.merged_prs".to_owned(),
         match value {
@@ -1512,6 +1822,8 @@ pub fn linear_merged_prs_without_review_adapters(
     specs: &[RoleSpec],
     repositories: &[String],
     window: &EvalWindow,
+    github_guard_state_path: Option<&Path>,
+    github_guard_max_bytes: u64,
 ) -> BTreeMap<String, QueryValue> {
     let query = "linear.merged_prs_without_review_record";
     if !specs
@@ -1521,7 +1833,12 @@ pub fn linear_merged_prs_without_review_adapters(
     {
         return BTreeMap::new();
     }
-    let value = read_merged_prs_without_review(repositories, window);
+    let value = read_merged_prs_without_review(
+        repositories,
+        window,
+        github_guard_state_path,
+        github_guard_max_bytes,
+    );
     BTreeMap::from([(
         query.to_owned(),
         match value {
@@ -1728,18 +2045,21 @@ fn has_gate_record(line: &super::GateLine, records: &BTreeSet<(String, i64)>) ->
 fn read_merged_prs_without_review(
     repositories: &[String],
     window: &EvalWindow,
+    github_guard_state_path: Option<&Path>,
+    github_guard_max_bytes: u64,
 ) -> Result<(usize, Vec<String>), String> {
     if repositories.is_empty() {
         return Err("retro config has no repositories for GitHub merge evidence".to_owned());
     }
     let linear = crate::LinearGraphQlSource::from_env().map_err(|error| error.to_string())?;
-    use super::sources::GithubSource;
-    let github = super::live::LiveGithub;
-    let start_secs = window.start_ms as f64 / 1000.0;
     let mut prs = Vec::new();
     let mut comments = Vec::new();
     for repository in repositories {
-        prs.extend(github.pull_requests(repository, start_secs)?);
+        prs.extend(guarded_pull_requests(
+            repository,
+            github_guard_state_path,
+            github_guard_max_bytes,
+        )?);
         comments.extend(linear.fetch_marker_comments(
             "<!-- reviewer ",
             &format!("repo={repository} "),
@@ -1755,36 +2075,7 @@ fn merged_prs_without_review_count(
     comments: &[crate::MarkerComment],
     window: &EvalWindow,
 ) -> Result<(usize, Vec<String>), String> {
-    let start_secs = window.start_ms as f64 / 1000.0;
-    let end_secs = window.end_ms as f64 / 1000.0;
-    let reviewed = comments
-        .iter()
-        .filter_map(|comment| {
-            let first_line = comment.body.lines().next().unwrap_or_default();
-            let Some(("reviewer", fields)) = super::marker_fields(first_line) else {
-                return None;
-            };
-            let (repo, pr) = (*fields.get("repo")?, *fields.get("pr")?);
-            normalize_pr_key(repo, pr).ok()
-        })
-        .collect::<BTreeSet<_>>();
-    let mut missing = BTreeSet::new();
-    for pr in prs {
-        if pr
-            .merged_at
-            .is_some_and(|at| at >= start_secs && at < end_secs)
-        {
-            let key = format!("{}#{}", pr.repo, pr.number);
-            if !reviewed.contains(&key) {
-                missing.insert(key);
-            }
-        }
-    }
-    let evidence = missing
-        .iter()
-        .map(|pr| format!("github-pr:{pr}:merged-without-review-marker"))
-        .collect::<Vec<_>>();
-    Ok((missing.len(), evidence))
+    linear::merged_prs_without_review_count(prs, comments, window)
 }
 
 /// Reads the SWM-261 fleet-ledger views without opening the store for writes.
@@ -1796,63 +2087,98 @@ pub fn ledger_adapters(
     projects: &[String],
     window: &EvalWindow,
 ) -> BTreeMap<String, QueryValue> {
-    let queries = [
-        ("ledger.lane_orders_due", "lane_orders_due", "order_id"),
-        (
-            "ledger.lane_orders_not_taken_up",
-            "lane_orders_not_taken_up",
-            "order_id",
-        ),
-        (
-            "ledger.need_ready_tickets_due",
-            "need_ready_tickets_due",
-            "action_id",
-        ),
-        (
-            "ledger.idle_lane_minutes_during_build_pause",
-            "idle_lane_minutes_during_build_pause",
-            "lane",
-        ),
-    ];
-    let mut values = BTreeMap::new();
-    for (query, view, id_field) in queries {
-        if !specs
-            .iter()
-            .flat_map(|spec| &spec.rules)
-            .any(|rule| rule.method == "deterministic" && rule.query_or_rubric == query)
-        {
+    let path = ledger_path
+        .map(Path::to_owned)
+        .or_else(|| crate::fleet::ledger::default_path().ok());
+    let coverage = path
+        .as_deref()
+        .ok_or_else(|| "fleet ledger path is unavailable".to_owned())
+        .and_then(|path| ledger::read_coverage(path, window));
+    let capacity_coverage = path
+        .as_deref()
+        .ok_or_else(|| "fleet ledger path is unavailable".to_owned())
+        .and_then(|path| ledger::read_capacity_coverage(path, window));
+    let mut views = ledger::ViewRows::new();
+    let requested = specs
+        .iter()
+        .flat_map(|spec| &spec.rules)
+        .filter(|rule| rule.method == "deterministic")
+        .map(|rule| rule.query_or_rubric.as_str())
+        .filter_map(|query| query.strip_prefix("ledger."))
+        .collect::<BTreeSet<_>>();
+    for view in requested {
+        if matches!(
+            view,
+            "idle_lane_minutes_during_build_pause"
+                | "need_ready_tickets_due"
+                | "need_ready_tickets_unanswered"
+        ) {
             continue;
         }
-        let value = if query == "ledger.need_ready_tickets_due" {
-            read_need_ready_tickets_due(ledger_path, projects, window)
-                .map(|(value, evidence)| QueryValue::Value {
-                    value: value as f64,
-                    evidence_refs: evidence,
-                })
-                .unwrap_or_else(|reason| QueryValue::Unavailable {
-                    reason,
-                    evidence_refs: Vec::new(),
-                })
+        let query = format!("ledger.{view}");
+        let view_coverage = if ledger::needs_capacity_coverage(&query) {
+            capacity_coverage
+                .as_ref()
+                .map(|_| ())
+                .map_err(String::as_str)
         } else {
-            read_ledger_unavailable_reason(ledger_path, view)
-                .and_then(|availability| match availability {
-                    Some(reason) => Ok(QueryValue::NotApplicable {
-                        reason,
-                        evidence_refs: Vec::new(),
-                    }),
-                    None => read_ledger_view(ledger_path, view, id_field, window).map(
-                        |(value, evidence_refs)| QueryValue::Value {
-                            value: value as f64,
-                            evidence_refs,
-                        },
-                    ),
-                })
-                .unwrap_or_else(|reason| QueryValue::Unavailable {
+            coverage.as_ref().map(|_| ()).map_err(String::as_str)
+        };
+        let rows = match (view_coverage, ledger::readable_view(&query)) {
+            (Err(reason), _) => Err(reason.to_owned()),
+            (Ok(()), Some(readable)) => path
+                .as_deref()
+                .ok_or_else(|| "fleet ledger path is unavailable".to_owned())
+                .and_then(|path| {
+                    ledger::read_view_rows(
+                        path,
+                        readable,
+                        ledger::time_column(&format!("ledger.{view}")),
+                        window,
+                    )
+                }),
+            (Ok(()), None) => Ok(Vec::new()),
+        };
+        views.insert(view.to_owned(), rows);
+    }
+    let mut values = ledger::adapters(
+        specs,
+        &views,
+        window,
+        coverage.as_ref().map(|_| ()).map_err(String::as_str),
+        capacity_coverage
+            .as_ref()
+            .map(|_| ())
+            .map_err(String::as_str),
+    );
+    if specs.iter().flat_map(|spec| &spec.rules).any(|rule| {
+        rule.method == "deterministic" && rule.query_or_rubric == "ledger.need_ready_tickets_due"
+    }) {
+        values.insert(
+            "ledger.need_ready_tickets_due".to_owned(),
+            match match &coverage {
+                Ok(()) => read_need_ready_tickets_due(ledger_path, projects, window),
+                Err(reason) => Err(reason.clone()),
+            } {
+                Ok((value, evidence_refs)) => QueryValue::Value {
+                    value: value as f64,
+                    evidence_refs,
+                },
+                Err(reason) => QueryValue::Unavailable {
                     reason,
                     evidence_refs: Vec::new(),
-                })
-        };
-        values.insert(query.to_owned(), value);
+                },
+            },
+        );
+    }
+    if requested_is_pause_metric(specs) {
+        values.insert(
+            "ledger.idle_lane_minutes_during_build_pause".into(),
+            QueryValue::NotApplicable {
+                reason: "no pause producer".into(),
+                evidence_refs: Vec::new(),
+            },
+        );
     }
     if specs.iter().flat_map(|spec| &spec.rules).any(|rule| {
         rule.method == "deterministic"
@@ -1860,7 +2186,12 @@ pub fn ledger_adapters(
     }) {
         values.insert(
             "ledger.need_ready_tickets_unanswered".to_owned(),
-            match read_need_ready_tickets_unanswered(ledger_path, ready_state, projects, window) {
+            match match &coverage {
+                Ok(()) => {
+                    read_need_ready_tickets_unanswered(ledger_path, ready_state, projects, window)
+                }
+                Err(reason) => Err(reason.clone()),
+            } {
                 Ok((value, evidence_refs)) => QueryValue::Value {
                     value: value as f64,
                     evidence_refs,
@@ -1873,6 +2204,23 @@ pub fn ledger_adapters(
         );
     }
     values
+}
+
+/// Reads hook-attributed turn rows from the ledger without invoking the fleet
+/// writer's exact-version migration/query path.
+#[implements("FR-047-AC-5")]
+pub fn session_turn_rows(
+    ledger_path: &Path,
+    window: &EvalWindow,
+) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, String> {
+    ledger::read_view_rows(ledger_path, "session_turn", "started_at", window)
+}
+
+fn requested_is_pause_metric(specs: &[RoleSpec]) -> bool {
+    specs.iter().flat_map(|spec| &spec.rules).any(|rule| {
+        rule.method == "deterministic"
+            && rule.query_or_rubric == "ledger.idle_lane_minutes_during_build_pause"
+    })
 }
 
 #[implements("FR-047-AC-1")]
@@ -1888,14 +2236,13 @@ fn read_need_ready_tickets_due(
         Some(path) => path.to_owned(),
         None => crate::fleet::ledger::default_path().map_err(|error| error.to_string())?,
     };
-    let due = crate::fleet::ledger::query(&path, "need_ready_tickets_due", None)
-        .map_err(|error| error.to_string())?;
+    let due = ledger::read_view_rows(&path, "need_ready_tickets_due", "at_ms", window)?;
     let project_names = projects
         .iter()
         .map(|project| project.to_ascii_lowercase())
         .collect::<BTreeSet<_>>();
     let mut evidence = Vec::new();
-    for row in due.rows {
+    for row in due {
         let at_ms = row
             .get("at_ms")
             .and_then(serde_json::Value::as_i64)
@@ -1988,10 +2335,8 @@ fn read_need_ready_tickets_unanswered(
         Some(path) => path.to_owned(),
         None => crate::fleet::ledger::default_path().map_err(|error| error.to_string())?,
     };
-    let due = crate::fleet::ledger::query(&path, "need_ready_tickets_due", None)
-        .map_err(|error| error.to_string())?;
+    let due = ledger::read_view_rows(&path, "need_ready_tickets_due", "at_ms", window)?;
     let actions = due
-        .rows
         .into_iter()
         .filter(|row| {
             row.get("at_ms")
@@ -2160,18 +2505,63 @@ fn read_ledger_view(
 fn read_merged_prs(
     repositories: &[String],
     window: &EvalWindow,
+    github_guard_state_path: Option<&Path>,
+    github_guard_max_bytes: u64,
 ) -> Result<(usize, Vec<String>), String> {
     if repositories.is_empty() {
         return Err("retro config has no repositories for GitHub merge evidence".to_owned());
     }
-    use super::sources::GithubSource;
-    let github = super::live::LiveGithub;
-    let start_secs = window.start_ms as f64 / 1000.0;
     let mut prs = Vec::new();
     for repository in repositories {
-        prs.extend(github.pull_requests(repository, start_secs)?);
+        prs.extend(guarded_pull_requests(
+            repository,
+            github_guard_state_path,
+            github_guard_max_bytes,
+        )?);
     }
     merged_prs_count(&prs, window)
+}
+
+#[implements("FR-047-AC-1")]
+fn guarded_pull_requests(
+    repository: &str,
+    state_path: Option<&Path>,
+    max_bytes: u64,
+) -> Result<Vec<super::sources::PullRequest>, String> {
+    let state_path = state_path.ok_or_else(|| {
+        "shared GitHub guard state path is not configured in eval.json".to_owned()
+    })?;
+    github::read_pull_requests(state_path, max_bytes, repository).and_then(|rows| {
+        rows.into_iter()
+            .map(|row| {
+                let created_at = crate::drift::timestamp_epoch(&row.created_at)
+                    .map_err(|_| "GitHub PR has an invalid createdAt timestamp".to_owned())?;
+                let updated_at = crate::drift::timestamp_epoch(&row.updated_at)
+                    .map_err(|_| "GitHub PR has an invalid updatedAt timestamp".to_owned())?;
+                let merged_at = row
+                    .merged_at
+                    .as_deref()
+                    .map(crate::drift::timestamp_epoch)
+                    .transpose()
+                    .map_err(|_| "GitHub PR has an invalid mergedAt timestamp".to_owned())?;
+                Ok(super::sources::PullRequest {
+                    closed_at: None,
+                    reopen_events: None,
+                    repo: repository.to_owned(),
+                    number: row.number,
+                    open: row.merged_at.is_none(),
+                    draft: row.is_draft,
+                    created_at,
+                    merged_at,
+                    updated_at,
+                    additions: 0,
+                    deletions: 0,
+                    review_decision: row.review_decision,
+                    force_pushes: None,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()
+    })
 }
 
 fn merged_prs_count(
@@ -2261,63 +2651,17 @@ fn gate_log_runs_count(
     Ok((selected.len(), evidence))
 }
 
+#[implements("FR-047-AC-9")]
 fn read_ready_buffer_mean(url: &str, window: &EvalWindow) -> Result<f64, String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|error| format!("Prometheus client: {error}"))?;
-    let base = url.trim_end_matches('/');
-    PROMETHEUS_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let response = client
-        .get(format!("{base}/api/v1/query_range"))
-        .query(&[
-            ("query", "avg(ix_fleet_ready_buffer_deficit)"),
-            ("start", &(window.start_ms as f64 / 1000.0).to_string()),
-            ("end", &(window.end_ms as f64 / 1000.0).to_string()),
-            ("step", "60"),
-        ])
-        .send()
-        .map_err(|error| format!("Prometheus range query: {error}"))?
-        .error_for_status()
-        .map_err(|error| format!("Prometheus range query: {error}"))?;
-    let body = response
-        .text()
-        .map_err(|error| format!("Prometheus range response: {error}"))?;
+    let body = github::read_prometheus_range(url, "avg(ix_fleet_ready_buffer_deficit)", window)?;
     ready_buffer_mean_from_response(&body, window)
 }
 
+#[implements("FR-047-AC-1")]
 fn ready_buffer_mean_from_response(body: &str, window: &EvalWindow) -> Result<f64, String> {
-    let document: serde_json::Value = serde_json::from_str(body)
-        .map_err(|error| format!("Prometheus response is not JSON: {error}"))?;
-    if document["status"] != "success" {
-        return Err("Prometheus range query status is not success".to_owned());
-    }
-    let series = document["data"]["result"]
-        .as_array()
-        .filter(|rows| !rows.is_empty())
-        .ok_or_else(|| "Prometheus range query returned no samples".to_owned())?;
     let mut points = BTreeMap::<i64, Vec<f64>>::new();
-    for row in series {
-        let samples = row["values"]
-            .as_array()
-            .ok_or_else(|| "Prometheus range series has no values array".to_owned())?;
-        for sample in samples {
-            let values = sample
-                .as_array()
-                .filter(|values| values.len() == 2)
-                .ok_or_else(|| "Prometheus range sample has an invalid shape".to_owned())?;
-            let at = values[0]
-                .as_f64()
-                .map(|seconds| (seconds * 1000.0).round() as i64)
-                .ok_or_else(|| "Prometheus range sample has no timestamp".to_owned())?;
-            let value = values[1]
-                .as_str()
-                .and_then(|value| value.parse::<f64>().ok())
-                .filter(|value| value.is_finite())
-                .ok_or_else(|| "Prometheus range sample has no finite value".to_owned())?;
-            points.entry(at).or_default().push(value);
-        }
+    for (at_ms, sample) in github::prometheus_samples(body, window)? {
+        points.entry(at_ms).or_default().push(sample);
     }
     let points = points
         .into_iter()
@@ -2445,8 +2789,13 @@ pub fn load_settings(team: &str) -> Result<EvalSettings, String> {
 
 #[implements("FR-047-AC-4")]
 fn load_settings_file(path: &Path) -> Result<EvalSettings, String> {
-    let contents =
-        std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(EvalSettings::default());
+        }
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
     let settings: EvalSettings =
         serde_json::from_str(&contents).map_err(|error| format!("{}: {error}", path.display()))?;
     if settings.role_spec_dir.as_os_str().is_empty() {
@@ -2455,7 +2804,31 @@ fn load_settings_file(path: &Path) -> Result<EvalSettings, String> {
             path.display()
         ));
     }
+    if settings
+        .github_guard_state_path
+        .as_ref()
+        .is_some_and(|path| path.as_os_str().is_empty())
+    {
+        return Err(format!(
+            "{}: github_guard_state_path must not be empty",
+            path.display()
+        ));
+    }
+    if !(1024 * 1024..=64 * 1024 * 1024).contains(&settings.github_guard_max_bytes) {
+        return Err(format!(
+            "{}: github_guard_max_bytes must be from 1 MiB through 64 MiB",
+            path.display()
+        ));
+    }
     Ok(settings)
+}
+
+#[implements("FR-047-AC-4")]
+fn default_role_spec_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".local/share/ix-board/role-specs")
 }
 
 /// Joins a relative role-spec directory to the evaluator settings directory.
@@ -2471,33 +2844,85 @@ pub fn resolve_role_spec_dir(team: &str, settings: &EvalSettings) -> PathBuf {
 /// Renders the same per-rule statuses and values used by the JSON document.
 #[implements("FR-047-AC-7")]
 pub fn render_text(report: &EvalReport) -> String {
-    report
-        .roles
-        .iter()
-        .flat_map(|role| {
-            role.rules.iter().map(move |rule| {
-                format!(
-                    "{} {} {:?}{}",
-                    role.role,
-                    rule.id,
-                    rule.status,
-                    rule.value.map_or_else(
-                        || rule.reason.as_deref().unwrap_or("").to_owned(),
-                        |value| format!(" {value}")
-                    ),
-                )
-            })
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut lines = vec![format!(
+        "team={} window={}..{} previous={}..{} schema_version={}",
+        report.team,
+        report.window.start_ms,
+        report.window.end_ms,
+        report.previous_window.start_ms,
+        report.previous_window.end_ms,
+        report.schema_version,
+    )];
+    for role in &report.roles {
+        lines.push(format!(
+            "role={} score={}/{} pass_rate={:?} previous={}/{} previous_pass_rate={:?} trend={:?} trend_matched_rules={} session_ids={}",
+            role.role,
+            role.score.passed,
+            role.score.evaluated,
+            role.score.pass_rate,
+            role.previous_score.passed,
+            role.previous_score.evaluated,
+            role.previous_score.pass_rate,
+            role.trend,
+            role.trend_matched_rules,
+            serde_json::to_string(&role.session_ids).unwrap_or_default(),
+        ));
+        lines.extend(role.objective_metrics.iter().map(|metric| {
+            format!(
+                "  objective_metric={}",
+                serde_json::to_string(metric).unwrap_or_default()
+            )
+        }));
+        lines.extend(
+            role.rules
+                .iter()
+                .map(|rule| format!("  rule={}", serde_json::to_string(rule).unwrap_or_default())),
+        );
+        lines.push(format!(
+            "  failing_rules={}",
+            serde_json::to_string(&role.failing_rules).unwrap_or_default()
+        ));
+    }
+    for session in &report.sessions {
+        lines.push(format!(
+            "session={} role={} score={}/{} pass_rate={:?}",
+            session.id,
+            session.role,
+            session.score.passed,
+            session.score.evaluated,
+            session.score.pass_rate,
+        ));
+        lines.extend(session.objective_metrics.iter().map(|metric| {
+            format!(
+                "  objective_metric={}",
+                serde_json::to_string(metric).unwrap_or_default()
+            )
+        }));
+        lines.extend(
+            session
+                .rules
+                .iter()
+                .map(|rule| format!("  rule={}", serde_json::to_string(rule).unwrap_or_default())),
+        );
+        lines.push(format!(
+            "  failing_rules={}",
+            serde_json::to_string(&session.failing_rules).unwrap_or_default()
+        ));
+    }
+    lines.push(format!(
+        "source_requests={}",
+        serde_json::to_string(&report.source_requests).unwrap_or_default()
+    ));
+    lines.join("\n")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ix_trace_rs::trace;
 
     #[test]
-    #[ix_trace_rs::trace("FR-047-AC-1")]
+    #[trace("FR-047-AC-1")]
     fn parse_and_evaluate_every_rule_including_unknown_queries() {
         let markdown = "## Evaluations\n| ID | Rule | Evidence source | Trigger | Method | Query or rubric | Evaluator | Comparator | Value | Unit | Cadence |\n|---|---|---|---|---|---|---|---|---|---|---|\n| R-1 | r | transcript | hooks.role_turns | deterministic | known.query | evaluator | = | 0 | runs | end |\n| R-2 | r | transcript | hooks.role_turns | deterministic | unknown.query | evaluator | = | 0 | runs | end |\n| R-3 | r | transcript | hooks.role_turns | judgement | rubric@1#x | team-retro | >= | 2 | score | daily |\n";
         let spec = parse_role_spec(Path::new("coder.md"), markdown).unwrap();
@@ -2524,8 +2949,44 @@ mod tests {
     }
 
     #[test]
-    #[ix_trace_rs::trace("FR-047-AC-2")]
-    #[ix_trace_rs::trace("FR-047-AC-3")]
+    #[trace("FR-047-AC-2")]
+    fn role_metrics_keep_their_value_status_unit_and_null_reason() {
+        let markdown = "## Metrics\n| ID | Name | Evidence source | Query | Unit | Target | Direction |\n|---|---|---|---|---|---|---|\n| CODE-M01 | Start time | github | github.ticket_start_to_pr_open_median_hours | hours | 4 | lower |\n| CODE-M02 | Throughput | retro | retro.net_closed_minus_new | issues/day | 1 | higher |\n## Evaluations\n| ID | Rule | Evidence source | Trigger | Method | Query or rubric | Evaluator | Comparator | Value | Unit | Cadence |\n|---|---|---|---|---|---|---|---|---|---|---|\n| CODE-R01-E1 | rule | github | github.pull_requests | deterministic | github.pull_requests | evaluator | = | 0 | PRs | 3h |\n";
+        let spec = parse_role_spec(Path::new("coder.md"), markdown).unwrap();
+        assert_eq!(spec.metrics.len(), 2);
+        assert_eq!(spec.metrics[0].id, "CODE-M01");
+        assert_eq!(spec.metrics[1].query, "retro.net_closed_minus_new");
+        let adapters = BTreeMap::from([
+            (
+                "github.ticket_start_to_pr_open_median_hours".into(),
+                QueryValue::Value {
+                    value: 3.5,
+                    evidence_refs: vec!["github:pr:7".into()],
+                },
+            ),
+            (
+                "retro.net_closed_minus_new".into(),
+                QueryValue::Unavailable {
+                    reason: "no complete stored snapshot".into(),
+                    evidence_refs: Vec::new(),
+                },
+            ),
+        ]);
+        let rows = evaluate_objective_metrics(&spec.metrics, &adapters);
+        assert_eq!(rows[0].value, Some(3.5));
+        assert_eq!(rows[0].status, RuleStatus::Pass);
+        assert_eq!(rows[0].evidence_refs, ["github:pr:7"]);
+        assert_eq!(rows[1].value, None);
+        assert_eq!(rows[1].status, RuleStatus::Unavailable);
+        assert_eq!(
+            rows[1].reason.as_deref(),
+            Some("no complete stored snapshot")
+        );
+    }
+
+    #[test]
+    #[trace("FR-047-AC-2")]
+    #[trace("FR-047-AC-3")]
     fn incomplete_and_not_applicable_rules_do_not_change_denominator() {
         let mk = |id: &str, status| RuleResult {
             id: id.into(),
@@ -2553,7 +3014,7 @@ mod tests {
     }
 
     #[test]
-    #[ix_trace_rs::trace("FR-047-AC-3")]
+    #[trace("FR-047-AC-3")]
     fn trend_uses_rules_scored_in_both_windows_despite_other_unavailable_rules() {
         let row = |id: &str, status, judgement_required| RuleResult {
             id: id.into(),
@@ -2591,7 +3052,7 @@ mod tests {
     }
 
     #[test]
-    #[ix_trace_rs::trace("FR-047-AC-4")]
+    #[trace("FR-047-AC-4")]
     fn evaluator_settings_keep_defaults_and_scope_gate_commands_by_repository() {
         let settings: EvalSettings = serde_json::from_str(
             r#"{"role_spec_dir":"roles","gate_commands":{"agent-ix/ix-board":["cargo","test"]}}"#,
@@ -2610,7 +3071,7 @@ mod tests {
     }
 
     #[test]
-    #[ix_trace_rs::trace("FR-047-AC-4")]
+    #[trace("FR-047-AC-4")]
     fn evaluator_settings_are_loaded_from_eval_json_only() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("eval.json");
@@ -2622,18 +3083,42 @@ mod tests {
         let settings = load_settings_file(&path).unwrap();
         assert_eq!(settings.ready_state.as_deref(), Some("Ready"));
         assert_eq!(settings.review_age_limit_hours, 2);
-        assert!(load_settings_file(&directory.path().join("config.json")).is_err());
+        let config_path = directory.path().join("config.json");
+        std::fs::write(&config_path, r#"{"team":"TEST"}"#).unwrap();
+        assert!(load_settings_file(&config_path).is_err());
     }
 
     #[test]
-    #[ix_trace_rs::trace("FR-047-AC-1")]
-    #[ix_trace_rs::trace("FR-047-AC-9")]
+    #[trace("FR-047-AC-4")]
+    fn missing_eval_settings_use_documented_defaults() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = load_settings_file(&directory.path().join("eval.json")).unwrap();
+        assert_eq!(
+            missing.role_spec_dir,
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".local/share/ix-board/role-specs")
+        );
+        assert_eq!(missing.review_age_limit_hours, 1);
+        assert!(missing.gate_commands.is_empty());
+        assert_eq!(missing.ready_state, None);
+        let minimal = directory.path().join("minimal.json");
+        std::fs::write(&minimal, "{}").unwrap();
+        let loaded = load_settings_file(&minimal).unwrap();
+        assert_eq!(loaded.role_spec_dir, missing.role_spec_dir);
+    }
+
+    #[test]
+    #[trace("FR-047-AC-1")]
+    #[trace("FR-047-AC-9")]
     fn retro_metric_adapter_uses_only_snapshots_inside_the_window() {
         let record: super::super::Record = serde_json::from_str(
             r#"{"schema_version":1,"kind":"snapshot","taken_at":"2023-11-14T22:13:20Z","team":"TEST","window":"24h","metrics":{"prs_oversize":{"id":"prs_oversize","status":"ok","value":2,"unit":"pull_requests","direction":"down","source":"github","query":"open pull requests","class":"flow","department_class":"throughput"}}}"#,
         ).unwrap();
         let spec = RoleSpec {
             role: "coder".into(),
+            metrics: Vec::new(),
             rules: vec![EvaluationRule {
                 id: "R-1".into(),
                 rule: "rule".into(),
@@ -2686,10 +3171,11 @@ mod tests {
     }
 
     #[test]
-    #[ix_trace_rs::trace("FR-047-AC-1")]
+    #[trace("FR-047-AC-1")]
     fn build_pause_metric_is_not_applicable_without_a_producer() {
         let spec = RoleSpec {
             role: "orchestrator".into(),
+            metrics: Vec::new(),
             rules: vec![EvaluationRule {
                 id: "ORCH-R1".into(),
                 rule: "rule".into(),
@@ -2710,10 +3196,11 @@ mod tests {
     }
 
     #[test]
-    #[ix_trace_rs::trace("FR-047-AC-1")]
+    #[trace("FR-047-AC-1")]
     fn every_deterministic_rule_has_an_explicit_registry_result() {
         let specs = [RoleSpec {
             role: "planner".into(),
+            metrics: Vec::new(),
             rules: vec![
                 EvaluationRule {
                     id: "A".into(),
@@ -2760,7 +3247,7 @@ mod tests {
     }
 
     #[test]
-    #[ix_trace_rs::trace("FR-047-AC-1")]
+    #[trace("FR-047-AC-1")]
     fn prometheus_ready_buffer_mean_is_time_weighted_and_rejects_gaps() {
         let window = EvalWindow {
             start_ms: 0,
@@ -2780,12 +3267,12 @@ mod tests {
         let no_series = r#"{"status":"success","data":{"resultType":"matrix","result":[]}}"#;
         assert_eq!(
             ready_buffer_mean_from_response(no_series, &window).unwrap_err(),
-            "Prometheus range query returned no samples"
+            "Prometheus range query returned no series"
         );
     }
 
     #[test]
-    #[ix_trace_rs::trace("FR-047-AC-1")]
+    #[trace("FR-047-AC-1")]
     fn linear_reviewed_prs_deduplicates_markers_and_merges_in_window() {
         let prs = [
             super::super::sources::PullRequest {
@@ -2837,7 +3324,7 @@ mod tests {
     }
 
     #[test]
-    #[ix_trace_rs::trace("FR-047-AC-1")]
+    #[trace("FR-047-AC-1")]
     fn merged_pull_requests_without_review_markers_are_reported_by_native_merge_time() {
         let pr = |number| super::super::sources::PullRequest {
             repo: "owner/repo".into(),
@@ -2875,7 +3362,7 @@ mod tests {
     }
 
     #[test]
-    #[ix_trace_rs::trace("FR-047-AC-1")]
+    #[trace("FR-047-AC-1")]
     fn github_merged_prs_uses_merge_time_and_deduplicates() {
         let pr = super::super::sources::PullRequest {
             repo: "owner/repo".into(),
@@ -2902,7 +3389,7 @@ mod tests {
     }
 
     #[test]
-    #[ix_trace_rs::trace("FR-047-AC-1")]
+    #[trace("FR-047-AC-1")]
     fn gate_log_runs_use_finished_time_and_exclude_repins() {
         let lines = [
             super::super::GateLine {
@@ -2940,7 +3427,7 @@ mod tests {
     }
 
     #[test]
-    #[ix_trace_rs::trace("FR-047-AC-1")]
+    #[trace("FR-047-AC-1")]
     fn reviewer_method_runs_count_only_distinct_runs_for_reviewed_prs() {
         let comment = |id: &str, run: &str, pr: &str| crate::MarkerComment {
             id: Some(id.into()),
@@ -2963,7 +3450,7 @@ mod tests {
     }
 
     #[test]
-    #[ix_trace_rs::trace("FR-047-AC-1")]
+    #[trace("FR-047-AC-1")]
     fn lead_gate_record_marker_requires_a_kind_and_parses_fields() {
         let (kind, fields) = lead_record_fields(
             "<!-- lead-record kind=gate repo=agent-ix/ix-board finished=2026-11-24T08:30:00Z -->",
@@ -2978,7 +3465,7 @@ mod tests {
     }
 
     #[test]
-    #[ix_trace_rs::trace("FR-047-AC-6")]
+    #[trace("FR-047-AC-6")]
     fn gate_record_join_requires_exact_pull_request_and_finish_time() {
         let line = super::super::GateLine {
             pr: "owner/repo#12".into(),
@@ -2998,7 +3485,7 @@ mod tests {
     }
 
     #[test]
-    #[ix_trace_rs::trace("FR-047-AC-1")]
+    #[trace("FR-047-AC-1")]
     fn fleet_ledger_due_action_adapter_uses_due_time_and_action_id() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("ledger.sqlite3");
@@ -3010,7 +3497,8 @@ mod tests {
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection
             .execute_batch(
-                "INSERT INTO tick(started_at,committed_at) VALUES(0,0);
+                "INSERT INTO run(kind,relay_ms) VALUES('tick',86401000);
+                 INSERT INTO tick(started_at,committed_at) VALUES(0,0);
                  INSERT INTO action(tick_id,kind,emitted_at,project,requested_count)
                    VALUES(1,'need_ready_tickets',1000,'Project A',3),
                          (1,'need_ready_tickets',1000,'Project B',2);",
@@ -3020,6 +3508,7 @@ mod tests {
 
         let specs = [RoleSpec {
             role: "planner".into(),
+            metrics: Vec::new(),
             rules: vec![EvaluationRule {
                 id: "PLAN-R1".into(),
                 rule: "due".into(),
@@ -3053,7 +3542,7 @@ mod tests {
     }
 
     #[test]
-    #[ix_trace_rs::trace("FR-047-AC-1")]
+    #[trace("FR-047-AC-1")]
     fn lane_order_ledger_view_accepts_text_order_id() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("ledger.sqlite3");
@@ -3087,7 +3576,7 @@ mod tests {
     }
 
     #[test]
-    #[ix_trace_rs::trace("FR-047-AC-6")]
+    #[trace("FR-047-AC-6")]
     fn ledger_unavailable_sentinel_preserves_its_reason() {
         let row = serde_json::Map::from_iter([
             ("available".into(), serde_json::Value::from(0_i64)),
@@ -3109,7 +3598,7 @@ mod tests {
     }
 
     #[test]
-    #[ix_trace_rs::trace("FR-047-AC-1")]
+    #[trace("FR-047-AC-1")]
     fn need_ready_action_counts_only_named_state_entries_in_its_following_day() {
         let events = [
             crate::linear::NamedStateChange {
@@ -3138,7 +3627,7 @@ mod tests {
     }
 
     #[test]
-    #[ix_trace_rs::trace("FR-047-AC-1")]
+    #[trace("FR-047-AC-1")]
     fn linear_marker_metrics_parse_review_data_and_disposition_rounds() {
         let comments = [
             crate::MarkerComment {
@@ -3194,11 +3683,12 @@ mod tests {
     }
 
     #[test]
-    #[ix_trace_rs::trace("FR-047-AC-7")]
+    #[trace("FR-047-AC-7")]
     fn session_filter_keeps_only_the_requested_session_row() {
         let session = |id: &str| SessionResult {
             id: id.into(),
             role: "coder".into(),
+            objective_metrics: Vec::new(),
             score: Score {
                 passed: 0,
                 evaluated: 0,
@@ -3218,10 +3708,11 @@ mod tests {
     }
 
     #[test]
-    #[ix_trace_rs::trace("FR-047-AC-5")]
+    #[trace("FR-047-AC-5")]
     fn session_metrics_require_one_role_session_for_team_level_values() {
         let spec = RoleSpec {
             role: "coder".into(),
+            metrics: Vec::new(),
             rules: vec![EvaluationRule {
                 id: "CODE-R1".into(),
                 rule: "team metric".into(),
@@ -3286,10 +3777,11 @@ mod tests {
     }
 
     #[test]
-    #[ix_trace_rs::trace("FR-047-AC-5")]
+    #[trace("FR-047-AC-5")]
     fn role_turns_are_counted_from_session_attributed_prompt_events() {
         let spec = RoleSpec {
             role: "minder".into(),
+            metrics: Vec::new(),
             rules: vec![EvaluationRule {
                 id: "MIND-R7".into(),
                 rule: "turns".into(),
@@ -3342,10 +3834,11 @@ mod tests {
     }
 
     #[test]
-    #[ix_trace_rs::trace("FR-047-AC-5")]
+    #[trace("FR-047-AC-5")]
     fn role_turn_adapter_reports_count_or_source_error() {
         let spec = RoleSpec {
             role: "minder".into(),
+            metrics: Vec::new(),
             rules: vec![EvaluationRule {
                 id: "MIND-R7".into(),
                 rule: "turns".into(),
