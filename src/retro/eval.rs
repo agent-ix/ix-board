@@ -1719,6 +1719,11 @@ pub fn ledger_adapters(
             "need_ready_tickets_due",
             "action_id",
         ),
+        (
+            "ledger.idle_lane_minutes_during_build_pause",
+            "idle_lane_minutes_during_build_pause",
+            "lane",
+        ),
     ];
     let mut values = BTreeMap::new();
     for (query, view, id_field) in queries {
@@ -1731,14 +1736,22 @@ pub fn ledger_adapters(
         }
         values.insert(
             query.to_owned(),
-            match read_ledger_view(ledger_path, view, id_field, window) {
-                Ok((value, evidence_refs)) => QueryValue::Value {
-                    value: value as f64,
-                    evidence_refs,
-                },
-                Err(reason) => QueryValue::Unavailable {
+            match read_ledger_unavailable_reason(ledger_path, view) {
+                Ok(Some(reason)) => QueryValue::NotApplicable {
                     reason,
                     evidence_refs: Vec::new(),
+                },
+                availability => match availability
+                    .and_then(|_| read_ledger_view(ledger_path, view, id_field, window))
+                {
+                    Ok((value, evidence_refs)) => QueryValue::Value {
+                        value: value as f64,
+                        evidence_refs,
+                    },
+                    Err(reason) => QueryValue::Unavailable {
+                        reason,
+                        evidence_refs: Vec::new(),
+                    },
                 },
             },
         );
@@ -1762,6 +1775,42 @@ pub fn ledger_adapters(
         );
     }
     values
+}
+
+fn read_ledger_unavailable_reason(
+    ledger_path: Option<&Path>,
+    view: &str,
+) -> Result<Option<String>, String> {
+    let path = match ledger_path {
+        Some(path) => path.to_owned(),
+        None => crate::fleet::ledger::default_path().map_err(|error| error.to_string())?,
+    };
+    let rows = crate::fleet::ledger::query(&path, view, None).map_err(|error| error.to_string())?;
+    ledger_unavailable_reason(view, &rows.rows)
+}
+
+fn ledger_unavailable_reason(
+    view: &str,
+    rows: &[serde_json::Map<String, serde_json::Value>],
+) -> Result<Option<String>, String> {
+    for row in rows {
+        let unavailable = row
+            .get("available")
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|available| available == 0)
+            || row
+                .get("available")
+                .and_then(serde_json::Value::as_bool)
+                .is_some_and(|available| !available);
+        if unavailable {
+            let reason = row
+                .get("unavailable_reason")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("fleet ledger {view} unavailable row has no reason"))?;
+            return Ok(Some(reason.to_owned()));
+        }
+    }
+    Ok(None)
 }
 
 #[implements("FR-047-AC-1")]
@@ -2823,6 +2872,28 @@ mod tests {
         .unwrap();
         assert_eq!(count, 1);
         assert_eq!(evidence, ["fleet-ledger:lane_orders_due:ord-abc"]);
+    }
+
+    #[test]
+    #[ix_trace_rs::trace("FR-047-AC-6")]
+    fn ledger_unavailable_sentinel_preserves_its_reason() {
+        let row = serde_json::Map::from_iter([
+            ("available".into(), serde_json::Value::from(0_i64)),
+            (
+                "unavailable_reason".into(),
+                serde_json::Value::String("relay all-orders source is unavailable".into()),
+            ),
+        ]);
+        assert_eq!(
+            ledger_unavailable_reason("lane_orders_due", &[row]).unwrap(),
+            Some("relay all-orders source is unavailable".into())
+        );
+        let available =
+            serde_json::Map::from_iter([("available".into(), serde_json::Value::from(1_i64))]);
+        assert_eq!(
+            ledger_unavailable_reason("lane_orders_due", &[available]).unwrap(),
+            None
+        );
     }
 
     #[test]
