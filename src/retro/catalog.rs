@@ -158,6 +158,72 @@ pub struct Record {
     pub department: Option<super::department::Report>,
 }
 
+/// Snapshot JSON projection. Catalog classes are added to command output while the stored
+/// [`Record`] stays compatible with older strict readers.
+#[derive(Clone, Debug, Serialize)]
+pub struct SnapshotOutput {
+    schema_version: u32,
+    kind: RecordKind,
+    taken_at: String,
+    team: String,
+    window: String,
+    metrics: BTreeMap<String, SnapshotMetric>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    department: Option<super::department::Report>,
+    #[serde(skip)]
+    record: Record,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct SnapshotMetric {
+    #[serde(flatten)]
+    metric: Metric,
+    class: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    department_class: Option<String>,
+}
+
+impl SnapshotOutput {
+    /// Builds the `retro snapshot --json` projection without adding fields to the stored record.
+    pub fn from_record(record: Record) -> Self {
+        let metrics = record
+            .metrics
+            .iter()
+            .map(|(id, metric)| {
+                let class = definition(id)
+                    .expect("snapshot metrics come from the fixed catalog")
+                    .family
+                    .to_owned();
+                let department_class =
+                    super::department::definition(id).map(|definition| definition.class.to_owned());
+                (
+                    id.clone(),
+                    SnapshotMetric {
+                        metric: metric.clone(),
+                        class,
+                        department_class,
+                    },
+                )
+            })
+            .collect();
+        Self {
+            schema_version: record.schema_version,
+            kind: record.kind,
+            taken_at: record.taken_at.clone(),
+            team: record.team.clone(),
+            window: record.window.clone(),
+            metrics,
+            department: record.department.clone(),
+            record,
+        }
+    }
+
+    /// Returns the classless record for text rendering.
+    pub fn record(&self) -> &Record {
+        &self.record
+    }
+}
+
 impl Record {
     /// Ids of the metrics that are unavailable, in catalog order.
     pub fn unavailable_ids(&self) -> Vec<&str> {

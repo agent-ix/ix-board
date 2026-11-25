@@ -445,7 +445,7 @@ enum Output {
     FleetLedger(ix_board::fleet::ledger::LedgerRows),
     FleetAssign(ix_board::fleet::assign::AssignReport),
     FleetTick(ix_board::fleet::tick::TickOutput),
-    Retro(retro::Record),
+    Retro(Box<retro::SnapshotOutput>),
     RetroDelta(retro::DeltaReport),
     RetroBackfill(retro::BackfillReport),
     ProjectStatusUpdated {
@@ -1062,7 +1062,7 @@ fn run_retro_snapshot(config_path: &std::path::Path, window: &str) -> Result<Out
         eprintln!("{notice}");
     }
     Ok(label_cached(
-        Output::Retro(record),
+        Output::Retro(Box::new(retro::SnapshotOutput::from_record(record))),
         linear.cache_freshness().as_ref(),
     ))
 }
@@ -1442,7 +1442,7 @@ fn render_human(output: &Output) -> String {
         Output::FleetAssign(report) => ix_board::fleet::assign::render_text(report),
         Output::FleetLedger(rows) => rows.render_text(),
         Output::FleetTick(tick) => tick.render_text(),
-        Output::Retro(record) => retro::render_text(record),
+        Output::Retro(output) => retro::render_text(output.record()),
         Output::RetroDelta(report) => retro::render_delta_text(report),
         Output::RetroBackfill(report) => retro::render_backfill_text(report),
         Output::ProgramScopeCheck(report) => {

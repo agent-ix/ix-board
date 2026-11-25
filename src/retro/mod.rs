@@ -22,7 +22,8 @@ use thiserror::Error as ThisError;
 
 pub use backfill::{BackfillReport, parse_day, render_backfill_text, run_backfill};
 pub use catalog::{
-    CATALOG, Direction, Metric, MetricDef, Record, RecordKind, SCHEMA_VERSION, Status,
+    CATALOG, Direction, Metric, MetricDef, Record, RecordKind, SCHEMA_VERSION, SnapshotOutput,
+    Status,
 };
 pub use config::{ConfigError, DEFAULT_WINDOW, RetroConfig, format_window, parse_window};
 pub use delta::{DeltaReport, render_delta_text, run_delta};

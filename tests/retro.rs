@@ -2048,17 +2048,29 @@ fn one(report: &DeltaReport, id: &str) -> ix_board::retro::delta::MetricDelta {
     report.metrics.iter().find(|m| m.id == id).unwrap().clone()
 }
 
-#[trace("FR-027-AC-9", "FR-027-AC-10")]
+#[trace("FR-024-AC-14", "FR-027-AC-9", "FR-027-AC-10")]
 #[test]
 fn delta_resolves_catalog_classes_and_accepts_legacy_records_and_reports() {
-    let old_record = serde_json::to_value(snap(
+    let old_record = snap(
         "2026-11-05T12:00:00Z",
         &[
             ("path_closed", Some(1.0), QUERY),
             ("fix_rounds_total", Some(1.0), QUERY),
         ],
+    );
+    let snapshot_output = serde_json::to_value(ix_board::retro::SnapshotOutput::from_record(
+        old_record.clone(),
     ))
     .unwrap();
+    assert_eq!(
+        snapshot_output["metrics"]["path_closed"]["class"],
+        "progress"
+    );
+    assert_eq!(
+        snapshot_output["metrics"]["fix_rounds_total"]["department_class"],
+        "review_rework"
+    );
+    let old_record = serde_json::to_value(old_record).unwrap();
     assert!(
         !old_record["metrics"]["path_closed"]
             .as_object()
