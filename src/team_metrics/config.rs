@@ -149,6 +149,17 @@ impl Config {
                     ));
                 }
             }
+            if scope.selectors.team.as_ref().is_some_and(|team| {
+                team.is_empty()
+                    || team.len() > 64
+                    || !team
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+            }) {
+                return Err(Error::Invalid(
+                    "Linear team key has unsafe label characters",
+                ));
+            }
             if !keys.insert(scope.key())
                 || scope.leads.is_empty()
                 || scope.leads.len() > 32

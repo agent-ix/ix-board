@@ -304,7 +304,7 @@ fn export_omits_unknown_values_and_uses_only_bounded_labels() {
     let state = state(&config);
     let text = render(&config, &state, 1234, 1000).unwrap();
     assert!(text.contains(
-        "ix_team_source_available{team_id=\"factory\",scope_id=\"completion\",source=\"tracker\"} 0"
+        "ix_team_source_available{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\",source=\"tracker\"} 0"
     ));
     assert!(!text.contains("ix_team_path_closed_24h{"));
     assert!(!text.contains("ix_team_scope_members{"));
@@ -499,8 +499,41 @@ fn failed_lifecycle_keeps_last_success_and_omits_current_ages() {
     state.observe(&config, &[], 31000, false);
     let text = render(&config, &state, 1000, 31000).unwrap();
     assert!(text.contains("source=\"lifecycle\"} 1\n")); // last successful timestamp is one Unix second.
-    assert!(!text.contains("ix_team_stage_oldest_age_seconds{"));
+    assert!(!text.contains("ix_team_stage_oldest_age_seconds{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\",stage=\"coding\"}"));
     assert!(!text.contains("ix_team_unattributed_executing_agents{"));
+}
+
+/// Trace: FR-033-AC-15
+#[trace("FR-033-AC-15")]
+#[test]
+fn team_series_have_linear_team_labels_and_explicit_empty_population_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(dir.path());
+    let mut state = state(&config);
+    state.history_ok = true;
+    state.history_at_ms = 100_000;
+    let scope = state.scopes.get_mut("factory:completion").unwrap();
+    scope.tracker_ok = true;
+    scope.tracker_at_ms = 100_000;
+    scope.lifecycle_ok = true;
+    scope.lifecycle_success_at_ms = 100_000;
+    let text = render(&config, &state, 0, 100_000).unwrap();
+
+    assert!(text.contains("team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\""));
+    assert!(text.contains(
+        "ix_team_executing_agents{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\"} 0"
+    ));
+    assert!(text.contains("ix_team_stage_oldest_age_seconds{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\",stage=\"coding\"} 0"));
+    for metric in [
+        "effort_per_verified_path_closure_seconds_24h",
+        "new_pr_first_review_median_seconds_24h",
+        "pr_changes_requested_share",
+    ] {
+        assert!(
+            text.contains(&format!("metric=\"{metric}\"}} 0")),
+            "expected explicit no-data status for {metric}"
+        );
+    }
 }
 
 /// Provenance: SWM-181; snapshots establish only current assignment facts.
@@ -536,6 +569,14 @@ fn bootstrap_never_invents_historical_stage_starts() {
         )
         .unwrap();
     assert!(!state.scopes["factory:completion"].assignments["draco:parent:42:child"].start_known);
+    state.history_ok = true;
+    state.history_at_ms = 5000;
+    let scope = state.scopes.get_mut("factory:completion").unwrap();
+    scope.tracker_ok = true;
+    scope.tracker_at_ms = 5000;
+    let text = render(&config, &state, 0, 5000).unwrap();
+    assert!(!text.contains("ix_team_stage_oldest_age_seconds{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\",stage=\"coding\"}"));
+    assert!(text.contains("metric=\"stage_oldest_age_seconds\",stage=\"coding\"} 0"));
 }
 
 /// Provenance: SWM-181; Unicode-heavy events stay within the actual byte ceiling.
@@ -672,7 +713,7 @@ fn cached_github_values_expire_independently_of_fresh_tracker_polls() {
     assert!(expired.contains("source=\"tracker\"} 1\n"));
     assert!(expired.contains("source=\"github_prs\"} 0\n"));
     assert!(!expired.contains("ix_team_prs_closed_unmerged_24h{"));
-    assert!(expired.contains("ix_team_source_last_success_timestamp_seconds{team_id=\"factory\",scope_id=\"completion\",source=\"github_prs\"} 100\n"));
+    assert!(expired.contains("ix_team_source_last_success_timestamp_seconds{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\",source=\"github_prs\"} 100\n"));
 }
 
 #[trace("FR-033-AC-1", "FR-033-AC-3")]

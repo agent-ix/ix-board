@@ -35,13 +35,27 @@ history. An explicit pause changes intent without erasing observed execution.
 
 HTTP serves cached metrics independently of source reads. Numeric labels are
 limited to configured team/scope IDs and bounded stage, state, metric and host
-categories. Missing or stale dependent facts omit current numeric values.
+categories. Every scope series also carries `team_key`, the configured Linear
+team key (empty only for scopes without a team selector). Missing or stale
+dependent facts omit current numeric values and set the corresponding
+`ix_team_metric_available` series to zero. A current empty population is
+reported as zero for counts and ages; undefined ratios and distributions omit
+their numeric series and report availability zero.
 Workers share the default coordinated Linear cache and persisted quota gate.
 Stale back-off fallback snapshots cannot certify a fresh tracker population;
 last-success timestamps retain the actual successful source-sync time.
 The exporter surface also serves the bounded fleet gauges defined by [FR-038](./FR-038-fleet-tick.md) and [FR-041](./FR-041-fleet-saturation.md) (`ix_fleet_tick_timestamp_seconds`, `ix_fleet_tick_actions{kind}`, `ix_fleet_ready_buffer_deficit`), omitting a value whose source is unavailable.
 The initial configuration permits four scopes and 1,000 output series. Individual
 evidence is retained for at most seven days within a 64 MiB SQLite file limit.
+
+The named series are absent when their source-side conditions are not met:
+effort requires a verified closure and complete observation coverage; first-review
+median requires at least one eligible new PR; changes-requested share requires a
+decisive review denominator; oldest stage age requires a known active stage start;
+and executing-agent count requires fresh lifecycle evidence. The exporter reports
+these conditions through `ix_team_metric_available`; an empty, fresh stage or
+execution population emits zero, while undefined ratios/distributions and stale
+source values omit the numeric series with availability zero.
 
 ## Acceptance Criteria
 
@@ -61,6 +75,7 @@ evidence is retained for at most seven days within a 64 MiB SQLite file limit.
 | FR-033-AC-12 | Every exporter GitHub read uses shared persistent admission and response caching. A rolling-hour hard ceiling of 40 sends and 1,000 pessimistically reserved GraphQL points survives concurrent workers and restarts. Per-PR REST polling and cache-miss fallbacks are prohibited; historical links use batches of at most 25, with at most 50 older links per repository per collection. Every actual HTTP attempt is admitted once with automatic redirects/retries disabled. Debits and leases use the current admission clock; Retry-After uses the response receipt clock. Server reset/Retry-After cooldowns survive HTTP errors and restart; cooldown or exhausted budget admits zero sends. Unsupported expensive department and commit/check evidence remains explicitly unavailable. | Test |
 | FR-033-AC-13 | Repository state uses at most four 50-row pages per open/recent cohort; incomplete, malformed, absent or stale evidence cannot certify an empty, clean or unmerged population. Required nullable native fields must be present and PR state/timestamps consistent. Cache representations bind the provider and effective credential; unknown credentials cannot reuse private bodies. Cache hits retain source observation times, conditional 304 responses require an existing valid representation, and stale values are omitted after 15 minutes. Query/output/time and shared SQLite storage limits are enforced: 16 KiB requests, 1 MiB response bodies, 20-second transport deadlines and a 45-second collection admission deadline; response storage is at most one eighth of the journal ceiling capped at 4 MiB and 128 entries, retained at most seven days. | Test |
 | FR-033-AC-14 | The exporter serves the fleet tick gauges from the last committed tick in the fleet ledger, omits them when it is older than twice the tick interval, serves the ready-buffer deficit with bounded labels, and omits each value whose source is unavailable. | Test |
+| FR-033-AC-15 | All scope metrics include `team_key` from the configured Linear selector. Fresh empty populations emit zero for `ix_team_executing_agents` and each `ix_team_stage_oldest_age_seconds` stage; missing effort, first-review median or changes-requested share values emit `ix_team_metric_available{metric=...} 0`, and stale evidence keeps the numeric values omitted. | Test |
 
 ## Dependencies
 

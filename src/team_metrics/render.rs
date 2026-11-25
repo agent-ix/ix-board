@@ -143,8 +143,10 @@ pub fn render(
     )?;
     for scope in &config.scopes {
         let labels = format!(
-            "team_id=\"{}\",scope_id=\"{}\"",
-            scope.team_id, scope.scope_id
+            "team_id=\"{}\",team_key=\"{}\",scope_id=\"{}\"",
+            scope.team_id,
+            scope.selectors.team.as_deref().unwrap_or(""),
+            scope.scope_id
         );
         let Some(s) = state.scopes.get(&scope.key()) else {
             continue;
@@ -260,13 +262,16 @@ pub fn render(
                 false,
             )?;
         }
-        if life_fresh {
-            out.metric(
-                "ix_team_executing_agents",
-                &labels,
-                s.samples.values().filter(|v| v.working).count() as f64,
-                false,
-            )?;
+        let executing_agents =
+            life_fresh.then(|| s.samples.values().filter(|v| v.working).count() as f64);
+        out.metric(
+            "ix_team_metric_available",
+            &format!("{labels},metric=\"executing_agents\""),
+            flag(executing_agents.is_some()),
+            false,
+        )?;
+        if let Some(count) = executing_agents {
+            out.metric("ix_team_executing_agents", &labels, count, false)?;
         }
         let paused = !s.pauses.is_empty()
             && scope
@@ -362,23 +367,39 @@ pub fn render(
                     }
                 }
             }
-            let oldest = s
+            let active = s
                 .assignments
                 .values()
                 .filter(|a| {
                     tracker_fresh
                         && history_fresh
-                        && a.start_known
                         && super::timeline::stage(&a.assignment.role) == stage
                         && s.members.values().any(|m| m.ticket == a.assignment.ticket)
                 })
+                .collect::<Vec<_>>();
+            let oldest = active
+                .iter()
+                .filter(|a| a.start_known)
                 .map(|a| now.saturating_sub(a.started_ms).max(0))
                 .max();
-            if let Some(age) = oldest {
+            let age = if active.is_empty() {
+                (tracker_fresh && history_fresh).then_some(0.0)
+            } else if active.iter().all(|a| a.start_known) {
+                oldest.map(|age| age as f64 / 1000.0)
+            } else {
+                None
+            };
+            out.metric(
+                "ix_team_metric_available",
+                &format!("{labels},metric=\"stage_oldest_age_seconds\",stage=\"{stage}\""),
+                flag(age.is_some()),
+                false,
+            )?;
+            if let Some(age) = age {
                 out.metric(
                     "ix_team_stage_oldest_age_seconds",
                     &format!("{labels},stage=\"{stage}\""),
-                    age as f64 / 1000.0,
+                    age,
                     false,
                 )?;
             }
@@ -465,27 +486,38 @@ pub fn render(
                 let unverified = r.metrics.get("path_closed_unverified")?.value?;
                 (closed >= unverified).then_some(closed - unverified)
             });
-        if let Some(value) = verified {
-            out.metric("ix_team_verified_path_closed_24h", &labels, value, false)?;
-            if value > 0.0
-                && life_fresh
-                && history_fresh
-                && let Some((_, execution, covered)) = s
-                    .effort_points
+        let effort = verified
+            .zip(
+                s.effort_points
                     .iter()
                     .rev()
-                    .find(|p| p.0 <= now - 86400000 && p.0 >= now - 86700000)
-            {
-                // Missing observations cannot turn an effort ratio into an apparent improvement.
-                if s.covered_seconds - covered >= 86100.0 {
-                    out.metric(
-                        "ix_team_effort_per_verified_path_closure_seconds_24h",
-                        &labels,
-                        (s.totals.get("execution_seconds").unwrap_or(&0.0) - execution) / value,
-                        false,
-                    )?;
-                }
-            }
+                    .find(|p| p.0 <= now - 86400000 && p.0 >= now - 86700000),
+            )
+            .and_then(|(closures, (_, execution, covered))| {
+                (closures > 0.0
+                    && life_fresh
+                    && history_fresh
+                    && s.covered_seconds - covered >= 86100.0)
+                    .then(|| {
+                        (s.totals.get("execution_seconds").unwrap_or(&0.0) - execution) / closures
+                    })
+            });
+        out.metric(
+            "ix_team_metric_available",
+            &format!("{labels},metric=\"effort_per_verified_path_closure_seconds_24h\""),
+            flag(effort.is_some()),
+            false,
+        )?;
+        if let Some(value) = verified {
+            out.metric("ix_team_verified_path_closed_24h", &labels, value, false)?;
+        }
+        if let Some(value) = effort {
+            out.metric(
+                "ix_team_effort_per_verified_path_closure_seconds_24h",
+                &labels,
+                value,
+                false,
+            )?;
         }
         if tracker_fresh && let Some(seconds) = s.build_execution_seconds_24h {
             out.metric(
