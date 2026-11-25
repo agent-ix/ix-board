@@ -31,3 +31,17 @@ Ticket: SWM-221. EARS grammar conformance of FR-047 description and behaviour st
 
 - FR-047 (examined): spec/functional/FR-047-retro-eval.md
 - FR-047/Behavior (examined): spec/functional/FR-047-retro-eval.md
+
+## Dispositions
+
+| FND | Outcome | Reason |
+| --- | --- | --- |
+| FND-001 | still-open | The Description continues to combine several independent obligations in compound SHALL sentences. |
+| FND-002 | still-open | Behavior bullets remain descriptive rather than SHALL requirements, and “bounded duration” still gives no bound. |
+
+### Round 2
+
+| FND | Outcome | Reason |
+| --- | --- | --- |
+| FND-001 | still-open | Compound SHALL obligations remain in the Description. |
+| FND-002 | still-open | Behavior remains descriptive and “bounded duration” remains unbounded. |

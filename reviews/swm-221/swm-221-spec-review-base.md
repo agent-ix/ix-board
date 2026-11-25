@@ -41,3 +41,20 @@ Ticket: SWM-221. Base spec review of the new FR-047 against the ticket, dev-team
 - FR-047-AC-7 (examined): spec/functional/FR-047-retro-eval.md
 - FR-047-AC-8 (examined): spec/functional/FR-047-retro-eval.md
 - FR-047 (examined): spec/functional/FR-047-retro-eval.md
+
+## Dispositions
+
+| FND | Outcome | Reason |
+| --- | --- | --- |
+| FND-001 | fixed | Behavior and JSON requirements now require `objective_metrics` on every role and session row, including null-value reasons. |
+| FND-002 | fixed | Unknown references are explicitly unavailable and the no-pause producer has an exact not-applicable reason. |
+| FND-003 | fixed | Missing settings defaults and the role-spec directory default are defined. |
+| FND-004 | still-open | `--since` still says “bounded duration” without a maximum, and the spec does not define a response-size bound or total runtime limit. |
+| FND-005 | still-open | The requirement refers to a query registry but does not define a spec-level mapping of each query to its counting rule, unit and time window. |
+
+### Round 2
+
+| FND | Outcome | Reason |
+| --- | --- | --- |
+| FND-004 | still-open | The spec still leaves the accepted duration maximum and total runtime/response bounds unstated. |
+| FND-005 | still-open | The spec still lacks a query-by-query method, unit and window registry. |

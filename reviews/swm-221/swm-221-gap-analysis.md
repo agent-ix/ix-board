@@ -48,3 +48,25 @@ Ticket: SWM-221. Planless gap analysis of FR-047 and the ticket criteria against
 ## Coverage
 
 Plan completion: not assessed. Matrix: FR-047-AC-7 tagged; AC-1 to AC-6 and AC-8 untagged. Semantic review of every test was not run.
+
+## Dispositions
+
+| FND | Outcome | Reason |
+| --- | --- | --- |
+| FND-001 | still-open | Relay and transcript reducers are implemented and tested in isolation, but `run_retro_eval` never invokes them, so rules cannot read those sources. |
+| FND-002 | fixed | Session rows now read event-window `session_turn` records produced by the fleet status path. |
+| FND-003 | fixed | Role/session results now populate `objective_metrics` from each role spec's Metrics table. |
+| FND-004 | fixed | The prior path-qualified trace attributes were replaced by bare imports and attributes; matrix shows AC-1 through AC-7 and AC-9 tagged. |
+| FND-005 | still-open | FR-047-AC-8 remains untagged; the matrix reports zero binders. |
+| FND-006 | still-open | Tests exercise reducers and serialization, but no test executes the composed adapter assembly in `run_retro_eval`. |
+| FND-007 | still-open | The ticket criterion to replace the matching `_lead-bin` shell scripts is not represented by a script replacement in this PR. |
+| FND-008 | fixed | Current test attributes and implementation markers use the bare trace form and their corresponding acceptance criteria. |
+
+### Round 2
+
+| FND | Outcome | Reason |
+| --- | --- | --- |
+| FND-001 | still-open | Relay and transcript adapters remain absent from the command assembly. |
+| FND-005 | still-open | AC-8 remains untagged. |
+| FND-006 | still-open | No test exercises the composed command adapter assembly. |
+| FND-007 | still-open | The requested `_lead-bin` shell-script replacement remains outside this diff. |

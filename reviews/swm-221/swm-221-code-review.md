@@ -67,3 +67,46 @@ Ticket: SWM-221. Code review with the rust-review lane folded in, of PR agent-ix
 - fetch_named_state_changes (examined): src/linear.rs
 - main_commits (context_only): src/retro/live.rs
 - fix_rounds (context_only): src/retro/metrics.rs
+
+## Dispositions
+
+| FND | Outcome | Reason |
+| --- | --- | --- |
+| FND-001 | still-open | The full duplicate retro snapshots were removed and stages report timings, but the command has no overall deadline bounding aggregate source work. |
+| FND-002 | still-open | GitHub now uses the shared guard, but the Linear marker and PR-history queries still have no evaluator-wide or shared request budget; source volume can grow with repositories and pagination. |
+| FND-003 | fixed | The marker reader accepts the real list-valued scope and validates marker fields separately; live-shape regression coverage exists in `src/retro/eval/linear.rs`. |
+| FND-004 | fixed | The composed ledger path preserves the required `no pause producer` not-applicable result. |
+| FND-005 | fixed | The reducer now sums the `minutes` column for minute-valued views. |
+| FND-006 | fixed | Ledger rules require collector and capacity event-time coverage before returning values; missing coverage is unavailable. |
+| FND-007 | fixed | Need-ready action counts use distinct action ids rather than missing-ticket totals. |
+| FND-008 | still-open | Lane-order rows are still reduced without filtering to the evaluated team, lane, or session. |
+| FND-009 | fixed | The retro adapters now read the configured department metric values and keyed metric reductions. |
+| FND-010 | fixed | Previous-window adapters use stored retro records only; current live state is collected only for the current window. |
+| FND-011 | fixed | Merge/review matching uses native merge time and excludes comments posted after the merge. |
+| FND-012 | fixed | Missing evaluator settings default successfully and `role_spec_dir` has a documented default. |
+| FND-013 | fixed | Disposition `new_findings` require location and finding text; keys include the pull-request identity. |
+| FND-014 | fixed | Gate-log joins use the exact pull-request key and finish-time match represented by the current source readers. |
+| FND-015 | fixed | Historical marker/record parsing is window bounded so malformed old entries outside the window do not poison the current query. |
+| FND-016 | fixed | Reviewer-method runs are selected within the requested event-time window. |
+| FND-017 | fixed | The read-only evaluator accepts supported schema versions 3 through 8, including the stacked fleet ledger schema. |
+| FND-018 | fixed | `run_retro_eval` assigns the explicit team to the loaded retro config before collection. |
+| FND-019 | fixed | Text rendering now includes scores, sessions, objective metrics and source counts with separated fields. |
+| FND-020 | still-open | Unknown roles now error, but filtering specs before adapter construction changes which sources are requested; the specification says filtering is presentation-only. |
+
+## New findings (disposition pass 1)
+
+| ID | Severity | Summary | Refs |
+| --- | --- | --- | --- |
+| FND-021 | high | The `relay` and `transcript` adapter modules are not called from `run_retro_eval`; configured relay-receipt, hook-event and transcript rules therefore remain unavailable even when their source data exists. | src/main.rs:1749-1825 |
+| FND-022 | high | The required `cargo clippy --workspace --all-targets --all-features -- -D warnings` gate fails on this head with dead-code and clippy diagnostics in changed production and test code. | src/retro/eval/ledger.rs:82-437 |
+
+### Round 2
+
+| FND | Outcome | Reason |
+| --- | --- | --- |
+| FND-001 | still-open | Source collection is staged, but there is still no evaluator-wide deadline bounding aggregate source calls. |
+| FND-002 | still-open | GitHub is guarded, but Linear history pagination still has no shared/evaluator request budget. |
+| FND-008 | still-open | Lane-order rows remain unfiltered to the evaluated team, lane or session. |
+| FND-020 | fixed | `source_specs` is now derived before presentation filters, so `--role` does not reduce source selection. |
+| FND-021 | still-open | This change does not wire relay or transcript reducers into `run_retro_eval`; their rules remain unavailable even with source data. |
+| FND-022 | fixed | `cargo clippy --workspace --all-targets --all-features -- -D warnings` passes on this head. |

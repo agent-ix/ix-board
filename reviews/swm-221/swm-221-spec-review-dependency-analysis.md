@@ -30,3 +30,9 @@ Ticket: SWM-221. Dependency analysis of the FR-047 relationships and Dependencie
 
 - FR-047/relationships (examined): spec/functional/FR-047-retro-eval.md
 - FR-047/Dependencies (examined): spec/functional/FR-047-retro-eval.md
+
+## Dispositions
+
+| FND | Outcome | Reason |
+| --- | --- | --- |
+| FND-001 | fixed | Relationships now include FR-026 and FR-041, and Dependencies state the ledger schema ownership and accepted versions. |
