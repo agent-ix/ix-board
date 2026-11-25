@@ -7,6 +7,7 @@
 //! (`ix.fleet.config`); a local override of any of them is refused.
 
 use super::FleetError;
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 const RELAY_OWNED: [&str; 6] = [
@@ -19,7 +20,7 @@ const RELAY_OWNED: [&str; 6] = [
 ];
 /// Default orchestrator cycle, ten minutes (FR-039).
 const DEFAULT_CYCLE_SECS: u64 = 600;
-const KNOWN: [&str; 16] = [
+const KNOWN: [&str; 17] = [
     "team_keys",
     "focus_window_secs",
     "ledger_path",
@@ -36,7 +37,19 @@ const KNOWN: [&str; 16] = [
     "max_clock_skew_secs",
     "push_interval_secs",
     "host_timeout_secs",
+    "capacity_limits",
 ];
+
+/// Explicit per-host capacity limits. Values are never inferred from telemetry.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HostCapacityLimits {
+    /// Interim sustainable build slots.
+    pub build_slots: Option<u32>,
+    /// Minimum free memory reserved for the host, in bytes.
+    pub memory_reserve_bytes: Option<u64>,
+    /// Maximum permitted CPU temperature, in Celsius.
+    pub thermal_limit_celsius: Option<f64>,
+}
 
 /// The relay defaults for the three relay-owned thresholds (ix-relay `[fleet]` documentation).
 /// The one definition in ix-board: used only for a lane whose host did not report
@@ -83,6 +96,8 @@ pub struct FleetConfig {
     pub team_keys: Vec<String>,
     /// The focus window of FR-037; ten minutes by default.
     pub focus_window: Duration,
+    /// Explicit host build-slot, memory-reserve and thermal limits.
+    pub capacity_limits: BTreeMap<String, HostCapacityLimits>,
 }
 
 impl Default for FleetConfig {
@@ -104,6 +119,7 @@ impl Default for FleetConfig {
             grace: None,
             team_keys: Vec::new(),
             focus_window: Duration::from_mins(10),
+            capacity_limits: BTreeMap::new(),
         }
     }
 }
@@ -201,6 +217,63 @@ impl FleetConfig {
                 .get("ledger_path")
                 .and_then(toml::Value::as_str)
                 .map(std::path::PathBuf::from);
+            if let Some(limits) = table.get("capacity_limits") {
+                let limits = limits.as_table().ok_or_else(|| {
+                    FleetError::Config("capacity_limits must be a host table".to_owned())
+                })?;
+                for (host, value) in limits {
+                    let fields = value.as_table().ok_or_else(|| {
+                        FleetError::Config(format!("capacity_limits.{host} must be a table"))
+                    })?;
+                    if let Some(key) = fields.keys().find(|key| {
+                        !matches!(key.as_str(), "build_slots" | "memory_reserve_bytes" | "thermal_limit_celsius")
+                    }) {
+                        return Err(FleetError::Config(format!(
+                            "unknown key capacity_limits.{host}.{key}"
+                        )));
+                    }
+                    let positive_u64 = |key: &str| -> Result<Option<u64>, FleetError> {
+                        fields
+                            .get(key)
+                            .map(|value| {
+                                value
+                                    .as_integer()
+                                    .and_then(|n| u64::try_from(n).ok())
+                                    .filter(|n| *n > 0)
+                                    .ok_or_else(|| FleetError::Config(format!(
+                                        "capacity_limits.{host}.{key} must be a positive integer"
+                                    )))
+                            })
+                            .transpose()
+                    };
+                    let build_slots = positive_u64("build_slots")?
+                        .map(u32::try_from)
+                        .transpose()
+                        .map_err(|_| FleetError::Config(format!(
+                            "capacity_limits.{host}.build_slots is too large"
+                        )))?;
+                    let thermal_limit_celsius = fields
+                        .get("thermal_limit_celsius")
+                        .map(|value| {
+                            value
+                                .as_float()
+                                .or_else(|| value.as_integer().map(|n| n as f64))
+                                .filter(|n| n.is_finite() && *n > 0.0)
+                                .ok_or_else(|| FleetError::Config(format!(
+                                    "capacity_limits.{host}.thermal_limit_celsius must be positive"
+                                )))
+                        })
+                        .transpose()?;
+                    config.capacity_limits.insert(
+                        host.to_lowercase(),
+                        HostCapacityLimits {
+                            build_slots,
+                            memory_reserve_bytes: positive_u64("memory_reserve_bytes")?,
+                            thermal_limit_celsius,
+                        },
+                    );
+                }
+            }
         }
         if let Some(path) = std::env::var_os("IX_BOARD_LEDGER_PATH").filter(|p| !p.is_empty()) {
             config.ledger_path = Some(std::path::PathBuf::from(path));
