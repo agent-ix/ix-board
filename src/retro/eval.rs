@@ -150,6 +150,7 @@ pub fn filter_sessions(
 }
 
 /// Reads the `hooks.role_turns` rule from session-attributed relay prompt rows.
+#[implements("FR-047-AC-5")]
 pub fn session_turn_adapters(
     spec: &RoleSpec,
     rows: Result<&[serde_json::Map<String, serde_json::Value>], &str>,
