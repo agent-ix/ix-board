@@ -133,6 +133,9 @@ fn issue(id: &str, state: &str, kind: WorkflowStateType, description: &str) -> I
         updated_at: None,
         attachment_urls: vec![],
         attachments_complete: true,
+        started_at: None,
+        completed_at: None,
+        pull_requests: Vec::new(),
     }
 }
 

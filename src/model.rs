@@ -288,6 +288,46 @@ pub struct Issue {
     pub attachment_urls: Vec<String>,
     /// Whether Linear returned every attachment record for this issue.
     pub attachments_complete: bool,
+    /// UTC time Linear recorded the issue entering a started state.
+    #[serde(default)]
+    pub started_at: Option<String>,
+    /// UTC time Linear recorded the issue completing.
+    #[serde(default)]
+    pub completed_at: Option<String>,
+    /// GitHub pull-request facts from Linear attachments.
+    #[serde(default)]
+    pub pull_requests: Vec<PullRequestFact>,
+}
+
+/// Lifecycle state of a linked GitHub pull request.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PullRequestStatus {
+    Open,
+    Draft,
+    Merged,
+    Closed,
+    Unknown,
+}
+
+/// A GitHub pull request attached to a Linear issue, as Linear recorded it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PullRequestFact {
+    /// Pull-request URL.
+    pub url: String,
+    /// Repository name without the owner.
+    pub repo: String,
+    /// Pull-request number.
+    pub number: u64,
+    /// Lifecycle state from the attachment metadata.
+    pub status: PullRequestStatus,
+    /// Whether the pull request is a draft.
+    pub draft: bool,
+    /// UTC creation time, when Linear recorded it.
+    pub created_at: Option<String>,
+    /// UTC merge time, when Linear recorded it.
+    pub merged_at: Option<String>,
 }
 
 /// Exact issue records returned for a batch, including unresolved selectors.
@@ -403,6 +443,50 @@ pub struct FocusStatus {
     pub blocker_layers: Vec<Vec<FocusBlocker>>,
     /// Focus issues eligible under FR-001, in its deterministic order.
     pub ready_queue: Vec<ReadyItem>,
+    /// Merges, closures and PR openings inside the closed-since window, newest first.
+    #[serde(default)]
+    pub activity: Vec<FocusActivity>,
+}
+
+/// Kind of focus activity event.
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, PartialEq, Ord, PartialOrd, Serialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum FocusActivityKind {
+    Merged,
+    Closed,
+    Opened,
+}
+
+/// Pull request named by an activity event.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FocusActivityPr {
+    /// Pull-request URL.
+    pub url: String,
+    /// Repository name without the owner.
+    pub repo: String,
+    /// Pull-request number.
+    pub number: u64,
+}
+
+/// One dated event on an in-focus issue.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FocusActivity {
+    /// UTC event time.
+    pub at: String,
+    /// What happened.
+    pub kind: FocusActivityKind,
+    /// Issue identifier.
+    pub identifier: String,
+    /// Issue title.
+    pub title: String,
+    /// Project name.
+    pub project: String,
+    /// Pull request, for merged and opened events.
+    pub pr: Option<FocusActivityPr>,
 }
 
 /// Versioned ix-board focus value for storage or transport by an opaque data service.
@@ -481,6 +565,9 @@ pub struct FocusProjectStatus {
     pub open_by_state: Vec<FocusStateCount>,
     /// Started focus issues assigned to this project.
     pub in_progress: Vec<FocusIssue>,
+    /// Issues completed inside the closed-since window, newest first.
+    #[serde(default)]
+    pub recently_closed: Vec<FocusIssue>,
     /// Progress over countable focus leaf issues assigned to this project.
     pub progress: FocusProgress,
     /// Selected milestone status, in Linear milestone order.
@@ -511,6 +598,9 @@ pub struct FocusMilestoneStatus {
     pub open_by_state: Vec<FocusStateCount>,
     /// Started focus issues assigned to this milestone.
     pub in_progress: Vec<FocusIssue>,
+    /// Issues completed inside the closed-since window, newest first.
+    #[serde(default)]
+    pub recently_closed: Vec<FocusIssue>,
     /// Progress over countable focus leaf issues assigned to this milestone.
     pub progress: FocusProgress,
 }
@@ -523,6 +613,9 @@ pub struct FocusUnmilestonedStatus {
     pub open_by_state: Vec<FocusStateCount>,
     /// Started focus issues without a milestone.
     pub in_progress: Vec<FocusIssue>,
+    /// Issues completed inside the closed-since window, newest first.
+    #[serde(default)]
+    pub recently_closed: Vec<FocusIssue>,
     /// Progress over countable focus leaf issues without a milestone.
     pub progress: FocusProgress,
 }
@@ -619,6 +712,18 @@ pub struct FocusIssue {
     pub title: String,
     /// Workflow state name.
     pub state: String,
+    /// Assignee display name, when assigned.
+    #[serde(default)]
+    pub assignee: Option<String>,
+    /// UTC time the issue started, when Linear recorded it.
+    #[serde(default)]
+    pub started_at: Option<String>,
+    /// UTC time the issue completed, when Linear recorded it.
+    #[serde(default)]
+    pub completed_at: Option<String>,
+    /// Linked GitHub pull requests; empty when none.
+    #[serde(default)]
+    pub prs: Vec<PullRequestFact>,
 }
 
 /// Issue summary included in a project chunk.

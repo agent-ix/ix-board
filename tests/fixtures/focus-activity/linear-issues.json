@@ -1,0 +1,116 @@
+{
+  "data": {
+    "issues": {
+      "nodes": [
+        {
+          "id": "issue-closed",
+          "identifier": "SWM-901",
+          "title": "Closed with several linked PRs",
+          "description": null,
+          "priority": 0.0,
+          "sortOrder": 0.0,
+          "createdAt": "2026-11-20T00:00:00Z",
+          "updatedAt": "2026-11-24T12:00:00Z",
+          "startedAt": "2026-11-24T10:00:00Z",
+          "completedAt": "2026-11-24T10:05:00Z",
+          "state": {"name": "Done", "type": "completed"},
+          "team": {"key": "SWM"},
+          "assignee": {"id": "user-1", "name": "Ada"},
+          "project": {"id": "project-activity"},
+          "projectMilestone": null,
+          "parent": null,
+          "relations": {"nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}},
+          "inverseRelations": {"nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}},
+          "attachments": {
+            "nodes": [
+              {
+                "url": "https://github.com/agent-ix/filament-examples/pull/128",
+                "sourceType": "github",
+                "metadata": {
+                  "url": "https://github.com/agent-ix/filament-examples/pull/128",
+                  "number": 128,
+                  "repoName": "filament-examples",
+                  "repoLogin": "agent-ix",
+                  "status": "merged",
+                  "draft": false,
+                  "createdAt": "2026-11-24T09:00:00Z",
+                  "mergedAt": "2026-11-24T10:00:00Z",
+                  "closedAt": "2026-11-24T10:00:00Z",
+                  "reviews": []
+                }
+              },
+              {
+                "url": "https://github.com/agent-ix/filament-examples/pull/128",
+                "sourceType": "github",
+                "metadata": {"number": 128, "repoName": "filament-examples", "status": "open"}
+              },
+              {
+                "url": "https://github.com/agent-ix/ix-board/pull/7",
+                "sourceType": "github",
+                "metadata": {
+                  "number": 7,
+                  "repoName": "ix-board",
+                  "status": "draft",
+                  "draft": true,
+                  "createdAt": "2026-11-24T08:00:00Z"
+                }
+              },
+              {
+                "url": "https://github.com/agent-ix/quoin/pull/9",
+                "sourceType": "github",
+                "metadata": {"number": 9, "repoName": "quoin", "status": "open", "draft": false}
+              },
+              {
+                "url": "https://github.com/agent-ix/quire-rs/pull/31",
+                "sourceType": "github",
+                "metadata": null
+              },
+              {
+                "url": "https://github.com/agent-ix/quire-rs/commit/abc123",
+                "sourceType": "github",
+                "metadata": {"status": "merged"}
+              },
+              {
+                "url": "https://example.com/design",
+                "sourceType": "figma",
+                "metadata": {}
+              }
+            ],
+            "pageInfo": {"hasNextPage": false}
+          }
+        },
+        {
+          "id": "issue-truncated",
+          "identifier": "SWM-902",
+          "title": "More attachments than one page",
+          "description": null,
+          "priority": 0.0,
+          "sortOrder": 1.0,
+          "createdAt": "2026-11-20T00:00:00Z",
+          "updatedAt": "2026-11-24T12:00:00Z",
+          "startedAt": null,
+          "completedAt": null,
+          "state": {"name": "Coding", "type": "started"},
+          "team": {"key": "SWM"},
+          "assignee": null,
+          "project": {"id": "project-activity"},
+          "projectMilestone": null,
+          "parent": null,
+          "relations": {"nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}},
+          "inverseRelations": {"nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}},
+          "attachments": {
+            "nodes": [
+              {
+                "url": "https://github.com/agent-ix/ix-board/pull/12",
+                "sourceType": "github",
+                "metadata": {"number": 12, "repoName": "ix-board", "status": "open", "draft": false, "createdAt": "2026-11-24T11:00:00Z"}
+              }
+            ],
+            "pageInfo": {"hasNextPage": true}
+          }
+        }
+      ],
+      "pageInfo": {"hasNextPage": false, "endCursor": null}
+    }
+  }
+}

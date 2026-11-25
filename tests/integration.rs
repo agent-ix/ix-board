@@ -199,6 +199,9 @@ fn issue(
         updated_at: None,
         attachment_urls: vec![],
         attachments_complete: true,
+        started_at: None,
+        completed_at: None,
+        pull_requests: Vec::new(),
     }
 }
 

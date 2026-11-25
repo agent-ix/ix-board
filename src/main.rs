@@ -281,6 +281,9 @@ enum FocusCommand {
         milestones: Vec<String>,
         #[arg(long = "issue", action = clap::ArgAction::Append)]
         issues: Vec<String>,
+        /// Report closures and PR events inside this window (for example 90m, 48h).
+        #[arg(long, default_value = "48h", value_parser = parse_duration)]
+        closed_since: u64,
     },
     /// Expand selectors into focus issues and prerequisite layers.
     Expand {
@@ -314,6 +317,9 @@ enum FocusCommand {
         /// Limit blocker roots and ready issues to these exact milestone IDs or names; repeatable.
         #[arg(long = "work-milestone", action = clap::ArgAction::Append)]
         work_milestones: Vec<String>,
+        /// Report closures and PR events inside this window (for example 90m, 48h).
+        #[arg(long, default_value = "48h", value_parser = parse_duration)]
+        closed_since: u64,
     },
     /// Prepare a bounded dependency-ordered handoff chunk for a focus.
     PlanChunk {
@@ -583,6 +589,7 @@ fn validate_command(command: &Command) -> Result<(), Error> {
                     projects,
                     milestones,
                     issues,
+                    ..
                 },
         } if initiatives.is_empty()
             && projects.is_empty()
@@ -1100,14 +1107,18 @@ fn run_linear(command: Command) -> Result<Output, Error> {
                     projects,
                     milestones,
                     issues,
+                    closed_since,
                 },
         } => service
-            .focus_record(&FocusSelection {
-                initiatives,
-                projects,
-                milestones,
-                issues,
-            })
+            .focus_record_windowed(
+                &FocusSelection {
+                    initiatives,
+                    projects,
+                    milestones,
+                    issues,
+                },
+                closed_since,
+            )
             .map(Output::FocusRecord),
         Command::Focus {
             command:
@@ -1133,9 +1144,10 @@ fn run_linear(command: Command) -> Result<Output, Error> {
                     milestones,
                     issues,
                     work_milestones,
+                    closed_since,
                 },
         } => service
-            .focus_status_for_milestones(
+            .focus_status_windowed(
                 &FocusSelection {
                     initiatives,
                     projects,
@@ -1143,6 +1155,7 @@ fn run_linear(command: Command) -> Result<Output, Error> {
                     issues,
                 },
                 &work_milestones,
+                closed_since,
             )
             .map(Output::FocusStatus),
         Command::Focus {
@@ -1805,6 +1818,7 @@ fn render_focus_status(status: &FocusStatus) -> String {
             &project.in_progress,
             project.progress,
         );
+        render_closed(&mut lines, "  ", &project.recently_closed);
         for milestone in &project.milestones {
             lines.push(format!("  Milestone {} — {}", milestone.name, milestone.id));
             lines.push(format!(
@@ -2048,6 +2062,18 @@ fn change_issue_id(change: &ix_board::FocusChange) -> &ix_board::IssueId {
     }
 }
 
+fn render_closed(lines: &mut Vec<String>, indent: &str, closed: &[ix_board::FocusIssue]) {
+    lines.push(format!("{indent}Closed in window:"));
+    lines.extend(closed.iter().map(|issue| {
+        let merged = issue
+            .prs
+            .iter()
+            .find(|pr| pr.status == ix_board::PullRequestStatus::Merged)
+            .map_or_else(String::new, |pr| format!(" ({}#{})", pr.repo, pr.number));
+        format!("{indent}  {} {}{merged}", issue.identifier, issue.title)
+    }));
+}
+
 fn render_status_group(
     lines: &mut Vec<String>,
     indent: &str,
@@ -2141,8 +2167,8 @@ fn render_chunk(chunk: &ProjectChunk) -> String {
 mod tests {
     use super::{
         Cli, Command, FocusCommand, Output, ProgramRoadmap, ProgramScopeCommand, format_issue_ref,
-        format_snapshot_time_at, output_outcome, render_chain, render_focus_status, render_orphans,
-        render_reconcile, render_roadmap,
+        format_snapshot_time_at, output_outcome, render_chain, render_closed, render_focus_status,
+        render_orphans, render_reconcile, render_roadmap,
     };
     use clap::Parser;
     use ix_board::program_review::ScopeCheckReport;
@@ -2239,6 +2265,7 @@ mod tests {
             projects: Vec::new(),
             blocker_layers: Vec::new(),
             ready_queue: Vec::new(),
+            activity: Vec::new(),
         };
         assert!(
             render_focus_status(&status).contains(
@@ -2591,6 +2618,51 @@ mod tests {
                 && issues == ["SWM-1"]
                 && work_milestones == ["M1"]
         ));
+    }
+
+    /// Trace: FR-045-AC-10
+    #[test]
+    fn closed_since_defaults_to_48h_and_closed_issues_render_with_merged_pr() {
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["ix-board", "focus", "status", "--project", "SWM-P1"];
+            args.extend_from_slice(extra);
+            match Cli::try_parse_from(args)
+                .expect("parse focus status")
+                .command
+            {
+                Command::Focus {
+                    command: FocusCommand::Status { closed_since, .. },
+                } => closed_since,
+                other => panic!("unexpected command {other:?}"),
+            }
+        };
+        assert_eq!(parse(&[]), 48 * 3600);
+        assert_eq!(parse(&["--closed-since", "90m"]), 90 * 60);
+
+        let closed = ix_board::FocusIssue {
+            id: IssueId("i1".to_owned()),
+            identifier: "SWM-1".to_owned(),
+            title: "Ship it".to_owned(),
+            state: "Done".to_owned(),
+            assignee: None,
+            started_at: None,
+            completed_at: Some("2026-11-24T10:05:00Z".to_owned()),
+            prs: vec![ix_board::PullRequestFact {
+                url: "https://github.com/agent-ix/ix-board/pull/7".to_owned(),
+                repo: "ix-board".to_owned(),
+                number: 7,
+                status: ix_board::PullRequestStatus::Merged,
+                draft: false,
+                created_at: None,
+                merged_at: Some("2026-11-24T10:00:00Z".to_owned()),
+            }],
+        };
+        let mut lines = Vec::new();
+        render_closed(&mut lines, "  ", &[closed]);
+        assert_eq!(
+            lines,
+            ["  Closed in window:", "    SWM-1 Ship it (ix-board#7)"]
+        );
     }
 
     /// Trace: FR-014-AC-3

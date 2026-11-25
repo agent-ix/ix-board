@@ -50,6 +50,8 @@ with the last successful report for that focus.
   projects, and issues into a deduplicated issue set and blocker layers (FR-011).
 - Focus status by project and milestone, blocker-state details, and the ready
   queue restricted to focus issues (FR-012).
+- Recently closed focus tickets and linked GitHub pull-request activity inside a
+  time window, carried by focus status and focus report (FR-045).
 - Focus hygiene findings for missing project/milestone assignment, overdue
   milestones, linked GitHub pull request status, stale issues, and duplicate
   title groups, plus a diff from the most recent successful report (FR-013).

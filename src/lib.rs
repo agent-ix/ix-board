@@ -9,6 +9,7 @@ pub mod cache_status;
 pub mod chain;
 mod drift;
 pub mod fleet;
+mod focus_activity;
 mod hygiene;
 mod linear;
 pub mod linear_summary;
@@ -71,15 +72,20 @@ pub use hygiene::{
 };
 pub use linear::{LinearGraphQlSource, MarkerComment};
 pub use model::{
-    ChunkIssue, FocusBlocker, FocusExpansion, FocusIssue, FocusIssueClassification, FocusMember,
-    FocusMilestone, FocusMilestoneStatus, FocusPlanChunk, FocusPlanIssue, FocusProgress,
-    FocusProject, FocusProjectMembership, FocusProjectStatus, FocusRecord, FocusSelection,
-    FocusStateCount, FocusStatus, FocusUnmilestonedStatus, Initiative, Issue, IssueBatch, IssueId,
-    Milestone, NextStep, Project, ProjectChunk, ProjectCompletion, ProjectId, ProjectPriority,
-    ProjectRunStatus, ProjectStatusCategory, ReadyItem, SearchKind, SearchResult, TeamKey,
-    WorkflowStateType, WorkspaceSnapshot,
+    ChunkIssue, FocusActivity, FocusActivityKind, FocusActivityPr, FocusBlocker, FocusExpansion,
+    FocusIssue, FocusIssueClassification, FocusMember, FocusMilestone, FocusMilestoneStatus,
+    FocusPlanChunk, FocusPlanIssue, FocusProgress, FocusProject, FocusProjectMembership,
+    FocusProjectStatus, FocusRecord, FocusSelection, FocusStateCount, FocusStatus,
+    FocusUnmilestonedStatus, Initiative, Issue, IssueBatch, IssueId, Milestone, NextStep, Project,
+    ProjectChunk, ProjectCompletion, ProjectId, ProjectPriority, ProjectRunStatus,
+    ProjectStatusCategory, PullRequestFact, PullRequestStatus, ReadyItem, SearchKind, SearchResult,
+    TeamKey, WorkflowStateType, WorkspaceSnapshot,
 };
 
+pub use focus_activity::DEFAULT_CLOSED_SINCE_SECONDS;
+use focus_activity::{
+    ActivityWindow, finish_activity, focus_issue_with_state, project_events, recently_closed,
+};
 use model::{compare_f64, issue_is_open};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -768,6 +774,16 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
         selection: &FocusSelection,
         work_milestones: &[String],
     ) -> Result<FocusStatus, Error> {
+        self.focus_status_windowed(selection, work_milestones, DEFAULT_CLOSED_SINCE_SECONDS)
+    }
+
+    /// Like [`Self::focus_status_for_milestones`], reporting closures and PR events from the last `closed_since_seconds`.
+    pub fn focus_status_windowed(
+        &mut self,
+        selection: &FocusSelection,
+        work_milestones: &[String],
+        closed_since_seconds: u64,
+    ) -> Result<FocusStatus, Error> {
         if selection.initiatives.is_empty()
             && selection.projects.is_empty()
             && selection.milestones.is_empty()
@@ -776,11 +792,28 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
             return Err(Error::EmptyFocus);
         }
         let snapshot = self.snapshot()?;
-        make_focus_status(&snapshot, selection, work_milestones)
+        make_focus_status(
+            &snapshot,
+            selection,
+            work_milestones,
+            ActivityWindow {
+                now: self.clock.now_epoch_seconds(),
+                closed_since_seconds,
+            },
+        )
     }
 
     /// Produces one versioned record with canonical selectors and focus status.
     pub fn focus_record(&mut self, selection: &FocusSelection) -> Result<FocusRecord, Error> {
+        self.focus_record_windowed(selection, DEFAULT_CLOSED_SINCE_SECONDS)
+    }
+
+    /// Like [`Self::focus_record`], reporting closures and PR events from the last `closed_since_seconds`.
+    pub fn focus_record_windowed(
+        &mut self,
+        selection: &FocusSelection,
+        closed_since_seconds: u64,
+    ) -> Result<FocusRecord, Error> {
         if selection.initiatives.is_empty()
             && selection.projects.is_empty()
             && selection.milestones.is_empty()
@@ -793,7 +826,15 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
             schema_version: FOCUS_RECORD_SCHEMA_VERSION,
             selection: canonical_selectors(&snapshot, selection)?,
             reported_at: self.clock.now_epoch_seconds(),
-            status: make_focus_status(&snapshot, selection, &[])?,
+            status: make_focus_status(
+                &snapshot,
+                selection,
+                &[],
+                ActivityWindow {
+                    now: self.clock.now_epoch_seconds(),
+                    closed_since_seconds,
+                },
+            )?,
         })
     }
 
@@ -1658,6 +1699,7 @@ fn make_focus_status(
     snapshot: &WorkspaceSnapshot,
     selection: &FocusSelection,
     work_milestones: &[String],
+    window: ActivityWindow,
 ) -> Result<FocusStatus, Error> {
     let expansion = make_focus_expansion(snapshot, selection)?;
     let scope = select_scope(
@@ -1701,6 +1743,7 @@ fn make_focus_status(
         .iter()
         .map(|value| scope::resolve_milestone_id(snapshot, value))
         .collect::<Result<BTreeSet<_>, _>>()?;
+    let mut events = Vec::new();
     let mut projects = snapshot
         .projects
         .iter()
@@ -1719,6 +1762,7 @@ fn make_focus_status(
                         && issue.project_id.as_ref() == Some(&project.id)
                 })
                 .collect::<Vec<_>>();
+            events.extend(project_events(&project.name, &member_issues, window));
             let mut milestones = project.milestones.iter().collect::<Vec<_>>();
             milestones.sort_by(|left, right| {
                 compare_f64(left.sort_order, right.sort_order).then_with(|| left.id.cmp(&right.id))
@@ -1746,6 +1790,7 @@ fn make_focus_status(
                         target_date: milestone.target_date.clone(),
                         open_by_state: open_state_counts(&assigned),
                         in_progress: started_issues(&assigned),
+                        recently_closed: recently_closed(&assigned, window),
                         progress: leaf_progress(&assigned, &leaf_ids),
                     }
                 })
@@ -1766,11 +1811,13 @@ fn make_focus_status(
                 target_date: project.target_date.clone(),
                 open_by_state: open_state_counts(&member_issues),
                 in_progress: started_issues(&member_issues),
+                recently_closed: recently_closed(&member_issues, window),
                 progress: leaf_progress(&member_issues, &leaf_ids),
                 milestones: milestone_status,
                 unmilestoned: FocusUnmilestonedStatus {
                     open_by_state: open_state_counts(&without_milestone),
                     in_progress: started_issues(&without_milestone),
+                    recently_closed: recently_closed(&without_milestone, window),
                     progress: leaf_progress(&without_milestone, &leaf_ids),
                 },
             }
@@ -1824,6 +1871,7 @@ fn make_focus_status(
         projects,
         blocker_layers,
         ready_queue,
+        activity: finish_activity(events),
     })
 }
 
@@ -2306,12 +2354,7 @@ fn started_issues(issues: &[&Issue]) -> Vec<FocusIssue> {
         .iter()
         .copied()
         .filter(|issue| issue.state_type == WorkflowStateType::Started)
-        .map(|issue| FocusIssue {
-            id: issue.id.clone(),
-            identifier: issue.identifier.clone(),
-            title: issue.title.clone(),
-            state: issue.state_name.clone(),
-        })
+        .map(|issue| focus_issue_with_state(issue, issue.state_name.clone()))
         .collect::<Vec<_>>();
     rows.sort_by(|left, right| {
         left.identifier
@@ -2445,12 +2488,7 @@ fn summarize_issues(
 }
 
 fn focus_issue(issue: &Issue) -> FocusIssue {
-    FocusIssue {
-        id: issue.id.clone(),
-        identifier: issue.identifier.clone(),
-        title: issue.title.clone(),
-        state: issue.state.clone(),
-    }
+    focus_issue_with_state(issue, issue.state.clone())
 }
 
 fn dependency_layers(
