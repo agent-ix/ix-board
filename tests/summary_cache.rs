@@ -118,7 +118,13 @@ fn failed_summary_age_uses_return_clock_and_cooldown_matches_absolute_transport_
 #[test]
 fn cold_and_warm_scope_and_roadmap_reuse_summaries_without_advancing_real_detail_reads() {
     let mut detail = project("p1");
-    detail.as_object_mut().expect("project").remove("progress");
+    // The detail project query requests neither member.
+    for summary_only in ["progress", "slugId"] {
+        detail
+            .as_object_mut()
+            .expect("project")
+            .remove(summary_only);
+    }
     detail["content"] = Value::Null;
     detail["teams"] = page(json!([]), None);
     detail["projectMilestones"] = page(json!([]), None);
