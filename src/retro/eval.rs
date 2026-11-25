@@ -2574,6 +2574,12 @@ mod tests {
                 .unwrap_err()
                 .contains("gap longer than two samples")
         );
+
+        let no_series = r#"{"status":"success","data":{"resultType":"matrix","result":[]}}"#;
+        assert_eq!(
+            ready_buffer_mean_from_response(no_series, &window).unwrap_err(),
+            "Prometheus range query returned no samples"
+        );
     }
 
     #[test]
