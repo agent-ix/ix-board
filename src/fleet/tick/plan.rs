@@ -117,7 +117,8 @@ fn severity_of(kind: ActionKind) -> Severity {
         | ActionKind::ActOnUndetermined
         | ActionKind::ResendOrder
         | ActionKind::RouteDeadLane
-        | ActionKind::RouteIdleLane => Severity::Medium,
+        | ActionKind::RouteIdleLane
+        | ActionKind::NeedReadyTickets => Severity::Medium,
         _ => Severity::Low,
     }
 }
@@ -509,6 +510,32 @@ impl Ctx<'_> {
             });
         }
     }
+
+    fn ready_buffer(&mut self) {
+        let Some(projects) = &self.input.facts.need_ready_tickets else {
+            return;
+        };
+        for project in projects.iter().filter(|project| project.need > 0) {
+            self.push(Cond {
+                kind: ActionKind::NeedReadyTickets,
+                subject: project.project.clone(),
+                lane: None,
+                target: Target {
+                    role: "planner",
+                    addr: Some(project.planner.clone()),
+                },
+                reason: "ready_buffer_deficit".to_owned(),
+                severity: severity_of(ActionKind::NeedReadyTickets),
+                evidence: vec!["ix_fleet_ready_buffer_deficit".to_owned()],
+                detail: json!({
+                    "project": project.project,
+                    "need": project.need,
+                    "ready": project.ready,
+                    "lanes": project.lanes,
+                }),
+            });
+        }
+    }
 }
 
 fn millis(d: std::time::Duration) -> i64 {
@@ -577,6 +604,7 @@ pub fn plan(input: &PlanInput<'_>) -> Plan {
     ctx.stale_prs();
     ctx.drains();
     ctx.add_lanes(&mut out.suppressed);
+    ctx.ready_buffer();
     let conds = std::mem::take(&mut ctx.conds);
     let now = input.report.run_ms;
     let interval = input.interval_ms;
@@ -727,4 +755,62 @@ pub fn plan(input: &PlanInput<'_>) -> Plan {
     out.suppressed
         .sort_by(|a, b| (&a.subject, &a.reason).cmp(&(&b.subject, &b.reason)));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fleet::FleetReport;
+    use crate::fleet::tick::NeedReadyTickets;
+
+    #[test]
+    fn positive_ready_buffer_deficit_routes_to_its_project_planner() {
+        let report = FleetReport {
+            schema_version: 1,
+            complete: true,
+            run_ms: 1_000,
+            rows: Vec::new(),
+            hosts: Vec::new(),
+            defects: Vec::new(),
+            host_busy: BTreeMap::new(),
+            relay_unavailable: false,
+        };
+        let settings = TickSettings::default();
+        let facts = TickFacts {
+            need_ready_tickets: Some(vec![NeedReadyTickets {
+                project: "QSL".to_owned(),
+                planner: "draco:factory:minder".to_owned(),
+                need: 3,
+                ready: 1,
+                lanes: 2,
+            }]),
+            ..TickFacts::default()
+        };
+        let plan = plan(&PlanInput {
+            report: &report,
+            first_seen: &[],
+            settings: &settings,
+            interval_ms: 300_000,
+            facts: &facts,
+            capacity: &Capacity {
+                open_runs: BTreeSet::new(),
+                levels: BTreeMap::new(),
+                cool_off_until: BTreeMap::new(),
+                draining: BTreeMap::new(),
+            },
+            orders: &StandingOrders::Missing,
+            open: &[],
+        });
+        let action = plan
+            .actions
+            .iter()
+            .find(|planned| planned.action.kind == ActionKind::NeedReadyTickets)
+            .expect("positive deficit emits a planner action");
+        assert_eq!(action.action.subject, "QSL");
+        assert_eq!(
+            action.action.target.addr.as_deref(),
+            Some("draco:factory:minder")
+        );
+        assert_eq!(action.action.detail["need"], 3);
+    }
 }

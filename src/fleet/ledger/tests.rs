@@ -152,6 +152,67 @@ fn concurrent_writers_serialize_with_increasing_sequences() {
     assert_eq!(sequences, (1..=10).collect::<Vec<_>>());
 }
 
+#[test]
+fn version_five_ledger_adds_planner_action_columns_without_losing_rows() {
+    let (_dir, path) = path();
+    let ledger = open(&path);
+    ledger
+        .connection
+        .execute(
+            "INSERT INTO action(kind,lane,emitted_at) VALUES('push_next_ticket','a',42)",
+            [],
+        )
+        .unwrap();
+    drop(ledger);
+    let connection = Connection::open(&path).unwrap();
+    for statement in schema::CAPACITY_VIEWS {
+        let view = statement.split_whitespace().nth(2).unwrap();
+        connection
+            .execute_batch(&format!("DROP VIEW {view}"))
+            .unwrap();
+    }
+    connection
+        .execute_batch(
+            "ALTER TABLE action DROP COLUMN project;
+             ALTER TABLE action DROP COLUMN requested_count;
+             DROP TABLE capacity_throttle_sample;
+             ALTER TABLE capacity_event DROP COLUMN source_basis;
+             ALTER TABLE host_output_sample DROP COLUMN source_basis;
+             PRAGMA user_version=5;",
+        )
+        .unwrap();
+
+    drop(open(&path));
+    let connection = Connection::open(&path).unwrap();
+    let row: (String, String, i64) = connection
+        .query_row(
+            "SELECT kind,lane,emitted_at FROM action WHERE id=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(row, ("push_next_ticket".to_owned(), "a".to_owned(), 42));
+    assert_eq!(user_version(&connection).unwrap(), VERSION);
+    let columns = connection
+        .prepare("PRAGMA table_info(action)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(columns.contains(&"project".to_owned()));
+    assert!(columns.contains(&"requested_count".to_owned()));
+}
+
+#[test]
+fn fresh_ledger_exposes_every_queryable_capacity_view() {
+    let (_dir, path) = path();
+    drop(open(&path));
+    for view in QUERYABLE {
+        query(&path, view, None).unwrap_or_else(|error| panic!("{view}: {error}"));
+    }
+}
+
 #[trace("FR-039-AC-3")]
 #[test]
 fn a_writer_that_cannot_take_the_lock_fails_without_writing() {
@@ -387,6 +448,7 @@ fn migration_is_one_transaction_and_a_later_version_is_refused() {
         "capacity_level",
         "capacity_event",
         "host_output_sample",
+        "capacity_throttle_sample",
         "capacity_window",
     ] {
         assert_eq!(
@@ -406,7 +468,7 @@ fn migration_is_one_transaction_and_a_later_version_is_refused() {
         .unwrap();
     assert!(matches!(
         Ledger::open(&path, &FleetConfig::default()),
-        Err(LedgerError::UnsupportedVersion { found: 5, .. })
+        Err(LedgerError::UnsupportedVersion { found: 7, .. })
     ));
 }
 
@@ -596,15 +658,15 @@ fn retention_never_prunes_open_rows() {
         .unwrap();
     ledger.record_status(&report(1000, &[])).unwrap();
     drop(ledger);
-    for (table, open_only) in [
-        ("plan_coverage_gap", "closed_at IS NULL"),
-        ("action", "resolved_at IS NULL"),
-        ("cycle_event", "ended_at IS NULL"),
-        ("capacity_level", "superseded_at IS NULL"),
+    for (table, open_only, expected_total) in [
+        ("plan_coverage_gap", "closed_at IS NULL", 1),
+        ("action", "resolved_at IS NULL", 1),
+        ("cycle_event", "ended_at IS NULL", 1),
+        ("capacity_level", "superseded_at IS NULL", 2),
     ] {
         assert_eq!(
             count(&path, &format!("SELECT COUNT(*) FROM {table}")),
-            1,
+            expected_total,
             "{table}"
         );
         assert_eq!(

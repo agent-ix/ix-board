@@ -50,6 +50,20 @@ impl TickSources for TickSourcesWithReady<'_> {
     }
 }
 
+#[test]
+fn live_ready_buffer_requires_configured_projects() {
+    let sources = LiveSources {
+        timeout: Duration::from_secs(1),
+        config: FleetConfig::default(),
+        settings: TickSettings::default(),
+        host_busy: BTreeMap::new(),
+        lanes: Vec::new(),
+        host_lane_counts: BTreeMap::new(),
+    };
+    let error = sources.need_ready_tickets().unwrap_err();
+    assert!(matches!(error, Unread::Failed(_)));
+}
+
 #[trace("FR-038-AC-6", "FR-038-AC-23")]
 #[test]
 fn live_busy_ratio_read_emits_add_lane_without_discarding_other_hosts() {
@@ -94,13 +108,19 @@ fn live_busy_ratio_read_emits_add_lane_without_discarding_other_hosts() {
         },
         1_000,
     );
-    let facts = TickFacts::read(&TickSourcesWithReady(&live_sources(
-        &report,
-        Duration::from_secs(1),
-    )));
     let mut settings = TickSettings::default();
     settings.lane_capacity.insert("draco".to_owned(), 2);
     settings.lane_capacity.insert("luna".to_owned(), 2);
+    let facts = TickFacts::read(
+        &TickSourcesWithReady(&live_sources(
+            &report,
+            Duration::from_secs(1),
+            &config,
+            &settings,
+        )),
+        report.run_ms,
+        config.tick_interval.as_secs(),
+    );
     let capacity = Capacity {
         open_runs: BTreeSet::new(),
         levels: BTreeMap::from([("draco".to_owned(), 2)]),

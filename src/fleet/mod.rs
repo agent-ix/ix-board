@@ -16,6 +16,7 @@ pub mod ledger;
 pub mod live;
 mod render;
 mod report;
+pub mod saturation;
 pub mod tick;
 
 pub use classify::{

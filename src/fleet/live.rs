@@ -139,6 +139,7 @@ pub trait PromQuery: Send + Sync {
 }
 
 /// The Prometheus HTTP API over a bounded blocking client.
+#[derive(Clone)]
 pub struct PromHttp {
     base: String,
     client: reqwest::blocking::Client,

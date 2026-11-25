@@ -30,10 +30,10 @@ a director count idle minutes and time-to-action from stored facts.
 Tables (version 1): `lane_interval` (lane, host, class, reason, started_at,
 ended_at, focus), `idle_minutes` view (lane, host, day, minutes per non-WORKING
 class, and minutes while ready work existed), `action` (id, tick id, kind, lane,
-emitted_at, executed_at, resolved_at), `defect`, `assignment_history`,
+project, requested_count, emitted_at, executed_at, resolved_at), `defect`, `assignment_history`,
 `ground_truth_sample` (lane, time, active or inactive, derived from hook events; at tick `t` the command writes labels for `t-W` and never for `t`, because truth at a time needs events up to `W` later; [FR-040](./FR-040-fleet-calibrate.md)), `calibration_run`,
 `audit_sample`, `saturation_sample` ([FR-041](./FR-041-fleet-saturation.md)),
-`tick` (id, started_at, committed_at), `run` (sequence, kind, `relay_ms`, `host_ms`, `relay_unavailable`, and the `tick_interval_s`, `cycle_interval_s` and `grace_s` in force) and `host_tick` (run sequence, host, relay time, lanes, working and not working lanes: the per-host figures of [FR-034](./FR-034-fleet-lane-status.md), written by every run that reads the relay). A run whose relay read failed stores the host clock in `host_ms` with `relay_unavailable` set and `relay_ms` empty, writes no `lane_tick` or `host_tick` row, closes no defect and prunes nothing, so host time never enters a relay-time column. The interval and grace are stored per run so views score each run with the configuration that was in force when it was written.
+`tick` (id, started_at, committed_at), `run` (sequence, kind, `relay_ms`, `host_ms`, `relay_unavailable`, and the `tick_interval_s`, `cycle_interval_s` and `grace_s` in force) and `host_tick` (run sequence, host, relay time, lanes, working and not working lanes: the per-host figures of [FR-034](./FR-034-fleet-lane-status.md), written by every run that reads the relay). A `need_ready_tickets` action stores its owning `project`, current positive `requested_count`, first `emitted_at` and `resolved_at` tick when the deficit clears; other action kinds leave the new fields empty. A run whose relay read failed stores the host clock in `host_ms` with `relay_unavailable` set and `relay_ms` empty, writes no `lane_tick` or `host_tick` row, closes no defect and prunes nothing, so host time never enters a relay-time column. The interval and grace are stored per run so views score each run with the configuration that was in force when it was written.
 
 - **Writers.** A writer SHALL hold an exclusive single-writer lock and assign a
   monotonic sequence number to its run; a concurrent run waits up to a bounded time
@@ -94,6 +94,13 @@ through the injected capacity measurement source. A successful measurement
 and its lane-attributed output commit before the open hold is removed. The
 migration from version 3 is additive and preserves prior rows.
 
+### Schema version 6: planner ready-buffer action facts
+
+Version 6 adds nullable `project` and `requested_count` columns to `action`.
+The migration is additive and preserves historical action rows. A `need_ready_tickets`
+row uses these columns while retaining its first `emitted_at` and the condition-clear
+`resolved_at` timestamps; other action kinds leave them empty.
+
 | Table | Columns | Written by |
 |-------|---------|------------|
 | `plan_coverage_tick` | tick id, `unowned_ready_count`, `short_queue_count`, `stale_assignment_count`, `unavailable_lists` | `fleet tick` ([FR-036](./FR-036-fleet-plan-coverage.md)) |
@@ -102,7 +109,7 @@ migration from version 3 is additive and preserves prior rows.
 | `drift_finding` | finding id, lane, rule, focus, `opened_tick`, `opened_at`, `closed_at`, evidence times | `fleet tick` ([FR-037](./FR-037-fleet-focus-and-drift.md)) |
 | `assignment_history` (extended) | adds `order_id`, `expect_ticket`, `sent_at`, `deadline_at`, `result` (`pending`, `confirmed`, `acted_not_focused`, `ack_expired`, `timed_out`), `result_at`, `confirm_latency_s` (empty for an unconfirmed result), `focus_at_deadline` | `fleet assign` ([FR-035](./FR-035-fleet-assign.md)) |
 | `order_focus_at_deadline` | `order_id`, `sender_role` (`orchestrator`, `minder`), `sender_addr`, lane, `expect_ticket`, `deadline_at`, `focus_ticket`, `focus_state`, `outcome` (`confirmed`, `acted_not_focused`, `ack_expired`, `timed_out`), `followup_at` | `fleet tick` and `fleet status`. **Deferred to SWM-255**: not written yet |
-| `action` (extended) | adds `severity`, `due_by`, `target_role` (`lane`, `lead`, `orchestrator`, `planner`, `host`), `target_addr`, `condition_started_at`, `parent_action_id`, `rung` (0 to 3) | `fleet tick` ([FR-038](./FR-038-fleet-tick.md)) |
+| `action` (extended) | adds `severity`, `due_by`, `target_role` (`lane`, `lead`, `orchestrator`, `planner`, `host`), `target_addr`, `condition_started_at`, `parent_action_id`, `rung` (0 to 3), `project`, `requested_count` | `fleet tick` ([FR-038](./FR-038-fleet-tick.md)); `project` and `requested_count` are set for `need_ready_tickets` ([FR-041](./FR-041-fleet-saturation.md)) |
 | `action_send` | `action_id`, `sent_at`, `sender_addr`, `recipient_addr`, receipt id | `fleet tick` and `fleet status`, from relay receipts. **Deferred to SWM-255**: not written yet |
 | `tick` (extended) | adds `session_addr` and `session_role` | `fleet tick` |
 | `session_turn` | `session_addr`, `session_role`, `started_at` | `fleet tick` and `fleet status`, from hook `prompt` events of the configured minder and orchestrator addresses. **Deferred to SWM-255**: not written yet |
@@ -212,6 +219,7 @@ in [FR-041](./FR-041-fleet-saturation.md); `answer_dialog_latency_max` and
 | FR-039-AC-9 | Opening a version 1 ledger migrates it to the current version in one transaction under the writer lock with every earlier row unchanged; a crash injected mid-migration leaves the version 1 ledger intact and openable; a ledger of a later version is refused without a change. | Test |
 | FR-039-AC-17 | Opening a version 2 ledger migrates it to version 3 under the writer lock, preserves every existing row, and adds provenance columns; a crash injected during migration leaves the version 2 ledger intact; new capacity steps expose one source-basis entry per measurement field in JSON. | Test |
 | FR-039-AC-18 | Opening a version 3 ledger migrates it to version 4 under the writer lock, preserves previous rows and creates the resumable capacity-window table; a start, hold, measurement-source response, end and status read preserve per-field and per-lane source basis, while failed measurement leaves the open window intact. | Test |
+| FR-039-AC-19 | Opening a version 5 ledger migrates to version 6 under the writer lock, preserves prior action rows and adds nullable `project` and `requested_count` columns. | Test |
 | FR-039-AC-10 | A gap present in tick 1 and absent in tick 3 gives one `plan_coverage_gap` row with `opened_tick` 1 and `closed_tick` 3; an `unavailable` list in tick 2 neither closes nor reopens it; `open_cycles` equals `max(1, ceil((close_or_now - open - grace) / cycle_interval))` on the evaluation clock: with a 10 minute cycle and grace of 15 minutes (10 minutes plus a 5 minute tick) a gap closed at 4, 24 and 25 minutes counts 1 each (the later ones are an orchestrator that acted in its next cycle), one closed at 26 minutes counts 2, one closed at 36 minutes counts 3, and one still open counts by elapsed time while no `cycle_event` row is written. | Test |
 | FR-039-AC-16 | With the orchestrator session writing no `cycle_event.ended_at` for more than twice `interval_s`, `fleet tick` writes one `cycle_missed` row for the span and not a second on the next tick; a session that ends cycles on time writes none. | Test |
 | FR-039-AC-11 | `lane_tick` holds one row per lane per committed `fleet status` or `fleet tick` run with its `source`, class and `ready_work_available` (true exactly when the lane has a remaining ticket or an unowned ready ticket in one of the lane's eligible teams or projects exists, written by `fleet tick`; empty on a `status` row); a status row and a tick row at the same relay time count once in the views, the tick row winning; `idle_lane_with_ready_work_ticks` and `idle_lane_episode_with_ready_work_max` equal the hand-computed values on a fixture. | Test |

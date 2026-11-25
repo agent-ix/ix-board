@@ -8,8 +8,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-const KNOWN: [&str; 9] = [
+const KNOWN: [&str; 11] = [
     "stale_pr_after_secs",
+    "drain_build_window_secs",
     "drain_cap_secs",
     "orchestrator",
     "minder",
@@ -18,6 +19,7 @@ const KNOWN: [&str; 9] = [
     "leads",
     "busy_targets",
     "lane_capacity",
+    "planners",
 ];
 
 /// Settings of `fleet tick` beyond the shared `[fleet]` table.
@@ -25,6 +27,8 @@ const KNOWN: [&str; 9] = [
 pub struct TickSettings {
     /// A lane-owned pull request without activity this long is stale (default 3h).
     pub stale_pr_after: Duration,
+    /// Build quiet window required before a drain can complete.
+    pub drain_build_window: Duration,
     /// A lane draining this long gets `escalate_drain` (default 4h).
     pub drain_cap: Duration,
     /// Address of the orchestrator session; owner of `fix_source` and rung 3.
@@ -41,12 +45,15 @@ pub struct TickSettings {
     pub busy_targets: BTreeMap<String, f64>,
     /// Host (lower case) to its lane capacity, the bound of a free lane slot.
     pub lane_capacity: BTreeMap<String, u32>,
+    /// Project identifier or name (lower case) to its planner session.
+    pub planners: BTreeMap<String, String>,
 }
 
 impl Default for TickSettings {
     fn default() -> Self {
         Self {
             stale_pr_after: Duration::from_secs(3 * 3600),
+            drain_build_window: Duration::from_secs(300),
             drain_cap: Duration::from_secs(4 * 3600),
             orchestrator: None,
             minder: None,
@@ -55,6 +62,7 @@ impl Default for TickSettings {
             leads: BTreeMap::new(),
             busy_targets: BTreeMap::new(),
             lane_capacity: BTreeMap::new(),
+            planners: BTreeMap::new(),
         }
     }
 }
@@ -120,6 +128,11 @@ impl TickSettings {
             return Err(FleetError::Config(format!("unknown key fleet_tick.{key}")));
         }
         secs(table, "stale_pr_after_secs", &mut out.stale_pr_after)?;
+        secs(
+            table,
+            "drain_build_window_secs",
+            &mut out.drain_build_window,
+        )?;
         secs(table, "drain_cap_secs", &mut out.drain_cap)?;
         out.orchestrator = text(table, "orchestrator")?;
         out.minder = text(table, "minder")?;
@@ -146,6 +159,16 @@ impl TickSettings {
                     .and_then(|n| u32::try_from(n).ok())
                     .ok_or_else(|| bad("lane_capacity", "whole numbers"))?;
                 out.lane_capacity.insert(host.to_lowercase(), n);
+            }
+        }
+        if let Some(planners) = sub(table, "planners")? {
+            for (project, planner) in planners {
+                let planner = planner
+                    .as_str()
+                    .filter(|planner| !planner.trim().is_empty())
+                    .ok_or_else(|| bad("planners", "non-empty session addresses"))?;
+                out.planners
+                    .insert(project.to_lowercase(), planner.to_owned());
             }
         }
         Ok(out)

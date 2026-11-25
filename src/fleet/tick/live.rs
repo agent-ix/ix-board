@@ -22,13 +22,39 @@ use std::time::Duration;
 /// `fleet status`; each other unwired source reports why it is unread.
 struct LiveSources {
     timeout: Duration,
+    config: FleetConfig,
+    settings: super::TickSettings,
     host_busy: BTreeMap<String, f64>,
+    lanes: Vec<(String, String)>,
+    host_lane_counts: BTreeMap<String, u32>,
 }
 
-fn live_sources(report: &FleetReport, timeout: Duration) -> LiveSources {
+fn live_sources(
+    report: &FleetReport,
+    timeout: Duration,
+    config: &FleetConfig,
+    settings: &super::TickSettings,
+) -> LiveSources {
     LiveSources {
         timeout,
+        config: config.clone(),
+        settings: settings.clone(),
         host_busy: report.host_busy.clone(),
+        lanes: report
+            .rows
+            .iter()
+            .map(|row| (row.host.to_lowercase(), row.lane.to_lowercase()))
+            .collect(),
+        host_lane_counts: report
+            .hosts
+            .iter()
+            .map(|host| {
+                (
+                    host.host.to_lowercase(),
+                    u32::try_from(host.lanes).unwrap_or(u32::MAX),
+                )
+            })
+            .collect(),
     }
 }
 
@@ -55,11 +81,270 @@ impl TickSources for LiveSources {
     }
 
     fn lane_prs(&self) -> Result<Vec<LanePr>, Unread> {
-        Err(Unread::Unwired("SWM-282"))
+        super::pr::read_live(self.timeout).map_err(|error| Unread::Failed(SourceError(error)))
     }
 
     fn ready_work(&self) -> Result<ReadyWork, Unread> {
         Err(Unread::Unwired("SWM-212"))
+    }
+
+    fn need_ready_tickets(&self) -> Result<Vec<super::NeedReadyTickets>, Unread> {
+        if self.config.saturation_projects.is_empty() {
+            return Err(Unread::Failed(SourceError(
+                "fleet.saturation_projects is empty".to_owned(),
+            )));
+        }
+        let report = crate::fleet::saturation::read_live(&self.config, &self.settings)
+            .map_err(|error| Unread::Failed(SourceError(error.to_string())))?;
+        if !report.complete {
+            return Err(Unread::Failed(SourceError(
+                "fleet saturation source coverage is incomplete".to_owned(),
+            )));
+        }
+        let mut needs = Vec::new();
+        for project in report
+            .projects
+            .into_iter()
+            .filter(|project| project.need > 0)
+        {
+            let Some(planner) = project.planner else {
+                return Err(Unread::Failed(SourceError(format!(
+                    "no planner configured for project {} with ready-buffer deficit {}",
+                    project.project, project.need
+                ))));
+            };
+            needs.push(super::NeedReadyTickets {
+                project: project.project,
+                planner,
+                need: project.need,
+                ready: project.ready,
+                lanes: project.lanes,
+            });
+        }
+        Ok(needs)
+    }
+
+    fn capacity_throttle_samples(
+        &self,
+        at_ms: i64,
+        interval_secs: u64,
+    ) -> Vec<super::CapacityThrottleSample> {
+        let prometheus = self
+            .config
+            .prometheus_url
+            .as_deref()
+            .map(|url| live::PromHttp::new(url, self.timeout));
+        self.config
+            .hosts
+            .iter()
+            .map(|host| {
+                let evidence = match prometheus.as_ref() {
+                    Some(Ok(query)) => crate::fleet::saturation::live_admission_blocked_share(
+                        query,
+                        host,
+                        interval_secs,
+                        self.config.push_interval.as_secs(),
+                    ),
+                    Some(Err(error)) => crate::fleet::saturation::Evidence::unavailable(
+                        "prometheus.ix_build_admission_blocked_seconds_total",
+                        error.to_string(),
+                        None,
+                    ),
+                    None => crate::fleet::saturation::Evidence::unavailable(
+                        "prometheus.ix_build_admission_blocked_seconds_total",
+                        "prometheus_url_unconfigured",
+                        None,
+                    ),
+                };
+                super::CapacityThrottleSample {
+                    host: host.to_lowercase(),
+                    at_ms,
+                    interval_secs,
+                    share: evidence.value,
+                    coverage: evidence.coverage,
+                    unavailable_reason: evidence.reason,
+                }
+            })
+            .collect()
+    }
+
+    fn drain_done(&self) -> Result<Vec<super::DrainDoneSample>, Unread> {
+        let path = ledger::resolve_path(&self.config)
+            .map_err(|error| Unread::Failed(SourceError(error.to_string())))?;
+        let history = ledger::capacity::status(&path)
+            .map_err(|error| Unread::Failed(SourceError(error.to_string())))?;
+        let open_drains = history
+            .hosts
+            .iter()
+            .flat_map(|host| {
+                host.draining_lanes
+                    .iter()
+                    .map(|lane| (host.host.to_lowercase(), lane.to_lowercase()))
+            })
+            .filter(|(host, lane)| {
+                self.lanes
+                    .iter()
+                    .any(|current| current == &(host.clone(), lane.clone()))
+            })
+            .collect::<Vec<_>>();
+        if open_drains.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(url) = self.config.prometheus_url.as_deref() else {
+            return Err(Unread::Failed(SourceError(
+                "prometheus_url_unconfigured_for_drain_evidence".to_owned(),
+            )));
+        };
+        let query = live::PromHttp::new(url, self.timeout)
+            .map_err(|error| Unread::Failed(SourceError(error.to_string())))?;
+        let mut completed = Vec::new();
+        for (host, lane) in open_drains {
+            let evidence = crate::fleet::saturation::live_drain_done(
+                &query,
+                &host,
+                &lane,
+                self.config.push_interval.as_secs(),
+                self.settings.drain_build_window.as_secs(),
+            );
+            match evidence.value {
+                Some(true) => completed.push(super::DrainDoneSample {
+                    host,
+                    lane,
+                    source_basis: format!(
+                        "ix_fleet_lane_state_ratio;increase(ix_fleet_lane_compile_seconds_total[{}s])",
+                        self.settings.drain_build_window.as_secs()
+                    ),
+                }),
+                Some(false) => {}
+                None => {
+                    return Err(Unread::Failed(SourceError(format!(
+                        "drain evidence unavailable for {host}/{lane}: {}",
+                        evidence.reason.unwrap_or_else(|| "unknown".to_owned())
+                    ))));
+                }
+            }
+        }
+        Ok(completed)
+    }
+
+    fn host_output_samples(&self, at_ms: i64) -> Vec<super::HostOutputSample> {
+        use crate::fleet::capacity::{LiveMeasurementSource, MeasurementSource, WindowRequest};
+        let prometheus = self
+            .config
+            .prometheus_url
+            .as_deref()
+            .and_then(|url| live::PromHttp::new(url, self.timeout).ok());
+        self.config
+            .hosts
+            .iter()
+            .map(|host| {
+                let source = LiveMeasurementSource {
+                    config: &self.config,
+                    prometheus: prometheus
+                        .as_ref()
+                        .map(|query| query as &dyn live::PromQuery),
+                };
+                let start_ms = at_ms.saturating_sub(3_600_000);
+                let request = WindowRequest {
+                    host: host.to_lowercase(),
+                    lanes: self.host_lane_counts.get(&host.to_lowercase()).copied().unwrap_or(0),
+                    start_ms,
+                    end_ms: at_ms,
+                    rampup_end_ms: start_ms,
+                };
+                let measured = source.measure(&request).ok();
+                let basis = measured.as_ref().map_or_else(
+                    || {
+                        serde_json::json!({
+                            "tickets_closed": {"availability":"unavailable", "reason":"measurement_failed"},
+                            "prs_merged": {"availability":"unavailable", "reason":"measurement_failed"},
+                            "commits_pushed": {"availability":"unavailable", "reason":"measurement_failed"}
+                        })
+                    },
+                    |measurement| {
+                        serde_json::json!({
+                            "tickets_closed": measurement.tickets_closed,
+                            "prs_merged": measurement.prs_merged,
+                            "commits_pushed": measurement.commits_pushed
+                        })
+                    },
+                );
+                super::HostOutputSample {
+                    host: host.to_lowercase(),
+                    at_ms,
+                    lanes: self.host_lane_counts.get(&host.to_lowercase()).copied(),
+                    tickets_closed: measured.as_ref().and_then(|m| m.tickets_closed.value),
+                    prs_merged: measured.as_ref().and_then(|m| m.prs_merged.value),
+                    commits_pushed: measured.as_ref().and_then(|m| m.commits_pushed.value),
+                    source_basis: basis.to_string(),
+                }
+            })
+            .collect()
+    }
+
+    fn overload_events(&self, at_ms: i64) -> Vec<super::OverloadEventSample> {
+        use crate::fleet::capacity::{LiveMeasurementSource, MeasurementSource, WindowRequest};
+        let prometheus = self
+            .config
+            .prometheus_url
+            .as_deref()
+            .and_then(|url| live::PromHttp::new(url, self.timeout).ok());
+        let window_secs = 300_i64;
+        let start_ms = at_ms.saturating_sub(window_secs * 1000);
+        let source = LiveMeasurementSource {
+            config: &self.config,
+            prometheus: prometheus
+                .as_ref()
+                .map(|query| query as &dyn live::PromQuery),
+        };
+        let mut events = Vec::new();
+        for host in &self.config.hosts {
+            let request = WindowRequest {
+                host: host.to_lowercase(),
+                lanes: self
+                    .host_lane_counts
+                    .get(&host.to_lowercase())
+                    .copied()
+                    .unwrap_or(0),
+                start_ms,
+                end_ms: at_ms,
+                rampup_end_ms: start_ms,
+            };
+            let Ok(measurement) = source.measure(&request) else {
+                continue;
+            };
+            if measurement
+                .memory_headroom_min
+                .value
+                .is_some_and(|headroom| headroom < 0.0)
+            {
+                events.push(super::OverloadEventSample {
+                    host: host.to_lowercase(),
+                    cause: "memory_below_reserve".to_owned(),
+                    source_basis: format!(
+                        "{};fleet.capacity_limits.{}.memory_reserve_bytes",
+                        measurement.memory_headroom_min.source,
+                        host.to_lowercase()
+                    ),
+                });
+            }
+            if measurement
+                .thermal_headroom_min
+                .value
+                .is_some_and(|headroom| headroom < 0.0)
+            {
+                events.push(super::OverloadEventSample {
+                    host: host.to_lowercase(),
+                    cause: "thermal_abort".to_owned(),
+                    source_basis: format!(
+                        "{};fleet.capacity_limits.{}.thermal_limit_celsius",
+                        measurement.thermal_headroom_min.source,
+                        host.to_lowercase()
+                    ),
+                });
+            }
+        }
+        events
     }
 }
 
@@ -144,7 +429,11 @@ pub fn run(file: Option<&toml::Value>, session: Option<&str>) -> Result<TickOutp
             .map_or_else(|| "no lane could be read".to_owned(), |d| d.reason.clone());
         return Err(FleetError::Tick(why));
     }
-    let facts = TickFacts::read(&live_sources(&report, config.host_timeout));
+    let facts = TickFacts::read(
+        &live_sources(&report, config.host_timeout, &config, &settings),
+        report.run_ms,
+        config.tick_interval.as_secs(),
+    );
     let orders = StandingOrders::load(settings.standing_orders_path.as_deref());
     let mut bus = connect(config.host_timeout).map_err(FleetError::Tick)?;
     let resolved;

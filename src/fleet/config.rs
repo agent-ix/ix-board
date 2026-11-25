@@ -20,7 +20,7 @@ const RELAY_OWNED: [&str; 6] = [
 ];
 /// Default orchestrator cycle, ten minutes (FR-039).
 const DEFAULT_CYCLE_SECS: u64 = 600;
-const KNOWN: [&str; 17] = [
+const KNOWN: [&str; 23] = [
     "team_keys",
     "focus_window_secs",
     "ledger_path",
@@ -38,6 +38,12 @@ const KNOWN: [&str; 17] = [
     "push_interval_secs",
     "host_timeout_secs",
     "capacity_limits",
+    "capacity_rampup_secs",
+    "capacity_window_min_secs",
+    "saturation_window_secs",
+    "min_duty_observation_secs",
+    "saturation_queue_depth",
+    "saturation_projects",
 ];
 
 /// Explicit per-host capacity limits. Values are never inferred from telemetry.
@@ -98,6 +104,18 @@ pub struct FleetConfig {
     pub focus_window: Duration,
     /// Explicit host build-slot, memory-reserve and thermal limits.
     pub capacity_limits: BTreeMap<String, HostCapacityLimits>,
+    /// Ramp-up duration after adding a lane (default 30 minutes).
+    pub capacity_rampup: Duration,
+    /// Minimum post-ramp-up measurement duration (default one hour).
+    pub capacity_window_min: Duration,
+    /// Trailing window for fleet saturation duty evidence.
+    pub saturation_window: Duration,
+    /// Minimum watcher/compiler observation interval for a usable duty estimate.
+    pub min_duty_observation: Duration,
+    /// Ready-ticket target per needed lane.
+    pub saturation_queue_depth: u32,
+    /// Linear projects whose ready tickets feed fleet buffer demand.
+    pub saturation_projects: Vec<String>,
 }
 
 impl Default for FleetConfig {
@@ -120,6 +138,12 @@ impl Default for FleetConfig {
             team_keys: Vec::new(),
             focus_window: Duration::from_mins(10),
             capacity_limits: BTreeMap::new(),
+            capacity_rampup: Duration::from_secs(30 * 60),
+            capacity_window_min: Duration::from_secs(60 * 60),
+            saturation_window: Duration::from_secs(24 * 60 * 60),
+            min_duty_observation: Duration::from_secs(60 * 60),
+            saturation_queue_depth: 2,
+            saturation_projects: Vec::new(),
         }
     }
 }
@@ -200,6 +224,34 @@ impl FleetConfig {
             secs(table, "max_clock_skew_secs", &mut config.max_clock_skew)?;
             secs(table, "push_interval_secs", &mut config.push_interval)?;
             secs(table, "host_timeout_secs", &mut config.host_timeout)?;
+            secs(table, "capacity_rampup_secs", &mut config.capacity_rampup)?;
+            secs(
+                table,
+                "capacity_window_min_secs",
+                &mut config.capacity_window_min,
+            )?;
+            secs(
+                table,
+                "saturation_window_secs",
+                &mut config.saturation_window,
+            )?;
+            secs(
+                table,
+                "min_duty_observation_secs",
+                &mut config.min_duty_observation,
+            )?;
+            config.saturation_projects = strings(table, "saturation_projects")?;
+            if let Some(value) = table.get("saturation_queue_depth") {
+                config.saturation_queue_depth = value
+                    .as_integer()
+                    .and_then(|value| u32::try_from(value).ok())
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| {
+                        FleetError::Config(
+                            "saturation_queue_depth must be a positive whole number".to_owned(),
+                        )
+                    })?;
+            }
             secs(table, "ledger_lock_wait_secs", &mut config.ledger_lock_wait)?;
             secs(table, "tick_interval_secs", &mut config.tick_interval)?;
             secs(table, "cycle_interval_secs", &mut config.cycle_interval)?;

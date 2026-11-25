@@ -38,8 +38,8 @@ its condition persists. Kinds and rules:
 | `escalate_stuck` | lane is STUCK or LOOP | the lane's lead |
 | `resend_order` | the lane's order is STALE-ORDER | the lane |
 | `add_lane` | a host's fresh busy ratio is below its target busy ratio (per-host configuration, default 0.85), ready unassigned tickets exist and a lane slot is free. Busy ratio comes from `ix_fleet_host_busy_ratio{host}` in the bounded per-host FR-034 read. Missing, invalid, duplicate or stale readings create a host-scoped `prometheus.host_busy` defect and make only that host ineligible. Ready-work reading is owned by SWM-212. | the host |
-| `escalate_stale_pr` | a lane-owned pull request has had no head or review activity longer than `stale_pr_after` (configurable, default 3h). The pull-request activity reader is owned by SWM-282; until it lands the tick reports it as `unavailable` | the lane's lead |
-| `need_ready_tickets` | ready-buffer deficit greater than zero ([FR-041](./FR-041-fleet-saturation.md)). **Deferred to SWM-217**: the tick does not emit it yet | the owning planner project |
+| `escalate_stale_pr` | a lane-owned pull request has had no head or review activity longer than `stale_pr_after` (configurable, default 3h); the live reader maps relay assignment tickets to Linear PR links and queries GitHub `updated_at` | the lane's lead |
+| `need_ready_tickets` | ready-buffer deficit greater than zero ([FR-041](./FR-041-fleet-saturation.md)) | the owning planner project |
 | `act_on_undetermined` | a reachable lane, on a host that is not `UNREACHABLE`, has a lane-scoped evidence defect: `no_events`, or a `missing_lane`, `stale_source` or `unreadable_source` defect naming that lane. Carries the defect, the lane's remaining assigned ticket if any, and `treat_as: idle`. A relay message to a BLOCKED pane is pane input, so for a lane whose class is BLOCKED the action is addressed to the lane's lead instead, with reason `lane_blocked_route_to_lead` | the lane, or its lead when the lane is BLOCKED |
 | `ladder_rung` | a condition with a ladder persists past a rung time (below). Carries the parent action id, `rung` 1 to 3 and the recipient | the worker, the lane's lead or the orchestrator per rung |
 | `escalate_drain` | a lane marked draining ([FR-041](./FR-041-fleet-saturation.md)) is still draining after the drain cap (configurable, default 4h) | the lane's lead |
@@ -89,7 +89,7 @@ no tick record.
 
 | ID | Criteria | Verification |
 |----|----------|--------------|
-| FR-038-AC-1 | Each action kind except the deferred `need_ready_tickets` is emitted by its fixture condition and not by its negation, with boundaries at exactly `stale_pr_after` and the busy-ratio target (the order deadline is the relay's: the tick acts on the relay's `AckExpired`). | Test |
+| FR-038-AC-1 | Each action kind is emitted by its fixture condition and not by its negation, with boundaries at exactly `stale_pr_after` and the busy-ratio target (the order deadline is the relay's: the tick acts on the relay's `AckExpired`). | Test |
 | FR-038-AC-2 | Identical inputs give byte-identical action lists in the specified order, and ids persist across two ticks while the condition persists. | Test |
 | FR-038-AC-3 | `answer_dialog` is emitted only with a matching SWM-226 standing order; no match, a missing file and an unreadable file each emit `escalate_block` and no `answer_dialog`. | Test |
 | FR-038-AC-4 | BLOCKED login, usage_limit and question emit `escalate_block` targeted at the lane's lead with severity high; STUCK and LOOP emit `escalate_stuck`. | Test |
@@ -112,6 +112,7 @@ no tick record.
 | FR-038-AC-21 | `act_on_undetermined` for a BLOCKED lane is addressed to the lane's lead and never to the lane; for any other class it is addressed to the lane. | Test |
 | FR-038-AC-22 | A failed read of a source the tick reads itself is a source defect in its own tick (`complete` false, one `fix_source` to the orchestrator, closed when the read works again), and a source with no reader yet raises no defect. | Test |
 | FR-038-AC-23 | The tick reuses bounded status host-series reads for busy ratios; missing, invalid, duplicate or older-than-two-push-interval ratios produce a defect for that host and do not discard another host's valid ratio or status evidence. | Test |
+| FR-038-AC-24 | A positive ready-buffer deficit emits one `need_ready_tickets` action per owning planner project and writes its requested ticket count, project, `emitted_at` and eventual `resolved_at` to the action ledger row; the action is resolved only when that project's deficit clears. | Test |
 
 ## Dependencies
 

@@ -500,13 +500,13 @@ Options:
       --session <SESSION>  Address of the session running the tick, recorded with it
 ```
 
-`fleet tick --json` reads `fleet status` internally and prints a deterministic, ordered action list (FR-038): `push_next_ticket`, `answer_dialog`, `escalate_block`, `escalate_stuck`, `resend_order`, `add_lane`, `escalate_stale_pr`, `act_on_undetermined`, `ladder_rung`, `escalate_drain`, `fix_source`, `route_dead_lane` and `route_idle_lane`, each with `id`, `target`, `reason`, `severity`, `due_by`, `condition_started_at`, evidence and kind-specific `detail`, sorted by severity, subject and kind. An action id stays the same while its condition persists. Each tick commits one `tick` row, one `lane_tick` row per lane (source `tick`) and the `action` rows to the ledger; it makes no relay, Linear or GitHub write. A tick that cannot evaluate (the relay cannot be read) prints an error, exits 4 and commits nothing; a tick with source defects exits 1 after printing the list.
+`fleet tick --json` reads `fleet status` internally and prints a deterministic, ordered action list (FR-038): `push_next_ticket`, `answer_dialog`, `escalate_block`, `escalate_stuck`, `resend_order`, `add_lane`, `escalate_stale_pr`, `act_on_undetermined`, `ladder_rung`, `escalate_drain`, `fix_source`, `route_dead_lane`, `route_idle_lane` and `need_ready_tickets`, each with `id`, `target`, `reason`, `severity`, `due_by`, `condition_started_at`, evidence and kind-specific `detail`, sorted by severity, subject and kind. An action id stays the same while its condition persists. Each tick commits one `tick` row, one `lane_tick` row per lane (source `tick`) and the `action` rows to the ledger; it makes no relay, Linear or GitHub write. A tick that cannot evaluate (the relay cannot be read) prints an error, exits 4 and commits nothing; a tick with source defects exits 1 after printing the list.
 
 The in-fleet ladder: a condition's own action is rung 0, sent in the tick that first emits it. While it persists the tick emits `ladder_rung` actions to the worker (rung 1), the lane's lead (rung 2) and the orchestrator (rung 3) in the first tick at or after 1, 2 and 3 tick intervals. A lane in BLOCKED never gets rung 1. A lane with no configured lead makes the orchestrator the owner (reason `lead_unresolved`) and rung 3 goes out with rung 2's time. The tick never addresses the owner.
 
-Settings come from the `[fleet_tick]` table: `stale_pr_after_secs` (default 3h), `drain_cap_secs` (4h), `orchestrator`, `minder`, `standing_orders_path`, `default_busy_target` (0.85), and the tables `leads` (lane to lead address), `busy_targets` and `lane_capacity` (host to value). `tick_interval_secs` stays under `[fleet]`.
+Settings come from the `[fleet_tick]` table: `stale_pr_after_secs` (default 3h), `drain_cap_secs` (4h), `drain_build_window_secs` (default 5m), `orchestrator`, `minder`, `standing_orders_path`, `default_busy_target` (0.85), and the tables `leads` (lane to lead address), `busy_targets`, `lane_capacity` and `planners` (project identifier to planner address). `tick_interval_secs` stays under `[fleet]`.
 
-Sources: the FR-072 assignment lists are read through relay-core; a list that fails to read is a source defect (`tick.assignments`) routed as `fix_source` in the same tick. Host busy ratio comes from `ix_fleet_host_busy_ratio{host}` in the same bounded per-host watcher read used by `fleet status`. A missing, invalid, duplicate or older-than-two-push-interval ratio creates a host-scoped `prometheus.host_busy` defect and disables only that host; the tick does not reread Prometheus for ratios. Ready unassigned work (SWM-212) remains a named seam, so live `add_lane` still waits for its `ready_work()` reader; SWM-281 does not start SWM-212. Lane pull-request activity (SWM-282) remains a named seam until its reader lands. `need_ready_tickets` is deferred to SWM-217. A source defect becomes `fix_source` in the tick in which it first appears. `act_on_undetermined` goes to the lead, not the lane, when the lane is BLOCKED. A DEAD lane and an IDLE lane with an empty FR-072 list emit `route_dead_lane` and `route_idle_lane` to the orchestrator. Without `--session` the caller is resolved through the relay from `HERDR_PANE_ID` and this machine's registration. Each tick first completes the pending `fleet assign` rows, the same step `fleet status` takes, and sets `executed_at` of a `push_next_ticket` when the lane works with its derived focus on the pushed ticket. A defect belongs to the run that reads its source: `fleet status` never closes the `tick.*` defects a tick raises. `answer_dialog` depends on the SWM-226 standing-order file: its machine-readable format is not specified, so a readable file lets the tick emit `answer_dialog` for a BLOCKED(dialog) or a `queued_question` with the relay reason and no order id, and a missing or unreadable file emits `escalate_block`. The exporter (`ix-team-exporter`) serves `ix_fleet_tick_timestamp_seconds` and `ix_fleet_tick_actions{kind}` from the last committed tick when its configuration sets `fleet_ledger`, and omits them when that tick is older than twice `fleet_tick_interval_seconds`.
+Sources: the FR-072 assignment lists are read through relay-core; a list that fails to read is a source defect (`tick.assignments`) routed as `fix_source` in the same tick. Host busy ratio comes from `ix_fleet_host_busy_ratio{host}` in the same bounded per-host watcher read used by `fleet status`. A missing, invalid, duplicate or older-than-two-push-interval ratio creates a host-scoped `prometheus.host_busy` defect and disables only that host; the tick does not reread Prometheus for ratios. Ready unassigned work (SWM-212) remains a named seam, so live `add_lane` still waits for its `ready_work()` reader; SWM-281 does not start SWM-212. Lane pull-request activity (SWM-282) remains a named seam until its reader lands. `need_ready_tickets` reads live saturation and writes one action row per owning planner project, including `project`, `requested_count`, and the existing `emitted_at` / `resolved_at` relay timestamps. A source defect becomes `fix_source` in the tick in which it first appears. `act_on_undetermined` goes to the lead, not the lane, when the lane is BLOCKED. A DEAD lane and an IDLE lane with an empty FR-072 list emit `route_dead_lane` and `route_idle_lane` to the orchestrator. Without `--session` the caller is resolved through the relay from `HERDR_PANE_ID` and this machine's registration. Each tick first completes the pending `fleet assign` rows, the same step `fleet status` takes, and sets `executed_at` of a `push_next_ticket` when the lane works with its derived focus on the pushed ticket. A defect belongs to the run that reads its source: `fleet status` never closes the `tick.*` defects a tick raises. `answer_dialog` depends on the SWM-226 standing-order file: its machine-readable format is not specified, so a readable file lets the tick emit `answer_dialog` for a BLOCKED(dialog) or a `queued_question` with the relay reason and no order id, and a missing or unreadable file emits `escalate_block`. The exporter (`ix-team-exporter`) serves `ix_fleet_tick_timestamp_seconds` and `ix_fleet_tick_actions{kind}` from the last committed tick when its configuration sets `fleet_ledger`, and omits them when that tick is older than twice `fleet_tick_interval_seconds`.
 
 ## ix-board fleet assign
 
@@ -552,9 +552,29 @@ Options:
 
 `fleet status` appends each run to a schema-versioned SQLite ledger (FR-039): a run record, one `lane_tick` row per lane (class, reason, evidence, relay time of the run), per-host lane counts, and the defects with their first-seen and close times. `fleet ledger query` reads it without writing, locking or migrating. Queryable views: `idle_minutes` (lane, host, day, minutes per non-WORKING class and minutes while ready work existed), `idle_lane_with_ready_work_ticks`, `lanes_with_ready_work`, `idle_lane_episodes_with_ready_work`, `idle_lane_episode_with_ready_work_max` and `defect_rows`. `--json` prints `{"view", "since_ms", "rows"}`; text prints one `column=value` line per row. `--since` is measured back from the newest run on the relay clock, never the local clock, and views without a time column (`idle_lane_episode_with_ready_work_max`) refuse it. Ready-work columns stay empty until `fleet tick` writes them. All stored times are relay server time; a run whose relay could not be read stores the host clock in `host_ms` with `relay_unavailable`, writes no lane rows, closes no defects and prunes nothing.
 
-The ledger lives at `IX_BOARD_LEDGER_PATH`, else `[fleet] ledger_path`, else `$XDG_STATE_HOME/ix-board/fleet-ledger.sqlite3` (`~/.local/state/ix-board/fleet-ledger.sqlite3`). A path inside a git work tree, or on a network filesystem (NFS, SMB/CIFS, 9p, a WSL `/mnt/<drive>` path, a Windows UNC share), is refused. Writers take an exclusive lock on `<ledger>.lock` and wait up to `ledger_lock_wait_secs`; on Windows a lock file whose process has exited is broken. A ledger of a newer schema version is refused without a change; version 1 through 3 ledgers migrate additively to the current version in a transaction. `[fleet]` ledger keys: `ledger_path`, `ledger_retention_days` (default 30; closed and point-in-time rows older than this are pruned, open rows never), `ledger_lock_wait_secs` (default 10), `tick_interval_secs` (default 300), `cycle_interval_secs` (default 600) and `grace_secs` (default cycle plus tick). The tick and cycle intervals and grace are stored on each run, so a changed value applies to later runs only.
+The ledger lives at `IX_BOARD_LEDGER_PATH`, else `[fleet] ledger_path`, else `$XDG_STATE_HOME/ix-board/fleet-ledger.sqlite3` (`~/.local/state/ix-board/fleet-ledger.sqlite3`). A path inside a git work tree, or on a network filesystem (NFS, SMB/CIFS, 9p, a WSL `/mnt/<drive>` path, a Windows UNC share), is refused. Writers take an exclusive lock on `<ledger>.lock` and wait up to `ledger_lock_wait_secs`; on Windows a lock file whose process has exited is broken. A ledger of a newer schema version is refused without a change; version 1 through 5 ledgers migrate additively to the current version in a transaction. `[fleet]` ledger keys: `ledger_path`, `ledger_retention_days` (default 30; closed and point-in-time rows older than this are pruned, open rows never), `ledger_lock_wait_secs` (default 10), `tick_interval_secs` (default 300), `cycle_interval_secs` (default 600) and `grace_secs` (default cycle plus tick). The tick and cycle intervals and grace are stored on each run, so a changed value applies to later runs only.
 
 When the ledger cannot be opened or written, `fleet status` still prints the report and adds one `ledger_unwritable` defect carrying the reason (exit 1, or 4 when no row was produced). An unknown view, a missing ledger or `--since` on an untimed view exits 3.
+
+## ix-board fleet saturation
+
+```text
+Compute build-slot demand and the ready-ticket buffer from live fleet sources
+
+Usage: ix-board fleet saturation [OPTIONS]
+
+Options:
+      --json  Emit machine-readable JSON on stdout instead of human-readable text
+```
+
+Configure `[fleet].saturation_projects` with the Linear projects counted toward the
+ready buffer, `[fleet.capacity_limits.<host>].build_slots` with the interim sustainable
+build-slot supply, and `[fleet_tick.planners]` with the owning planner session for each
+project. `server-capacity.max_agents` supplies lane capacity only. Duty uses the relay
+watcher compiler counter and lane-presence samples over the configured window; incomplete
+coverage is unavailable with a reason. A positive project deficit emits a `need_ready_tickets`
+tick action and stores `project`, `requested_count`, `emitted_at` and `resolved_at` in the
+action ledger row.
 
 ## ix-board fleet capacity
 
@@ -567,7 +587,10 @@ Commands:
   status  Print host state, discovery runs, measured steps and sustainable-level history
   start   Open a host discovery run
   step    Record a held lane count and its ramp-up boundary
+  window  Measure and persist the open hold from live Prometheus, Linear and GitHub sources
   end     Close a discovery run and record a supported level
+  drain   Mark a lane draining and lower the six-hour lane ceiling
+  remove  Record an orchestrator-directed lane removal
 ```
 
 Every timestamp argument is relay-clock milliseconds. `step` records the hold and ramp-up
@@ -576,10 +599,14 @@ provide a `MeasurementSource` to `measure_open_step`, which receives the persist
 count and post-ramp-up window and returns each field with value, source, availability, coverage,
 observation time and an unavailable reason. Status JSON groups `hosts`, `runs`, `steps`, `levels`,
 `events` and `open_windows`; each step and lane-output field includes its `source_basis` object.
-Fields with under 90% coverage serialize as `null` with an explanation, never as zero. The
-textfile exporter reads the same ledger and emits `ix_fleet_capacity_recorded_level` (only when a
-level exists), `ix_fleet_capacity_recorded_level_timestamp_seconds`, one-hot
-`ix_fleet_capacity_discovery_state{host,state}`, and `ix_fleet_capacity_draining_lanes`.
+`window <host> --end-ms <relay-ms>` reads Prometheus for build slots, queue wait, admission-blocked
+seconds, memory and host-specific temperature, and Linear/GitHub for lane output. It requires the
+configured minimum post-ramp-up window (one hour by default). Fields with under 90% coverage
+serialize as `null` with an explanation, never as zero. The textfile exporter reads the same ledger
+and emits `ix_fleet_capacity_recorded_level` (only when a level exists),
+`ix_fleet_capacity_recorded_level_timestamp_seconds`, one-hot
+`ix_fleet_capacity_discovery_state{host,state}`, `ix_fleet_capacity_draining_lanes` and the
+capacity throttle and overload series.
 
 ## ix-board drift
 

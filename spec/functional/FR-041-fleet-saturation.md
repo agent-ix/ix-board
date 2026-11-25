@@ -42,20 +42,24 @@ The command family `ix-board fleet capacity` SHALL also record capacity discover
   ([FR-034](./FR-034-fleet-lane-status.md)) contributes no slots and no lane capacity.
 - **Duty cycle** per lane: build seconds divided by observed lane seconds over a
   trailing window (default 24h). The final source is locked-build; the interim
-  source is the watcher's per-lane compiler-attribution seconds. A lane with less
-  than a configured minimum of observed time has duty `unavailable` and is
-  excluded from the mean.
+  source is `increase(ix_fleet_lane_compile_seconds_total{host,lane,job="ix-relay-watcher"}[window])`.
+  Observed lane seconds are `count_over_time(ix_fleet_lane_state_ratio{host,lane}[window])`
+  multiplied by the configured push interval, capped at the window length for each lane;
+  this is the documented watcher-presence basis because no observed-lane-seconds series exists.
+  Both series need at least 90% sample coverage. A lane with less than the configured minimum
+  of observed time has duty `unavailable` and is excluded from the mean.
 - **Capacity measurement sources and basis.** Every field in a discovery step and
   each per-lane output observation SHALL retain its source name, availability,
   reason, coverage and observation time. A field with less than 90% window
   coverage SHALL be serialized as `null` with its reason; it SHALL NOT be
-  replaced with zero. Interim supply and sustainable slots use relay
-  `server-capacity.max_agents`; the source basis is `server_capacity.max_agents`.
+  replaced with zero. Interim sustainable slots use the explicit
+  `fleet.capacity_limits.<host>.build_slots` value. Relay
+  `server-capacity.max_agents` is lane capacity only.
   SWM-242 supplies `ix_build_slots_busy`, `ix_build_slots_configured`,
   `ix_build_queue_wait_seconds`, `ix_build_admission_blocked_seconds_total`
   and `ix_build_builds_total{outcome}`. Queue-wait p90 is computed from the
   histogram buckets. `ix_build_slots_configured` is the configured slot count;
-  the interim server-capacity value remains the sustainable slot count.
+  interim `sustainable_slots` comes from `fleet.capacity_limits.<host>.build_slots`.
   Memory readings use node-exporter `node_memory_MemAvailable_bytes` and the
   explicit per-host memory reserve in `[fleet.capacity_limits.<host>]`;
   thermal readings use `node_thermal_temperature_celsius` and the explicit
@@ -76,7 +80,9 @@ The command family `ix-board fleet capacity` SHALL also record capacity discover
   `need_ready_tickets`; the action does not wait for the build scheduler.
 - A positive deficit becomes one action per owning planner project: shares follow
   each project's lane count, the remainder goes to the project with the smallest
-  buffer, ties by project id.
+  buffer, ties by project id. The tick writes the project and positive requested count
+  on the `action` row; its existing relay-time `emitted_at` and `resolved_at` record
+  when the deficit first appeared and when it cleared.
 
 ## Capacity discovery history
 
@@ -99,7 +105,7 @@ marks a lane draining; `remove <host> <lane>` records the lane's removal;
 through the ledger writer lock ([FR-039](./FR-039-fleet-ledger.md)); `start` is refused when the
 host already has an open run, when two runs of that host started the same UTC day, or when the host is within its cool-off.
 
-### Tables (ledger version 4)
+### Tables (ledger version 6)
 
 | Table | Columns |
 |-------|---------|
@@ -124,14 +130,14 @@ host already has an open run, when two runs of that host started the same UTC da
   over the previous valid step is below 50% of that previous step's output divided by its
   lane count (`knee_reason` `output_gain`), or `throttled_share` exceeds 5% (`throttle`). Both thresholds are configurable.
   Queue wait, busy and configured slots come from SWM-242 build series; interim
-  sustainable slots come from `server-capacity.max_agents`. Memory and thermal
+  sustainable slots come from `fleet.capacity_limits.<host>.build_slots`. Memory and thermal
   readings come from node-exporter/relay-watcher and are compared with explicit
   per-host limits. `slots_busy_equals_sustainable` is true only when busy and
   sustainable counts are both available and equal throughout the window.
 - **Run end.** `end` writes `found_level` and, for a run whose level was found on a valid step, a `capacity_level` row for the host with `evidence_steps` and the `output_basis` of that step; the previous level row gets `superseded_at`. History is never deleted. A run that ends with no new level (`found_level` empty, as with `inconclusive_no_demand` returning the host to its last validly measured level, or `throttled` with no valid step) writes no row and is not a run without a recorded level. `inconclusive_no_demand` is accepted only after two consecutive inconclusive steps; `step_bound` only after 8 steps.
 - **Lane changes are observed, not reported.** The tick writes a `lane_added`, `lane_removed` or `lane_lost` event whenever a host's non-draining lane count in `lane_tick` rises or falls between consecutive ticks. The event carries the reason of a `fleet capacity step`, `drain` or `remove` issued within one tick interval before the change, and `lane_change_unrecorded` when there is none, so a lane changed outside `fleet capacity` is visible. A removal that follows a `draining_mark` of the same lane inherits that mark's `reason` and `evidence_kind`. A lane that disappears without a `draining_mark` or `fleet capacity` command and whose class in the previous tick was `DEAD` or `UNREACHABLE`, or whose session ended (a crash, a session exit or a host loss), is written as `lane_lost`, not `lane_removed`: it is not a reduction the orchestrator caused, so it is excluded from `lane_count_reductions` and `lane_change_unrecorded`, and listed separately by `lanes_lost` so a crashing lane stays visible.
-- **Evidence is checked, not claimed.** `evidence_kind` is set by ix-board, never taken from the command: `admission_block` when `ix_build_admission_blocked_seconds_total` grew in the 15 minutes before the event, `build_abort` when `ix_build_builds_total` gained an outcome in the closed set `aborted_memory`, `aborted_thermal`, `aborted_rss_cap` or `aborted_pause_exceeded` in that period, `memory_below_reserve` when node-exporter `node_memory_MemAvailable_bytes` (or the configured host memory fallback) was below the configured per-host reserve, `thermal_abort` when the selected host temperature reached the configured per-host limit, `knee` when the host's latest valid `capacity_step` has `knee_signal`, `throttle_share` when admission-blocked share exceeded 5% over the trailing hour. A reduction with none of these has empty `evidence_kind` and is a violation.
-- **Step-down and cool-off.** `drain` with an overload reason writes a `draining_mark` event in the cycle of the overload and a `step_down` event whose `ceiling_until` is the cool-off end (default 6 hours). A `lane_added` event before `ceiling_until` that raises the lane count above the ceiling is a raise during cool-off. A `drain_done` event is written by the tick when the lane's current ticket has a commit or pull request and the scheduler shows no build for it; a `lane_removed` event before it is a removal before drain. `overload_event` rows are written by the tick from the scheduler and watcher series (memory below the profile reserve, a thermal build abort).
+- **Evidence is checked, not claimed.** `evidence_kind` is set by ix-board, never taken from the command: `admission_block` when `ix_build_admission_blocked_seconds_total` grew in the 15 minutes before the event, `build_abort` when `ix_build_builds_total` gained an outcome in the closed set `aborted_memory`, `aborted_thermal`, `aborted_rss_cap` or `aborted_pause_exceeded` in that period, `memory_below_reserve` when node-exporter `node_memory_MemAvailable_bytes` (or the configured host memory fallback) was below the configured per-host reserve, `knee` when the host's latest valid `capacity_step` has `knee_signal`, `throttle_share` when admission-blocked share exceeded 5% over the trailing hour. A temperature reading at the configured limit does not prove that a build was aborted; `thermal_abort` is corroborated by `aborted_thermal` in `ix_build_builds_total`. A reduction with none of these has empty `evidence_kind` and is a violation.
+- **Step-down and cool-off.** `drain` with an overload reason writes a `draining_mark` event in the cycle of the overload and a `step_down` event whose `ceiling_until` is the cool-off end (default 6 hours). A `lane_added` event before `ceiling_until` that raises the lane count above the ceiling is a raise during cool-off. A `drain_done` event is written by the tick only when the lane's watcher state is current and not `working` and `increase(ix_fleet_lane_compile_seconds_total{host,lane,job="ix-relay-watcher"}[W])` is zero; W defaults to five minutes and is configurable. Current watcher state with no compile series means no build. A missing lane series is recorded as `lane_lost`; stale watcher state stays unavailable. A `lane_removed` event before `drain_done` is a removal before drain. `overload_event` rows are written by the tick from memory and thermal limit breaches.
 - **Throttled share.** Until the dev-team FR-010 governor exists, throttled
   share is admission-blocked share only: the increase of
   `ix_build_admission_blocked_seconds_total` divided by the window length, with
@@ -139,7 +145,7 @@ host already has an open run, when two runs of that host started the same UTC da
   `ix_build_pause_seconds_total` is absent until that producer exists; ix-board
   never queries it or substitutes zero. The JSON `prom.host_throttled_share`
   field carries its basis and coverage.
-- **Host output samples.** Each tick writes one `host_output_sample` per host, with tickets closed, pull requests merged and commits pushed over the trailing hour, so a share can be computed on either basis.
+- **Host output samples.** Each tick writes one `host_output_sample` per host, with tickets closed, pull requests merged and commits pushed over the trailing hour, so a share can be computed on either basis. Lane-to-ticket mapping uses relay work events and ledger assignment records; pull requests and commits are attributed through GitHub ticket identifiers in title or branch. The source basis is retained; items without a ticket mapping are reported as unattributed, and no mapping makes the observation unavailable rather than zero.
 
 ### Prometheus series
 
@@ -203,7 +209,8 @@ watcher behavior.
 | FR-041-AC-9 | A host with a stale registry lease contributes zero slots and zero lane capacity to supply, and its UNREACHABLE lanes are excluded from demand and from the duty mean. | Test |
 | FR-041-AC-3 | A buffer at or above target gives deficit zero and no action; one below gives the exact shortfall. | Test |
 | FR-041-AC-4 | A mean duty of zero, no lane with duty, a missing capacity or a missing queue makes dependent values `unavailable` with reason, omits the gauge, and never reports deficit zero. | Test |
-| FR-041-AC-5 | With only interim supply (server-capacity) and watcher compiler seconds a positive deficit still yields `need_ready_tickets`; when locked-build data is present it replaces both interim sources. | Test |
+| FR-041-AC-5 | With interim supply from configured build slots and watcher compiler seconds a positive deficit still yields `need_ready_tickets`; `server-capacity.max_agents` supplies lane capacity only, and locked-build data replaces interim supply and duty when present. | Test |
+| FR-041-AC-24 | A positive deficit yields one planner action with `project` and the requested additional ticket count persisted on its action row; the row's `emitted_at` is the first deficient tick and `resolved_at` is set only when the project deficit clears. | Test |
 | FR-041-AC-6 | A deficit of N produces per-project actions whose counts sum to N, deterministically. | Test |
 | FR-041-AC-7 | `ix_fleet_ready_buffer_deficit` has bounded labels, matches the command output, and each run stores a `saturation_sample` ledger row. | Test |
 | FR-041-AC-10 | `fleet capacity window` on a fixture computes host output as tickets closed plus pull requests merged per hour over the post-ramp-up window with per-lane attribution by focus and branch in `capacity_step_lane_output`, and uses commits per hour with `output_basis` `commits` when the sum is under 5. | Test |
@@ -223,6 +230,6 @@ watcher behavior.
 
 ## Dependencies
 
-- Final supply and duty: locked-build scheduler (W6). Interim: `agent-msg server-capacity` slots and the ix-relay watcher per-lane compiler seconds (ix-relay PR #52, target contract). Lane build evidence also uses [FR-034](./FR-034-fleet-lane-status.md).
-- Capacity discovery reads `ix_build_queue_wait_seconds`, `ix_build_slots_busy`, `ix_build_slots_configured`, `ix_build_admission_blocked_seconds_total` and `ix_build_builds_total{outcome}` from dev-team FR-010/FR-015; interim sustainable slots from relay server-capacity; memory and thermal readings and explicit per-host limits as described above; Linear/GitHub for host output; [FR-037](./FR-037-fleet-focus-and-drift.md) focus for per-lane attribution; and the [FR-039](./FR-039-fleet-ledger.md) ledger. `fleet tick` ([FR-038](./FR-038-fleet-tick.md)) writes `drain_done`, `overload_event`, `lane_added`, `lane_removed` and `host_output_sample`. These producers are enablement owned by their respective projects; this requirement adds none.
+- Final supply and duty: locked-build scheduler (W6). Interim supply: explicit per-host `fleet.capacity_limits.<host>.build_slots`; interim duty: the ix-relay watcher per-lane compiler seconds (ix-relay PR #52, target contract). `server-capacity.max_agents` is lane capacity only. Lane build evidence also uses [FR-034](./FR-034-fleet-lane-status.md).
+- Capacity discovery reads `ix_build_queue_wait_seconds`, `ix_build_slots_busy`, `ix_build_slots_configured`, `ix_build_admission_blocked_seconds_total` and `ix_build_builds_total{outcome}` from dev-team FR-010/FR-015; interim sustainable slots from explicit per-host configuration; memory and thermal readings and explicit per-host limits as described above; Linear/GitHub for host output; [FR-037](./FR-037-fleet-focus-and-drift.md) focus for per-lane attribution; and the [FR-039](./FR-039-fleet-ledger.md) ledger. `fleet tick` ([FR-038](./FR-038-fleet-tick.md)) writes `drain_done`, `overload_event`, `lane_added`, `lane_removed` and `host_output_sample`. These producers are enablement owned by their respective projects; this requirement adds none.
 - `ix_build_builds_total{outcome}` uses the closed outcome set `ok`, `failed`, `cancelled`, `timed_out`, `aborted_memory`, `aborted_thermal`, `aborted_rss_cap` and `aborted_pause_exceeded` from dev-team FR-015. FR-010 termination reason values already include the `aborted_` prefix; producers and consumers use each value once, without adding a second prefix.

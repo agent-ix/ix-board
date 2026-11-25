@@ -7,6 +7,7 @@ use crate::fleet::capacity::{
     WindowRequest,
 };
 use rusqlite::Connection;
+use std::collections::BTreeMap;
 
 const START: i64 = 1_000_000;
 
@@ -20,13 +21,33 @@ fn value<T>(value: T, source: &str, at_ms: i64) -> Observation<T> {
     Observation::available(value, source, at_ms)
 }
 
+fn capacity_config() -> FleetConfig {
+    let mut config = FleetConfig {
+        hosts: vec!["draco".to_owned()],
+        ..FleetConfig::default()
+    };
+    config.capacity_limits.insert(
+        "draco".to_owned(),
+        crate::fleet::config::HostCapacityLimits {
+            build_slots: Some(2),
+            memory_reserve_bytes: Some(1024),
+            thermal_limit_celsius: Some(85.0),
+        },
+    );
+    config
+}
+
 fn sample(request: &WindowRequest) -> WindowMeasurements {
     let at = request.end_ms;
     let output_basis = value("tickets_prs".to_owned(), "ix-board.capacity", at);
     WindowMeasurements {
         lanes: value(request.lanes, "ledger.capacity_window", at),
-        build_slots_busy: value(2, "node_exporter:ix_build_slots_busy", at),
-        build_slots_sustainable: value(2, "server_capacity.max_agents", at),
+        build_slots_busy: value(2, "prometheus.ix_build_slots_busy", at),
+        build_slots_sustainable: value(
+            2,
+            "ix_board_config:fleet.capacity_limits.draco.build_slots",
+            at,
+        ),
         window_start_ms: request.start_ms,
         window_end_ms: request.end_ms,
         rampup_end_ms: request.rampup_end_ms,
@@ -86,15 +107,17 @@ impl MeasurementSource for BrokenSource {
 #[test]
 fn run_window_and_level_round_trip_with_each_field_basis() {
     let (_dir, path) = path();
-    let config = FleetConfig::default();
+    let config = capacity_config();
     let run_id = start(&path, &config, "draco", "first", START).unwrap();
-    let window = open_step(&path, &config, run_id, 2, None, START, START + 1_000).unwrap();
+    let rampup_end = START + i64::try_from(config.capacity_rampup.as_millis()).unwrap();
+    let window = open_step(&path, &config, run_id, 2, None, START, rampup_end).unwrap();
     assert_eq!(window.step_no, 1);
     assert_eq!(status(&path).unwrap().open_windows, vec![window.clone()]);
 
     {
         let ledger = Ledger::open(&path, &config).unwrap();
-        for at in [START + 1_000, START + 301_000, START + 601_000] {
+        for tick in 1..=12 {
+            let at = rampup_end + i64::from(tick) * 300_000;
             ledger
                 .connection
                 .execute(
@@ -104,14 +127,14 @@ fn run_window_and_level_round_trip_with_each_field_basis() {
                 .unwrap();
         }
     }
-    measure_open_step(&path, &config, run_id, START + 601_000, &Source).unwrap();
+    measure_open_step(&path, &config, run_id, rampup_end + 3_600_000, &Source).unwrap();
     assert_eq!(
         end(
             &path,
             &config,
             "draco",
             "build_slots_saturated",
-            START + 602_000
+            rampup_end + 3_601_000
         )
         .unwrap(),
         Some(2)
@@ -124,7 +147,7 @@ fn run_window_and_level_round_trip_with_each_field_basis() {
     assert_eq!(history.steps[0].host_output_per_hour, Some(30.0));
     assert_eq!(
         history.steps[0].source_basis["build_slots_sustainable"].source,
-        "server_capacity.max_agents"
+        "ix_board_config:fleet.capacity_limits.draco.build_slots"
     );
     assert_eq!(
         history.steps[0].source_basis["throttled_share"].source,
@@ -141,11 +164,87 @@ fn run_window_and_level_round_trip_with_each_field_basis() {
     assert!(
         exposition.contains("ix_fleet_capacity_discovery_state{host=\"draco\",state=\"ended\"} 1")
     );
+    record_saturation_samples(
+        &path,
+        &config,
+        rampup_end + 3_602_000,
+        &[SaturationSampleInput {
+            host: "draco",
+            deficit: Some(2),
+        }],
+    )
+    .unwrap();
+    assert!(
+        metrics(&path)
+            .unwrap()
+            .contains("ix_fleet_ready_buffer_deficit{host=\"draco\"} 2")
+    );
     let json = serde_json::to_value(history).unwrap();
     assert_eq!(
         json["steps"][0]["source_basis"]["memory_headroom_min"]["availability"],
         "available"
     );
+}
+
+#[test]
+fn unavailable_saturation_deficit_is_not_exported_as_zero() {
+    let (_dir, path) = path();
+    let config = capacity_config();
+    record_saturation_samples(
+        &path,
+        &config,
+        START,
+        &[SaturationSampleInput {
+            host: "draco",
+            deficit: None,
+        }],
+    )
+    .unwrap();
+    assert!(
+        !metrics(&path)
+            .unwrap()
+            .contains("ix_fleet_ready_buffer_deficit{host=\"draco\"}")
+    );
+}
+
+#[test]
+fn throttled_export_requires_twelve_covered_admission_samples() {
+    let (_dir, path) = path();
+    let config = capacity_config();
+    let now = 10_000_000_i64;
+    drop(Ledger::open(&path, &config).unwrap());
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO capacity_level(host,level,output_basis,recorded_at,reason,evidence_steps)
+             VALUES('draco',2,'tickets_prs',?1,'step_bound','[]')",
+            [now - 4_000_000],
+        )
+        .unwrap();
+    for index in 0..12_i64 {
+        connection
+            .execute(
+                "INSERT INTO capacity_throttle_sample(host,at,interval_s,throttled_share,
+                   coverage,source_basis) VALUES('draco',?1,300,0.06,0.95,'admission_only')",
+                [now - 3_300_000 + index * 300_000],
+            )
+            .unwrap();
+    }
+    drop(connection);
+
+    let exposition = metrics_at(&path, now).unwrap();
+    assert!(exposition.contains("ix_fleet_capacity_throttled_at_level{host=\"draco\"} 1"));
+    assert!(exposition.contains("ix_fleet_capacity_throttled_without_step_down{host=\"draco\"} 1"));
+
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE capacity_throttle_sample SET throttled_share=NULL WHERE at=?1",
+            [now - 3_300_000],
+        )
+        .unwrap();
+    let exposition = metrics_at(&path, now).unwrap();
+    assert!(!exposition.contains("ix_fleet_capacity_throttled_at_level{host=\"draco\"}"));
 }
 
 #[test]
@@ -165,11 +264,18 @@ fn incomplete_observation_is_null_with_its_source_and_reason() {
 #[test]
 fn a_failed_measurement_keeps_the_open_hold_for_retry() {
     let (_dir, path) = path();
-    let config = FleetConfig::default();
+    let config = capacity_config();
     let run_id = start(&path, &config, "draco", "first", START).unwrap();
-    let expected = open_step(&path, &config, run_id, 1, None, START, START + 1_000).unwrap();
-    let error =
-        measure_open_step(&path, &config, run_id, START + 601_000, &BrokenSource).unwrap_err();
+    let rampup_end = START + i64::try_from(config.capacity_rampup.as_millis()).unwrap();
+    let expected = open_step(&path, &config, run_id, 1, None, START, rampup_end).unwrap();
+    let error = measure_open_step(
+        &path,
+        &config,
+        run_id,
+        rampup_end + 3_601_000,
+        &BrokenSource,
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("scrape timeout"));
     assert_eq!(status(&path).unwrap().open_windows, vec![expected]);
     assert!(status(&path).unwrap().steps.is_empty());
@@ -178,7 +284,7 @@ fn a_failed_measurement_keeps_the_open_hold_for_retry() {
 #[test]
 fn capacity_events_keep_verified_evidence() {
     let (_dir, path) = path();
-    let config = FleetConfig::default();
+    let config = capacity_config();
     record_event(
         &path,
         &config,
@@ -196,9 +302,9 @@ fn capacity_events_keep_verified_evidence() {
     .unwrap();
     let event = &status(&path).unwrap().events[0];
     assert_eq!(event.kind, "draining_mark");
-    assert_eq!(event.evidence_kind.as_deref(), Some("thermal_abort"));
+    assert_eq!(event.evidence_kind, None);
     assert_eq!(event.ceiling_until, Some(START + 21_600_000));
-    let rejected = record_event(
+    record_event(
         &path,
         &config,
         &CapacityEventInput {
@@ -211,23 +317,38 @@ fn capacity_events_keep_verified_evidence() {
             at_ms: START + 1,
             ceiling_until: None,
         },
-    );
-    assert!(rejected.is_err());
+    )
+    .unwrap();
+    assert_eq!(status(&path).unwrap().events[0].evidence_kind, None);
 }
 
 #[test]
 fn version_three_ledger_migrates_additively_to_resumable_windows() {
     let (_dir, path) = path();
-    let config = FleetConfig::default();
+    let config = capacity_config();
     drop(Ledger::open(&path, &config).unwrap());
     {
         let connection = Connection::open(&path).unwrap();
+        for statement in crate::fleet::ledger::schema::CAPACITY_VIEWS {
+            let view = statement.split_whitespace().nth(2).unwrap();
+            connection
+                .execute_batch(&format!("DROP VIEW {view}"))
+                .unwrap();
+        }
         connection
             .execute_batch(
-                "DROP TABLE capacity_window;
-             DROP INDEX capacity_step_run_step;
-             DROP INDEX capacity_step_lane_output_run_step_lane;
-             PRAGMA user_version=3;",
+                "ALTER TABLE capacity_step DROP COLUMN build_slots_busy;
+             ALTER TABLE capacity_step DROP COLUMN build_slots_sustainable;
+             ALTER TABLE capacity_step DROP COLUMN measurement_values;
+             ALTER TABLE action DROP COLUMN project;
+             ALTER TABLE action DROP COLUMN requested_count;
+             DROP TABLE capacity_throttle_sample;
+             ALTER TABLE capacity_event DROP COLUMN source_basis;
+             ALTER TABLE host_output_sample DROP COLUMN source_basis;
+             CREATE UNIQUE INDEX capacity_step_run_step ON capacity_step(run_id,step_no);
+             CREATE UNIQUE INDEX capacity_step_lane_output_run_step_lane
+               ON capacity_step_lane_output(run_id,step_no,lane);
+             PRAGMA user_version=4;",
             )
             .unwrap();
     }
@@ -246,5 +367,29 @@ fn version_three_ledger_migrates_additively_to_resumable_windows() {
             )
             .unwrap(),
         1
+    );
+}
+
+#[test]
+fn marking_a_lane_draining_writes_step_down_ceiling_atomically() {
+    let (_dir, path) = path();
+    let config = capacity_config();
+    mark_draining(
+        &path,
+        &config,
+        "draco",
+        "draco:workspace:a",
+        "memory_below_reserve",
+        START,
+    )
+    .unwrap();
+    let status = status(&path).unwrap();
+    assert_eq!(status.events.len(), 2);
+    assert_eq!(status.events[0].kind, "step_down");
+    assert_eq!(status.events[1].kind, "draining_mark");
+    assert_eq!(status.events[0].ceiling_until, Some(START + 21_600_000));
+    assert_eq!(
+        status.events[1].reason.as_deref(),
+        Some("memory_below_reserve")
     );
 }
