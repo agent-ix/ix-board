@@ -1379,6 +1379,7 @@ pub fn linear_merged_prs_without_review_adapters(
 }
 
 /// Evaluates code-lead gate records against the append-only gate log.
+#[implements("FR-047-AC-6")]
 pub fn linear_gate_record_adapters(
     specs: &[RoleSpec],
     repositories: &[String],
@@ -1422,6 +1423,7 @@ pub fn linear_gate_record_adapters(
         .collect()
 }
 
+#[implements("FR-047-AC-6")]
 fn read_linear_gate_record_metrics(
     repositories: &[String],
     gate_log: Option<&Path>,
@@ -1521,6 +1523,7 @@ fn read_linear_gate_record_metrics(
     ]))
 }
 
+#[implements("FR-047-AC-6")]
 fn lead_record_fields(line: &str) -> Option<(&str, BTreeMap<&str, &str>)> {
     let inner = line
         .trim()
