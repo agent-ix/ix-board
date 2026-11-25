@@ -539,7 +539,7 @@ pub fn render(
                 s.effort_points
                     .iter()
                     .rev()
-                    .find(|p| p.0 <= now - 86400000 && p.0 >= now - 86700000),
+                    .find(|p| p.0 >= now - 86400000 && p.0 <= now - 86100000),
             )
             .and_then(|(closures, (_, execution, covered))| {
                 (closures > 0.0
@@ -554,7 +554,7 @@ pub fn render(
             .effort_points
             .iter()
             .rev()
-            .find(|p| p.0 <= now - 86400000 && p.0 >= now - 86700000)
+            .find(|p| p.0 >= now - 86400000 && p.0 <= now - 86100000)
             .map(|(_, _, covered)| ((s.covered_seconds - covered).max(0.0) / 86400.0).min(1.0))
             .unwrap_or(0.0);
         coverage(

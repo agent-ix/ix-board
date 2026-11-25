@@ -4,10 +4,12 @@ use super::github::SelectedGithub;
 use super::history::CommandHistory;
 use super::timeline::{ExecutionSample, Member};
 use super::{Config, Error, Event, History, Journal, ScopeState, State};
+use crate::fleet::live::{PromHttp, PromQuery};
 use crate::retro::sources::{AgentSource, GithubSource, LinearSource};
 use crate::{Issue, Project, ProjectStatusCategory, WorkflowStateType, WorkspaceSnapshot, retro};
 use ix_trace_rs::implements;
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 /// A completed tracker refresh, passed across a bounded worker channel.
 pub struct TrackerBatch {
@@ -158,14 +160,7 @@ impl Collector {
                         let complete = observation.expected > 0 && observation.coverage() >= 0.95;
                         scope.leads = observation.live.clone();
                         lead_population_complete &= complete;
-                        lead_observations.insert(
-                            scope.key(),
-                            (
-                                observation.expected,
-                                observation.observed,
-                                observation.not_running,
-                            ),
-                        );
+                        lead_observations.insert(scope.key(), observation);
                     }
                     Err(error) => {
                         lead_population_complete = false;
@@ -182,6 +177,47 @@ impl Collector {
                 }
             }
         }
+        let prometheus_status = read_prometheus_status(
+            &self
+                .config
+                .scopes
+                .iter()
+                .filter_map(|scope| scope.selectors.team.clone())
+                .collect(),
+        )
+        .map_err(|error| eprintln!("Prometheus pane/lane status: {error}"))
+        .ok();
+        let execution_observed_at = super::now_ms().unwrap_or(now);
+        for scope in &self.config.scopes {
+            let key = scope.key();
+            let observation = lead_observations.get(&key);
+            let expected = if scope.derive_leads_from_relay {
+                observation
+                    .map(|o| o.expected_addresses.as_slice())
+                    .unwrap_or(&[])
+            } else {
+                scope.leads.as_slice()
+            };
+            let no_pane = observation.map(|o| &o.no_pane).cloned().unwrap_or_default();
+            let state = self.state.scopes.get(&key);
+            let (observed, working) = classify_execution_leads(
+                expected,
+                &no_pane,
+                prometheus_status.as_ref(),
+                state,
+                &[],
+                execution_observed_at,
+            );
+            if let Some(state) = self.state.scopes.get_mut(&key) {
+                state.relay_leads_expected = expected.len();
+                state.relay_leads_observed = observation.map_or(0, |o| o.observed);
+                state.relay_leads_not_running = observation.map_or(0, |o| o.no_pane.len());
+                state.execution_observed_count = observed;
+                state.execution_working_count = working;
+                state.execution_observed_at_ms = execution_observed_at;
+            }
+        }
+        self.journal.checkpoint(&self.state, &[], now)?;
         self.state.quota_frontier = crate::default_cache_path()
             .ok()
             .and_then(|path| super::quota_frontier::read(&path, now).ok());
@@ -310,54 +346,6 @@ impl Collector {
             now,
             complete && self.state.history_ok,
         );
-        let execution_counts = self
-            .config
-            .scopes
-            .iter()
-            .map(|scope| {
-                let key = scope.key();
-                let not_running = lead_observations
-                    .get(&key)
-                    .map(|(_, _, not_running)| *not_running)
-                    .unwrap_or_default();
-                let observed_sessions: Vec<_> = scope
-                    .leads
-                    .iter()
-                    .filter_map(|lead| {
-                        self.state
-                            .scopes
-                            .get(&key)?
-                            .bindings
-                            .get(&lead.to_lowercase())
-                    })
-                    .filter_map(|binding| {
-                        samples.iter().find(|sample| {
-                            sample.machine == binding.machine && sample.session == binding.session
-                        })
-                    })
-                    .collect();
-                let observed = not_running + observed_sessions.len();
-                let working = observed_sessions
-                    .iter()
-                    .filter(|sample| sample.working)
-                    .count();
-                (key, observed, working)
-            })
-            .collect::<Vec<_>>();
-        for (key, (expected, observed, not_running)) in lead_observations {
-            if let Some(scope) = self.state.scopes.get_mut(&key) {
-                scope.relay_leads_expected = expected;
-                scope.relay_leads_observed = observed;
-                scope.relay_leads_not_running = not_running;
-            }
-        }
-        for (key, observed, working) in execution_counts {
-            if let Some(scope) = self.state.scopes.get_mut(&key) {
-                scope.execution_observed_count = observed;
-                scope.execution_working_count = working;
-                scope.execution_observed_at_ms = now;
-            }
-        }
         self.journal.checkpoint(&self.state, &[], now)?;
         history
     }
@@ -783,7 +771,8 @@ struct RelayDirectoryLead {
 struct LeadObservation {
     expected: usize,
     observed: usize,
-    not_running: usize,
+    expected_addresses: Vec<String>,
+    no_pane: BTreeSet<String>,
     live: Vec<String>,
 }
 impl LeadObservation {
@@ -849,7 +838,7 @@ fn observe_live_leads(team: &str, leads: &[String]) -> Result<LeadObservation, S
         by_host.entry(host).or_default().push(lead);
     }
     let mut observed = 0;
-    let mut not_running = 0;
+    let mut no_pane = BTreeSet::new();
     let mut live = Vec::new();
     for (host, addresses) in by_host {
         let (program, args): (&str, Vec<&str>) = if host.eq_ignore_ascii_case(local_host) {
@@ -889,9 +878,6 @@ fn observe_live_leads(team: &str, leads: &[String]) -> Result<LeadObservation, S
                 ))
             })
             .collect();
-        let team_workspace_present = workspace_labels
-            .values()
-            .any(|label| label.eq_ignore_ascii_case(team));
         let live_tabs: BTreeSet<_> = tabs
             .iter()
             .filter(|tab| {
@@ -914,9 +900,6 @@ fn observe_live_leads(team: &str, leads: &[String]) -> Result<LeadObservation, S
             if !workspace.eq_ignore_ascii_case(team) {
                 continue;
             }
-            if !team_workspace_present {
-                continue;
-            }
             observed += 1;
             if live_tabs
                 .iter()
@@ -924,7 +907,7 @@ fn observe_live_leads(team: &str, leads: &[String]) -> Result<LeadObservation, S
             {
                 live.push((*address).to_owned());
             } else {
-                not_running += 1;
+                no_pane.insert((*address).to_owned());
             }
         }
     }
@@ -932,9 +915,247 @@ fn observe_live_leads(team: &str, leads: &[String]) -> Result<LeadObservation, S
     Ok(LeadObservation {
         expected: leads.len(),
         observed,
-        not_running,
+        expected_addresses: leads.to_vec(),
+        no_pane,
         live,
     })
+}
+
+#[derive(Clone, Debug, Default)]
+struct PrometheusLeadStatus {
+    pane_info: Vec<PrometheusSample>,
+    pane_status: Vec<PrometheusSample>,
+    lane_status: Vec<PrometheusSample>,
+}
+
+#[derive(Clone, Debug)]
+struct PrometheusSample {
+    labels: BTreeMap<String, String>,
+    timestamp_seconds: f64,
+    value: f64,
+}
+
+fn read_prometheus_status(teams: &BTreeSet<String>) -> Result<PrometheusLeadStatus, String> {
+    let base = std::env::var("IX_PROMETHEUS_URL")
+        .unwrap_or_else(|_| "http://prometheus.luna.ix".to_owned());
+    let client = PromHttp::new(&base, Duration::from_secs(5)).map_err(|e| e.to_string())?;
+    let pane_info_query = "timestamp(herdr_pane_info_ratio)";
+    let lane_filter = teams
+        .iter()
+        .map(|team| format!(".*:{}:.*", regex_escape(team)))
+        .collect::<Vec<_>>()
+        .join("|");
+    let lane_query = format!("timestamp(ix_fleet_lane_state_ratio{{lane=~\"{lane_filter}\"}})");
+    Ok(PrometheusLeadStatus {
+        pane_info: parse_prometheus_samples(
+            &client.query(pane_info_query).map_err(|e| e.to_string())?,
+        )?,
+        pane_status: parse_prometheus_samples(
+            &client
+                .query("timestamp(herdr_pane_status_ratio)")
+                .map_err(|e| e.to_string())?,
+        )?,
+        lane_status: parse_prometheus_samples(
+            &client.query(&lane_query).map_err(|e| e.to_string())?,
+        )?,
+    })
+}
+
+fn regex_escape(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|ch| {
+            if ".+*?()|[]{}^$\\".contains(ch) {
+                vec!['\\', ch]
+            } else {
+                vec![ch]
+            }
+        })
+        .collect()
+}
+
+fn parse_prometheus_samples(body: &str) -> Result<Vec<PrometheusSample>, String> {
+    let value: serde_json::Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    if value.get("status").and_then(serde_json::Value::as_str) != Some("success") {
+        return Err("Prometheus query did not succeed".to_owned());
+    }
+    let rows = value
+        .pointer("/data/result")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "Prometheus response omitted result rows".to_owned())?;
+    rows.iter()
+        .map(|row| {
+            let labels = row
+                .get("metric")
+                .and_then(serde_json::Value::as_object)
+                .ok_or_else(|| "Prometheus row omitted labels".to_owned())?
+                .iter()
+                .map(|(key, value)| {
+                    value
+                        .as_str()
+                        .map(|value| (key.clone(), value.to_owned()))
+                        .ok_or_else(|| "Prometheus label was not a string".to_owned())
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()?;
+            let sample = row
+                .get("value")
+                .and_then(serde_json::Value::as_array)
+                .filter(|value| value.len() == 2)
+                .ok_or_else(|| "Prometheus row omitted instant value".to_owned())?;
+            let parse_number = |value: &serde_json::Value| {
+                value
+                    .as_f64()
+                    .or_else(|| value.as_str().and_then(|value| value.parse::<f64>().ok()))
+            };
+            let evaluation_seconds = parse_number(&sample[0])
+                .ok_or_else(|| "Prometheus row had invalid sample timestamp".to_owned())?;
+            let value = parse_number(&sample[1])
+                .ok_or_else(|| "Prometheus row had invalid sample value".to_owned())?;
+            if !evaluation_seconds.is_finite() || !value.is_finite() {
+                return Err("Prometheus row had non-finite sample".to_owned());
+            }
+            Ok(PrometheusSample {
+                labels,
+                timestamp_seconds: value,
+                value: 1.0,
+            })
+        })
+        .collect()
+}
+
+fn status_is_fresh(sample: &PrometheusSample, now_ms: i64) -> bool {
+    let Some(sample_ms) = (sample.timestamp_seconds * 1000.0)
+        .is_finite()
+        .then_some((sample.timestamp_seconds * 1000.0) as i64)
+    else {
+        return false;
+    };
+    let age = now_ms.saturating_sub(sample_ms);
+    (0..=90_000).contains(&age)
+}
+
+fn classify_execution_leads(
+    expected: &[String],
+    no_pane: &BTreeSet<String>,
+    prometheus: Option<&PrometheusLeadStatus>,
+    state: Option<&ScopeState>,
+    samples: &[ExecutionSample],
+    now_ms: i64,
+) -> (usize, usize) {
+    let mut observed = 0;
+    let mut working = 0;
+    for lead in expected {
+        let machine = lead.split(':').next().unwrap_or_default();
+        if no_pane.contains(lead)
+            && prometheus.is_some_and(|status| host_feed_is_fresh(machine, status, now_ms))
+        {
+            observed += 1;
+            continue;
+        }
+        if let Some((is_working, _)) = prometheus.and_then(|status| {
+            observed_pane_status(lead, status, now_ms)
+                .or_else(|| observed_lane_status(lead, status, now_ms))
+        }) {
+            observed += 1;
+            working += usize::from(is_working);
+            continue;
+        }
+        let binding = state.and_then(|scope| scope.bindings.get(&lead.to_lowercase()));
+        if let Some(sample) = binding.and_then(|binding| {
+            samples.iter().find(|sample| {
+                sample.machine == binding.machine
+                    && sample.session == binding.session
+                    && now_ms.saturating_sub(sample.at_ms).abs() <= 90_000
+            })
+        }) {
+            observed += 1;
+            working += usize::from(sample.working);
+        }
+    }
+    (observed, working)
+}
+
+fn host_feed_is_fresh(machine: &str, status: &PrometheusLeadStatus, now_ms: i64) -> bool {
+    status.pane_info.iter().any(|sample| {
+        status_is_fresh(sample, now_ms)
+            && sample
+                .labels
+                .get("machine")
+                .is_some_and(|host| host.eq_ignore_ascii_case(machine))
+    })
+}
+
+fn observed_pane_status(
+    lead: &str,
+    status: &PrometheusLeadStatus,
+    now_ms: i64,
+) -> Option<(bool, i64)> {
+    let mut parts = lead.splitn(3, ':');
+    let (machine, workspace, tab) = (parts.next()?, parts.next()?, parts.next()?);
+    let pane = status
+        .pane_info
+        .iter()
+        .filter(|sample| {
+            status_is_fresh(sample, now_ms)
+                && sample
+                    .labels
+                    .get("machine")
+                    .is_some_and(|v| v.eq_ignore_ascii_case(machine))
+                && sample
+                    .labels
+                    .get("workspace_label")
+                    .is_some_and(|v| v.eq_ignore_ascii_case(workspace))
+                && sample
+                    .labels
+                    .get("tab_label")
+                    .is_some_and(|v| v.eq_ignore_ascii_case(tab))
+                && sample.value > 0.0
+        })
+        .find_map(|info| info.labels.get("pane").map(|pane| (info, pane)))?;
+    let (info, pane) = pane;
+    let matching = status
+        .pane_status
+        .iter()
+        .filter(|sample| {
+            status_is_fresh(sample, now_ms)
+                && sample.labels.get("machine") == info.labels.get("machine")
+                && sample.labels.get("pane") == Some(pane)
+                && sample.value > 0.0
+        })
+        .max_by(|a, b| a.timestamp_seconds.total_cmp(&b.timestamp_seconds))?;
+    Some((
+        matching
+            .labels
+            .get("status")
+            .is_some_and(|s| s == "working"),
+        (matching.timestamp_seconds * 1000.0) as i64,
+    ))
+}
+
+fn observed_lane_status(
+    lead: &str,
+    status: &PrometheusLeadStatus,
+    now_ms: i64,
+) -> Option<(bool, i64)> {
+    let matching = status
+        .lane_status
+        .iter()
+        .filter(|sample| {
+            status_is_fresh(sample, now_ms)
+                && sample
+                    .labels
+                    .get("lane")
+                    .is_some_and(|lane| lane.eq_ignore_ascii_case(lead))
+                && sample.value > 0.0
+        })
+        .max_by(|a, b| a.timestamp_seconds.total_cmp(&b.timestamp_seconds))?;
+    Some((
+        matching
+            .labels
+            .get("state")
+            .is_some_and(|state| state == "working"),
+        (matching.timestamp_seconds * 1000.0) as i64,
+    ))
 }
 
 /// Selects the only started release project for the team; ambiguity fails closed.
@@ -1351,6 +1572,7 @@ mod tests {
 mod revision_tests {
     use super::*;
     use ix_trace_rs::trace;
+
     #[trace("FR-033-AC-6")]
     #[test]
     fn changing_selectors_invalidates_comparable_effort_history() {
@@ -1372,5 +1594,75 @@ mod revision_tests {
         assert!(state.effort_points.is_empty());
         assert!(!state.lifecycle_ok);
         assert_eq!(state.totals["scope_revisions"], 1.0);
+    }
+
+    #[test]
+    fn current_pane_lane_and_fresh_empty_host_feeds_classify_lead_coverage() {
+        let now_ms = 1_000_000;
+        let decoded = parse_prometheus_samples(
+            r#"{"status":"success","data":{"resultType":"vector","result":[{"metric":{"machine":"luna"},"value":[1000,"999.95"]}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(decoded[0].timestamp_seconds, 999.95);
+        let sample = |labels: &[(&str, &str)], timestamp_seconds: f64| PrometheusSample {
+            labels: labels
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect(),
+            timestamp_seconds,
+            value: 1.0,
+        };
+        let status = PrometheusLeadStatus {
+            pane_info: vec![
+                sample(
+                    &[
+                        ("machine", "luna"),
+                        ("pane", "wZ:p1"),
+                        ("workspace_label", "QSL"),
+                        ("tab_label", "code"),
+                    ],
+                    999.95,
+                ),
+                sample(
+                    &[
+                        ("machine", "draco"),
+                        ("pane", "w1F:p9"),
+                        ("workspace_label", "OTHER"),
+                        ("tab_label", "shell"),
+                    ],
+                    999.95,
+                ),
+            ],
+            pane_status: vec![sample(
+                &[
+                    ("machine", "luna"),
+                    ("pane", "wZ:p1"),
+                    ("status", "working"),
+                ],
+                999.95,
+            )],
+            lane_status: vec![sample(
+                &[
+                    ("host", "terra"),
+                    ("lane", "terra:QSL:plan"),
+                    ("state", "working"),
+                ],
+                999.95,
+            )],
+        };
+        let expected = vec![
+            "luna:QSL:code".to_owned(),
+            "terra:QSL:plan".to_owned(),
+            "draco:QSL:idle-lead".to_owned(),
+            "titan:QSL:missing-feed".to_owned(),
+        ];
+        let no_pane = BTreeSet::from([
+            "draco:QSL:idle-lead".to_owned(),
+            "titan:QSL:missing-feed".to_owned(),
+        ]);
+        assert_eq!(
+            classify_execution_leads(&expected, &no_pane, Some(&status), None, &[], now_ms),
+            (3, 2)
+        );
     }
 }

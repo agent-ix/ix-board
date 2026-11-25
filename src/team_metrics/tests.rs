@@ -427,6 +427,60 @@ fn daily_velocity_emits_seven_days_with_day_labels_and_coverage() {
     ));
 }
 
+#[test]
+fn effort_emits_after_23h55_of_complete_forward_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(dir.path());
+    let mut state = state(&config);
+    let now = 86_100_000;
+    state.history_ok = true;
+    state.history_at_ms = now;
+    let scope = state.scopes.get_mut("factory:completion").unwrap();
+    scope.tracker_ok = true;
+    scope.tracker_at_ms = now;
+    scope.github_observed_at_ms = now;
+    scope.lifecycle_ok = true;
+    scope.lifecycle_at_ms = now;
+    scope.lifecycle_success_at_ms = now;
+    scope.covered_seconds = 86_100.0;
+    scope.effort_points = vec![(0, 0.0, 0.0)];
+    scope.totals.insert("execution_seconds".into(), 1200.0);
+    let metric = |id: &str, value| crate::retro::Metric {
+        id: id.into(),
+        status: crate::retro::Status::Ok,
+        value: Some(value),
+        unit: "issues".into(),
+        direction: crate::retro::Direction::Up,
+        source: "linear".into(),
+        query: "test fixture".into(),
+        reason: None,
+    };
+    scope.record = Some(crate::retro::Record {
+        schema_version: 1,
+        kind: crate::retro::RecordKind::Snapshot,
+        taken_at: "1970-01-02T00:00:00Z".into(),
+        team: "factory".into(),
+        window: "24h".into(),
+        metrics: BTreeMap::from([
+            ("path_closed".into(), metric("path_closed", 2.0)),
+            (
+                "path_closed_unverified".into(),
+                metric("path_closed_unverified", 0.0),
+            ),
+        ]),
+        department: None,
+    });
+    let text = render(&config, &state, 0, now).unwrap();
+    assert!(text.contains(
+        "ix_team_effort_per_verified_path_closure_seconds_24h{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\"} 600"
+    ));
+    assert!(
+        text.contains(
+            "metric=\"effort_per_verified_path_closure_seconds_24h\"} 0.9965277777777778"
+        )
+    );
+}
+
 /// Provenance: SWM-181; scalar throughput snapshots retain gauge semantics.
 #[trace("FR-033-AC-5")]
 #[test]
