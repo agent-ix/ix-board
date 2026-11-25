@@ -21,6 +21,10 @@ pub(crate) fn request_count() -> u64 {
     GITHUB_HTTP_REQUESTS.load(Ordering::Relaxed)
 }
 
+pub(super) fn request_count_for_rules() {
+    GITHUB_HTTP_REQUESTS.fetch_add(1, Ordering::Relaxed);
+}
+
 /// One pull request with native GitHub timestamps and review state.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -90,10 +94,21 @@ impl GithubSource for GuardedRetroGithub {
         })
     }
 
+    #[implements("FR-024-AC-19")]
     fn pull_request(&self, repo: &str, number: u64) -> Result<PullRequestInfo, String> {
-        Err(format!(
-            "guarded single-PR query unavailable for {repo}#{number}"
-        ))
+        let path = self.state_path.as_deref().ok_or_else(|| {
+            "shared GitHub guard state path is not configured in eval.json".to_owned()
+        })?;
+        let (owner, name) = split_repository(repo)?;
+        let query = "query RetroAttachedPullRequest($owner:String!, $name:String!, $number:Int!) { rateLimit { cost remaining resetAt } repository(owner:$owner,name:$name) { pullRequest(number:$number) { mergedAt updatedAt } } }";
+        let variables = BTreeMap::from([
+            ("owner".into(), owner.into()),
+            ("name".into(), name.into()),
+            ("number".into(), number.to_string()),
+        ]);
+        GITHUB_HTTP_REQUESTS.fetch_add(1, Ordering::Relaxed);
+        let response = guarded_graphql(path, self.max_bytes, query, variables)?;
+        parse_pull_request_info(&response, repo, number)
     }
 
     fn main_commits(
@@ -106,6 +121,37 @@ impl GithubSource for GuardedRetroGithub {
             "guarded commit query unavailable for {repo}@{branch}"
         ))
     }
+}
+
+#[implements("FR-024-AC-19")]
+fn parse_pull_request_info(
+    response: &serde_json::Value,
+    repository: &str,
+    number: u64,
+) -> Result<PullRequestInfo, String> {
+    if response
+        .get("errors")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|errors| !errors.is_empty())
+    {
+        return Err(format!(
+            "GitHub returned partial PR evidence for {repository}#{number}"
+        ));
+    }
+    let pull_request = response
+        .pointer("/data/repository/pullRequest")
+        .filter(|value| !value.is_null())
+        .ok_or_else(|| format!("GitHub returned no PR for {repository}#{number}"))?;
+    let updated_at = pull_request
+        .get("updatedAt")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("GitHub returned no valid update time for {repository}#{number}"))
+        .and_then(timestamp_epoch)?;
+    let merged = pull_request
+        .get("mergedAt")
+        .and_then(serde_json::Value::as_str)
+        .is_some();
+    Ok(PullRequestInfo { merged, updated_at })
 }
 
 /// Reads one repository's bounded PR connection through the shared team-metrics
@@ -268,7 +314,7 @@ pub(crate) fn prometheus_samples(
     Ok(samples)
 }
 
-fn split_repository(repository: &str) -> Result<(&str, &str), String> {
+pub(super) fn split_repository(repository: &str) -> Result<(&str, &str), String> {
     let mut parts = repository.split('/');
     let (Some(owner), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
         return Err("GitHub repository must be owner/name".into());
@@ -288,7 +334,7 @@ fn split_repository(repository: &str) -> Result<(&str, &str), String> {
     Ok((owner, name))
 }
 
-fn timestamp_ms(value: &str) -> Option<i64> {
+pub(super) fn timestamp_ms(value: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(value)
         .ok()
         .map(|timestamp| timestamp.timestamp_millis())
@@ -304,6 +350,32 @@ fn timestamp_epoch(value: &str) -> Result<f64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[trace("FR-024-AC-19")]
+    fn attached_pull_request_state_requires_exact_merged_state_and_valid_timestamp() {
+        let merged = serde_json::json!({
+            "data": {"repository": {"pullRequest": {
+                "mergedAt": "2023-11-14T22:13:20Z",
+                "updatedAt": "2023-11-14T22:14:20Z"
+            }}}
+        });
+        let info = parse_pull_request_info(&merged, "agent-ix/ix-board", 42).unwrap();
+        assert!(info.merged);
+        assert_eq!(info.updated_at, 1_700_000_060.0);
+
+        let open = serde_json::json!({
+            "data": {"repository": {"pullRequest": {
+                "mergedAt": null,
+                "updatedAt": "2023-11-14T22:14:20Z"
+            }}}
+        });
+        assert!(
+            !parse_pull_request_info(&open, "agent-ix/ix-board", 42)
+                .unwrap()
+                .merged
+        );
+    }
     use ix_trace_rs::trace;
 
     #[test]

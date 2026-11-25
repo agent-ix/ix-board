@@ -150,6 +150,25 @@ query LabeledIssues($first: Int!, $after: String, $label: String!) {
   }
 }"#;
 
+const OPEN_DECISIONS_QUERY: &str = r#"
+query OpenDecisionIssues($first: Int!, $after: String, $label: String!) {
+  issues(first: $first, after: $after, filter: {
+    labels: { name: { eq: $label } },
+    state: { type: { nin: ["completed", "canceled"] } }
+  }) {
+    nodes { identifier assignee { id } }
+    pageInfo { hasNextPage endCursor }
+  }
+}"#;
+
+const TICKET_IDENTITY_QUERY: &str = r#"
+query TicketIdentity($identifier: String!) {
+  issues(first: 2, filter: { identifier: { eq: $identifier } }) {
+    nodes { id createdAt state { type } }
+    pageInfo { hasNextPage }
+  }
+}"#;
+
 const HISTORY_PAGE_SIZE: i32 = 100;
 
 const PROJECT_STATUSES_QUERY: &str = r#"
@@ -182,6 +201,7 @@ pub struct LinearGraphQlSource {
     cache_namespace: String,
     quota_path: std::path::PathBuf,
     metrics: std::sync::Arc<TransportMetrics>,
+    retro_eval_budget: Option<std::sync::Arc<LinearRequestBudget>>,
 }
 
 #[derive(Default)]
@@ -193,6 +213,152 @@ struct TransportMetrics {
 }
 
 static EVAL_REQUESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RETRO_EVAL_BUDGET_CLOCK: crate::SystemClock = crate::SystemClock;
+/// Maximum Linear GraphQL sends allowed in one `retro eval` invocation.
+pub(crate) const RETRO_EVAL_LINEAR_REQUEST_LIMIT: u64 = 200;
+
+thread_local! {
+    static ACTIVE_RETRO_EVAL_BUDGET: std::cell::RefCell<Option<std::sync::Arc<LinearRequestBudget>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Scoped propagation of the current retro-evaluation request budget to new Linear sources.
+///
+/// `LinearGraphQlSource::from_env` attaches the active budget automatically. The scope is local to
+/// the invoking thread; sources created there retain the shared budget in their clones.
+pub(crate) struct LinearRequestScope {
+    previous: Option<std::sync::Arc<LinearRequestBudget>>,
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl LinearRequestScope {
+    /// Installs the invocation-wide budget until this guard is dropped.
+    #[implements("FR-047-AC-9")]
+    pub(crate) fn enter(budget: std::sync::Arc<LinearRequestBudget>) -> Self {
+        let previous = ACTIVE_RETRO_EVAL_BUDGET.with(|active| active.replace(Some(budget)));
+        Self {
+            previous,
+            _not_send: std::marker::PhantomData,
+        }
+    }
+
+    fn current() -> Option<std::sync::Arc<LinearRequestBudget>> {
+        ACTIVE_RETRO_EVAL_BUDGET.with(|active| active.borrow().clone())
+    }
+}
+
+impl Drop for LinearRequestScope {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        ACTIVE_RETRO_EVAL_BUDGET.with(|active| {
+            active.replace(previous);
+        });
+    }
+}
+
+/// One invocation-wide limit shared by every Linear source clone used by retro evaluation.
+///
+/// The deadline is copied from the operation's existing [`Deadline`] at setup so adapter-created
+/// source instances can enforce the same wall-clock bound without carrying a borrowed lifetime.
+pub(crate) struct LinearRequestBudget {
+    limit: u64,
+    used: std::sync::atomic::AtomicU64,
+    deadline_at: std::time::Instant,
+    deadline_limit: std::time::Duration,
+    deadline: Deadline<'static>,
+}
+
+impl LinearRequestBudget {
+    /// Starts an invocation budget using the remaining time on its shared operation deadline.
+    #[implements("FR-047-AC-9")]
+    pub(crate) fn within(
+        deadline: &Deadline<'_>,
+        request_limit: u64,
+    ) -> Result<std::sync::Arc<Self>, Error> {
+        let remaining = deadline.remaining()?;
+        let deadline_at =
+            std::time::Instant::now()
+                .checked_add(remaining)
+                .ok_or(Error::ReadTimeout {
+                    deadline: deadline.limit(),
+                })?;
+        Ok(std::sync::Arc::new(Self {
+            limit: request_limit,
+            used: std::sync::atomic::AtomicU64::new(0),
+            deadline_at,
+            deadline_limit: deadline.limit(),
+            deadline: Deadline::start(&RETRO_EVAL_BUDGET_CLOCK, remaining),
+        }))
+    }
+
+    /// Starts a budget with an explicit expiry instant for deterministic internal tests.
+    #[cfg(test)]
+    fn with_deadline_at(
+        request_limit: u64,
+        deadline_at: std::time::Instant,
+        deadline_limit: std::time::Duration,
+    ) -> Self {
+        let remaining = deadline_at
+            .checked_duration_since(std::time::Instant::now())
+            .unwrap_or(std::time::Duration::ZERO);
+        Self {
+            limit: request_limit,
+            used: std::sync::atomic::AtomicU64::new(0),
+            deadline_at,
+            deadline_limit,
+            deadline: Deadline::start(&RETRO_EVAL_BUDGET_CLOCK, remaining),
+        }
+    }
+
+    #[implements("FR-047-AC-9")]
+    fn admit_request(&self) -> Result<(), Error> {
+        self.remaining()?;
+        let admitted = self.used.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |used| (used < self.limit).then_some(used.saturating_add(1)),
+        );
+        admitted.map_err(|_| Error::RetroEvaluationRequestBudgetExceeded { limit: self.limit })?;
+        Ok(())
+    }
+
+    fn remaining(&self) -> Result<std::time::Duration, Error> {
+        self.deadline_at
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(Error::ReadTimeout {
+                deadline: self.deadline_limit,
+            })
+    }
+
+    /// Remaining Linear requests in this invocation-wide cap.
+    #[implements("FR-047-AC-9")]
+    pub(crate) fn remaining_requests(&self) -> u64 {
+        self.limit
+            .saturating_sub(self.used.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Human-readable deadline reason for an unavailable partial evaluator result.
+    #[implements("FR-047-AC-9")]
+    pub(crate) fn deadline_reason(&self) -> Option<String> {
+        self.remaining().err().map(|_| {
+            format!(
+                "retro evaluation exceeded its {:?} wall-clock deadline",
+                self.deadline_limit
+            )
+        })
+    }
+
+    /// Human-readable request-cap reason for an unavailable partial evaluator result.
+    #[implements("FR-047-AC-9")]
+    pub(crate) fn request_budget_reason(&self) -> Option<String> {
+        (self.remaining_requests() == 0).then(|| {
+            format!(
+                "retro evaluation exhausted its Linear request budget of {}",
+                self.limit
+            )
+        })
+    }
+}
 
 /// Number of Linear GraphQL requests attempted by this process.
 #[implements("FR-047-AC-9")]
@@ -310,6 +476,7 @@ impl LinearGraphQlSource {
             cache_namespace,
             quota_path,
             metrics: std::sync::Arc::default(),
+            retro_eval_budget: LinearRequestScope::current(),
         })
     }
 
@@ -1107,6 +1274,81 @@ impl LinearGraphQlSource {
             .collect()
     }
 
+    /// Reads identifiers of open issues with `label` that have no assigned owner.
+    pub fn fetch_open_decisions_without_assignee(
+        &self,
+        label: &str,
+    ) -> Result<Vec<String>, String> {
+        let issues = crate::retro::sources::read_all_pages(|after| {
+            let data: OpenDecisionIssueData = self
+                .request(
+                    OPEN_DECISIONS_QUERY,
+                    LabelVariables {
+                        first: ISSUE_PAGE_SIZE,
+                        after: after.map(str::to_owned),
+                        label: label.to_owned(),
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(crate::retro::sources::Page {
+                items: data.issues.nodes,
+                has_next: data.issues.page_info.has_next_page,
+                cursor: data.issues.page_info.end_cursor,
+            })
+        })?;
+        Ok(issues
+            .into_iter()
+            .filter(|issue| issue.assignee.is_none())
+            .map(|issue| issue.identifier)
+            .collect())
+    }
+
+    /// Reads the first entry into a Linear `started` state for a ticket identifier.
+    ///
+    /// `Ok(None)` means the complete issue history contains no started-state entry.
+    #[implements("FR-047-AC-1")]
+    pub fn fetch_ticket_started_at(&self, identifier: &str) -> Result<Option<f64>, String> {
+        let data: TicketIdentityData = self
+            .request(
+                TICKET_IDENTITY_QUERY,
+                TicketIdentityVariables {
+                    identifier: identifier.to_owned(),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        if data.issues.page_info.has_next_page || data.issues.nodes.len() != 1 {
+            return Err(format!(
+                "Linear ticket identity is incomplete or ambiguous for {identifier}"
+            ));
+        }
+        let issue = data
+            .issues
+            .nodes
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("Linear ticket {identifier} was not found"))?;
+        let created_at =
+            crate::drift::timestamp_epoch(&issue.created_at).map_err(|error| error.to_string())?;
+        let history = self.fetch_state_changes(&issue.id)?;
+        let first_started = history
+            .iter()
+            .filter(|event| event.to == Some(crate::model::WorkflowStateType::Started))
+            .map(|event| event.at)
+            .min_by(f64::total_cmp);
+        if first_started.is_some() {
+            return Ok(first_started);
+        }
+        if history
+            .iter()
+            .min_by(|left, right| left.at.total_cmp(&right.at))
+            .is_some_and(|event| event.from == Some(crate::model::WorkflowStateType::Started))
+            || (history.is_empty() && issue.state.status_type == "started")
+        {
+            return Ok(Some(created_at));
+        }
+        Ok(None)
+    }
+
     fn complete_relations(
         &self,
         deadline: Option<&Deadline<'_>>,
@@ -1200,16 +1442,26 @@ impl LinearGraphQlSource {
 
     /// Sends one request. With a deadline, nothing is sent once it has expired and the
     /// request timeout is the lesser of the legacy timeout and the time remaining.
+    #[implements("FR-047-AC-9")]
     pub(crate) fn request_within<T: DeserializeOwned, V: Serialize>(
         &self,
         deadline: Option<&Deadline<'_>>,
         query: &str,
         variables: V,
     ) -> Result<T, Error> {
+        if let Some(budget) = self.retro_eval_budget.as_ref() {
+            budget.admit_request()?;
+        }
         let config = crate::quota::QuotaConfig::from_config(crate::settings::load()?.as_ref())?;
-        let quota = crate::quota::QuotaGate::open_within(&self.quota_path, &config, deadline)?;
+        let effective_deadline = deadline.or_else(|| {
+            self.retro_eval_budget
+                .as_ref()
+                .map(|budget| &budget.deadline)
+        });
+        let quota =
+            crate::quota::QuotaGate::open_within(&self.quota_path, &config, effective_deadline)?;
         const ESTIMATED_COMPLEXITY: u64 = 10_000;
-        let reservation = quota.reserve_evaluated(ESTIMATED_COMPLEXITY, deadline)?;
+        let reservation = quota.reserve_evaluated(ESTIMATED_COMPLEXITY, effective_deadline)?;
         EVAL_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.metrics
             .requests
@@ -1222,14 +1474,26 @@ impl LinearGraphQlSource {
             .post(&self.endpoint)
             .header(reqwest::header::AUTHORIZATION, self.api_key.expose_secret())
             .json(&GraphQlRequest { query, variables });
+        let mut timeout = REQUEST_TIMEOUT;
         let mut deadline_bound = None;
-        if let Some(deadline) = deadline {
-            let timeout = deadline.request_timeout(REQUEST_TIMEOUT)?;
-            if timeout < REQUEST_TIMEOUT {
+        if let Some(deadline) = effective_deadline {
+            let remaining = deadline.request_timeout(REQUEST_TIMEOUT)?;
+            if remaining < timeout {
+                timeout = remaining;
                 deadline_bound = Some(deadline.limit());
             }
-            request = request.timeout(timeout);
         }
+        if let Some(budget) = self.retro_eval_budget.as_ref() {
+            let remaining = budget.remaining()?;
+            if remaining < timeout {
+                timeout = remaining;
+                deadline_bound = self
+                    .retro_eval_budget
+                    .as_ref()
+                    .map(|budget| budget.deadline_limit);
+            }
+        }
+        request = request.timeout(timeout);
         let transport_error = |error: reqwest::Error| match deadline_bound {
             Some(limit) if error.is_timeout() => Error::ReadTimeout { deadline: limit },
             _ => Error::Http(error),
@@ -1272,7 +1536,7 @@ impl LinearGraphQlSource {
                     status,
                     &headers,
                     None,
-                    deadline,
+                    effective_deadline,
                 )?;
                 if status == 429 {
                     return Err(Error::QuotaAdmissionRefused {
@@ -1290,7 +1554,7 @@ impl LinearGraphQlSource {
             status,
             &headers,
             Some(&value),
-            deadline,
+            effective_deadline,
         )?;
         if status == 429
             || value
@@ -2246,6 +2510,46 @@ struct LabeledIssueData {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct OpenDecisionIssueData {
+    issues: Connection<RawOpenDecisionIssue>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TicketIdentityData {
+    issues: Connection<RawTicketIdentity>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct RawTicketIdentity {
+    id: String,
+    created_at: String,
+    state: RawTicketState,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTicketState {
+    #[serde(rename = "type")]
+    status_type: String,
+}
+
+#[derive(Serialize)]
+struct TicketIdentityVariables {
+    identifier: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOpenDecisionIssue {
+    identifier: String,
+    assignee: Option<RawUser>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
 struct RawLabeledIssue {
     identifier: String,
@@ -2523,8 +2827,8 @@ struct RawRelationIssue {
 mod tests {
     use super::{
         CACHE_MODEL_VERSION, INITIATIVE_PAGE_SIZE, ISSUE_PAGE_SIZE, IssueData, LinearGraphQlSource,
-        PROJECT_PAGE_SIZE, PROJECT_UPDATE_MUTATION, ProjectData, ProjectUpdateInput,
-        RawProjectStatusOption, canonical_project_status, collect_blocked_by,
+        LinearRequestBudget, PROJECT_PAGE_SIZE, PROJECT_UPDATE_MUTATION, ProjectData,
+        ProjectUpdateInput, RawProjectStatusOption, canonical_project_status, collect_blocked_by,
         resolve_project_status_id, should_fetch_issue_history,
     };
     use crate::Error;
@@ -2540,6 +2844,104 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::thread::JoinHandle;
+
+    #[test]
+    #[trace("FR-047-AC-9")]
+    fn retro_eval_request_budget_stops_at_shared_cap() {
+        let budget = LinearRequestBudget::with_deadline_at(
+            1,
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(30),
+        );
+        assert!(budget.admit_request().is_ok());
+        assert!(matches!(
+            budget.admit_request(),
+            Err(Error::RetroEvaluationRequestBudgetExceeded { limit: 1 })
+        ));
+        assert_eq!(budget.used.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    #[trace("FR-047-AC-9")]
+    fn retro_eval_scope_shares_one_cap_across_new_source_instances() {
+        let budget = std::sync::Arc::new(LinearRequestBudget::with_deadline_at(
+            1,
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(30),
+        ));
+        let _scope = super::LinearRequestScope::enter(std::sync::Arc::clone(&budget));
+        let first = LinearGraphQlSource::with_endpoint("test-key", "http://127.0.0.1:1")
+            .expect("first fixture source");
+        let second = LinearGraphQlSource::with_endpoint("test-key", "http://127.0.0.1:1")
+            .expect("second fixture source");
+        assert_eq!(
+            first
+                .retro_eval_budget
+                .as_ref()
+                .unwrap()
+                .remaining_requests(),
+            1
+        );
+        assert!(
+            first
+                .retro_eval_budget
+                .as_ref()
+                .unwrap()
+                .admit_request()
+                .is_ok()
+        );
+        assert_eq!(
+            second
+                .retro_eval_budget
+                .as_ref()
+                .unwrap()
+                .remaining_requests(),
+            0
+        );
+        let result = second.request::<Value, _>("query Test { test }", ());
+        assert!(matches!(
+            result,
+            Err(Error::RetroEvaluationRequestBudgetExceeded { limit: 1 })
+        ));
+    }
+
+    #[test]
+    #[trace("FR-047-AC-9")]
+    fn expired_retro_eval_deadline_refuses_request_before_transport() {
+        let budget = std::sync::Arc::new(LinearRequestBudget::with_deadline_at(
+            5,
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(5),
+        ));
+        let _scope = super::LinearRequestScope::enter(budget);
+        let source = LinearGraphQlSource::with_endpoint("test-key", "http://127.0.0.1:1")
+            .expect("fixture source");
+        let result = source.request::<Value, _>("query Test { test }", ());
+        match result {
+            Err(Error::ReadTimeout { deadline }) => {
+                assert_eq!(deadline, std::time::Duration::from_secs(5));
+            }
+            other => panic!("expired invocation deadline must refuse the request: {other:?}"),
+        }
+    }
+
+    #[test]
+    #[trace("FR-047-AC-9")]
+    fn exhausted_retro_eval_budget_refuses_request_before_transport() {
+        let budget = std::sync::Arc::new(LinearRequestBudget::with_deadline_at(
+            0,
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(30),
+        ));
+        let _scope = super::LinearRequestScope::enter(budget);
+        let source = LinearGraphQlSource::with_endpoint("test-key", "http://127.0.0.1:1")
+            .expect("fixture source");
+        let result = source.request::<Value, _>("query Test { test }", ());
+        assert!(matches!(
+            result,
+            Err(Error::RetroEvaluationRequestBudgetExceeded { limit: 0 })
+        ));
+    }
 
     struct CachedSnapshotSource {
         namespace: String,

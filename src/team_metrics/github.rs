@@ -4,6 +4,7 @@
 use super::Config;
 use super::github_http::Http;
 use crate::retro::sources::{GithubSource, MainCommit, PullRequest, PullRequestInfo};
+use ix_trace_rs::implements;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -354,6 +355,8 @@ fn backoff(response: &Response, now: i64) -> i64 {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GraphResponse {
+    #[serde(default)]
+    errors: Option<Vec<serde_json::Value>>,
     data: GraphData,
 }
 #[derive(Deserialize)]
@@ -361,7 +364,10 @@ struct GraphResponse {
 struct GraphData {
     #[serde(rename = "rateLimit")]
     rate: Rate,
-    repository: serde_json::Value,
+    #[serde(default)]
+    repository: Option<serde_json::Value>,
+    #[serde(default)]
+    node: Option<serde_json::Value>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -371,15 +377,42 @@ struct Rate {
     #[serde(rename = "resetAt")]
     reset_at: String,
 }
+#[implements("FR-033-AC-13")]
 fn graph_body(body: &str) -> Result<String, String> {
-    let response: GraphResponse = serde_json::from_str(body).map_err(|e| e.to_string())?;
-    if response.data.rate.cost > u64::try_from(RESERVED_COST).map_err(|_| "cost overflow")?
-        || response.data.rate.remaining == 0
-        || epoch(&response.data.rate.reset_at).is_err()
+    let value: serde_json::Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    if value
+        .get("errors")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|errors| !errors.is_empty())
+    {
+        return Err("GitHub GraphQL returned errors".into());
+    }
+    let response: GraphResponse = serde_json::from_value(value).map_err(|e| e.to_string())?;
+    if response
+        .errors
+        .as_ref()
+        .is_some_and(|errors| !errors.is_empty())
+    {
+        return Err("GitHub GraphQL returned errors".into());
+    }
+    let response_data = response.data;
+    if response_data.rate.cost > u64::try_from(RESERVED_COST).map_err(|_| "cost overflow")?
+        || response_data.rate.remaining == 0
+        || epoch(&response_data.rate.reset_at).is_err()
     {
         return Err("GitHub GraphQL cost/quota evidence unavailable".into());
     }
-    Ok(serde_json::json!({"data":{"repository":response.data.repository}}).to_string())
+    if response_data.repository.is_none() && response_data.node.is_none() {
+        return Err("GitHub GraphQL response has no supported data connection".into());
+    }
+    let mut data = serde_json::Map::new();
+    if let Some(repository) = response_data.repository {
+        data.insert("repository".into(), repository);
+    }
+    if let Some(node) = response_data.node {
+        data.insert("node".into(), node);
+    }
+    Ok(serde_json::json!({"data":data}).to_string())
 }
 fn graph_request(query: &str, repo: &str, after: Option<&str>) -> Result<Request, String> {
     let mut pieces = repo.split('/');
@@ -633,6 +666,8 @@ fn validate_page(
     let nodes = response
         .data
         .repository
+        .as_ref()
+        .ok_or("GitHub PR repository unavailable")?
         .get("pullRequests")
         .and_then(|r| r.get("nodes"))
         .and_then(serde_json::Value::as_array)
@@ -739,8 +774,12 @@ fn parse_infos(
 ) -> Result<BTreeMap<u64, PullRequestInfo>, String> {
     graph_body(body)?;
     let response: GraphResponse = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    let repository = response
+        .data
+        .repository
+        .ok_or_else(|| "GitHub PR repository unavailable".to_owned())?;
     let mut data: BTreeMap<String, Option<RawInfo>> =
-        serde_json::from_value(response.data.repository).map_err(|e| e.to_string())?;
+        serde_json::from_value(repository).map_err(|e| e.to_string())?;
     let mut rows = BTreeMap::new();
     for n in numbers {
         let info = data
@@ -1339,6 +1378,29 @@ mod tests {
     }
     fn graph_body_validator(body: &str, _at: i64) -> Result<(), String> {
         graph_body(body).map(|_| ())
+    }
+
+    #[trace("FR-033-AC-13")]
+    #[test]
+    fn graph_body_preserves_node_connections_and_rejects_graph_errors() {
+        let body = serde_json::json!({
+            "data": {
+                "rateLimit": {"cost": 1, "remaining": 100, "resetAt": "2030-01-01T00:00:00Z"},
+                "node": {"pullRequests": {"nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}}}
+            }
+        })
+        .to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&graph_body(&body).unwrap()).unwrap();
+        assert_eq!(
+            parsed.pointer("/data/node/pullRequests/nodes"),
+            Some(&serde_json::json!([]))
+        );
+
+        let errors = r#"{"errors":[{"message":"denied"}]}"#;
+        assert_eq!(
+            graph_body(errors).unwrap_err(),
+            "GitHub GraphQL returned errors"
+        );
     }
 
     #[trace("FR-033-AC-12", "FR-033-AC-13")]

@@ -7,9 +7,12 @@ use ix_trace_rs::implements;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[path = "eval/github.rs"]
 mod github;
+#[path = "eval/github_rules.rs"]
+pub mod github_rules;
 #[path = "eval/ledger.rs"]
 mod ledger;
 #[path = "eval/linear.rs"]
@@ -20,6 +23,71 @@ pub mod relay;
 pub mod transcript;
 
 static PROMETHEUS_REQUESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static EVAL_DEADLINE_CLOCK: crate::SystemClock = crate::SystemClock;
+
+/// Maximum Linear GraphQL requests admitted by one default `retro eval` invocation.
+pub const DEFAULT_EVAL_LINEAR_REQUEST_LIMIT: u64 = crate::linear::RETRO_EVAL_LINEAR_REQUEST_LIMIT;
+
+/// Shared deadline and Linear request scope for one `retro eval` invocation.
+///
+/// Keep this guard alive for the full operation. New `LinearGraphQlSource` instances created on
+/// the calling thread automatically inherit its shared request budget, and cloned sources keep
+/// that same budget when used by worker threads.
+pub struct EvalRunScope {
+    deadline: crate::Deadline<'static>,
+    linear_budget: std::sync::Arc<crate::linear::LinearRequestBudget>,
+    _linear_scope: crate::linear::LinearRequestScope,
+}
+
+impl EvalRunScope {
+    /// Starts a bounded evaluation and installs the shared Linear request cap.
+    #[implements("FR-047-AC-9")]
+    pub fn start(
+        deadline_limit: Duration,
+        linear_request_limit: u64,
+    ) -> Result<Self, crate::Error> {
+        let deadline = crate::Deadline::start(&EVAL_DEADLINE_CLOCK, deadline_limit);
+        let linear_budget =
+            crate::linear::LinearRequestBudget::within(&deadline, linear_request_limit)?;
+        let linear_scope =
+            crate::linear::LinearRequestScope::enter(std::sync::Arc::clone(&linear_budget));
+        Ok(Self {
+            deadline,
+            linear_budget,
+            _linear_scope: linear_scope,
+        })
+    }
+
+    /// Returns the operation deadline for source reads and stage-level checks.
+    #[implements("FR-047-AC-9")]
+    pub fn deadline(&self) -> &crate::Deadline<'static> {
+        &self.deadline
+    }
+
+    /// Returns time remaining or the typed timeout error after expiry.
+    #[implements("FR-047-AC-9")]
+    pub fn remaining(&self) -> Result<Duration, crate::Error> {
+        self.deadline.remaining()
+    }
+
+    /// Human-readable wall-clock expiry reason for unavailable partial results.
+    #[implements("FR-047-AC-9")]
+    pub fn deadline_reason(&self) -> Option<String> {
+        self.linear_budget.deadline_reason()
+    }
+
+    /// Number of Linear requests still available in this invocation.
+    #[implements("FR-047-AC-9")]
+    pub fn remaining_linear_requests(&self) -> u64 {
+        self.linear_budget.remaining_requests()
+    }
+
+    /// Human-readable Linear request-cap reason for unavailable partial results.
+    #[implements("FR-047-AC-9")]
+    pub fn request_budget_reason(&self) -> Option<String> {
+        self.linear_budget.request_budget_reason()
+    }
+}
 
 /// Request totals reported by one `retro eval` invocation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
@@ -209,6 +277,17 @@ impl Default for EvalSettings {
 pub struct EvalWindow {
     pub start_ms: i64,
     pub end_ms: i64,
+}
+
+/// Team-owned session addresses used to scope role-level lane-order evidence.
+/// Addresses must come from the selected team's verified session configuration and
+/// session-turn records; fleet lane names are not inferred from labels or prefixes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LaneOrderScope {
+    /// Stable id/name of the selected team; required to enable scoped reductions.
+    pub team_id: Option<String>,
+    /// Explicit lane/session addresses owned by this team, grouped by evaluator role.
+    pub sessions_by_role: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// Current and preceding window results for a role.
@@ -1041,6 +1120,12 @@ fn retro_record_value(record: &super::Record, metric_id: &str) -> QueryValue {
     }
     if metric_id == "order_flip_loop" {
         let evidence_ref = format!("retro:department-loop:order_flip_loop:{}", record.taken_at);
+        if record.department.is_none() {
+            return QueryValue::Unavailable {
+                reason: "installed department producer needs TEST department configuration and one complete 24-hour snapshot window".into(),
+                evidence_refs: vec![evidence_ref],
+            };
+        }
         return match record
             .department
             .as_ref()
@@ -1104,6 +1189,12 @@ fn retro_record_value(record: &super::Record, metric_id: &str) -> QueryValue {
                 .unwrap_or_else(|| "department metric is unavailable".to_owned()),
             evidence_refs: vec![evidence_ref],
         },
+        None if record.department.is_none() && super::department::definition(department_id).is_some() => {
+            QueryValue::Unavailable {
+                reason: "installed department producer needs TEST department configuration and one complete 24-hour snapshot window".into(),
+                evidence_refs: vec![evidence_ref],
+            }
+        }
         None => QueryValue::Unavailable {
             reason: format!("retro catalog and department report have no metric {metric_id:?}"),
             evidence_refs: vec![format!("retro:observed:{}", record.taken_at)],
@@ -1689,6 +1780,527 @@ fn read_pr_methods_with_multiple_runs(
     linear::pr_methods_with_multiple_runs(&prs, &comments, window)
 }
 
+/// Evaluates the class-A Linear role queries from bounded tracker history and the guarded PR
+/// journal. Use the `_with_github` variant when the invocation already has its complete role-query
+/// evidence so marker reducers can reuse changed-file and commit-ancestry coverage.
+#[implements("FR-047-AC-1")]
+pub fn linear_class_a_adapters(
+    specs: &[RoleSpec],
+    repositories: &[String],
+    decision_label: Option<&str>,
+    window: &EvalWindow,
+    _github_guard_state_path: Option<&Path>,
+    _github_guard_max_bytes: u64,
+) -> BTreeMap<String, QueryValue> {
+    linear_class_a_adapters_with_github(
+        specs,
+        repositories,
+        decision_label,
+        window,
+        Err("guarded GitHub role evidence was not supplied"),
+    )
+}
+
+/// Evaluates class-A Linear queries against an already-collected complete GitHub evidence set.
+///
+/// The evidence is shared with GitHub role reducers, so changed-file and commit ancestry reads are
+/// not repeated. Pass the source error through `Err` to keep affected values unavailable.
+#[implements("FR-047-AC-1")]
+pub fn linear_class_a_adapters_with_github(
+    specs: &[RoleSpec],
+    repositories: &[String],
+    decision_label: Option<&str>,
+    window: &EvalWindow,
+    github_evidence: Result<&[github_rules::PullRequestEvidence], &str>,
+) -> BTreeMap<String, QueryValue> {
+    let rule_queries = [
+        "linear.redundant_gate_runs",
+        "linear.findings_open_at_merge",
+        "linear.gate_runs_before_clean_review",
+        "linear.fix_round_findings_returned_still_open",
+        "linear.open_decisions_without_owner",
+        "linear.findings_without_outcome_after_disposition",
+        "linear.mergeable_yes_with_open_finding",
+        "linear.outside_diff_findings_without_failure",
+    ];
+    let mut needed = specs
+        .iter()
+        .flat_map(|spec| &spec.rules)
+        .filter(|rule| rule.method == "deterministic")
+        .map(|rule| rule.query_or_rubric.as_str())
+        .filter(|query| rule_queries.contains(query))
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    let metric_needed = specs
+        .iter()
+        .flat_map(|spec| &spec.metrics)
+        .any(|metric| metric.query == "linear.review_to_clean_median_hours");
+    if metric_needed {
+        needed.insert("linear.review_to_clean_median_hours".to_owned());
+    }
+    if needed.is_empty() {
+        return BTreeMap::new();
+    }
+
+    let mut results = BTreeMap::new();
+    let unavailable = |reason: String| QueryValue::Unavailable {
+        reason,
+        evidence_refs: Vec::new(),
+    };
+    let linear = match crate::LinearGraphQlSource::from_env() {
+        Ok(linear) => linear,
+        Err(error) => {
+            return needed
+                .into_iter()
+                .map(|query| (query, unavailable(error.to_string())))
+                .collect();
+        }
+    };
+
+    if needed.contains("linear.open_decisions_without_owner") {
+        let value = match decision_label.filter(|label| !label.trim().is_empty()) {
+            Some(label) => linear
+                .fetch_open_decisions_without_assignee(label)
+                .map(|issues| QueryValue::Value {
+                    value: issues.len() as f64,
+                    evidence_refs: issues
+                        .into_iter()
+                        .map(|identifier| format!("linear-issue:{identifier}"))
+                        .collect(),
+                })
+                .unwrap_or_else(unavailable),
+            None => unavailable("retro config has no decision_label".to_owned()),
+        };
+        results.insert("linear.open_decisions_without_owner".to_owned(), value);
+    }
+
+    let reviewer_queries = [
+        "linear.findings_open_at_merge",
+        "linear.fix_round_findings_returned_still_open",
+        "linear.findings_without_outcome_after_disposition",
+        "linear.mergeable_yes_with_open_finding",
+        "linear.outside_diff_findings_without_failure",
+        "linear.review_to_clean_median_hours",
+    ];
+    let reviewer_needed = reviewer_queries.iter().any(|query| needed.contains(*query));
+    if reviewer_needed {
+        let comments_result = read_linear_review_comments(&linear, repositories);
+        let final_fix_result = if needed.contains("linear.findings_open_at_merge") {
+            read_linear_gate_comments(&linear, repositories)
+        } else {
+            Ok(Vec::new())
+        };
+        match comments_result {
+            Ok(comments) => {
+                let (final_fix_records, final_fix_error) = match final_fix_result {
+                    Ok(records) => (records, None),
+                    Err(reason) => (Vec::new(), Some(reason)),
+                };
+                let rows = github_evidence.as_ref().ok().copied().unwrap_or_default();
+                let prs = pull_requests_from_github_evidence(rows);
+                let changed_files = rows
+                    .iter()
+                    .map(|row| {
+                        row.changed_files.as_ref().map(|files| {
+                            (format!("{}#{}", row.repository, row.number), files.clone())
+                        })
+                    })
+                    .collect::<Option<BTreeMap<_, _>>>();
+                let values = linear::reviewer_class_a_metrics(
+                    &comments,
+                    &prs,
+                    window,
+                    changed_files.as_ref(),
+                    &final_fix_records,
+                );
+                for query in reviewer_queries
+                    .into_iter()
+                    .filter(|query| needed.contains(*query))
+                {
+                    let requires_github = matches!(
+                        query,
+                        "linear.findings_open_at_merge"
+                            | "linear.fix_round_findings_returned_still_open"
+                    );
+                    let value = if requires_github && github_evidence.is_err() {
+                        unavailable(
+                            github_evidence
+                                .as_ref()
+                                .err()
+                                .copied()
+                                .unwrap_or("GitHub evidence unavailable")
+                                .to_owned(),
+                        )
+                    } else if query == "linear.findings_open_at_merge"
+                        && let Some(reason) = final_fix_error.as_ref()
+                    {
+                        unavailable(format!("final-fix Linear source is unavailable: {reason}"))
+                    } else {
+                        values.get(query).cloned().unwrap_or_else(|| {
+                            unavailable(format!("Linear reducer did not register {query}"))
+                        })
+                    };
+                    results.insert(query.to_owned(), value);
+                }
+            }
+            Err(reason) => {
+                for query in reviewer_queries
+                    .into_iter()
+                    .filter(|query| needed.contains(*query))
+                {
+                    results.insert(query.to_owned(), unavailable(reason.clone()));
+                }
+            }
+        }
+    }
+
+    let gate_queries = [
+        "linear.redundant_gate_runs",
+        "linear.gate_runs_before_clean_review",
+    ];
+    if gate_queries.iter().any(|query| needed.contains(*query)) {
+        let gate_result = read_linear_gate_comments(&linear, repositories);
+        let review_result = if needed.contains("linear.gate_runs_before_clean_review") {
+            read_linear_review_comments(&linear, repositories)
+        } else {
+            Ok(Vec::new())
+        };
+        match (gate_result, review_result) {
+            (Ok(gate_comments), Ok(review_comments)) => {
+                match linear::gate_records(&gate_comments) {
+                    Ok(records) => {
+                        if needed.contains("linear.gate_runs_before_clean_review") {
+                            let waived = waiver_prs(&gate_comments, "LEAD-R20");
+                            let value = linear::gate_runs_before_clean_review(
+                                &records,
+                                &review_comments,
+                                &waived,
+                                window,
+                            )
+                            .map(|(value, evidence_refs)| QueryValue::Value {
+                                value: value as f64,
+                                evidence_refs,
+                            })
+                            .unwrap_or_else(unavailable);
+                            results
+                                .insert("linear.gate_runs_before_clean_review".to_owned(), value);
+                        }
+                        if needed.contains("linear.redundant_gate_runs") {
+                            let waived = waiver_prs(&gate_comments, "LEAD-R06");
+                            let value = match github_evidence.as_ref() {
+                                Err(reason) => unavailable((*reason).to_owned()),
+                                Ok(rows) => {
+                                    match gate_head_ancestry_pairs(&records, rows, &waived, window)
+                                    {
+                                        Ok(covered_pairs) => {
+                                            let (value, evidence_refs) =
+                                                linear::redundant_gate_runs(
+                                                    &records,
+                                                    &covered_pairs,
+                                                    &waived,
+                                                    window,
+                                                );
+                                            QueryValue::Value {
+                                                value: value as f64,
+                                                evidence_refs,
+                                            }
+                                        }
+                                        Err(reason) => unavailable(reason),
+                                    }
+                                }
+                            };
+                            results.insert("linear.redundant_gate_runs".to_owned(), value);
+                        }
+                    }
+                    Err(reason) => {
+                        for query in gate_queries
+                            .into_iter()
+                            .filter(|query| needed.contains(*query))
+                        {
+                            results.insert(query.to_owned(), unavailable(reason.clone()));
+                        }
+                    }
+                }
+            }
+            (Err(reason), _) | (_, Err(reason)) => {
+                for query in gate_queries
+                    .into_iter()
+                    .filter(|query| needed.contains(*query))
+                {
+                    results.insert(query.to_owned(), unavailable(reason.clone()));
+                }
+            }
+        }
+    }
+
+    if needed.contains("linear.outside_diff_findings_without_failure") {
+        if let Err(reason) = github_evidence {
+            results.insert(
+                "linear.outside_diff_findings_without_failure".to_owned(),
+                unavailable(reason.to_owned()),
+            );
+        }
+    }
+    results
+}
+
+fn read_linear_review_comments(
+    linear: &crate::LinearGraphQlSource,
+    repositories: &[String],
+) -> Result<Vec<crate::MarkerComment>, String> {
+    if repositories.is_empty() {
+        return Err("retro config has no repositories for Linear review evidence".to_owned());
+    }
+    let mut comments = Vec::new();
+    for repository in repositories {
+        comments.extend(linear.fetch_marker_comments(
+            "<!-- reviewer ",
+            &format!("repo={repository} "),
+            None,
+        )?);
+        comments.extend(linear.fetch_marker_comments(
+            "<!-- reviewer-dispositions ",
+            &format!("repo={repository} "),
+            None,
+        )?);
+    }
+    Ok(comments)
+}
+
+/// Reads complete Linear marker populations and builds the Linear-owned GitHub PR joins.
+///
+/// The result includes reviewer heads, successful gate heads, and known waivers. The Linear source
+/// cannot establish file coverage, ticket-start state, or transcript dispatch, so those fields stay
+/// unknown for the GitHub reducer.
+#[implements("FR-047-AC-1")]
+pub fn linear_pull_request_joins(
+    repositories: &[String],
+) -> Result<BTreeMap<(String, u64), github_rules::PullRequestJoins>, String> {
+    if repositories.is_empty() {
+        return Err("retro config has no repositories for Linear PR joins".to_owned());
+    }
+    let linear = crate::LinearGraphQlSource::from_env().map_err(|error| error.to_string())?;
+    let comments = read_linear_join_comments(&linear, repositories)?;
+    linear::pull_request_joins(
+        &comments,
+        true,
+        &[],
+        0,
+        &EvalWindow {
+            start_ms: 0,
+            end_ms: 0,
+        },
+    )
+}
+
+/// Extends Linear marker joins to the already-read guarded GitHub PR population.
+///
+/// Supplying GitHub rows lets the complete Linear marker read distinguish an empty marker set from
+/// missing data, derives reviewer timing evidence, and adds first Linear `started` state times for
+/// tickets when `include_ticket_started_at` is selected.
+#[implements("FR-047-AC-1")]
+pub fn linear_pull_request_joins_for_evidence(
+    repositories: &[String],
+    github_rows: &[github_rules::PullRequestEvidence],
+    include_ticket_started_at: bool,
+    review_age_limit_hours: u64,
+    window: &EvalWindow,
+) -> Result<BTreeMap<(String, u64), github_rules::PullRequestJoins>, String> {
+    let linear = crate::LinearGraphQlSource::from_env().map_err(|error| error.to_string())?;
+    let comments = read_linear_join_comments(&linear, repositories)?;
+    let mut joins =
+        linear::pull_request_joins(&comments, true, github_rows, review_age_limit_hours, window)?;
+    if !include_ticket_started_at {
+        return Ok(joins);
+    }
+    let mut ticket_starts = BTreeMap::<String, Option<i64>>::new();
+    for row in github_rows {
+        let join = joins
+            .entry((row.repository.clone(), row.number))
+            .or_default();
+        join.reviewed_heads.get_or_insert_with(BTreeSet::new);
+        join.gate_covered_heads.get_or_insert_with(BTreeSet::new);
+        join.waived_for_gate.get_or_insert(false);
+        join.waived_for_review.get_or_insert(false);
+        join.ready_merge_waived.get_or_insert(false);
+        let Some(ticket) = row.ticket.as_deref() else {
+            continue;
+        };
+        if !ticket_starts.contains_key(ticket) {
+            let start = match linear.fetch_ticket_started_at(ticket) {
+                Ok(start) => start,
+                Err(_) => break,
+            };
+            let millis = start
+                .map(|seconds| seconds * 1000.0)
+                .map(|millis| {
+                    if !millis.is_finite() || millis < i64::MIN as f64 || millis > i64::MAX as f64 {
+                        Err(format!(
+                            "Linear start time is out of range for ticket {ticket}"
+                        ))
+                    } else {
+                        Ok(millis.round() as i64)
+                    }
+                })
+                .transpose()?;
+            ticket_starts.insert(ticket.to_owned(), millis);
+        }
+        join.ticket_started_at_ms = ticket_starts.get(ticket).copied().flatten();
+    }
+    Ok(joins)
+}
+
+fn read_linear_join_comments(
+    linear: &crate::LinearGraphQlSource,
+    repositories: &[String],
+) -> Result<Vec<crate::MarkerComment>, String> {
+    if repositories.is_empty() {
+        return Err("retro config has no repositories for Linear PR joins".to_owned());
+    }
+    let mut comments = Vec::new();
+    for repository in repositories {
+        comments.extend(linear.fetch_marker_comments(
+            "<!-- reviewer ",
+            &format!("repo={repository} "),
+            None,
+        )?);
+        comments.extend(linear.fetch_marker_comments(
+            "<!-- lead-record ",
+            &format!("repo={repository} "),
+            None,
+        )?);
+    }
+    Ok(comments)
+}
+
+fn read_linear_gate_comments(
+    linear: &crate::LinearGraphQlSource,
+    repositories: &[String],
+) -> Result<Vec<crate::MarkerComment>, String> {
+    if repositories.is_empty() {
+        return Err("retro config has no repositories for Linear gate evidence".to_owned());
+    }
+    let mut comments = Vec::new();
+    for repository in repositories {
+        comments.extend(linear.fetch_marker_comments(
+            "<!-- lead-record ",
+            &format!("repo={repository} "),
+            None,
+        )?);
+    }
+    Ok(comments)
+}
+
+fn waiver_prs(comments: &[crate::MarkerComment], rule: &str) -> BTreeSet<String> {
+    comments
+        .iter()
+        .filter_map(|comment| {
+            let fields = lead_record_fields(comment.body.lines().next().unwrap_or_default())?.1;
+            if fields.get("kind") != Some(&"waiver") {
+                return None;
+            }
+            let waived_rule = fields.get("covers")?;
+            if *waived_rule != rule && !waived_rule.starts_with(&format!("{rule}-")) {
+                return None;
+            }
+            let repo = fields.get("repo")?;
+            let pr = fields.get("pr")?;
+            linear::normalize_pr_key(repo, pr).ok()
+        })
+        .collect()
+}
+
+fn pull_requests_from_github_evidence(
+    rows: &[github_rules::PullRequestEvidence],
+) -> Vec<super::sources::PullRequest> {
+    rows.iter()
+        .map(|row| super::sources::PullRequest {
+            closed_at: row.closed_at_ms.map(|at| at as f64 / 1000.0),
+            reopen_events: None,
+            repo: row.repository.clone(),
+            number: row.number,
+            open: row.merged_at_ms.is_none() && row.closed_at_ms.is_none(),
+            draft: false,
+            created_at: row.created_at_ms.map_or(0.0, |at| at as f64 / 1000.0),
+            merged_at: row.merged_at_ms.map(|at| at as f64 / 1000.0),
+            updated_at: row
+                .merged_at_ms
+                .or(row.closed_at_ms)
+                .map_or(0.0, |at| at as f64 / 1000.0),
+            additions: 0,
+            deletions: 0,
+            review_decision: None,
+            force_pushes: None,
+        })
+        .collect()
+}
+
+fn gate_head_ancestry_pairs(
+    records: &[linear::GateRecord],
+    github_rows: &[github_rules::PullRequestEvidence],
+    waived_prs: &BTreeSet<String>,
+    window: &EvalWindow,
+) -> Result<BTreeSet<(String, String, String)>, String> {
+    let start = window.start_ms as f64 / 1000.0;
+    let end = window.end_ms as f64 / 1000.0;
+    let mut covered = BTreeSet::new();
+    for current in records.iter().filter(|record| {
+        record.created_at >= start && record.created_at < end && !waived_prs.contains(&record.pr)
+    }) {
+        let (repository, number) = current
+            .pr
+            .rsplit_once('#')
+            .and_then(|(repo, number)| number.parse::<u64>().ok().map(|number| (repo, number)))
+            .ok_or_else(|| format!("gate record has invalid PR key {:?}", current.pr))?;
+        let row = github_rows
+            .iter()
+            .find(|row| row.repository == repository && row.number == number)
+            .ok_or_else(|| format!("GitHub evidence is incomplete for gate PR {}", current.pr))?;
+        let ancestry = row.commit_ancestry.as_ref().ok_or_else(|| {
+            format!(
+                "GitHub commit ancestry is incomplete for gate PR {}",
+                current.pr
+            )
+        })?;
+        for earlier in records.iter().filter(|earlier| {
+            earlier.pr == current.pr && earlier.exit == 0 && earlier.started_at < current.started_at
+        }) {
+            if commit_is_ancestor(&earlier.head, &current.head, ancestry) {
+                covered.insert((
+                    current.pr.clone(),
+                    earlier.head.clone(),
+                    current.head.clone(),
+                ));
+            }
+        }
+    }
+    Ok(covered)
+}
+
+fn commit_is_ancestor(
+    ancestor: &str,
+    descendant: &str,
+    ancestry: &BTreeMap<String, BTreeSet<String>>,
+) -> bool {
+    if ancestor == descendant {
+        return true;
+    }
+    let mut pending = vec![descendant.to_owned()];
+    let mut visited = BTreeSet::new();
+    while let Some(commit) = pending.pop() {
+        if !visited.insert(commit.clone()) {
+            continue;
+        }
+        for parent in ancestry.get(&commit).into_iter().flatten() {
+            if parent == ancestor {
+                return true;
+            }
+            pending.push(parent.clone());
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 fn pr_methods_count(
     comments: &[crate::MarkerComment],
@@ -2052,6 +2664,38 @@ pub fn ledger_adapters(
     projects: &[String],
     window: &EvalWindow,
 ) -> BTreeMap<String, QueryValue> {
+    ledger_adapters_impl(specs, ledger_path, ready_state, projects, window, None)
+}
+
+/// Reads Fleet ledger values while restricting lane-order queries to explicit session
+/// addresses belonging to this team.
+#[implements("FR-047-AC-1")]
+pub fn ledger_adapters_scoped(
+    specs: &[RoleSpec],
+    ledger_path: Option<&Path>,
+    ready_state: Option<&str>,
+    projects: &[String],
+    window: &EvalWindow,
+    lane_order_scope: &LaneOrderScope,
+) -> BTreeMap<String, QueryValue> {
+    ledger_adapters_impl(
+        specs,
+        ledger_path,
+        ready_state,
+        projects,
+        window,
+        Some(lane_order_scope),
+    )
+}
+
+fn ledger_adapters_impl(
+    specs: &[RoleSpec],
+    ledger_path: Option<&Path>,
+    ready_state: Option<&str>,
+    projects: &[String],
+    window: &EvalWindow,
+    lane_order_scope: Option<&LaneOrderScope>,
+) -> BTreeMap<String, QueryValue> {
     let path = ledger_path
         .map(Path::to_owned)
         .or_else(|| crate::fleet::ledger::default_path().ok());
@@ -2104,6 +2748,11 @@ pub fn ledger_adapters(
                 }),
             (Ok(()), None) => Ok(Vec::new()),
         };
+        let rows = if matches!(view, "lane_orders_due" | "lane_orders_not_taken_up") {
+            rows.and_then(|rows| ledger::scope_lane_order_rows(specs, view, rows, lane_order_scope))
+        } else {
+            rows
+        };
         views.insert(view.to_owned(), rows);
     }
     let mut values = ledger::adapters(
@@ -2140,7 +2789,7 @@ pub fn ledger_adapters(
         values.insert(
             "ledger.idle_lane_minutes_during_build_pause".into(),
             QueryValue::NotApplicable {
-                reason: "no pause producer".into(),
+                reason: "builds are never paused".into(),
                 evidence_refs: Vec::new(),
             },
         );
@@ -2179,6 +2828,12 @@ pub fn session_turn_rows(
     window: &EvalWindow,
 ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, String> {
     ledger::read_view_rows(ledger_path, "session_turn", "started_at", window)
+}
+
+/// Reports whether the installed read-only ledger schema has explicit transcript IDs.
+#[implements("FR-047-AC-5")]
+pub fn session_turn_has_transcript_id(ledger_path: &Path) -> Result<bool, String> {
+    ledger::session_turn_has_transcript_id(ledger_path)
 }
 
 fn requested_is_pause_metric(specs: &[RoleSpec]) -> bool {
@@ -2629,7 +3284,7 @@ pub fn declared_adapters(specs: &[RoleSpec]) -> BTreeMap<String, QueryValue> {
         let query = rule.query_or_rubric.as_str();
         let (reason, applicable) = match query {
             "ledger.idle_lane_minutes_during_build_pause" => {
-                ("no pause producer".to_owned(), false)
+                ("builds are never paused".to_owned(), false)
             }
             "linear.waiver_records" => (
                 "waiver records are judgement evidence, not a numeric producer".to_owned(),
@@ -3088,6 +3743,22 @@ mod tests {
 
     #[test]
     #[trace("FR-047-AC-1")]
+    fn missing_department_configuration_has_the_accumulation_reason() {
+        let record: super::super::Record = serde_json::from_str(
+            r#"{"schema_version":1,"kind":"snapshot","taken_at":"2023-11-14T22:13:20Z","team":"TEST","window":"24h","metrics":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            retro_record_value(&record, "claims_without_movement"),
+            QueryValue::Unavailable {
+                reason: "installed department producer needs TEST department configuration and one complete 24-hour snapshot window".into(),
+                evidence_refs: vec!["retro:department:claims_without_movement:2023-11-14T22:13:20Z".into()],
+            }
+        );
+    }
+
+    #[test]
+    #[trace("FR-047-AC-1")]
     fn build_pause_metric_is_not_applicable_without_a_producer() {
         let spec = RoleSpec {
             role: "orchestrator".into(),
@@ -3108,7 +3779,10 @@ mod tests {
         let results = evaluate_rules(&spec.rules, &adapters);
         assert_eq!(results[0].status, RuleStatus::NotApplicable);
         assert_eq!(results[0].value, None);
-        assert_eq!(results[0].reason.as_deref(), Some("no pause producer"));
+        assert_eq!(
+            results[0].reason.as_deref(),
+            Some("builds are never paused")
+        );
     }
 
     #[test]

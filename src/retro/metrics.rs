@@ -78,6 +78,7 @@ pub fn collect_selected(
 }
 
 #[implements("FR-047-AC-1")]
+#[implements("FR-024-AC-19")]
 fn collect_inner(
     config: &RetroConfig,
     frame: Frame,
@@ -95,6 +96,7 @@ fn collect_inner(
         "path_closed",
         "intake_new",
         "net_closed_minus_new",
+        "tickets_closed_per_hour",
         "gates_remaining",
         "path_closed_unverified",
         "done_reopened",
@@ -123,6 +125,7 @@ fn collect_inner(
                     "path_closed",
                     "intake_new",
                     "net_closed_minus_new",
+                    "tickets_closed_per_hour",
                     "gates_remaining",
                     "path_closed_unverified",
                 ]) {
@@ -225,11 +228,12 @@ fn collect_inner(
     out.metrics
 }
 
-const LINEAR_SNAPSHOT_IDS: [&str; 11] = [
+const LINEAR_SNAPSHOT_IDS: [&str; 12] = [
     "path_remaining",
     "path_closed",
     "intake_new",
     "net_closed_minus_new",
+    "tickets_closed_per_hour",
     "gates_remaining",
     "path_closed_unverified",
     "done_reopened",
@@ -315,6 +319,10 @@ impl Out<'_> {
             "net_closed_minus_new" => (
                 "linear",
                 format!("project and path issues completed in the window (counted once) minus intake_new; {window}"),
+            ),
+            "tickets_closed_per_hour" => (
+                "linear+github",
+                format!("unique configured project and gate-path issues completed in the window with at least one attached merged pull request, divided by window hours; {window}"),
             ),
             "gates_remaining" => ("linear", format!("gate tickets not completed; gates={gates}")),
             "path_closed_unverified" => (
@@ -589,6 +597,7 @@ fn count(value: usize) -> f64 {
 }
 
 #[implements("FR-047-AC-1")]
+#[implements("FR-024-AC-19")]
 fn progress(
     out: &mut Out<'_>,
     scope: &Scope<'_>,
@@ -618,9 +627,10 @@ fn progress(
         "path_closed",
         "intake_new",
         "net_closed_minus_new",
+        "tickets_closed_per_hour",
         "path_closed_unverified",
     ]) {
-        let path_done = window_progress(out, scope, history);
+        let path_done = window_progress(out, scope, history, sources.github);
         if out.wants("path_closed_unverified") {
             let unverified = path_done.and_then(|done| {
                 let candidates = scope
@@ -636,23 +646,26 @@ fn progress(
     }
 }
 
-/// `path_closed`, `intake_new` and `net_closed_minus_new`: the progress metrics that depend only
+/// Progress metrics that depend only
 /// on issue creation and state history inside the frame. Returns the path issues completed in
 /// the frame.
 #[implements("FR-047-AC-1")]
+#[implements("FR-024-AC-19")]
 fn window_progress(
     out: &mut Out<'_>,
     scope: &Scope<'_>,
     history: &mut History<'_>,
+    github: &dyn GithubSource,
 ) -> Result<BTreeSet<IssueId>, String> {
     let frame = scope.frame;
     let needs_path_done = out.wants_any(&["path_closed", "path_closed_unverified"]);
     let needs_net = out.wants("net_closed_minus_new");
+    let needs_closed_rate = out.wants("tickets_closed_per_hour");
     let mut wanted = Vec::new();
-    if needs_path_done || needs_net {
+    if needs_path_done || needs_net || needs_closed_rate {
         wanted.extend(scope.path_ok().unwrap_or_default().iter().copied());
     }
-    if needs_net {
+    if needs_net || needs_closed_rate {
         wanted.extend(scope.projects_ok().unwrap_or_default().iter().copied());
     }
     if !wanted.is_empty() {
@@ -700,6 +713,26 @@ fn window_progress(
         })();
         out.put("net_closed_minus_new", net);
     }
+    if needs_closed_rate {
+        let closed_rate = (|| {
+            let mut eligible = scope.path_ok()?.to_vec();
+            eligible.extend(scope.projects_ok()?);
+            eligible.sort_by(|left, right| left.id.cmp(&right.id));
+            eligible.dedup_by(|left, right| left.id == right.id);
+            let closed = history.changed_in_window(&eligible, frame, to_completed)?;
+            let candidates = eligible
+                .into_iter()
+                .filter(|issue| closed.contains(&issue.id))
+                .collect::<Vec<_>>();
+            let unverified = unverified_count_with_github(&candidates, github)? as usize;
+            let merged_closed = candidates.len().saturating_sub(unverified);
+            if frame.hours() <= 0.0 {
+                return Err("closed-ticket rate requires a positive frame duration".to_owned());
+            }
+            Ok(count(merged_closed) / frame.hours())
+        })();
+        out.put("tickets_closed_per_hour", closed_rate);
+    }
     path_done
 }
 
@@ -738,6 +771,11 @@ fn attached_pull_requests(issue: &Issue) -> Vec<(String, u64)> {
 }
 
 fn unverified_count(candidates: &[&Issue], sources: &Sources<'_>) -> Outcome {
+    unverified_count_with_github(candidates, sources.github)
+}
+
+#[implements("FR-024-AC-19")]
+fn unverified_count_with_github(candidates: &[&Issue], github: &dyn GithubSource) -> Outcome {
     let mut unverified = 0;
     for issue in candidates {
         if !issue.attachments_complete {
@@ -748,8 +786,7 @@ fn unverified_count(candidates: &[&Issue], sources: &Sources<'_>) -> Outcome {
         }
         let mut merged = false;
         for (repo, number) in attached_pull_requests(issue) {
-            merged |= sources
-                .github
+            merged |= github
                 .pull_request(&repo, number)
                 .map_err(|error| format!("GitHub unavailable: {repo}#{number}: {error}"))?
                 .merged;
@@ -1466,13 +1503,14 @@ pub const NOT_RECONSTRUCTIBLE: &str = "not reconstructible";
 
 /// The metrics a past day can be measured for from issue creation, state history and pull
 /// request timestamps (FR-028).
-pub const RECONSTRUCTIBLE: [&str; 7] = [
+pub const RECONSTRUCTIBLE: [&str; 8] = [
     "prs_merged_per_hour",
     "pr_cycle_median_hours",
     "pr_cycle_p90_hours",
     "path_closed",
     "intake_new",
     "net_closed_minus_new",
+    "tickets_closed_per_hour",
     "done_reopened",
 ];
 
@@ -1509,7 +1547,7 @@ pub fn collect_history(
             match &workspace {
                 Ok(snapshot) => {
                     let scope = Scope::new(config, snapshot, *frame);
-                    let _ = window_progress(&mut out, &scope, &mut history);
+                    let _ = window_progress(&mut out, &scope, &mut history, github);
                     rework_issues(&mut out, &scope, &mut history);
                 }
                 Err(error) => {
@@ -1534,6 +1572,9 @@ pub fn collect_history(
 mod selected_tests {
     use super::*;
     use crate::agents::AgentsReport;
+    use crate::model::{
+        Issue, IssueId, Project, ProjectId, ProjectStatusCategory, TeamKey, WorkflowStateType,
+    };
     use crate::retro::sources::{
         GateLine, LabeledIssue, MainCommit, PullRequest, PullRequestInfo, StateChange,
     };
@@ -1599,6 +1640,169 @@ mod selected_tests {
         fn processes(&self) -> Result<Vec<crate::retro::sources::ProcessRow>, String> {
             panic!("unrequested process read")
         }
+    }
+
+    struct ClosedRateSources {
+        snapshot: WorkspaceSnapshot,
+    }
+
+    impl LinearSource for ClosedRateSources {
+        fn workspace(&self, _: f64) -> Result<WorkspaceSnapshot, String> {
+            Ok(self.snapshot.clone())
+        }
+        fn project_open_count(&self, _: &str) -> Result<usize, String> {
+            Ok(0)
+        }
+        fn state_history(&self, _issue_id: &str) -> Result<Vec<StateChange>, String> {
+            Ok(vec![StateChange {
+                at: 5_000.0,
+                from: Some(WorkflowStateType::Started),
+                to: Some(WorkflowStateType::Completed),
+            }])
+        }
+        fn marker_lines(&self, _: &str, _: &str) -> Result<Vec<String>, String> {
+            Ok(Vec::new())
+        }
+        fn open_issues_with_label(&self, _: &str) -> Result<Vec<LabeledIssue>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl GithubSource for ClosedRateSources {
+        fn pull_requests(&self, _: &str, _: f64) -> Result<Vec<PullRequest>, String> {
+            Ok(Vec::new())
+        }
+        fn pull_request(&self, _: &str, number: u64) -> Result<PullRequestInfo, String> {
+            Ok(PullRequestInfo {
+                merged: number == 1,
+                updated_at: 5_100.0,
+            })
+        }
+        fn main_commits(&self, _: &str, _: &str, _: f64) -> Result<Vec<MainCommit>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl crate::retro::sources::AgentSource for ClosedRateSources {
+        fn report(&self, _: &[String]) -> Result<AgentsReport, String> {
+            Ok(AgentsReport {
+                schema_version: 1,
+                teams: Vec::new(),
+                idle_after_secs: 0,
+                agents: Vec::new(),
+                missing_teams: Vec::new(),
+                errors: Vec::new(),
+                missing_hosts: Vec::new(),
+                ready_queue_error: None,
+                ready_queue_warnings: Vec::new(),
+            })
+        }
+    }
+
+    impl crate::retro::sources::GateLogSource for ClosedRateSources {
+        fn lines(&self, _: &std::path::Path) -> Result<Vec<GateLine>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl crate::retro::sources::RelaySource for ClosedRateSources {
+        fn pending_sent_at_ms(&self, _: &str) -> Result<Vec<i64>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl crate::retro::sources::LocalSource for ClosedRateSources {
+        fn prunable_worktrees(&self, _: &std::path::Path) -> Result<u64, String> {
+            Ok(0)
+        }
+        fn disk_bytes(&self, _: &std::path::Path) -> Result<u64, String> {
+            Ok(0)
+        }
+        fn processes(&self) -> Result<Vec<crate::retro::sources::ProcessRow>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    #[trace("FR-024-AC-19")]
+    fn tickets_closed_per_hour_requires_a_completed_issue_with_a_merged_attached_pr() {
+        let config = RetroConfig::parse(
+            std::path::Path::new("eval.json"),
+            r#"{"team":"TEST","gate_tickets":[],"projects":["P"],"repos":[]}"#,
+        )
+        .expect("parse retro config");
+        let issue = |id: &str, number: u64| Issue {
+            id: IssueId(id.to_owned()),
+            identifier: id.to_owned(),
+            title: id.to_owned(),
+            description: None,
+            state: "Done".to_owned(),
+            state_name: "Done".to_owned(),
+            state_type: WorkflowStateType::Completed,
+            parent_id: None,
+            team_key: TeamKey("TEST".to_owned()),
+            assignee_id: None,
+            assignee_name: None,
+            project_id: Some(ProjectId("project-1".to_owned())),
+            project_milestone_id: None,
+            priority: 0.0,
+            sort_order: 0.0,
+            blocked_by: Vec::new(),
+            created_at: Some("1970-01-01T00:01:00Z".to_owned()),
+            updated_at: Some("1970-01-01T01:23:20Z".to_owned()),
+            attachment_urls: vec![format!(
+                "https://github.com/agent-ix/ix-board/pull/{number}"
+            )],
+            attachments_complete: true,
+            started_at: None,
+            completed_at: None,
+            pull_requests: Vec::new(),
+        };
+        let sources = ClosedRateSources {
+            snapshot: WorkspaceSnapshot {
+                projects: vec![Project {
+                    id: ProjectId("project-1".to_owned()),
+                    identifier: None,
+                    name: "P".to_owned(),
+                    updated_at: None,
+                    description: String::new(),
+                    content: None,
+                    status: "Started".to_owned(),
+                    status_name: None,
+                    status_category: ProjectStatusCategory::Started,
+                    priority: 0,
+                    sort_order: 0.0,
+                    target_date: None,
+                    team_keys: vec![TeamKey("TEST".to_owned())],
+                    milestones: Vec::new(),
+                    initiatives: Vec::new(),
+                }],
+                issues: vec![issue("TEST-1", 1), issue("TEST-2", 2)],
+                fetched_at: 7_200,
+            },
+        };
+        let sources_bundle = Sources {
+            linear: &sources,
+            github: &sources,
+            agents: &sources,
+            gate_log: &sources,
+            relay: &sources,
+            local: &sources,
+        };
+        let metrics = collect_selected(
+            &config,
+            Frame {
+                now: 7_200.0,
+                window_secs: 3_600,
+                end_exclusive: true,
+            },
+            &sources_bundle,
+            &BTreeSet::from(["tickets_closed_per_hour".to_owned()]),
+        );
+        let metric = &metrics["tickets_closed_per_hour"];
+        assert_eq!(metric.status, Status::Ok, "{metric:?}");
+        assert_eq!(metric.value, Some(1.0));
+        assert_eq!(metric.unit, "tickets_per_hour");
     }
 
     #[test]

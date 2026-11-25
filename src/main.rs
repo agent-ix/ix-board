@@ -1734,8 +1734,8 @@ fn run_retro_backfill(
 #[implements("FR-047-AC-3")]
 #[implements("FR-047-AC-7")]
 #[implements("FR-047-AC-9")]
-#[implements("FR-047-AC-2")]
 #[implements("FR-047-AC-4")]
+#[implements("FR-047-AC-8")]
 fn run_retro_eval(
     config_path: &std::path::Path,
     team_override: Option<&str>,
@@ -1743,6 +1743,11 @@ fn run_retro_eval(
     role_filter: Option<&str>,
     session_filter: Option<&str>,
 ) -> Result<retro::eval::EvalReport, Error> {
+    let run_scope = retro::eval::EvalRunScope::start(
+        std::time::Duration::from_secs(240),
+        retro::eval::DEFAULT_EVAL_LINEAR_REQUEST_LIMIT,
+    )
+    .map_err(|error| retro::RetroError::Evaluation(error.to_string()))?;
     let request_start = retro::eval::request_count_snapshot();
     let mut config = retro_eval_stage("configuration", || retro::RetroConfig::load(config_path))
         .map_err(retro::RetroError::from)?;
@@ -1754,6 +1759,13 @@ fn run_retro_eval(
         .map_err(retro::RetroError::Evaluation)?;
     let source_specs = retro::eval::specs_with_objective_metric_queries(&specs);
     let duration = retro::parse_window(since).map_err(retro::RetroError::from)?;
+    const MAX_EVAL_WINDOW_SECONDS: u64 = 31 * 24 * 60 * 60;
+    if duration > MAX_EVAL_WINDOW_SECONDS {
+        return Err(retro::RetroError::Evaluation(format!(
+            "--since exceeds the maximum retro-eval window of {MAX_EVAL_WINDOW_SECONDS} seconds"
+        ))
+        .into());
+    }
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0_i64, |elapsed| {
@@ -1777,18 +1789,21 @@ fn run_retro_eval(
         }
         specs.retain(|spec| spec.role == role);
     }
-    let store_read = retro_eval_stage("retro_store", || {
+    let store_read = retro_eval_stage_bounded("retro_store", &run_scope, || {
         retro::Store::from_env(&team)
             .and_then(|store| store.read_all())
             .map_err(|error| error.to_string())
-    });
+    })
+    .unwrap_or_else(Err);
     let records = store_read
         .as_ref()
         .map(Vec::as_slice)
         .map_err(String::as_str);
-    let current_live_record = retro_eval_stage("current.live_retro_record", || {
-        collect_eval_retro_record(&config, &window, &source_specs, &settings)
-    });
+    let current_live_record =
+        retro_eval_stage_bounded("current.live_retro_record", &run_scope, || {
+            collect_eval_retro_record(&config, &window, &source_specs, &settings)
+        })
+        .unwrap_or_else(Err);
     let fleet_settings = ix_board::settings_value().ok().flatten();
     let fleet_config = ix_board::fleet::FleetConfig::from_toml(
         fleet_settings.as_ref(),
@@ -1801,79 +1816,16 @@ fn run_retro_eval(
     let fleet_ledger_path = fleet_config
         .as_ref()
         .and_then(|config| ix_board::fleet::ledger::resolve_path(config).ok());
-    let mut current_adapters = retro::eval::declared_adapters(&source_specs);
-    current_adapters.extend(retro::eval::retro_adapters(&source_specs, records, &window));
-    if let Ok(record) = &current_live_record {
-        current_adapters.extend(retro::eval::retro_record_adapters(
-            &source_specs,
-            Ok(record),
-        ));
-    }
-    current_adapters.extend(retro_eval_stage("current.prometheus", || {
-        retro::eval::prometheus_adapters(&source_specs, prometheus_url, &window)
-    }));
-    current_adapters.extend(retro_eval_stage("current.linear_reviewed_prs", || {
-        retro::eval::linear_reviewed_prs_adapters(
-            &source_specs,
-            &config.repos,
-            &window,
-            settings.github_guard_state_path.as_deref(),
-            settings.github_guard_max_bytes,
-        )
-    }));
-    current_adapters.extend(retro_eval_stage("current.linear_markers", || {
-        retro::eval::linear_marker_adapters(&source_specs, &config.repos, &window)
-    }));
-    current_adapters.extend(retro_eval_stage("current.github_merged_prs", || {
-        retro::eval::github_merged_prs_adapters(
-            &source_specs,
-            &config.repos,
-            &window,
-            settings.github_guard_state_path.as_deref(),
-            settings.github_guard_max_bytes,
-        )
-    }));
-    current_adapters.extend(retro_eval_stage(
-        "current.linear_merge_without_review",
-        || {
-            retro::eval::linear_merged_prs_without_review_adapters(
-                &source_specs,
-                &config.repos,
-                &window,
-                settings.github_guard_state_path.as_deref(),
-                settings.github_guard_max_bytes,
-            )
-        },
-    ));
-    current_adapters.extend(retro_eval_stage("current.linear_gate_records", || {
-        retro::eval::linear_gate_record_adapters(
-            &source_specs,
-            &config.repos,
-            config.gate_log.as_deref(),
-            &window,
-        )
-    }));
-    current_adapters.extend(retro_eval_stage("current.gate_log", || {
-        retro::eval::gate_log_adapters(&source_specs, config.gate_log.as_deref(), &window)
-    }));
-    current_adapters.extend(retro_eval_stage("current.fleet_ledger", || {
-        retro::eval::ledger_adapters(
-            &source_specs,
-            fleet_ledger_path.as_deref(),
-            settings.ready_state.as_deref(),
-            &config.projects,
-            &window,
-        )
-    }));
-    let mut previous_adapters = retro::eval::declared_adapters(&source_specs);
-    previous_adapters.extend(retro::eval::retro_adapters(
-        &source_specs,
-        records,
-        &previous_window,
-    ));
-    // Previous-window source evidence is never recomputed from today's live state. Only the
-    // append-only retro store can supply prior-window values; other sources stay unavailable.
-    let session_ledger_rows = retro_eval_stage("session_turn_ledger", || {
+    let tick_settings =
+        ix_board::fleet::tick::TickSettings::from_toml(fleet_settings.as_ref()).ok();
+    let needs_relay = source_specs
+        .iter()
+        .flat_map(|spec| &spec.rules)
+        .any(|rule| rule.method == "deterministic" && rule.query_or_rubric.starts_with("relay."));
+    let relay_settings = needs_relay
+        .then(|| relay_core::config::load_core(relay_core::config::CoreFlags::default()).ok())
+        .flatten();
+    let session_ledger_rows = retro_eval_stage_bounded("session_turn_ledger", &run_scope, || {
         fleet_ledger_path
             .as_deref()
             .ok_or_else(|| "fleet ledger path is unavailable for session_turn".to_owned())
@@ -1884,11 +1836,278 @@ fn run_retro_eval(
                 };
                 retro::eval::session_turn_rows(path, &source_window)
             })
-    });
-    let session_rows = session_ledger_rows
+    })
+    .unwrap_or_else(Err);
+    let all_session_rows = session_ledger_rows
         .as_ref()
         .map(Vec::as_slice)
         .unwrap_or_default();
+    let scoped_session_rows = all_session_rows
+        .iter()
+        .filter(|row| {
+            row.get("session_addr")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|address| address_belongs_to_team(address, &config.herdr_teams))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let scoped_session_ledger_rows = session_ledger_rows
+        .as_ref()
+        .map(|_| scoped_session_rows.clone())
+        .map_err(Clone::clone);
+    let session_rows = scoped_session_rows.as_slice();
+    let mut sessions_by_role =
+        std::collections::BTreeMap::<String, std::collections::BTreeSet<String>>::new();
+    for row in session_rows {
+        let Some(started_at) = row.get("started_at").and_then(serde_json::Value::as_i64) else {
+            continue;
+        };
+        if started_at < window.start_ms || started_at >= window.end_ms {
+            continue;
+        }
+        let (Some(address), Some(role)) = (
+            row.get("session_addr").and_then(serde_json::Value::as_str),
+            row.get("session_role").and_then(serde_json::Value::as_str),
+        ) else {
+            continue;
+        };
+        if !address_belongs_to_team(address, &config.herdr_teams) {
+            continue;
+        }
+        sessions_by_role
+            .entry(role.to_owned())
+            .or_default()
+            .insert(address.to_owned());
+    }
+    let lane_order_scope = retro::eval::LaneOrderScope {
+        team_id: Some(team.clone()),
+        sessions_by_role,
+    };
+    let session_lane_order_adapters =
+        retro_eval_stage_bounded("current.session_lane_orders", &run_scope, || {
+            collect_session_lane_order_adapters(
+                &source_specs,
+                fleet_ledger_path.as_deref(),
+                settings.ready_state.as_deref(),
+                &config.projects,
+                &window,
+                &team,
+                &config.herdr_teams,
+                session_rows,
+            )
+        })
+        .unwrap_or_else(Err)
+        .unwrap_or_default();
+    let mut current_adapters = retro::eval::declared_adapters(&source_specs);
+    current_adapters.extend(retro::eval::retro_adapters(&source_specs, records, &window));
+    current_adapters.extend(retro::eval::retro_record_adapters(
+        &source_specs,
+        current_live_record.as_ref().map_err(String::as_str),
+    ));
+    current_adapters.extend(retro_eval_bounded_adapters(
+        "current.prometheus",
+        &run_scope,
+        &source_specs,
+        "prom.",
+        || retro::eval::prometheus_adapters(&source_specs, prometheus_url, &window),
+    ));
+    current_adapters.extend(retro_eval_bounded_adapters(
+        "current.linear_reviewed_prs",
+        &run_scope,
+        &source_specs,
+        "linear.",
+        || {
+            retro::eval::linear_reviewed_prs_adapters(
+                &source_specs,
+                &config.repos,
+                &window,
+                settings.github_guard_state_path.as_deref(),
+                settings.github_guard_max_bytes,
+            )
+        },
+    ));
+    current_adapters.extend(retro_eval_bounded_adapters(
+        "current.linear_markers",
+        &run_scope,
+        &source_specs,
+        "linear.",
+        || retro::eval::linear_marker_adapters(&source_specs, &config.repos, &window),
+    ));
+    current_adapters.extend(retro_eval_bounded_adapters(
+        "current.github_merged_prs",
+        &run_scope,
+        &source_specs,
+        "github.",
+        || {
+            retro::eval::github_merged_prs_adapters(
+                &source_specs,
+                &config.repos,
+                &window,
+                settings.github_guard_state_path.as_deref(),
+                settings.github_guard_max_bytes,
+            )
+        },
+    ));
+    current_adapters.extend(retro_eval_bounded_adapters(
+        "current.linear_merge_without_review",
+        &run_scope,
+        &source_specs,
+        "linear.",
+        || {
+            retro::eval::linear_merged_prs_without_review_adapters(
+                &source_specs,
+                &config.repos,
+                &window,
+                settings.github_guard_state_path.as_deref(),
+                settings.github_guard_max_bytes,
+            )
+        },
+    ));
+    current_adapters.extend(retro_eval_bounded_adapters(
+        "current.linear_gate_records",
+        &run_scope,
+        &source_specs,
+        "linear.",
+        || {
+            retro::eval::linear_gate_record_adapters(
+                &source_specs,
+                &config.repos,
+                config.gate_log.as_deref(),
+                &window,
+            )
+        },
+    ));
+    current_adapters.extend(retro_eval_bounded_adapters(
+        "current.gate_log",
+        &run_scope,
+        &source_specs,
+        "linear.",
+        || retro::eval::gate_log_adapters(&source_specs, config.gate_log.as_deref(), &window),
+    ));
+    current_adapters.extend(retro_eval_bounded_adapters(
+        "current.fleet_ledger",
+        &run_scope,
+        &source_specs,
+        "ledger.",
+        || {
+            retro::eval::ledger_adapters_scoped(
+                &source_specs,
+                fleet_ledger_path.as_deref(),
+                settings.ready_state.as_deref(),
+                &config.projects,
+                &window,
+                &lane_order_scope,
+            )
+        },
+    ));
+    let relay_timeout = fleet_config
+        .as_ref()
+        .map(|config| config.host_timeout)
+        .unwrap_or_else(|| std::time::Duration::from_secs(20));
+    current_adapters.extend(retro_eval_bounded_adapters(
+        "current.relay",
+        &run_scope,
+        &source_specs,
+        "relay.",
+        || {
+            retro::eval::relay::live_adapters(
+                &source_specs,
+                &window,
+                fleet_ledger_path.as_deref(),
+                relay_settings
+                    .as_ref()
+                    .map(|config| config.url.value.as_str()),
+                relay_settings
+                    .as_ref()
+                    .map(|config| config.prefix.value.as_str()),
+                tick_settings.as_ref(),
+                fleet_config.as_ref().map(|config| config.tick_interval),
+                relay_timeout,
+            )
+        },
+    ));
+    let transcript_turns = retro::eval::transcript::turn_rows_from_ledger(session_rows);
+    let needs_transcript = source_specs.iter().any(|spec| {
+        spec.rules.iter().any(|rule| {
+            rule.method == "deterministic"
+                && (rule.query_or_rubric.starts_with("transcript.")
+                    || rule.query_or_rubric == "github.review_ready_prs_undispatched")
+        }) || spec.metrics.iter().any(|metric| {
+            metric.query.starts_with("transcript.")
+                || metric.query == "github.ticket_start_to_pr_open_median_hours"
+        })
+    });
+    let transcript_id_column_present = needs_transcript
+        .then(|| {
+            retro_eval_stage_bounded("session_turn.transcript_id_schema", &run_scope, || {
+                fleet_ledger_path
+                    .as_deref()
+                    .ok_or_else(|| {
+                        "fleet ledger path is unavailable for transcript identity".to_owned()
+                    })
+                    .and_then(retro::eval::session_turn_has_transcript_id)
+            })
+            .unwrap_or_else(Err)
+        })
+        .unwrap_or(Ok(false));
+    let transcript_inventory = if needs_transcript {
+        retro_eval_stage_bounded("current.transcripts", &run_scope, || {
+            let home = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .ok_or_else(|| "transcript home directory is unavailable".to_owned())?;
+            Ok(retro::eval::transcript::discover_transcripts(
+                &home,
+                &transcript_turns,
+                retro::eval::transcript::TranscriptReadLimits::default(),
+            ))
+        })
+        .unwrap_or_else(Err)
+    } else {
+        Ok(retro::eval::transcript::TranscriptInventory {
+            turns: transcript_turns,
+            transcripts: std::collections::BTreeMap::new(),
+            complete: true,
+            unavailable_reasons: Vec::new(),
+        })
+    };
+    let transcript_context = retro::eval::transcript::AdapterContext {
+        review_age_limit_hours: settings.review_age_limit_hours,
+        ..Default::default()
+    };
+    let (role_transcript_adapters, session_transcript_adapters) = transcript_adapter_sets(
+        &source_specs,
+        &transcript_inventory,
+        &window,
+        &transcript_context,
+        &transcript_id_column_present,
+    );
+    current_adapters.extend(role_transcript_adapters);
+    let role_github_linear_adapters =
+        retro_eval_stage_bounded("current.role_github_linear", &run_scope, || {
+            collect_role_github_linear_adapters(
+                &source_specs,
+                &config.repos,
+                config.decision_label.as_deref(),
+                &window,
+                &settings,
+                &run_scope,
+                &transcript_inventory,
+                &transcript_id_column_present,
+                previous_window.start_ms,
+            )
+        })
+        .unwrap_or_else(|reason| {
+            unavailable_adapters_for_prefixes(&source_specs, &["github.", "linear."], &reason)
+        });
+    current_adapters.extend(role_github_linear_adapters);
+    let mut previous_adapters = retro::eval::declared_adapters(&source_specs);
+    previous_adapters.extend(retro::eval::retro_adapters(
+        &source_specs,
+        records,
+        &previous_window,
+    ));
+    // Previous-window source evidence is never recomputed from today's live state. Only the
+    // append-only retro store can supply prior-window values; other sources stay unavailable.
     let mut sessions =
         retro::eval::evaluate_sessions(&specs, &current_adapters, session_rows, &window, None);
     let mut role_session_counts = std::collections::BTreeMap::<String, usize>::new();
@@ -1899,6 +2118,39 @@ fn run_retro_eval(
         let Some(spec) = specs.iter().find(|spec| spec.role == session.role) else {
             continue;
         };
+        let session_key = (session.role.clone(), session.id.clone());
+        let mut session_source_adapters = session_transcript_adapters
+            .get(&session_key)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(adapters) = session_lane_order_adapters.get(&session_key) {
+            session_source_adapters.extend(adapters.clone());
+        }
+        if !session_source_adapters.is_empty() {
+            let scoped_rules = spec
+                .rules
+                .iter()
+                .filter(|rule| {
+                    rule.method == "deterministic"
+                        && (rule.query_or_rubric.starts_with("transcript.")
+                            || is_lane_order_query(&rule.query_or_rubric))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let results = retro::eval::evaluate_rules(&scoped_rules, &session_source_adapters);
+            for result in results {
+                if let Some(existing) = session.rules.iter_mut().find(|row| row.id == result.id) {
+                    *existing = result;
+                }
+            }
+            session.score = retro::eval::score(&session.rules);
+            session.failing_rules = session
+                .rules
+                .iter()
+                .filter(|rule| rule.status == retro::eval::RuleStatus::Fail)
+                .map(|rule| rule.id.clone())
+                .collect();
+        }
         session.objective_metrics = if role_session_counts.get(&session.role) == Some(&1) {
             retro::eval::evaluate_objective_metrics(&spec.metrics, &current_adapters)
         } else {
@@ -1907,6 +2159,29 @@ fn run_retro_eval(
                 "team-level objective metric is ambiguous for this role session",
             )
         };
+        if !session_source_adapters.is_empty() {
+            let scoped_metrics = spec
+                .metrics
+                .iter()
+                .filter(|metric| {
+                    metric.query.starts_with("transcript.") || is_lane_order_query(&metric.query)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            for metric in
+                retro::eval::evaluate_objective_metrics(&scoped_metrics, &session_source_adapters)
+            {
+                if let Some(existing) = session
+                    .objective_metrics
+                    .iter_mut()
+                    .find(|row| row.id == metric.id)
+                {
+                    *existing = metric;
+                } else {
+                    session.objective_metrics.push(metric);
+                }
+            }
+        }
     }
     let sessions = retro::eval::filter_sessions(sessions, session_filter);
     let roles = specs
@@ -1915,13 +2190,17 @@ fn run_retro_eval(
             let mut current_role_adapters = current_adapters.clone();
             current_role_adapters.extend(retro::eval::session_turn_adapters(
                 &spec,
-                session_ledger_rows.as_deref().map_err(String::as_str),
+                scoped_session_ledger_rows
+                    .as_deref()
+                    .map_err(String::as_str),
                 &window,
             ));
             let mut previous_role_adapters = previous_adapters.clone();
             previous_role_adapters.extend(retro::eval::session_turn_adapters(
                 &spec,
-                session_ledger_rows.as_deref().map_err(String::as_str),
+                scoped_session_ledger_rows
+                    .as_deref()
+                    .map_err(String::as_str),
                 &previous_window,
             ));
             let rules = retro::eval::evaluate_rules(&spec.rules, &current_role_adapters);
@@ -1954,7 +2233,7 @@ fn run_retro_eval(
             }
         })
         .collect::<Vec<_>>();
-    Ok(retro::eval::EvalReport {
+    let report = retro::eval::EvalReport {
         schema_version: 1,
         team,
         window,
@@ -1962,7 +2241,17 @@ fn run_retro_eval(
         roles,
         sessions,
         source_requests: retro::eval::request_counts_since(request_start),
-    })
+    };
+    const MAX_EVAL_REPORT_BYTES: usize = 4 * 1024 * 1024;
+    let report_bytes = serde_json::to_vec(&report)
+        .map_err(|error| retro::RetroError::Evaluation(error.to_string()))?;
+    if report_bytes.len() > MAX_EVAL_REPORT_BYTES {
+        return Err(retro::RetroError::Evaluation(format!(
+            "retro-eval report exceeds the {MAX_EVAL_REPORT_BYTES}-byte output limit"
+        ))
+        .into());
+    }
+    Ok(report)
 }
 
 #[implements("FR-047-AC-9")]
@@ -1977,6 +2266,664 @@ fn retro_eval_stage<T>(name: &str, operation: impl FnOnce() -> T) -> T {
     result
 }
 
+#[implements("FR-047-AC-9")]
+fn retro_eval_stage_bounded<T>(
+    name: &str,
+    scope: &retro::eval::EvalRunScope,
+    operation: impl FnOnce() -> T,
+) -> Result<T, String> {
+    scope.remaining().map_err(|error| {
+        let reason = format!("evaluation deadline elapsed before {name}: {error}");
+        eprintln!("[retro-eval] stage={name} status=skipped reason={reason}");
+        reason
+    })?;
+    Ok(retro_eval_stage(name, operation))
+}
+
+#[implements("FR-047-AC-9")]
+fn retro_eval_bounded_adapters(
+    name: &str,
+    scope: &retro::eval::EvalRunScope,
+    specs: &[retro::eval::RoleSpec],
+    query_prefix: &str,
+    operation: impl FnOnce() -> std::collections::BTreeMap<String, retro::eval::QueryValue>,
+) -> std::collections::BTreeMap<String, retro::eval::QueryValue> {
+    match retro_eval_stage_bounded(name, scope, operation) {
+        Ok(values) => values,
+        Err(reason) => specs
+            .iter()
+            .flat_map(|spec| &spec.rules)
+            .filter(|rule| {
+                rule.method == "deterministic" && rule.query_or_rubric.starts_with(query_prefix)
+            })
+            .map(|rule| {
+                (
+                    rule.query_or_rubric.clone(),
+                    retro::eval::QueryValue::Unavailable {
+                        reason: reason.clone(),
+                        evidence_refs: Vec::new(),
+                    },
+                )
+            })
+            .collect(),
+    }
+}
+
+#[implements("FR-047-AC-1")]
+fn address_belongs_to_team(address: &str, teams: &[String]) -> bool {
+    let mut segments = address.split(':');
+    let (Some(server), Some(workspace), Some(tab), None) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return false;
+    };
+    if server.is_empty() || workspace.is_empty() || tab.is_empty() {
+        return false;
+    }
+    teams
+        .iter()
+        .any(|team| workspace.eq_ignore_ascii_case(team.as_str()))
+}
+
+fn is_lane_order_query(query: &str) -> bool {
+    matches!(
+        query,
+        "ledger.lane_orders_due" | "ledger.lane_orders_not_taken_up"
+    )
+}
+
+#[implements("FR-047-AC-1")]
+fn collect_session_lane_order_adapters(
+    specs: &[retro::eval::RoleSpec],
+    ledger_path: Option<&std::path::Path>,
+    ready_state: Option<&str>,
+    projects: &[String],
+    window: &retro::eval::EvalWindow,
+    team: &str,
+    team_workspaces: &[String],
+    session_rows: &[serde_json::Map<String, serde_json::Value>],
+) -> Result<
+    std::collections::BTreeMap<
+        (String, String),
+        std::collections::BTreeMap<String, retro::eval::QueryValue>,
+    >,
+    String,
+> {
+    let mut result = std::collections::BTreeMap::new();
+    let mut identities = std::collections::BTreeSet::new();
+    for row in session_rows {
+        let (Some(at), Some(address), Some(role)) = (
+            row.get("started_at").and_then(serde_json::Value::as_i64),
+            row.get("session_addr").and_then(serde_json::Value::as_str),
+            row.get("session_role").and_then(serde_json::Value::as_str),
+        ) else {
+            continue;
+        };
+        if at >= window.start_ms
+            && at < window.end_ms
+            && address_belongs_to_team(address, team_workspaces)
+        {
+            identities.insert((role.to_owned(), address.to_owned()));
+        }
+    }
+    if identities.len() > retro::eval::transcript::DEFAULT_MAX_TRANSCRIPT_SESSIONS {
+        return Err("lane-order scope exceeds the bounded session limit".to_owned());
+    }
+    for (role, address) in identities {
+        let Some(spec) = specs.iter().find(|spec| spec.role == role) else {
+            continue;
+        };
+        let mut scoped_spec = spec.clone();
+        scoped_spec.rules.retain(|rule| {
+            rule.method == "deterministic" && is_lane_order_query(&rule.query_or_rubric)
+        });
+        if scoped_spec.rules.is_empty() {
+            continue;
+        }
+        let scope = retro::eval::LaneOrderScope {
+            team_id: Some(team.to_owned()),
+            sessions_by_role: std::collections::BTreeMap::from([(
+                role.clone(),
+                std::collections::BTreeSet::from([address.clone()]),
+            )]),
+        };
+        let adapters = retro::eval::ledger_adapters_scoped(
+            &[scoped_spec],
+            ledger_path,
+            ready_state,
+            projects,
+            window,
+            &scope,
+        );
+        result.insert((role, address), adapters);
+    }
+    Ok(result)
+}
+
+#[implements("FR-047-AC-5")]
+fn transcript_adapter_sets(
+    specs: &[retro::eval::RoleSpec],
+    inventory: &Result<retro::eval::transcript::TranscriptInventory, String>,
+    window: &retro::eval::EvalWindow,
+    context: &retro::eval::transcript::AdapterContext,
+    transcript_id_column_present: &Result<bool, String>,
+) -> (
+    std::collections::BTreeMap<String, retro::eval::QueryValue>,
+    std::collections::BTreeMap<
+        (String, String),
+        std::collections::BTreeMap<String, retro::eval::QueryValue>,
+    >,
+) {
+    use retro::eval::QueryValue;
+    let mut role_values = std::collections::BTreeMap::new();
+    let mut session_values = std::collections::BTreeMap::new();
+    for spec in specs {
+        let queries = spec
+            .rules
+            .iter()
+            .filter(|rule| {
+                rule.method == "deterministic" && rule.query_or_rubric.starts_with("transcript.")
+            })
+            .map(|rule| rule.query_or_rubric.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        if queries.is_empty() {
+            continue;
+        }
+        let inventory = match inventory {
+            Ok(inventory) => inventory,
+            Err(reason) => {
+                for query in &queries {
+                    role_values.insert(
+                        query.clone(),
+                        QueryValue::Unavailable {
+                            reason: format!("{query}: transcript collection unavailable: {reason}"),
+                            evidence_refs: Vec::new(),
+                        },
+                    );
+                }
+                continue;
+            }
+        };
+        let missing_id_reason = match transcript_id_column_present {
+            Ok(true) => {
+                "installed session_turn producer has not yet accumulated a transcript_id for this turn"
+            }
+            Ok(false) => "transcript_id writer is pending in unmerged SWM-261 PR #103",
+            Err(reason) => reason.as_str(),
+        };
+        let mut values_by_session = std::collections::BTreeMap::<
+            String,
+            std::collections::BTreeMap<String, Vec<QueryValue>>,
+        >::new();
+        for turn in &inventory.turns {
+            if turn.session_role == spec.role
+                && turn.started_at_ms >= window.start_ms
+                && turn.started_at_ms < window.end_ms
+            {
+                values_by_session
+                    .entry(turn.session_addr.clone())
+                    .or_default();
+            }
+        }
+        for transcript in inventory.transcripts.values().filter(|transcript| {
+            transcript.binding.session_role == spec.role
+                && transcript.binding.started_at_ms >= window.start_ms
+                && transcript.binding.started_at_ms < window.end_ms
+        }) {
+            let values = retro::eval::transcript::adapters(spec, transcript, window, context);
+            let by_query = values_by_session
+                .entry(transcript.binding.session_addr.clone())
+                .or_default();
+            for (query, value) in values {
+                by_query.entry(query).or_default().push(value);
+            }
+        }
+        let mut role_inputs = std::collections::BTreeMap::<String, Vec<QueryValue>>::new();
+        for (address, by_query) in values_by_session {
+            let mut adapters = std::collections::BTreeMap::new();
+            for query in &queries {
+                let value = combine_transcript_values(
+                    query,
+                    by_query.get(query).map(Vec::as_slice).unwrap_or_default(),
+                    missing_id_reason,
+                );
+                role_inputs
+                    .entry(query.clone())
+                    .or_default()
+                    .push(value.clone());
+                adapters.insert(query.clone(), value);
+            }
+            session_values.insert((spec.role.clone(), address), adapters);
+        }
+        for query in &queries {
+            let inputs = role_inputs
+                .get(query)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            role_values.insert(
+                query.clone(),
+                combine_transcript_values(query, inputs, missing_id_reason),
+            );
+        }
+    }
+    (role_values, session_values)
+}
+
+#[implements("FR-047-AC-5")]
+fn combine_transcript_values(
+    query: &str,
+    values: &[retro::eval::QueryValue],
+    empty_reason: &str,
+) -> retro::eval::QueryValue {
+    use retro::eval::QueryValue;
+    if values.is_empty() {
+        return QueryValue::Unavailable {
+            reason: format!("{query}: {empty_reason}"),
+            evidence_refs: Vec::new(),
+        };
+    }
+    if let Some(reason) = values.iter().find_map(|value| match value {
+        QueryValue::Unavailable { reason, .. } => Some(reason.as_str()),
+        _ => None,
+    }) {
+        return QueryValue::Unavailable {
+            reason: format!("{query}: incomplete transcript population: {reason}"),
+            evidence_refs: Vec::new(),
+        };
+    }
+    if values
+        .iter()
+        .all(|value| matches!(value, QueryValue::NotApplicable { .. }))
+    {
+        let evidence_refs = values
+            .iter()
+            .flat_map(|value| match value {
+                QueryValue::NotApplicable { evidence_refs, .. } => evidence_refs.clone(),
+                _ => Vec::new(),
+            })
+            .collect();
+        return QueryValue::NotApplicable {
+            reason: format!("{query}: not applicable for every attributed transcript"),
+            evidence_refs,
+        };
+    }
+    let mut numbers = Vec::with_capacity(values.len());
+    let mut evidence_refs = Vec::new();
+    for value in values {
+        let QueryValue::Value {
+            value,
+            evidence_refs: evidence,
+        } = value
+        else {
+            return QueryValue::Unavailable {
+                reason: format!("{query}: transcript population has mixed applicability"),
+                evidence_refs: Vec::new(),
+            };
+        };
+        numbers.push(*value);
+        evidence_refs.extend(evidence.clone());
+    }
+    evidence_refs.sort();
+    evidence_refs.dedup();
+    let value = if query.ends_with("_max") {
+        numbers.into_iter().reduce(f64::max).unwrap_or_default()
+    } else {
+        numbers.into_iter().sum()
+    };
+    QueryValue::Value {
+        value,
+        evidence_refs,
+    }
+}
+
+#[implements("FR-047-AC-1")]
+#[implements("FR-047-AC-9")]
+fn collect_role_github_linear_adapters(
+    specs: &[retro::eval::RoleSpec],
+    repositories: &[String],
+    decision_label: Option<&str>,
+    window: &retro::eval::EvalWindow,
+    settings: &retro::eval::EvalSettings,
+    run_scope: &retro::eval::EvalRunScope,
+    transcript_inventory: &Result<retro::eval::transcript::TranscriptInventory, String>,
+    transcript_id_column_present: &Result<bool, String>,
+    transcript_coverage_start_ms: i64,
+) -> std::collections::BTreeMap<String, retro::eval::QueryValue> {
+    let has_role_github_queries = specs.iter().any(|spec| {
+        spec.rules.iter().any(|rule| {
+            rule.method == "deterministic"
+                && rule.query_or_rubric.starts_with("github.")
+                && matches!(
+                    rule.query_or_rubric.as_str(),
+                    "github.review_ready_prs_undispatched"
+                        | "github.merges_beyond_reviewed_change"
+                        | "github.merges_without_covering_gate"
+                        | "github.ready_prs_unmerged_over_hour"
+                )
+        }) || spec
+            .metrics
+            .iter()
+            .any(|metric| metric.query == "github.ticket_start_to_pr_open_median_hours")
+    });
+    let has_role_linear_queries = specs.iter().any(|spec| {
+        spec.rules.iter().any(|rule| {
+            rule.method == "deterministic"
+                && matches!(
+                    rule.query_or_rubric.as_str(),
+                    "linear.redundant_gate_runs"
+                        | "linear.findings_open_at_merge"
+                        | "linear.gate_runs_before_clean_review"
+                        | "linear.fix_round_findings_returned_still_open"
+                        | "linear.open_decisions_without_owner"
+                        | "linear.findings_without_outcome_after_disposition"
+                        | "linear.mergeable_yes_with_open_finding"
+                        | "linear.outside_diff_findings_without_failure"
+                )
+        }) || spec
+            .metrics
+            .iter()
+            .any(|metric| metric.query == "linear.review_to_clean_median_hours")
+    });
+    if !has_role_github_queries && !has_role_linear_queries {
+        return std::collections::BTreeMap::new();
+    }
+
+    let needs_pull_request_evidence = has_role_github_queries
+        || specs.iter().any(|spec| {
+            spec.rules.iter().any(|rule| {
+                rule.method == "deterministic"
+                    && matches!(
+                        rule.query_or_rubric.as_str(),
+                        "linear.redundant_gate_runs"
+                            | "linear.findings_open_at_merge"
+                            | "linear.fix_round_findings_returned_still_open"
+                            | "linear.outside_diff_findings_without_failure"
+                    )
+            })
+        });
+    let evidence = if !needs_pull_request_evidence {
+        Err("GitHub pull-request evidence is not required for selected role queries".to_owned())
+    } else {
+        match (
+            settings.github_guard_state_path.as_deref(),
+            repositories.is_empty(),
+        ) {
+            (Some(state_path), false) => retro::eval::github_rules::read_pull_request_evidence(
+                state_path,
+                settings.github_guard_max_bytes,
+                repositories,
+                &std::collections::BTreeMap::new(),
+                run_scope.deadline(),
+            ),
+            (None, _) => Err("shared GitHub guard path is not configured".to_owned()),
+            (_, true) => {
+                Err("retro config has no repositories for role-specific GitHub evidence".to_owned())
+            }
+        }
+    };
+    match evidence {
+        Ok(mut evidence) => {
+            let mut join_error = None;
+            if has_role_github_queries {
+                let include_ticket_started_at = specs.iter().any(|spec| {
+                    spec.metrics
+                        .iter()
+                        .any(|metric| metric.query == "github.ticket_start_to_pr_open_median_hours")
+                });
+                match retro::eval::linear_pull_request_joins_for_evidence(
+                    repositories,
+                    &evidence,
+                    include_ticket_started_at,
+                    settings.review_age_limit_hours,
+                    window,
+                ) {
+                    Ok(joins) => {
+                        for row in &mut evidence {
+                            if let Some(join) = joins.get(&(row.repository.clone(), row.number)) {
+                                row.reviewed_heads = join.reviewed_heads.clone();
+                                row.gate_required = join.gate_required;
+                                row.gate_covered_heads = join.gate_covered_heads.clone();
+                                row.waived_for_gate = join.waived_for_gate;
+                                row.waived_for_review = join.waived_for_review;
+                                row.reviewer_or_dispatch_by_deadline =
+                                    join.reviewer_or_dispatch_by_deadline;
+                                row.reviewer_or_dispatch_by_window_end =
+                                    join.reviewer_or_dispatch_by_window_end;
+                                row.ready_merge_waived = join.ready_merge_waived;
+                                row.ticket_started_at_ms = join.ticket_started_at_ms;
+                            }
+                        }
+                        apply_transcript_dispatch_joins(
+                            &mut evidence,
+                            transcript_inventory,
+                            transcript_id_column_present,
+                            transcript_coverage_start_ms,
+                            window,
+                            settings.review_age_limit_hours,
+                        );
+                    }
+                    Err(reason) => join_error = Some(reason),
+                }
+            }
+            let mut values = retro::eval::github_rules::adapters(
+                specs,
+                join_error.as_deref().map_or(Ok(&evidence), Err),
+                window,
+                settings.review_age_limit_hours,
+            );
+            if let Some(retro::eval::QueryValue::Unavailable {
+                reason,
+                evidence_refs,
+            }) = values.get_mut("github.review_ready_prs_undispatched")
+                && reason.contains("reviewer and lead dispatch evidence is incomplete")
+            {
+                *reason = transcript_dispatch_unavailable_reason(
+                    transcript_id_column_present,
+                    transcript_inventory,
+                    transcript_coverage_start_ms,
+                );
+                evidence_refs.clear();
+            }
+            values.extend(retro::eval::linear_class_a_adapters_with_github(
+                specs,
+                repositories,
+                decision_label,
+                window,
+                Ok(&evidence),
+            ));
+            values
+        }
+        Err(reason) => {
+            let mut values = retro::eval::github_rules::adapters(
+                specs,
+                Err(&reason),
+                window,
+                settings.review_age_limit_hours,
+            );
+            values.extend(retro::eval::linear_class_a_adapters_with_github(
+                specs,
+                repositories,
+                decision_label,
+                window,
+                Err(&reason),
+            ));
+            values
+        }
+    }
+}
+
+#[implements("FR-047-AC-5")]
+fn transcript_dispatch_unavailable_reason(
+    transcript_id_column_present: &Result<bool, String>,
+    inventory: &Result<retro::eval::transcript::TranscriptInventory, String>,
+    coverage_start_ms: i64,
+) -> String {
+    match transcript_id_column_present {
+        Ok(false) => {
+            return "transcript_id writer is pending in unmerged SWM-261 PR #103".to_owned();
+        }
+        Err(reason) => return format!("session_turn.transcript_id schema unavailable: {reason}"),
+        Ok(true) => {}
+    }
+    if let Ok(inventory) = inventory {
+        let has_missing_code_lead_id = inventory.turns.iter().any(|turn| {
+            turn.session_role == "code-lead"
+                && turn.started_at_ms >= coverage_start_ms
+                && turn.transcript_id.is_none()
+        });
+        if has_missing_code_lead_id || !inventory.complete {
+            return "installed session_turn producer has not yet accumulated a transcript_id for this turn".to_owned();
+        }
+    }
+    "installed session_turn producer must accumulate a full 48-hour transcript_id history before older ready PRs can be classified".to_owned()
+}
+
+#[implements("FR-047-AC-5")]
+fn apply_transcript_dispatch_joins(
+    evidence: &mut [retro::eval::github_rules::PullRequestEvidence],
+    inventory: &Result<retro::eval::transcript::TranscriptInventory, String>,
+    transcript_id_column_present: &Result<bool, String>,
+    coverage_start_ms: i64,
+    window: &retro::eval::EvalWindow,
+    review_age_limit_hours: u64,
+) {
+    use retro::eval::transcript::TranscriptEventKind;
+
+    let Ok(inventory) = inventory else {
+        return;
+    };
+    let complete_code_lead_coverage = transcript_id_column_present == &Ok(true)
+        && inventory.complete
+        && inventory.turns.iter().all(|turn| {
+            turn.session_role != "code-lead"
+                || turn.started_at_ms < window.start_ms
+                || turn.started_at_ms >= window.end_ms
+                || inventory
+                    .transcripts
+                    .get(turn.transcript_id.as_deref().unwrap_or_default())
+                    .is_some_and(|transcript| transcript.complete)
+        });
+    let dispatches_for = |pr: &retro::eval::github_rules::PullRequestEvidence, through_ms: i64| {
+        inventory.transcripts.values().any(|transcript| {
+            transcript.binding.session_role == "code-lead"
+                && transcript.complete
+                && transcript.events.iter().any(|event| {
+                    event.at_ms >= pr.ready_at_ms.unwrap_or(i64::MAX)
+                        && event.at_ms <= through_ms
+                        && transcript_event_names_pr_dispatch(
+                            event,
+                            &pr.repository,
+                            pr.number,
+                            pr.url.as_str(),
+                        )
+                })
+        })
+    };
+
+    for pr in evidence {
+        let Some(ready_at_ms) = pr.ready_at_ms else {
+            continue;
+        };
+        let deadline_ms = ready_at_ms.saturating_add(
+            review_age_limit_hours
+                .saturating_mul(3_600_000)
+                .min(i64::MAX as u64) as i64,
+        );
+        let deadline_complete = complete_code_lead_coverage
+            && ready_at_ms >= coverage_start_ms
+            && deadline_ms < window.end_ms;
+        let window_end_complete = complete_code_lead_coverage && ready_at_ms >= coverage_start_ms;
+        if deadline_complete {
+            let transcript_dispatch = dispatches_for(pr, deadline_ms);
+            pr.reviewer_or_dispatch_by_deadline =
+                or_complete_evidence(pr.reviewer_or_dispatch_by_deadline, transcript_dispatch);
+        } else if !has_positive(pr.reviewer_or_dispatch_by_deadline) {
+            pr.reviewer_or_dispatch_by_deadline = None;
+        }
+        if window_end_complete {
+            let transcript_dispatch = dispatches_for(pr, window.end_ms);
+            pr.reviewer_or_dispatch_by_window_end =
+                or_complete_evidence(pr.reviewer_or_dispatch_by_window_end, transcript_dispatch);
+        } else if !has_positive(pr.reviewer_or_dispatch_by_window_end) {
+            pr.reviewer_or_dispatch_by_window_end = None;
+        }
+    }
+
+    fn has_positive(value: Option<bool>) -> bool {
+        value == Some(true)
+    }
+
+    fn or_complete_evidence(existing: Option<bool>, transcript: bool) -> Option<bool> {
+        Some(existing.unwrap_or(false) || transcript)
+    }
+
+    fn transcript_event_names_pr_dispatch(
+        event: &retro::eval::transcript::TranscriptEvent,
+        repository: &str,
+        number: u64,
+        url: &str,
+    ) -> bool {
+        if !matches!(
+            event.kind,
+            TranscriptEventKind::ToolCall | TranscriptEventKind::AssistantMessage
+        ) {
+            return false;
+        }
+        let Some(text) = event.command.as_deref() else {
+            return false;
+        };
+        let lower = text.to_ascii_lowercase();
+        let explicit_review = lower.contains("review")
+            && (lower.contains("agent-msg send")
+                || lower.contains("/reviewer")
+                || lower.contains("please review")
+                || lower.contains("review this"));
+        explicit_review
+            && (lower.contains(&url.to_ascii_lowercase())
+                || lower.contains(&format!("{repository}#{}", number).to_ascii_lowercase())
+                || lower.contains(&format!("{repository}/pull/{number}").to_ascii_lowercase()))
+    }
+}
+
+#[implements("FR-047-AC-1")]
+fn unavailable_adapters_for_prefixes(
+    specs: &[retro::eval::RoleSpec],
+    prefixes: &[&str],
+    reason: &str,
+) -> std::collections::BTreeMap<String, retro::eval::QueryValue> {
+    let mut queries = std::collections::BTreeSet::new();
+    for spec in specs {
+        queries.extend(
+            spec.rules
+                .iter()
+                .filter(|rule| rule.method == "deterministic")
+                .map(|rule| rule.query_or_rubric.as_str())
+                .filter(|query| prefixes.iter().any(|prefix| query.starts_with(prefix))),
+        );
+        queries.extend(
+            spec.metrics
+                .iter()
+                .map(|metric| metric.query.as_str())
+                .filter(|query| prefixes.iter().any(|prefix| query.starts_with(prefix))),
+        );
+    }
+    queries
+        .into_iter()
+        .map(|query| {
+            (
+                query.to_owned(),
+                retro::eval::QueryValue::Unavailable {
+                    reason: format!("{query}: {reason}"),
+                    evidence_refs: Vec::new(),
+                },
+            )
+        })
+        .collect()
+}
+
 #[implements("FR-047-AC-1")]
 #[implements("FR-047-AC-9")]
 fn collect_eval_retro_record(
@@ -1987,9 +2934,14 @@ fn collect_eval_retro_record(
 ) -> Result<retro::Record, String> {
     let requested = specs
         .iter()
-        .flat_map(|spec| &spec.rules)
-        .filter(|rule| rule.method == "deterministic")
-        .filter_map(|rule| rule.query_or_rubric.strip_prefix("retro."))
+        .flat_map(|spec| {
+            spec.rules
+                .iter()
+                .filter(|rule| rule.method == "deterministic")
+                .map(|rule| rule.query_or_rubric.as_str())
+                .chain(spec.metrics.iter().map(|metric| metric.query.as_str()))
+        })
+        .filter_map(|query| query.strip_prefix("retro."))
         .map(str::to_owned)
         .collect::<std::collections::BTreeSet<_>>();
     if requested.is_empty() {
@@ -2017,8 +2969,18 @@ fn collect_eval_retro_record(
         local: &retro::live::SystemLocal,
     };
     let metrics = retro::metrics::collect_selected(config, frame, &sources, &requested);
+    let needs_department = requested
+        .iter()
+        .any(|id| retro::department::definition(id).is_some() || id == "order_flip_loop");
+    let department = needs_department
+        .then(|| retro::collect_department_report(config, frame, &sources, &metrics, None, None))
+        .flatten();
     Ok(retro::Record {
-        schema_version: retro::SCHEMA_VERSION,
+        schema_version: if department.is_some() {
+            2
+        } else {
+            retro::SCHEMA_VERSION
+        },
         kind: retro::RecordKind::Snapshot,
         taken_at: chrono::DateTime::<chrono::Utc>::from_timestamp(frame.now.floor() as i64, 0)
             .ok_or_else(|| "retro evaluation timestamp is out of range".to_owned())?
@@ -2026,7 +2988,7 @@ fn collect_eval_retro_record(
         team: config.team.clone(),
         window: retro::format_window(window_secs),
         metrics,
-        department: None,
+        department,
     })
 }
 
@@ -3382,6 +4344,248 @@ mod tests {
         assert_eq!(value["source_requests"]["github_guard_calls"], 5);
         assert_eq!(value["source_requests"]["prometheus_http_requests"], 1);
         assert!(value.get("RetroEval").is_none());
+    }
+
+    #[trace("FR-047-AC-8")]
+    #[trace("FR-047-AC-5")]
+    #[trace("FR-047-AC-6")]
+    #[test]
+    fn retro_eval_composes_scoped_ledger_relay_and_transcript_adapters_read_only() {
+        use ix_board::retro::eval::{
+            EvalWindow, EvaluationRule, ObjectiveMetricSpec, QueryValue, RoleSpec,
+        };
+        use std::collections::BTreeMap;
+        use std::fs;
+
+        let home = tempfile::tempdir().expect("temporary home");
+        let ledger_path = home.path().join("ledger.sqlite3");
+        let connection = rusqlite::Connection::open(&ledger_path).expect("create ledger fixture");
+        connection
+            .execute_batch(
+                "PRAGMA user_version=8;
+                 CREATE TABLE run(relay_ms INTEGER NOT NULL);
+                 INSERT INTO run VALUES (1700000000000);
+                 CREATE TABLE lane_orders_due(
+                   order_id TEXT, lane TEXT, at_ms INTEGER, available INTEGER,
+                   unavailable_reason TEXT);
+                 INSERT INTO lane_orders_due VALUES
+                   ('team-order','test:workspace:coder',1700000000100,1,NULL),
+                   ('foreign-order','test:other:coder',1700000000100,1,NULL);",
+            )
+            .expect("seed read-only ledger fixture");
+        drop(connection);
+
+        let transcript_path = home.path().join(".claude/projects/work/transcript-1.jsonl");
+        fs::create_dir_all(transcript_path.parent().expect("transcript parent"))
+            .expect("create transcript directory");
+        fs::write(
+            &transcript_path,
+            r#"{"type":"assistant","timestamp":"2023-11-14T22:13:20Z","sessionId":"transcript-1","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"gh pr merge 42","description":"merge"}}]}}"#,
+        )
+        .expect("write transcript fixture");
+
+        let rule = |id: &str, query: &str| EvaluationRule {
+            id: id.to_owned(),
+            rule: "fixture rule".to_owned(),
+            evidence_source: query.to_owned(),
+            trigger: "fixture".to_owned(),
+            method: "deterministic".to_owned(),
+            query_or_rubric: query.to_owned(),
+            comparator: ">=".to_owned(),
+            target: 1.0,
+            unit: "count".to_owned(),
+        };
+        let specs = vec![RoleSpec {
+            role: "coder".to_owned(),
+            metrics: vec![ObjectiveMetricSpec {
+                id: "CODE-M01".to_owned(),
+                query: "transcript.coder_merge_commands".to_owned(),
+                unit: "commands".to_owned(),
+                target: 1.0,
+                direction: "higher_is_better".to_owned(),
+            }],
+            rules: vec![
+                rule("CODE-R11-E1", "transcript.coder_merge_commands"),
+                rule("PLAN-R01-E1", "ledger.lane_orders_due"),
+                rule("MIND-R01-E1", "relay.minder_orders_without_expect_ticket"),
+                rule("LEAD-R02-E1", "github.review_ready_prs_undispatched"),
+            ],
+        }];
+        let window = EvalWindow {
+            start_ms: 1_795_607_000_000,
+            end_ms: 1_795_609_000_000,
+        };
+        let session_row = serde_json::json!({
+            "session_addr":"test:workspace:coder",
+            "session_role":"coder",
+            "started_at":1_700_000_000_000_i64,
+            "transcript_id":"transcript-1"
+        })
+        .as_object()
+        .expect("session row")
+        .clone();
+        let ledger_bytes_before = fs::read(&ledger_path).expect("read ledger before evaluation");
+        let transcript_before =
+            fs::read(&transcript_path).expect("read transcript before evaluation");
+
+        let lane_adapters = super::collect_session_lane_order_adapters(
+            &specs,
+            Some(&ledger_path),
+            None,
+            &[],
+            &window,
+            "TEST",
+            &["TEST".to_owned()],
+            &[session_row.clone()],
+        )
+        .expect("collect scoped lane-order adapter");
+        let session_key = ("coder".to_owned(), "test:workspace:coder".to_owned());
+        assert!(matches!(
+            lane_adapters[&session_key]["ledger.lane_orders_due"],
+            QueryValue::Value { value: 1.0, .. }
+        ));
+
+        let turns = ix_board::retro::eval::transcript::turn_rows_from_ledger(&[session_row]);
+        let inventory = ix_board::retro::eval::transcript::discover_transcripts(
+            home.path(),
+            &turns,
+            ix_board::retro::eval::transcript::TranscriptReadLimits::default(),
+        );
+        let (_, transcript_adapters) = super::transcript_adapter_sets(
+            &specs,
+            &Ok(inventory),
+            &window,
+            &Default::default(),
+            &Ok(true),
+        );
+        assert!(matches!(
+            transcript_adapters[&session_key]["transcript.coder_merge_commands"],
+            QueryValue::Value { value: 1.0, .. }
+        ));
+
+        let relay_adapters = ix_board::retro::eval::relay::live_adapters(
+            &specs,
+            &window,
+            Some(&ledger_path),
+            None,
+            None,
+            None,
+            None,
+            std::time::Duration::from_millis(10),
+        );
+        assert!(matches!(
+            relay_adapters["relay.minder_orders_without_expect_ticket"],
+            QueryValue::Unavailable { .. }
+        ));
+        let github_adapters = ix_board::retro::eval::github_rules::adapters(
+            &specs,
+            Err("shared GitHub source is unavailable"),
+            &window,
+            1,
+        );
+        assert!(matches!(
+            github_adapters["github.review_ready_prs_undispatched"],
+            QueryValue::Unavailable { .. }
+        ));
+
+        let mut composed = BTreeMap::new();
+        composed.extend(lane_adapters[&session_key].clone());
+        composed.extend(transcript_adapters[&session_key].clone());
+        composed.extend(relay_adapters);
+        composed.extend(github_adapters);
+        assert_eq!(composed.len(), 4);
+        assert_eq!(
+            fs::read(&ledger_path).expect("read ledger after evaluation"),
+            ledger_bytes_before
+        );
+        assert_eq!(
+            fs::read(&transcript_path).expect("read transcript after evaluation"),
+            transcript_before
+        );
+    }
+
+    #[trace("FR-047-AC-5")]
+    #[test]
+    fn retro_eval_joins_explicit_transcript_review_dispatch_to_exact_github_pr() {
+        use super::apply_transcript_dispatch_joins;
+        use ix_board::retro::eval::EvalWindow;
+        use ix_board::retro::eval::github_rules::PullRequestEvidence;
+        use ix_board::retro::eval::transcript::{
+            HarnessFormat, SessionBinding, SessionTurnRow, TranscriptInventory, parse_lines,
+        };
+        use std::collections::BTreeMap;
+
+        let at_ms = 1_700_000_000_000_i64;
+        let json = br#"{"type":"assistant","timestamp":"2023-11-14T22:13:20Z","sessionId":"transcript-1","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"agent-msg send test:workspace:reviewer \"Please review https://github.com/agent-ix/ix-board/pull/42\"","description":"dispatch review"}}]}}"#;
+        let transcript = parse_lines(
+            HarnessFormat::Claude,
+            SessionBinding {
+                transcript_id: "transcript-1".to_owned(),
+                session_addr: "test:workspace:code-lead".to_owned(),
+                session_role: "code-lead".to_owned(),
+                started_at_ms: at_ms,
+            },
+            &[json.as_slice()],
+            4096,
+            4096,
+        );
+        assert!(transcript.complete);
+        let inventory = TranscriptInventory {
+            turns: vec![SessionTurnRow {
+                transcript_id: Some("transcript-1".to_owned()),
+                session_addr: "test:workspace:code-lead".to_owned(),
+                session_role: "code-lead".to_owned(),
+                started_at_ms: at_ms,
+            }],
+            transcripts: BTreeMap::from([("transcript-1".to_owned(), transcript)]),
+            complete: true,
+            unavailable_reasons: Vec::new(),
+        };
+        let mut evidence = vec![PullRequestEvidence {
+            repository: "agent-ix/ix-board".to_owned(),
+            number: 42,
+            url: "https://github.com/agent-ix/ix-board/pull/42".to_owned(),
+            ready_at_ms: Some(at_ms),
+            ..Default::default()
+        }];
+        let window = EvalWindow {
+            start_ms: at_ms,
+            end_ms: at_ms + 7_200_000,
+        };
+
+        apply_transcript_dispatch_joins(
+            &mut evidence,
+            &Ok(inventory),
+            &Ok(true),
+            at_ms - 1,
+            &window,
+            1,
+        );
+
+        assert_eq!(evidence[0].reviewer_or_dispatch_by_deadline, Some(true));
+        assert_eq!(evidence[0].reviewer_or_dispatch_by_window_end, Some(true));
+    }
+
+    #[trace("FR-047-AC-9")]
+    #[test]
+    fn retro_eval_deadline_returns_partial_source_reason_without_starting_next_stage() {
+        let scope = ix_board::retro::eval::EvalRunScope::start(
+            std::time::Duration::from_millis(1),
+            ix_board::retro::eval::DEFAULT_EVAL_LINEAR_REQUEST_LIMIT,
+        )
+        .expect("start bounded invocation");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let mut called = false;
+        let result = super::retro_eval_stage_bounded("fixture", &scope, || {
+            called = true;
+            1
+        });
+        assert!(!called);
+        assert!(
+            result
+                .unwrap_err()
+                .contains("evaluation deadline elapsed before fixture")
+        );
     }
 
     #[trace("FR-020-AC-2")]

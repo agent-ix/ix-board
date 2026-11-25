@@ -7,6 +7,8 @@ use super::{EvalWindow, QueryValue, RoleSpec};
 use ix_trace_rs::implements;
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+use std::time::Duration;
 
 pub type LedgerViewRows = Result<Vec<Map<String, Value>>, String>;
 pub type LedgerViews = BTreeMap<String, LedgerViewRows>;
@@ -107,7 +109,9 @@ pub fn adapters(
     values
 }
 
-fn requested_queries(specs: &[RoleSpec]) -> BTreeSet<String> {
+/// Returns the deterministic relay query ids requested by these role specifications.
+#[implements("FR-047-AC-1")]
+pub fn requested_queries(specs: &[RoleSpec]) -> BTreeSet<String> {
     specs
         .iter()
         .flat_map(|spec| &spec.rules)
@@ -130,6 +134,607 @@ fn requested_queries(specs: &[RoleSpec]) -> BTreeSet<String> {
             )
         })
         .collect()
+}
+
+/// Collects complete, bounded relay and Fleet ledger evidence and evaluates the requested relay
+/// rules. The relay URL and prefix must come from the caller's verified relay configuration;
+/// source failures are represented as `Unavailable` query values and never as empty evidence.
+#[implements("FR-047-AC-1")]
+#[implements("FR-047-AC-6")]
+pub fn live_adapters(
+    specs: &[RoleSpec],
+    window: &EvalWindow,
+    ledger_path: Option<&Path>,
+    relay_url: Option<&str>,
+    relay_prefix: Option<&str>,
+    tick_settings: Option<&crate::fleet::tick::TickSettings>,
+    tick_interval: Option<Duration>,
+    timeout: Duration,
+) -> BTreeMap<String, QueryValue> {
+    let requested = requested_queries(specs);
+    if requested.is_empty() {
+        return BTreeMap::new();
+    }
+    if window.start_ms < 0 || window.end_ms <= window.start_ms {
+        return requested
+            .into_iter()
+            .map(|query| {
+                (
+                    query.clone(),
+                    unavailable(&query, "relay evaluation window is invalid"),
+                )
+            })
+            .collect();
+    }
+
+    let tick_ms = tick_interval.and_then(|interval| i64::try_from(interval.as_millis()).ok());
+    let minder_addr = tick_settings.and_then(|settings| settings.minder.as_deref());
+    let orchestrator_addr = tick_settings.and_then(|settings| settings.orchestrator.as_deref());
+    let wants_orders = requested.iter().any(|query| {
+        matches!(
+            query.as_str(),
+            ORDER_WITHOUT_TICKET
+                | ORCH_ORDER_WITHOUT_TICKET
+                | ORCH_ORDER_NOT_ASSIGNED
+                | NEED_READY_UNSENT
+        )
+    });
+    let wants_assigned = requested.contains(ORCH_ORDER_NOT_ASSIGNED);
+    let wants_receipts = requested.iter().any(|query| {
+        matches!(
+            query.as_str(),
+            PUSH_UNSENT
+                | ESCALATE_BLOCK_UNSENT
+                | DEAD_UNROUTED
+                | IDLE_UNROUTED
+                | BLOCKED_SEND
+                | ESCALATE_DRAIN_UNSENT
+                | ORCH_ACTION_UNSENT
+        )
+    });
+    let wants_action_sends = requested.iter().any(|query| {
+        matches!(
+            query.as_str(),
+            PUSH_UNSENT
+                | ESCALATE_BLOCK_UNSENT
+                | DEAD_UNROUTED
+                | IDLE_UNROUTED
+                | ESCALATE_DRAIN_UNSENT
+                | ORCH_ACTION_UNSENT
+        )
+    });
+    let wants_actions = requested.iter().any(|query| {
+        matches!(
+            query.as_str(),
+            PUSH_UNSENT
+                | ESCALATE_BLOCK_UNSENT
+                | DEAD_UNROUTED
+                | IDLE_UNROUTED
+                | ESCALATE_DRAIN_UNSENT
+                | ORCH_ACTION_UNSENT
+                | NEED_READY_UNSENT
+        )
+    });
+    let wants_blocked_intervals = requested.contains(BLOCKED_SEND);
+
+    let bounded_end = window.end_ms.saturating_sub(1);
+    let orders = if wants_orders {
+        match (relay_url, relay_prefix) {
+            (Some(url), Some(prefix)) => {
+                read_orders(url, prefix, timeout, window.start_ms, bounded_end)
+            }
+            _ => Err("verified relay connection settings are unavailable".to_owned()),
+        }
+    } else {
+        Ok(Vec::new())
+    };
+    let receipts = if wants_receipts {
+        match (relay_url, relay_prefix) {
+            (Some(url), Some(prefix)) => {
+                let end = bounded_end;
+                read_receipts(url, prefix, timeout, window.start_ms, end)
+            }
+            _ => Err("verified relay connection settings are unavailable".to_owned()),
+        }
+    } else {
+        Ok(Vec::new())
+    };
+
+    let action_window = EvalWindow {
+        start_ms: window.start_ms,
+        end_ms: window.end_ms,
+    };
+    let (action_sends, views, assigned) = match ledger_path {
+        Some(path) if wants_actions || wants_assigned || wants_blocked_intervals => {
+            let coverage = if wants_actions || wants_blocked_intervals {
+                action_coverage(path, window)
+            } else {
+                Ok(())
+            };
+            let actions = if wants_actions {
+                read_ledger_rows(path, "action", "emitted_at", &action_window)
+            } else {
+                Ok(Vec::new())
+            };
+            let executed_actions = if requested.contains(ORCH_ACTION_UNSENT) {
+                read_ledger_rows(path, "action", "executed_at", window)
+            } else {
+                Ok(Vec::new())
+            };
+            let sends = if wants_action_sends {
+                read_ledger_rows(path, "action_send", "sent_at", &action_window)
+                    .and_then(|rows| require_sender_role(rows, path))
+            } else {
+                Ok(Vec::new())
+            };
+            let assigned = if wants_assigned {
+                read_ledger_rows(path, "assignment_history", "sent_at", window)
+                    .and_then(normalize_assigned_order_ids)
+            } else {
+                Ok(BTreeSet::new())
+            };
+            let mut views = LedgerViews::new();
+            if wants_actions {
+                let action_rows = actions.as_ref().map(Vec::as_slice);
+                for (name, kind) in [
+                    ("push_next_ticket_actions", "push_next_ticket"),
+                    ("escalate_block_actions", "escalate_block"),
+                    ("escalate_drain_actions", "escalate_drain"),
+                    ("need_ready_tickets_actions", "need_ready_tickets"),
+                    ("dead_lane_ticks", "route_dead_lane"),
+                    ("idle_empty_list_ticks", "route_idle_lane"),
+                ] {
+                    let view = action_rows
+                        .map(|rows| normalize_actions(rows, kind))
+                        .map_err(Clone::clone);
+                    views.insert(name.to_owned(), view);
+                }
+            }
+            if requested.contains(ORCH_ACTION_UNSENT) {
+                let view = executed_actions
+                    .as_ref()
+                    .map(|rows| normalize_actions(rows, "orchestrator_addressed"))
+                    .map_err(Clone::clone);
+                views.insert("orchestrator_addressed_actions".to_owned(), view);
+            }
+            if wants_blocked_intervals {
+                let blocked = tick_ms
+                    .filter(|interval| *interval > 0)
+                    .ok_or_else(|| "fleet tick interval is unavailable".to_owned())
+                    .and_then(|interval| read_blocked_intervals(path, window, interval));
+                views.insert("blocked_lane_ticks".to_owned(), blocked);
+            }
+            if let Err(reason) = coverage {
+                for rows in views.values_mut() {
+                    *rows = Err(reason.clone());
+                }
+                (Err(reason.clone()), views, Err(reason))
+            } else {
+                (sends, views, assigned)
+            }
+        }
+        Some(_) => (
+            if wants_receipts {
+                Err("fleet action ledger source is unavailable".to_owned())
+            } else {
+                Ok(Vec::new())
+            },
+            LedgerViews::new(),
+            if wants_assigned {
+                Err("fleet assignment history is unavailable".to_owned())
+            } else {
+                Ok(BTreeSet::new())
+            },
+        ),
+        None => (
+            Err("fleet ledger path is unavailable".to_owned()),
+            LedgerViews::new(),
+            Err("fleet ledger path is unavailable".to_owned()),
+        ),
+    };
+
+    let assigned = assigned.as_ref().map_err(String::as_str);
+    let evidence = RelayEvidence {
+        orders: orders.as_deref().map_err(String::as_str),
+        receipts: receipts.as_deref().map_err(String::as_str),
+        action_sends: action_sends.as_deref().map_err(String::as_str),
+        views: &views,
+        fleet_assign_order_ids: assigned,
+        minder_addr,
+        orchestrator_addr,
+        tick_interval_ms: tick_ms,
+    };
+    adapters(specs, &evidence, window)
+}
+
+#[implements("FR-047-AC-1")]
+#[implements("FR-047-AC-6")]
+fn read_orders(
+    url: &str,
+    prefix: &str,
+    timeout: Duration,
+    since_ms: i64,
+    until_ms: i64,
+) -> Result<Vec<Map<String, Value>>, String> {
+    if since_ms < 0 || until_ms < since_ms {
+        return Err("relay order window is invalid".to_owned());
+    }
+    let mut relay = relay_core::Relay::connect(url, timeout)
+        .map_err(|_| "relay order source is unavailable".to_owned())?
+        .with_prefix(prefix.to_owned());
+    let mut cursor = None;
+    let mut rows = Vec::new();
+    let mut seen = BTreeSet::new();
+    for _ in 0..MAX_RELAY_PAGES {
+        let request = relay_core::receipts::OrderListRequest::new(
+            since_ms,
+            until_ms,
+            relay_core::receipts::ORDERS_PAGE_CAP,
+            cursor.clone(),
+        )
+        .map_err(|_| "relay order request is invalid".to_owned())?;
+        let page = relay
+            .orders(&request)
+            .map_err(|_| "relay order source is unavailable".to_owned())?;
+        validate_order_page(&page, since_ms, until_ms, cursor.as_ref())?;
+        for order in page.orders {
+            if !seen.insert(order.order_id.clone()) {
+                return Err("relay order pagination repeated an order".to_owned());
+            }
+            let value = serde_json::to_value(order)
+                .map_err(|_| "relay order row could not be normalized".to_owned())?;
+            let mut row = value
+                .as_object()
+                .cloned()
+                .ok_or_else(|| "relay order row has an invalid shape".to_owned())?;
+            if let Some(at) = row.get("enqueued_at_ms").cloned() {
+                row.insert("at_ms".to_owned(), at);
+            }
+            rows.push(row);
+        }
+        if !page.truncated {
+            if page.next_cursor.is_some() {
+                return Err("complete relay order page has an unexpected cursor".to_owned());
+            }
+            return Ok(rows);
+        }
+        let Some(next) = page.next_cursor else {
+            return Err("truncated relay order page has no cursor".to_owned());
+        };
+        cursor = Some(next);
+    }
+    Err("relay order page limit was exceeded".to_owned())
+}
+
+#[implements("FR-047-AC-1")]
+#[implements("FR-047-AC-6")]
+fn read_receipts(
+    url: &str,
+    prefix: &str,
+    timeout: Duration,
+    since_ms: i64,
+    until_ms: i64,
+) -> Result<Vec<Map<String, Value>>, String> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0_i64, |elapsed| {
+            elapsed.as_millis().min(i64::MAX as u128) as i64
+        });
+    if since_ms < 0 || until_ms < since_ms || until_ms > now_ms {
+        return Err("relay receipt window is invalid".to_owned());
+    }
+    let mut relay = relay_core::Relay::connect(url, timeout)
+        .map_err(|_| "relay receipt source is unavailable".to_owned())?
+        .with_prefix(prefix.to_owned());
+    let mut cursor = None;
+    let mut rows = Vec::new();
+    let mut seen = BTreeSet::new();
+    for _ in 0..MAX_RELAY_PAGES {
+        let request = relay_core::receipts::ReceiptRequest {
+            since_ms,
+            until_ms,
+            now_ms,
+            page_size: relay_core::receipts::RECEIPT_PAGE_CAP,
+            after: cursor.clone(),
+        };
+        let page = relay
+            .receipt_export(&request)
+            .map_err(|_| "relay receipt source is unavailable".to_owned())?;
+        validate_receipt_page(&page, since_ms, until_ms, cursor.as_deref())?;
+        for ordered in page.events {
+            if !seen.insert(ordered.cursor) {
+                return Err("relay receipt pagination repeated an event".to_owned());
+            }
+            let value = serde_json::to_value(ordered.event)
+                .map_err(|_| "relay receipt row could not be normalized".to_owned())?;
+            let mut row = value
+                .as_object()
+                .cloned()
+                .ok_or_else(|| "relay receipt row has an invalid shape".to_owned())?;
+            row.insert(
+                "receipt_id".to_owned(),
+                row.get("original_id").cloned().unwrap_or(Value::Null),
+            );
+            if let Some(at) = row.get("event_time_ms").cloned() {
+                row.insert("at_ms".to_owned(), at);
+            }
+            rows.push(row);
+        }
+        if !page.has_more {
+            if page.next_cursor.is_some() {
+                return Err("complete relay receipt page has an unexpected cursor".to_owned());
+            }
+            return Ok(rows);
+        }
+        let Some(next) = page.next_cursor else {
+            return Err("relay receipt page has more events but no cursor".to_owned());
+        };
+        cursor = Some(next);
+    }
+    Err("relay receipt page limit was exceeded".to_owned())
+}
+
+const MAX_RELAY_PAGES: usize = 100;
+
+fn validate_order_page(
+    page: &relay_core::receipts::OrderPage,
+    since_ms: i64,
+    until_ms: i64,
+    previous_cursor: Option<&relay_core::receipts::OrderCursor>,
+) -> Result<(), String> {
+    if !page.complete
+        || page.skipped != 0
+        || page
+            .oldest_available_at
+            .is_none_or(|oldest| oldest > since_ms)
+        || page.window.since != since_ms
+        || page.window.until != until_ms
+        || page.window.filter != "enqueued_at"
+        || page.window.order != "newest_first"
+        || page.limit != relay_core::receipts::ORDERS_PAGE_CAP
+    {
+        return Err("relay order window is incomplete".to_owned());
+    }
+    if page.truncated {
+        let Some(next) = page.next_cursor.as_ref() else {
+            return Err("truncated relay order page has no cursor".to_owned());
+        };
+        if previous_cursor == Some(next) {
+            return Err("relay order cursor did not advance".to_owned());
+        }
+        if page.orders.last().is_none_or(|order| {
+            order.order_id != next.order_id || order.enqueued_at_ms != next.enqueued_at_ms
+        }) {
+            return Err("relay order cursor does not match the last returned order".to_owned());
+        }
+    } else if page.next_cursor.is_some() {
+        return Err("complete relay order page has an unexpected cursor".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_receipt_page(
+    page: &relay_core::receipts::ReceiptExport,
+    since_ms: i64,
+    until_ms: i64,
+    previous_cursor: Option<&str>,
+) -> Result<(), String> {
+    if !page.complete
+        || !page.reasons.is_empty()
+        || page.requested_since_ms != since_ms
+        || page.requested_until_ms != until_ms
+        || page.covered_since_ms.is_none_or(|start| start > since_ms)
+        || page.covered_until_ms.is_none_or(|end| end < until_ms)
+    {
+        return Err("relay receipt window is incomplete".to_owned());
+    }
+    if page.has_more {
+        let Some(next) = page.next_cursor.as_deref() else {
+            return Err("relay receipt page has more events but no cursor".to_owned());
+        };
+        if previous_cursor == Some(next) {
+            return Err("relay receipt cursor did not advance".to_owned());
+        }
+        if page.events.last().is_none_or(|event| event.cursor != next) {
+            return Err("relay receipt cursor does not match the last returned event".to_owned());
+        }
+    } else if page.next_cursor.is_some() {
+        return Err("complete relay receipt page has an unexpected cursor".to_owned());
+    }
+    Ok(())
+}
+
+fn read_ledger_rows(
+    path: &Path,
+    object: &str,
+    time_column: &str,
+    window: &EvalWindow,
+) -> Result<Vec<Map<String, Value>>, String> {
+    super::ledger::read_view_rows(path, object, time_column, window)
+}
+
+#[implements("FR-047-AC-6")]
+fn action_coverage(path: &Path, window: &EvalWindow) -> Result<(), String> {
+    let ticks = read_ledger_rows(path, "tick", "committed_at", window)?;
+    if ticks.is_empty() {
+        return Err(
+            "fleet action ledger has no committed tick in this event-time window".to_owned(),
+        );
+    }
+    let runs = read_ledger_rows(path, "run", "relay_ms", window)?;
+    if runs.is_empty() {
+        return Err(
+            "fleet action ledger has no collector run in this event-time window".to_owned(),
+        );
+    }
+    if runs
+        .iter()
+        .any(|run| run.get("relay_unavailable").and_then(Value::as_i64) == Some(1))
+    {
+        return Err("fleet action ledger has an unavailable relay collector run".to_owned());
+    }
+    Ok(())
+}
+
+#[implements("FR-047-AC-6")]
+fn require_sender_role(
+    rows: Vec<Map<String, Value>>,
+    path: &Path,
+) -> Result<Vec<Map<String, Value>>, String> {
+    let connection = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|_| "fleet action ledger is unavailable".to_owned())?;
+    let version = connection
+        .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+        .map_err(|_| "fleet action ledger schema version is unavailable".to_owned())?;
+    let has_sender_role = connection
+        .prepare("PRAGMA table_info(action_send)")
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|_| "fleet action ledger columns are unavailable".to_owned())?
+        .iter()
+        .any(|column| column == "sender_role");
+    if version < 7 || !has_sender_role {
+        return Err("fleet action ledger lacks sender_role support (v7 required)".to_owned());
+    }
+    if rows.iter().any(|row| row.get("sender_role").is_none()) {
+        return Err(format!(
+            "{}: action_send rows do not record sender_role",
+            path.display(),
+        ));
+    }
+    Ok(rows)
+}
+
+#[implements("FR-047-AC-1")]
+#[implements("FR-047-AC-6")]
+fn normalize_assigned_order_ids(rows: Vec<Map<String, Value>>) -> Result<BTreeSet<String>, String> {
+    let mut ids = BTreeSet::new();
+    for row in rows {
+        let Some(order_id) = row.get("order_id").and_then(Value::as_str) else {
+            return Err("assignment_history row has no stable order id".to_owned());
+        };
+        ids.insert(order_id.to_owned());
+    }
+    Ok(ids)
+}
+
+#[implements("FR-047-AC-1")]
+fn normalize_actions(rows: &[Map<String, Value>], kind: &str) -> Vec<Map<String, Value>> {
+    rows.iter()
+        .filter(|row| {
+            if kind == "orchestrator_addressed" {
+                row.get("target_role").and_then(Value::as_str) == Some("orchestrator")
+            } else {
+                row.get("kind").and_then(Value::as_str) == Some(kind)
+            }
+        })
+        .map(|row| {
+            let mut normalized = row.clone();
+            if let Some(id) = row.get("id").cloned() {
+                normalized.insert("action_id".to_owned(), id);
+            }
+            if let Some(at) = row.get("emitted_at").cloned() {
+                normalized.insert("at_ms".to_owned(), at);
+            }
+            if kind == "route_dead_lane" || kind == "route_idle_lane" {
+                normalized.insert(
+                    "lane_addr".to_owned(),
+                    row.get("lane").cloned().unwrap_or(Value::Null),
+                );
+            }
+            normalized
+        })
+        .collect()
+}
+
+#[implements("FR-047-AC-1")]
+#[implements("FR-047-AC-6")]
+fn read_blocked_intervals(
+    path: &Path,
+    window: &EvalWindow,
+    tick_interval_ms: i64,
+) -> Result<Vec<Map<String, Value>>, String> {
+    let start = window
+        .start_ms
+        .saturating_sub(tick_interval_ms.saturating_mul(2));
+    let extended = EvalWindow {
+        start_ms: start,
+        end_ms: window.end_ms.saturating_add(tick_interval_ms),
+    };
+    let rows = read_ledger_rows(path, "lane_tick_rows", "at_ms", &extended)?;
+    if rows.is_empty() {
+        return Err("lane_tick_rows has no coverage for the blocked-lane window".to_owned());
+    }
+    let max_gap_ms = tick_interval_ms.saturating_mul(2);
+    let mut by_lane = BTreeMap::<String, Vec<(i64, String)>>::new();
+    for row in rows {
+        let (Some(lane), Some(at), Some(class)) = (
+            row.get("lane").and_then(Value::as_str),
+            row.get("at_ms").and_then(Value::as_i64),
+            row.get("class").and_then(Value::as_str),
+        ) else {
+            return Err("lane_tick_rows has a row without lane, class or time".to_owned());
+        };
+        by_lane
+            .entry(lane.to_owned())
+            .or_default()
+            .push((at, class.to_ascii_lowercase()));
+    }
+    let mut intervals = Vec::new();
+    for (lane, mut samples) in by_lane {
+        samples.sort_by_key(|(at, _)| *at);
+        if samples.first().is_none_or(|(at, _)| {
+            *at > window.start_ms || window.start_ms.saturating_sub(*at) > max_gap_ms
+        }) {
+            return Err(format!(
+                "lane {lane} lacks a status sample covering window start"
+            ));
+        }
+        if samples
+            .windows(2)
+            .any(|pair| pair[1].0.saturating_sub(pair[0].0) > max_gap_ms)
+        {
+            return Err(format!("lane {lane} has a status gap over two fleet ticks"));
+        }
+        if samples
+            .last()
+            .is_none_or(|(at, _)| window.end_ms.saturating_sub(*at) > max_gap_ms)
+        {
+            return Err(format!(
+                "lane {lane} lacks a status sample covering window end"
+            ));
+        }
+        let mut index = 0;
+        while index < samples.len() {
+            if samples[index].1 != "blocked" {
+                index += 1;
+                continue;
+            }
+            let start_ms = samples[index].0;
+            while index < samples.len() && samples[index].1 == "blocked" {
+                index += 1;
+            }
+            let end_ms = samples
+                .get(index)
+                .map(|(at, _)| *at)
+                .unwrap_or(window.end_ms);
+            if end_ms <= window.start_ms || start_ms >= window.end_ms {
+                continue;
+            }
+            intervals.push(Map::from_iter([
+                ("lane_addr".to_owned(), Value::String(lane.clone())),
+                ("start_ms".to_owned(), Value::from(start_ms)),
+                ("end_ms".to_owned(), Value::from(end_ms)),
+            ]));
+        }
+    }
+    Ok(intervals)
 }
 
 fn orders_without_ticket(
@@ -267,6 +872,9 @@ fn action_send_violations(
                 _ => return unavailable(query, "fleet tick interval is unavailable"),
             },
         };
+        if due_by > window.end_ms {
+            continue;
+        }
         let expected_recipient = if view_name == "orchestrator_addressed_actions" {
             evidence.orchestrator_addr
         } else {
@@ -342,6 +950,9 @@ fn lane_route_violations(
                 _ => return unavailable(query, "fleet tick interval is unavailable"),
             },
         };
+        if due_by > window.end_ms {
+            continue;
+        }
         let routed = sends.iter().any(|send| {
             integer(send, &["action_id"]) == Some(action_id)
                 && string(send, &["sender_role"]).is_some_and(|role| role == "minder")
@@ -460,6 +1071,9 @@ fn need_ready_violations(evidence: &RelayEvidence<'_>, window: &EvalWindow) -> Q
                 "need_ready_tickets_actions contains a row without planner address",
             );
         };
+        if at_ms.saturating_add(tick_ms) > window.end_ms {
+            continue;
+        }
         let matching_order = orders.iter().find(|order| {
             string(order, &["sender_addr", "sender"])
                 .is_some_and(|sender| sender.eq_ignore_ascii_case(orchestrator))
@@ -582,6 +1196,62 @@ mod tests {
 
     fn map(value: Value) -> Map<String, Value> {
         value.as_object().cloned().expect("object fixture")
+    }
+
+    fn order_page() -> relay_core::receipts::OrderPage {
+        relay_core::receipts::OrderPage {
+            orders: Vec::new(),
+            truncated: false,
+            next_cursor: None,
+            window: relay_core::receipts::OrderWindow {
+                since: 1_000,
+                until: 1_999,
+                filter: "enqueued_at",
+                order: "newest_first",
+            },
+            limit: relay_core::receipts::ORDERS_PAGE_CAP,
+            oldest_available_at: Some(0),
+            complete: true,
+            incomplete_reason: None,
+            skipped: 0,
+        }
+    }
+
+    fn receipt_export() -> relay_core::receipts::ReceiptExport {
+        relay_core::receipts::ReceiptExport {
+            requested_since_ms: 1_000,
+            requested_until_ms: 1_999,
+            covered_since_ms: Some(1_000),
+            covered_until_ms: Some(1_999),
+            instrumentation_start_ms: Some(0),
+            retention_boundary_ms: 0,
+            complete: true,
+            reasons: Vec::new(),
+            events: Vec::new(),
+            next_cursor: None,
+            has_more: false,
+        }
+    }
+
+    fn queued_ordered_receipt() -> relay_core::receipts::OrderedReceipt {
+        relay_core::receipts::OrderedReceipt {
+            cursor: "1700000000000-0".to_owned(),
+            event: relay_core::receipts::ReceiptEvent {
+                event_id: "event-1".to_owned(),
+                original_id: "receipt-1".to_owned(),
+                attempt_id: None,
+                outcome: relay_core::receipts::ReceiptOutcome::Queued,
+                sender: "test:workspace:minder".to_owned(),
+                target: "test:workspace:coder".to_owned(),
+                event_time_ms: Some(1_500),
+                observed_at_ms: 1_500,
+                evidence: None,
+                reason: None,
+                session: None,
+                expect_ticket: None,
+                delivered_at_ms: None,
+            },
+        }
     }
 
     fn evidence<'a>(
@@ -736,6 +1406,29 @@ mod tests {
     /// Trace: FR-047-AC-1
     #[trace("FR-047-AC-1")]
     #[test]
+    fn action_not_yet_due_at_window_end_is_not_judged_as_missing() {
+        let query = PUSH_UNSENT;
+        let specs = [RoleSpec {
+            role: "minder".to_owned(),
+            metrics: Vec::new(),
+            rules: vec![rule(query, "MIND-R03-E1")],
+        }];
+        let actions = vec![map(
+            json!({"action_id":8, "at_ms":1900, "due_by":2300, "target_addr":"test:workspace:coder"}),
+        )];
+        let views = BTreeMap::from([("push_next_ticket_actions".to_owned(), Ok(actions))]);
+        let assigned = BTreeSet::new();
+        let source = evidence(Ok(&[]), Ok(&[]), Ok(&[]), &views, Ok(&assigned));
+        let values = adapters(&specs, &source, &window());
+        assert!(matches!(
+            values.get(query),
+            Some(QueryValue::Value { value: 0.0, .. })
+        ));
+    }
+
+    /// Trace: FR-047-AC-1
+    #[trace("FR-047-AC-1")]
+    #[test]
     fn blocked_lane_rule_counts_only_minder_sends_during_complete_block_interval() {
         let query = BLOCKED_SEND;
         let specs = [RoleSpec {
@@ -785,11 +1478,181 @@ mod tests {
             json!({"order_id":"planner-order-1", "sender":"test:workspace:orchestrator", "recipient":"test:workspace:planner", "receipt_target":"test:workspace:planner", "expect_ticket":null, "ack_ms":30000, "deadline_at":31200, "enqueued_at":1200, "delivered_at":null, "acted_at":null, "state":"queued", "expired":false}),
         )];
         let assigned = BTreeSet::new();
-        let source = evidence(Ok(&orders), Ok(&[]), Ok(&[]), &views, Ok(&assigned));
+        let mut source = evidence(Ok(&orders), Ok(&[]), Ok(&[]), &views, Ok(&assigned));
+        source.tick_interval_ms = Some(300);
         let values = adapters(&specs, &source, &window());
         assert!(matches!(
             values.get(query),
             Some(QueryValue::Value { value: 1.0, evidence_refs, .. }) if evidence_refs == &["fleet-action:12"]
         ));
+    }
+
+    /// Trace: FR-047-AC-6
+    #[trace("FR-047-AC-6")]
+    #[test]
+    fn complete_empty_relay_pages_are_accepted_but_partial_pages_are_rejected() {
+        let orders = order_page();
+        assert!(validate_order_page(&orders, 1_000, 1_999, None).is_ok());
+
+        let mut incomplete_orders = order_page();
+        incomplete_orders.complete = false;
+        assert!(validate_order_page(&incomplete_orders, 1_000, 1_999, None).is_err());
+
+        let receipts = receipt_export();
+        assert!(validate_receipt_page(&receipts, 1_000, 1_999, None).is_ok());
+
+        let mut incomplete_receipts = receipt_export();
+        incomplete_receipts
+            .reasons
+            .push(relay_core::receipts::ReceiptCoverageReason::RecordingGap);
+        assert!(validate_receipt_page(&incomplete_receipts, 1_000, 1_999, None).is_err());
+    }
+
+    /// Trace: FR-047-AC-6
+    #[trace("FR-047-AC-6")]
+    #[test]
+    fn truncated_relay_pages_require_a_matching_advancing_cursor() {
+        let mut page = order_page();
+        let state = relay_core::receipts::OrderState {
+            order_id: "order-1".to_owned(),
+            sender: "test:workspace:orchestrator".to_owned(),
+            recipient: "test:workspace:coder".to_owned(),
+            receipt_target: "test:workspace:coder".to_owned(),
+            expect_ticket: Some("SWM-221".to_owned()),
+            ack_ms: 10_000,
+            deadline_at: 11_000,
+            enqueued_at_ms: 1_000,
+            delivered_at_ms: None,
+            acted_at_ms: None,
+            state: "queued".to_owned(),
+            expired: false,
+        };
+        page.orders.push(state);
+        page.truncated = true;
+        page.next_cursor = Some(relay_core::receipts::OrderCursor {
+            enqueued_at_ms: 1_000,
+            order_id: "order-1".to_owned(),
+        });
+        assert!(validate_order_page(&page, 1_000, 1_999, None).is_ok());
+        assert!(validate_order_page(&page, 1_000, 1_999, page.next_cursor.as_ref()).is_err());
+        page.next_cursor.as_mut().expect("cursor fixture").order_id = "wrong".to_owned();
+        assert!(validate_order_page(&page, 1_000, 1_999, None).is_err());
+    }
+
+    /// Trace: FR-047-AC-6
+    #[trace("FR-047-AC-6")]
+    #[test]
+    fn receipt_page_cursor_must_match_last_real_receipt() {
+        let mut page = receipt_export();
+        let event = queued_ordered_receipt();
+        page.next_cursor = Some(event.cursor.clone());
+        page.has_more = true;
+        page.events.push(event);
+        assert!(validate_receipt_page(&page, 1_000, 1_999, None).is_ok());
+        assert!(validate_receipt_page(&page, 1_000, 1_999, Some("1700000000000-0")).is_err());
+        page.next_cursor = Some("1700000000000-9".to_owned());
+        assert!(validate_receipt_page(&page, 1_000, 1_999, None).is_err());
+    }
+
+    /// Trace: FR-047-AC-6
+    #[trace("FR-047-AC-6")]
+    #[test]
+    fn live_adapter_does_no_source_io_when_no_relay_rule_is_requested() {
+        assert!(
+            live_adapters(&[], &window(), None, None, None, None, None, Duration::ZERO,).is_empty()
+        );
+    }
+
+    /// Trace: FR-047-AC-1
+    #[trace("FR-047-AC-1")]
+    #[test]
+    fn live_action_normalization_uses_fleet_ledger_action_rows() {
+        let rows = [map(json!({
+            "id": 42,
+            "kind": "route_dead_lane",
+            "lane": "test:workspace:coder",
+            "emitted_at": 1200,
+            "target_role": "orchestrator",
+            "target_addr": "test:workspace:orchestrator"
+        }))];
+        let normalized = normalize_actions(&rows, "route_dead_lane");
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0]["action_id"], json!(42));
+        assert_eq!(normalized[0]["at_ms"], json!(1200));
+        assert_eq!(normalized[0]["lane_addr"], json!("test:workspace:coder"));
+    }
+
+    /// Trace: FR-047-AC-6
+    #[trace("FR-047-AC-6")]
+    #[test]
+    fn old_action_send_schema_is_unavailable_even_for_an_empty_table() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("ledger.sqlite3");
+        let connection = rusqlite::Connection::open(&path).expect("create ledger fixture");
+        connection
+            .execute_batch("PRAGMA user_version=6; CREATE TABLE action_send(action_id INTEGER, sent_at INTEGER, sender_addr TEXT, recipient_addr TEXT, receipt_id TEXT);")
+            .expect("create v6 action_send table");
+        assert!(require_sender_role(Vec::new(), &path).is_err());
+        connection
+            .execute_batch(
+                "PRAGMA user_version=7; ALTER TABLE action_send ADD COLUMN sender_role TEXT;",
+            )
+            .expect("upgrade fixture to v7 action_send shape");
+        assert!(require_sender_role(Vec::new(), &path).is_ok());
+    }
+
+    /// Trace: FR-047-AC-6
+    #[trace("FR-047-AC-6")]
+    #[test]
+    fn ledger_assignment_rows_without_order_identity_are_incomplete() {
+        assert!(normalize_assigned_order_ids(vec![map(json!({"assigned_at":1200}))]).is_err());
+        assert!(normalize_assigned_order_ids(Vec::new()).is_ok_and(|ids| ids.is_empty()));
+    }
+
+    /// Trace: FR-047-AC-1
+    #[trace("FR-047-AC-1")]
+    #[test]
+    fn blocked_intervals_come_from_complete_lane_tick_history() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("ledger.sqlite3");
+        let connection = rusqlite::Connection::open(&path).expect("create ledger fixture");
+        connection
+            .execute_batch(
+                "PRAGMA user_version=6;
+                 CREATE TABLE lane_tick_rows(lane TEXT, at_ms INTEGER, class TEXT);
+                 INSERT INTO lane_tick_rows VALUES
+                   ('test:workspace:coder',800,'IDLE'),
+                   ('test:workspace:coder',1100,'BLOCKED'),
+                   ('test:workspace:coder',1500,'BLOCKED'),
+                   ('test:workspace:coder',2100,'IDLE');",
+            )
+            .expect("write lane status history");
+        let intervals = read_blocked_intervals(
+            &path,
+            &EvalWindow {
+                start_ms: 1_000,
+                end_ms: 2_000,
+            },
+            300,
+        )
+        .expect("complete lane history");
+        assert_eq!(intervals.len(), 1);
+        assert_eq!(intervals[0]["start_ms"], json!(1100));
+        assert_eq!(intervals[0]["end_ms"], json!(2100));
+
+        connection
+            .execute("DELETE FROM lane_tick_rows", [])
+            .expect("remove lane history");
+        assert!(
+            read_blocked_intervals(
+                &path,
+                &EvalWindow {
+                    start_ms: 1_000,
+                    end_ms: 2_000,
+                },
+                300,
+            )
+            .is_err()
+        );
     }
 }

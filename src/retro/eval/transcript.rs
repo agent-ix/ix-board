@@ -10,9 +10,15 @@ use super::{EvalWindow, QueryValue, RoleSpec};
 use ix_trace_rs::implements;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 
 pub const DEFAULT_MAX_TRANSCRIPT_BYTES: usize = 4 * 1024 * 1024;
 pub const DEFAULT_MAX_RECORD_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_MAX_DISCOVERY_ENTRIES: usize = 20_000;
+pub const DEFAULT_MAX_COLLECTION_BYTES: usize = 64 * 1024 * 1024;
+pub const DEFAULT_MAX_TRANSCRIPT_SESSIONS: usize = 128;
 
 /// A transcript encoding supported by the bounded parser.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,16 +84,95 @@ pub struct HookTurn {
 /// In-memory session-turn projection. It is not persisted by the evaluator.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionTurnRow {
-    pub transcript_id: String,
+    /// Transcript ID from an authoritative source, or `None` when unavailable.
+    pub transcript_id: Option<String>,
+    /// Explicit relay/session address.
     pub session_addr: String,
+    /// Configured role attributed to the address.
     pub session_role: String,
+    /// Hook event time in Unix milliseconds.
     pub started_at_ms: i64,
+}
+
+/// Explicit limits for live transcript discovery and reading.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TranscriptReadLimits {
+    /// Maximum bytes in any one transcript.
+    pub max_transcript_bytes: usize,
+    /// Maximum bytes in one newline-delimited record.
+    pub max_record_bytes: usize,
+    /// Maximum total transcript file bytes read in one discovery call.
+    pub max_collection_bytes: usize,
+    /// Maximum directory entries inspected across both harness roots.
+    pub max_discovery_entries: usize,
+    /// Maximum distinct transcript IDs accepted from the input rows.
+    pub max_sessions: usize,
+    /// Maximum directory nesting below either harness root.
+    pub max_directory_depth: usize,
+}
+
+impl Default for TranscriptReadLimits {
+    fn default() -> Self {
+        Self {
+            max_transcript_bytes: DEFAULT_MAX_TRANSCRIPT_BYTES,
+            max_record_bytes: DEFAULT_MAX_RECORD_BYTES,
+            max_collection_bytes: DEFAULT_MAX_COLLECTION_BYTES,
+            max_discovery_entries: DEFAULT_MAX_DISCOVERY_ENTRIES,
+            max_sessions: DEFAULT_MAX_TRANSCRIPT_SESSIONS,
+            max_directory_depth: 32,
+        }
+    }
+}
+
+/// Transcript evidence joined to explicit session-turn ledger identities.
+/// Turns remain present even when a transcript is missing or unavailable.
+#[derive(Clone)]
+pub struct TranscriptInventory {
+    /// Explicit ledger turns, preserved even when their transcript is unavailable.
+    pub turns: Vec<SessionTurnRow>,
+    /// Parsed sessions indexed by the explicit ledger transcript ID.
+    pub transcripts: BTreeMap<String, TranscriptSession>,
+    /// Whether discovery and every accepted transcript were complete.
+    pub complete: bool,
+    /// Stable source issue codes; no paths, transcript text, or credentials.
+    pub unavailable_reasons: Vec<String>,
+}
+
+impl TranscriptInventory {
+    /// Produces query values separately for each explicit transcript identity.
+    #[implements("FR-047-AC-5")]
+    pub fn adapters_by_transcript(
+        &self,
+        spec: &RoleSpec,
+        window: &EvalWindow,
+        context: &AdapterContext,
+    ) -> BTreeMap<String, BTreeMap<String, QueryValue>> {
+        self.transcripts
+            .iter()
+            .filter(|(_, transcript)| transcript.binding.session_role == spec.role)
+            .map(|(transcript_id, transcript)| {
+                (
+                    transcript_id.clone(),
+                    adapters(spec, transcript, window, context),
+                )
+            })
+            .collect()
+    }
+
+    /// Ledger-shaped virtual rows for the existing session scorer.
+    #[implements("FR-047-AC-5")]
+    pub fn ledger_rows(&self) -> Vec<serde_json::Map<String, Value>> {
+        self.turns
+            .iter()
+            .map(SessionTurnRow::as_ledger_row)
+            .collect()
+    }
 }
 
 impl SessionTurnRow {
     /// Converts the virtual row to the keys consumed by session scoring.
     pub fn as_ledger_row(&self) -> serde_json::Map<String, Value> {
-        serde_json::Map::from_iter([
+        let mut row = serde_json::Map::from_iter([
             (
                 "session_addr".to_owned(),
                 Value::String(self.session_addr.clone()),
@@ -100,12 +185,51 @@ impl SessionTurnRow {
                 "started_at".to_owned(),
                 Value::Number(self.started_at_ms.into()),
             ),
-            (
+        ]);
+        if let Some(transcript_id) = &self.transcript_id {
+            row.insert(
                 "transcript_id".to_owned(),
-                Value::String(self.transcript_id.clone()),
-            ),
-        ])
+                Value::String(transcript_id.clone()),
+            );
+        }
+        row
     }
+}
+
+/// Converts rows returned by the existing read-only `session_turn` query into
+/// typed transcript inputs. Legacy rows without `transcript_id` are retained
+/// with `None`; malformed present IDs become invalid IDs and score unavailable.
+#[implements("FR-047-AC-5")]
+pub fn turn_rows_from_ledger(rows: &[serde_json::Map<String, Value>]) -> Vec<SessionTurnRow> {
+    let mut turns = rows
+        .iter()
+        .filter_map(|row| {
+            Some(SessionTurnRow {
+                transcript_id: row
+                    .get("transcript_id")
+                    .map(|value| value.as_str().unwrap_or_default().to_owned()),
+                session_addr: row.get("session_addr")?.as_str()?.to_owned(),
+                session_role: row.get("session_role")?.as_str()?.to_owned(),
+                started_at_ms: row.get("started_at")?.as_i64()?,
+            })
+        })
+        .collect::<Vec<_>>();
+    turns.sort_by(|left, right| {
+        (
+            &left.session_addr,
+            &left.session_role,
+            left.started_at_ms,
+            &left.transcript_id,
+        )
+            .cmp(&(
+                &right.session_addr,
+                &right.session_role,
+                right.started_at_ms,
+                &right.transcript_id,
+            ))
+    });
+    turns.dedup();
+    turns
 }
 
 /// Cross-source facts required by checks whose answer depends on external
@@ -242,7 +366,7 @@ pub fn session_turn_rows(
         .iter()
         .filter(|hook| hook.started_at_ms >= window.start_ms && hook.started_at_ms < window.end_ms)
         .map(|hook| SessionTurnRow {
-            transcript_id: hook.transcript_id.clone(),
+            transcript_id: Some(hook.transcript_id.clone()),
             session_addr: hook.session_addr.clone(),
             session_role: hook.session_role.clone(),
             started_at_ms: hook.started_at_ms,
@@ -259,6 +383,441 @@ pub fn session_turn_rows(
         left.session_addr == right.session_addr && left.started_at_ms == right.started_at_ms
     });
     rows
+}
+
+/// Discovers and reads transcripts for ledger rows that already contain an explicit
+/// transcript ID, address, and role. Claude files are matched by exact `<id>.jsonl`
+/// names; Codex files are matched by an exact ID suffix and then validated by the
+/// session metadata record. No timestamps, modification times, or nearest-session
+/// heuristics are used to bind a transcript.
+#[implements("FR-047-AC-5")]
+pub fn discover_transcripts(
+    home: &Path,
+    ledger_rows: &[SessionTurnRow],
+    limits: TranscriptReadLimits,
+) -> TranscriptInventory {
+    let mut turns = ledger_rows.to_vec();
+    turns.sort_by(|left, right| {
+        (
+            &left.session_addr,
+            &left.session_role,
+            left.started_at_ms,
+            &left.transcript_id,
+        )
+            .cmp(&(
+                &right.session_addr,
+                &right.session_role,
+                right.started_at_ms,
+                &right.transcript_id,
+            ))
+    });
+    turns.dedup();
+
+    let mut inventory = TranscriptInventory {
+        turns,
+        transcripts: BTreeMap::new(),
+        complete: true,
+        unavailable_reasons: Vec::new(),
+    };
+    let mut identities = BTreeMap::<String, (String, String, i64, bool)>::new();
+    for turn in &inventory.turns {
+        let Some(transcript_id) = turn.transcript_id.as_deref() else {
+            inventory.complete = false;
+            inventory
+                .unavailable_reasons
+                .push("transcript_id_unavailable".to_owned());
+            let unavailable_key = format!(
+                "transcript-id-unavailable:{}:{}",
+                turn.session_addr, turn.started_at_ms
+            );
+            inventory
+                .transcripts
+                .entry(unavailable_key)
+                .or_insert_with(|| unavailable_transcript(turn, "transcript_id_unavailable"));
+            continue;
+        };
+        if !valid_transcript_id(transcript_id) {
+            inventory.complete = false;
+            inventory
+                .unavailable_reasons
+                .push("invalid_transcript_id".to_owned());
+            let unavailable_key = format!(
+                "invalid-transcript-id:{}:{}",
+                turn.session_addr, turn.started_at_ms
+            );
+            inventory
+                .transcripts
+                .entry(unavailable_key)
+                .or_insert_with(|| unavailable_transcript(turn, "invalid_transcript_id"));
+            continue;
+        }
+        match identities.get_mut(transcript_id) {
+            Some((address, role, started_at, consistent)) => {
+                if address != &turn.session_addr || role != &turn.session_role {
+                    *consistent = false;
+                }
+                *started_at = (*started_at).min(turn.started_at_ms);
+            }
+            None => {
+                identities.insert(
+                    transcript_id.to_owned(),
+                    (
+                        turn.session_addr.clone(),
+                        turn.session_role.clone(),
+                        turn.started_at_ms,
+                        true,
+                    ),
+                );
+            }
+        }
+    }
+
+    let requested = identities
+        .iter()
+        .filter(|(_, (_, _, _, consistent))| *consistent)
+        .map(|(id, _)| id.clone())
+        .collect::<BTreeSet<_>>();
+    if identities.len() > limits.max_sessions {
+        inventory.complete = false;
+        inventory
+            .unavailable_reasons
+            .push("transcript_session_limit".to_owned());
+        for id in requested {
+            if let Some((address, role, started_at_ms, _)) = identities.get(&id) {
+                let turn = SessionTurnRow {
+                    transcript_id: Some(id.clone()),
+                    session_addr: address.clone(),
+                    session_role: role.clone(),
+                    started_at_ms: *started_at_ms,
+                };
+                inventory.transcripts.insert(
+                    id,
+                    unavailable_transcript(&turn, "transcript_session_limit"),
+                );
+            }
+        }
+        return inventory;
+    }
+
+    for (id, (address, role, started_at_ms, consistent)) in &identities {
+        if !consistent {
+            let turn = SessionTurnRow {
+                transcript_id: Some(id.clone()),
+                session_addr: address.clone(),
+                session_role: role.clone(),
+                started_at_ms: *started_at_ms,
+            };
+            inventory.transcripts.insert(
+                id.clone(),
+                unavailable_transcript(&turn, "transcript_binding_conflict"),
+            );
+            inventory.complete = false;
+            inventory
+                .unavailable_reasons
+                .push("transcript_binding_conflict".to_owned());
+        }
+    }
+
+    if requested.is_empty() {
+        inventory.unavailable_reasons.sort_unstable();
+        inventory.unavailable_reasons.dedup();
+        return inventory;
+    }
+
+    let roots = [
+        (home.join(".claude/projects"), HarnessFormat::Claude),
+        (home.join(".codex/sessions"), HarnessFormat::Codex),
+    ];
+    let mut candidates = BTreeMap::<String, Vec<(HarnessFormat, PathBuf)>>::new();
+    let mut entries_seen = 0usize;
+    let mut discovery_error = None;
+    for (root, format) in roots {
+        if let Err(reason) = collect_candidates(
+            &root,
+            format,
+            &requested,
+            0,
+            &mut entries_seen,
+            limits,
+            &mut candidates,
+        ) {
+            discovery_error = Some(reason);
+            break;
+        }
+    }
+    if let Some(reason) = discovery_error {
+        inventory.complete = false;
+        inventory.unavailable_reasons.push(reason.to_owned());
+        for (id, (address, role, started_at_ms, consistent)) in identities {
+            if inventory.transcripts.contains_key(&id) {
+                continue;
+            }
+            let turn = SessionTurnRow {
+                transcript_id: Some(id.clone()),
+                session_addr: address,
+                session_role: role,
+                started_at_ms,
+            };
+            let reason = if consistent {
+                "transcript_discovery_incomplete"
+            } else {
+                "transcript_binding_conflict"
+            };
+            inventory
+                .transcripts
+                .insert(id, unavailable_transcript(&turn, reason));
+        }
+        return inventory;
+    }
+
+    let mut bytes_used = 0usize;
+    for (id, (address, role, started_at_ms, consistent)) in identities {
+        if inventory.transcripts.contains_key(&id) {
+            continue;
+        }
+        let turn = SessionTurnRow {
+            transcript_id: Some(id.clone()),
+            session_addr: address,
+            session_role: role,
+            started_at_ms,
+        };
+        if !consistent {
+            continue;
+        }
+        let found = candidates.remove(&id).unwrap_or_default();
+        if found.is_empty() {
+            inventory.complete = false;
+            inventory
+                .unavailable_reasons
+                .push("transcript_missing".to_owned());
+            inventory
+                .transcripts
+                .insert(id, unavailable_transcript(&turn, "transcript_missing"));
+            continue;
+        }
+        if found.len() != 1 {
+            inventory.complete = false;
+            inventory
+                .unavailable_reasons
+                .push("transcript_ambiguous".to_owned());
+            inventory
+                .transcripts
+                .insert(id, unavailable_transcript(&turn, "transcript_ambiguous"));
+            continue;
+        }
+        let (format, path) = &found[0];
+        let parsed = match read_bounded_lines(path, &mut bytes_used, limits) {
+            Ok(lines) => parse_lines(
+                *format,
+                SessionBinding {
+                    transcript_id: id.clone(),
+                    session_addr: turn.session_addr.clone(),
+                    session_role: turn.session_role.clone(),
+                    started_at_ms: turn.started_at_ms,
+                },
+                &lines.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+                limits.max_transcript_bytes,
+                limits.max_record_bytes,
+            ),
+            Err(reason) => unavailable_transcript(&turn, reason),
+        };
+        if !parsed.complete {
+            inventory.complete = false;
+            if let Some(reason) = parsed.unavailable_reason.as_ref() {
+                inventory.unavailable_reasons.push(reason.clone());
+            }
+        }
+        inventory.transcripts.insert(id, parsed);
+    }
+    inventory.unavailable_reasons.sort_unstable();
+    inventory.unavailable_reasons.dedup();
+    inventory
+}
+
+#[implements("FR-047-AC-5")]
+fn valid_transcript_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 512
+        && !id.contains(['/', '\\', '\0'])
+        && id.bytes().all(|byte| !byte.is_ascii_control())
+}
+
+#[implements("FR-047-AC-5")]
+fn unavailable_transcript(turn: &SessionTurnRow, reason: &'static str) -> TranscriptSession {
+    incomplete(
+        TranscriptSession {
+            binding: SessionBinding {
+                transcript_id: turn.transcript_id.clone().unwrap_or_default(),
+                session_addr: turn.session_addr.clone(),
+                session_role: turn.session_role.clone(),
+                started_at_ms: turn.started_at_ms,
+            },
+            events: Vec::new(),
+            complete: false,
+            unavailable_reason: None,
+            bytes_read: 0,
+            fleet_status_checks: Vec::new(),
+        },
+        reason,
+    )
+}
+
+#[implements("FR-047-AC-5")]
+fn collect_candidates(
+    directory: &Path,
+    format: HarnessFormat,
+    requested: &BTreeSet<String>,
+    depth: usize,
+    entries_seen: &mut usize,
+    limits: TranscriptReadLimits,
+    candidates: &mut BTreeMap<String, Vec<(HarnessFormat, PathBuf)>>,
+) -> Result<(), &'static str> {
+    let metadata = match fs::symlink_metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err("transcript_discovery_unreadable"),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("transcript_root_invalid");
+    }
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err("transcript_discovery_unreadable"),
+    };
+    if depth > limits.max_directory_depth {
+        return Err("transcript_discovery_depth_limit");
+    }
+    for entry in entries {
+        *entries_seen = entries_seen.saturating_add(1);
+        if *entries_seen > limits.max_discovery_entries {
+            return Err("transcript_discovery_entry_limit");
+        }
+        let entry = entry.map_err(|_| "transcript_discovery_unreadable")?;
+        let file_type = entry
+            .file_type()
+            .map_err(|_| "transcript_discovery_unreadable")?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            collect_candidates(
+                &entry.path(),
+                format,
+                requested,
+                depth + 1,
+                entries_seen,
+                limits,
+                candidates,
+            )?;
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        for id in requested {
+            let matches = match format {
+                HarnessFormat::Claude => file_name == format!("{id}.jsonl"),
+                HarnessFormat::Codex => codex_filename_matches(file_name, id),
+            };
+            if matches {
+                candidates
+                    .entry(id.clone())
+                    .or_default()
+                    .push((format, path.clone()));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[implements("FR-047-AC-5")]
+fn codex_filename_matches(file_name: &str, id: &str) -> bool {
+    let Some(stem) = file_name.strip_suffix(".jsonl") else {
+        return false;
+    };
+    stem.strip_suffix(id)
+        .is_some_and(|prefix| prefix.ends_with('-'))
+}
+
+#[implements("FR-047-AC-5")]
+fn read_bounded_lines(
+    path: &Path,
+    bytes_used: &mut usize,
+    limits: TranscriptReadLimits,
+) -> Result<Vec<Vec<u8>>, &'static str> {
+    let before = fs::metadata(path).map_err(|_| "transcript_unreadable")?;
+    let file_len = usize::try_from(before.len()).map_err(|_| "transcript_size_limit")?;
+    if file_len == 0 {
+        return Err("transcript_empty");
+    }
+    if file_len > limits.max_transcript_bytes {
+        return Err("transcript_size_limit");
+    }
+    let next_used = bytes_used
+        .checked_add(file_len)
+        .ok_or("transcript_collection_size_limit")?;
+    if next_used > limits.max_collection_bytes {
+        return Err("transcript_collection_size_limit");
+    }
+    let file = File::open(path).map_err(|_| "transcript_unreadable")?;
+    let mut reader = BufReader::new(file);
+    let mut records = Vec::new();
+    let mut record = Vec::new();
+    let mut bytes_read = 0usize;
+    loop {
+        let available = reader.fill_buf().map_err(|_| "transcript_unreadable")?;
+        if available.is_empty() {
+            break;
+        }
+        let chunk_len = available.len();
+        let mut start = 0usize;
+        while start < chunk_len {
+            let end = available[start..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(chunk_len, |offset| start + offset + 1);
+            let piece = &available[start..end];
+            bytes_read = bytes_read
+                .checked_add(piece.len())
+                .ok_or("transcript_size_limit")?;
+            if bytes_read > limits.max_transcript_bytes {
+                return Err("transcript_size_limit");
+            }
+            let content_len = piece
+                .last()
+                .filter(|byte| **byte == b'\n')
+                .map_or(piece.len(), |_| piece.len().saturating_sub(1));
+            if record.len().saturating_add(content_len) > limits.max_record_bytes {
+                return Err("transcript_record_size_limit");
+            }
+            record.extend_from_slice(&piece[..content_len]);
+            if content_len < piece.len() {
+                records.push(std::mem::take(&mut record));
+            }
+            start = end;
+        }
+        reader.consume(chunk_len);
+    }
+    if !record.is_empty() {
+        records.push(record);
+    }
+    if bytes_read != file_len {
+        return Err("transcript_changed_during_read");
+    }
+    let after = fs::metadata(path).map_err(|_| "transcript_unreadable")?;
+    if after.len() != before.len() || after.modified().ok() != before.modified().ok() {
+        return Err("transcript_changed_during_read");
+    }
+    *bytes_used = next_used;
+    Ok(records)
 }
 
 /// Produces transcript-backed deterministic query values for one role.
@@ -1398,9 +1957,15 @@ fn timestamp_ms(record: &Value) -> Option<i64> {
         .or_else(|| record.get("timestamp_ms").and_then(Value::as_i64))
 }
 
+#[implements("FR-047-AC-5")]
 fn transcript_id(record: &Value, harness: HarnessFormat) -> Option<&str> {
     match harness {
         HarnessFormat::Claude => record.get("sessionId").and_then(Value::as_str),
+        HarnessFormat::Codex
+            if record.get("type").and_then(Value::as_str) == Some("session_meta") =>
+        {
+            record.pointer("/payload/id").and_then(Value::as_str)
+        }
         HarnessFormat::Codex => record
             .pointer("/payload/session_id")
             .and_then(Value::as_str)
@@ -1578,6 +2143,206 @@ mod tests {
             session_turn_rows(&[broken], &hooks, &window).len(),
             1,
             "hook-attributed turns stay visible so their rule rows can report unavailable"
+        );
+    }
+
+    fn ledger_turn(id: &str, role: &str) -> SessionTurnRow {
+        SessionTurnRow {
+            transcript_id: Some(id.to_owned()),
+            session_addr: "test:workspace:coder".to_owned(),
+            session_role: role.to_owned(),
+            started_at_ms: 1_700_000_000_000,
+        }
+    }
+
+    fn write_transcript(home: &Path, relative: &str, content: &str) -> PathBuf {
+        let path = home.join(relative);
+        fs::create_dir_all(path.parent().expect("transcript parent"))
+            .expect("create transcript parent");
+        fs::write(&path, content).expect("write transcript fixture");
+        path
+    }
+
+    #[test]
+    #[trace("FR-047-AC-5")]
+    fn discovers_and_parses_claude_transcript_by_explicit_ledger_id() {
+        let home = tempfile::tempdir().expect("temporary home");
+        write_transcript(
+            home.path(),
+            ".claude/projects/work/claude-7.jsonl",
+            r#"{"type":"assistant","timestamp":"2023-11-14T22:13:20Z","sessionId":"claude-7","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"git status --short"}}]}}"#,
+        );
+        let turns = vec![ledger_turn("claude-7", "coder")];
+
+        let inventory = discover_transcripts(home.path(), &turns, TranscriptReadLimits::default());
+
+        assert!(inventory.complete);
+        assert_eq!(inventory.turns.len(), 1);
+        let session = &inventory.transcripts["claude-7"];
+        assert!(session.complete);
+        assert_eq!(session.binding.session_addr, "test:workspace:coder");
+        assert_eq!(
+            session.events[0].command.as_deref(),
+            Some("git status --short")
+        );
+        let spec = RoleSpec {
+            role: "coder".to_owned(),
+            metrics: Vec::new(),
+            rules: vec![rule("transcript.coder_merge_commands")],
+        };
+        assert!(
+            inventory
+                .adapters_by_transcript(
+                    &spec,
+                    &EvalWindow {
+                        start_ms: 1_795_607_000_000,
+                        end_ms: 1_795_609_000_000,
+                    },
+                    &AdapterContext::default(),
+                )
+                .contains_key("claude-7")
+        );
+    }
+
+    #[test]
+    #[trace("FR-047-AC-5")]
+    fn discovers_codex_transcript_by_exact_id_and_validates_session_meta() {
+        let home = tempfile::tempdir().expect("temporary home");
+        write_transcript(
+            home.path(),
+            ".codex/sessions/2023/11/14/rollout-2023-11-14T22-13-20-codex-8.jsonl",
+            concat!(
+                r#"{"timestamp":"2023-11-14T22:13:20Z","type":"session_meta","payload":{"id":"codex-8","source":"cli","cwd":"/work"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2023-11-14T22:14:20Z","payload":{"id":"call-1","type":"item_completed","item":{"type":"CommandExecution","completed_at_ms":1700000060000,"command":"cargo check","cwd":"/work","status":"completed"}}}"#,
+                "\n"
+            ),
+        );
+        let turns = vec![ledger_turn("codex-8", "coder")];
+
+        let inventory = discover_transcripts(home.path(), &turns, TranscriptReadLimits::default());
+
+        assert!(inventory.complete);
+        let session = &inventory.transcripts["codex-8"];
+        assert!(session.complete);
+        assert_eq!(session.events[0].command.as_deref(), Some("cargo check"));
+    }
+
+    #[test]
+    #[trace("FR-047-AC-5")]
+    fn missing_ambiguous_and_malformed_sources_keep_turns_unavailable() {
+        let home = tempfile::tempdir().expect("temporary home");
+        write_transcript(
+            home.path(),
+            ".claude/projects/work/bad.jsonl",
+            "{not-json}\n",
+        );
+        write_transcript(
+            home.path(),
+            ".claude/projects/work/shared.jsonl",
+            r#"{"type":"assistant","timestamp":"2023-11-14T22:13:20Z","sessionId":"shared","message":{"content":"Done"}}"#,
+        );
+        write_transcript(
+            home.path(),
+            ".codex/sessions/2023/11/14/rollout-2023-11-14T22-13-20-shared.jsonl",
+            r#"{"timestamp":"2023-11-14T22:13:20Z","type":"session_meta","payload":{"id":"shared","source":"cli"}}"#,
+        );
+        let turns = vec![
+            ledger_turn("missing", "coder"),
+            ledger_turn("bad", "coder"),
+            ledger_turn("shared", "coder"),
+            SessionTurnRow {
+                transcript_id: None,
+                session_addr: "test:workspace:minder".to_owned(),
+                session_role: "minder".to_owned(),
+                started_at_ms: 1_700_000_000_100,
+            },
+        ];
+
+        let inventory = discover_transcripts(home.path(), &turns, TranscriptReadLimits::default());
+
+        assert!(!inventory.complete);
+        assert_eq!(inventory.turns.len(), 4);
+        assert_eq!(
+            inventory.transcripts["missing"]
+                .unavailable_reason
+                .as_deref(),
+            Some("transcript_missing")
+        );
+        assert_eq!(
+            inventory.transcripts["bad"].unavailable_reason.as_deref(),
+            Some("malformed_transcript_record")
+        );
+        assert_eq!(
+            inventory.transcripts["shared"]
+                .unavailable_reason
+                .as_deref(),
+            Some("transcript_ambiguous")
+        );
+        assert!(inventory.transcripts.values().any(|session| {
+            session.binding.session_role == "minder"
+                && session.unavailable_reason.as_deref() == Some("transcript_id_unavailable")
+        }));
+        assert!(
+            inventory
+                .turns
+                .iter()
+                .any(|turn| turn.session_role == "minder" && turn.transcript_id.is_none())
+        );
+        assert!(inventory.ledger_rows().iter().any(|row| {
+            row.get("session_role").and_then(Value::as_str) == Some("minder")
+                && !row.contains_key("transcript_id")
+        }));
+        assert!(
+            turn_rows_from_ledger(&inventory.ledger_rows())
+                .iter()
+                .any(|turn| turn.session_role == "minder" && turn.transcript_id.is_none())
+        );
+    }
+
+    #[test]
+    #[trace("FR-047-AC-5")]
+    fn oversized_files_and_records_are_rejected_with_bounded_reads() {
+        let home = tempfile::tempdir().expect("temporary home");
+        write_transcript(
+            home.path(),
+            ".claude/projects/work/large.jsonl",
+            &format!("{}\n", "x".repeat(80)),
+        );
+        write_transcript(
+            home.path(),
+            ".claude/projects/work/record.jsonl",
+            &format!("{}\n", " ".repeat(40)),
+        );
+        let turns = vec![
+            ledger_turn("large", "coder"),
+            ledger_turn("record", "coder"),
+        ];
+        let limits = TranscriptReadLimits {
+            max_transcript_bytes: 64,
+            max_record_bytes: 16,
+            max_collection_bytes: 128,
+            ..TranscriptReadLimits::default()
+        };
+
+        let inventory = discover_transcripts(home.path(), &turns, limits);
+
+        assert!(!inventory.complete);
+        assert_eq!(
+            inventory.transcripts["large"].unavailable_reason.as_deref(),
+            Some("transcript_size_limit")
+        );
+        assert_eq!(
+            inventory.transcripts["record"]
+                .unavailable_reason
+                .as_deref(),
+            Some("transcript_record_size_limit")
+        );
+        assert!(
+            inventory
+                .transcripts
+                .values()
+                .all(|session| session.bytes_read == 0)
         );
     }
 }

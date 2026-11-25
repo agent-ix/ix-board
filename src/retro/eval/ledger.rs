@@ -8,6 +8,56 @@ use ix_trace_rs::implements;
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Restricts lane-order evidence to explicit team role-session addresses.
+#[implements("FR-047-AC-1")]
+pub(super) fn scope_lane_order_rows(
+    specs: &[RoleSpec],
+    view: &str,
+    rows: Vec<Map<String, Value>>,
+    scope: Option<&super::LaneOrderScope>,
+) -> Result<Vec<Map<String, Value>>, String> {
+    let Some(scope) = scope else {
+        return Err(format!("{view} requires an explicit team lane-order scope"));
+    };
+    let Some(team) = scope
+        .team_id
+        .as_deref()
+        .filter(|team| !team.trim().is_empty())
+    else {
+        return Err(format!("{view} requires a verified team identity"));
+    };
+    let mut lane_sessions = BTreeSet::new();
+    for spec in specs.iter().filter(|spec| {
+        spec.rules.iter().any(|rule| {
+            rule.method == "deterministic" && rule.query_or_rubric == format!("ledger.{view}")
+        })
+    }) {
+        if let Some(sessions) = scope.sessions_by_role.get(&spec.role) {
+            lane_sessions.extend(sessions.iter().map(|session| session.to_ascii_lowercase()));
+        }
+    }
+    if lane_sessions.is_empty() {
+        return Err(format!(
+            "{view} has no explicit session addresses for team {team}"
+        ));
+    }
+
+    let mut selected = Vec::new();
+    for row in rows {
+        if row.get("available").and_then(Value::as_i64) == Some(0) {
+            selected.push(row);
+            continue;
+        }
+        let Some(lane) = row.get("lane").and_then(Value::as_str) else {
+            return Err(format!("{view} contains an available row without a lane"));
+        };
+        if lane_sessions.contains(&lane.to_ascii_lowercase()) {
+            selected.push(row);
+        }
+    }
+    Ok(selected)
+}
+
 /// Complete read-only rows, keyed by the stable ledger view name. A failed or
 /// partial view read is represented by `Err` and cannot become a numeric zero.
 pub(super) type ViewRows = BTreeMap<String, Result<Vec<Map<String, Value>>, String>>;
@@ -153,6 +203,38 @@ pub(super) fn read_coverage(path: &std::path::Path, window: &EvalWindow) -> Resu
     } else {
         Ok(())
     }
+}
+
+/// Checks whether a read-only fleet ledger exposes the explicit transcript identity field.
+#[implements("FR-047-AC-5")]
+pub(super) fn session_turn_has_transcript_id(path: &std::path::Path) -> Result<bool, String> {
+    let connection = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("{}: {error}", path.display()))?;
+    let version = connection
+        .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+        .map_err(|error| {
+            format!(
+                "{}: cannot read ledger schema version: {error}",
+                path.display()
+            )
+        })?;
+    if !(3..=8).contains(&version) {
+        return Err(format!(
+            "{}: unsupported ledger schema version {version}; retro evaluator supports 3 through 8",
+            path.display()
+        ));
+    }
+    let columns = connection
+        .prepare("PRAGMA table_info(\"session_turn\")")
+        .and_then(|mut statement| {
+            let names = statement.query_map([], |row| row.get::<_, String>(1))?;
+            names.collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|error| format!("{}: cannot inspect session_turn: {error}", path.display()))?;
+    Ok(columns.iter().any(|column| column == "transcript_id"))
 }
 
 #[implements("FR-047-AC-6")]
@@ -329,7 +411,7 @@ fn view_for(query: &str) -> ViewSpec<'_> {
         }
         "idle_lane_minutes_during_build_pause" => ViewSpec {
             name: short,
-            reduction: NotApplicable("no pause producer"),
+            reduction: NotApplicable("builds are never paused"),
         },
         "idle_capacity_minutes_with_ready_work" => ViewSpec {
             name: short,
@@ -449,9 +531,9 @@ fn reduce_view(
                 .get("unavailable_reason")
                 .and_then(Value::as_str)
                 .unwrap_or("ledger view marks source data unavailable");
-            if view == "idle_lane_minutes_during_build_pause" && reason == "no pause producer" {
+            if view == "idle_lane_minutes_during_build_pause" {
                 return QueryValue::NotApplicable {
-                    reason: reason.to_owned(),
+                    reason: "builds are never paused".to_owned(),
                     evidence_refs: Vec::new(),
                 };
             }
@@ -717,6 +799,75 @@ mod tests {
         );
     }
 
+    /// Trace: FR-047-AC-1
+    #[test]
+    #[trace("FR-047-AC-1")]
+    fn lane_order_scope_keeps_only_exact_team_session_addresses() {
+        let spec = spec("ledger.lane_orders_due");
+        let rows = vec![
+            row(&[
+                ("order_id", Value::from("team-order")),
+                ("lane", Value::from("test:workspace:coder")),
+                ("at_ms", Value::from(150)),
+                ("available", Value::from(1)),
+            ]),
+            row(&[
+                ("order_id", Value::from("other-team-order")),
+                ("lane", Value::from("test:workspace:other-coder")),
+                ("at_ms", Value::from(150)),
+                ("available", Value::from(1)),
+            ]),
+        ];
+        let scope = crate::retro::eval::LaneOrderScope {
+            team_id: Some("factory-panel".to_owned()),
+            sessions_by_role: BTreeMap::from([(
+                "orchestrator".to_owned(),
+                BTreeSet::from(["test:workspace:coder".to_owned()]),
+            )]),
+        };
+        let scoped = scope_lane_order_rows(&[spec], "lane_orders_due", rows, Some(&scope))
+            .expect("explicit team session scope");
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0]["order_id"], Value::from("team-order"));
+    }
+
+    /// Trace: FR-047-AC-6
+    #[test]
+    #[trace("FR-047-AC-6")]
+    fn lane_order_scope_is_unavailable_without_team_or_session_identity() {
+        let spec = spec("ledger.lane_orders_due");
+        let rows = vec![row(&[
+            ("order_id", Value::from("order-1")),
+            ("lane", Value::from("test:workspace:coder")),
+            ("at_ms", Value::from(150)),
+            ("available", Value::from(1)),
+        ])];
+        assert!(
+            scope_lane_order_rows(&[spec.clone()], "lane_orders_due", rows.clone(), None).is_err()
+        );
+        let no_sessions = crate::retro::eval::LaneOrderScope {
+            team_id: Some("factory-panel".to_owned()),
+            sessions_by_role: BTreeMap::new(),
+        };
+        assert!(
+            scope_lane_order_rows(
+                &[spec.clone()],
+                "lane_orders_due",
+                rows.clone(),
+                Some(&no_sessions)
+            )
+            .is_err()
+        );
+        let no_team = crate::retro::eval::LaneOrderScope {
+            team_id: None,
+            sessions_by_role: BTreeMap::from([(
+                "orchestrator".to_owned(),
+                BTreeSet::from(["test:workspace:coder".to_owned()]),
+            )]),
+        };
+        assert!(scope_lane_order_rows(&[spec], "lane_orders_due", rows, Some(&no_team)).is_err());
+    }
+
     #[test]
     #[trace("FR-047-AC-6")]
     fn source_failure_and_missing_view_are_unavailable_not_zero() {
@@ -754,7 +905,7 @@ mod tests {
         );
         assert!(matches!(
             result.get("ledger.idle_lane_minutes_during_build_pause"),
-            Some(QueryValue::NotApplicable { reason, .. }) if reason == "no pause producer"
+            Some(QueryValue::NotApplicable { reason, .. }) if reason == "builds are never paused"
         ));
     }
 

@@ -68,6 +68,12 @@ pub const CATALOG: &[MetricDef] = &[
     def("path_closed", "progress", "issues", Up),
     def("intake_new", "progress", "issues", Neutral),
     def("net_closed_minus_new", "progress", "issues", Up),
+    def(
+        "tickets_closed_per_hour",
+        "progress",
+        "tickets_per_hour",
+        Up,
+    ),
     def("gates_remaining", "progress", "issues", Down),
     def("path_closed_unverified", "progress", "issues", Down),
     def("prs_merged_per_hour", "flow", "pull_requests_per_hour", Up),

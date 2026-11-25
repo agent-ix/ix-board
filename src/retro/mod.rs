@@ -19,6 +19,8 @@ mod saved;
 pub mod sources;
 pub mod store;
 
+use ix_trace_rs::implements;
+use std::collections::BTreeMap;
 use thiserror::Error as ThisError;
 
 pub use backfill::{BackfillReport, parse_day, render_backfill_text, run_backfill};
@@ -105,6 +107,7 @@ pub fn run_snapshot(
 
 /// Collects the same snapshot as the writer without reading or writing a store.
 /// Optional comparison envelopes must already be loaded by the caller.
+#[implements("FR-024-AC-1")]
 pub fn collect_snapshot(
     config: &RetroConfig,
     frame: Frame,
@@ -116,47 +119,8 @@ pub fn collect_snapshot(
     let window_secs = frame.window_secs;
     let now = frame.now;
     let metrics = metrics::collect(config, frame, sources);
-    let department = config.department.as_ref().map(|department| {
-        let mut batches = vec![
-            sources
-                .linear
-                .department_evidence(&department.scope, frame.now - window_secs as f64),
-            sources
-                .github
-                .department_evidence(department, frame.now - window_secs as f64),
-        ];
-        department::enrich_merged_attachments(department, &mut batches, sources.github);
-        let repositories: Vec<_> = department
-            .scope
-            .repositories
-            .iter()
-            .map(|s| s.id.clone())
-            .collect();
-        let allowed = batches
-            .iter()
-            .flat_map(|b| &b.observations)
-            .filter_map(|o| match &o.fact {
-                department::Fact::PullRequest(_) => {
-                    o.entity_id.rsplit_once('/').map(|(_, key)| key.to_owned())
-                }
-                _ => None,
-            })
-            .collect();
-        if let Ok(lines) = metrics::marker_lines_for(sources, &allowed) {
-            department::enrich_reviewer_rounds(&mut batches, &lines, &repositories);
-        }
-        department::read_source_logs(department, frame, &mut batches, |path| {
-            std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))
-        });
-        if let Some(operations) = &department.operations {
-            batches.extend(department::read_operational_files(
-                operations, department, frame,
-            ));
-        }
-        let mut report = department::collect(department, frame, &batches, &metrics);
-        department::assess(&mut report, department, previous, baseline);
-        report
-    });
+    let department =
+        collect_department_report(config, frame, sources, &metrics, previous, baseline);
     let record = Record {
         schema_version: if department.is_some() {
             2
@@ -171,6 +135,63 @@ pub fn collect_snapshot(
         department,
     };
     Ok(record)
+}
+
+/// Collects the configured department evidence for an already bounded metric snapshot.
+///
+/// The evaluator uses this path to retain department measurements while selecting only the
+/// FR-024 metrics requested by its role rules.
+#[implements("FR-047-AC-1")]
+#[implements("FR-024-AC-1")]
+pub fn collect_department_report(
+    config: &RetroConfig,
+    frame: Frame,
+    sources: &Sources<'_>,
+    metrics: &BTreeMap<String, Metric>,
+    previous: Option<&department::Report>,
+    baseline: Option<&department::Report>,
+) -> Option<department::Report> {
+    let department = config.department.as_ref()?;
+    let window_secs = frame.window_secs;
+    let mut batches = vec![
+        sources
+            .linear
+            .department_evidence(&department.scope, frame.now - window_secs as f64),
+        sources
+            .github
+            .department_evidence(department, frame.now - window_secs as f64),
+    ];
+    department::enrich_merged_attachments(department, &mut batches, sources.github);
+    let repositories: Vec<_> = department
+        .scope
+        .repositories
+        .iter()
+        .map(|s| s.id.clone())
+        .collect();
+    let allowed = batches
+        .iter()
+        .flat_map(|b| &b.observations)
+        .filter_map(|o| match &o.fact {
+            department::Fact::PullRequest(_) => {
+                o.entity_id.rsplit_once('/').map(|(_, key)| key.to_owned())
+            }
+            _ => None,
+        })
+        .collect();
+    if let Ok(lines) = metrics::marker_lines_for(sources, &allowed) {
+        department::enrich_reviewer_rounds(&mut batches, &lines, &repositories);
+    }
+    department::read_source_logs(department, frame, &mut batches, |path| {
+        std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))
+    });
+    if let Some(operations) = &department.operations {
+        batches.extend(department::read_operational_files(
+            operations, department, frame,
+        ));
+    }
+    let mut report = department::collect(department, frame, &batches, metrics);
+    department::assess(&mut report, department, previous, baseline);
+    Some(report)
 }
 
 /// One line per metric: id, status, value and unit, or the reason it is unavailable.
