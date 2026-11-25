@@ -1777,6 +1777,7 @@ pub fn ledger_adapters(
     values
 }
 
+#[implements("FR-047-AC-6")]
 fn read_ledger_unavailable_reason(
     ledger_path: Option<&Path>,
     view: &str,
@@ -1789,6 +1790,7 @@ fn read_ledger_unavailable_reason(
     ledger_unavailable_reason(view, &rows.rows)
 }
 
+#[implements("FR-047-AC-6")]
 fn ledger_unavailable_reason(
     view: &str,
     rows: &[serde_json::Map<String, serde_json::Value>],
