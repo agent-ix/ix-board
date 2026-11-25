@@ -354,6 +354,24 @@ enum RetroCommand {
         #[arg(long, default_value = retro::DEFAULT_WINDOW)]
         window: String,
     },
+    /// Evaluate configured role rules over an event-time window.
+    Eval {
+        /// JSON retro configuration file.
+        #[arg(long)]
+        config: PathBuf,
+        /// Override the configured team.
+        #[arg(long)]
+        team: Option<String>,
+        /// Trailing window (for example 24h).
+        #[arg(long, default_value = "24h")]
+        since: String,
+        /// Limit presentation to a role.
+        #[arg(long)]
+        role: Option<String>,
+        /// Limit presentation to a session.
+        #[arg(long)]
+        session: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -566,6 +584,7 @@ enum Output {
     },
     RetroDelta(retro::DeltaReport),
     RetroBackfill(retro::BackfillReport),
+    RetroEval(retro::eval::EvalReport),
     ProjectStatusUpdated {
         project: String,
         status: String,
@@ -651,7 +670,7 @@ fn main() -> std::process::ExitCode {
                 emit_warning(diagnostics, warning.kind(), &warning.to_string());
             }
             let rendered = if cli.json {
-                ix_cli_kit::json::encode_canonical(&output, true).map_err(|error| error.to_string())
+                encode_output_json(&output)
             } else {
                 Ok(render_human(&output))
             };
@@ -704,6 +723,15 @@ fn main() -> std::process::ExitCode {
                 _ => Outcome::Internal,
             })
         }
+    }
+}
+
+fn encode_output_json(output: &Output) -> Result<String, String> {
+    match output {
+        Output::RetroEval(report) => {
+            ix_cli_kit::json::encode_canonical(report, true).map_err(|error| error.to_string())
+        }
+        _ => ix_cli_kit::json::encode_canonical(output, true).map_err(|error| error.to_string()),
     }
 }
 
@@ -981,6 +1009,23 @@ fn run(command: Command) -> Result<Output, Error> {
                 },
         } => run_retro_backfill(&config, &since, until.as_deref(), &window)
             .map(Output::RetroBackfill),
+        Command::Retro {
+            command:
+                RetroCommand::Eval {
+                    config,
+                    team,
+                    since,
+                    role,
+                    session,
+                },
+        } => run_retro_eval(
+            &config,
+            team.as_deref(),
+            &since,
+            role.as_deref(),
+            session.as_deref(),
+        )
+        .map(Output::RetroEval),
         Command::Scope {
             command: ProgramScopeCommand::Check { scope },
         } => {
@@ -1683,6 +1728,225 @@ fn run_retro_backfill(
     )?)
 }
 
+fn run_retro_eval(
+    config_path: &std::path::Path,
+    team_override: Option<&str>,
+    since: &str,
+    role_filter: Option<&str>,
+    session_filter: Option<&str>,
+) -> Result<retro::eval::EvalReport, Error> {
+    let config = retro::RetroConfig::load(config_path).map_err(retro::RetroError::from)?;
+    let team = team_override.unwrap_or(&config.team);
+    let settings = retro::eval::load_settings(team).map_err(retro::RetroError::Evaluation)?;
+    let specs_dir = retro::eval::resolve_role_spec_dir(team, &settings);
+    let mut specs =
+        retro::eval::read_role_specs(&specs_dir).map_err(retro::RetroError::Evaluation)?;
+    let duration = retro::parse_window(since).map_err(retro::RetroError::from)?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0_i64, |elapsed| {
+            elapsed.as_millis().min(i64::MAX as u128) as i64
+        });
+    let duration_ms = duration.saturating_mul(1000).min(i64::MAX as u64) as i64;
+    let window = retro::eval::EvalWindow {
+        start_ms: now_ms.saturating_sub(duration_ms),
+        end_ms: now_ms,
+    };
+    let previous_window = retro::eval::EvalWindow {
+        start_ms: window.start_ms.saturating_sub(duration_ms),
+        end_ms: window.start_ms,
+    };
+    if let Some(role) = role_filter {
+        specs.retain(|spec| spec.role == role);
+    }
+    let store_read = retro::Store::from_env(team)
+        .and_then(|store| store.read_all())
+        .map_err(|error| error.to_string());
+    let records = store_read
+        .as_ref()
+        .map(Vec::as_slice)
+        .map_err(String::as_str);
+    let current_live_record = collect_eval_retro_record(&config, &window);
+    let previous_live_record = collect_eval_retro_record(&config, &previous_window);
+    let fleet_settings = ix_board::settings_value().ok().flatten();
+    let fleet_config = ix_board::fleet::FleetConfig::from_toml(
+        fleet_settings.as_ref(),
+        std::env::var("IX_PROMETHEUS_URL").ok(),
+    )
+    .ok();
+    let prometheus_url = fleet_config
+        .as_ref()
+        .and_then(|config| config.prometheus_url.as_deref());
+    let fleet_ledger_path = fleet_config
+        .as_ref()
+        .and_then(|config| ix_board::fleet::ledger::resolve_path(config).ok());
+    let mut current_adapters = retro::eval::declared_adapters(&specs);
+    current_adapters.extend(retro::eval::retro_adapters(&specs, records, &window));
+    current_adapters.extend(retro::eval::retro_record_adapters(
+        &specs,
+        current_live_record.as_ref().map_err(String::as_str),
+    ));
+    current_adapters.extend(retro::eval::prometheus_adapters(
+        &specs,
+        prometheus_url,
+        &window,
+    ));
+    current_adapters.extend(retro::eval::linear_reviewed_prs_adapters(
+        &specs,
+        &config.repos,
+        &window,
+    ));
+    current_adapters.extend(retro::eval::linear_marker_adapters(
+        &specs,
+        &config.repos,
+        &window,
+    ));
+    current_adapters.extend(retro::eval::github_merged_prs_adapters(
+        &specs,
+        &config.repos,
+        &window,
+    ));
+    current_adapters.extend(retro::eval::linear_merged_prs_without_review_adapters(
+        &specs,
+        &config.repos,
+        &window,
+    ));
+    current_adapters.extend(retro::eval::gate_log_adapters(
+        &specs,
+        config.gate_log.as_deref(),
+        &window,
+    ));
+    current_adapters.extend(retro::eval::ledger_adapters(
+        &specs,
+        fleet_ledger_path.as_deref(),
+        settings.ready_state.as_deref(),
+        &window,
+    ));
+    let mut previous_adapters = retro::eval::declared_adapters(&specs);
+    previous_adapters.extend(retro::eval::retro_adapters(
+        &specs,
+        records,
+        &previous_window,
+    ));
+    previous_adapters.extend(retro::eval::retro_record_adapters(
+        &specs,
+        previous_live_record.as_ref().map_err(String::as_str),
+    ));
+    previous_adapters.extend(retro::eval::prometheus_adapters(
+        &specs,
+        prometheus_url,
+        &previous_window,
+    ));
+    previous_adapters.extend(retro::eval::linear_reviewed_prs_adapters(
+        &specs,
+        &config.repos,
+        &previous_window,
+    ));
+    previous_adapters.extend(retro::eval::linear_marker_adapters(
+        &specs,
+        &config.repos,
+        &previous_window,
+    ));
+    previous_adapters.extend(retro::eval::github_merged_prs_adapters(
+        &specs,
+        &config.repos,
+        &previous_window,
+    ));
+    previous_adapters.extend(retro::eval::linear_merged_prs_without_review_adapters(
+        &specs,
+        &config.repos,
+        &previous_window,
+    ));
+    previous_adapters.extend(retro::eval::gate_log_adapters(
+        &specs,
+        config.gate_log.as_deref(),
+        &previous_window,
+    ));
+    previous_adapters.extend(retro::eval::ledger_adapters(
+        &specs,
+        fleet_ledger_path.as_deref(),
+        settings.ready_state.as_deref(),
+        &previous_window,
+    ));
+    let session_ledger_rows = fleet_ledger_path
+        .as_deref()
+        .and_then(|path| ix_board::fleet::ledger::query(path, "session_turn", None).ok())
+        .map_or_else(Vec::new, |rows| rows.rows);
+    let sessions = retro::eval::evaluate_sessions(
+        &specs,
+        &current_adapters,
+        &session_ledger_rows,
+        &window,
+        session_filter,
+    );
+    let roles = specs
+        .into_iter()
+        .map(|spec| {
+            let rules = retro::eval::evaluate_rules(&spec.rules, &current_adapters);
+            let previous_rules = retro::eval::evaluate_rules(&spec.rules, &previous_adapters);
+            let score = retro::eval::score(&rules);
+            let previous_score = retro::eval::score(&previous_rules);
+            let trend = retro::eval::complete_score(&rules)
+                .and_then(|current| {
+                    retro::eval::complete_score(&previous_rules).map(|previous| (current, previous))
+                })
+                .and_then(|(current, previous)| current.pass_rate.zip(previous.pass_rate))
+                .map(|(current, previous)| current - previous);
+            let failing_rules = rules
+                .iter()
+                .filter(|rule| rule.status == retro::eval::RuleStatus::Fail)
+                .map(|rule| rule.id.clone())
+                .collect();
+            let role_name = spec.role;
+            retro::eval::RoleResult {
+                role: role_name.clone(),
+                previous_score,
+                score,
+                trend,
+                rules,
+                failing_rules,
+                session_ids: sessions
+                    .iter()
+                    .filter(|session| session.role == role_name)
+                    .map(|session| session.id.clone())
+                    .collect(),
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok(retro::eval::EvalReport {
+        schema_version: 1,
+        team: team.to_owned(),
+        window,
+        previous_window,
+        roles,
+        sessions,
+    })
+}
+
+fn collect_eval_retro_record(
+    config: &retro::RetroConfig,
+    window: &retro::eval::EvalWindow,
+) -> Result<retro::Record, String> {
+    let window_secs = u64::try_from(window.end_ms.saturating_sub(window.start_ms) / 1000)
+        .map_err(|_| "evaluation window has a negative duration".to_owned())?;
+    let frame = retro::Frame {
+        now: window.end_ms as f64 / 1000.0,
+        window_secs,
+        end_exclusive: true,
+    };
+    let linear = retro::live::linear_or_unreadable();
+    let agents = retro::live::LiveAgents::start(config.herdr_teams.clone());
+    let sources = retro::Sources {
+        linear: linear.as_ref(),
+        github: &retro::live::LiveGithub,
+        agents: &agents,
+        gate_log: &retro::live::FileGateLog,
+        relay: &retro::live::RedisCliRelay,
+        local: &retro::live::SystemLocal,
+    };
+    retro::collect_snapshot(config, frame, &sources, None, None).map_err(|error| error.to_string())
+}
+
 fn run_auth(command: AuthCommand) -> Result<Output, Error> {
     let store = SecretStore::system();
     let scope = AppScope::try_from("ix-board")?;
@@ -2141,6 +2405,7 @@ fn render_human(output: &Output) -> String {
         ),
         Output::RetroDelta(report) => retro::render_delta_text(report),
         Output::RetroBackfill(report) => retro::render_backfill_text(report),
+        Output::RetroEval(report) => retro::eval::render_text(report),
         Output::ProgramScopeCheck(report) => {
             let mut lines = Vec::new();
             for name in &report.missing_initiatives {
@@ -2965,15 +3230,39 @@ fn render_chunk(chunk: &ProjectChunk) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, FocusCommand, Output, ProgramRoadmap, ProgramScopeCommand, format_issue_ref,
-        format_snapshot_time_at, output_outcome, render_chain, render_closed, render_focus_status,
-        render_orphans, render_reconcile, render_roadmap,
+        Cli, Command, FocusCommand, Output, ProgramRoadmap, ProgramScopeCommand,
+        encode_output_json, format_issue_ref, format_snapshot_time_at, output_outcome,
+        render_chain, render_closed, render_focus_status, render_orphans, render_reconcile,
+        render_roadmap,
     };
     use clap::Parser;
     use ix_board::program_review::ScopeCheckReport;
     use ix_board::{FocusStatus, IssueBatch, IssueId, IssueReference};
     use ix_cli_kit::exit::Outcome;
     use ix_trace_rs::trace;
+
+    #[test]
+    fn retro_eval_json_is_the_report_object_not_an_enum_wrapper() {
+        let report = ix_board::retro::eval::EvalReport {
+            schema_version: 1,
+            team: "TEST".into(),
+            window: ix_board::retro::eval::EvalWindow {
+                start_ms: 10,
+                end_ms: 20,
+            },
+            previous_window: ix_board::retro::eval::EvalWindow {
+                start_ms: 0,
+                end_ms: 10,
+            },
+            roles: Vec::new(),
+            sessions: Vec::new(),
+        };
+        let encoded = encode_output_json(&Output::RetroEval(report)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(value["team"], "TEST");
+        assert_eq!(value["schema_version"], 1);
+        assert!(value.get("RetroEval").is_none());
+    }
 
     #[trace("FR-020-AC-2")]
     #[test]
@@ -3159,16 +3448,16 @@ mod tests {
     /// Trace: FR-021-AC-3, FR-023-AC-1
     #[test]
     fn program_review_commands_accept_the_scope_file_option() {
-        let scope = Cli::try_parse_from(["ix-board", "scope", "check", "--scope", "qsl.toml"])
+        let scope = Cli::try_parse_from(["ix-board", "scope", "check", "--scope", "sample-team.toml"])
             .expect("parse scope check");
         assert!(
-            matches!(scope.command, Command::Scope { command: ProgramScopeCommand::Check { scope } } if scope.to_str() == Some("qsl.toml"))
+            matches!(scope.command, Command::Scope { command: ProgramScopeCommand::Check { scope } } if scope.to_str() == Some("sample-team.toml"))
         );
 
-        let roadmap = Cli::try_parse_from(["ix-board", "roadmap", "--scope", "qsl.toml"])
+        let roadmap = Cli::try_parse_from(["ix-board", "roadmap", "--scope", "sample-team.toml"])
             .expect("parse scoped roadmap");
         assert!(
-            matches!(roadmap.command, Command::Roadmap { scope: Some(scope) } if scope.to_str() == Some("qsl.toml"))
+            matches!(roadmap.command, Command::Roadmap { scope: Some(scope) } if scope.to_str() == Some("sample-team.toml"))
         );
         assert!(Cli::try_parse_from(["ix-board", "roadmap"]).is_ok());
 
@@ -3177,7 +3466,7 @@ mod tests {
             "reconcile",
             "SWM",
             "--scope",
-            "qsl.toml",
+            "sample-team.toml",
             "--stale-days",
             "21",
         ])
@@ -3188,7 +3477,7 @@ mod tests {
                 project,
                 scope: Some(scope),
                 stale_days: 21
-            } if project == "SWM" && scope.to_str() == Some("qsl.toml")
+            } if project == "SWM" && scope.to_str() == Some("sample-team.toml")
         ));
         assert!(Cli::try_parse_from(["ix-board", "reconcile", "SWM"]).is_ok());
         assert!(
@@ -3196,9 +3485,9 @@ mod tests {
         );
 
         let chain =
-            Cli::try_parse_from(["ix-board", "chain", "QSL-42"]).expect("parse single issue chain");
+            Cli::try_parse_from(["ix-board", "chain", "TEST-42"]).expect("parse single issue chain");
         assert!(
-            matches!(chain.command, Command::Chain { issue: Some(issue), scope: None } if issue == "QSL-42")
+            matches!(chain.command, Command::Chain { issue: Some(issue), scope: None } if issue == "TEST-42")
         );
         let scoped_chain = Cli::try_parse_from(["ix-board", "chain", "--scope", "program.toml"])
             .expect("parse scoped chain");
@@ -3251,14 +3540,14 @@ mod tests {
     /// Trace: FR-022-AC-1
     fn chain_human_and_json_outputs_include_graph_details() {
         let report = ix_board::chain::ChainReport {
-            starts: vec!["QSL-1".to_owned()],
+            starts: vec!["TEST-1".to_owned()],
             nodes: vec![ix_board::chain::ChainNode {
                 id: IssueId("issue-1".to_owned()),
-                identifier: "QSL-1".to_owned(),
+                identifier: "TEST-1".to_owned(),
                 title: "Review API".to_owned(),
                 state: "In Progress".to_owned(),
-                team: "QSL".to_owned(),
-                owner_lane: Some("terra:QSL:code".to_owned()),
+                team: "TEST".to_owned(),
+                owner_lane: Some("test:workspace:code".to_owned()),
                 assignee_id: Some("user-1".to_owned()),
                 assignee_name: Some("Quill Dev".to_owned()),
                 age_days: Some(12),
@@ -3267,27 +3556,27 @@ mod tests {
                 unowned_root_blocker: false,
             }],
             paths: vec![ix_board::chain::ChainPath {
-                start: "QSL-1".to_owned(),
-                issues: vec!["QSL-1".to_owned(), "IR-2".to_owned()],
+                start: "TEST-1".to_owned(),
+                issues: vec!["TEST-1".to_owned(), "IR-2".to_owned()],
             }],
             root_blockers: vec!["IR-2".to_owned()],
             unowned_root_blockers: vec!["IR-2".to_owned()],
             cycles: vec![vec![
-                "QSL-4".to_owned(),
-                "QSL-5".to_owned(),
-                "QSL-4".to_owned(),
+                "TEST-4".to_owned(),
+                "TEST-5".to_owned(),
+                "TEST-4".to_owned(),
             ]],
             warnings: Vec::new(),
         };
         let human = render_chain(&report);
         for detail in [
-            "QSL-1",
+            "TEST-1",
             "In Progress",
-            "team=QSL",
-            "terra:QSL:code",
+            "team=TEST",
+            "test:workspace:code",
             "Quill Dev",
             "12 days old",
-            "QSL-4 -> QSL-5 -> QSL-4",
+            "TEST-4 -> TEST-5 -> TEST-4",
         ] {
             assert!(
                 human.contains(detail),
@@ -3297,7 +3586,7 @@ mod tests {
         let json = serde_json::to_value(Output::Chain(report)).unwrap();
         assert!(json["nodes"].is_array());
         assert_eq!(json["nodes"][0]["assignee_name"], "Quill Dev");
-        assert_eq!(json["cycles"][0][1], "QSL-5");
+        assert_eq!(json["cycles"][0][1], "TEST-5");
         assert_eq!(json["unowned_root_blockers"][0], "IR-2");
     }
 
@@ -3311,7 +3600,7 @@ mod tests {
                 title: "QLS: integration".to_owned(),
                 team: "IR".to_owned(),
                 suggestions: vec![ix_board::orphans::ProjectSuggestion {
-                    project: "QSL Language Spec".to_owned(),
+                    project: "TEST Language Spec".to_owned(),
                     reason: "title begins with project prefix \"QLS\"".to_owned(),
                     team_mismatch: true,
                 }],
@@ -3323,7 +3612,7 @@ mod tests {
         for value in [
             "Open (1)",
             "Done (0)",
-            "QSL Language Spec",
+            "TEST Language Spec",
             "title begins",
             "team IR is not associated",
         ] {
@@ -3346,8 +3635,8 @@ mod tests {
             project_membership_mismatches: vec![
                 ix_board::program_review::ProjectInitiativeMismatch {
                     project: "Compiler".to_owned(),
-                    missing_from_linear: vec!["QSL Core".to_owned()],
-                    missing_from_scope: vec!["QSL Ecosystem".to_owned()],
+                    missing_from_linear: vec!["TEST Core".to_owned()],
+                    missing_from_scope: vec!["TEST Ecosystem".to_owned()],
                 },
             ],
             missing_scope_initiatives: vec!["Missing Initiative".to_owned()],
@@ -3356,8 +3645,8 @@ mod tests {
         let human = render_roadmap(&report);
         for message in [
             "missing from scope file: Runtime",
-            "scope project missing Linear initiative membership: Compiler | QSL Core",
-            "Linear initiative membership missing from scope file: Compiler | QSL Ecosystem",
+            "scope project missing Linear initiative membership: Compiler | TEST Core",
+            "Linear initiative membership missing from scope file: Compiler | TEST Ecosystem",
             "initiative listed in scope file but missing from Linear: Missing Initiative",
             "project listed in scope file but missing from Linear: Missing Project",
         ] {

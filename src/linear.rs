@@ -812,6 +812,47 @@ impl LinearGraphQlSource {
             .collect()
     }
 
+    /// Reads native state names for exact configured-state transitions.
+    pub fn fetch_named_state_changes(
+        &self,
+        issue_id: &str,
+    ) -> Result<Vec<NamedStateChange>, String> {
+        let events = crate::retro::sources::read_all_pages(|after| {
+            let data: IssueHistoryData = self
+                .request(
+                    ISSUE_HISTORY_QUERY,
+                    IssueHistoryVariables {
+                        id: issue_id.to_owned(),
+                        first: HISTORY_PAGE_SIZE,
+                        after: after.map(str::to_owned),
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            let history = data
+                .issue
+                .ok_or_else(|| format!("issue {issue_id} not found"))?
+                .history;
+            Ok(crate::retro::sources::Page {
+                items: history.nodes,
+                has_next: history.page_info.has_next_page,
+                cursor: history.page_info.end_cursor,
+            })
+        })?;
+        events
+            .into_iter()
+            .filter(|event| event.from_state.is_some() || event.to_state.is_some())
+            .map(|event| {
+                let at = crate::drift::timestamp_epoch(&event.created_at)
+                    .map_err(|error| error.to_string())?;
+                Ok(NamedStateChange {
+                    at,
+                    from: event.from_state.map(|state| state.name),
+                    to: event.to_state.map(|state| state.name),
+                })
+            })
+            .collect()
+    }
+
     /// Reads native state-entry events for department residence and bounce metrics.
     /// Equal timestamps deliberately retain unknown sequence rather than inventing order.
     pub fn fetch_department_state_events(
@@ -2173,6 +2214,17 @@ pub struct MarkerComment {
     pub created_at: Option<String>,
     /// Structured marker/data payload, kept outside metric labels.
     pub body: String,
+}
+
+/// One event-time tracker state transition with the native state names.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NamedStateChange {
+    /// Unix seconds of the transition.
+    pub at: f64,
+    /// State name left, if supplied by Linear.
+    pub from: Option<String>,
+    /// State name entered, if supplied by Linear.
+    pub to: Option<String>,
 }
 
 #[derive(Deserialize)]

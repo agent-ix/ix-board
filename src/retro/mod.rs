@@ -12,6 +12,7 @@ pub mod catalog;
 pub mod config;
 pub mod delta;
 pub mod department;
+pub mod eval;
 pub mod live;
 pub mod metrics;
 mod saved;
@@ -28,8 +29,10 @@ pub use catalog::{
 pub use config::{ConfigError, DEFAULT_WINDOW, RetroConfig, format_window, parse_window};
 pub use delta::{DeltaReport, render_delta_text, run_delta};
 pub use metrics::Frame;
+pub(crate) use metrics::marker_fields;
 pub use saved::{SavedReport, SavedReportError, decode_saved_report, read_saved_report};
 pub use sources::Sources;
+pub(crate) use sources::{GateLine, GateLogSource};
 pub use store::{Store, StoreError};
 
 /// Failures of a retro command.
@@ -56,6 +59,9 @@ pub enum RetroError {
     /// The last requested day has not ended.
     #[error("a requested day ends at {0}, which has not happened yet")]
     FutureDay(String),
+    /// Role-spec evaluation could not read its required inputs.
+    #[error("retro evaluation failed: {0}")]
+    Evaluation(String),
     /// A snapshot record lies inside the requested range.
     #[error("refusing to backfill: the range contains the snapshot record taken at {0}")]
     SnapshotInRange(String),
