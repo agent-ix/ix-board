@@ -49,6 +49,7 @@ Head a08cbe8d22a89747a362e1181f0be032d31f81f3; fix diff only.
 | FND-001 | fixed | The test carries `#[trace(...)]`; `quire matrix` reports FR-027-AC-9 and AC-10 tagged. |
 | FND-002 | fixed | The FR-024-AC-19 tag is removed. |
 | FND-003 | fixed | `retro snapshot --json` carries both fields on output, stored lines stay classless and older records decode; the PR body and FR-024-AC-14 say so. |
+| FND-004 | fixed | The field test now checks `class` on every metric, equal or omitted `department_class`, classless storage and decoding of the output. |
 
 ## New findings (disposition pass 2)
 

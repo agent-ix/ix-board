@@ -53,6 +53,9 @@ Head a08cbe8d22a89747a362e1181f0be032d31f81f3; fix diff only.
 | FND-002 | fixed | Both `MetricDelta` fields are optional with serde default; the saved 0.10.0-shape delta decodes. |
 | FND-003 | fixed | Stored metrics have no class field, so the test's class assertions can only be met by catalog resolution. |
 | FND-004 | fixed | Root plugin manifests are back to 0.5.0, identical to base; nested ones unchanged at 0.3.0. |
+| FND-005 | fixed | The current reader accepts and discards both fields in snapshot output; older readers are recorded in FR-024-AC-19 with the relay-tui repin in AGE-2248. |
+| FND-006 | fixed | `try_from_record` returns `UnknownMetricDefinition` for an id outside the catalog; a test covers it. |
+| FND-007 | fixed | The output serializes the whole `Record` and replaces only `metrics`, so new fields carry through. |
 
 ## New findings (disposition pass 2)
 

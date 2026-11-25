@@ -38,6 +38,7 @@ Head a08cbe8d22a89747a362e1181f0be032d31f81f3; fix diff only.
 | --- | --- | --- |
 | FND-001 | fixed | Delta output and legacy decoding are now separate criteria and the snapshot record obligation is removed from the delta requirement. |
 | FND-002 | fixed | FR-027 and AC-9 now state that store records never contain the fields and AC-9 drops the condition; the description keeps one now-vacuous sentence beginning `When a stored metric has no class metadata`. |
+| FND-003 | fixed | The store rule is stated only in FR-024-AC-14 and FR-027-AC-9 covers delta output alone. |
 
 ## New findings (disposition pass 2)
 
@@ -46,3 +47,11 @@ Head f2e972f4099055b1946355247f0d2dc3aa0e15f8; this round's diff only.
 | ID | Severity | Summary | Refs |
 | --- | --- | --- | --- |
 | FND-003 | low | The rule that store records never contain the class fields is now stated in both FR-027 (description and AC-9) and FR-024-AC-14, and AC-9 again joins a store obligation to a delta output criterion. | FR-027-AC-9 |
+
+## New findings (disposition pass 3)
+
+Head abb5d8fe85a9a2710c04ca07bd549f019693d5b7; this round's diff only.
+
+| ID | Severity | Summary | Refs |
+| --- | --- | --- | --- |
+| FND-004 | low | FR-024-AC-19 puts a `relay-tui SHALL repin` obligation on another repository inside an ix-board criterion, with `Test; downstream compatibility ticket` as its method; the matrix shows it tagged although no test here can verify the repin. | FR-024-AC-19 |
