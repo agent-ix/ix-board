@@ -366,6 +366,7 @@ fn unsupported_journal_and_unknown_config_fields_are_refused() {
     assert!(config.validate().is_ok());
 }
 
+#[trace("FR-033-AC-16")]
 #[test]
 fn current_release_and_relay_lead_discovery_can_replace_static_config_lists() {
     let dir = tempfile::tempdir().unwrap();
@@ -380,6 +381,7 @@ fn current_release_and_relay_lead_discovery_can_replace_static_config_lists() {
     assert!(selectors.current_release_project);
 }
 
+#[trace("FR-033-AC-16")]
 #[test]
 fn low_relay_lead_coverage_publishes_partial_execution_value_and_exposes_ratio() {
     let dir = tempfile::tempdir().unwrap();
@@ -401,6 +403,7 @@ fn low_relay_lead_coverage_publishes_partial_execution_value_and_exposes_ratio()
     ));
 }
 
+#[trace("FR-033-AC-18")]
 #[test]
 fn daily_velocity_emits_seven_days_with_day_labels_and_coverage() {
     let dir = tempfile::tempdir().unwrap();

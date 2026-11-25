@@ -5,6 +5,7 @@ use crate::{
     MarkerComment,
     retro::metrics::{first_line, marker_fields},
 };
+use ix_trace_rs::implements;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -109,6 +110,7 @@ fn yaml<T: serde::de::DeserializeOwned>(body: &str) -> Result<T, String> {
 
 /// Measures only PRs with explicit review records created in the selected day.
 /// Unresolved findings are pending; dispositions distinguish confirmed from rejected.
+#[implements("FR-033-AC-10", "FR-033-AC-17")]
 pub(crate) fn calculate(
     comments: &[MarkerComment],
     allowed: &BTreeSet<String>,
@@ -527,6 +529,7 @@ mod tests {
         assert_eq!(v["pr_changes_requested_share"], 1.0);
     }
 
+    #[trace("FR-033-AC-17")]
     #[test]
     fn changes_requested_uses_latest_mergeability_not_the_findings_share() {
         let not_mergeable = comment(
@@ -550,6 +553,7 @@ mod tests {
         assert_eq!(values["review_prs_with_findings_share_24h"], 0.0);
     }
 
+    #[trace("FR-033-AC-17")]
     #[test]
     fn changes_requested_share_remains_visible_with_partial_coverage() {
         let open: BTreeSet<_> = (1..=20)

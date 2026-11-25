@@ -6,6 +6,7 @@ use super::timeline::{ExecutionSample, Member};
 use super::{Config, Error, Event, History, Journal, ScopeState, State};
 use crate::retro::sources::{AgentSource, GithubSource, LinearSource};
 use crate::{Issue, Project, ProjectStatusCategory, WorkflowStateType, WorkspaceSnapshot, retro};
+use ix_trace_rs::implements;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A completed tracker refresh, passed across a bounded worker channel.
@@ -139,6 +140,7 @@ impl Collector {
         ))
     }
     /// Polls the installed relay command and lifecycle sources on their own cadence.
+    #[implements("FR-033-AC-16")]
     pub fn activity(&mut self, now: i64) -> Result<(), Error> {
         let mut lead_observations = BTreeMap::new();
         let mut lead_population_complete = true;
@@ -360,6 +362,7 @@ impl Collector {
         history
     }
     /// Collects tracker/VCS data using shared retro calculations, outside the activity worker.
+    #[implements("FR-033-AC-16", "FR-033-AC-18")]
     pub fn tracker(config: &Config, now: i64) -> TrackerBatch {
         let source = retro::live::linear_or_unreadable();
         let workspace = tracker_workspace(source.as_ref(), now as f64 / 1000.0 - 86400.0);
@@ -790,6 +793,7 @@ impl LeadObservation {
 }
 
 /// Returns the registered addresses in the exact Linear team workspace.
+#[implements("FR-033-AC-16")]
 fn discover_relay_leads(team: &str) -> Result<Vec<String>, String> {
     let output = super::history::read_history(
         "agent-msg",
@@ -817,6 +821,7 @@ fn discover_relay_leads(team: &str) -> Result<Vec<String>, String> {
 }
 
 /// Classifies relay-directory addresses against complete Herdr snapshots per machine.
+#[implements("FR-033-AC-16")]
 fn observe_live_leads(team: &str, leads: &[String]) -> Result<LeadObservation, String> {
     let whoami = super::history::read_history(
         "agent-msg",
@@ -933,6 +938,7 @@ fn observe_live_leads(team: &str, leads: &[String]) -> Result<LeadObservation, S
 }
 
 /// Selects the only started release project for the team; ambiguity fails closed.
+#[implements("FR-033-AC-16")]
 fn current_release_project<'a>(
     workspace: &'a WorkspaceSnapshot,
     team: &str,
@@ -957,6 +963,7 @@ fn current_release_project<'a>(
 }
 
 /// Returns seven UTC-day completion counts only when every selected ticket history is readable.
+#[implements("FR-033-AC-18")]
 fn daily_linear_closures(
     source: &dyn LinearSource,
     issues: &[Issue],
@@ -992,6 +999,7 @@ fn daily_linear_closures(
 }
 
 /// Counts GitHub merge timestamps by UTC day for the trailing seven calendar days.
+#[implements("FR-033-AC-18")]
 fn daily_github_merges(prs: &[crate::retro::sources::PullRequest], now: f64) -> Vec<usize> {
     let day_now = (now / 86400.0).floor() as i64;
     let mut counts = vec![0usize; 7];
@@ -1170,6 +1178,7 @@ impl LinearSource for SelectedLinear<'_> {
 mod tests {
     use super::*;
     use ix_trace_rs::trace;
+    #[trace("FR-033-AC-16")]
     #[test]
     fn current_release_selector_requires_one_started_team_release_project() {
         let project = |id: &str, name: &str, status_category: &str| {
