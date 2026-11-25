@@ -546,6 +546,7 @@ pub fn score(results: &[RuleResult]) -> Score {
 }
 
 /// Compares only deterministic rules with pass/fail results in both windows.
+#[implements("FR-047-AC-3")]
 pub fn trend_delta(current: &[RuleResult], previous: &[RuleResult]) -> (Option<f64>, usize) {
     let previous = previous
         .iter()
@@ -1817,6 +1818,7 @@ pub fn ledger_adapters(
     values
 }
 
+#[implements("FR-047-AC-1")]
 fn read_need_ready_tickets_due(
     ledger_path: Option<&Path>,
     projects: &[String],
