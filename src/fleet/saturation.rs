@@ -4,6 +4,7 @@
 //! Fleet supply, duty, and ready-buffer saturation (FR-041).
 
 use crate::fleet::live::PromQuery;
+use ix_trace_rs::implements;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -190,6 +191,7 @@ fn escape_label(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+#[implements("FR-041-AC-1")]
 fn slot_count(value: f64) -> Option<u32> {
     (value.is_finite() && value >= 0.0 && value.fract() == 0.0 && value <= f64::from(u32::MAX))
         .then_some(value as u32)
@@ -200,6 +202,7 @@ fn slot_count(value: f64) -> Option<u32> {
 /// The denominator is the count of `ix_fleet_lane_state_ratio` samples times the configured
 /// push interval, capped at the requested window for each lane. Every lane must have 90% coverage
 /// in both series; otherwise both host aggregates are unavailable.
+#[implements("FR-041-AC-5")]
 pub fn live_duty(
     query: &dyn PromQuery,
     host: &str,
@@ -280,6 +283,7 @@ pub fn live_duty(
 }
 
 /// Reads admission-blocked share for one complete tick interval.
+#[implements("FR-041-AC-16")]
 pub fn live_admission_blocked_share(
     query: &dyn PromQuery,
     host: &str,
@@ -319,6 +323,7 @@ pub fn live_admission_blocked_share(
 }
 
 /// Determines whether a drain is complete from fresh watcher state and lane compiler activity.
+#[implements("FR-041-AC-15")]
 pub fn live_drain_done(
     query: &dyn PromQuery,
     host: &str,
@@ -370,6 +375,10 @@ pub fn live_drain_done(
 }
 
 /// Computes supply, mean duty, target, buffer, and planner shares with no external reads.
+#[implements("FR-041-AC-1")]
+#[implements("FR-041-AC-3")]
+#[implements("FR-041-AC-4")]
+#[implements("FR-041-AC-5")]
 pub fn evaluate(input: SaturationInput) -> SaturationReport {
     let mut hosts = Vec::new();
     let mut host_targets = BTreeMap::new();
@@ -588,6 +597,7 @@ pub fn evaluate(input: SaturationInput) -> SaturationReport {
 /// Reads production relay, Linear and Prometheus sources and evaluates live fleet saturation.
 ///
 /// Source failures stay attached to the affected fields as unavailable evidence.
+#[implements("FR-041-AC-5")]
 pub fn read_live(
     config: &crate::fleet::FleetConfig,
     settings: &crate::fleet::tick::TickSettings,
@@ -904,6 +914,7 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use crate::fleet::SourceError;
+    use ix_trace_rs::trace;
     use std::sync::Mutex;
 
     struct DutyPrometheus {
@@ -978,6 +989,7 @@ mod tests {
         }
     }
 
+    #[trace("FR-041-AC-15")]
     #[test]
     fn drain_done_requires_fresh_non_working_state_and_no_compile_increase() {
         let source = DrainPrometheus {
@@ -1008,6 +1020,7 @@ mod tests {
         );
     }
 
+    #[trace("FR-041-AC-16")]
     #[test]
     fn live_throttle_share_uses_admission_blocked_seconds_and_coverage() {
         let source = AdmissionPrometheus {
@@ -1031,6 +1044,7 @@ mod tests {
         );
     }
 
+    #[trace("FR-041-AC-16")]
     #[test]
     fn live_throttle_share_is_unavailable_below_ninety_percent_coverage() {
         let source = AdmissionPrometheus {
@@ -1094,6 +1108,7 @@ mod tests {
         assert!(compiler.reason.unwrap().contains("coverage"));
     }
 
+    #[trace("FR-041-AC-1", "FR-041-AC-6")]
     #[test]
     fn positive_deficit_is_split_across_projects_with_exact_total() {
         let input = SaturationInput {

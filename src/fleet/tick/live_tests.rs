@@ -51,6 +51,7 @@ impl TickSources for TickSourcesWithReady<'_> {
 }
 
 #[test]
+#[trace("FR-041-AC-5")]
 fn live_ready_buffer_requires_configured_projects() {
     let sources = LiveSources {
         timeout: Duration::from_secs(1),

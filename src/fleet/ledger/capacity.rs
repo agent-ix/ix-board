@@ -8,6 +8,7 @@ use crate::fleet::FleetConfig;
 use crate::fleet::capacity::{
     CapacityError, FieldBasis, MeasurementSource, WindowMeasurements, WindowRequest,
 };
+use ix_trace_rs::implements;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -250,6 +251,7 @@ pub struct SaturationSampleInput<'a> {
 /// # Errors
 ///
 /// A blank host, an unknown trigger, an existing open run or a ledger failure.
+#[implements("FR-041-AC-14")]
 pub fn start(
     path: &Path,
     config: &FleetConfig,
@@ -322,6 +324,7 @@ pub fn start(
 /// # Errors
 ///
 /// The host or event fields are invalid or the ledger cannot write the event.
+#[implements("FR-041-AC-20")]
 pub fn record_event(
     path: &Path,
     config: &FleetConfig,
@@ -395,6 +398,8 @@ pub fn record_event(
 }
 
 /// Records a draining mark and its six-hour step-down ceiling in one ledger transaction.
+#[implements("FR-041-AC-14")]
+#[implements("FR-041-AC-20")]
 pub fn mark_draining(
     path: &Path,
     config: &FleetConfig,
@@ -458,6 +463,7 @@ pub fn mark_draining(
 /// # Errors
 ///
 /// A host is not configured or the ledger could not write the sample.
+#[implements("FR-041-AC-7")]
 pub fn record_saturation_samples(
     path: &Path,
     config: &FleetConfig,
@@ -492,6 +498,7 @@ pub fn record_saturation_samples(
 /// # Errors
 ///
 /// The run is closed or has an active window, the values are invalid, or the ledger fails.
+#[implements("FR-041-AC-11")]
 pub fn open_step(
     path: &Path,
     config: &FleetConfig,
@@ -606,6 +613,7 @@ pub fn open_step(
 ///
 /// There is no active window, the provider rejects the request, the measurement is malformed,
 /// or the ledger cannot commit it.
+#[implements("FR-041-AC-11")]
 pub fn measure_open_step(
     path: &Path,
     config: &FleetConfig,
@@ -702,6 +710,7 @@ pub fn measure_open_step(
 /// # Errors
 ///
 /// The run is closed, its hold is still open, its reason is unknown, or the ledger fails.
+#[implements("FR-041-AC-13")]
 pub fn end(
     path: &Path,
     config: &FleetConfig,
@@ -919,6 +928,7 @@ fn read_connection(path: &Path) -> Result<Option<Connection>, LedgerError> {
 /// # Errors
 ///
 /// A newer, foreign or unreadable ledger.
+#[implements("FR-041-AC-17")]
 pub fn status(path: &Path) -> Result<CapacityStatus, LedgerError> {
     let Some(connection) = read_connection(path)? else {
         return Ok(CapacityStatus::default());
@@ -1290,6 +1300,7 @@ fn slots_equal(measurement: &WindowMeasurements) -> crate::fleet::capacity::Obse
 /// # Errors
 ///
 /// A newer, foreign or unreadable ledger.
+#[implements("FR-041-AC-16")]
 pub fn metrics(path: &Path) -> Result<String, LedgerError> {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1299,6 +1310,7 @@ pub fn metrics(path: &Path) -> Result<String, LedgerError> {
     metrics_at(path, now_ms)
 }
 
+#[implements("FR-041-AC-16")]
 fn metrics_at(path: &Path, now_ms: i64) -> Result<String, LedgerError> {
     let status = status(path)?;
     let mut text = String::new();
@@ -1435,6 +1447,7 @@ fn metrics_at(path: &Path, now_ms: i64) -> Result<String, LedgerError> {
 /// # Errors
 ///
 /// A malformed window, a closed or missing run, source-basis serialization, or a database error.
+#[implements("FR-041-AC-11")]
 pub fn record_window(
     path: &Path,
     config: &FleetConfig,
@@ -1446,6 +1459,8 @@ pub fn record_window(
     record_window_inner(path, config, run_id, step_no, repeat_of, measurement, false)
 }
 
+#[implements("FR-041-AC-11")]
+#[implements("FR-041-AC-12")]
 fn record_window_inner(
     path: &Path,
     config: &FleetConfig,

@@ -18,6 +18,7 @@ pub use plan::{Capacity, OpenAction, PlanInput, plan};
 pub use settings::TickSettings;
 
 use super::SourceError;
+use ix_trace_rs::implements;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -377,6 +378,7 @@ pub struct TickFacts {
 
 impl TickFacts {
     /// Reads every source once; a failure is recorded, never silently an empty value.
+    #[implements("FR-038-AC-24")]
     pub fn read(sources: &dyn TickSources, at_ms: i64, interval_secs: u64) -> Self {
         let mut facts = Self {
             capacity_throttle_samples: sources.capacity_throttle_samples(at_ms, interval_secs),

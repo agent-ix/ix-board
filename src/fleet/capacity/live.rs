@@ -11,6 +11,7 @@ use crate::fleet::{FleetConfig, live::PromQuery};
 use crate::team_metrics::wire::AssignmentStatus;
 use crate::team_metrics::{Change, EventPage};
 use crate::{LinearGraphQlSource, ReadService};
+use ix_trace_rs::implements;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -26,6 +27,7 @@ pub struct LiveMeasurementSource<'a> {
 
 impl LiveMeasurementSource<'_> {
     /// Evidence kind derived from the live host source; absent data never becomes a zero event.
+    #[implements("FR-041-AC-20")]
     pub fn derived_evidence_kind(&self, host: &str) -> Option<&'static str> {
         let query = self.prometheus?;
         let host = host.to_lowercase();
@@ -159,6 +161,7 @@ fn temp_query(host: &str, selector: &str, span: &str) -> String {
     }
 }
 
+#[implements("FR-041-AC-10")]
 fn source_observation(
     query: Option<&dyn PromQuery>,
     host: &str,
@@ -188,6 +191,7 @@ fn source_observation(
     }
 }
 
+#[implements("FR-041-AC-10")]
 fn github_commit_count(
     client: &reqwest::blocking::Client,
     token: &str,
@@ -243,6 +247,7 @@ fn github_commit_count(
     Err("GitHub commit pagination exceeded 100 pages".to_owned())
 }
 
+#[implements("FR-041-AC-10")]
 fn github_pull_request_details(
     client: &reqwest::blocking::Client,
     token: &str,
@@ -313,6 +318,7 @@ fn github_token() -> Option<String> {
         })
 }
 
+#[implements("FR-041-AC-10")]
 fn linear_output(
     request: &WindowRequest,
     config: &FleetConfig,
@@ -526,6 +532,7 @@ fn linear_output(
     )
 }
 
+#[implements("FR-041-AC-10")]
 fn lane_ticket_history(
     config: &FleetConfig,
     request: &WindowRequest,
@@ -618,6 +625,7 @@ fn lane_ticket_history(
 }
 
 impl MeasurementSource for LiveMeasurementSource<'_> {
+    #[implements("FR-041-AC-10")]
     fn measure(&self, request: &WindowRequest) -> Result<WindowMeasurements, CapacityError> {
         if request.end_ms <= request.start_ms || request.rampup_end_ms > request.start_ms {
             return Err(CapacityError::Invalid(

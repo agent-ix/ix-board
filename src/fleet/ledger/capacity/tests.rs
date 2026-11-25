@@ -6,6 +6,7 @@ use crate::fleet::capacity::{
     Availability, CapacityError, LaneOutputMeasurement as SourceLaneOutput, Observation,
     WindowRequest,
 };
+use ix_trace_rs::trace;
 use rusqlite::Connection;
 use std::collections::BTreeMap;
 
@@ -187,6 +188,7 @@ fn run_window_and_level_round_trip_with_each_field_basis() {
 }
 
 #[test]
+#[trace("FR-041-AC-4")]
 fn unavailable_saturation_deficit_is_not_exported_as_zero() {
     let (_dir, path) = path();
     let config = capacity_config();
@@ -208,6 +210,7 @@ fn unavailable_saturation_deficit_is_not_exported_as_zero() {
 }
 
 #[test]
+#[trace("FR-041-AC-16")]
 fn throttled_export_requires_twelve_covered_admission_samples() {
     let (_dir, path) = path();
     let config = capacity_config();
@@ -323,6 +326,7 @@ fn capacity_events_keep_verified_evidence() {
 }
 
 #[test]
+#[trace("FR-039-AC-19")]
 fn version_three_ledger_migrates_additively_to_resumable_windows() {
     let (_dir, path) = path();
     let config = capacity_config();
@@ -370,6 +374,7 @@ fn version_three_ledger_migrates_additively_to_resumable_windows() {
     );
 }
 
+#[trace("FR-041-AC-14")]
 #[test]
 fn marking_a_lane_draining_writes_step_down_ceiling_atomically() {
     let (_dir, path) = path();

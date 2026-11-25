@@ -153,6 +153,7 @@ fn concurrent_writers_serialize_with_increasing_sequences() {
 }
 
 #[test]
+#[trace("FR-039-AC-19")]
 fn version_five_ledger_adds_planner_action_columns_without_losing_rows() {
     let (_dir, path) = path();
     let ledger = open(&path);
@@ -205,6 +206,7 @@ fn version_five_ledger_adds_planner_action_columns_without_losing_rows() {
 }
 
 #[test]
+#[trace("FR-041-AC-17")]
 fn fresh_ledger_exposes_every_queryable_capacity_view() {
     let (_dir, path) = path();
     drop(open(&path));

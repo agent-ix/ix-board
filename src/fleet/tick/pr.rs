@@ -5,6 +5,7 @@
 
 use super::LanePr;
 use crate::{LinearGraphQlSource, PullRequestStatus, ReadService};
+use ix_trace_rs::implements;
 use relay_core::assignment::AssignmentList;
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -75,6 +76,7 @@ fn github_api_url(url: &str) -> Result<String, String> {
     ))
 }
 
+#[implements("FR-038-AC-5")]
 fn read_lane_prs(
     assignments: &[AssignmentList],
     facts: &mut dyn PullRequestFacts,
@@ -133,6 +135,7 @@ fn read_lane_prs(
     Ok(result)
 }
 
+#[implements("FR-038-AC-5")]
 pub(super) fn read_live(timeout: Duration) -> Result<Vec<LanePr>, String> {
     let settings = relay_core::config::load_core(relay_core::config::CoreFlags::default())
         .map_err(|error| error.to_string())?;
@@ -150,6 +153,7 @@ mod tests {
     use super::*;
     use crate::Issue;
     use crate::{IssueId, ProjectId, TeamKey, WorkflowStateType};
+    use ix_trace_rs::trace;
     use relay_core::assignment::{AssignedTicket, AssignmentList};
 
     struct Facts(Vec<Issue>);
@@ -163,6 +167,7 @@ mod tests {
         }
     }
 
+    #[trace("FR-038-AC-5")]
     #[test]
     fn assigned_lane_open_pr_becomes_live_stale_pr_evidence() {
         let issue = crate::Issue {

@@ -27,6 +27,7 @@ use ix_cli_kit::secrets::{AppScope, SecretKey, SecretStore, SecretValue};
 use ix_cli_kit::streams::{
     ColorChoice, Diagnostics, DiagnosticsFormat, emit_diagnostic, emit_result, emit_warning,
 };
+use ix_trace_rs::implements;
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::io::Read;
@@ -1113,12 +1114,14 @@ fn run_fleet_ledger_query(
         .map_err(|e| Error::Fleet(FleetError::Ledger(e.to_string())))
 }
 
+#[implements("FR-041-AC-17")]
 fn run_fleet_capacity_status() -> Result<ix_board::fleet::ledger::CapacityStatus, Error> {
     use ix_board::fleet::{FleetError, ledger};
     let (_, path) = fleet_capacity_config()?;
     ledger::capacity::status(&path).map_err(|e| Error::Fleet(FleetError::Ledger(e.to_string())))
 }
 
+#[implements("FR-041-AC-5")]
 fn run_fleet_saturation() -> Result<ix_board::fleet::saturation::SaturationReport, Error> {
     use ix_board::fleet::tick::TickSettings;
     use ix_board::fleet::{FleetError, ledger};
@@ -1156,12 +1159,14 @@ fn fleet_capacity_config() -> Result<(ix_board::fleet::FleetConfig, PathBuf), Er
     Ok((config, path))
 }
 
+#[implements("FR-041-AC-14")]
 fn run_fleet_capacity_start(host: &str, trigger: &str, at_ms: i64) -> Result<i64, Error> {
     let (config, path) = fleet_capacity_config()?;
     ix_board::fleet::ledger::capacity::start(&path, &config, host, trigger, at_ms)
         .map_err(|error| Error::Fleet(ix_board::fleet::FleetError::Ledger(error.to_string())))
 }
 
+#[implements("FR-041-AC-11")]
 fn run_fleet_capacity_step(
     host: &str,
     lanes: u32,
@@ -1194,12 +1199,14 @@ fn run_fleet_capacity_step(
     .map_err(|error| Error::Fleet(ix_board::fleet::FleetError::Ledger(error.to_string())))
 }
 
+#[implements("FR-041-AC-13")]
 fn run_fleet_capacity_end(host: &str, reason: &str, at_ms: i64) -> Result<Option<u32>, Error> {
     let (config, path) = fleet_capacity_config()?;
     ix_board::fleet::ledger::capacity::end(&path, &config, host, reason, at_ms)
         .map_err(|error| Error::Fleet(ix_board::fleet::FleetError::Ledger(error.to_string())))
 }
 
+#[implements("FR-041-AC-14")]
 fn run_fleet_capacity_drain(
     host: &str,
     lane: &str,
@@ -1213,6 +1220,7 @@ fn run_fleet_capacity_drain(
         .map_err(|error| Error::Fleet(ix_board::fleet::FleetError::Ledger(error.to_string())))
 }
 
+#[implements("FR-041-AC-19")]
 fn run_fleet_capacity_remove(
     host: &str,
     lane: &str,
@@ -1239,6 +1247,7 @@ fn run_fleet_capacity_remove(
         .map_err(|error| Error::Fleet(ix_board::fleet::FleetError::Ledger(error.to_string())))
 }
 
+#[implements("FR-041-AC-10")]
 fn run_fleet_capacity_window(
     host: &str,
     end_ms: i64,

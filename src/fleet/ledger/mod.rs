@@ -20,6 +20,7 @@ use self::lock::WriterLock;
 use super::FleetConfig;
 use super::classify::ClassKind;
 use super::report::{Defect, FleetReport};
+use ix_trace_rs::implements;
 use rusqlite::{Connection, OpenFlags, params};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -223,6 +224,7 @@ fn apply_v4(tx: &rusqlite::Transaction<'_>) -> Result<(), LedgerError> {
     Ok(())
 }
 
+#[implements("FR-039-AC-19")]
 fn apply_v5(tx: &rusqlite::Transaction<'_>) -> Result<(), LedgerError> {
     for statement in schema::V5 {
         tx.execute_batch(statement)?;
@@ -231,6 +233,7 @@ fn apply_v5(tx: &rusqlite::Transaction<'_>) -> Result<(), LedgerError> {
     Ok(())
 }
 
+#[implements("FR-039-AC-19")]
 fn apply_v6(tx: &rusqlite::Transaction<'_>) -> Result<(), LedgerError> {
     for statement in schema::V6 {
         tx.execute_batch(statement)?;
@@ -262,6 +265,7 @@ impl Ledger {
     ///
     /// A path inside git, a lock held past the bound, an unsupported schema or a database
     /// failure.
+    #[implements("FR-039-AC-19")]
     pub fn open(path: &Path, config: &FleetConfig) -> Result<Self, LedgerError> {
         Self::open_with(path, config, None)
     }

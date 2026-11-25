@@ -12,6 +12,7 @@ use crate::fleet::{
     Coverage, FleetConfig, FleetError, FleetReport, SeriesSource, SourceError, Sources,
     build_report, live,
 };
+use ix_trace_rs::implements;
 use relay_core::Relay;
 use relay_core::config::{CoreFlags, load_core};
 use std::collections::BTreeMap;
@@ -80,6 +81,7 @@ impl TickSources for LiveSources {
         Ok(self.host_busy.clone())
     }
 
+    #[implements("FR-038-AC-5")]
     fn lane_prs(&self) -> Result<Vec<LanePr>, Unread> {
         super::pr::read_live(self.timeout).map_err(|error| Unread::Failed(SourceError(error)))
     }
@@ -88,6 +90,7 @@ impl TickSources for LiveSources {
         Err(Unread::Unwired("SWM-212"))
     }
 
+    #[implements("FR-041-AC-5")]
     fn need_ready_tickets(&self) -> Result<Vec<super::NeedReadyTickets>, Unread> {
         if self.config.saturation_projects.is_empty() {
             return Err(Unread::Failed(SourceError(
@@ -124,6 +127,7 @@ impl TickSources for LiveSources {
         Ok(needs)
     }
 
+    #[implements("FR-041-AC-16")]
     fn capacity_throttle_samples(
         &self,
         at_ms: i64,
@@ -168,6 +172,7 @@ impl TickSources for LiveSources {
             .collect()
     }
 
+    #[implements("FR-041-AC-15")]
     fn drain_done(&self) -> Result<Vec<super::DrainDoneSample>, Unread> {
         let path = ledger::resolve_path(&self.config)
             .map_err(|error| Unread::Failed(SourceError(error.to_string())))?;
@@ -227,6 +232,7 @@ impl TickSources for LiveSources {
         Ok(completed)
     }
 
+    #[implements("FR-041-AC-21")]
     fn host_output_samples(&self, at_ms: i64) -> Vec<super::HostOutputSample> {
         use crate::fleet::capacity::{LiveMeasurementSource, MeasurementSource, WindowRequest};
         let prometheus = self
@@ -282,6 +288,7 @@ impl TickSources for LiveSources {
             .collect()
     }
 
+    #[implements("FR-041-AC-16")]
     fn overload_events(&self, at_ms: i64) -> Vec<super::OverloadEventSample> {
         use crate::fleet::capacity::{LiveMeasurementSource, MeasurementSource, WindowRequest};
         let prometheus = self
@@ -405,6 +412,7 @@ fn host_now_ms() -> i64 {
 ///
 /// A refused configuration, a relay that cannot be read, or a ledger failure; no tick is
 /// committed then.
+#[implements("FR-038-AC-24")]
 pub fn run(file: Option<&toml::Value>, session: Option<&str>) -> Result<TickOutput, FleetError> {
     let config = FleetConfig::from_toml(file, std::env::var("IX_PROMETHEUS_URL").ok())?;
     let settings = TickSettings::from_toml(file)?;

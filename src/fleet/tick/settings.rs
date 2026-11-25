@@ -4,6 +4,7 @@
 //! The `[fleet_tick]` table: owners, thresholds and per-host targets of `fleet tick` (FR-038).
 
 use crate::fleet::FleetError;
+use ix_trace_rs::implements;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -116,6 +117,8 @@ impl TickSettings {
     /// # Errors
     ///
     /// Refuses an unknown key and a malformed value.
+    #[implements("FR-038-AC-5")]
+    #[implements("FR-038-AC-15")]
     pub fn from_toml(file: Option<&toml::Value>) -> Result<Self, FleetError> {
         let mut out = Self::default();
         let Some(table) = file

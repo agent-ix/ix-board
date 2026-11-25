@@ -7,6 +7,7 @@
 //! (`ix.fleet.config`); a local override of any of them is refused.
 
 use super::FleetError;
+use ix_trace_rs::implements;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -184,6 +185,7 @@ impl FleetConfig {
     /// # Errors
     ///
     /// Refuses a relay-owned threshold, an unknown key and a malformed value.
+    #[implements("FR-041-AC-5")]
     pub fn from_toml(
         file: Option<&toml::Value>,
         env_prometheus: Option<String>,

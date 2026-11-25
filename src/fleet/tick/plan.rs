@@ -8,6 +8,7 @@ use super::{
     Action, ActionKind, Severity, StandingOrders, Suppressed, Target, TickFacts, TickSettings,
 };
 use crate::fleet::{ClassKind, DefectKind, FleetReport, LaneRow};
+use ix_trace_rs::implements;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -511,6 +512,7 @@ impl Ctx<'_> {
         }
     }
 
+    #[implements("FR-038-AC-24")]
     fn ready_buffer(&mut self) {
         let Some(projects) = &self.input.facts.need_ready_tickets else {
             return;
@@ -543,6 +545,7 @@ fn millis(d: std::time::Duration) -> i64 {
 }
 
 /// Plans one tick.
+#[implements("FR-038-AC-24")]
 pub fn plan(input: &PlanInput<'_>) -> Plan {
     let mut ctx = Ctx {
         input,

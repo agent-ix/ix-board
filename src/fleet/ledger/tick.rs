@@ -13,6 +13,7 @@ use crate::fleet::tick::{
     TickFacts, TickOutput, TickSettings, plan,
 };
 use crate::fleet::{ClassKind, FleetReport};
+use ix_trace_rs::implements;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -34,6 +35,7 @@ pub struct TickCommit<'a> {
     pub focus: &'a BTreeMap<String, String>,
 }
 
+#[implements("FR-038-AC-24")]
 fn load_open(tx: &Transaction<'_>) -> Result<Vec<OpenAction>, LedgerError> {
     let mut statement = tx.prepare(
         "SELECT id, kind, COALESCE(project, lane), condition_started_at, due_by, rung, parent_action_id
@@ -172,6 +174,9 @@ impl Ledger {
     /// # Errors
     ///
     /// A database failure; nothing of the tick is written then.
+    #[implements("FR-038-AC-24")]
+    #[implements("FR-041-AC-15")]
+    #[implements("FR-041-AC-21")]
     pub fn commit_tick(&mut self, commit: &TickCommit<'_>) -> Result<TickOutput, LedgerError> {
         let run_ms = commit.report.run_ms;
         let facts = commit.facts;
@@ -398,6 +403,7 @@ impl Ledger {
     }
 }
 
+#[implements("FR-038-AC-24")]
 fn insert_action(
     tx: &Transaction<'_>,
     tick_id: i64,
@@ -427,6 +433,7 @@ fn insert_action(
     Ok(tx.last_insert_rowid())
 }
 
+#[implements("FR-038-AC-24")]
 fn requested_count(action: &Action) -> Option<i64> {
     (action.kind == ActionKind::NeedReadyTickets)
         .then(|| {
@@ -438,6 +445,8 @@ fn requested_count(action: &Action) -> Option<i64> {
         .flatten()
 }
 
+#[implements("FR-041-AC-19")]
+#[implements("FR-041-AC-23")]
 fn record_lane_capacity_events(
     tx: &Transaction<'_>,
     report: &FleetReport,
@@ -639,6 +648,9 @@ mod tests {
     use crate::fleet::report::{HostSummary, LaneRow};
     use crate::fleet::tick::{NeedReadyTickets, TickSettings};
     use crate::fleet::{ClassKind, FleetConfig, FleetReport};
+    use ix_trace_rs::trace;
+
+    #[trace("FR-038-AC-24")]
     #[test]
     fn need_ready_ticket_action_persists_requested_count_and_resolution_times() {
         let directory = tempfile::tempdir().unwrap();
@@ -737,6 +749,7 @@ mod tests {
         assert_eq!(row, (None, "SWM".to_owned(), 5, 10_000, 30_000));
     }
 
+    #[trace("FR-041-AC-15", "FR-041-AC-21")]
     #[test]
     fn tick_persists_drain_completion_and_host_output_source_basis() {
         let directory = tempfile::tempdir().unwrap();
@@ -802,6 +815,7 @@ mod tests {
         assert!(output.2.contains("github.ticket_id"));
     }
 
+    #[trace("FR-041-AC-19", "FR-041-AC-23")]
     #[test]
     fn tick_records_lane_additions_and_losses_from_consecutive_reports() {
         let directory = tempfile::tempdir().unwrap();
