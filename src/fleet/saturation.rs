@@ -100,11 +100,15 @@ pub struct HostSaturation {
     pub unsupplied_lanes: Option<u32>,
     /// Finite share of the global ready buffer reserved for this host's unsupplied lanes.
     pub ready_share: Evidence<u32>,
+    /// Distinct unfinished assignment tickets queued behind reachable lane heads.
+    pub queued_behind_first: Evidence<u32>,
+    /// Global ready tickets plus eligible lane-queue tails available for zero-lane discovery.
+    pub bootstrap_ticket_pool: Evidence<u32>,
     /// Whether this host has a current registry lease.
     pub registry_current: bool,
     /// Target ready tickets for this host.
     pub target_ready: Evidence<u32>,
-    /// This host's allocated ready tickets.
+    /// Its ready share, or the bootstrap ticket pool when the host has no reachable lanes.
     pub ready_buffer: Evidence<u32>,
     /// Positive shortage for this host; unavailable inputs remain null.
     pub ready_buffer_deficit: Evidence<u32>,
@@ -163,6 +167,8 @@ pub struct SaturationInput {
     pub hosts: Vec<HostInput>,
     /// Ready, unassigned ticket counts, keyed by project.
     pub project_ready: Option<BTreeMap<String, u32>>,
+    /// Distinct unfinished tickets queued after the head of reachable lane assignment lists.
+    pub queued_behind_first: Option<u32>,
     /// Owning planner address by project.
     pub planners: BTreeMap<String, String>,
     /// Reachable lane count by owning project.
@@ -223,6 +229,16 @@ fn fr001_ready_candidate(
         && issue.assignee_id.is_none()
         && blockers_complete
         && !reachable_assignment
+}
+
+#[implements("FR-041-AC-11")]
+fn is_unfinished_assignment(issue: &crate::Issue) -> bool {
+    !matches!(
+        issue.state_type,
+        crate::WorkflowStateType::Completed
+            | crate::WorkflowStateType::Canceled
+            | crate::WorkflowStateType::Duplicate
+    )
 }
 
 #[implements("FR-041-AC-6")]
@@ -526,25 +542,14 @@ fn allocate_ready_shares(hosts: &[HostInput], ready: u32) -> BTreeMap<String, u3
 }
 
 #[implements("FR-041-AC-11")]
-fn allocate_bootstrap_shares(hosts: &[HostInput], ready: u32) -> BTreeMap<String, u32> {
+fn bootstrap_ticket_pool(hosts: &[HostInput], ready: u32, queued_behind_first: u32) -> u32 {
     let total_unsupplied = hosts
         .iter()
         .map(|host| host.unsupplied_lanes)
         .fold(0u32, u32::saturating_add);
-    let mut remaining = ready.saturating_sub(total_unsupplied);
-    let mut eligible: Vec<_> = hosts
-        .iter()
-        .filter(|host| host.active_lanes == 0 && !host.stale_host)
-        .map(|host| host.host.to_lowercase())
-        .collect();
-    eligible.sort();
-    let mut shares = BTreeMap::new();
-    for host in eligible {
-        let share = u32::from(remaining > 0);
-        remaining = remaining.saturating_sub(share);
-        shares.insert(host, share);
-    }
-    shares
+    ready
+        .saturating_sub(total_unsupplied)
+        .saturating_add(queued_behind_first)
 }
 
 #[derive(serde::Deserialize)]
@@ -676,36 +681,48 @@ pub fn evaluate(input: SaturationInput) -> SaturationReport {
     let ready_shares = total_ready
         .filter(|_| assignments_available)
         .map(|ready| allocate_ready_shares(&input.hosts, ready));
-    let bootstrap_shares = total_ready
+    let bootstrap_ticket_pool = total_ready
+        .zip(input.queued_behind_first)
         .filter(|_| assignments_available)
-        .map(|ready| allocate_bootstrap_shares(&input.hosts, ready));
+        .map(|(ready, queued)| {
+            Evidence::available(
+                bootstrap_ticket_pool(&input.hosts, ready, queued),
+                "linear.ready_queue.remaining_after_unsupplied_lanes+relay.assignment_queue_tails",
+                1.0,
+            )
+        })
+        .unwrap_or_else(|| {
+            unavailable(
+                "linear.ready_queue+relay.assignment_queue_tails",
+                if total_ready.is_none() {
+                    "project_ready_unavailable"
+                } else {
+                    "assignment_evidence_unavailable"
+                },
+            )
+        });
+    let queued_behind_first = input.queued_behind_first.map_or_else(
+        || {
+            unavailable(
+                "relay.assignments.queue_tails",
+                "assignment_evidence_unavailable",
+            )
+        },
+        |count| Evidence::available(count, "relay.assignments.queue_tails", 1.0),
+    );
     let mut hosts = Vec::new();
     let mut host_targets = BTreeMap::new();
     let mut complete = true;
     let mut active_hosts = 0usize;
     for source in input.hosts {
         if source.active_lanes == 0 {
-            let ready_share = if source.stale_host {
-                unavailable("linear.ready_queue.bootstrap", "stale_host_registry_lease")
-            } else if !source.assignment_evidence_available {
+            let ready_share = if !source.assignment_evidence_available {
                 unavailable(
                     "relay.assignments+agent-msg.work.events",
                     "assignment_evidence_unavailable",
                 )
             } else {
-                bootstrap_shares.as_ref().map_or_else(
-                    || unavailable("linear.ready_queue.bootstrap", "project_ready_unavailable"),
-                    |shares| {
-                        Evidence::available(
-                            shares
-                                .get(&source.host.to_lowercase())
-                                .copied()
-                                .unwrap_or_default(),
-                            "linear.ready_queue.bootstrap_after_unsupplied_lanes",
-                            1.0,
-                        )
-                    },
-                )
+                Evidence::available(0, "no_unsupplied_lanes", 1.0)
             };
             hosts.push(HostSaturation {
                 host: source.host,
@@ -723,13 +740,15 @@ pub fn evaluate(input: SaturationInput) -> SaturationReport {
                 supplied_lanes: source.assignment_evidence_available.then_some(0),
                 unsupplied_lanes: source.assignment_evidence_available.then_some(0),
                 ready_share: ready_share.clone(),
+                queued_behind_first: queued_behind_first.clone(),
+                bootstrap_ticket_pool: bootstrap_ticket_pool.clone(),
                 registry_current: !source.stale_host,
                 target_ready: Evidence::unavailable(
                     "fleet.capacity",
                     "no_current_reachable_lanes",
                     None,
                 ),
-                ready_buffer: ready_share,
+                ready_buffer: bootstrap_ticket_pool.clone(),
                 ready_buffer_deficit: unavailable("fleet.capacity", "host_target_unavailable"),
             });
             continue;
@@ -820,6 +839,8 @@ pub fn evaluate(input: SaturationInput) -> SaturationReport {
                 .assignment_evidence_available
                 .then_some(source.unsupplied_lanes),
             ready_share: ready_share.clone(),
+            queued_behind_first: queued_behind_first.clone(),
+            bootstrap_ticket_pool: bootstrap_ticket_pool.clone(),
             registry_current: !source.stale_host,
             target_ready,
             ready_buffer: ready_share,
@@ -978,6 +999,7 @@ pub fn evaluate(input: SaturationInput) -> SaturationReport {
 #[implements("FR-041-AC-8")]
 #[implements("FR-041-AC-9")]
 #[implements("FR-041-AC-24")]
+#[implements("FR-041-AC-11")]
 pub fn read_live(
     config: &crate::fleet::FleetConfig,
     settings: &crate::fleet::tick::TickSettings,
@@ -1092,13 +1114,14 @@ pub fn read_live(
         .collect();
     let mut reachable_assigned = BTreeSet::new();
     let mut supplied_lanes = BTreeSet::new();
+    let mut queued_behind_first = BTreeSet::new();
     let mut lane_project: BTreeMap<String, String> = BTreeMap::new();
     for list in assignments {
         let lane = list.lane.to_lowercase();
         if !reachable_lanes.contains(&lane) {
             continue;
         }
-        for ticket in list.tickets {
+        for (position, ticket) in list.tickets.into_iter().enumerate() {
             let key = ticket
                 .reference
                 .rsplit('/')
@@ -1107,13 +1130,11 @@ pub fn read_live(
                 .to_lowercase();
             reachable_assigned.insert(key.clone());
             let issue = issue_map.get(&key);
-            if issue.is_some_and(|issue| {
-                matches!(
-                    issue.state_type,
-                    WorkflowStateType::Unstarted | WorkflowStateType::Started
-                )
-            }) {
+            if issue.is_some_and(|issue| is_unfinished_assignment(issue)) {
                 supplied_lanes.insert(lane.clone());
+                if position > 0 {
+                    queued_behind_first.insert(key.clone());
+                }
             }
             if let Some(project) = issue
                 .and_then(|issue| issue.project_id.as_ref())
@@ -1133,10 +1154,7 @@ pub fn read_live(
             let Some(issue) = issue_map.get(&key) else {
                 continue;
             };
-            if !matches!(
-                issue.state_type,
-                WorkflowStateType::Unstarted | WorkflowStateType::Started
-            ) {
+            if !is_unfinished_assignment(issue) {
                 continue;
             }
             supplied_lanes.insert(lane.clone());
@@ -1406,6 +1424,7 @@ pub fn read_live(
         queue_depth: config.saturation_queue_depth,
         hosts,
         project_ready: Some(project_ready),
+        queued_behind_first: Some(u32::try_from(queued_behind_first.len()).unwrap_or(u32::MAX)),
         planners,
         project_lanes,
     }))
@@ -1777,6 +1796,7 @@ mod tests {
                 stale_host: false,
             }],
             project_ready: Some(BTreeMap::from([("QSL".to_owned(), 0)])),
+            queued_behind_first: Some(0),
             planners: BTreeMap::new(),
             project_lanes: BTreeMap::from([("QSL".to_owned(), 1)]),
         });
@@ -1813,6 +1833,7 @@ mod tests {
                 stale_host: false,
             }],
             project_ready: Some(BTreeMap::from([("QSL".to_owned(), 2)])),
+            queued_behind_first: Some(0),
             planners: BTreeMap::new(),
             project_lanes: BTreeMap::from([("QSL".to_owned(), 1)]),
         });
@@ -1824,7 +1845,7 @@ mod tests {
 
     #[trace("FR-041-AC-2")]
     #[test]
-    fn zero_lane_fresh_host_can_bootstrap_from_ready_work_but_stale_host_cannot() {
+    fn zero_lane_start_uses_shared_bootstrap_pool_and_stale_hosts_remain_ineligible() {
         let make_host = |host: &str, stale_host| HostInput {
             host: host.to_owned(),
             sustainable_slots: Evidence::available(2, "config", 1.0),
@@ -1842,30 +1863,50 @@ mod tests {
             assignment_evidence_available: true,
             stale_host,
         };
+        let mut assigned = make_host("titan", false);
+        assigned.active_lanes = 4;
+        assigned.unsupplied_lanes = 4;
         let report = evaluate(SaturationInput {
             observed_at_ms: 1,
             window_secs: 3_600,
             queue_depth: 2,
             hosts: vec![
+                assigned,
                 make_host("luna", true),
                 make_host("terra", false),
                 make_host("draco", false),
             ],
             project_ready: Some(BTreeMap::from([("QSL".to_owned(), 1)])),
+            queued_behind_first: Some(3),
             planners: BTreeMap::new(),
             project_lanes: BTreeMap::new(),
         });
-        assert_eq!(report.hosts[0].ready_buffer.value, None);
-        assert_eq!(report.hosts[1].ready_buffer.value, Some(0));
-        assert_eq!(report.hosts[2].ready_buffer.value, Some(1));
-        assert_eq!(
-            report.hosts[2].ready_buffer.source,
-            "linear.ready_queue.bootstrap_after_unsupplied_lanes"
-        );
-        assert_eq!(
-            report.hosts[0].ready_buffer.reason.as_deref(),
-            Some("stale_host_registry_lease")
-        );
+        for host in &report.hosts[1..] {
+            assert_eq!(host.bootstrap_ticket_pool.value, Some(3));
+        }
+        assert!(!report.hosts[1].registry_current);
+        assert!(report.hosts[2].registry_current);
+        assert!(report.hosts[3].registry_current);
+    }
+
+    #[test]
+    #[trace("FR-041-AC-11")]
+    fn any_nonterminal_assignment_state_supplies_a_lane() {
+        for state in [
+            crate::WorkflowStateType::Triage,
+            crate::WorkflowStateType::Backlog,
+            crate::WorkflowStateType::Unstarted,
+            crate::WorkflowStateType::Started,
+        ] {
+            assert!(is_unfinished_assignment(&ready_issue("Assigned", state)));
+        }
+        for state in [
+            crate::WorkflowStateType::Completed,
+            crate::WorkflowStateType::Canceled,
+            crate::WorkflowStateType::Duplicate,
+        ] {
+            assert!(!is_unfinished_assignment(&ready_issue("Closed", state)));
+        }
     }
 
     #[trace("FR-041-AC-11")]
@@ -1890,6 +1931,7 @@ mod tests {
             queue_depth: 1,
             hosts: vec![make_host("terra"), make_host("draco")],
             project_ready: Some(BTreeMap::from([("QSL".to_owned(), 1)])),
+            queued_behind_first: Some(0),
             planners: BTreeMap::new(),
             project_lanes: BTreeMap::new(),
         });
@@ -1928,6 +1970,7 @@ mod tests {
                 stale_host: false,
             }],
             project_ready: Some(BTreeMap::from([("QSL".to_owned(), 2)])),
+            queued_behind_first: Some(0),
             planners: BTreeMap::new(),
             project_lanes: BTreeMap::new(),
         });
@@ -1961,6 +2004,7 @@ mod tests {
                 stale_host: false,
             }],
             project_ready: Some(BTreeMap::from([("QSL".to_owned(), 2)])),
+            queued_behind_first: Some(0),
             planners: BTreeMap::new(),
             project_lanes: BTreeMap::from([("QSL".to_owned(), 1)]),
         });
@@ -2039,6 +2083,7 @@ mod tests {
                 stale_host: false,
             }],
             project_ready: Some(BTreeMap::from([("p1".to_owned(), 1), ("p2".to_owned(), 2)])),
+            queued_behind_first: Some(0),
             planners: BTreeMap::from([
                 ("p1".to_owned(), "draco:w:p1".to_owned()),
                 ("p2".to_owned(), "draco:w:p2".to_owned()),
@@ -2090,6 +2135,7 @@ mod tests {
                 ),
             ],
             project_ready: Some(BTreeMap::from([("QSL".to_owned(), 1)])),
+            queued_behind_first: Some(0),
             planners: BTreeMap::from([("qsl".to_owned(), "draco:factory:minder".to_owned())]),
             project_lanes: BTreeMap::from([("QSL".to_owned(), 2)]),
         });
@@ -2145,6 +2191,7 @@ mod tests {
                 },
             ],
             project_ready: Some(BTreeMap::from([("QSL".to_owned(), 0)])),
+            queued_behind_first: Some(0),
             planners: BTreeMap::from([("qsl".to_owned(), "draco:factory:minder".to_owned())]),
             project_lanes: BTreeMap::from([("QSL".to_owned(), 1)]),
         });

@@ -185,6 +185,8 @@ fn run_window_and_level_round_trip_with_each_field_basis() {
             registry_current: true,
             ready_buffer: Some(2),
             ready_share: Some(2),
+            queued_behind_first: Some(0),
+            bootstrap_ticket_pool: Some(0),
             deficit: Some(2),
             source_basis: "{}".to_owned(),
             reason: None,
@@ -226,6 +228,8 @@ fn saturation_coverage_controls_window_validity_when_metrics_are_unavailable() {
                 registry_current: true,
                 ready_buffer: Some(2),
                 ready_share: Some(2),
+                queued_behind_first: Some(0),
+                bootstrap_ticket_pool: Some(0),
                 deficit: Some(0),
                 source_basis: "{}".to_owned(),
                 reason: None,
@@ -292,6 +296,8 @@ fn demand_coverage_validates_positive_deficit_and_names_short_demand() {
                     registry_current: true,
                     ready_buffer: Some(ready_buffer),
                     ready_share: Some(ready_buffer),
+                    queued_behind_first: Some(0),
+                    bootstrap_ticket_pool: Some(0),
                     deficit: Some(4),
                     source_basis: "{}".to_owned(),
                     reason: None,
@@ -311,14 +317,21 @@ fn demand_coverage_validates_positive_deficit_and_names_short_demand() {
         let connection = Connection::open(&path).unwrap();
         connection
             .query_row(
-                "SELECT valid,inconclusive_reason FROM capacity_step WHERE run_id=?1 AND step_no=1",
+                "SELECT valid,inconclusive_reason,deficit_coverage
+                 FROM capacity_step WHERE run_id=?1 AND step_no=1",
                 [run_id],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, f64>(2)?,
+                    ))
+                },
             )
             .unwrap()
     };
-    assert_eq!(run_case(2), (1, None));
-    assert_eq!(run_case(1), (0, Some("demand_short".to_owned())));
+    assert_eq!(run_case(2), (1, None, 11.0 / 12.0));
+    assert_eq!(run_case(1), (0, Some("demand_short".to_owned()), 0.0));
 }
 
 #[test]
@@ -342,6 +355,8 @@ fn demand_coverage_does_not_depend_on_deficit_availability() {
                 registry_current: true,
                 ready_buffer: Some(2),
                 ready_share: Some(2),
+                queued_behind_first: Some(0),
+                bootstrap_ticket_pool: Some(0),
                 deficit: None,
                 source_basis: "{}".to_owned(),
                 reason: Some("deficit_unavailable"),
@@ -400,6 +415,8 @@ fn discovery_start_view_requires_demand_and_an_available_run_slot() {
             registry_current: true,
             ready_buffer: Some(1),
             ready_share: Some(1),
+            queued_behind_first: Some(0),
+            bootstrap_ticket_pool: Some(1),
             deficit: None,
             source_basis: "{}".to_owned(),
             reason: None,
@@ -408,7 +425,7 @@ fn discovery_start_view_requires_demand_and_an_available_run_slot() {
     )
     .unwrap();
     assert_eq!(
-        query_ledger(&path, "unrecorded_hosts_without_discovery_run", None)
+        query_ledger(&path, "unrecorded_hosts_ready_for_discovery", None)
             .unwrap()
             .rows
             .len(),
@@ -424,7 +441,7 @@ fn discovery_start_view_requires_demand_and_an_available_run_slot() {
         .unwrap();
     drop(connection);
     assert!(
-        query_ledger(&path, "unrecorded_hosts_without_discovery_run", None)
+        query_ledger(&path, "unrecorded_hosts_ready_for_discovery", None)
             .unwrap()
             .rows
             .is_empty()
@@ -446,7 +463,7 @@ fn discovery_start_view_requires_demand_and_an_available_run_slot() {
         .unwrap();
     drop(connection);
     assert!(
-        query_ledger(&path, "unrecorded_hosts_without_discovery_run", None)
+        query_ledger(&path, "unrecorded_hosts_ready_for_discovery", None)
             .unwrap()
             .rows
             .is_empty(),
@@ -461,12 +478,129 @@ fn discovery_start_view_requires_demand_and_an_available_run_slot() {
         .unwrap();
     drop(connection);
     assert!(
-        query_ledger(&path, "unrecorded_hosts_without_discovery_run", None)
+        query_ledger(&path, "unrecorded_hosts_ready_for_discovery", None)
             .unwrap()
             .rows
             .is_empty(),
         "stale samples cannot start a discovery run"
     );
+}
+
+#[test]
+#[trace("FR-041-AC-11")]
+fn discovery_violation_view_keeps_each_sample_and_accounts_for_later_start() {
+    let (_dir, path) = path();
+    let config = capacity_config();
+    let now = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let first = now - 25 * 60_000;
+    let second = first + 5 * 60_000;
+    for at in [first, second] {
+        record_saturation_samples(
+            &path,
+            &config,
+            at,
+            &[SaturationSampleInput {
+                host: "draco",
+                active_lanes: 0,
+                supplied_lanes: Some(0),
+                unsupplied_lanes: Some(0),
+                registry_current: true,
+                ready_buffer: Some(1),
+                ready_share: Some(0),
+                queued_behind_first: Some(0),
+                bootstrap_ticket_pool: Some(1),
+                deficit: None,
+                source_basis: "{}".to_owned(),
+                reason: None,
+                coverage: Some(1.0),
+            }],
+        )
+        .unwrap();
+    }
+    let rows = query_ledger(&path, "unrecorded_hosts_without_discovery_run", None)
+        .unwrap()
+        .rows;
+    assert_eq!(
+        rows.len(),
+        2,
+        "both mature demand samples remain observable"
+    );
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "INSERT INTO capacity_run(host,trigger,started_at,ended_at,end_reason)
+             VALUES('draco','first',?1,?2,'step_bound')",
+            rusqlite::params![first + 60_000, first + 120_000],
+        )
+        .unwrap();
+    let rows = query_ledger(&path, "unrecorded_hosts_without_discovery_run", None)
+        .unwrap()
+        .rows;
+    assert_eq!(
+        rows.len(),
+        1,
+        "the later sample still records an unmet start"
+    );
+    assert_eq!(rows[0]["at"], second);
+}
+
+#[test]
+#[trace("FR-041-AC-11")]
+fn zero_lane_bootstrap_never_covers_a_capacity_step() {
+    let (_dir, path) = path();
+    let config = capacity_config();
+    let run_id = start(&path, &config, "draco", "first", START).unwrap();
+    let rampup_end = START + i64::try_from(config.capacity_rampup.as_millis()).unwrap();
+    let window = open_step(&path, &config, run_id, 2, None, START, rampup_end).unwrap();
+    for tick in 1..=12 {
+        record_saturation_samples(
+            &path,
+            &config,
+            rampup_end + i64::from(tick) * 300_000,
+            &[SaturationSampleInput {
+                host: "draco",
+                active_lanes: 0,
+                supplied_lanes: Some(0),
+                unsupplied_lanes: Some(0),
+                registry_current: true,
+                ready_buffer: Some(1),
+                ready_share: Some(0),
+                queued_behind_first: Some(0),
+                bootstrap_ticket_pool: Some(1),
+                deficit: None,
+                source_basis: "{}".to_owned(),
+                reason: None,
+                coverage: Some(1.0),
+            }],
+        )
+        .unwrap();
+    }
+    let request = WindowRequest {
+        host: window.host,
+        lanes: window.lanes,
+        start_ms: rampup_end,
+        end_ms: rampup_end + 3_600_000,
+        rampup_end_ms: rampup_end,
+    };
+    record_window(&path, &config, run_id, 1, None, &sample(&request)).unwrap();
+    let (valid, reason, coverage): (i64, Option<String>, f64) = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT valid,inconclusive_reason,deficit_coverage
+             FROM capacity_step WHERE run_id=?1 AND step_no=1",
+            [run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(valid, 0);
+    assert_eq!(reason.as_deref(), Some("demand_short"));
+    assert_eq!(coverage, 0.0);
 }
 
 #[test]
@@ -491,6 +625,8 @@ fn partial_host_coverage_cannot_certify_demand() {
                 registry_current: true,
                 ready_buffer: Some(2),
                 ready_share: Some(2),
+                queued_behind_first: Some(0),
+                bootstrap_ticket_pool: Some(0),
                 deficit: Some(0),
                 source_basis: "{}".to_owned(),
                 reason: partial.then_some("partial_deficit_from_hosts_with_usable_supply_and_duty"),
@@ -540,6 +676,8 @@ fn duplicate_and_clumped_saturation_samples_do_not_inflate_window_coverage() {
                     registry_current: true,
                     ready_buffer: Some(2),
                     ready_share: Some(2),
+                    queued_behind_first: Some(0),
+                    bootstrap_ticket_pool: Some(0),
                     deficit: Some(0),
                     source_basis: "{}".to_owned(),
                     reason: None,
@@ -581,10 +719,15 @@ fn version_six_ledger_refreshes_output_share_provenance_columns() {
         .unwrap()
         .execute_batch(
             "DROP VIEW host_output_share_of_recorded_level;
+             DROP VIEW unrecorded_hosts_with_demand;
+             DROP VIEW unrecorded_hosts_without_discovery_run;
+             DROP VIEW unrecorded_hosts_ready_for_discovery;
              ALTER TABLE host_output_sample DROP COLUMN sample_interval_ms;
              ALTER TABLE saturation_sample DROP COLUMN source_basis;
              ALTER TABLE saturation_sample DROP COLUMN unavailable_reason;
-             ALTER TABLE saturation_sample DROP COLUMN coverage",
+             ALTER TABLE saturation_sample DROP COLUMN coverage;
+             ALTER TABLE saturation_sample DROP COLUMN queued_behind_first;
+             ALTER TABLE saturation_sample DROP COLUMN bootstrap_ticket_pool",
         )
         .unwrap();
     drop(Ledger::open(&path, &config).unwrap());
@@ -617,6 +760,16 @@ fn version_six_ledger_refreshes_output_share_provenance_columns() {
             .any(|column| column == "unavailable_reason")
     );
     assert!(saturation_columns.iter().any(|column| column == "coverage"));
+    assert!(
+        saturation_columns
+            .iter()
+            .any(|column| column == "queued_behind_first")
+    );
+    assert!(
+        saturation_columns
+            .iter()
+            .any(|column| column == "bootstrap_ticket_pool")
+    );
 }
 
 #[test]
@@ -672,6 +825,8 @@ fn unavailable_saturation_deficit_is_not_exported_as_zero() {
             registry_current: true,
             ready_buffer: None,
             ready_share: None,
+            queued_behind_first: None,
+            bootstrap_ticket_pool: None,
             deficit: None,
             source_basis: "{}".to_owned(),
             reason: Some("supply_unavailable"),
@@ -704,6 +859,8 @@ fn ready_deficit_export_requires_a_fresh_sample_and_exposes_its_timestamp() {
             registry_current: true,
             ready_buffer: Some(3),
             ready_share: Some(2),
+            queued_behind_first: Some(0),
+            bootstrap_ticket_pool: Some(0),
             deficit: Some(3),
             source_basis: r#"{"deficit":{"source":"fleet.capacity.known_hosts_only"}}"#.to_owned(),
             reason: None,

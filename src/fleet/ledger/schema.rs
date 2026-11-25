@@ -205,6 +205,8 @@ pub const V6: &[&str] = &[
     "ALTER TABLE saturation_sample ADD COLUMN unsupplied_lanes INTEGER",
     "ALTER TABLE saturation_sample ADD COLUMN ready_share INTEGER",
     "ALTER TABLE saturation_sample ADD COLUMN registry_current INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE saturation_sample ADD COLUMN queued_behind_first INTEGER",
+    "ALTER TABLE saturation_sample ADD COLUMN bootstrap_ticket_pool INTEGER",
 ];
 
 /// Capacity-history views consumed by the orchestrator and minder role specs.
@@ -253,21 +255,39 @@ pub const CAPACITY_VIEWS: &[&str] = &[
          AND s.unsupplied_lanes IS NOT NULL AND s.ready_share IS NOT NULL
          AND ((s.active_lanes>0 AND s.registry_current=1
                  AND s.supplied_lanes+s.ready_share>=s.active_lanes)
-          OR (s.active_lanes=0 AND s.registry_current=1 AND s.ready_share>=1))
+          OR (s.active_lanes=0 AND s.registry_current=1
+              AND s.bootstrap_ticket_pool>=1))
          AND NOT EXISTS (
          SELECT 1 FROM capacity_level l WHERE lower(l.host)=lower(s.host)
-           AND l.superseded_at IS NULL)",
+           AND l.recorded_at<=s.at
+           AND (l.superseded_at IS NULL OR l.superseded_at>s.at))",
     "CREATE VIEW unrecorded_hosts_without_discovery_run AS
+       SELECT s.*,s.at AS at_ms FROM unrecorded_hosts_with_demand s
+       WHERE s.at+600000<=unixepoch('now')*1000
+         AND NOT EXISTS (SELECT 1 FROM capacity_run r WHERE lower(r.host)=lower(s.host)
+              AND r.started_at>=s.at AND r.started_at<=s.at+600000)
+         AND NOT EXISTS (SELECT 1 FROM capacity_run r WHERE lower(r.host)=lower(s.host)
+              AND r.started_at<=s.at AND (r.ended_at IS NULL OR r.ended_at>s.at))
+         AND (SELECT COUNT(*) FROM capacity_run r WHERE lower(r.host)=lower(s.host)
+              AND date(r.started_at/1000,'unixepoch')=date(s.at/1000,'unixepoch')
+              AND r.started_at<=s.at)<2
+         AND NOT EXISTS (SELECT 1 FROM capacity_event e WHERE lower(e.host)=lower(s.host)
+              AND e.kind='step_down' AND e.at<=s.at AND e.ceiling_until>s.at)",
+    "CREATE VIEW unrecorded_hosts_ready_for_discovery AS
        SELECT s.*,s.at AS at_ms FROM unrecorded_hosts_with_demand s
        WHERE s.at<=unixepoch('now')*1000
          AND s.at>=unixepoch('now')*1000-600000
          AND s.at=(SELECT MAX(latest.at) FROM saturation_sample latest
                    WHERE lower(latest.host)=lower(s.host)
                      AND latest.at<=unixepoch('now')*1000)
+         AND NOT EXISTS (SELECT 1 FROM capacity_level l WHERE lower(l.host)=lower(s.host)
+              AND l.superseded_at IS NULL)
          AND NOT EXISTS (SELECT 1 FROM capacity_run r WHERE lower(r.host)=lower(s.host)
-         AND r.ended_at IS NULL)
+              AND r.ended_at IS NULL)
          AND (SELECT COUNT(*) FROM capacity_run r WHERE lower(r.host)=lower(s.host)
-              AND date(r.started_at/1000,'unixepoch')=date('now'))<2",
+              AND date(r.started_at/1000,'unixepoch')=date('now'))<2
+         AND NOT EXISTS (SELECT 1 FROM capacity_event e WHERE lower(e.host)=lower(s.host)
+              AND e.kind='step_down' AND e.ceiling_until>unixepoch('now')*1000)",
     "CREATE VIEW hosts_with_recorded_level AS
        SELECT *,recorded_at AS at_ms FROM capacity_level WHERE superseded_at IS NULL",
     "CREATE VIEW host_step_downs AS
@@ -509,6 +529,7 @@ pub const QUERYABLE: &[&str] = &[
     "discovery_runs_without_recorded_level",
     "unrecorded_hosts_with_demand",
     "unrecorded_hosts_without_discovery_run",
+    "unrecorded_hosts_ready_for_discovery",
     "hosts_with_recorded_level",
     "host_step_downs",
     "raises_during_cool_off",

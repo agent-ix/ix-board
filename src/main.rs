@@ -1138,6 +1138,8 @@ struct SaturationSampleSourceBasis {
     supplied_lanes: ix_board::fleet::saturation::Evidence<u32>,
     unsupplied_lanes: ix_board::fleet::saturation::Evidence<u32>,
     ready_share: ix_board::fleet::saturation::Evidence<u32>,
+    queued_behind_first: ix_board::fleet::saturation::Evidence<u32>,
+    bootstrap_ticket_pool: ix_board::fleet::saturation::Evidence<u32>,
     registry_current: ix_board::fleet::saturation::Evidence<bool>,
     deficit: ix_board::fleet::saturation::Evidence<u32>,
 }
@@ -1188,6 +1190,8 @@ fn run_fleet_saturation(
                     coverage: host.ready_share.coverage,
                 },
                 ready_share: host.ready_share.clone(),
+                queued_behind_first: host.queued_behind_first.clone(),
+                bootstrap_ticket_pool: host.bootstrap_ticket_pool.clone(),
                 registry_current: ix_board::fleet::saturation::Evidence::available(
                     host.registry_current,
                     "relay.registry",
@@ -1205,6 +1209,8 @@ fn run_fleet_saturation(
                 registry_current: host.registry_current,
                 ready_buffer: report.ready_buffer.value,
                 ready_share: host.ready_share.value,
+                queued_behind_first: host.queued_behind_first.value,
+                bootstrap_ticket_pool: host.bootstrap_ticket_pool.value,
                 deficit: host.ready_buffer_deficit.value,
                 source_basis,
                 reason: host.ready_buffer_deficit.reason.as_deref(),

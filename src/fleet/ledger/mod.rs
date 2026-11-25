@@ -299,6 +299,14 @@ fn refresh_v6_host_output_view(tx: &rusqlite::Transaction<'_>) -> Result<(), Led
             "registry_current",
             "ALTER TABLE saturation_sample ADD COLUMN registry_current INTEGER NOT NULL DEFAULT 0",
         ),
+        (
+            "queued_behind_first",
+            "ALTER TABLE saturation_sample ADD COLUMN queued_behind_first INTEGER",
+        ),
+        (
+            "bootstrap_ticket_pool",
+            "ALTER TABLE saturation_sample ADD COLUMN bootstrap_ticket_pool INTEGER",
+        ),
     ] {
         let exists: i64 = tx.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('saturation_sample') WHERE name=?1",

@@ -254,6 +254,10 @@ pub struct SaturationSampleInput<'a> {
     pub ready_buffer: Option<u32>,
     /// Host share of ready tickets allocated to its unsupplied lanes.
     pub ready_share: Option<u32>,
+    /// Distinct unfinished assigned tickets queued after reachable lane heads.
+    pub queued_behind_first: Option<u32>,
+    /// Ready buffer remaining after unsupplied lanes plus unfinished assigned queue tails.
+    pub bootstrap_ticket_pool: Option<u32>,
     /// Positive shortage; zero is present only when all required sources were measured.
     pub deficit: Option<u32>,
     /// JSON source, availability, reason and coverage basis for each measured field.
@@ -503,8 +507,8 @@ pub fn record_saturation_samples(
             )));
         }
         tx.execute(
-            "INSERT INTO saturation_sample(host,at,deficit,source_basis,unavailable_reason,coverage,ready_buffer,active_lanes,supplied_lanes,unsupplied_lanes,ready_share,registry_current)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            "INSERT INTO saturation_sample(host,at,deficit,source_basis,unavailable_reason,coverage,ready_buffer,active_lanes,supplied_lanes,unsupplied_lanes,ready_share,queued_behind_first,bootstrap_ticket_pool,registry_current)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             params![
                 host,
                 at_ms,
@@ -517,6 +521,8 @@ pub fn record_saturation_samples(
                 sample.supplied_lanes.map(i64::from),
                 sample.unsupplied_lanes.map(i64::from),
                 sample.ready_share.map(i64::from),
+                sample.queued_behind_first.map(i64::from),
+                sample.bootstrap_ticket_pool.map(i64::from),
                 i64::from(sample.registry_current)
             ],
         )?;
@@ -1687,7 +1693,6 @@ fn record_window_inner(
             && unsupplied.is_some()
             && registry == Some(1)
             && match (active, ready_share, supplied, measurement.lanes.value) {
-                (Some(0), Some(share), _, _) => share >= 1,
                 (Some(active), Some(share), Some(supplied), Some(step_lanes)) if active > 0 => {
                     supplied.saturating_add(share) >= i64::from(step_lanes)
                 }
@@ -1695,13 +1700,13 @@ fn record_window_inner(
             };
         if covers {
             demand_covered += 1;
-        }
-        let interval_start = at.max(measurement.window_start_ms);
-        let interval_end = at
-            .saturating_add(interval_ms)
-            .min(measurement.window_end_ms);
-        if interval_end > interval_start {
-            intervals.push((interval_start, interval_end));
+            let interval_start = at.max(measurement.window_start_ms);
+            let interval_end = at
+                .saturating_add(interval_ms)
+                .min(measurement.window_end_ms);
+            if interval_end > interval_start {
+                intervals.push((interval_start, interval_end));
+            }
         }
     }
     intervals.sort_unstable();
@@ -1722,10 +1727,12 @@ fn record_window_inner(
     let zero_throughout = samples > 0 && deficit_unavailable == 0 && positive == 0;
     let demand_short = demand_unavailable == 0 && samples > 0 && demand_covered < samples;
     let valid = coverage >= 0.9 && demand_unavailable == 0 && !demand_short;
-    let inconclusive_reason = if demand_unavailable > 0 || coverage < 0.9 || samples == 0 {
+    let inconclusive_reason = if demand_unavailable > 0 || samples == 0 {
         Some("deficit_coverage")
     } else if demand_short {
         Some("demand_short")
+    } else if coverage < 0.9 {
+        Some("deficit_coverage")
     } else {
         None
     };
