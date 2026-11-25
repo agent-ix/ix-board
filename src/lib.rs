@@ -9,6 +9,7 @@ pub mod cache_status;
 pub mod chain;
 mod drift;
 pub mod fleet;
+mod focus_activity;
 mod hygiene;
 mod linear;
 pub mod linear_summary;
@@ -73,15 +74,20 @@ pub use hygiene::{
 };
 pub use linear::{LinearGraphQlSource, MarkerComment};
 pub use model::{
-    ChunkIssue, FocusBlocker, FocusExpansion, FocusIssue, FocusIssueClassification, FocusMember,
-    FocusMilestone, FocusMilestoneStatus, FocusPlanChunk, FocusPlanIssue, FocusProgress,
-    FocusProject, FocusProjectMembership, FocusProjectStatus, FocusRecord, FocusSelection,
-    FocusStateCount, FocusStatus, FocusUnmilestonedStatus, Initiative, Issue, IssueBatch, IssueId,
-    Milestone, NextStep, Project, ProjectChunk, ProjectCompletion, ProjectId, ProjectPriority,
-    ProjectRunStatus, ProjectStatusCategory, ReadyItem, SearchKind, SearchResult, TeamKey,
-    WorkflowStateType, WorkspaceSnapshot,
+    ChunkIssue, FocusActivity, FocusActivityKind, FocusActivityPr, FocusBlocker, FocusExpansion,
+    FocusIssue, FocusIssueClassification, FocusMember, FocusMilestone, FocusMilestoneStatus,
+    FocusPlanChunk, FocusPlanIssue, FocusProgress, FocusProject, FocusProjectMembership,
+    FocusProjectStatus, FocusRecord, FocusSelection, FocusStateCount, FocusStatus,
+    FocusUnmilestonedStatus, Initiative, Issue, IssueBatch, IssueId, Milestone, NextStep, Project,
+    ProjectChunk, ProjectCompletion, ProjectId, ProjectPriority, ProjectRunStatus,
+    ProjectStatusCategory, PullRequestFact, PullRequestStatus, ReadyItem, SearchKind, SearchResult,
+    TeamKey, WorkflowStateType, WorkspaceSnapshot,
 };
 
+pub use focus_activity::DEFAULT_CLOSED_SINCE_SECONDS;
+use focus_activity::{
+    ActivityWindow, finish_activity, focus_issue_with_state, project_events, recently_closed,
+};
 use model::{compare_f64, issue_is_open};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -684,7 +690,7 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
     }
 
     /// [`ReadService::next`] with the unavailable references that kept a candidate out
-    /// of the queue (FR-045).
+    /// of the queue (FR-046).
     pub fn next_with_warnings(
         &mut self,
         team: &str,
@@ -786,6 +792,16 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
         selection: &FocusSelection,
         work_milestones: &[String],
     ) -> Result<FocusStatus, Error> {
+        self.focus_status_windowed(selection, work_milestones, DEFAULT_CLOSED_SINCE_SECONDS)
+    }
+
+    /// Like [`Self::focus_status_for_milestones`], reporting closures and PR events from the last `closed_since_seconds`.
+    pub fn focus_status_windowed(
+        &mut self,
+        selection: &FocusSelection,
+        work_milestones: &[String],
+        closed_since_seconds: u64,
+    ) -> Result<FocusStatus, Error> {
         if selection.initiatives.is_empty()
             && selection.projects.is_empty()
             && selection.milestones.is_empty()
@@ -794,11 +810,28 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
             return Err(Error::EmptyFocus);
         }
         let snapshot = self.snapshot()?;
-        make_focus_status(&snapshot, selection, work_milestones)
+        make_focus_status(
+            &snapshot,
+            selection,
+            work_milestones,
+            ActivityWindow {
+                now: self.clock.now_epoch_seconds(),
+                closed_since_seconds,
+            },
+        )
     }
 
     /// Produces one versioned record with canonical selectors and focus status.
     pub fn focus_record(&mut self, selection: &FocusSelection) -> Result<FocusRecord, Error> {
+        self.focus_record_windowed(selection, DEFAULT_CLOSED_SINCE_SECONDS)
+    }
+
+    /// Like [`Self::focus_record`], reporting closures and PR events from the last `closed_since_seconds`.
+    pub fn focus_record_windowed(
+        &mut self,
+        selection: &FocusSelection,
+        closed_since_seconds: u64,
+    ) -> Result<FocusRecord, Error> {
         if selection.initiatives.is_empty()
             && selection.projects.is_empty()
             && selection.milestones.is_empty()
@@ -811,7 +844,15 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
             schema_version: FOCUS_RECORD_SCHEMA_VERSION,
             selection: canonical_selectors(&snapshot, selection)?,
             reported_at: self.clock.now_epoch_seconds(),
-            status: make_focus_status(&snapshot, selection, &[])?,
+            status: make_focus_status(
+                &snapshot,
+                selection,
+                &[],
+                ActivityWindow {
+                    now: self.clock.now_epoch_seconds(),
+                    closed_since_seconds,
+                },
+            )?,
         })
     }
 
@@ -1436,7 +1477,7 @@ fn unresolved_blockers_within(
             continue;
         }
         let Some(blocker) = issues.get(&blocker_id) else {
-            // A prerequisite with no record is not proven Completed (FR-045).
+            // A prerequisite with no record is not proven Completed (FR-046).
             unresolved.insert(format!("{} (unavailable)", blocker_id.0));
             continue;
         };
@@ -1646,7 +1687,7 @@ fn make_focus_expansion(
         }) {
             let summary = focus_issue(issue);
             // An issue whose milestone this project does not hold stays at project
-            // level (FR-045).
+            // level (FR-046).
             match milestones
                 .iter_mut()
                 .find(|m| issue.project_milestone_id.as_ref() == Some(&m.id))
@@ -1693,6 +1734,7 @@ fn make_focus_status(
     snapshot: &WorkspaceSnapshot,
     selection: &FocusSelection,
     work_milestones: &[String],
+    window: ActivityWindow,
 ) -> Result<FocusStatus, Error> {
     let expansion = make_focus_expansion(snapshot, selection)?;
     let scope = select_scope(
@@ -1736,6 +1778,7 @@ fn make_focus_status(
         .iter()
         .map(|value| scope::resolve_milestone_id(snapshot, value))
         .collect::<Result<BTreeSet<_>, _>>()?;
+    let mut events = Vec::new();
     let mut projects = snapshot
         .projects
         .iter()
@@ -1754,6 +1797,7 @@ fn make_focus_status(
                         && issue.project_id.as_ref() == Some(&project.id)
                 })
                 .collect::<Vec<_>>();
+            events.extend(project_events(&project.name, &member_issues, window));
             let mut milestones = project.milestones.iter().collect::<Vec<_>>();
             milestones.sort_by(|left, right| {
                 compare_f64(left.sort_order, right.sort_order).then_with(|| left.id.cmp(&right.id))
@@ -1781,11 +1825,12 @@ fn make_focus_status(
                         target_date: milestone.target_date.clone(),
                         open_by_state: open_state_counts(&assigned),
                         in_progress: started_issues(&assigned),
+                        recently_closed: recently_closed(&assigned, window),
                         progress: leaf_progress(&assigned, &leaf_ids),
                     }
                 })
                 .collect();
-            // No milestone, or one this project does not hold (FR-045).
+            // No milestone, or one this project does not hold (FR-046).
             let without_milestone = member_issues
                 .iter()
                 .copied()
@@ -1807,9 +1852,10 @@ fn make_focus_status(
                 target_date: project.target_date.clone(),
                 open_by_state: open_state_counts(&member_issues),
                 in_progress: started_issues(&member_issues),
+                recently_closed: recently_closed(&member_issues, window),
                 progress: leaf_progress(&member_issues, &leaf_ids),
                 milestones: milestone_status,
-                unmilestoned: unmilestoned_status(&without_milestone, &leaf_ids),
+                unmilestoned: unmilestoned_status(&without_milestone, &leaf_ids, window),
             }
         })
         .collect::<Vec<_>>();
@@ -1831,7 +1877,8 @@ fn make_focus_status(
                     .is_some_and(|id| row_ids.contains(id))
         })
         .collect::<Vec<_>>();
-    let outside_projects = (!outside.is_empty()).then(|| unmilestoned_status(&outside, &leaf_ids));
+    let outside_projects =
+        (!outside.is_empty()).then(|| unmilestoned_status(&outside, &leaf_ids, window));
 
     let work_ids = scope
         .issue_ids
@@ -1877,13 +1924,19 @@ fn make_focus_status(
         ready_queue,
         outside_projects,
         warnings: expansion.warnings,
+        activity: finish_activity(events),
     })
 }
 
-fn unmilestoned_status(issues: &[&Issue], leaf_ids: &BTreeSet<IssueId>) -> FocusUnmilestonedStatus {
+fn unmilestoned_status(
+    issues: &[&Issue],
+    leaf_ids: &BTreeSet<IssueId>,
+    window: ActivityWindow,
+) -> FocusUnmilestonedStatus {
     FocusUnmilestonedStatus {
         open_by_state: open_state_counts(issues),
         in_progress: started_issues(issues),
+        recently_closed: recently_closed(issues, window),
         progress: leaf_progress(issues, leaf_ids),
     }
 }
@@ -2104,7 +2157,7 @@ fn compare_plan_milestone_order(
 }
 
 /// The name of the issue's milestone, or `None` when it has none or its project does
-/// not hold the referenced one (FR-045).
+/// not hold the referenced one (FR-046).
 fn plan_milestone(issue: &Issue, projects: &HashMap<&ProjectId, &Project>) -> Option<String> {
     let milestone_id = issue.project_milestone_id.as_ref()?;
     projects
@@ -2352,12 +2405,7 @@ fn started_issues(issues: &[&Issue]) -> Vec<FocusIssue> {
         .iter()
         .copied()
         .filter(|issue| issue.state_type == WorkflowStateType::Started)
-        .map(|issue| FocusIssue {
-            id: issue.id.clone(),
-            identifier: issue.identifier.clone(),
-            title: issue.title.clone(),
-            state: issue.state_name.clone(),
-        })
+        .map(|issue| focus_issue_with_state(issue, issue.state_name.clone()))
         .collect::<Vec<_>>();
     rows.sort_by(|left, right| {
         left.identifier
@@ -2413,7 +2461,7 @@ fn focus_blocker_layers_within(
             if !visited.insert(id.clone()) {
                 continue;
             }
-            // An unavailable prerequisite has no row (FR-045).
+            // An unavailable prerequisite has no row (FR-046).
             let Some(blocker) = issues.get(&id).copied() else {
                 continue;
             };
@@ -2489,12 +2537,7 @@ fn summarize_issues(
 }
 
 fn focus_issue(issue: &Issue) -> FocusIssue {
-    FocusIssue {
-        id: issue.id.clone(),
-        identifier: issue.identifier.clone(),
-        title: issue.title.clone(),
-        state: issue.state.clone(),
-    }
+    focus_issue_with_state(issue, issue.state.clone())
 }
 
 fn dependency_layers(
@@ -2554,7 +2597,7 @@ fn dependency_layers_within(
         let Some(issue) = issues.get(&id) else {
             return Err(Error::MissingDependency { issue: id.0 });
         };
-        // Prerequisites with no record stay out of the closure (FR-045).
+        // Prerequisites with no record stay out of the closure (FR-046).
         pending.extend(
             issue
                 .blocked_by

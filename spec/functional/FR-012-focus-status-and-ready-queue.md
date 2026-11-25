@@ -70,7 +70,7 @@ layers, with each blocker included once in its layer and a `focus_root_ids`
 list sorted by stable Linear issue identifier, naming every resolved focus
 issue whose transitive `blocked_by` closure contains that blocker. Dependency
 cycles SHALL produce the FR-002 error; unavailable records follow
-[FR-045](FR-045-dangling-references.md).
+[FR-046](FR-046-dangling-references.md).
 
 The ready queue SHALL contain focus issues that satisfy FR-001's full ready
 eligibility rules, including project-running state, issue and spec state, and
@@ -163,7 +163,7 @@ category. It introduces no second calculator and no store.
   zero.
 - **Failures.** A snapshot that is incomplete, a parent cycle, or a dependency
   cycle returns the existing explicit error for the whole batch and no partial
-  result. An unavailable record is an [FR-045](FR-045-dangling-references.md)
+  result. An unavailable record is an [FR-046](FR-046-dangling-references.md)
   warning on the batch. A failed or timed-out read
   returns the FR-004 error and no result. The library keeps no last-good result
   and no revision cache; the caller keeps any last-good result with its original

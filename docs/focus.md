@@ -106,6 +106,17 @@ depend on it, followed by the ready queue for the focus.
   `(selected focus only)`.
 - The ready queue applies the [readiness rules](how-it-works.md#readiness) to
   focus issues only.
+- `--closed-since <duration>` (default `48h`; units s, m, h) sets the window for
+  recent activity. Each project, milestone and no-milestone group lists
+  `recently_closed` issues (completed inside the window, newest first, at most
+  50), and the top-level `activity` list holds merged, closed and opened events
+  (newest first, at most 200, one per kind, issue and pull request). Every
+  focus issue carries `assignee`, `started_at`, `completed_at` and `prs`: the
+  GitHub pull requests Linear has attached, with `repo`, `number`, `status`
+  (`open`, `draft`, `merged`, `closed`, or `unknown` when Linear gave no
+  metadata), `draft`, `created_at` and `merged_at`. A ticket whose attachments
+  Linear truncated still reports the pull requests it returned. `focus report`
+  accepts the same flag.
 
 Example output, with invented names:
 

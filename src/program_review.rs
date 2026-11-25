@@ -1240,6 +1240,9 @@ owns = "program review"
                 updated_at: Some("2026-10-21T00:00:00Z".into()),
                 attachment_urls: Vec::new(),
                 attachments_complete: true,
+                started_at: None,
+                completed_at: None,
+                pull_requests: Vec::new(),
             },
             Issue {
                 id: IssueId("2".into()),
@@ -1262,6 +1265,9 @@ owns = "program review"
                 updated_at: None,
                 attachment_urls: Vec::new(),
                 attachments_complete: true,
+                started_at: None,
+                completed_at: None,
+                pull_requests: Vec::new(),
             },
         ];
         let workspace = WorkspaceSnapshot {

@@ -8,8 +8,9 @@ use ix_cli_kit::secrets::{AppScope, CredentialBackend, SecretKey, SecretStore, S
 use crate::{
     CatalogEvidence, Clock, Deadline, DriftConfig, DriftEvidence, DriftTicket, Error,
     HistoricalProject, Initiative, Issue, IssueId, IssueTransition, Milestone, Project, ProjectId,
-    ProjectMutationSource, ProjectPriority, ProjectRunStatus, ProjectStatusCategory, SystemClock,
-    TeamKey, WorkflowStateType, WorkspaceSnapshot, WorkspaceSource, issue_is_open,
+    ProjectMutationSource, ProjectPriority, ProjectRunStatus, ProjectStatusCategory,
+    PullRequestFact, PullRequestStatus, SystemClock, TeamKey, WorkflowStateType, WorkspaceSnapshot,
+    WorkspaceSource, issue_is_open,
 };
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -29,7 +30,7 @@ const INITIAL_RELATION_PAGE_SIZE: i32 = 10;
 const PAGE_LIMIT: usize = 1_000;
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 // Full catalog partitions exclude snapshots produced by the old null lower-bound query.
-const CACHE_MODEL_VERSION: &str = "v15";
+const CACHE_MODEL_VERSION: &str = "v16";
 const ENDPOINT: &str = "https://api.linear.app/graphql";
 
 const PROJECT_QUERY: &str = r#"
@@ -61,7 +62,7 @@ const ISSUE_QUERY: &str = r#"
 query WorkspaceIssues($first: Int!, $relationFirst: Int!, $after: String, $filter: IssueFilter, $includeArchived: Boolean!) {
   issues(first: $first, after: $after, includeArchived: $includeArchived, filter: $filter) {
     nodes {
-      id identifier title description priority sortOrder createdAt updatedAt archivedAt trashed
+      id identifier title description priority sortOrder createdAt updatedAt archivedAt trashed startedAt completedAt
       state { name type }
       team { key }
       assignee { id name }
@@ -77,7 +78,7 @@ query WorkspaceIssues($first: Int!, $relationFirst: Int!, $after: String, $filte
         pageInfo { hasNextPage endCursor }
       }
       attachments(first: 50) {
-        nodes { url }
+        nodes { url sourceType metadata }
         pageInfo { hasNextPage }
       }
     }
@@ -1536,6 +1537,9 @@ impl LinearGraphQlSource {
                         .collect(),
                     created_at: raw.created_at,
                     updated_at: raw.updated_at,
+                    started_at: raw.started_at,
+                    completed_at: raw.completed_at,
+                    pull_requests: pull_request_facts(raw.attachments.as_ref()),
                     attachments_complete: raw
                         .attachments
                         .as_ref()
@@ -2237,6 +2241,10 @@ struct RawIssue {
     sort_order: f64,
     created_at: Option<String>,
     updated_at: Option<String>,
+    #[serde(default)]
+    started_at: Option<String>,
+    #[serde(default)]
+    completed_at: Option<String>,
     state: RawState,
     team: RawTeam,
     assignee: Option<RawUser>,
@@ -2253,6 +2261,72 @@ struct RawIssue {
 #[serde(rename_all = "camelCase")]
 struct RawAttachment {
     url: String,
+    #[serde(default)]
+    source_type: Option<String>,
+    #[serde(default)]
+    metadata: Option<serde_json::Value>,
+}
+
+/// The subset of a GitHub attachment's metadata that describes its pull request.
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawPullMetadata {
+    number: Option<u64>,
+    repo_name: Option<String>,
+    status: Option<String>,
+    draft: Option<bool>,
+    created_at: Option<String>,
+    merged_at: Option<String>,
+}
+
+/// Parses `https://github.com/<owner>/<repo>/pull/<n>` into its repo name and number.
+fn parse_pull_url(url: &str) -> Option<(String, u64)> {
+    let rest = url.strip_prefix("https://github.com/")?;
+    let mut parts = rest.split('/');
+    let _owner = parts.next().filter(|part| !part.is_empty())?;
+    let repo = parts.next().filter(|part| !part.is_empty())?;
+    if parts.next()? != "pull" {
+        return None;
+    }
+    let number = parts.next()?.parse().ok()?;
+    Some((repo.to_owned(), number))
+}
+
+/// Pull-request facts from a connection, keeping the first attachment of each URL.
+fn pull_request_facts(attachments: Option<&Connection<RawAttachment>>) -> Vec<PullRequestFact> {
+    let mut seen = BTreeSet::new();
+    attachments
+        .into_iter()
+        .flat_map(|attachments| attachments.nodes.iter())
+        .filter_map(pull_request_fact)
+        .filter(|fact| seen.insert(fact.url.clone()))
+        .collect()
+}
+
+fn pull_request_fact(attachment: &RawAttachment) -> Option<PullRequestFact> {
+    if attachment
+        .source_type
+        .as_deref()
+        .is_some_and(|source| source != "github")
+    {
+        return None;
+    }
+    let (url_repo, url_number) = parse_pull_url(&attachment.url)?;
+    let metadata = attachment
+        .metadata
+        .clone()
+        .and_then(|value| serde_json::from_value::<RawPullMetadata>(value).ok())
+        .unwrap_or_default();
+    let status = PullRequestStatus::from_metadata(metadata.status.as_deref());
+    Some(PullRequestFact {
+        url: attachment.url.clone(),
+        repo: metadata.repo_name.unwrap_or(url_repo),
+        number: metadata.number.unwrap_or(url_number),
+        status,
+        draft: metadata.draft.unwrap_or(status == PullRequestStatus::Draft),
+        created_at: metadata.created_at,
+        merged_at: metadata.merged_at,
+    })
 }
 
 #[derive(Deserialize)]
@@ -2334,6 +2408,7 @@ mod tests {
         resolve_project_status_id, should_fetch_issue_history,
     };
     use crate::Error;
+    use crate::PullRequestStatus;
     use crate::{
         Issue, IssueId, Project, ProjectCompletion, ProjectId, ProjectMutationSource,
         ProjectPriority, ProjectRunStatus, ProjectStatusCategory, ReadService, TeamKey,
@@ -3105,6 +3180,9 @@ mod tests {
                     updated_at: None,
                     attachment_urls: Vec::new(),
                     attachments_complete: true,
+                    started_at: None,
+                    completed_at: None,
+                    pull_requests: Vec::new(),
                 },
                 Issue {
                     parent_id: None,
@@ -3128,6 +3206,9 @@ mod tests {
                     updated_at: None,
                     attachment_urls: Vec::new(),
                     attachments_complete: true,
+                    started_at: None,
+                    completed_at: None,
+                    pull_requests: Vec::new(),
                 },
             ],
         };
@@ -3385,6 +3466,85 @@ mod tests {
             warning.contains("incomplete attachment data")
                 && warning.contains("all-linked-PRs-merged")
         }));
+    }
+
+    /// Trace: FR-045-AC-7, FR-045-AC-8, FR-045-AC-9
+    #[test]
+    fn github_attachments_decode_into_pull_request_facts() {
+        let project = serde_json::json!({
+            "id": "project-activity",
+            "identifier": "SWM",
+            "name": "Activity",
+            "updatedAt": null,
+            "description": "",
+            "content": null,
+            "priority": 0,
+            "sortOrder": 0.0,
+            "targetDate": null,
+            "status": {"name": "Started", "type": "started"},
+            "teams": connection(serde_json::json!([{"key": "SWM"}])),
+            "projectMilestones": connection(serde_json::json!([])),
+            "initiatives": connection(serde_json::json!([]))
+        });
+        let issue_response: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/focus-activity/linear-issues.json"
+        ))
+        .expect("decode Linear activity fixture");
+        let (endpoint, server) = mock_linear(vec![
+            serde_json::json!({"data": {"projects": connection(serde_json::json!([project]))}}),
+            issue_response,
+        ]);
+        let source = LinearGraphQlSource::with_endpoint("test-key", endpoint)
+            .expect("source with local endpoint");
+        let snapshot = source.fetch_workspace().expect("fetch fixture workspace");
+        server.join().expect("mock server");
+
+        let closed = &snapshot.issues[0];
+        assert_eq!(closed.started_at.as_deref(), Some("2026-11-24T10:00:00Z"));
+        assert_eq!(closed.completed_at.as_deref(), Some("2026-11-24T10:05:00Z"));
+        assert!(closed.attachments_complete);
+        assert_eq!(closed.attachment_urls.len(), 7);
+        let prs = &closed.pull_requests;
+        assert_eq!(
+            prs.len(),
+            4,
+            "only GitHub pull attachments become PR facts, once per URL"
+        );
+        assert_eq!(
+            (
+                prs[0].status,
+                prs[0].draft,
+                prs[0].number,
+                prs[0].repo.as_str()
+            ),
+            (PullRequestStatus::Merged, false, 128, "filament-examples")
+        );
+        assert_eq!(prs[0].created_at.as_deref(), Some("2026-11-24T09:00:00Z"));
+        assert_eq!(prs[0].merged_at.as_deref(), Some("2026-11-24T10:00:00Z"));
+        assert_eq!(
+            (prs[1].status, prs[1].draft),
+            (PullRequestStatus::Draft, true)
+        );
+        assert_eq!(
+            (prs[2].status, prs[2].merged_at.as_deref()),
+            (PullRequestStatus::Open, None)
+        );
+        let fallback = &prs[3];
+        assert_eq!(
+            (
+                fallback.status,
+                fallback.repo.as_str(),
+                fallback.number,
+                fallback.draft
+            ),
+            (PullRequestStatus::Unknown, "quire-rs", 31, false)
+        );
+        assert_eq!(fallback.created_at, None);
+
+        let truncated = &snapshot.issues[1];
+        assert!(!truncated.attachments_complete);
+        assert_eq!(truncated.pull_requests.len(), 1);
+        assert_eq!(truncated.pull_requests[0].number, 12);
     }
 
     #[test]

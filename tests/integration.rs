@@ -199,6 +199,9 @@ fn issue(
         updated_at: None,
         attachment_urls: vec![],
         attachments_complete: true,
+        started_at: None,
+        completed_at: None,
+        pull_requests: Vec::new(),
     }
 }
 
@@ -1710,7 +1713,7 @@ fn focus_expansion_rejects_empty_or_unresolved_selectors_without_partial_data() 
     ));
 }
 
-/// Trace: FR-011-AC-5, FR-012-AC-6, FR-045-AC-8
+/// Trace: FR-011-AC-5, FR-012-AC-6, FR-046-AC-8
 #[test]
 fn focus_expansion_refuses_dependency_cycles() {
     let directory = TempDir::new().expect("temporary directory");

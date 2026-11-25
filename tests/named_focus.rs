@@ -73,6 +73,9 @@ fn issue(id: &str, project: Option<&str>, kind: WorkflowStateType, stage: &str) 
         updated_at: None,
         attachment_urls: vec![],
         attachments_complete: true,
+        started_at: None,
+        completed_at: None,
+        pull_requests: Vec::new(),
     }
 }
 
@@ -878,7 +881,7 @@ fn an_unknown_status_category_is_kept_and_never_reported_healthy() {
     assert_eq!(batch.teams[0].causes[0].key, "k");
 }
 
-#[trace("FR-012-AC-19", "FR-045-AC-8")]
+#[trace("FR-012-AC-19", "FR-046-AC-8")]
 #[test]
 fn snapshot_errors_fail_the_whole_batch_with_the_existing_error() {
     let healthy = selection("SWM", vec![proj("p2")], vec![]);

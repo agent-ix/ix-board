@@ -258,6 +258,9 @@ fn issue(
         updated_at: Some(iso(ago(updated_h))),
         attachment_urls: Vec::new(),
         attachments_complete: true,
+        started_at: None,
+        completed_at: None,
+        pull_requests: Vec::new(),
     }
 }
 

@@ -299,6 +299,9 @@ fn ticket(id: &str, identifier: &str, project: &str) -> Issue {
         updated_at: None,
         attachment_urls: vec![],
         attachments_complete: true,
+        started_at: None,
+        completed_at: None,
+        pull_requests: Vec::new(),
     }
 }
 

@@ -446,7 +446,7 @@ pub(crate) fn classify_leaves_within(
                     identifier: issue.identifier.clone(),
                 });
             }
-            // An unavailable parent ends the ancestry here (FR-045); reads that report
+            // An unavailable parent ends the ancestry here (FR-046); reads that report
             // warnings name it.
             next = by_id
                 .get(id)

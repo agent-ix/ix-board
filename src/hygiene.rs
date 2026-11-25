@@ -1169,6 +1169,9 @@ mod tests {
             updated_at: Some("2026-01-01T00:00:00Z".to_owned()),
             attachment_urls: Vec::new(),
             attachments_complete: true,
+            started_at: None,
+            completed_at: None,
+            pull_requests: Vec::new(),
         }
     }
 

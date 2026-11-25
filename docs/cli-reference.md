@@ -201,6 +201,7 @@ Options:
       --color <WHEN>                 Colorize human diagnostics on stderr: auto (TTY only), always, or never [default: auto]
       --milestone <MILESTONES>
       --issue <ISSUES>
+      --closed-since <CLOSED_SINCE>  Report closures and PR events inside this window (for example 90m, 48h) [default: 48h]
   -h, --help                         Print help
 ```
 
@@ -246,6 +247,8 @@ Options:
           Linear issue UUID or identifier; may be repeated
       --work-milestone <WORK_MILESTONES>
           Limit blocker roots and ready issues to these exact milestone IDs or names; repeatable
+      --closed-since <CLOSED_SINCE>
+          Report closures and PR events inside this window (for example 90m, 48h) [default: 48h]
   -h, --help
           Print help
 ```

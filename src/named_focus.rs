@@ -332,7 +332,7 @@ pub struct NamedFocusRequest {
 /// Membership is recomputed from the snapshot and the stored identities. A parent cycle or
 /// dependency cycle fails the whole batch with that error and no partial result. An
 /// unavailable parent, blocker, project or milestone record is reported in
-/// [`NamedBatch::warnings`] and the batch is still evaluated (FR-045).
+/// [`NamedBatch::warnings`] and the batch is still evaluated (FR-046).
 pub fn evaluate_named_batch(
     snapshot: &WorkspaceSnapshot,
     evidence: &CatalogEvidence,

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Agent-IX
 
-//! Dangling Linear references that a read tolerates and reports (FR-045).
+//! Dangling Linear references that a read tolerates and reports (FR-046).
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::{Display, Formatter};

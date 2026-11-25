@@ -1,5 +1,5 @@
 ---
-id: FR-045
+id: FR-046
 title: Tolerate unavailable Linear references in reads
 type: FR
 relationships:
@@ -19,7 +19,7 @@ dependencies:
   - FR-013
   - FR-014
 ---
-# FR-045: Tolerate unavailable Linear references in reads
+# FR-046: Tolerate unavailable Linear references in reads
 
 ## Description
 
@@ -49,8 +49,9 @@ Each reference degrades as follows.
 - **Project.** An issue whose project has no record is not ready, and its plan
   reason names the unavailable project. A status result counts every selected
   issue that no project row holds, whether it references an unavailable project
-  or has none, in `outside_projects`; the member is omitted when no such issue
-  exists.
+  or has none, in `outside_projects`, with their recently closed tickets
+  (FR-045); the member is omitted when no such issue exists. The activity list
+  of FR-045 covers the issues of project rows.
 - **Parent.** Ancestry ends at the issue that holds the reference. The issue is
   a leaf when no snapshot issue names it as parent.
 - **Blocker.** The unavailable prerequisite is not `Completed`, so every issue
@@ -73,14 +74,14 @@ reference.
 
 | ID | Criteria | Verification |
 |----|----------|--------------|
-| FR-045-AC-1 | Given an issue whose milestone its project does not hold, `focus expand`, `focus status`, `focus report` and `focus plan-chunk` succeed for a project and for an initiative selection, count the issue at project level with a null plan milestone, report project and total leaf counts equal to `select_scope`, and carry an `unavailable_milestone` warning naming the issue, milestone and project. | Test |
-| FR-045-AC-2 | Given an issue that has a milestone and no project, a ticket-selected focus succeeds, counts it in `outside_projects`, and warns with a null project. | Test |
-| FR-045-AC-3 | Given selected issues that reference an unavailable project or have no project, status row totals plus `outside_projects` equal the `select_scope` counts; an unavailable project is warned, its issue is not ready with a reason naming the project, and `next` excludes it and returns the warning. | Test |
-| FR-045-AC-4 | Given an issue whose parent has no record, `select_scope`, the focus reads and the named batch succeed, count the issue as a leaf, and the reads carry an `unavailable_parent` warning. | Test |
-| FR-045-AC-5 | Given a blocker with no record, direct or behind an available blocker, the focus reads, `project-chunk` and the named batch succeed, warn on the issue that holds the reference, report the dependent as not ready and blocked, keep the available blocker layers, and `next` excludes the dependent and returns the warning. | Test |
-| FR-045-AC-6 | A result without unavailable references has no `warnings` or `outside_projects` member in its JSON; a result with them lists the warnings in terminal output in sorted order without duplicates. | Test |
-| FR-045-AC-7 | `focus hygiene` over a focus with unavailable references succeeds and carries the same warnings. | Test |
-| FR-045-AC-8 | A parent cycle and a dependency cycle still return their explicit errors. | Test |
+| FR-046-AC-1 | Given an issue whose milestone its project does not hold, `focus expand`, `focus status`, `focus report` and `focus plan-chunk` succeed for a project and for an initiative selection, count the issue at project level with a null plan milestone, report project and total leaf counts equal to `select_scope`, and carry an `unavailable_milestone` warning naming the issue, milestone and project. | Test |
+| FR-046-AC-2 | Given an issue that has a milestone and no project, a ticket-selected focus succeeds, counts it in `outside_projects`, and warns with a null project. | Test |
+| FR-046-AC-3 | Given selected issues that reference an unavailable project or have no project, status row totals plus `outside_projects` equal the `select_scope` counts and `outside_projects` lists their recently closed tickets; an unavailable project is warned, its issue is not ready with a reason naming the project, and `next` excludes it and returns the warning. | Test |
+| FR-046-AC-4 | Given an issue whose parent has no record, `select_scope`, the focus reads and the named batch succeed, count the issue as a leaf, and the reads carry an `unavailable_parent` warning. | Test |
+| FR-046-AC-5 | Given a blocker with no record, direct or behind an available blocker, the focus reads, `project-chunk` and the named batch succeed, warn on the issue that holds the reference, report the dependent as not ready and blocked, keep the available blocker layers, and `next` excludes the dependent and returns the warning. | Test |
+| FR-046-AC-6 | A result without unavailable references has no `warnings` or `outside_projects` member in its JSON; a result with them lists the warnings in terminal output in sorted order without duplicates. | Test |
+| FR-046-AC-7 | `focus hygiene` over a focus with unavailable references succeeds and carries the same warnings. | Test |
+| FR-046-AC-8 | A parent cycle and a dependency cycle still return their explicit errors. | Test |
 
 ## Dependencies
 

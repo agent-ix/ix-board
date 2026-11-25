@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Agent-IX
 
-//! Reads over references to unavailable Linear records (FR-045), and the cached leaf
+//! Reads over references to unavailable Linear records (FR-046), and the cached leaf
 //! counts of the roadmap (FR-020).
 
 use ix_board::linear_summary::{InitiativeSummary, ProjectSummary, SummarySnapshot};
@@ -123,6 +123,9 @@ fn issue(id: &str, project: Option<&str>) -> Issue {
         updated_at: Some("2026-11-01T00:00:00Z".to_owned()),
         attachment_urls: Vec::new(),
         attachments_complete: true,
+        started_at: None,
+        completed_at: None,
+        pull_requests: Vec::new(),
     }
 }
 
@@ -267,7 +270,7 @@ fn project_level<'a>(expansion: &'a FocusExpansion, project: &str) -> Vec<&'a st
         .collect()
 }
 
-#[trace("FR-045-AC-1")]
+#[trace("FR-046-AC-1")]
 #[test]
 fn an_unavailable_milestone_counts_at_project_level_in_every_focus_read() {
     let snapshot = dangling();
@@ -321,16 +324,20 @@ fn an_unavailable_milestone_counts_at_project_level_in_every_focus_read() {
     );
 }
 
-#[trace("FR-045-AC-2", "FR-045-AC-3")]
+#[trace("FR-046-AC-2", "FR-046-AC-3")]
 #[test]
 fn issues_outside_every_project_row_are_counted_and_warned() {
-    let snapshot = dangling();
+    let mut snapshot = dangling();
+    // SWM-6 completed inside the 48 hours before the fixture clock.
+    snapshot.issues[5].completed_at = Some("1970-01-01T00:15:00Z".to_owned());
     let mut fixture = fixture(snapshot.clone());
     let selection = tickets(&["SWM-3", "SWM-5", "SWM-6"]);
     let status = fixture.reads.focus_status(&selection).expect("status");
     assert_counts_match_scope(&snapshot, &selection, &status);
     let outside = status.outside_projects.as_ref().expect("outside group");
     assert_eq!((outside.progress.done, outside.progress.total), (1, 2));
+    assert_eq!(outside.recently_closed.len(), 1);
+    assert_eq!(outside.recently_closed[0].identifier, "SWM-6");
     assert_eq!(status.projects.len(), 1);
     assert_eq!(
         status.warnings,
@@ -346,7 +353,7 @@ fn issues_outside_every_project_row_are_counted_and_warned() {
     assert_eq!(expansion.focus_issues.len(), 3);
 }
 
-#[trace("FR-045-AC-3")]
+#[trace("FR-046-AC-3")]
 #[test]
 fn an_unavailable_project_is_not_ready_and_next_reports_it() {
     let mut fixture = fixture(snapshot(vec![issue("SWM-6", Some("ghost"))]));
@@ -371,7 +378,7 @@ fn an_unavailable_project_is_not_ready_and_next_reports_it() {
     );
 }
 
-#[trace("FR-045-AC-4")]
+#[trace("FR-046-AC-4")]
 #[test]
 fn an_unavailable_parent_leaves_the_issue_a_counted_leaf() {
     let snapshot = dangling();
@@ -417,7 +424,7 @@ fn an_unavailable_parent_leaves_the_issue_a_counted_leaf() {
     assert_eq!(batch.warnings, [parent_warning()]);
 }
 
-#[trace("FR-045-AC-5", "FR-002-AC-7")]
+#[trace("FR-046-AC-5", "FR-002-AC-7")]
 #[test]
 fn an_unavailable_blocker_blocks_its_dependents_without_failing_any_read() {
     let snapshot = dangling();
@@ -498,7 +505,7 @@ fn an_unavailable_blocker_blocks_its_dependents_without_failing_any_read() {
     assert!(batch.warnings.contains(&expected));
 }
 
-#[trace("FR-045-AC-6", "FR-045-AC-1")]
+#[trace("FR-046-AC-6", "FR-046-AC-1")]
 #[test]
 fn warning_members_appear_in_json_only_when_there_is_something_to_report() {
     let mut clean = fixture(snapshot(vec![issue("SWM-3", Some("p1"))]));
@@ -542,7 +549,7 @@ fn warning_members_appear_in_json_only_when_there_is_something_to_report() {
     assert_eq!(decoded, status);
 }
 
-#[trace("FR-045-AC-7")]
+#[trace("FR-046-AC-7")]
 #[test]
 fn focus_hygiene_carries_the_same_warnings() {
     let mut fixture = fixture(dangling());

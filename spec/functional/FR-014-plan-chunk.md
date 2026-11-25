@@ -67,7 +67,7 @@ use Linear milestone `sortOrder` ascending, then milestone identifier. This
 command's row order SHALL not use FR-001 ticket priority or ticket manual
 order. The stable issue identifier SHALL be the final tie-breaker. Dependency
 cycles SHALL retain FR-002's error; unavailable records follow
-[FR-045](FR-045-dangling-references.md).
+[FR-046](FR-046-dangling-references.md).
 
 For each emitted issue, the output SHALL include its stable identifier, title,
 milestone name or `null`, readiness boolean and reasons, the stable identifiers
@@ -113,7 +113,7 @@ produce explicit errors and no partial chunk.
   FR-010.
 - Explicit errors for empty focus, invalid size, incomplete source data, or a
   dependency cycle; no partial result on error.
-- FR-045 warnings for unavailable records.
+- FR-046 warnings for unavailable records.
 
 ## Acceptance Criteria
 

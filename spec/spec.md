@@ -50,6 +50,8 @@ with the last successful report for that focus.
   projects, and issues into a deduplicated issue set and blocker layers (FR-011).
 - Focus status by project and milestone, blocker-state details, and the ready
   queue restricted to focus issues (FR-012).
+- Recently closed focus tickets and linked GitHub pull-request activity inside a
+  time window, carried by focus status and focus report (FR-045).
 - Focus hygiene findings for missing project/milestone assignment, overdue
   milestones, linked GitHub pull request status, stale issues, and duplicate
   title groups, plus a diff from the most recent successful report (FR-013).
@@ -145,7 +147,7 @@ records through Linear GraphQL and caches read results locally.
 
 ## Requirements Architecture
 
-SWM-295 adds [FR-045](./functional/FR-045-dangling-references.md): reads complete
+SWM-295 adds [FR-046](./functional/FR-046-dangling-references.md): reads complete
 over references to unavailable Linear records and report typed warnings. SWM-296
 adds identifiers, initiative membership and cached leaf counts to the FR-020
 roadmap.

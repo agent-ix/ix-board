@@ -182,6 +182,9 @@ fn issue(id: &str, parent: Option<&str>, category: WorkflowStateType) -> Issue {
         updated_at: None,
         attachment_urls: vec![],
         attachments_complete: true,
+        started_at: None,
+        completed_at: None,
+        pull_requests: Vec::new(),
     }
 }
 
@@ -241,7 +244,7 @@ fn tc_010_01_overlapping_selectors_count_leaves_once_and_exclude_terminal_nonwor
     assert_eq!(by_identifier, by_name);
 }
 
-/// Trace: FR-010-AC-3, FR-045-AC-4, FR-045-AC-8
+/// Trace: FR-010-AC-3, FR-046-AC-4, FR-046-AC-8
 #[test]
 fn tc_010_02_unknown_ambiguous_and_cyclic_scope_is_refused() {
     let mut snapshot = WorkspaceSnapshot {

@@ -250,8 +250,8 @@ fn unfiltered_paged_baseline_replaces_poisoned_model_partition_without_resetting
     let mut source = source(&endpoint, "poisoned-model-fixture");
     source.configure_cache(&path).expect("shared cache");
     let current = source.cache_namespace();
-    assert!(current.starts_with("linear:v15:"));
-    let poisoned = current.replacen("linear:v15:", "linear:v14:", 1);
+    assert!(current.starts_with("linear:v16:"));
+    let poisoned = current.replacen("linear:v16:", "linear:v14:", 1);
     let mut reader = ReadService::with_clock(source.clone(), &path, clock.clone()).expect("reader");
     let db = Connection::open(&path).expect("seed former partition");
     let empty = serde_json::to_vec(&WorkspaceSnapshot {
