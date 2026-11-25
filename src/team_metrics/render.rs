@@ -383,11 +383,10 @@ pub fn render(
                 .map(|a| now.saturating_sub(a.started_ms).max(0))
                 .max();
             let age = if active.is_empty() {
-                (tracker_fresh && history_fresh).then_some(0.0)
-            } else if active.iter().all(|a| a.start_known) {
-                oldest.map(|age| age as f64 / 1000.0)
+                (tracker_fresh && history_fresh && life_fresh && s.population_observed)
+                    .then_some(0.0)
             } else {
-                None
+                oldest.map(|age| age as f64 / 1000.0)
             };
             out.metric(
                 "ix_team_metric_available",

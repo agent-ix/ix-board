@@ -201,7 +201,13 @@ impl Collector {
                     missing.machine, missing.reason
                 );
             }
-            for row in report.agents.iter().filter(|r| !r.partial) {
+            for row in report.agents.iter().filter(|r| {
+                execution_evidence_usable(
+                    r.verdict,
+                    r.availability.pane.complete,
+                    r.availability.transcript.complete,
+                )
+            }) {
                 // Agent reports label this host "local". Resolve that alias
                 // only through an exact native session AND pane match to a
                 // verified relay binding; never infer it from the hostname.
@@ -498,21 +504,28 @@ impl Collector {
                             m.evidence_refs.clear();
                         }
                     }
-                    let all_prs = cfg
-                        .repos
-                        .iter()
-                        .map(|repo| github.pull_requests(repo, now as f64 / 1000.0 - 86400.0))
-                        .collect::<Result<Vec<_>, _>>()
-                        .map(|rows| rows.into_iter().flatten().collect::<Vec<_>>());
+                    let mut all_prs = Vec::new();
+                    let mut successful_repos = 0usize;
+                    for repo in &cfg.repos {
+                        match github.pull_requests(repo, now as f64 / 1000.0 - 86400.0) {
+                            Ok(rows) => {
+                                successful_repos += 1;
+                                all_prs.extend(rows);
+                            }
+                            Err(error) => eprintln!("GitHub evidence for {repo}: {error}"),
+                        }
+                    }
+                    let all_prs = (successful_repos > 0).then_some(all_prs);
                     let pr_stats = all_prs
                         .as_ref()
-                        .ok()
                         .filter(|_| github.observed_at() > 0)
                         .map(|prs| super::pr_stats::calculate(prs, now as f64 / 1000.0));
                     let review_stats = (|| -> Result<super::reviews::ReviewStats, String> {
                         let client =
                             crate::LinearGraphQlSource::from_env().map_err(|e| e.to_string())?;
-                        let prs = all_prs.as_ref().map_err(Clone::clone)?;
+                        let prs = all_prs
+                            .as_ref()
+                            .ok_or_else(|| "GitHub PR population unavailable".to_owned())?;
                         let allowed: BTreeSet<_> = prs
                             .iter()
                             .map(|p| format!("{}#{}", p.repo, p.number))
@@ -521,19 +534,16 @@ impl Collector {
                             .iter()
                             .map(|p| (format!("{}#{}", p.repo, p.number), p.created_at))
                             .collect();
-                        let mut comments = Vec::new();
-                        for repo in &cfg.repos {
-                            comments.extend(client.fetch_marker_comments(
-                                "<!-- reviewer ",
-                                &format!("repo={repo} "),
-                                Some(now as f64 / 1000.0 - 86400.0),
-                            )?);
-                            comments.extend(client.fetch_marker_comments(
-                                "<!-- reviewer-dispositions ",
-                                &format!("repo={repo} "),
-                                Some(now as f64 / 1000.0 - 86400.0),
-                            )?);
-                        }
+                        let mut comments = client.fetch_marker_comments(
+                            "<!-- reviewer ",
+                            "repo=",
+                            Some(now as f64 / 1000.0 - 86400.0),
+                        )?;
+                        comments.extend(client.fetch_marker_comments(
+                            "<!-- reviewer-dispositions ",
+                            "repo=",
+                            Some(now as f64 / 1000.0 - 86400.0),
+                        )?);
                         super::reviews::calculate(
                             &comments,
                             &allowed,
@@ -714,6 +724,14 @@ fn verified_sync_ms(freshness: Option<crate::CacheFreshness>) -> Result<i64, Str
         .ok_or_else(|| "tracker cache is stale or has no verified sync provenance".into())
 }
 
+fn execution_evidence_usable(
+    verdict: crate::agents::Verdict,
+    pane_complete: bool,
+    transcript_complete: bool,
+) -> bool {
+    pane_complete && transcript_complete && verdict != crate::agents::Verdict::Unknown
+}
+
 struct NoAgents;
 impl AgentSource for NoAgents {
     fn report(&self, _: &[String]) -> Result<crate::agents::AgentsReport, String> {
@@ -790,6 +808,25 @@ impl LinearSource for SelectedLinear<'_> {
 mod tests {
     use super::*;
     use ix_trace_rs::trace;
+    #[trace("FR-033-AC-15")]
+    #[test]
+    fn execution_samples_ignore_unrelated_partial_git_and_process_sources() {
+        assert!(super::execution_evidence_usable(
+            crate::agents::Verdict::Working,
+            true,
+            true
+        ));
+        assert!(!super::execution_evidence_usable(
+            crate::agents::Verdict::Unknown,
+            true,
+            true
+        ));
+        assert!(!super::execution_evidence_usable(
+            crate::agents::Verdict::Working,
+            false,
+            true
+        ));
+    }
     #[trace("FR-033-AC-5", "FR-033-AC-13")]
     #[test]
     fn provider_receipt_and_cached_provenance_do_not_inherit_linear_poll_times() {

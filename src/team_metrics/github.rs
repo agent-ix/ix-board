@@ -27,6 +27,7 @@ const MAX_OLD: usize = 50;
 const MAX_REPOS: usize = 32;
 pub(super) const MAX_QUERY: usize = 16 * 1024;
 const CACHE_BYTES: i64 = 4 * 1024 * 1024;
+const PR_FIELDS: &str = "nodes { number createdAt mergedAt closedAt updatedAt isDraft state additions deletions reviewDecision timelineItems(first: 1, itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT]) { totalCount } reopenEvents: timelineItems(first: 1, itemTypes: [REOPENED_EVENT]) { totalCount } } pageInfo { hasNextPage endCursor }";
 
 #[derive(serde::Serialize)]
 pub(super) struct Request {
@@ -314,15 +315,8 @@ impl<T: Transport> Guard<T> {
             }
             Err(reason) => Err(reason),
         };
-        if result.is_err() {
-            // Malformed payloads, transport timeouts and GraphQL errors also suppress
-            // retry storms. A longer server cooldown always wins.
-            tx.execute(
-                "UPDATE github_gate SET cooldown=max(cooldown,?1) WHERE id=1",
-                [received.saturating_add(HOUR_MS)],
-            )
-            .map_err(|e| e.to_string())?;
-        }
+        // Ordinary repository errors stay local to their caller. Only explicit
+        // server rate-limit responses above set the shared cooldown.
         tx.commit().map_err(|e| e.to_string())?;
         result
     }
@@ -542,49 +536,72 @@ impl<T: Transport> SelectedGithub<T> {
         });
         Ok(cached)
     }
-    fn list(&self, repo: &str, states: &str, since: Option<f64>) -> PrRows {
-        let query = crate::retro::live::PULL_REQUEST_QUERY
-            .replace("__STATES__", states)
-            .replacen(
-                "  repository(",
-                "  rateLimit { cost remaining resetAt }\n  repository(",
-                1,
-            );
-        let mut cursor = None;
-        let mut seen = BTreeSet::new();
-        let mut prs = Vec::new();
-        let mut previous_update = f64::INFINITY;
+    fn list_recent_population(&self, repo: &str, since: f64) -> PrRows {
+        let mut open_after: Option<String> = None;
+        let mut closed_after: Option<String> = None;
+        let mut open_more = true;
+        let mut closed_more = true;
+        let mut rows = Vec::new();
         for _ in 0..MAX_PAGES {
-            let request = graph_request(&query, repo, cursor.as_deref())?;
-            let body = self.read(&request, |body, at| {
-                validate_page(body, repo, since, states, at)
-            })?;
-            let page =
-                crate::retro::live::pull_request_page(&graph_body(&body.body)?, repo, since)?;
-            if page.items.len() > 50 || page.items.iter().any(|p| !seen.insert(p.number)) {
-                return Err("GitHub duplicate/oversize PR page".into());
+            if !open_more && !closed_more {
+                return Ok(rows);
             }
-            for pr in &page.items {
-                if pr.updated_at > previous_update {
-                    return Err("GitHub pagination order is inconsistent".into());
-                }
-                previous_update = pr.updated_at;
+            let mut fields = Vec::new();
+            let mut variables = BTreeMap::new();
+            if open_more {
+                fields.push(format!(
+                    "open: pullRequests(first: 50, states: [OPEN], after: $openAfter, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{ {PR_FIELDS} }}"
+                ));
+                variables.insert(
+                    "openAfter".to_owned(),
+                    open_after.clone().unwrap_or_default(),
+                );
             }
-            prs.extend(
-                page.items
-                    .into_iter()
-                    .filter(|p| since.is_none_or(|s| p.updated_at >= s)),
+            if closed_more {
+                fields.push(format!(
+                    "recent: pullRequests(first: 50, states: [MERGED, CLOSED], after: $recentAfter, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{ {PR_FIELDS} }}"
+                ));
+                variables.insert(
+                    "recentAfter".to_owned(),
+                    closed_after.clone().unwrap_or_default(),
+                );
+            }
+            let declarations = variables
+                .keys()
+                .map(|name| format!("${name}: String"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "query($owner: String!, $name: String!, {declarations}) {{ rateLimit {{ cost remaining resetAt }} repository(owner: $owner, name: $name) {{ {} }} }}",
+                fields.join("\n")
             );
-            if !page.has_next {
-                return Ok(prs);
+            let mut request = graph_request(&query, repo, None)?;
+            for (name, value) in variables {
+                if !value.is_empty() {
+                    request.variables.insert(name, value);
+                }
             }
-            let next = page.cursor.ok_or("GitHub next cursor absent")?;
-            if cursor.as_ref() == Some(&next) {
-                return Err("GitHub pagination did not advance".into());
+            let body = self.read(&request, |body, at| {
+                validate_population_page(body, repo, since, open_more, closed_more, at)
+            })?;
+            if open_more {
+                let page = population_page(&body.body, "open", repo, None)?;
+                rows.extend(page.items);
+                open_after = page.cursor;
+                open_more = page.has_next;
             }
-            cursor = Some(next);
+            if closed_more {
+                let page = population_page(&body.body, "recent", repo, Some(since))?;
+                rows.extend(page.items);
+                closed_after = page.cursor;
+                closed_more = page.has_next;
+            }
         }
-        Err("GitHub repository page budget exhausted; incomplete population".into())
+        if open_more || closed_more {
+            Err("GitHub repository page budget exhausted; incomplete population".into())
+        } else {
+            Ok(rows)
+        }
     }
     fn repository_prs(&self, repo: &str) -> PrRows {
         if let Some(rows) = self.lists.borrow().get(repo) {
@@ -593,15 +610,7 @@ impl<T: Transport> SelectedGithub<T> {
         if self.lists.borrow().len() >= MAX_REPOS {
             return Err("GitHub repository population exceeds collection bound".into());
         }
-        let result = (|| {
-            let mut rows = self.list(repo, "[OPEN]", None)?;
-            rows.extend(self.list(
-                repo,
-                "[MERGED, CLOSED]",
-                Some(self.now as f64 / 1000.0 - 86_400.0),
-            )?);
-            Ok(rows)
-        })();
+        let result = self.list_recent_population(repo, self.now as f64 / 1000.0 - 86_400.0);
         self.lists.borrow_mut().insert(repo.into(), result.clone());
         result
     }
@@ -703,6 +712,49 @@ fn validate_page(
         .any(|pair| pair[0].updated_at < pair[1].updated_at)
     {
         return Err("GitHub PR page is not ordered by native update time".into());
+    }
+    Ok(())
+}
+fn population_connection(body: &str, alias: &str) -> Result<String, String> {
+    let response: serde_json::Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    let data = response.get("data").ok_or("GitHub response data missing")?;
+    let connection = data
+        .get("repository")
+        .and_then(|r| r.get(alias))
+        .ok_or("GitHub batched PR connection missing")?;
+    Ok(serde_json::json!({
+        "data": {
+            "rateLimit": data.get("rateLimit").ok_or("GitHub quota evidence missing")?,
+            "repository": {"pullRequests": connection}
+        }
+    })
+    .to_string())
+}
+fn population_page(
+    body: &str,
+    alias: &str,
+    repo: &str,
+    since: Option<f64>,
+) -> Result<crate::retro::sources::Page<PullRequest>, String> {
+    let wrapper = population_connection(body, alias)?;
+    crate::retro::live::pull_request_page(&graph_body(&wrapper)?, repo, since)
+}
+fn validate_population_page(
+    body: &str,
+    repo: &str,
+    since: f64,
+    open: bool,
+    recent: bool,
+    at: i64,
+) -> Result<(), String> {
+    for (enabled, alias, cutoff, states) in [
+        (open, "open", None, "[OPEN]"),
+        (recent, "recent", Some(since), "[MERGED, CLOSED]"),
+    ] {
+        if enabled {
+            let wrapper = population_connection(body, alias)?;
+            validate_page(&wrapper, repo, cutoff, states, at)?;
+        }
     }
     Ok(())
 }
@@ -947,8 +999,21 @@ mod tests {
             assert!(!request.conditional);
             let query = &request.query;
             assert!(query.len() < MAX_QUERY);
-            let repository = if query.contains("pullRequests(") {
-                serde_json::json!({"pullRequests":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}})
+            let connection =
+                serde_json::json!({"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}});
+            let repository = if query.contains("open: pullRequests")
+                || query.contains("recent: pullRequests")
+            {
+                let mut aliases = serde_json::Map::new();
+                if query.contains("open: pullRequests") {
+                    aliases.insert("open".into(), connection.clone());
+                }
+                if query.contains("recent: pullRequests") {
+                    aliases.insert("recent".into(), connection);
+                }
+                serde_json::Value::Object(aliases)
+            } else if query.contains("pullRequests(") {
+                serde_json::json!({"pullRequests":connection})
             } else {
                 let mut fields = serde_json::Map::new();
                 for number in query.split("pullRequest(number: ").skip(1) {
@@ -1009,8 +1074,8 @@ mod tests {
             );
             assert_eq!(
                 transport.count(),
-                if offset < TTL_MS { 8 } else { 16 },
-                "cold=8, warm/restart=0, expired unchanged=8 sends for two repositories"
+                if offset < TTL_MS { 6 } else { 12 },
+                "cold=6, warm/restart=0, expired unchanged=6 sends for two repositories"
             );
         }
     }
@@ -1185,10 +1250,13 @@ mod tests {
     #[trace("FR-033-AC-13")]
     #[test]
     fn malformed_partial_null_and_cost_excess_never_certify_evidence() {
-        for body in [
-            "{}",
-            "{\"errors\":[{\"type\":\"RATE_LIMITED\"}]}",
-            "{\"data\":{\"repository\":null,\"rateLimit\":{\"cost\":26,\"remaining\":1,\"resetAt\":\"2030-01-01T00:00:00Z\"}}}",
+        for (body, expected_sends) in [
+            ("{}", 2),
+            ("{\"errors\":[{\"type\":\"RATE_LIMITED\"}]}", 2),
+            (
+                "{\"data\":{\"repository\":null,\"rateLimit\":{\"cost\":26,\"remaining\":1,\"resetAt\":\"2030-01-01T00:00:00Z\"}}}",
+                1,
+            ),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let cfg = config(dir.path());
@@ -1202,7 +1270,7 @@ mod tests {
             );
             assert!(source.pull_requests("agent-ix/one", 0.0).is_err());
             assert!(source.pull_request("agent-ix/one", 1).is_err());
-            assert_eq!(fake.count(), 1);
+            assert_eq!(fake.count(), expected_sends);
         }
         let null = serde_json::json!({"data":{"rateLimit":{"cost":1,"remaining":100,"resetAt":"2030-01-01T00:00:00Z"},"repository":{"p1":null}}}).to_string();
         assert!(parse_infos(&null, &[1], 1000).unwrap().is_empty());
@@ -1215,14 +1283,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = config(dir.path());
         let fake = Fake::new(|request, _| {
-            let n = request
-                .variables
-                .get("after")
-                .map(String::as_str)
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0)
-                + 1;
-            Ok(response(serde_json::json!({"data":{"rateLimit":{"cost":1,"remaining":100,"resetAt":"2030-01-01T00:00:00Z"},"repository":{"pullRequests":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":n.to_string()}}}}}).to_string()))
+            let next = |key: &str| {
+                request
+                    .variables
+                    .get(key)
+                    .map(String::as_str)
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0)
+                    + 1
+            };
+            let connection = |n: u64| serde_json::json!({"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":n.to_string()}});
+            let mut repository = serde_json::Map::new();
+            if request.query.contains("open: pullRequests") {
+                repository.insert("open".into(), connection(next("openAfter")));
+            }
+            if request.query.contains("recent: pullRequests") {
+                repository.insert("recent".into(), connection(next("recentAfter")));
+            }
+            Ok(response(serde_json::json!({"data":{"rateLimit":{"cost":1,"remaining":100,"resetAt":"2030-01-01T00:00:00Z"},"repository":repository}}).to_string()))
         });
         let source = source(open(&cfg, fake.clone()), BTreeSet::new(), true, 1000);
         assert!(source.pull_requests("agent-ix/one", 0.0).is_err());
@@ -1364,7 +1442,7 @@ mod tests {
                 .request_at(&request(0, true), 1001, valid_json)
                 .is_err()
         );
-        assert_eq!(fake.count(), 1);
+        assert_eq!(fake.count(), 2);
         let response = Response {
             status: 429,
             headers: [(
@@ -1410,16 +1488,43 @@ mod tests {
         let cfg = config(dir.path());
         let fake = Fake::new(|request, _| {
             let query = &request.query;
-            let open = query.contains("states: [OPEN]");
+            if query.contains("pullRequest(number:") {
+                let mut fields = serde_json::Map::new();
+                for number in query.split("pullRequest(number: ").skip(1) {
+                    let n: u64 = number.split(')').next().unwrap().parse().unwrap();
+                    let merged = n == 2;
+                    fields.insert(
+                        format!("p{n}"),
+                        serde_json::json!({
+                                "state":if merged {"MERGED"} else {"OPEN"},
+                                "createdAt":"2026-11-20T00:00:00Z",
+                                "updatedAt":"2026-11-22T00:00:00Z",
+                        "mergedAt":if merged {Some("2026-11-22T00:00:00Z")} else {None::<&str>},
+                        "closedAt":if merged {Some("2026-11-22T00:00:00Z")} else {None::<&str>}
+                            }),
+                    );
+                }
+                return Ok(response(serde_json::json!({"data":{"rateLimit":{"cost":3,"remaining":100,"resetAt":"2030-01-01T00:00:00Z"},"repository":fields}}).to_string()));
+            }
             let node = serde_json::json!({
-                "number":if open {1} else {2},"state":if open {"OPEN"} else {"MERGED"},
+                "number":1,"state":"OPEN",
                 "createdAt":"2026-11-20T00:00:00Z","updatedAt":"2026-11-22T00:00:00Z",
-                "mergedAt":if open {None} else {Some("2026-11-22T00:00:00Z")},
-                "closedAt":if open {None} else {Some("2026-11-22T00:00:00Z")},
+                "mergedAt":None::<&str>,"closedAt":None::<&str>,
                 "isDraft":false,"additions":7,"deletions":3,"reviewDecision":"APPROVED",
                 "timelineItems":{"totalCount":0},"reopenEvents":{"totalCount":0}
             });
-            Ok(response(serde_json::json!({"data":{"rateLimit":{"cost":3,"remaining":100,"resetAt":"2030-01-01T00:00:00Z"},"repository":{"pullRequests":{"nodes":[node],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}).to_string()))
+            let merged = serde_json::json!({
+                "number":2,"state":"MERGED","createdAt":"2026-11-20T00:00:00Z",
+                "updatedAt":"2026-11-22T00:00:00Z","mergedAt":"2026-11-22T00:00:00Z",
+                "closedAt":"2026-11-22T00:00:00Z","isDraft":false,"additions":7,
+                "deletions":3,"reviewDecision":"APPROVED","timelineItems":{"totalCount":0},
+                "reopenEvents":{"totalCount":0}
+            });
+            let connection = |node| serde_json::json!({"nodes":[node],"pageInfo":{"hasNextPage":false,"endCursor":null}});
+            let repository =
+                serde_json::json!({"open":connection(node),"recent":connection(merged)});
+            assert!(query.contains("open: pullRequests") && query.contains("recent: pullRequests"));
+            Ok(response(serde_json::json!({"data":{"rateLimit":{"cost":3,"remaining":100,"resetAt":"2030-01-01T00:00:00Z"},"repository":repository}}).to_string()))
         });
         let at = chrono::DateTime::parse_from_rfc3339("2026-11-22T01:00:00Z")
             .unwrap()
@@ -1434,7 +1539,7 @@ mod tests {
         assert!(rows[0].open);
         assert!(!source.pull_request("agent-ix/one", 1).unwrap().merged);
         assert!(source.pull_request("agent-ix/one", 2).unwrap().merged);
-        assert_eq!(fake.count(), 2);
+        assert_eq!(fake.count(), 1);
         assert_eq!(source.observed_at(), at);
         source
             .guard
@@ -1448,7 +1553,7 @@ mod tests {
         assert!(source.pull_request("agent-ix/one", 1).is_err());
         assert_eq!(
             fake.count(),
-            2,
+            1,
             "a shared cooldown overrides prior per-cycle memoization"
         );
     }
@@ -1479,18 +1584,18 @@ mod tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        assert_eq!(charges, vec![1_000_000, 1_020_000]);
+        assert_eq!(charges, vec![1_000_000]);
         assert_eq!(source.observed_at(), 1_020_000);
-        assert_eq!(fake.count(), 2);
+        assert_eq!(fake.count(), 1);
         drop(source);
         let guard = open(&cfg, fake.clone()).unwrap();
         assert!(
             guard
-                .request_at(&request(8, false), 1_030_000, valid_json)
+                .request_at(&request(8, false), 1_010_000, valid_json)
                 .is_err(),
             "a restarted worker with a clock older than the prior receipt must fail closed"
         );
-        assert_eq!(fake.count(), 2);
+        assert_eq!(fake.count(), 1);
     }
 
     #[trace("FR-033-AC-12")]
@@ -1833,11 +1938,11 @@ mod tests {
             assert!(query.contains("$owner"));
             assert!(query.contains("$name"));
             let repository = if query.contains("pullRequests(") {
-                let (nodes, has_next, cursor) = if query.contains("states: [OPEN]") {
-                    let number = if variables.get("after").is_none() {
+                let (nodes, has_next, cursor) = if query.contains("open: pullRequests") {
+                    let number = if variables.get("openAfter").is_none() {
                         1
                     } else {
-                        assert_eq!(variables.get("after").unwrap(), "opaque-page-two");
+                        assert_eq!(variables.get("openAfter").unwrap(), "opaque-page-two");
                         2
                     };
                     let node = serde_json::json!({"number":number,"state":"OPEN","createdAt":"1970-01-01T00:00:00Z","updatedAt":"1970-01-01T00:00:00Z","mergedAt":null,"closedAt":null,"isDraft":false,"additions":3,"deletions":2,"reviewDecision":null,"timelineItems":{"totalCount":0},"reopenEvents":{"totalCount":0}});
@@ -1851,11 +1956,11 @@ mod tests {
                         },
                     )
                 } else {
-                    assert_eq!(variables.len(), 2);
-                    assert!(query.contains("states: [MERGED, CLOSED]"));
                     (Vec::new(), false, None)
                 };
-                serde_json::json!({"pullRequests":{"nodes":nodes,"pageInfo":{"hasNextPage":has_next,"endCursor":cursor}}})
+                let open = serde_json::json!({"nodes":nodes,"pageInfo":{"hasNextPage":has_next,"endCursor":cursor}});
+                let recent = serde_json::json!({"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}});
+                serde_json::json!({"open":open,"recent":recent})
             } else {
                 assert_eq!(variables.len(), 2);
                 assert!(query.contains("p3: pullRequest(number: 3)"));
@@ -1881,20 +1986,20 @@ mod tests {
         let seen = server.finish();
         assert_eq!(
             seen.len(),
-            4,
-            "two open pages, one recent page and one historical batch"
+            3,
+            "two batched population pages and one historical batch"
         );
         let pagination: Vec<_> = seen
             .iter()
             .map(|request| {
                 let payload: serde_json::Value =
                     serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
-                payload["variables"].get("after").cloned()
+                payload["variables"].get("openAfter").cloned()
             })
             .collect();
         assert_eq!(
             pagination,
-            vec![None, Some(serde_json::json!("opaque-page-two")), None, None]
+            vec![None, Some(serde_json::json!("opaque-page-two")), None]
         );
     }
 

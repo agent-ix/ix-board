@@ -14,6 +14,7 @@ pub(crate) struct ReviewStats {
     pub values: BTreeMap<String, f64>,
 }
 pub(crate) const NAMES: &[&str] = &[
+    "pr_changes_requested_share",
     "review_recorded_prs_24h",
     "review_classifiable_prs_24h",
     "review_classification_share",
@@ -28,6 +29,7 @@ pub(crate) const NAMES: &[&str] = &[
     "new_pr_first_review_median_seconds_24h",
     "new_pr_first_review_p90_seconds_24h",
     "new_pr_first_review_count_24h",
+    "review_records_skipped_24h",
 ];
 
 // These are projections of the externally owned dev-team marker payload. Extra
@@ -111,6 +113,7 @@ pub(crate) fn calculate(
     let mut reviews: BTreeMap<(String, String), Review> = BTreeMap::new();
     let mut outcomes: BTreeMap<(String, String, String), (u64, f64, Disposition)> = BTreeMap::new();
     let mut seen = BTreeSet::new();
+    let mut skipped = 0usize;
     // Resolve attributed review artifacts before their dispositions, regardless
     // of source ordering. Unrelated artifacts cannot invalidate this scope.
     let mut ordered: Vec<_> = comments.iter().collect();
@@ -118,92 +121,109 @@ pub(crate) fn calculate(
         marker_fields(first_line(&c.body)).is_none_or(|(kind, _)| kind != "reviewer")
     });
     for comment in ordered {
-        let id = comment
-            .id
-            .as_ref()
-            .ok_or("review comment has no native identity")?;
+        let Some(id) = comment.id.as_ref() else {
+            skipped += 1;
+            continue;
+        };
         if !seen.insert(id) {
+            skipped += 1;
             continue;
         }
-        let at = crate::drift::timestamp_epoch(
-            comment
-                .created_at
-                .as_deref()
-                .ok_or("review comment has no source timestamp")?,
-        )
-        .map_err(|e| e.to_string())?;
+        let Some(created_at) = comment.created_at.as_deref() else {
+            skipped += 1;
+            continue;
+        };
+        let Ok(at) = crate::drift::timestamp_epoch(created_at) else {
+            skipped += 1;
+            continue;
+        };
         if at <= now - 86400.0 || at > now {
             continue;
         }
         let Some((kind, fields)) = marker_fields(first_line(&comment.body)) else {
-            return Err("unsupported review marker".into());
+            skipped += 1;
+            continue;
         };
-        let repo = *fields
-            .get("repo")
-            .ok_or("review marker has no repository")?;
-        let artifact = *fields
-            .get("id")
-            .ok_or("review marker has no artifact identity")?;
+        let (Some(repo), Some(artifact)) = (fields.get("repo"), fields.get("id")) else {
+            skipped += 1;
+            continue;
+        };
         if kind == "reviewer" {
-            let pr = *fields
-                .get("pr")
-                .ok_or("review marker has no PR attribution")?;
+            let Some(pr) = fields.get("pr") else {
+                skipped += 1;
+                continue;
+            };
             let full = if pr.starts_with(&format!("{repo}#")) {
-                pr.to_owned()
+                (*pr).to_owned()
             } else {
-                let short = repo.rsplit('/').next().ok_or("repository identity")?;
-                let number = pr
-                    .strip_prefix(&format!("{short}#"))
-                    .ok_or("PR/repository attribution mismatch")?;
+                let Some(short) = repo.rsplit('/').next() else {
+                    skipped += 1;
+                    continue;
+                };
+                let Some(number) = pr.strip_prefix(&format!("{short}#")) else {
+                    skipped += 1;
+                    continue;
+                };
                 format!("{repo}#{number}")
             };
             if !allowed.contains(&full) {
                 continue;
             }
-            let data: ReviewData = yaml(&comment.body)?;
+            let Ok(data) = yaml::<ReviewData>(&comment.body) else {
+                skipped += 1;
+                continue;
+            };
             if data.clean != data.findings.is_empty() {
-                return Err("review clean flag contradicts findings".into());
+                skipped += 1;
+                continue;
             }
             let mut findings = BTreeMap::new();
+            let mut valid = true;
             for finding in data.findings {
                 if !matches!(finding.severity.as_str(), "high" | "medium" | "low")
                     || findings.insert(finding.fnd, finding.severity).is_some()
                 {
-                    return Err("duplicate finding or unsupported severity".into());
+                    valid = false;
+                    break;
                 }
             }
-            if reviews
-                .insert(
-                    (repo.into(), artifact.into()),
-                    Review {
-                        pr: full,
-                        at,
-                        clean: data.clean,
-                        findings,
-                    },
-                )
-                .is_some()
-            {
-                return Err("duplicate review artifact identity".into());
-            }
-        } else if kind == "reviewer-dispositions" {
-            if !reviews.contains_key(&(repo.into(), artifact.into())) {
+            let key = (repo.to_string(), artifact.to_string());
+            if !valid || reviews.contains_key(&key) {
+                skipped += 1;
                 continue;
             }
-            let round = fields
-                .get("round")
-                .ok_or("disposition round missing")?
-                .parse::<u64>()
-                .map_err(|_| "disposition round invalid")?;
-            let data: DispositionData = yaml(&comment.body)?;
-            for d in data.dispositions {
-                if !matches!(
+            reviews.insert(
+                key,
+                Review {
+                    pr: full,
+                    at,
+                    clean: data.clean,
+                    findings,
+                },
+            );
+        } else if kind == "reviewer-dispositions" {
+            if !reviews.contains_key(&((*repo).to_string(), (*artifact).to_string())) {
+                continue;
+            }
+            let Some(round) = fields.get("round").and_then(|r| r.parse::<u64>().ok()) else {
+                skipped += 1;
+                continue;
+            };
+            let Ok(data) = yaml::<DispositionData>(&comment.body) else {
+                skipped += 1;
+                continue;
+            };
+            if data.dispositions.iter().any(|d| {
+                !matches!(
                     d.outcome.as_str(),
                     "fixed" | "rejected" | "deferred" | "accepted-no-change" | "still-open"
-                ) {
-                    return Err("unsupported finding disposition".into());
-                }
-                let key = (repo.into(), artifact.into(), d.fnd.clone());
+                )
+            }) {
+                skipped += 1;
+                continue;
+            }
+            for d in data.dispositions {
+                let key = ((*repo).to_string(), (*artifact).to_string(), d.fnd.clone());
                 if outcomes
                     .get(&key)
                     .is_none_or(|old| (round, at) > (old.0, old.1))
@@ -249,6 +269,7 @@ pub(crate) fn calculate(
         }
     }
     let mut values = BTreeMap::new();
+    values.insert("review_records_skipped_24h".into(), skipped as f64);
     let classified = prs.values().filter(|p| p.2).count();
     values.insert("review_recorded_prs_24h".into(), prs.len() as f64);
     values.insert("review_classifiable_prs_24h".into(), classified as f64);
@@ -267,6 +288,10 @@ pub(crate) fn calculate(
         );
         values.insert(
             "review_prs_with_findings_share_24h".into(),
+            prs.values().filter(|p| p.0).count() as f64 / prs.len() as f64,
+        );
+        values.insert(
+            "pr_changes_requested_share".into(),
             prs.values().filter(|p| p.0).count() as f64 / prs.len() as f64,
         );
     }
@@ -332,6 +357,8 @@ mod tests {
         assert_eq!(v["review_recorded_prs_24h"], 1.0);
         assert_eq!(v["review_findings_pending_24h"], 1.0);
         assert_eq!(v["review_classifiable_prs_24h"], 0.0);
+        assert_eq!(v["pr_changes_requested_share"], 1.0);
+        assert_eq!(v["review_records_skipped_24h"], 0.0);
         assert!(!v.contains_key("review_confirmed_finding_pr_share_24h"));
     }
     #[trace("FR-033-AC-10")]
@@ -385,18 +412,47 @@ mod tests {
     }
     #[trace("FR-033-AC-10")]
     #[test]
-    fn missing_or_contradictory_structured_evidence_is_unavailable() {
+    fn missing_or_contradictory_structured_evidence_is_skipped_and_counted() {
         let mut r = review();
         r.body =
             "<!-- reviewer repo=owner/repo id=SR-1 pr=repo#1 -->\nHigh severity defect in prose"
                 .into();
-        assert!(calculate(&[r], &allowed(), &BTreeMap::new(), 100000.0).is_err());
+        let v = calculate(&[r], &allowed(), &BTreeMap::new(), 100000.0)
+            .unwrap()
+            .values;
+        assert_eq!(v["review_records_skipped_24h"], 1.0);
+        assert!(!v.contains_key("new_pr_first_review_median_seconds_24h"));
         let bad = comment(
             "bad",
             99000.0,
             "<!-- reviewer repo=owner/repo id=SR-1 pr=repo#1 -->",
             "clean: true\nfindings:\n  - fnd: FND-1\n    severity: high",
         );
-        assert!(calculate(&[bad], &allowed(), &BTreeMap::new(), 100000.0).is_err());
+        let v = calculate(&[bad], &allowed(), &BTreeMap::new(), 100000.0)
+            .unwrap()
+            .values;
+        assert_eq!(v["review_records_skipped_24h"], 1.0);
+        assert!(!v.contains_key("new_pr_first_review_median_seconds_24h"));
+    }
+    #[trace("FR-033-AC-10")]
+    #[test]
+    fn missing_native_comment_id_and_duplicate_review_identity_are_counted_and_skipped() {
+        let mut no_id = review();
+        no_id.id = None;
+        let mut duplicate = review();
+        duplicate.id = Some("duplicate-native-id".into());
+        let mut another = duplicate.clone();
+        another.id = Some("second-native-id".into());
+        let v = calculate(
+            &[no_id, duplicate, another],
+            &allowed(),
+            &BTreeMap::new(),
+            100000.0,
+        )
+        .unwrap()
+        .values;
+        assert_eq!(v["review_records_skipped_24h"], 2.0);
+        assert_eq!(v["review_recorded_prs_24h"], 1.0);
+        assert_eq!(v["pr_changes_requested_share"], 1.0);
     }
 }

@@ -117,6 +117,15 @@ fn add(totals: &mut BTreeMap<String, f64>, key: &str, value: f64) {
     *totals.entry(key.into()).or_default() += value;
 }
 fn scope_matches(selected: &Selectors, reported: &relay_work_wire::ReportedScope) -> bool {
+    if selected.team.is_some()
+        && selected.initiatives.is_empty()
+        && selected.projects.is_empty()
+        && selected.tickets.is_empty()
+    {
+        // Team-only selection follows the whole current team; lead snapshots may
+        // report narrower initiative/project slices over time.
+        return true;
+    }
     let same = |a: &[String], b: &[String]| {
         a.iter().collect::<BTreeSet<_>>() == b.iter().collect::<BTreeSet<_>>()
     };

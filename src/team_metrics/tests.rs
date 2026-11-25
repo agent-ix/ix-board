@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Agent-IX
 use super::*;
 use super::{
-    timeline::{ExecutionSample, Member},
+    timeline::{Active, ExecutionSample, Member},
     wire::AssignmentStatus,
 };
 use crate::WorkflowStateType;
@@ -500,7 +500,54 @@ fn failed_lifecycle_keeps_last_success_and_omits_current_ages() {
     let text = render(&config, &state, 1000, 31000).unwrap();
     assert!(text.contains("source=\"lifecycle\"} 1\n")); // last successful timestamp is one Unix second.
     assert!(!text.contains("ix_team_stage_oldest_age_seconds{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\",stage=\"coding\"}"));
+    assert!(!text.contains(
+        "ix_team_executing_agents{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\"}"
+    ));
+    assert!(text.contains("metric=\"executing_agents\"} 0"));
     assert!(!text.contains("ix_team_unattributed_executing_agents{"));
+}
+
+#[trace("FR-033-AC-15")]
+#[test]
+fn a_known_stage_start_survives_an_unknown_start_in_the_same_stage() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(dir.path());
+    let mut state = state(&config);
+    state.history_ok = true;
+    state.history_at_ms = 100_000;
+    let scope = state.scopes.get_mut("factory:completion").unwrap();
+    scope.tracker_ok = true;
+    scope.tracker_at_ms = 100_000;
+    scope.lifecycle_ok = true;
+    scope.lifecycle_success_at_ms = 100_000;
+    scope.population_observed = true;
+    let mut known = assignment("coder", AssignmentStatus::Running);
+    known.agent_id = "known".into();
+    let mut unknown = assignment("coding", AssignmentStatus::Running);
+    unknown.agent_id = "unknown".into();
+    scope.assignments.insert(
+        "known".into(),
+        Active {
+            binding: binding(),
+            assignment: known,
+            started_ms: 90_000,
+            start_known: true,
+            accounted_ms: 100_000,
+        },
+    );
+    scope.assignments.insert(
+        "unknown".into(),
+        Active {
+            binding: binding(),
+            assignment: unknown,
+            started_ms: 0,
+            start_known: false,
+            accounted_ms: 100_000,
+        },
+    );
+    let text = render(&config, &state, 0, 100_000).unwrap();
+    assert!(text.contains("stage=\"coding\"} 10"));
+    assert!(text.contains("metric=\"stage_oldest_age_seconds\",stage=\"coding\"} 1"));
 }
 
 /// Trace: FR-033-AC-15
@@ -517,6 +564,7 @@ fn team_series_have_linear_team_labels_and_explicit_empty_population_status() {
     scope.tracker_at_ms = 100_000;
     scope.lifecycle_ok = true;
     scope.lifecycle_success_at_ms = 100_000;
+    scope.population_observed = true;
     let text = render(&config, &state, 0, 100_000).unwrap();
 
     assert!(text.contains("team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\""));
@@ -654,7 +702,8 @@ fn completed_stages_do_not_leak_into_a_disjoint_scope_with_the_same_lead() {
 #[test]
 fn a_lead_working_a_different_reported_scope_has_unknown_parent_attribution() {
     let dir = tempfile::tempdir().unwrap();
-    let config = config(dir.path());
+    let mut config = config(dir.path());
+    config.scopes[0].selectors.initiatives = vec!["selected-initiative".into()];
     let mut state = state(&config);
     let different = relay_work_wire::ReportedScope {
         initiatives: vec![],
