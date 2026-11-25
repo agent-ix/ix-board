@@ -1606,7 +1606,7 @@ mod revision_tests {
 
     #[trace("FR-033-AC-16")]
     #[test]
-    fn current_pane_lane_and_fresh_empty_host_feeds_classify_lead_coverage() {
+    fn fresh_and_stale_pane_lane_and_host_feeds_classify_lead_coverage() {
         let now_ms = 1_000_000;
         let decoded = parse_prometheus_samples(
             r#"{"status":"success","data":{"resultType":"vector","result":[{"metric":{"machine":"luna"},"value":[1000,"999.95"]}]}}"#,
@@ -1641,33 +1641,93 @@ mod revision_tests {
                     ],
                     999.95,
                 ),
+                sample(
+                    &[
+                        ("machine", "terra"),
+                        ("pane", "wE:p88"),
+                        ("workspace_label", "QSL"),
+                        ("tab_label", "stale-info"),
+                    ],
+                    909.0,
+                ),
+                sample(
+                    &[
+                        ("machine", "terra"),
+                        ("pane", "wE:p89"),
+                        ("workspace_label", "QSL"),
+                        ("tab_label", "stale-status"),
+                    ],
+                    999.95,
+                ),
+                sample(
+                    &[
+                        ("machine", "titan"),
+                        ("pane", "wB:pZ"),
+                        ("workspace_label", "QSL"),
+                        ("tab_label", "stale-host"),
+                    ],
+                    909.0,
+                ),
             ],
-            pane_status: vec![sample(
-                &[
-                    ("machine", "luna"),
-                    ("pane", "wZ:p1"),
-                    ("status", "working"),
-                ],
-                999.95,
-            )],
-            lane_status: vec![sample(
-                &[
-                    ("host", "terra"),
-                    ("lane", "terra:QSL:plan"),
-                    ("state", "working"),
-                ],
-                999.95,
-            )],
+            pane_status: vec![
+                sample(
+                    &[
+                        ("machine", "luna"),
+                        ("pane", "wZ:p1"),
+                        ("status", "working"),
+                    ],
+                    999.95,
+                ),
+                sample(
+                    &[
+                        ("machine", "terra"),
+                        ("pane", "wE:p88"),
+                        ("status", "working"),
+                    ],
+                    999.95,
+                ),
+                sample(
+                    &[
+                        ("machine", "terra"),
+                        ("pane", "wE:p89"),
+                        ("status", "working"),
+                    ],
+                    909.0,
+                ),
+            ],
+            lane_status: vec![
+                sample(
+                    &[
+                        ("host", "terra"),
+                        ("lane", "terra:QSL:plan"),
+                        ("state", "working"),
+                    ],
+                    999.95,
+                ),
+                sample(
+                    &[
+                        ("host", "titan"),
+                        ("lane", "titan:QSL:stale-lane"),
+                        ("state", "working"),
+                    ],
+                    909.0,
+                ),
+            ],
         };
         let expected = vec![
             "luna:QSL:code".to_owned(),
             "terra:QSL:plan".to_owned(),
             "draco:QSL:idle-lead".to_owned(),
             "titan:QSL:missing-feed".to_owned(),
+            "terra:QSL:stale-info".to_owned(),
+            "terra:QSL:stale-status".to_owned(),
+            "titan:QSL:stale-lane".to_owned(),
+            "titan:QSL:stale-host".to_owned(),
         ];
         let no_pane = BTreeSet::from([
             "draco:QSL:idle-lead".to_owned(),
             "titan:QSL:missing-feed".to_owned(),
+            "titan:QSL:stale-host".to_owned(),
         ]);
         assert_eq!(
             classify_execution_leads(&expected, &no_pane, Some(&status), None, &[], now_ms),
