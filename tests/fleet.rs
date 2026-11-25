@@ -48,6 +48,9 @@ fn list(machine: &str, lanes: &[&str]) -> HostLaneList {
 
 fn series(window: u64, blocked: &[(&str, &str)]) -> HostSeries {
     HostSeries {
+        busy_ratio: None,
+        busy_ratio_error: None,
+        busy_sample_age: None,
         blocked: blocked
             .iter()
             .map(|(lane, reason)| (lane.to_lowercase(), (*reason).to_owned()))
@@ -671,6 +674,10 @@ fn prometheus_responses_become_host_series_with_relay_thresholds() {
         vector(r#"{"metric":{"lane":"titan:wB:pN"},"value":[1,"42.5"]}"#),
     );
     canned.insert(
+        "ix_fleet_host_busy_ratio",
+        vector(r#"{"metric":{"host":"titan"},"value":[1,"0.73"]}"#),
+    );
+    canned.insert(
         "time() - timestamp",
         vector(r#"{"metric":{},"value":[1,"12"]}"#),
     );
@@ -685,6 +692,7 @@ fn prometheus_responses_become_host_series_with_relay_thresholds() {
     assert!(!read.blocked.contains_key("titan:wb:pm"));
     assert_eq!(read.config.working_window, Some(Duration::from_secs(300)));
     assert_eq!(read.compile_seconds.get("titan:wb:pn"), Some(&42.5));
+    assert_eq!(read.busy_ratio, Some(0.73));
     assert_eq!(read.sample_age, Some(Duration::from_secs(12)));
     assert_eq!(read.probes.iter().filter(|p| !p.ok).count(), 1);
     let failing = PrometheusSeries {
@@ -695,6 +703,121 @@ fn prometheus_responses_become_host_series_with_relay_thresholds() {
         query: CannedProm(BTreeMap::from([("ix_fleet", r#"{"status":"error"}"#)])),
     };
     assert!(bad.host_series("titan").is_err());
+}
+
+#[trace("FR-038-AC-23")]
+#[test]
+fn invalid_duplicate_and_missing_busy_samples_are_busy_only_reading_errors() {
+    let read = |busy: &'static str| {
+        PrometheusSeries {
+            query: CannedProm(BTreeMap::from([
+                ("ix_fleet_host_busy_ratio", vector(busy)),
+                (
+                    "ix_fleet_lane_blocked",
+                    vector(r#"{"metric":{"host":"draco","lane":"draco:w:1","reason":"login"},"value":[1,"1"]}"#),
+                ),
+                (
+                    "ix_fleet_probe_ok",
+                    vector(r#"{"metric":{"source":"cpu"},"value":[1,"1"]}"#),
+                ),
+                (
+                    "ix_fleet_config",
+                    vector(r#"{"metric":{"name":"working_window"},"value":[1,"300"]},{"metric":{"name":"max_tool_runtime"},"value":[1,"7200"]},{"metric":{"name":"no_events_after"},"value":[1,"1800"]}"#),
+                ),
+                ("ix_fleet_lane_compile_seconds_total", vector("")),
+                (
+                    "time() - timestamp(ix_fleet_host_busy_ratio",
+                    vector(r#"{"metric":{},"value":[1,"12"]}"#),
+                ),
+                (
+                    "time() - timestamp",
+                    vector(r#"{"metric":{},"value":[1,"12"]}"#),
+                ),
+            ])),
+        }
+        .host_series("draco")
+        .unwrap()
+    };
+
+    let invalid = read(r#"{"metric":{"host":"draco"},"value":[1,"NaN"]}"#);
+    assert!(invalid.busy_ratio.is_none());
+    assert!(invalid.busy_ratio_error.is_some());
+    assert_eq!(
+        invalid.blocked.get("draco:w:1").map(String::as_str),
+        Some("login")
+    );
+    assert_eq!(
+        invalid
+            .probes
+            .iter()
+            .map(|probe| probe.source.as_str())
+            .collect::<Vec<_>>(),
+        ["cpu"]
+    );
+    assert_eq!(
+        invalid.config.working_window,
+        Some(Duration::from_secs(300))
+    );
+    let invalid_report = report_with_busy_reading(invalid);
+    assert!(invalid_report.defects.iter().any(|defect| {
+        defect.source == "prometheus.host_busy"
+            && defect.host.as_deref() == Some("draco")
+            && defect.kind == DefectKind::UnreadableSource
+    }));
+
+    let out_of_range = read(r#"{"metric":{"host":"draco"},"value":[1,"1.5"]}"#);
+    assert!(out_of_range.busy_ratio.is_none());
+    assert!(out_of_range.busy_ratio_error.is_some());
+
+    let duplicate = read(
+        r#"{"metric":{"host":"draco","job":"watcher"},"value":[1,"0.2"]},{"metric":{"host":"draco","job":"other"},"value":[1,"0.3"]}"#,
+    );
+    assert!(duplicate.busy_ratio.is_none());
+    assert!(duplicate.busy_ratio_error.is_some());
+    assert_eq!(duplicate.busy_sample_age, Some(Duration::from_secs(12)));
+
+    let missing = read("");
+    assert!(missing.busy_ratio.is_none());
+    assert!(missing.busy_ratio_error.is_none());
+    assert!(
+        missing
+            .absent
+            .iter()
+            .any(|name| name == live::series::HOST_BUSY_RATIO)
+    );
+    let missing_report = report_with_busy_reading(missing);
+    assert!(missing_report.defects.iter().any(|defect| {
+        defect.source == "prometheus.host_busy"
+            && defect.host.as_deref() == Some("draco")
+            && defect.kind == DefectKind::UnreadableSource
+    }));
+}
+
+fn report_with_busy_reading(reading: HostSeries) -> FleetReport {
+    let mut world = World::one_host(&["draco:w:1"], vec![], &[]);
+    world.series.hosts.insert("draco".to_owned(), Ok(reading));
+    world.run()
+}
+
+#[trace("FR-038-AC-23")]
+#[test]
+fn stale_busy_ratio_is_a_host_defect_and_not_used_by_the_tick() {
+    let mut world = World::one_host(&["h:w:1"], vec![], &[]);
+    world.cfg.push_interval = Duration::from_secs(30);
+    let reading = world.series.hosts.get_mut("h").unwrap().as_mut().unwrap();
+    reading.busy_ratio = Some(0.2);
+    // This falls between the configured threshold (60s) and a mismatched 120s
+    // threshold, so both the defect and report output must use the same bound.
+    reading.busy_sample_age = Some(Duration::from_secs(90));
+
+    let report = world.run();
+
+    assert!(!report.host_busy.contains_key("h"));
+    assert!(report.defects.iter().any(|defect| {
+        defect.kind == DefectKind::StaleSource
+            && defect.source == "prometheus.host_busy"
+            && defect.host.as_deref() == Some("h")
+    }));
 }
 
 #[trace("FR-034-AC-9")]
@@ -957,13 +1080,19 @@ fn empty_prometheus_results_mark_the_required_series_absent_under_one_set_of_nam
             ("ix_fleet_probe_ok", empty),
             ("ix_fleet_config", empty),
             ("ix_fleet_lane_compile_seconds_total", empty),
+            ("ix_fleet_host_busy_ratio", empty),
             ("time() - timestamp", empty),
         ])),
     };
     let read = source.host_series("h").unwrap();
     assert_eq!(
         read.absent,
-        [series::PROBE_OK, series::CONFIG, series::COMPILE_SECONDS]
+        [
+            series::HOST_BUSY_RATIO,
+            series::PROBE_OK,
+            series::CONFIG,
+            series::COMPILE_SECONDS
+        ]
     );
     assert_eq!(series::LANE_BLOCKED, "ix_fleet_lane_blocked_ratio");
     assert_eq!(series::PROBE_OK, "ix_fleet_probe_ok_ratio");
@@ -972,6 +1101,7 @@ fn empty_prometheus_results_mark_the_required_series_absent_under_one_set_of_nam
         series::COMPILE_SECONDS,
         "ix_fleet_lane_compile_seconds_total"
     );
+    assert_eq!(series::HOST_BUSY_RATIO, "ix_fleet_host_busy_ratio");
 }
 
 #[trace("FR-034-AC-20")]

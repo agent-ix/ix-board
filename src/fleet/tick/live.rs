@@ -9,7 +9,8 @@ use super::{
 };
 use crate::fleet::ledger::{self, Ledger, TickCommit};
 use crate::fleet::{
-    Coverage, FleetConfig, FleetError, SeriesSource, SourceError, Sources, build_report, live,
+    Coverage, FleetConfig, FleetError, FleetReport, SeriesSource, SourceError, Sources,
+    build_report, live,
 };
 use relay_core::Relay;
 use relay_core::config::{CoreFlags, load_core};
@@ -17,10 +18,18 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// The sources a live tick reads. Only the FR-072 lists are wired; each other source reports
-/// why it is unread, so the tick names the missing seam instead of emitting from an empty one.
+/// The sources a live tick reads. The busy map comes from the same bounded host-series reads as
+/// `fleet status`; each other unwired source reports why it is unread.
 struct LiveSources {
     timeout: Duration,
+    host_busy: BTreeMap<String, f64>,
+}
+
+fn live_sources(report: &FleetReport, timeout: Duration) -> LiveSources {
+    LiveSources {
+        timeout,
+        host_busy: report.host_busy.clone(),
+    }
 }
 
 impl TickSources for LiveSources {
@@ -42,7 +51,7 @@ impl TickSources for LiveSources {
     }
 
     fn host_busy(&self) -> Result<BTreeMap<String, f64>, Unread> {
-        Err(Unread::Unwired("SWM-281"))
+        Ok(self.host_busy.clone())
     }
 
     fn lane_prs(&self) -> Result<Vec<LanePr>, Unread> {
@@ -123,7 +132,7 @@ pub fn run(file: Option<&toml::Value>, session: Option<&str>) -> Result<TickOutp
     let (relay, receipts) = live::read_relay(config.host_timeout);
     let sources = Sources {
         relay,
-        series,
+        series: series.clone(),
         receipts: &receipts,
         weak: &live::NoWeakSignals,
     };
@@ -135,9 +144,7 @@ pub fn run(file: Option<&toml::Value>, session: Option<&str>) -> Result<TickOutp
             .map_or_else(|| "no lane could be read".to_owned(), |d| d.reason.clone());
         return Err(FleetError::Tick(why));
     }
-    let facts = TickFacts::read(&LiveSources {
-        timeout: config.host_timeout,
-    });
+    let facts = TickFacts::read(&live_sources(&report, config.host_timeout));
     let orders = StandingOrders::load(settings.standing_orders_path.as_deref());
     let mut bus = connect(config.host_timeout).map_err(FleetError::Tick)?;
     let resolved;
@@ -238,3 +245,7 @@ pub fn commit_completing(
         })
         .map_err(|e| FleetError::Ledger(e.to_string()))
 }
+
+#[cfg(test)]
+#[path = "live_tests.rs"]
+mod tests;

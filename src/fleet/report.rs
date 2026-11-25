@@ -100,6 +100,12 @@ pub struct ProbeReading {
 /// One host's watcher series.
 #[derive(Clone, Debug, Default)]
 pub struct HostSeries {
+    /// The watcher-reported busy ratio for the host.
+    pub busy_ratio: Option<f64>,
+    /// Why the busy ratio could not be used even though the series was readable.
+    pub busy_ratio_error: Option<String>,
+    /// Age of the busy ratio sample, independently of the relay configuration series.
+    pub busy_sample_age: Option<Duration>,
     /// Lane (lower case) to relay-resolved blocked reason.
     pub blocked: BTreeMap<String, String>,
     /// Probe readings.
@@ -309,6 +315,9 @@ pub struct FleetReport {
     pub hosts: Vec<HostSummary>,
     /// Source defects.
     pub defects: Vec<Defect>,
+    /// Usable per-host busy ratios retained from the same bounded read as the status report.
+    #[serde(skip)]
+    pub host_busy: BTreeMap<String, f64>,
     /// The relay could not be read, so `run_ms` is the host clock, not relay time. Not part of
     /// the wire report.
     #[serde(skip)]
@@ -348,6 +357,38 @@ fn host_of(addr: &str) -> String {
 }
 
 type HostReads = BTreeMap<String, Result<HostSeries, SourceError>>;
+
+fn host_series_stale_after(config: &FleetConfig) -> Duration {
+    config.push_interval.saturating_mul(2)
+}
+
+fn usable_busy_ratio(
+    series: &HostSeries,
+    config: &FleetConfig,
+) -> Result<f64, (DefectKind, String)> {
+    if let Some(reason) = &series.busy_ratio_error {
+        return Err((DefectKind::UnreadableSource, reason.clone()));
+    }
+    let Some(ratio) = series.busy_ratio else {
+        return Err((
+            DefectKind::UnreadableSource,
+            "ix_fleet_host_busy_ratio has no sample".to_owned(),
+        ));
+    };
+    let Some(age) = series.busy_sample_age else {
+        return Err((
+            DefectKind::StaleSource,
+            "busy ratio sample age is unavailable".to_owned(),
+        ));
+    };
+    if age > host_series_stale_after(config) {
+        return Err((
+            DefectKind::StaleSource,
+            format!("busy ratio sample is {}s old", age.as_secs()),
+        ));
+    }
+    Ok(ratio)
+}
 
 /// Reads every host in parallel, each bounded by `timeout`; a host that misses it is an error.
 fn read_hosts(
@@ -423,7 +464,7 @@ fn host_defects(ctx: &mut Ctx<'_>, host: &str, read: &Result<HostSeries, SourceE
             error.0.clone(),
         ),
         Ok(series) => {
-            let stale_after = ctx.cfg.push_interval * 2;
+            let stale_after = host_series_stale_after(ctx.cfg);
             match series.sample_age {
                 None => ctx.defect(
                     DefectKind::StaleSource,
@@ -440,6 +481,9 @@ fn host_defects(ctx: &mut Ctx<'_>, host: &str, read: &Result<HostSeries, SourceE
                     format!("newest sample is {}s old", sample_age.as_secs()),
                 ),
                 Some(_) => {}
+            }
+            if let Err((kind, reason)) = usable_busy_ratio(series, ctx.cfg) {
+                ctx.defect(kind, "prometheus.host_busy", Some(host), None, reason);
             }
             for probe in series.probes.iter().filter(|p| !p.ok) {
                 ctx.defect(
@@ -869,7 +913,15 @@ pub fn build_report(cfg: &FleetConfig, sources: &Sources<'_>, local_now_ms: i64)
             schema_version: SCHEMA_VERSION,
         });
     }
-    finish(relay.now_ms, rows, ctx.defects)
+    let mut report = finish(relay.now_ms, rows, ctx.defects);
+    for (host, reading) in &reads {
+        if let Ok(reading) = reading
+            && let Ok(ratio) = usable_busy_ratio(reading, cfg)
+        {
+            report.host_busy.insert(host.to_lowercase(), ratio);
+        }
+    }
+    report
 }
 
 fn summarize(rows: &[LaneRow]) -> Vec<HostSummary> {
@@ -901,6 +953,7 @@ fn finish(run_ms: i64, mut rows: Vec<LaneRow>, mut defects: Vec<Defect>) -> Flee
         hosts: summarize(&rows),
         rows,
         defects,
+        host_busy: BTreeMap::new(),
         relay_unavailable: false,
     }
 }
