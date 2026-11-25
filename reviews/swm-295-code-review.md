@@ -43,3 +43,22 @@ removed. factory-panel reads selected keys of `roadmap --json` and
 | FND-003 | low | Warnings are lost or bypass diagnostics outside the focus reads. `agents` calls `next`, which discards them; a missing blocker used to surface as `ready_queue_error` and now silently removes work from `next_ready`. The `next` command prints them with raw `eprintln!`, ignoring `--diagnostics-format`. | src/main.rs:983, src/main.rs:1119-1124 |
 | FND-004 | low | The poisoned summary row in the partition test is still keyed `summary:v1` while the reader now uses `summary:v2`, so the summary half of that test can no longer fail if the namespace stopped partitioning summaries. | tests/delta_cache.rs:268 |
 | FND-005 | low | The shipped plugin skills do not mention `warnings` or `outside_projects`. An agent following focus-status reports project and milestone rows only, which can total less than the focus, with no warning shown. | plugin/skills/focus-status/SKILL.md:37-42 |
+
+## New findings (disposition pass 1)
+
+| ID | Severity | Summary | Refs |
+| --- | --- | --- | --- |
+| FND-006 | low | The ticket-selection uncertainty check looks only at orphans of the selection's team, so it misses a gap whose first visible issue is in another team. With ticket SWM-1, a missing child record, then OPS-2, then SWM-3, the batch reports `complete`, total 1, no unknown fact and no warning, and SWM-3 is left out. Where the check does fire for an orphan outside the selection, no warning names that orphan, so the cause cannot be found from the result. | src/named_focus.rs:746-757 |
+| FND-007 | low | A milestone moved to another project, named by a changed issue while neither project is re-read, is added to the new owner and left on the old one, so one milestone id is held by two projects until a later read. Issue counts are unaffected. Whether Linear moves `updatedAt` on such a move was not verified. | src/linear.rs:2412-2442 |
+
+## Dispositions
+
+Round 1, at 48e165f.
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-001 | fixed | `blocked_by` and layers name the unavailable prerequisite; dependents leave layer zero. |
+| FND-002 | fixed | Affected selections are incomplete with `unavailable_references`; the team union follows. |
+| FND-003 | fixed | `next` uses `emit_warning`; `agents` lists `ready_queue_warnings`. |
+| FND-004 | fixed | Poisoned summary row keyed v2. |
+| FND-005 | fixed | Skills require reporting `warnings` and `outside_projects`. |

@@ -40,3 +40,12 @@ pre-existing and not raised. Reverse gaps: new public items
 found. Semantic review: not run as a separate pass (no opt-in); tagged tests
 were read against their criteria by hand. Evidence binding (`quoin matrix` run
 evidence) is not assessed.
+
+## Dispositions
+
+Round 1, at 48e165f.
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-001 | fixed | tests/cli_dangling.rs runs the binary through the no-snapshot, counted and unreadable branches. |
+| FND-002 | fixed | Terminal test renders disordered input with a repeated blocker; FR-046-AC-6 states the order. |

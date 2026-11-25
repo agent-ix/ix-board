@@ -30,3 +30,12 @@ and FR-046 reported grammar warnings only, on FR-020.
 | --- | --- | --- | --- |
 | FND-001 | low | FR-014-AC-8 gives layer zero only to a node with no blocker prerequisites, while FR-046 gives an unavailable prerequisite no layer row, so the implementation puts its dependent in layer zero. FR-014-AC-8 and FR-002 layer ordering state no exception. | spec/functional/FR-014-plan-chunk.md:129 |
 | FND-002 | low | FR-045 defines activity as events on focus issues; FR-046 limits it to issues of project rows without amending FR-045, so events of outside_projects issues are omitted although FR-045 still requires them. | spec/functional/FR-045-focus-activity.md:43, spec/functional/FR-046-dangling-references.md:53 |
+
+## Dispositions
+
+Round 1, at 48e165f.
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-001 | fixed | FR-014 and FR-002 count a prerequisite without a record as layer zero. |
+| FND-002 | fixed | Activity now includes issues outside every project row; FR-045-AC-4 and FR-046 name their project text. |
