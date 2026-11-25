@@ -22,7 +22,7 @@ relationships:
 
 ## Description
 
-The `ix-board fleet saturation [--json]` command SHALL compute supply (sustainable
+The `ix-board fleet saturation [collect] [--json]` command SHALL compute supply (sustainable
 build slots and lane capacity), demand (lanes needed to saturate those slots), and
 the ready-buffer deficit. The command SHALL export the gauge
 `ix_fleet_ready_buffer_deficit`, and `fleet tick` SHALL emit a `need_ready_tickets`
@@ -32,29 +32,29 @@ The command family `ix-board fleet capacity` SHALL also record capacity discover
 
 ## Behavior
 
-- **Supply** per host: `sustainable_slots` and `lane_capacity`. The final source of
+- **Supply** per host: `sustainable_slots` and optional `lane_capacity`. The final source of
   `sustainable_slots` is the build scheduler (locked-build, W6). Until it exists,
   `sustainable_slots` comes from the explicit `fleet.capacity_limits.<host>.build_slots`
   ix-board configuration value, with that config path retained as its source basis;
-  `server-capacity.max_agents` is lane capacity only and never build slots. Memory reserve
+  `fleet.capacity_limits.<host>.lane_capacity` is an optional operator-entered demand bound.
+  Absence of that setting is normal and never makes demand unavailable. Memory reserve
   and thermal limit also come from explicit per-host `fleet.capacity_limits.<host>` config.
   A host whose registry lease is stale
   ([FR-034](./FR-034-fleet-lane-status.md)) contributes no slots and no lane capacity.
-- **Duty cycle** per lane: build seconds divided by observed lane seconds over a
+- **Duty cycle** per lane: build seconds divided by observed engaged lane seconds over a
   trailing window (default 24h). The final source is locked-build; the interim
   source is `increase(ix_fleet_lane_compile_seconds_total{host,lane,job="ix-relay-watcher"}[window])`.
-  Observed lane seconds are `count_over_time(ix_fleet_lane_state_ratio{host,lane}[window])`
-  multiplied by the configured push interval, capped at the window length for each lane;
-  this is the documented watcher-presence basis because no observed-lane-seconds series exists.
-  Both series need at least 90% sample coverage. A lane with less than the configured minimum
-  of observed time has duty `unavailable` and is excluded from the mean.
+  State coverage uses all `ix_fleet_lane_state_ratio{host,lane}` samples. Engaged lane seconds
+  count samples where `state!="idle"` and multiply by the configured push interval, capped at the
+  window length for each lane; this is the watcher-presence basis because no observed-lane-seconds
+  series exists. Both watcher inputs need at least 90% sample coverage. A lane with less than the
+  configured minimum of engaged time is excluded from the mean; idle time does not dilute duty.
 - **Capacity measurement sources and basis.** Every field in a discovery step and
   each per-lane output observation SHALL retain its source name, availability,
   reason, coverage and observation time. A field with less than 90% window
   coverage SHALL be serialized as `null` with its reason; it SHALL NOT be
   replaced with zero. Interim sustainable slots use the explicit
   `fleet.capacity_limits.<host>.build_slots` value. Relay
-  `server-capacity.max_agents` is lane capacity only.
   SWM-242 supplies `ix_build_slots_busy`, `ix_build_slots_configured`,
   `ix_build_queue_wait_seconds`, `ix_build_admission_blocked_seconds_total`
   and `ix_build_builds_total{outcome}`. Queue-wait p90 is computed from the
@@ -66,14 +66,23 @@ The command family `ix-board fleet capacity` SHALL also record capacity discover
   per-host thermal limit from the same configuration. Both limits and their
   config basis are persisted per field.
 - **Demand**: `lanes_needed = ceil(sustainable_slots / mean duty)` per host,
-  bounded by `lane_capacity`. When no lane has a duty value, or the mean duty is
-  zero, demand is `unavailable` with reason `no_duty` or `zero_duty`. `UNREACHABLE`
-  lanes are excluded from demand and from the mean.
+  bounded only when an operator has entered `fleet.capacity_limits.<host>.lane_capacity`.
+  An absent lane limit does not make `lanes_needed` or the ready-buffer deficit
+  unavailable. Duty is compiler seconds divided by observed engaged lane seconds;
+  engaged time counts watcher `ix_fleet_lane_state_ratio` samples in any state
+  other than `idle`, times the push interval. Idle samples never dilute duty.
+  Lanes below the minimum engaged time are excluded from the mean; if no lanes
+  meet that minimum, duty is unavailable. A stale host contributes zero supply
+  and demand. `UNREACHABLE` lanes are excluded from demand and from the mean.
 - **Ready buffer**: the count of ready, unassigned and unstarted tickets
   ([FR-001](./FR-001-ready-queue.md) queue, minus tickets in any reachable lane's
   assignment; tickets held by an `UNREACHABLE` lane are not subtracted) across the configured code-lead
   projects. Target buffer is `lanes_needed x queue_depth` (default 2).
   `deficit = max(0, target - buffer)`.
+  When a host has a current registry lease but no reachable lanes yet, its
+  bootstrap sample records the global ready-buffer count so discovery may start
+  only when at least one ready ticket exists for the first lane. A stale host
+  has no bootstrap buffer evidence.
 - An unreadable input makes each dependent value `unavailable` with its reason. The
   command SHALL NOT report a deficit of zero from missing data and omits the gauge.
 - Interim supply and interim duty are sufficient for the deficit and for
@@ -83,6 +92,12 @@ The command family `ix-board fleet capacity` SHALL also record capacity discover
   buffer, ties by project id. The tick writes the project and positive requested count
   on the `action` row; its existing relay-time `emitted_at` and `resolved_at` record
   when the deficit first appeared and when it cleared.
+- `fleet saturation --json` is a read-only report. The `fleet saturation collect
+  --json` subcommand SHALL append one live saturation sample per configured host
+  to the local ledger without sending relay messages or lane orders. A draco
+  macOS LaunchAgent SHALL run this collector every 300 seconds, matching the
+  default `fleet.tick_interval_secs`; collection is independent of panel reads
+  and manual invocation. Missing or unavailable samples do not count as zero.
 
 ## Capacity discovery history
 
@@ -110,11 +125,11 @@ host already has an open run, when two runs of that host started the same UTC da
 | Table | Columns |
 |-------|---------|
 | `capacity_run` | `run_id`, host, `trigger`, `started_at`, `ended_at`, `end_reason` (`knee`, `build_slots_saturated`, `step_bound`, `inconclusive_no_demand`, `throttled`), `found_level` |
-| `capacity_step` | `run_id`, `step_no`, `repeat_of` (the `step_no` of an inconclusive window this one repeats, else empty), host, `lanes`, `window_start`, `window_end`, `rampup_end` (30 minutes after the lane was added, configurable), `valid`, `inconclusive_reason` (`deficit_nonzero`, `deficit_coverage`), `deficit_coverage`, `deficit_zero_throughout`, `host_output_per_hour`, `tickets_closed`, `prs_merged`, `commits_pushed`, `output_basis` (`tickets_prs` or `commits`), `queue_wait_p90_s`, `throttled_share`, `memory_headroom_min`, `thermal_headroom_min`, `slots_busy_equals_sustainable`, `knee_signal`, `knee_reason` (`output_gain`, `throttle`), `source_basis` (JSON object keyed by field, with availability, source, reason, coverage and observation time) |
+| `capacity_step` | `run_id`, `step_no`, `repeat_of` (the `step_no` of an inconclusive window this one repeats, else empty), host, `lanes`, `window_start`, `window_end`, `rampup_end` (30 minutes after the lane was added, configurable), `valid`, `inconclusive_reason` (`demand_short`, `deficit_coverage`), `deficit_coverage` (demand-covered sample coverage), `deficit_zero_throughout` (separate backlog indicator), `host_output_per_hour`, `tickets_closed`, `prs_merged`, `commits_pushed`, `output_basis` (`tickets_prs` or `commits`), `queue_wait_p90_s`, `throttled_share`, `memory_headroom_min`, `thermal_headroom_min`, `slots_busy_equals_sustainable`, `knee_signal`, `knee_reason` (`output_gain`, `throttle`), `source_basis` (JSON object keyed by field, with availability, source, reason, coverage and observation time) |
 | `capacity_step_lane_output` | `run_id`, `step_no`, lane, `tickets_closed`, `prs_merged`, `commits_pushed`, `source_basis` (same JSON shape per lane field) |
 | `capacity_level` | host, `level`, `output_basis` (`tickets_prs` or `commits`, of the step the level was found at), `recorded_at`, `run_id`, `reason`, `evidence_steps`, `superseded_at` |
 | `capacity_event` | event id, host, lane, `kind` (`lane_added`, `draining_mark`, `drain_done`, `lane_removed`, `lane_lost`, `step_down`, `overload_event`), `reason` (as given, or `lane_change_unrecorded`), `evidence_kind` (`admission_block`, `build_abort`, `memory_below_reserve`, `thermal_abort`, `knee`, `throttle_share`, empty; set by ix-board, below), `cycle_id`, `at`, `ceiling_until` |
-| `host_output_sample` | host, `at`, `lanes`, trailing-hour `tickets_closed`, `prs_merged`, `commits_pushed` |
+| `host_output_sample` | host, `at`, `lanes`, trailing-hour `tickets_closed`, `prs_merged`, `commits_pushed`, `source_basis` (JSON source, availability, reason, coverage and observation time for each current sample field) |
 
 ### Measurement
 
@@ -125,7 +140,8 @@ host already has an open run, when two runs of that host started the same UTC da
   tickets closed plus pull requests merged in the window number fewer than 5 the
   step is measured in commits pushed per hour and `output_basis` is `commits`.
   The window excludes the ramp-up period.
-- **Valid window.** A window is `valid` only when `saturation_sample` rows of the host cover at least 90% of the window (sample count times the tick interval over the window length) and every one shows a deficit of zero. A window with no samples, or with an unavailable deficit (which stores no value and so is not a covering sample), is invalid with reason `deficit_coverage`; a window with any positive deficit is invalid with reason `deficit_nonzero`. After an invalid window the hold repeats the step: the repeated row keeps its `step_no` and carries `repeat_of`.
+- **Demand evidence.** A supplied lane is reachable and holds at least one unfinished assigned ticket in progress or queued (`Started` or `Unstarted`). Other reachable lanes are unsupplied. The global ready buffer counts ready, unassigned, unstarted tickets. Each host receives a ready share apportioned by its unsupplied-lane count, using largest remainder and host ID for ties, capped at its unsupplied count; shares sum to no more than the global buffer. For a zero-lane host with a current registry lease, bootstrap tickets are the remaining buffer after all hosts' unsupplied lanes, with at most one distinct ticket allocated per host in host-ID order. The collector stores `ready_buffer`, `active_lanes`, `supplied_lanes`, `unsupplied_lanes`, `ready_share`, `registry_current`, and source basis on each `saturation_sample`.
+- **Valid window.** Demand coverage depends only on ready-buffer, assignment, lane and registry evidence; it never depends on duty, `lanes_needed` or deficit. A sample covers a positive-lane step when `supplied_lanes + ready_share >= step.lanes`; a zero-lane host covers bootstrap demand only when its registry lease is current and it has a distinct bootstrap ticket. Every sample in the window must have complete demand evidence and cover demand. Covering samples must span at least 90% of the window. Missing or incomplete evidence is invalid with reason `deficit_coverage`; any sample that falls short is invalid with reason `demand_short`. A positive target-buffer deficit does not invalidate a window. `deficit_zero_throughout` remains a separate backlog indicator. After an invalid window the hold repeats the step: the repeated row keeps its `step_no` and carries `repeat_of`.
 - **Knee signal.** A valid step has `knee_signal` when the gain in `host_output_per_hour`
   over the previous valid step is below 50% of that previous step's output divided by its
   lane count (`knee_reason` `output_gain`), or `throttled_share` exceeds 5% (`throttle`). Both thresholds are configurable.
@@ -145,11 +161,16 @@ host already has an open run, when two runs of that host started the same UTC da
   `ix_build_pause_seconds_total` is absent until that producer exists; ix-board
   never queries it or substitutes zero. The JSON `prom.host_throttled_share`
   field carries its basis and coverage.
-- **Host output samples.** Each tick writes one `host_output_sample` per host, with tickets closed, pull requests merged and commits pushed over the trailing hour, so a share can be computed on either basis. Lane-to-ticket mapping uses relay work events and ledger assignment records; pull requests and commits are attributed through GitHub ticket identifiers in title or branch. The source basis is retained; items without a ticket mapping are reported as unattributed, and no mapping makes the observation unavailable rather than zero.
+- **Host output samples.** Each tick writes one `host_output_sample` per host, with tickets closed, pull requests merged and commits pushed over the trailing hour, so a share can be computed on either basis. Lane-to-ticket mapping uses relay work events and ledger assignment records; pull requests and commits are attributed through a Linear issue attachment or a GitHub ticket identifier in title or branch. The source basis is retained on each current sample and on `host_output_share_of_recorded_level`; an unavailable current sample carries its reason. Items without a ticket mapping are counted as unattributed alongside the attributed host value, and do not invalidate that value. When no ticket mapping exists for the host, the observation is unavailable rather than zero.
 
 ### Prometheus series
 
 The exporter ([FR-033](./FR-033-team-flow-effort-export.md)) SHALL serve, per host with bounded labels:
+`ix_fleet_ready_buffer_deficit{host}` from the latest `saturation_sample` no older than 600 seconds,
+`ix_fleet_ready_buffer_deficit_timestamp_seconds{host}` for that sample's timestamp, and
+`ix_fleet_ready_buffer_deficit_unavailable{host,reason}` when the value is missing, stale, future-dated or has unavailable inputs; the value gauge is omitted in those cases and `reason` is bounded,
+`ix_fleet_host_output_share_of_recorded_level{host}` (fraction from 0 to 1) and
+`ix_fleet_host_output_share_of_recorded_level_timestamp_seconds{host}` from the current output sample,
 `ix_fleet_capacity_recorded_level{host}` (the current `capacity_level.level`, omitted when none),
 `ix_fleet_capacity_recorded_level_timestamp_seconds{host}`,
 `ix_fleet_capacity_discovery_state{host,state}` (1 for the current state, one of `none`, `running`, `ended`) and
@@ -173,8 +194,8 @@ watcher behavior.
 | `discovery_raised_past_knee` | steps of a run after a `knee_signal` step with `lanes` above that step's |
 | `discovery_runs_ended` | `capacity_run` rows with `ended_at` |
 | `discovery_runs_without_recorded_level` | ended runs with a non-empty `found_level` and no `capacity_level` row of the same `run_id`; a run ending with no new level is excluded |
-| `unrecorded_hosts_at_zero_deficit` | `saturation_sample` rows with deficit zero for a host with no current `capacity_level` |
-| `unrecorded_hosts_without_discovery_run` | those rows with no `capacity_run` started within one cycle after the sample |
+| `unrecorded_hosts_with_demand` | `saturation_sample` rows with complete ready-buffer, assignment and registry evidence where `supplied_lanes + ready_share >= active_lanes`, or a current-lease zero-lane host has a distinct bootstrap ticket, and which have no current `capacity_level` |
+| `unrecorded_hosts_without_discovery_run` | the latest `unrecorded_hosts_with_demand` sample for each host, no older than 600 seconds and not future-dated, with no open discovery run and fewer than two runs started for that host on the current UTC day |
 | `hosts_with_recorded_level` | `capacity_level` rows with `superseded_at` empty |
 | `host_minutes_above_recorded_level_outside_bounded_discovery` | minutes in which the host's non-draining `lane_tick` count exceeds its `capacity_level.level` and no run with 8 or fewer steps was open |
 | `host_step_downs` | `capacity_event` rows of kind `step_down` |
@@ -193,7 +214,7 @@ watcher behavior.
 | `discovery_raised_past_slot_saturation` | steps after such a step in the run with `lanes` above that step's |
 | `lane_count_reductions` | `lane_removed` (not `lane_lost`), `draining_mark` and `step_down` `capacity_event` rows (including `lane_change_unrecorded`), with `reason` and `evidence_kind` |
 | `lane_reductions_without_throttle_evidence` | `lane_count_reductions` with empty `evidence_kind`, or reason `lane_change_unrecorded` |
-| `host_output_share_of_recorded_level` | latest `host_output_sample` output per hour, on the `output_basis` stored with the host's current `capacity_level` (tickets closed plus pull requests merged, or commits pushed), over `host_output_per_hour` of the step at that level, in percent |
+| `host_output_share_of_recorded_level` | one row per host with a current level: the latest host output sample normalized by its `sample_interval_ms`, on the `output_basis` stored with the host's current `capacity_level`, divided by the level's exact evidence `step_no` output per hour, in percent; the row carries the sample's `source_basis` and `unavailable_reason` |
 | `prom.hosts_throttled_at_recorded_level` | series `ix_fleet_capacity_throttled_at_level{host}` |
 | `prom.throttled_hosts_without_step_down` | series `ix_fleet_capacity_throttled_without_step_down{host}` |
 | `prom.reserve_breach_or_thermal_abort_events` | series `ix_fleet_capacity_overload_events_total{host,cause}`, from `overload_event` rows |
@@ -203,18 +224,18 @@ watcher behavior.
 
 | ID | Criteria | Verification |
 |----|----------|--------------|
-| FR-041-AC-1 | Fixtures with known slots, capacity and duty yield the hand-computed `lanes_needed`, target buffer and deficit; `lanes_needed` never exceeds `lane_capacity`. | Test |
-| FR-041-AC-2 | Ready tickets assigned to a reachable lane or started do not count toward the buffer; only ready, unassigned, unstarted tickets do. | Test |
+| FR-041-AC-1 | Fixtures with known slots and engaged-time duty yield the hand-computed `lanes_needed`, target buffer and deficit without a lane limit; when an operator-entered `fleet.capacity_limits.<host>.lane_capacity` is present it bounds `lanes_needed`, while its absence never makes either value unavailable. | Test |
+| FR-041-AC-2 | Ready tickets assigned to a reachable lane or started do not count toward the buffer; only ready, unassigned, unstarted tickets do. A fresh host with zero reachable lanes may bootstrap discovery only when at least one ready ticket exists; a stale host has no bootstrap buffer. | Test |
 | FR-041-AC-8 | Tickets assigned to an UNREACHABLE lane still count in the ready buffer, while tickets assigned to a reachable lane do not. | Test |
 | FR-041-AC-9 | A host with a stale registry lease contributes zero slots and zero lane capacity to supply, and its UNREACHABLE lanes are excluded from demand and from the duty mean. | Test |
 | FR-041-AC-3 | A buffer at or above target gives deficit zero and no action; one below gives the exact shortfall. | Test |
-| FR-041-AC-4 | A mean duty of zero, no lane with duty, a missing capacity or a missing queue makes dependent values `unavailable` with reason, omits the gauge, and never reports deficit zero. | Test |
-| FR-041-AC-5 | With interim supply from configured build slots and watcher compiler seconds a positive deficit still yields `need_ready_tickets`; `server-capacity.max_agents` supplies lane capacity only, and locked-build data replaces interim supply and duty when present. | Test |
+| FR-041-AC-4 | A mean duty of zero, no lane with duty, missing sustainable slots or a missing queue makes dependent values `unavailable` with reason, omits the gauge, and never reports deficit zero; an absent optional lane cap does not. | Test |
+| FR-041-AC-5 | With interim supply from configured build slots and watcher compiler seconds divided by observed non-idle lane seconds, idle time does not dilute duty and a positive deficit still yields `need_ready_tickets`; an optional operator lane limit bounds demand only when entered, and locked-build data replaces interim supply and duty when present. | Test |
 | FR-041-AC-24 | A positive deficit yields one planner action with `project` and the requested additional ticket count persisted on its action row; the row's `emitted_at` is the first deficient tick and `resolved_at` is set only when the project deficit clears. | Test |
 | FR-041-AC-6 | A deficit of N produces per-project actions whose counts sum to N, deterministically. | Test |
-| FR-041-AC-7 | `ix_fleet_ready_buffer_deficit` has bounded labels, matches the command output, and each run stores a `saturation_sample` ledger row. | Test |
-| FR-041-AC-10 | `fleet capacity window` on a fixture computes host output as tickets closed plus pull requests merged per hour over the post-ramp-up window with per-lane attribution by focus and branch in `capacity_step_lane_output`, and uses commits per hour with `output_basis` `commits` when the sum is under 5. | Test |
-| FR-041-AC-11 | A window whose `saturation_sample` rows cover under 90% of its length, one with no samples, one containing an unavailable deficit, and one with any positive deficit are each `valid` false (`deficit_coverage`, `deficit_coverage`, `deficit_coverage`, `deficit_nonzero`); a window with at least 90% coverage and all zeros is valid; the repeated hold keeps its `step_no` with `repeat_of`, and `discovery_steps_violating_ramp` does not list it. | Test |
+| FR-041-AC-7 | `ix_fleet_ready_buffer_deficit` has bounded labels, matches the read-only command output, and each `fleet saturation collect` run stores one `saturation_sample` per host with global ready buffer, active/supplied/unsupplied lane counts, allocated ready share, current-lease evidence, source basis and unavailable reason; the exporter omits the value when the newest sample is older than 600 seconds and serves its timestamp and a bounded unavailable reason. | Test |
+| FR-041-AC-10 | `fleet capacity window` on a fixture computes host output as tickets closed plus pull requests merged per hour over the post-ramp-up window with per-lane attribution by relay/ledger lane assignment and Linear PR attachment or GitHub ticket id; it records unattributed items without discarding attributed host output, and uses commits per hour with `output_basis` `commits` when the sum is under 5. | Test |
+| FR-041-AC-11 | Each sample stores global ready buffer, active, supplied and unsupplied lane counts, ready share and current registry evidence. Supplied lanes plus ready share cover a positive-lane step; a zero-lane current-lease host requires a distinct bootstrap ticket after accounting for all hosts' unsupplied lanes. A window is valid only when every sample has complete demand evidence and covers demand and covering samples span at least 90%; coverage uses the union of distinct sample intervals, so duplicates and clumped timestamps do not inflate it. Missing evidence is `deficit_coverage`, short demand is `demand_short`. Deficit availability, duty and `lanes_needed` do not affect demand coverage. Positive deficit is compatible with a valid window. The repeated hold keeps its `step_no` with `repeat_of`, and `discovery_steps_violating_ramp` does not list it. The discovery-start view uses the latest sample no older than 600 seconds, excludes any host with an open run and applies the two-run cap to the current UTC day. | Test |
 | FR-041-AC-18 | A step that follows an invalid window with a new `step_no`, a `knee_signal` on an invalid step, and a `capacity_level` whose evidence includes an invalid step are each listed by `discovery_steps_judged_without_demand`; a correctly repeated step is not. | Test |
 | FR-041-AC-12 | `knee_signal` is set at an output gain just under and not at just over 50% of the previous step's per-lane mean, and when throttled share exceeds 5%; `slots_busy_equals_sustainable` is true only when busy equalled sustainable throughout. | Test |
 | FR-041-AC-13 | `end` writes `found_level` and a `capacity_level` row with evidence steps and the step's `output_basis`, and sets `superseded_at` on the previous row, keeping both; a run ending `inconclusive_no_demand` with no new level writes no row and is not listed by `discovery_runs_without_recorded_level`, while an ended run with a `found_level` and no row is; `end inconclusive_no_demand` is refused before two consecutive inconclusive steps and `step_bound` before 8 steps. | Test |
@@ -226,10 +247,11 @@ watcher behavior.
 | FR-041-AC-15 | `drain_done` is recorded by the tick only when the lane's ticket has a commit or pull request and no build runs; a `lane_removed` event before it is listed by `lane_removals_before_drain`; a drain older than the cap with no sent `escalate_drain` action (`action_send`) is listed by `drains_over_cap_without_escalation`. | Test |
 | FR-041-AC-16 | The exporter serves `ix_fleet_capacity_recorded_level{host}`, its timestamp series, `ix_fleet_capacity_discovery_state{host,state}`, `ix_fleet_capacity_draining_lanes{host}`, `ix_fleet_capacity_throttled_at_level{host}`, `ix_fleet_capacity_throttled_without_step_down{host}` and `ix_fleet_capacity_overload_events_total{host,cause}` with labels bounded by host, state and cause, omits the level for a host with none, and the values equal the ledger; a host throttled above 5% in every interval of an hour with no `step_down` shows `throttled_without_step_down` 1, and 0 after a `step_down`. | Test |
 | FR-041-AC-17 | Every capacity view and `prom.` name in the role-spec query table exists under its name and returns the hand-computed value on a fixture covering a knee run, a no-demand run, a slot-saturated run and an overload step-down. | Test |
-| FR-041-AC-21 | `host_output_share_of_recorded_level` uses the `output_basis` stored with the recorded level for both the numerator and the denominator: a level found on `commits` is compared with commits per hour, a level on `tickets_prs` with tickets closed plus pull requests merged. | Test |
+| FR-041-AC-21 | `host_output_share_of_recorded_level` uses the `output_basis` stored with the recorded level for both the numerator and the denominator: a level found on `commits` is compared with commits per hour, a level on `tickets_prs` with tickets closed plus pull requests merged; one row names the exact evidence `step_no` per host, includes `sample_interval_ms`, and retains current sample `source_basis` and `unavailable_reason`. Prometheus exports the share and its sample timestamp. | Test |
+| FR-041-AC-25 | The pull-request output reader sends a User-Agent, maps PRs through Linear issue attachments or ticket identifiers from PR title and branch, combines relay work events with ledger assignment history when available, and preserves counts of unattributed items without turning them into zero or discarding attributed host output; an HTTP fixture exercises the production reader path. | Test |
 
 ## Dependencies
 
-- Final supply and duty: locked-build scheduler (W6). Interim supply: explicit per-host `fleet.capacity_limits.<host>.build_slots`; interim duty: the ix-relay watcher per-lane compiler seconds (ix-relay PR #52, target contract). `server-capacity.max_agents` is lane capacity only. Lane build evidence also uses [FR-034](./FR-034-fleet-lane-status.md).
+- Final supply and duty: locked-build scheduler (W6). Interim supply: explicit per-host `fleet.capacity_limits.<host>.build_slots`; interim duty: the ix-relay watcher per-lane compiler seconds divided by observed non-idle lane-state seconds (ix-relay PR #52, target contract). An optional lane-demand bound comes only from explicit `fleet.capacity_limits.<host>.lane_capacity`. Lane build evidence also uses [FR-034](./FR-034-fleet-lane-status.md).
 - Capacity discovery reads `ix_build_queue_wait_seconds`, `ix_build_slots_busy`, `ix_build_slots_configured`, `ix_build_admission_blocked_seconds_total` and `ix_build_builds_total{outcome}` from dev-team FR-010/FR-015; interim sustainable slots from explicit per-host configuration; memory and thermal readings and explicit per-host limits as described above; Linear/GitHub for host output; [FR-037](./FR-037-fleet-focus-and-drift.md) focus for per-lane attribution; and the [FR-039](./FR-039-fleet-ledger.md) ledger. `fleet tick` ([FR-038](./FR-038-fleet-tick.md)) writes `drain_done`, `overload_event`, `lane_added`, `lane_removed` and `host_output_sample`. These producers are enablement owned by their respective projects; this requirement adds none.
 - `ix_build_builds_total{outcome}` uses the closed outcome set `ok`, `failed`, `cancelled`, `timed_out`, `aborted_memory`, `aborted_thermal`, `aborted_rss_cap` and `aborted_pause_exceeded` from dev-team FR-015. FR-010 termination reason values already include the `aborted_` prefix; producers and consumers use each value once, without adding a second prefix.

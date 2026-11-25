@@ -16,6 +16,7 @@ use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Real host measurements from Prometheus and ix-relay, with Linear issue/PR output.
 pub struct LiveMeasurementSource<'a> {
@@ -34,7 +35,9 @@ impl LiveMeasurementSource<'_> {
         let label = esc(&host);
         let admission = query_value(
             query,
-            &format!("increase(ix_build_admission_blocked_seconds_total{{host=\"{label}\"}}[15m])"),
+            &format!(
+                "sum(increase(ix_build_admission_blocked_seconds_total{{host=\"{label}\"}}[15m]))"
+            ),
         )
         .ok()
         .flatten()
@@ -56,14 +59,14 @@ impl LiveMeasurementSource<'_> {
         if let Some(reserve) = limits.memory_reserve_bytes {
             let available = query_value(
                 query,
-                &format!("min_over_time(node_memory_MemAvailable_bytes{{host=\"{label}\"}}[15m])"),
+                &format!("min(min_over_time(node_memory_MemAvailable_bytes{{instance=\"{label}\"}}[15m]))"),
             )
             .ok()
             .flatten()
             .or_else(|| {
                 query_value(
                     query,
-                    &format!("min_over_time((ix_fleet_host_memory_total_bytes{{host=\"{label}\"}} - ix_fleet_host_memory_used_bytes{{host=\"{label}\"}})[15m:])"),
+                    &format!("min_over_time((ix_fleet_host_memory_total_bytes{{host=\"{label}\"}} - ix_fleet_host_memory_used_bytes{{host=\"{label}\"}})[15m:30s])"),
                 )
                 .ok()
                 .flatten()
@@ -78,7 +81,7 @@ impl LiveMeasurementSource<'_> {
         let throttle = query_value(
             query,
             &format!(
-                "increase(ix_build_admission_blocked_seconds_total{{host=\"{label}\"}}[1h]) / 3600"
+                "sum(increase(ix_build_admission_blocked_seconds_total{{host=\"{label}\"}}[1h])) / 3600"
             ),
         )
         .ok()
@@ -90,6 +93,35 @@ impl LiveMeasurementSource<'_> {
 
 fn query_value(query: &dyn PromQuery, expression: &str) -> Result<Option<f64>, String> {
     let body = query.query(expression).map_err(|error| error.to_string())?;
+    let value: Value = serde_json::from_str(&body).map_err(|error| error.to_string())?;
+    if value["status"] != "success" {
+        return Err("Prometheus query did not succeed".to_owned());
+    }
+    let result = value["data"]["result"]
+        .as_array()
+        .ok_or_else(|| "Prometheus response has no result vector".to_owned())?;
+    if result.len() > 1 {
+        return Err("Prometheus query returned multiple host values".to_owned());
+    }
+    result.first().map_or(Ok(None), |sample| {
+        sample["value"][1]
+            .as_str()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite())
+            .map(Some)
+            .ok_or_else(|| "Prometheus value is not finite numeric data".to_owned())
+    })
+}
+
+#[implements("FR-041-AC-10")]
+fn query_value_at(
+    query: &dyn PromQuery,
+    expression: &str,
+    timestamp_ms: i64,
+) -> Result<Option<f64>, String> {
+    let body = query
+        .query_at(expression, timestamp_ms)
+        .map_err(|error| error.to_string())?;
     let value: Value = serde_json::from_str(&body).map_err(|error| error.to_string())?;
     if value["status"] != "success" {
         return Err("Prometheus query did not succeed".to_owned());
@@ -135,23 +167,40 @@ fn duration(window: &WindowRequest) -> Result<String, CapacityError> {
     Ok(format!("{seconds}s"))
 }
 
+#[implements("FR-041-AC-10")]
+fn validate_evaluation_time(end_ms: i64) -> Result<(), CapacityError> {
+    let now_ms = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| CapacityError::Invalid("system clock predates Unix epoch".into()))?
+            .as_millis(),
+    )
+    .map_err(|_| CapacityError::Invalid("system time exceeds supported range".into()))?;
+    if end_ms > now_ms {
+        return Err(CapacityError::Invalid(
+            "capacity measurement end is in the future".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[implements("FR-041-AC-10")]
 fn temp_query(host: &str, selector: &str, span: &str) -> String {
     match host.to_lowercase().as_str() {
         "titan" => format!(
-            "max_over_time(node_hwmon_temp_celsius{{host=\"{}\",sensor=\"Tctl\"}}[{span}])",
+            "max(max_over_time(node_hwmon_temp_celsius{{instance=\"{}\",chip=\"pci0000:00_0000:00:18_3\",sensor=\"temp1\"}}[{span}]))",
             esc(host)
         ),
         "luna" => format!(
-            "max(max_over_time(node_hwmon_temp_celsius{{host=\"{}\"}}[{span}])) or max(max_over_time(node_thermal_zone_temp{{host=\"{}\"}}[{span}]))",
-            esc(host),
+            "max(max_over_time(node_thermal_zone_temp{{instance=\"{}\",type=\"x86_pkg_temp\"}}[{span}]))",
             esc(host)
         ),
         "terra" => format!(
-            "max_over_time(windows_sensors_physical_cpu_temperature_celsius{{host=\"{}\"}}[{span}])",
+            "max(max_over_time(node_thermal_zone_temp{{instance=\"{}\",sensor=\"CPU Package\"}}[{span}]))",
             esc(host)
         ),
         "draco" => format!(
-            "max_over_time(node_thermal_temperature_celsius{{host=\"{}\"}}[{span}])",
+            "max(max_over_time(node_thermal_temperature_celsius{{instance=\"{}\",sensor=~\"PMU tdie.*\"}}[{span}]))",
             esc(host)
         ),
         _ => format!(
@@ -173,8 +222,8 @@ fn source_observation(
     let Some(query) = query else {
         return unavailable(source, "prometheus_url_unconfigured");
     };
-    match query_value(query, &expression) {
-        Ok(Some(value)) => match query_value(query, &coverage_expression) {
+    match query_value_at(query, &expression, at) {
+        Ok(Some(value)) => match query_value_at(query, &coverage_expression, at) {
             Ok(Some(coverage)) if coverage >= 0.9 => Observation {
                 value: Some(value),
                 availability: super::Availability::Available,
@@ -327,6 +376,7 @@ fn linear_output(
     Observation<u64>,
     Observation<u64>,
     Vec<LaneOutputMeasurement>,
+    BTreeMap<String, String>,
 ) {
     let timeout = config.host_timeout;
     let fail = |source: &str, reason: String| unavailable(source, reason);
@@ -341,6 +391,7 @@ fn linear_output(
                     "linear_source_unavailable".to_owned(),
                 ),
                 Vec::new(),
+                BTreeMap::new(),
             );
         }
     };
@@ -355,6 +406,7 @@ fn linear_output(
                     "linear_source_unavailable".to_owned(),
                 ),
                 Vec::new(),
+                BTreeMap::new(),
             );
         }
     };
@@ -369,6 +421,7 @@ fn linear_output(
                     "linear_source_unavailable".to_owned(),
                 ),
                 Vec::new(),
+                BTreeMap::new(),
             );
         }
     };
@@ -386,6 +439,7 @@ fn linear_output(
                 ),
                 fail("github.ticket_linkage", reason),
                 Vec::new(),
+                BTreeMap::new(),
             );
         }
     };
@@ -406,68 +460,49 @@ fn linear_output(
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .ok();
-    let mut github_error = if github_token.is_none() {
-        Some("GITHUB_TOKEN_or_GH_TOKEN_unconfigured".to_owned())
-    } else if github_client.is_none() {
-        Some("GitHub client could not be created".to_owned())
-    } else {
-        None
-    };
-    let mut github_pr_error = github_error.clone();
+    let mut unattributed_tickets = 0_u64;
+    let mut unattributed_pull_requests = 0_u64;
+    let mut unattributed_commit_lists = 0_u64;
+    let mut incomplete_attachment_lists = 0_u64;
     let mut lane_counts: BTreeMap<String, (u64, u64, u64)> = BTreeMap::new();
     for (lane, ticket) in assignments {
         let counts = lane_counts.entry(lane.clone()).or_default();
         {
             let key = ticket.rsplit('/').next().unwrap_or(&ticket).to_lowercase();
             let Some(issue) = issue_map.get(&key) else {
-                github_error.get_or_insert_with(|| {
-                    format!("Linear snapshot missing assigned ticket {key}")
-                });
+                unattributed_tickets = unattributed_tickets.saturating_add(1);
                 continue;
             };
             if closed_at(issue.completed_at.as_deref()) {
                 counts.0 = counts.0.saturating_add(1);
             }
             if !issue.attachments_complete {
-                github_error.get_or_insert_with(|| {
-                    format!("Linear pull request attachments incomplete for {key}")
-                });
-                github_pr_error.get_or_insert_with(|| {
-                    format!("Linear pull request attachments incomplete for {key}")
-                });
-                continue;
+                incomplete_attachment_lists = incomplete_attachment_lists.saturating_add(1);
             }
-            if let (Some(client), Some(token)) = (&github_client, &github_token) {
-                for pr in &issue.pull_requests {
-                    match github_pull_request_details(client, token, &pr.url) {
-                        Ok((title, branch, merged_at))
-                            if title.to_lowercase().contains(&key)
-                                || branch.to_lowercase().contains(&key) =>
-                        {
-                            if merged_at.is_some_and(|merged| (start..=end).contains(&merged)) {
-                                counts.1 = counts.1.saturating_add(1);
-                            }
-                        }
-                        Ok(_) => {
-                            let reason = format!(
-                                "GitHub PR {} has no {key} ticket id in title or branch",
-                                pr.url
-                            );
-                            github_error.get_or_insert_with(|| reason.clone());
-                            github_pr_error.get_or_insert(reason);
-                            continue;
-                        }
-                        Err(error) => {
-                            github_error.get_or_insert_with(|| error.clone());
-                            github_pr_error.get_or_insert(error);
-                            continue;
+            for pr in &issue.pull_requests {
+                let (Some(client), Some(token)) = (&github_client, &github_token) else {
+                    unattributed_pull_requests = unattributed_pull_requests.saturating_add(1);
+                    unattributed_commit_lists = unattributed_commit_lists.saturating_add(1);
+                    continue;
+                };
+                match github_pull_request_details(client, token, &pr.url) {
+                    // The Linear issue attachment links the PR to this ticket even when the PR
+                    // title and branch omit the ticket identifier.
+                    Ok((_title, _branch, merged_at)) => {
+                        if merged_at.is_some_and(|merged| (start..=end).contains(&merged)) {
+                            counts.1 = counts.1.saturating_add(1);
                         }
                     }
-                    match github_commit_count(client, token, &pr.url, start, end) {
-                        Ok(commits) => counts.2 = counts.2.saturating_add(commits),
-                        Err(error) => {
-                            github_error.get_or_insert(error);
-                        }
+                    Err(_) => {
+                        unattributed_pull_requests = unattributed_pull_requests.saturating_add(1);
+                        unattributed_commit_lists = unattributed_commit_lists.saturating_add(1);
+                        continue;
+                    }
+                }
+                match github_commit_count(client, token, &pr.url, start, end) {
+                    Ok(commits) => counts.2 = counts.2.saturating_add(commits),
+                    Err(_) => {
+                        unattributed_commit_lists = unattributed_commit_lists.saturating_add(1);
                     }
                 }
             }
@@ -480,24 +515,21 @@ fn linear_output(
             fail("linear.pull_request.merged_at", reason.clone()),
             fail("github.pull_request_commits", reason),
             Vec::new(),
+            BTreeMap::new(),
         );
     }
     let completed = lane_counts.values().map(|counts| counts.0).sum();
     let merged = lane_counts.values().map(|counts| counts.1).sum();
     let commits: u64 = lane_counts.values().map(|counts| counts.2).sum();
-    let prs_observation = github_pr_error.map_or_else(
-        || {
-            Observation::available(
-                merged,
-                "github.pull_request.merged_at_by_ticket",
-                request.end_ms,
-            )
-        },
-        |reason| unavailable("github.pull_request.merged_at_by_ticket", reason),
+    let prs_observation = Observation::available(
+        merged,
+        "linear.pull_request_attachment+github.pull_request.merged_at",
+        request.end_ms,
     );
-    let commits_observation = github_error.map_or_else(
-        || Observation::available(commits, "github.pull_request_commits", request.end_ms),
-        |reason| unavailable("github.pull_request_commits", reason),
+    let commits_observation = Observation::available(
+        commits,
+        "linear.pull_request_attachment+github.pull_request_commits",
+        request.end_ms,
     );
     let lane_output = lane_counts
         .into_iter()
@@ -524,11 +556,35 @@ fn linear_output(
         })
         .collect();
     let at = request.end_ms;
+    let attribution_basis = BTreeMap::from([
+        (
+            "output_attribution_basis".to_owned(),
+            "relay_work_event_or_ledger_assignment+linear_pull_request_attachment+github"
+                .to_owned(),
+        ),
+        (
+            "unattributed_ticket_count".to_owned(),
+            unattributed_tickets.to_string(),
+        ),
+        (
+            "unattributed_pull_request_count".to_owned(),
+            unattributed_pull_requests.to_string(),
+        ),
+        (
+            "unattributed_commit_list_count".to_owned(),
+            unattributed_commit_lists.to_string(),
+        ),
+        (
+            "incomplete_attachment_list_count".to_owned(),
+            incomplete_attachment_lists.to_string(),
+        ),
+    ]);
     (
         Observation::available(completed, "linear.issue.completed_at", at),
         prs_observation,
         commits_observation,
         lane_output,
+        attribution_basis,
     )
 }
 
@@ -562,16 +618,17 @@ fn lane_ticket_history(
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
-    if assignments.is_empty() {
-        return Err("no ledger assignment overlaps the output window".to_owned());
-    }
-
-    let mut cursor = format!("{}-0", request.start_ms);
+    let mut cursor: Option<String> = None;
     let mut work_tickets = BTreeSet::new();
+    let mut event_assignments = BTreeSet::new();
+    let mut active_before_window = BTreeSet::new();
     let mut covered = false;
     let mut finished = false;
     for _ in 0..20 {
-        let args = ["work", "events", "--after", &cursor, "--limit", "500"];
+        let mut args = vec!["work", "events", "--limit", "500"];
+        if let Some(cursor) = &cursor {
+            args.extend(["--after", cursor]);
+        }
         let bytes = crate::team_metrics::read_history("agent-msg", &args, config.host_timeout)
             .map_err(|error| error.to_string())?;
         let page: EventPage = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
@@ -586,7 +643,7 @@ fn lane_ticket_history(
         }
         covered = true;
         for event in &page.events {
-            if !(request.start_ms..=request.end_ms).contains(&event.at_ms) {
+            if event.at_ms > request.end_ms {
                 continue;
             }
             if let Change::Agent { agent } = &event.change
@@ -595,29 +652,46 @@ fn lane_ticket_history(
                     AssignmentStatus::Running | AssignmentStatus::Done
                 )
             {
-                work_tickets.insert(agent.ticket.to_lowercase());
+                let ticket = agent.ticket.to_lowercase();
+                let host_prefix = format!("{}:", request.host.to_lowercase());
+                let address = event.binding.address.trim().to_lowercase();
+                if !address.is_empty() && address.starts_with(&host_prefix) {
+                    let pair = (address, ticket.clone());
+                    if event.at_ms >= request.start_ms {
+                        work_tickets.insert(ticket);
+                        event_assignments.insert(pair);
+                    } else if agent.status == AssignmentStatus::Running {
+                        active_before_window.insert(pair);
+                    } else {
+                        active_before_window.remove(&pair);
+                    }
+                }
             }
         }
         if !page.has_more {
             finished = true;
             break;
         }
-        if page.next_cursor == cursor {
+        if cursor.as_deref() == Some(page.next_cursor.as_str()) {
             return Err("agent-msg work-event cursor did not advance".to_owned());
         }
-        cursor = page.next_cursor;
+        cursor = Some(page.next_cursor);
     }
     if !covered || !finished {
         return Err(
             "agent-msg work-event history is unavailable or exceeded page limit".to_owned(),
         );
     }
-    let matched = assignments
+    let mut matched = assignments
         .into_iter()
         .filter(|(_, ticket)| {
             work_tickets.contains(&ticket.rsplit('/').next().unwrap_or(ticket).to_lowercase())
         })
         .collect::<Vec<_>>();
+    matched.extend(event_assignments);
+    matched.extend(active_before_window);
+    matched.sort();
+    matched.dedup();
     if matched.is_empty() {
         return Err("no assignment ticket maps to a work event in the output window".to_owned());
     }
@@ -633,6 +707,7 @@ impl MeasurementSource for LiveMeasurementSource<'_> {
             ));
         }
         let span = duration(request)?;
+        validate_evaluation_time(request.end_ms)?;
         let host = request.host.to_lowercase();
         let label = esc(&host);
         let at = request.end_ms;
@@ -663,8 +738,10 @@ impl MeasurementSource for LiveMeasurementSource<'_> {
             "prometheus.ix_build_slots_busy",
             at,
         );
-        let queue_selector = format!("ix_build_queue_wait_seconds{{host=\"{label}\"}}");
-        let queue_wait_query = format!("quantile_over_time(0.9, {queue_selector}[{span}])");
+        let queue_selector = format!("ix_build_queue_wait_seconds_count{{host=\"{label}\"}}");
+        let queue_wait_query = format!(
+            "histogram_quantile(0.9, sum by (le) (increase(ix_build_queue_wait_seconds_bucket{{host=\"{label}\"}}[{span}])))"
+        );
         let queue_wait_coverage = format!(
             "sum(count_over_time({queue_selector}[{span}])) * {} / {window_seconds}",
             self.config.push_interval.as_secs()
@@ -677,8 +754,14 @@ impl MeasurementSource for LiveMeasurementSource<'_> {
             "prometheus.ix_build_queue_wait_seconds",
             at,
         );
-        let (admission_query, admission_coverage) =
-            source("ix_build_admission_blocked_seconds_total", "increase");
+        let admission_selector =
+            format!("ix_build_admission_blocked_seconds_total{{host=\"{label}\"}}");
+        let admission_query = format!("sum(increase({admission_selector}[{span}]))");
+        let admission_coverage = format!(
+            "count_over_time((sum by (host) ({admission_selector}))[{span}:{}]) * {} / {window_seconds}",
+            self.config.push_interval.as_secs(),
+            self.config.push_interval.as_secs()
+        );
         let admission = source_observation(
             self.prometheus,
             &host,
@@ -701,7 +784,7 @@ impl MeasurementSource for LiveMeasurementSource<'_> {
                 "admission_blocked_source_unavailable",
             ),
         };
-        let memory_selector = format!("node_memory_MemAvailable_bytes{{host=\"{label}\"}}");
+        let memory_selector = format!("node_memory_MemAvailable_bytes{{instance=\"{label}\"}}");
         let memory_coverage = format!(
             "sum(count_over_time({memory_selector}[{span}])) * {} / {window_seconds}",
             self.config.push_interval.as_secs()
@@ -709,7 +792,7 @@ impl MeasurementSource for LiveMeasurementSource<'_> {
         let memory = source_observation(
             self.prometheus,
             &host,
-            format!("min_over_time({memory_selector}[{span}])"),
+            format!("min(min_over_time({memory_selector}[{span}]))"),
             memory_coverage,
             "node_exporter.node_memory_MemAvailable_bytes",
             at,
@@ -721,10 +804,12 @@ impl MeasurementSource for LiveMeasurementSource<'_> {
                 self.prometheus,
                 &host,
                 format!(
-                    "min_over_time((ix_fleet_host_memory_total_bytes{{host=\"{label}\"}} - ix_fleet_host_memory_used_bytes{{host=\"{label}\"}})[{span}:])"
+                    "min_over_time((ix_fleet_host_memory_total_bytes{{host=\"{label}\"}} - ix_fleet_host_memory_used_bytes{{host=\"{label}\"}})[{span}:{}])",
+                    self.config.push_interval.as_secs()
                 ),
                 format!(
-                    "sum(count_over_time(ix_fleet_host_memory_total_bytes{{host=\"{label}\"}}[{span}])) * {} / {window_seconds}",
+                    "count_over_time((ix_fleet_host_memory_total_bytes{{host=\"{label}\"}} - ix_fleet_host_memory_used_bytes{{host=\"{label}\"}})[{span}:{}]) * {} / {window_seconds}",
+                    self.config.push_interval.as_secs(),
                     self.config.push_interval.as_secs()
                 ),
                 "relay_watcher.ix_fleet_host_memory_total_bytes-ix_fleet_host_memory_used_bytes",
@@ -733,24 +818,30 @@ impl MeasurementSource for LiveMeasurementSource<'_> {
         };
         let temperature_expression = temp_query(&host, "node_thermal_temperature_celsius", &span);
         let temperature_selector = match host.as_str() {
-            "titan" => format!("node_hwmon_temp_celsius{{host=\"{label}\",sensor=\"Tctl\"}}"),
-            "luna" => format!(
-                "node_hwmon_temp_celsius{{host=\"{label}\"}} or node_thermal_zone_temp{{host=\"{label}\"}}"
+            "titan" => format!(
+                "node_hwmon_temp_celsius{{instance=\"{label}\",chip=\"pci0000:00_0000:00:18_3\",sensor=\"temp1\"}}"
             ),
-            "terra" => {
-                format!("windows_sensors_physical_cpu_temperature_celsius{{host=\"{label}\"}}")
+            "luna" => {
+                format!("node_thermal_zone_temp{{instance=\"{label}\",type=\"x86_pkg_temp\"}}")
             }
-            "draco" => format!("node_thermal_temperature_celsius{{host=\"{label}\"}}"),
-            _ => format!("node_thermal_temperature_celsius{{host=\"{label}\"}}"),
+            "terra" => {
+                format!("node_thermal_zone_temp{{instance=\"{label}\",sensor=\"CPU Package\"}}")
+            }
+            "draco" => format!(
+                "node_thermal_temperature_celsius{{instance=\"{label}\",sensor=~\"PMU tdie.*\"}}"
+            ),
+            _ => format!("node_thermal_temperature_celsius{{instance=\"{label}\"}}"),
         };
         let temperature_coverage = if host == "luna" {
             format!(
-                "(sum(count_over_time(node_hwmon_temp_celsius{{host=\"{label}\"}}[{span}])) + sum(count_over_time(node_thermal_zone_temp{{host=\"{label}\"}}[{span}]))) * {} / {window_seconds}",
+                "count_over_time((max(node_thermal_zone_temp{{instance=\"{label}\",type=\"x86_pkg_temp\"}}))[{span}:{}]) * {} / {window_seconds}",
+                self.config.push_interval.as_secs(),
                 self.config.push_interval.as_secs()
             )
         } else {
             format!(
-                "sum(count_over_time({temperature_selector}[{span}])) * {} / {window_seconds}",
+                "count_over_time((max({temperature_selector}))[{span}:{}]) * {} / {window_seconds}",
+                self.config.push_interval.as_secs(),
                 self.config.push_interval.as_secs()
             )
         };
@@ -761,8 +852,8 @@ impl MeasurementSource for LiveMeasurementSource<'_> {
             temperature_coverage,
             match host.as_str() {
                 "draco" => "node_exporter.node_thermal_temperature_celsius",
-                "titan" => "node_exporter.node_hwmon_temp_celsius:Tctl",
-                "luna" => "node_exporter.hwmon_or_thermal_zone",
+                "titan" => "node_exporter.node_hwmon_temp_celsius:cpu_chip_temp1",
+                "luna" => "node_exporter.node_thermal_zone_temp:x86_pkg_temp",
                 "terra" => "windows_sensors.physical_cpu",
                 _ => "node_exporter.host_temperature",
             },
@@ -776,7 +867,7 @@ impl MeasurementSource for LiveMeasurementSource<'_> {
             .and_then(|limit| limit.thermal_limit_celsius)
             .zip(temperature.value)
             .map(|(limit, current)| limit - current);
-        let (tickets_closed, prs_merged, commits_pushed, lane_output) =
+        let (tickets_closed, prs_merged, commits_pushed, lane_output, output_attribution_basis) =
             linear_output(request, self.config);
         let total_output = tickets_closed
             .value
@@ -840,8 +931,26 @@ impl MeasurementSource for LiveMeasurementSource<'_> {
                 "slot_values_unavailable",
             ),
         };
-        let mut derived_sources = BTreeMap::new();
+        let mut derived_sources = output_attribution_basis;
         derived_sources.insert("throttled_share".to_owned(), "admission_only".to_owned());
+        derived_sources.insert(
+            "memory_reserve".to_owned(),
+            format!(
+                "ix_board_config:fleet.capacity_limits.{host}.memory_reserve_bytes={}",
+                limits
+                    .and_then(|limit| limit.memory_reserve_bytes)
+                    .map_or_else(|| "unconfigured".to_owned(), |value| value.to_string())
+            ),
+        );
+        derived_sources.insert(
+            "thermal_limit".to_owned(),
+            format!(
+                "ix_board_config:fleet.capacity_limits.{host}.thermal_limit_celsius={}",
+                limits
+                    .and_then(|limit| limit.thermal_limit_celsius)
+                    .map_or_else(|| "unconfigured".to_owned(), |value| value.to_string())
+            ),
+        );
         let build_slots_busy = match busy.value {
             Some(value) if value >= 0.0 && value.fract() == 0.0 && value <= f64::from(u32::MAX) => {
                 Observation {
@@ -855,8 +964,31 @@ impl MeasurementSource for LiveMeasurementSource<'_> {
             }
             _ => unavailable("prometheus.ix_build_slots_busy", "slot_count_unavailable"),
         };
+        let lane_selector =
+            format!("ix_fleet_lane_state_ratio{{host=\"{label}\",job=\"ix-relay-watcher\"}}");
+        let lane_count_expression = format!(
+            "count(count by (lane) (last_over_time({lane_selector}[{}s])))",
+            self.config.push_interval.as_secs().saturating_mul(2).max(1)
+        );
+        let lane_count = source_observation(
+            self.prometheus,
+            &host,
+            lane_count_expression,
+            "vector(1)".to_owned(),
+            "prometheus.ix_fleet_lane_state_ratio.distinct_lanes",
+            at,
+        );
+        let lanes = match lane_count.value {
+            Some(value) if value >= 0.0 && value.fract() == 0.0 && value <= f64::from(u32::MAX) => {
+                Observation::available(value as u32, &lane_count.source, at)
+            }
+            _ => unavailable(
+                "prometheus.ix_fleet_lane_state_ratio.distinct_lanes",
+                "lane_count_unavailable",
+            ),
+        };
         Ok(WindowMeasurements {
-            lanes: Observation::available(request.lanes, "relay.capacity_window.lanes", at),
+            lanes,
             build_slots_busy,
             build_slots_sustainable: sustainable,
             window_start_ms: request.start_ms,
@@ -894,7 +1026,14 @@ mod tests {
     use crate::fleet::SourceError;
     use crate::fleet::config::HostCapacityLimits;
     use crate::fleet::live::PromQuery;
+    use ix_trace_rs::trace;
     use std::time::Duration;
+
+    #[test]
+    #[trace("FR-041-AC-10")]
+    fn capacity_window_rejects_a_future_prometheus_evaluation_time() {
+        assert!(validate_evaluation_time(i64::MAX).is_err());
+    }
 
     struct MockPrometheus;
 
@@ -919,9 +1058,14 @@ mod tests {
                 r#"{{"status":"success","data":{{"result":[{{"value":[0,"{value}"]}}]}}}}"#
             ))
         }
+
+        fn query_at(&self, expression: &str, _: i64) -> Result<String, SourceError> {
+            self.query(expression)
+        }
     }
 
     #[test]
+    #[trace("FR-041-AC-10")]
     fn live_measurement_reads_host_build_memory_and_thermal_series() {
         let mut config = FleetConfig {
             hosts: vec!["draco".to_owned()],
@@ -932,6 +1076,7 @@ mod tests {
             "draco".to_owned(),
             HostCapacityLimits {
                 build_slots: Some(3),
+                lane_capacity: None,
                 memory_reserve_bytes: Some(1_073_741_824),
                 thermal_limit_celsius: Some(85.0),
             },

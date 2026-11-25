@@ -52,6 +52,8 @@ const KNOWN: [&str; 23] = [
 pub struct HostCapacityLimits {
     /// Interim sustainable build slots.
     pub build_slots: Option<u32>,
+    /// Optional operator-entered limit on lane demand.
+    pub lane_capacity: Option<u32>,
     /// Minimum free memory reserved for the host, in bytes.
     pub memory_reserve_bytes: Option<u64>,
     /// Maximum permitted CPU temperature, in Celsius.
@@ -282,7 +284,10 @@ impl FleetConfig {
                     if let Some(key) = fields.keys().find(|key| {
                         !matches!(
                             key.as_str(),
-                            "build_slots" | "memory_reserve_bytes" | "thermal_limit_celsius"
+                            "build_slots"
+                                | "lane_capacity"
+                                | "memory_reserve_bytes"
+                                | "thermal_limit_celsius"
                         )
                     }) {
                         return Err(FleetError::Config(format!(
@@ -311,6 +316,14 @@ impl FleetConfig {
                                 "capacity_limits.{host}.build_slots is too large"
                             ))
                         })?;
+                    let lane_capacity = positive_u64("lane_capacity")?
+                        .map(u32::try_from)
+                        .transpose()
+                        .map_err(|_| {
+                            FleetError::Config(format!(
+                                "capacity_limits.{host}.lane_capacity is too large"
+                            ))
+                        })?;
                     let thermal_limit_celsius = fields
                         .get("thermal_limit_celsius")
                         .map(|value| {
@@ -327,6 +340,7 @@ impl FleetConfig {
                         host.to_lowercase(),
                         HostCapacityLimits {
                             build_slots,
+                            lane_capacity,
                             memory_reserve_bytes: positive_u64("memory_reserve_bytes")?,
                             thermal_limit_celsius,
                         },

@@ -128,6 +128,17 @@ pub struct NeedReadyTickets {
     pub lanes: u32,
 }
 
+/// Deficit rows from saturation, with completeness kept separate from positive known needs.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NeedReadyTicketsRead {
+    /// Positive project deficits computed from available hosts.
+    pub projects: Vec<NeedReadyTickets>,
+    /// False when any required host or queue input is unavailable.
+    pub complete: bool,
+    /// Unavailable source bases and reasons retained for operators.
+    pub unavailable: Vec<String>,
+}
+
 /// Admission-blocked share observed for one host during a tick interval.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CapacityThrottleSample {
@@ -290,6 +301,32 @@ pub struct LanePr {
     pub last_activity_ms: i64,
 }
 
+/// A known hole in the live lane-to-PR mapping, retained with its original source basis.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LanePrUnavailable {
+    /// Lane, when attribution reached a verified lane.
+    pub lane: Option<String>,
+    /// Ticket whose PR mapping could not be resolved.
+    pub ticket: Option<String>,
+    /// PR URL or identifier, when known.
+    pub pr: Option<String>,
+    /// Source that could not establish the mapping.
+    pub source_basis: String,
+    /// Why it could not establish the mapping.
+    pub reason: String,
+}
+
+/// Live PR read, including partial rows and explicit source gaps.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LanePrRead {
+    /// PRs whose lane attribution and activity were verified.
+    pub items: Vec<LanePr>,
+    /// Unavailable mappings or activity reads.
+    pub unavailable: Vec<LanePrUnavailable>,
+    /// Earliest time represented by the paged event source, if supplied.
+    pub available_from_ms: Option<i64>,
+}
+
 /// Ready, unassigned work: the total and the lanes an unowned ready ticket is eligible for.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ReadyWork {
@@ -318,7 +355,7 @@ pub trait TickSources {
     /// # Errors
     ///
     /// Why the pull requests could not be read.
-    fn lane_prs(&self) -> Result<Vec<LanePr>, Unread>;
+    fn lane_prs(&self) -> Result<LanePrRead, Unread>;
     /// Ready work no lane holds.
     ///
     /// # Errors
@@ -326,7 +363,7 @@ pub trait TickSources {
     /// Why the ready queue could not be read.
     fn ready_work(&self) -> Result<ReadyWork, Unread>;
     /// Positive ready-buffer deficits by owning planner project.
-    fn need_ready_tickets(&self) -> Result<Vec<NeedReadyTickets>, Unread> {
+    fn need_ready_tickets(&self) -> Result<NeedReadyTicketsRead, Unread> {
         Err(Unread::Unwired("SWM-217"))
     }
     /// Admission-blocked shares; missing coverage remains an unavailable row.
@@ -360,10 +397,16 @@ pub struct TickFacts {
     pub host_busy: Option<BTreeMap<String, f64>>,
     /// Lane-owned pull requests.
     pub prs: Option<Vec<LanePr>>,
+    /// Known holes in live lane-to-PR attribution.
+    pub pr_unavailable: Vec<LanePrUnavailable>,
+    /// Start of the event source's retained history.
+    pub pr_available_from_ms: Option<i64>,
     /// Ready, unassigned work.
     pub ready: Option<ReadyWork>,
     /// Ready-buffer deficits by project.
     pub need_ready_tickets: Option<Vec<NeedReadyTickets>>,
+    /// True only when saturation inputs were complete for every current host.
+    pub need_ready_tickets_complete: Option<bool>,
     /// One admission-blocked share observation per host and tick interval.
     pub capacity_throttle_samples: Vec<CapacityThrottleSample>,
     /// Drain completions proven by current watcher state and build evidence.
@@ -379,25 +422,27 @@ pub struct TickFacts {
 impl TickFacts {
     /// Reads every source once; a failure is recorded, never silently an empty value.
     #[implements("FR-038-AC-24")]
+    #[implements("FR-041-AC-24")]
     pub fn read(sources: &dyn TickSources, at_ms: i64, interval_secs: u64) -> Self {
         let mut facts = Self {
             capacity_throttle_samples: sources.capacity_throttle_samples(at_ms, interval_secs),
             ..Self::default()
         };
-        let mut note = |source: &str, error: Unread| {
+        let mut unavailable_rows = Vec::new();
+        fn note(source: &str, error: Unread) -> Unavailable {
             let (reason, unwired) = match error {
                 Unread::Unwired(ticket) => (format!("no reader yet; owned by {ticket}"), true),
                 Unread::Failed(error) => (error.0, false),
             };
-            facts.unavailable.push(Unavailable {
+            Unavailable {
                 source: source.to_owned(),
                 reason,
                 unwired,
-            });
-        };
+            }
+        }
         let drain_done = sources.drain_done();
         if let Err(error) = &drain_done {
-            note("drain_done", error.clone());
+            unavailable_rows.push(note("drain_done", error.clone()));
         }
         facts.drain_done = drain_done.unwrap_or_default();
         facts.host_output_samples = sources.host_output_samples(at_ms);
@@ -407,20 +452,60 @@ impl TickFacts {
         let prs = sources.lane_prs();
         let ready = sources.ready_work();
         let need_ready_tickets = sources.need_ready_tickets();
-        let (a, b, p, r, n) = (
-            assignments.map_err(|e| note("assignments", e)).ok(),
-            busy.map_err(|e| note("host_busy", e)).ok(),
-            prs.map_err(|e| note("lane_prs", e)).ok(),
-            ready.map_err(|e| note("ready_work", e)).ok(),
-            need_ready_tickets
-                .map_err(|e| note("need_ready_tickets", e))
+        let (a, b, r) = (
+            assignments
+                .map_err(|e| unavailable_rows.push(note("assignments", e)))
+                .ok(),
+            busy.map_err(|e| unavailable_rows.push(note("host_busy", e)))
+                .ok(),
+            ready
+                .map_err(|e| unavailable_rows.push(note("ready_work", e)))
                 .ok(),
         );
+        let p = match prs {
+            Ok(read) => {
+                for unavailable in &read.unavailable {
+                    unavailable_rows.push(Unavailable {
+                        source: unavailable.source_basis.clone(),
+                        reason: format!(
+                            "lane={:?} ticket={:?} pr={:?}: {}",
+                            unavailable.lane,
+                            unavailable.ticket,
+                            unavailable.pr,
+                            unavailable.reason
+                        ),
+                        unwired: false,
+                    });
+                }
+                facts.pr_unavailable = read.unavailable;
+                facts.pr_available_from_ms = read.available_from_ms;
+                Some(read.items)
+            }
+            Err(error) => {
+                unavailable_rows.push(note("lane_prs", error));
+                None
+            }
+        };
         facts.assignments = a;
         facts.host_busy = b;
         facts.prs = p;
         facts.ready = r;
-        facts.need_ready_tickets = n;
+        facts.need_ready_tickets = match need_ready_tickets {
+            Ok(read) => {
+                facts.need_ready_tickets_complete = Some(read.complete);
+                unavailable_rows.extend(read.unavailable.into_iter().map(|reason| Unavailable {
+                    source: "need_ready_tickets".to_owned(),
+                    reason,
+                    unwired: false,
+                }));
+                Some(read.projects)
+            }
+            Err(error) => {
+                unavailable_rows.push(note("need_ready_tickets", error));
+                None
+            }
+        };
+        facts.unavailable.extend(unavailable_rows);
         facts
     }
 }

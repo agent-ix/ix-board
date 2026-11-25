@@ -238,12 +238,30 @@ pub struct CapacityEventInput<'a> {
 }
 
 /// One host's ready-buffer deficit sample, with `None` retained when supply or duty is missing.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SaturationSampleInput<'a> {
     /// Host name.
     pub host: &'a str,
+    /// Reachable lane count on this host at sample time.
+    pub active_lanes: u32,
+    /// Reachable lanes with unfinished assigned tickets at sample time.
+    pub supplied_lanes: Option<u32>,
+    /// Reachable lanes without unfinished assigned tickets at sample time.
+    pub unsupplied_lanes: Option<u32>,
+    /// Whether the host's registry lease is current at sample time.
+    pub registry_current: bool,
+    /// Global ready, unassigned ticket count at sample time.
+    pub ready_buffer: Option<u32>,
+    /// Host share of ready tickets allocated to its unsupplied lanes.
+    pub ready_share: Option<u32>,
     /// Positive shortage; zero is present only when all required sources were measured.
     pub deficit: Option<u32>,
+    /// JSON source, availability, reason and coverage basis for each measured field.
+    pub source_basis: String,
+    /// Reason the planner deficit is unavailable or partial.
+    pub reason: Option<&'a str>,
+    /// Coverage of ready-buffer and assignment evidence, independent of duty and deficit.
+    pub coverage: Option<f64>,
 }
 
 /// Opens a host discovery run and returns its ledger id.
@@ -485,8 +503,22 @@ pub fn record_saturation_samples(
             )));
         }
         tx.execute(
-            "INSERT INTO saturation_sample(host,at,deficit) VALUES(?1,?2,?3)",
-            params![host, at_ms, sample.deficit.map(i64::from)],
+            "INSERT INTO saturation_sample(host,at,deficit,source_basis,unavailable_reason,coverage,ready_buffer,active_lanes,supplied_lanes,unsupplied_lanes,ready_share,registry_current)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            params![
+                host,
+                at_ms,
+                sample.deficit.map(i64::from),
+                sample.source_basis,
+                sample.reason,
+                sample.coverage,
+                sample.ready_buffer.map(i64::from),
+                i64::from(sample.active_lanes),
+                sample.supplied_lanes.map(i64::from),
+                sample.unsupplied_lanes.map(i64::from),
+                sample.ready_share.map(i64::from),
+                i64::from(sample.registry_current)
+            ],
         )?;
     }
     tx.commit()?;
@@ -887,8 +919,8 @@ pub fn end(
             params![host, i64::from(level), output_basis, at_ms, run_id, reason, evidence_steps],
         )?;
         tx.execute(
-            "INSERT INTO host_output_sample(host,at,lanes,tickets_closed,prs_merged,commits_pushed)
-             SELECT ?1,window_end,?2,?3,?4,?5 FROM capacity_step
+            "INSERT INTO host_output_sample(host,at,lanes,tickets_closed,prs_merged,commits_pushed,source_basis,sample_interval_ms)
+             SELECT ?1,window_end,?2,?3,?4,?5,source_basis,window_end-window_start FROM capacity_step
              WHERE run_id=?6 AND step_no=?7 AND valid=1 ORDER BY window_end DESC LIMIT 1",
             params![
                 host,
@@ -1322,6 +1354,10 @@ fn metrics_at(path: &Path, now_ms: i64) -> Result<String, LedgerError> {
     text.push_str("# TYPE ix_fleet_capacity_throttled_without_step_down gauge\n");
     text.push_str("# TYPE ix_fleet_capacity_overload_events_total counter\n");
     text.push_str("# TYPE ix_fleet_ready_buffer_deficit gauge\n");
+    text.push_str("# TYPE ix_fleet_ready_buffer_deficit_timestamp_seconds gauge\n");
+    text.push_str("# TYPE ix_fleet_ready_buffer_deficit_unavailable gauge\n");
+    text.push_str("# TYPE ix_fleet_host_output_share_of_recorded_level gauge\n");
+    text.push_str("# TYPE ix_fleet_host_output_share_of_recorded_level_timestamp_seconds gauge\n");
     let trailing_hour = now_ms.saturating_sub(3_600_000);
     let connection = if path.exists() {
         Some(Connection::open_with_flags(
@@ -1421,23 +1457,116 @@ fn metrics_at(path: &Path, now_ms: i64) -> Result<String, LedgerError> {
         }
     }
     if let Some(connection) = connection.as_ref() {
+        let mut latest_deficit = BTreeMap::new();
         let mut statement = connection.prepare(
-            "SELECT s.host,s.deficit FROM saturation_sample s
-             WHERE s.at=(SELECT MAX(latest.at) FROM saturation_sample latest
-                         WHERE lower(latest.host)=lower(s.host))
-               AND s.deficit IS NOT NULL ORDER BY lower(s.host)",
+            "WITH ranked AS (
+               SELECT host,at,deficit,unavailable_reason,coverage,
+                 ROW_NUMBER() OVER(PARTITION BY lower(host) ORDER BY at DESC,id DESC) AS rn
+               FROM saturation_sample)
+             SELECT host,at,deficit,unavailable_reason,coverage FROM ranked WHERE rn=1",
         )?;
         for row in statement.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<f64>>(4)?,
+            ))
         })? {
-            let (host, deficit) = row?;
+            let (host, at, deficit, reason, coverage) = row?;
+            latest_deficit.insert(host.to_lowercase(), (host, at, deficit, reason, coverage));
+        }
+        let hosts = status
+            .hosts
+            .iter()
+            .map(|host| host.host.to_lowercase())
+            .chain(latest_deficit.keys().cloned())
+            .collect::<BTreeSet<_>>();
+        for host_key in hosts {
+            let Some((host, at, deficit, reason, coverage)) = latest_deficit.get(&host_key) else {
+                text.push_str(&format!(
+                    "ix_fleet_ready_buffer_deficit_unavailable{{host=\"{}\",reason=\"sample_missing\"}} 1\n",
+                    label(&host_key)
+                ));
+                continue;
+            };
+            let escaped = label(host);
             text.push_str(&format!(
-                "ix_fleet_ready_buffer_deficit{{host=\"{}\"}} {deficit}\n",
-                label(&host)
+                "ix_fleet_ready_buffer_deficit_timestamp_seconds{{host=\"{escaped}\"}} {}\n",
+                prometheus_seconds(*at)
+            ));
+            if *at <= now_ms && now_ms.saturating_sub(*at) <= 600_000 {
+                if let Some(deficit) = deficit {
+                    text.push_str(&format!(
+                        "ix_fleet_ready_buffer_deficit{{host=\"{escaped}\"}} {deficit}\n"
+                    ));
+                    continue;
+                }
+            }
+            let unavailable = if *at > now_ms {
+                "sample_future"
+            } else if now_ms.saturating_sub(*at) > 600_000 {
+                "sample_stale"
+            } else {
+                bounded_deficit_reason(reason.as_deref(), *coverage)
+            };
+            text.push_str(&format!(
+                "ix_fleet_ready_buffer_deficit_unavailable{{host=\"{escaped}\",reason=\"{unavailable}\"}} 1\n"
             ));
         }
     }
+    if let Some(connection) = connection.as_ref() {
+        let mut statement = connection.prepare(
+            "SELECT host,share_percent,at_ms FROM host_output_share_of_recorded_level
+             ORDER BY lower(host)",
+        )?;
+        for row in statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<f64>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })? {
+            let (host, share_percent, at_ms) = row?;
+            let escaped = label(&host);
+            if let Some(at_ms) = at_ms {
+                text.push_str(&format!(
+                    "ix_fleet_host_output_share_of_recorded_level_timestamp_seconds{{host=\"{escaped}\"}} {}\n",
+                    prometheus_seconds(at_ms)
+                ));
+            }
+            if let Some(share_percent) = share_percent {
+                text.push_str(&format!(
+                    "ix_fleet_host_output_share_of_recorded_level{{host=\"{escaped}\"}} {}\n",
+                    share_percent / 100.0
+                ));
+            }
+        }
+    }
     Ok(text)
+}
+
+#[implements("FR-041-AC-16")]
+fn bounded_deficit_reason(reason: Option<&str>, coverage: Option<f64>) -> &'static str {
+    match reason {
+        Some("partial_deficit_from_hosts_with_usable_supply_and_duty") => "partial_deficit",
+        Some(value) if value.contains("coverage") || coverage.is_some_and(|value| value < 0.9) => {
+            "coverage_incomplete"
+        }
+        Some(value) if value.contains("duty") => "duty_unavailable",
+        Some(value) if value.contains("supply") || value.contains("slot") => "supply_unavailable",
+        Some(value) if value.contains("linear") || value.contains("ticket") => {
+            "ready_work_unavailable"
+        }
+        Some(_) => "source_unavailable",
+        None => "source_unavailable",
+    }
+}
+
+#[implements("FR-041-AC-16")]
+fn prometheus_seconds(at_ms: i64) -> String {
+    format!("{}.{:03}", at_ms.div_euclid(1000), at_ms.rem_euclid(1000))
 }
 
 /// Persists one source-backed hold window and deterministically judges its demand coverage and
@@ -1491,45 +1620,115 @@ fn record_window_inner(
     let host = host.ok_or_else(|| LedgerError::Capacity(format!("run {run_id} is not open")))?;
 
     let interval_ms = ledger.tick_interval_s.saturating_mul(1000).max(1);
-    let (samples, unavailable, positive): (i64, i64, i64) = tx.query_row(
-        "SELECT COUNT(*), SUM(CASE WHEN deficit IS NULL THEN 1 ELSE 0 END),
-                SUM(CASE WHEN deficit > 0 THEN 1 ELSE 0 END)
-         FROM saturation_sample WHERE host=?1 AND at>=?2 AND at<=?3",
-        params![host, measurement.window_start_ms, measurement.window_end_ms],
-        |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                row.get::<_, Option<i64>>(2)?.unwrap_or(0),
-            ))
-        },
-    )?;
+    let sample_rows = {
+        let mut statement = tx.prepare(
+            "SELECT at,coverage,ready_buffer,ready_share,supplied_lanes,
+                    unsupplied_lanes,registry_current,active_lanes,deficit
+             FROM saturation_sample WHERE host=?1 AND at>=?2 AND at<=?3 ORDER BY at",
+        )?;
+        statement
+            .query_map(
+                params![host, measurement.window_start_ms, measurement.window_end_ms],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<f64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                        row.get::<_, Option<i64>>(8)?,
+                    ))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let samples = i64::try_from(sample_rows.len()).unwrap_or(i64::MAX);
+    let mut demand_unavailable = 0i64;
+    let mut deficit_unavailable = 0i64;
+    let mut positive = 0i64;
+    let mut demand_covered = 0i64;
+    let mut intervals = Vec::with_capacity(sample_rows.len());
+    for (
+        at,
+        coverage,
+        ready_buffer,
+        ready_share,
+        supplied,
+        unsupplied,
+        registry,
+        active,
+        deficit,
+    ) in sample_rows
+    {
+        if coverage.is_none_or(|coverage| coverage < 0.9)
+            || ready_buffer.is_none()
+            || ready_share.is_none()
+            || supplied.is_none()
+            || unsupplied.is_none()
+            || registry.is_none()
+            || active.is_none()
+            || (active.is_some_and(|active| active > 0) && measurement.lanes.value.is_none())
+        {
+            demand_unavailable += 1;
+        }
+        if deficit.is_none() || coverage.is_none_or(|coverage| coverage < 0.9) {
+            deficit_unavailable += 1;
+        }
+        if deficit.is_some_and(|deficit| deficit > 0) {
+            positive += 1;
+        }
+        let covers = coverage.is_some_and(|coverage| coverage >= 0.9)
+            && ready_buffer.is_some()
+            && ready_share.is_some()
+            && supplied.is_some()
+            && unsupplied.is_some()
+            && registry == Some(1)
+            && match (active, ready_share, supplied, measurement.lanes.value) {
+                (Some(0), Some(share), _, _) => share >= 1,
+                (Some(active), Some(share), Some(supplied), Some(step_lanes)) if active > 0 => {
+                    supplied.saturating_add(share) >= i64::from(step_lanes)
+                }
+                _ => false,
+            };
+        if covers {
+            demand_covered += 1;
+        }
+        let interval_start = at.max(measurement.window_start_ms);
+        let interval_end = at
+            .saturating_add(interval_ms)
+            .min(measurement.window_end_ms);
+        if interval_end > interval_start {
+            intervals.push((interval_start, interval_end));
+        }
+    }
+    intervals.sort_unstable();
+    let mut covered_ms = 0i64;
+    let mut union_end = measurement.window_start_ms;
+    for (start, end) in intervals {
+        let start = start.max(union_end);
+        if end > start {
+            covered_ms = covered_ms.saturating_add(end - start);
+            union_end = end;
+        }
+    }
     let span_ms = measurement
         .window_end_ms
         .saturating_sub(measurement.window_start_ms)
         .max(1);
-    let covered_ms = samples.saturating_mul(interval_ms);
     let coverage = (covered_ms as f64 / span_ms as f64).min(1.0);
-    let zero_throughout = samples > 0 && unavailable == 0 && positive == 0;
-    let measurements_available = measured(&measurement.lanes).is_some()
-        && measured(&measurement.build_slots_busy).is_some()
-        && measured(&measurement.build_slots_sustainable).is_some()
-        && measured(&measurement.host_output_per_hour).is_some()
-        && measured(&measurement.output_basis).is_some()
-        && measured(&measurement.queue_wait_p90_s).is_some()
-        && measured(&measurement.throttled_share).is_some()
-        && measured(&measurement.memory_headroom_min).is_some()
-        && measured(&measurement.thermal_headroom_min).is_some()
-        && measured(&slots_equal(measurement)).is_some();
-    let valid = coverage >= 0.9 && zero_throughout && measurements_available;
-    let inconclusive_reason =
-        if coverage < 0.9 || unavailable > 0 || samples == 0 || !measurements_available {
-            Some("deficit_coverage")
-        } else if positive > 0 {
-            Some("deficit_nonzero")
-        } else {
-            None
-        };
+    let zero_throughout = samples > 0 && deficit_unavailable == 0 && positive == 0;
+    let demand_short = demand_unavailable == 0 && samples > 0 && demand_covered < samples;
+    let valid = coverage >= 0.9 && demand_unavailable == 0 && !demand_short;
+    let inconclusive_reason = if demand_unavailable > 0 || coverage < 0.9 || samples == 0 {
+        Some("deficit_coverage")
+    } else if demand_short {
+        Some("demand_short")
+    } else {
+        None
+    };
     let mut sources = BTreeMap::from([
         ("lanes".to_owned(), observation_basis(&measurement.lanes)),
         (
@@ -1598,14 +1797,31 @@ fn record_window_inner(
         (
             "deficit_zero_throughout".to_owned(),
             FieldBasis {
-                availability: if samples > 0 && unavailable == 0 {
+                availability: if samples > 0 && deficit_unavailable == 0 {
                     crate::fleet::capacity::Availability::Available
                 } else {
                     crate::fleet::capacity::Availability::Unavailable
                 },
                 source: "ledger.saturation_sample".to_owned(),
-                reason: (samples == 0 || unavailable > 0)
+                reason: (samples == 0 || deficit_unavailable > 0)
                     .then(|| "deficit_sample_unavailable".to_owned()),
+                coverage: Some(coverage),
+                observed_at_ms: Some(measurement.window_end_ms),
+            },
+        ),
+        (
+            "demand_coverage".to_owned(),
+            FieldBasis {
+                availability: if coverage >= 0.9 && !demand_short && demand_unavailable == 0 {
+                    crate::fleet::capacity::Availability::Available
+                } else {
+                    crate::fleet::capacity::Availability::Unavailable
+                },
+                source: "ledger.saturation_sample.ready_buffer_vs_step_lanes".to_owned(),
+                reason: demand_short.then(|| "demand_short".to_owned()).or_else(|| {
+                    (coverage < 0.9 || demand_unavailable > 0)
+                        .then(|| "demand_coverage_below_90_percent".to_owned())
+                }),
                 coverage: Some(coverage),
                 observed_at_ms: Some(measurement.window_end_ms),
             },
@@ -1613,10 +1829,26 @@ fn record_window_inner(
         (
             "knee_signal".to_owned(),
             FieldBasis {
-                availability: crate::fleet::capacity::Availability::Available,
-                source: "ix-board.FR-041".to_owned(),
-                reason: None,
-                coverage: Some(1.0),
+                availability: if measured(&measurement.throttled_share).is_some()
+                    || measured(&measurement.host_output_per_hour).is_some()
+                {
+                    crate::fleet::capacity::Availability::Available
+                } else {
+                    crate::fleet::capacity::Availability::Unavailable
+                },
+                source: "ix-board.FR-041.knee_rule".to_owned(),
+                reason: (measured(&measurement.throttled_share).is_none()
+                    && measured(&measurement.host_output_per_hour).is_none())
+                .then(|| "knee_inputs_unavailable".to_owned()),
+                coverage: Some(
+                    if measured(&measurement.throttled_share).is_some()
+                        || measured(&measurement.host_output_per_hour).is_some()
+                    {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                ),
                 observed_at_ms: Some(measurement.window_end_ms),
             },
         ),

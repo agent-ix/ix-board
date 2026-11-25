@@ -10,6 +10,7 @@ use super::report::{
     ExpiredOrder, HostSeries, OrderReceipts, ProbeReading, ReceiptRead, RegInfo, RelayConfig,
     RelaySnapshot, SeriesSource, UnresolvedOrder, WeakSignals, parse_event,
 };
+use ix_trace_rs::implements;
 use relay_core::config::{CoreFlags, load_core};
 use relay_core::receipts::{
     ExpiredOrders, RECEIPT_EVENT_CAP, RECEIPT_PAGE_CAP, ReceiptCoverageReason, ReceiptEvent,
@@ -136,6 +137,20 @@ pub trait PromQuery: Send + Sync {
     ///
     /// The transport or HTTP failure.
     fn query(&self, expr: &str) -> Result<String, SourceError>;
+
+    /// Evaluates `expr` at the requested Unix timestamp in milliseconds.
+    ///
+    /// Implementations that cannot preserve historical evaluation refuse the request instead
+    /// of silently returning a current sample.
+    ///
+    /// # Errors
+    ///
+    /// The implementation does not support timestamped queries, or the transport failed.
+    fn query_at(&self, _expr: &str, _timestamp_ms: i64) -> Result<String, SourceError> {
+        Err(SourceError(
+            "prometheus client does not support timestamped queries".to_owned(),
+        ))
+    }
 }
 
 /// The Prometheus HTTP API over a bounded blocking client.
@@ -164,6 +179,20 @@ impl PromHttp {
     }
 }
 
+#[implements("FR-041-AC-10")]
+fn prometheus_timestamp(timestamp_ms: i64) -> Result<String, SourceError> {
+    if timestamp_ms < 0 {
+        return Err(SourceError(
+            "prometheus timestamp must be nonnegative milliseconds".to_owned(),
+        ));
+    }
+    Ok(format!(
+        "{}.{:03}",
+        timestamp_ms / 1000,
+        timestamp_ms % 1000
+    ))
+}
+
 impl PromQuery for PromHttp {
     fn query(&self, expr: &str) -> Result<String, SourceError> {
         let response = self
@@ -181,6 +210,42 @@ impl PromQuery for PromHttp {
         response
             .text()
             .map_err(|e| SourceError(format!("prometheus: {e}")))
+    }
+
+    #[implements("FR-041-AC-10")]
+    fn query_at(&self, expr: &str, timestamp_ms: i64) -> Result<String, SourceError> {
+        let timestamp = prometheus_timestamp(timestamp_ms)?;
+        let response = self
+            .client
+            .get(format!("{}/api/v1/query", self.base))
+            .query(&[("query", expr), ("time", timestamp.as_str())])
+            .send()
+            .map_err(|e| SourceError(format!("prometheus: {e}")))?;
+        if !response.status().is_success() {
+            return Err(SourceError(format!(
+                "prometheus: HTTP {}",
+                response.status()
+            )));
+        }
+        response
+            .text()
+            .map_err(|e| SourceError(format!("prometheus: {e}")))
+    }
+}
+
+#[cfg(test)]
+mod prom_query_tests {
+    use super::*;
+    use ix_trace_rs::trace;
+
+    #[test]
+    #[trace("FR-041-AC-10")]
+    fn prometheus_timestamp_preserves_milliseconds() {
+        assert_eq!(
+            prometheus_timestamp(1_795_636_246_989).unwrap(),
+            "1795636246.989"
+        );
+        assert!(prometheus_timestamp(-1).is_err());
     }
 }
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Agent-IX
 
+use super::super::LanePrRead;
 use super::*;
 use crate::fleet::live::{NoWeakSignals, PromQuery, PrometheusSeries, ReadReceipts};
 use crate::fleet::report::{RegInfo, Sources};
@@ -38,7 +39,7 @@ impl TickSources for TickSourcesWithReady<'_> {
         self.0.host_busy()
     }
 
-    fn lane_prs(&self) -> Result<Vec<LanePr>, Unread> {
+    fn lane_prs(&self) -> Result<LanePrRead, Unread> {
         Err(Unread::Unwired("test"))
     }
 

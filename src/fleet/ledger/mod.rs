@@ -21,7 +21,7 @@ use super::FleetConfig;
 use super::classify::ClassKind;
 use super::report::{Defect, FleetReport};
 use ix_trace_rs::implements;
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -236,12 +236,185 @@ fn apply_v5(tx: &rusqlite::Transaction<'_>) -> Result<(), LedgerError> {
 #[implements("FR-039-AC-19")]
 fn apply_v6(tx: &rusqlite::Transaction<'_>) -> Result<(), LedgerError> {
     for statement in schema::V6 {
+        let parts = statement.split_whitespace().collect::<Vec<_>>();
+        if parts.len() >= 6
+            && parts[0] == "ALTER"
+            && parts[1] == "TABLE"
+            && parts[3] == "ADD"
+            && parts[4] == "COLUMN"
+        {
+            let exists: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name=?2",
+                rusqlite::params![parts[2], parts[5]],
+                |row| row.get(0),
+            )?;
+            if exists != 0 {
+                continue;
+            }
+        }
         tx.execute_batch(statement)?;
     }
     for statement in schema::CAPACITY_VIEWS {
         tx.execute_batch(statement)?;
     }
-    tx.pragma_update(None, "user_version", schema::VERSION)?;
+    tx.pragma_update(None, "user_version", 6)?;
+    Ok(())
+}
+
+#[implements("FR-041-AC-11")]
+fn refresh_v6_host_output_view(tx: &rusqlite::Transaction<'_>) -> Result<(), LedgerError> {
+    let sample_interval_column: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('host_output_sample')
+         WHERE name='sample_interval_ms'",
+        [],
+        |row| row.get(0),
+    )?;
+    if sample_interval_column == 0 {
+        tx.execute_batch(
+            "ALTER TABLE host_output_sample ADD COLUMN sample_interval_ms INTEGER NOT NULL DEFAULT 3600000",
+        )?;
+    }
+    for (column, statement) in [
+        (
+            "ready_buffer",
+            "ALTER TABLE saturation_sample ADD COLUMN ready_buffer INTEGER",
+        ),
+        (
+            "active_lanes",
+            "ALTER TABLE saturation_sample ADD COLUMN active_lanes INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "supplied_lanes",
+            "ALTER TABLE saturation_sample ADD COLUMN supplied_lanes INTEGER",
+        ),
+        (
+            "unsupplied_lanes",
+            "ALTER TABLE saturation_sample ADD COLUMN unsupplied_lanes INTEGER",
+        ),
+        (
+            "ready_share",
+            "ALTER TABLE saturation_sample ADD COLUMN ready_share INTEGER",
+        ),
+        (
+            "registry_current",
+            "ALTER TABLE saturation_sample ADD COLUMN registry_current INTEGER NOT NULL DEFAULT 0",
+        ),
+    ] {
+        let exists: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('saturation_sample') WHERE name=?1",
+            [column],
+            |row| row.get(0),
+        )?;
+        if exists == 0 {
+            tx.execute_batch(statement)?;
+        }
+    }
+    for (column, statement) in [
+        (
+            "source_basis",
+            "ALTER TABLE saturation_sample ADD COLUMN source_basis TEXT NOT NULL DEFAULT 'unknown'",
+        ),
+        (
+            "unavailable_reason",
+            "ALTER TABLE saturation_sample ADD COLUMN unavailable_reason TEXT",
+        ),
+        (
+            "coverage",
+            "ALTER TABLE saturation_sample ADD COLUMN coverage REAL",
+        ),
+    ] {
+        let exists: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('saturation_sample') WHERE name=?1",
+            [column],
+            |row| row.get(0),
+        )?;
+        if exists == 0 {
+            tx.execute_batch(statement)?;
+        }
+    }
+    let columns: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('host_output_share_of_recorded_level')
+         WHERE name IN ('source_basis','unavailable_reason')",
+        [],
+        |row| row.get(0),
+    )?;
+    if columns == 2 {
+        refresh_v6_demand_views(tx)?;
+        return Ok(());
+    }
+    tx.execute_batch("DROP VIEW IF EXISTS host_output_share_of_recorded_level")?;
+    let view = schema::CAPACITY_VIEWS
+        .iter()
+        .find(|statement| statement.starts_with("CREATE VIEW host_output_share_of_recorded_level"))
+        .ok_or_else(|| LedgerError::Capacity("host output share view is not defined".to_owned()))?;
+    tx.execute_batch(view)?;
+    refresh_v6_demand_views(tx)?;
+    Ok(())
+}
+
+fn refresh_v6_demand_views(tx: &rusqlite::Transaction<'_>) -> Result<(), LedgerError> {
+    let definition: Option<String> = tx
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='capacity_step'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if definition
+        .as_deref()
+        .is_some_and(|sql| sql.contains("'deficit_nonzero'"))
+    {
+        for statement in schema::CAPACITY_VIEWS {
+            if let Some(name) = statement.split_whitespace().nth(2) {
+                tx.execute_batch(&format!("DROP VIEW IF EXISTS {name}"))?;
+            }
+        }
+        tx.execute_batch(
+            "DROP VIEW IF EXISTS unrecorded_hosts_at_zero_deficit;
+             ALTER TABLE capacity_step RENAME TO capacity_step_before_demand_coverage;
+             CREATE TABLE capacity_step(
+               run_id INTEGER NOT NULL, step_no INTEGER NOT NULL, repeat_of INTEGER,
+               host TEXT NOT NULL, lanes INTEGER, window_start INTEGER, window_end INTEGER,
+               rampup_end INTEGER, valid INTEGER,
+               inconclusive_reason TEXT CHECK(inconclusive_reason IS NULL OR
+                 inconclusive_reason IN ('demand_short','deficit_coverage')),
+               deficit_coverage REAL, deficit_zero_throughout INTEGER, host_output_per_hour REAL,
+               tickets_closed INTEGER, prs_merged INTEGER, commits_pushed INTEGER,
+               output_basis TEXT CHECK(output_basis IS NULL OR output_basis IN ('tickets_prs','commits')),
+               queue_wait_p90_s REAL, throttled_share REAL, memory_headroom_min REAL,
+               thermal_headroom_min REAL, slots_busy_equals_sustainable INTEGER,
+               knee_signal INTEGER, knee_reason TEXT CHECK(knee_reason IS NULL OR
+                 knee_reason IN ('output_gain','throttle')),
+               source_basis TEXT NOT NULL DEFAULT '{}', build_slots_busy INTEGER,
+               build_slots_sustainable INTEGER, measurement_values TEXT NOT NULL DEFAULT '{}');
+             INSERT INTO capacity_step(
+               run_id,step_no,repeat_of,host,lanes,window_start,window_end,rampup_end,valid,
+               inconclusive_reason,deficit_coverage,deficit_zero_throughout,host_output_per_hour,
+               tickets_closed,prs_merged,commits_pushed,output_basis,queue_wait_p90_s,
+               throttled_share,memory_headroom_min,thermal_headroom_min,
+               slots_busy_equals_sustainable,knee_signal,knee_reason,source_basis,
+               build_slots_busy,build_slots_sustainable,measurement_values)
+             SELECT run_id,step_no,repeat_of,host,lanes,window_start,window_end,rampup_end,valid,
+               CASE inconclusive_reason WHEN 'deficit_nonzero' THEN 'demand_short'
+                 ELSE inconclusive_reason END,
+               deficit_coverage,deficit_zero_throughout,host_output_per_hour,tickets_closed,
+               prs_merged,commits_pushed,output_basis,queue_wait_p90_s,throttled_share,
+               memory_headroom_min,thermal_headroom_min,slots_busy_equals_sustainable,
+               knee_signal,knee_reason,source_basis,build_slots_busy,build_slots_sustainable,
+               measurement_values FROM capacity_step_before_demand_coverage;
+             DROP TABLE capacity_step_before_demand_coverage;",
+        )?;
+    } else {
+        tx.execute_batch("DROP VIEW IF EXISTS unrecorded_hosts_at_zero_deficit")?;
+        for statement in schema::CAPACITY_VIEWS {
+            if let Some(name) = statement.split_whitespace().nth(2) {
+                tx.execute_batch(&format!("DROP VIEW IF EXISTS {name}"))?;
+            }
+        }
+    }
+    for statement in schema::CAPACITY_VIEWS {
+        tx.execute_batch(statement)?;
+    }
     Ok(())
 }
 
@@ -337,7 +510,11 @@ impl Ledger {
                 apply_v6(&tx)?;
                 tx.commit()?;
             }
-            6 => {}
+            6 => {
+                let tx = connection.transaction()?;
+                refresh_v6_host_output_view(&tx)?;
+                tx.commit()?;
+            }
             found => {
                 return Err(LedgerError::UnsupportedVersion {
                     path: path.to_owned(),
@@ -661,6 +838,7 @@ impl LedgerRows {
 ///
 /// An unknown view, `--since` on a view without a time, a missing or newer ledger, or a
 /// database failure. Nothing is written, migrated or locked.
+#[implements("FR-041-AC-11")]
 pub fn query(path: &Path, view: &str, since: Option<Duration>) -> Result<LedgerRows, LedgerError> {
     if !QUERYABLE.contains(&view) {
         return Err(LedgerError::UnknownView(view.to_owned()));
@@ -717,7 +895,13 @@ pub fn query(path: &Path, view: &str, since: Option<Duration>) -> Result<LedgerR
                 rusqlite::types::ValueRef::Real(f) => serde_json::Number::from_f64(f)
                     .map_or(serde_json::Value::Null, serde_json::Value::Number),
                 rusqlite::types::ValueRef::Text(t) => {
-                    serde_json::Value::String(String::from_utf8_lossy(t).into_owned())
+                    let text = String::from_utf8_lossy(t).into_owned();
+                    if name == "source_basis" {
+                        serde_json::from_str(&text)
+                            .unwrap_or_else(|_| serde_json::Value::String(text))
+                    } else {
+                        serde_json::Value::String(text)
+                    }
                 }
                 rusqlite::types::ValueRef::Blob(_) => serde_json::Value::Null,
             };

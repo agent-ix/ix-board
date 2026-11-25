@@ -5,8 +5,8 @@
 
 use ix_board::fleet::ledger::{Ledger, TickCommit, tick_metrics};
 use ix_board::fleet::tick::{
-    Action, ActionKind, LanePr, ReadyWork, StandingOrders, TickFacts, TickOutput, TickSettings,
-    TickSources, Unread, caller_from,
+    Action, ActionKind, LanePr, LanePrRead, NeedReadyTicketsRead, ReadyWork, StandingOrders,
+    TickFacts, TickOutput, TickSettings, TickSources, Unread, caller_from,
 };
 use ix_board::fleet::{
     ClassKind, Defect, DefectKind, Evidence, FleetConfig, FleetReport, HostSummary, LaneRow,
@@ -871,7 +871,7 @@ impl TickSources for Recording {
         self.calls.set(self.calls.get() + 1);
         Err(Unread::Failed(SourceError("down".to_owned())))
     }
-    fn lane_prs(&self) -> Result<Vec<LanePr>, Unread> {
+    fn lane_prs(&self) -> Result<LanePrRead, Unread> {
         self.calls.set(self.calls.get() + 1);
         Err(Unread::Unwired("SWM-282"))
     }
@@ -879,9 +879,12 @@ impl TickSources for Recording {
         self.calls.set(self.calls.get() + 1);
         Ok(ReadyWork::default())
     }
-    fn need_ready_tickets(&self) -> Result<Vec<ix_board::fleet::tick::NeedReadyTickets>, Unread> {
+    fn need_ready_tickets(&self) -> Result<NeedReadyTicketsRead, Unread> {
         self.calls.set(self.calls.get() + 1);
-        Ok(Vec::new())
+        Ok(NeedReadyTicketsRead {
+            complete: true,
+            ..NeedReadyTicketsRead::default()
+        })
     }
     fn capacity_throttle_samples(
         &self,
@@ -1238,7 +1241,7 @@ impl TickSources for FailingAssignments {
     fn host_busy(&self) -> Result<BTreeMap<String, f64>, Unread> {
         Ok(BTreeMap::new())
     }
-    fn lane_prs(&self) -> Result<Vec<LanePr>, Unread> {
+    fn lane_prs(&self) -> Result<LanePrRead, Unread> {
         Err(Unread::Unwired("SWM-282"))
     }
     fn ready_work(&self) -> Result<ReadyWork, Unread> {

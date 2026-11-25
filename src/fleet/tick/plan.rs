@@ -513,6 +513,7 @@ impl Ctx<'_> {
     }
 
     #[implements("FR-038-AC-24")]
+    #[implements("FR-041-AC-24")]
     fn ready_buffer(&mut self) {
         let Some(projects) = &self.input.facts.need_ready_tickets else {
             return;
@@ -546,6 +547,7 @@ fn millis(d: std::time::Duration) -> i64 {
 
 /// Plans one tick.
 #[implements("FR-038-AC-24")]
+#[implements("FR-041-AC-24")]
 pub fn plan(input: &PlanInput<'_>) -> Plan {
     let mut ctx = Ctx {
         input,
@@ -740,7 +742,23 @@ pub fn plan(input: &PlanInput<'_>) -> Plan {
         } else {
             !live.contains(&(open.kind, open.subject.clone()))
         };
-        if cleared {
+        let source_unavailable = match open.kind {
+            ActionKind::NeedReadyTickets => {
+                input.facts.need_ready_tickets.is_none()
+                    || input.facts.need_ready_tickets_complete == Some(false)
+            }
+            ActionKind::EscalateStalePr => {
+                input.facts.prs.is_none()
+                    || input.facts.pr_unavailable.iter().any(|unavailable| {
+                        unavailable
+                            .lane
+                            .as_deref()
+                            .is_none_or(|lane| lane.eq_ignore_ascii_case(&open.subject))
+                    })
+            }
+            _ => false,
+        };
+        if cleared && !source_unavailable {
             out.resolved.push(open.clone());
         }
     }
@@ -765,6 +783,7 @@ mod tests {
     use super::*;
     use crate::fleet::FleetReport;
     use crate::fleet::tick::NeedReadyTickets;
+    use ix_trace_rs::trace;
 
     #[test]
     fn positive_ready_buffer_deficit_routes_to_its_project_planner() {
@@ -815,5 +834,96 @@ mod tests {
             Some("draco:factory:minder")
         );
         assert_eq!(action.action.detail["need"], 3);
+    }
+
+    #[trace("FR-041-AC-24")]
+    #[test]
+    fn unavailable_saturation_or_pr_source_does_not_resolve_open_conditions() {
+        let report = FleetReport {
+            schema_version: 1,
+            complete: false,
+            run_ms: 2_000,
+            rows: Vec::new(),
+            hosts: Vec::new(),
+            defects: Vec::new(),
+            host_busy: BTreeMap::new(),
+            relay_unavailable: false,
+        };
+        let settings = TickSettings::default();
+        let facts = TickFacts::default();
+        let capacity = Capacity::default();
+        let orders = StandingOrders::Missing;
+        for kind in [ActionKind::NeedReadyTickets, ActionKind::EscalateStalePr] {
+            let open = [OpenAction {
+                id: 9,
+                kind,
+                subject: "QSL".to_owned(),
+                started_at: 1_000,
+                due_by: 2_000,
+                rung: None,
+                parent: None,
+            }];
+            let plan = plan(&PlanInput {
+                report: &report,
+                first_seen: &[],
+                settings: &settings,
+                interval_ms: 300_000,
+                facts: &facts,
+                capacity: &capacity,
+                orders: &orders,
+                open: &open,
+            });
+            assert!(plan.resolved.is_empty(), "{kind:?} source is unavailable");
+        }
+    }
+
+    #[trace("FR-041-AC-24")]
+    #[test]
+    fn partial_saturation_emits_known_need_and_preserves_other_project_condition() {
+        let report = FleetReport {
+            schema_version: 1,
+            complete: false,
+            run_ms: 2_000,
+            rows: Vec::new(),
+            hosts: Vec::new(),
+            defects: Vec::new(),
+            host_busy: BTreeMap::new(),
+            relay_unavailable: false,
+        };
+        let settings = TickSettings::default();
+        let facts = TickFacts {
+            need_ready_tickets: Some(vec![NeedReadyTickets {
+                project: "QSL".to_owned(),
+                planner: "draco:factory:minder".to_owned(),
+                need: 2,
+                ready: 1,
+                lanes: 1,
+            }]),
+            need_ready_tickets_complete: Some(false),
+            ..TickFacts::default()
+        };
+        let open = [OpenAction {
+            id: 9,
+            kind: ActionKind::NeedReadyTickets,
+            subject: "Other project".to_owned(),
+            started_at: 1_000,
+            due_by: 2_000,
+            rung: None,
+            parent: None,
+        }];
+        let result = plan(&PlanInput {
+            report: &report,
+            first_seen: &[],
+            settings: &settings,
+            interval_ms: 300_000,
+            facts: &facts,
+            capacity: &Capacity::default(),
+            orders: &StandingOrders::Missing,
+            open: &open,
+        });
+        assert!(result.actions.iter().any(|action| {
+            action.action.kind == ActionKind::NeedReadyTickets && action.action.subject == "QSL"
+        }));
+        assert!(result.resolved.is_empty());
     }
 }

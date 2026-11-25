@@ -6,9 +6,11 @@ use crate::fleet::capacity::{
     Availability, CapacityError, LaneOutputMeasurement as SourceLaneOutput, Observation,
     WindowRequest,
 };
+use crate::fleet::ledger::query as query_ledger;
 use ix_trace_rs::trace;
 use rusqlite::Connection;
 use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const START: i64 = 1_000_000;
 
@@ -31,6 +33,7 @@ fn capacity_config() -> FleetConfig {
         "draco".to_owned(),
         crate::fleet::config::HostCapacityLimits {
             build_slots: Some(2),
+            lane_capacity: None,
             memory_reserve_bytes: Some(1024),
             thermal_limit_celsius: Some(85.0),
         },
@@ -106,6 +109,7 @@ impl MeasurementSource for BrokenSource {
 }
 
 #[test]
+#[trace("FR-041-AC-11")]
 fn run_window_and_level_round_trip_with_each_field_basis() {
     let (_dir, path) = path();
     let config = capacity_config();
@@ -122,7 +126,8 @@ fn run_window_and_level_round_trip_with_each_field_basis() {
             ledger
                 .connection
                 .execute(
-                    "INSERT INTO saturation_sample(host,at,deficit) VALUES('draco',?1,0)",
+                    "INSERT INTO saturation_sample(host,at,deficit,source_basis,coverage,ready_buffer,active_lanes,supplied_lanes,unsupplied_lanes,ready_share,registry_current)
+                     VALUES('draco',?1,0,'test',1.0,2,2,0,2,2,1)",
                     [at],
                 )
                 .unwrap();
@@ -160,6 +165,9 @@ fn run_window_and_level_round_trip_with_each_field_basis() {
         "git.push_events"
     );
     assert_eq!(history.runs[0].found_level, Some(2));
+    let output_share = query_ledger(&path, "host_output_share_of_recorded_level", None).unwrap();
+    assert!(output_share.rows[0]["source_basis"].is_object());
+    assert!(output_share.rows[0].get("unavailable_reason").is_some());
     let exposition = metrics(&path).unwrap();
     assert!(exposition.contains("ix_fleet_capacity_recorded_level{host=\"draco\"} 2"));
     assert!(
@@ -171,12 +179,21 @@ fn run_window_and_level_round_trip_with_each_field_basis() {
         rampup_end + 3_602_000,
         &[SaturationSampleInput {
             host: "draco",
+            active_lanes: 2,
+            supplied_lanes: Some(0),
+            unsupplied_lanes: Some(2),
+            registry_current: true,
+            ready_buffer: Some(2),
+            ready_share: Some(2),
             deficit: Some(2),
+            source_basis: "{}".to_owned(),
+            reason: None,
+            coverage: Some(1.0),
         }],
     )
     .unwrap();
     assert!(
-        metrics(&path)
+        metrics_at(&path, rampup_end + 3_602_000)
             .unwrap()
             .contains("ix_fleet_ready_buffer_deficit{host=\"draco\"} 2")
     );
@@ -185,6 +202,457 @@ fn run_window_and_level_round_trip_with_each_field_basis() {
         json["steps"][0]["source_basis"]["memory_headroom_min"]["availability"],
         "available"
     );
+}
+
+#[test]
+#[trace("FR-041-AC-11")]
+fn saturation_coverage_controls_window_validity_when_metrics_are_unavailable() {
+    let (_dir, path) = path();
+    let config = capacity_config();
+    let run_id = start(&path, &config, "draco", "first", START).unwrap();
+    let rampup_end = START + i64::try_from(config.capacity_rampup.as_millis()).unwrap();
+    let window = open_step(&path, &config, run_id, 2, None, START, rampup_end).unwrap();
+    for tick in 1..=12 {
+        let at = rampup_end + i64::from(tick) * 300_000;
+        record_saturation_samples(
+            &path,
+            &config,
+            at,
+            &[SaturationSampleInput {
+                host: "draco",
+                active_lanes: 2,
+                supplied_lanes: Some(0),
+                unsupplied_lanes: Some(2),
+                registry_current: true,
+                ready_buffer: Some(2),
+                ready_share: Some(2),
+                deficit: Some(0),
+                source_basis: "{}".to_owned(),
+                reason: None,
+                coverage: Some(1.0),
+            }],
+        )
+        .unwrap();
+    }
+    let mut measurement = sample(&WindowRequest {
+        host: window.host,
+        lanes: window.lanes,
+        start_ms: rampup_end,
+        end_ms: rampup_end + 3_600_000,
+        rampup_end_ms: rampup_end,
+    });
+    measurement.build_slots_busy =
+        Observation::unavailable("ix_build_slots_busy", "series_missing", None);
+    measurement.build_slots_sustainable =
+        Observation::unavailable("config", "not_configured", None);
+    measurement.host_output_per_hour = Observation::unavailable("output", "source_missing", None);
+    measurement.output_basis = Observation::unavailable("output", "source_missing", None);
+    measurement.queue_wait_p90_s =
+        Observation::unavailable("ix_build_queue_wait_seconds_bucket", "series_missing", None);
+    measurement.throttled_share =
+        Observation::unavailable("admission_only", "series_missing", None);
+    measurement.memory_headroom_min = Observation::unavailable("memory", "series_missing", None);
+    measurement.thermal_headroom_min = Observation::unavailable("thermal", "series_missing", None);
+    measurement.slots_busy_equals_sustainable =
+        Observation::unavailable("slots", "source_missing", None);
+    record_window(&path, &config, run_id, 1, None, &measurement).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    let (valid, basis): (i64, String) = connection
+        .query_row(
+            "SELECT valid,source_basis FROM capacity_step WHERE run_id=?1 AND step_no=1",
+            [run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(valid, 1);
+    let basis: serde_json::Value = serde_json::from_str(&basis).unwrap();
+    assert_eq!(basis["knee_signal"]["availability"], "unavailable");
+    assert_eq!(basis["knee_signal"]["reason"], "knee_inputs_unavailable");
+}
+
+#[test]
+#[trace("FR-041-AC-11")]
+fn demand_coverage_validates_positive_deficit_and_names_short_demand() {
+    let run_case = |ready_buffer: u32| {
+        let (_dir, path) = path();
+        let config = capacity_config();
+        let run_id = start(&path, &config, "draco", "first", START).unwrap();
+        let rampup_end = START + i64::try_from(config.capacity_rampup.as_millis()).unwrap();
+        let window = open_step(&path, &config, run_id, 2, None, START, rampup_end).unwrap();
+        for tick in 1..=12 {
+            record_saturation_samples(
+                &path,
+                &config,
+                rampup_end + i64::from(tick) * 300_000,
+                &[SaturationSampleInput {
+                    host: "draco",
+                    active_lanes: 2,
+                    supplied_lanes: Some(0),
+                    unsupplied_lanes: Some(2),
+                    registry_current: true,
+                    ready_buffer: Some(ready_buffer),
+                    ready_share: Some(ready_buffer),
+                    deficit: Some(4),
+                    source_basis: "{}".to_owned(),
+                    reason: None,
+                    coverage: Some(1.0),
+                }],
+            )
+            .unwrap();
+        }
+        let request = WindowRequest {
+            host: window.host,
+            lanes: window.lanes,
+            start_ms: rampup_end,
+            end_ms: rampup_end + 3_600_000,
+            rampup_end_ms: rampup_end,
+        };
+        record_window(&path, &config, run_id, 1, None, &sample(&request)).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .query_row(
+                "SELECT valid,inconclusive_reason FROM capacity_step WHERE run_id=?1 AND step_no=1",
+                [run_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .unwrap()
+    };
+    assert_eq!(run_case(2), (1, None));
+    assert_eq!(run_case(1), (0, Some("demand_short".to_owned())));
+}
+
+#[test]
+#[trace("FR-041-AC-11")]
+fn demand_coverage_does_not_depend_on_deficit_availability() {
+    let (_dir, path) = path();
+    let config = capacity_config();
+    let run_id = start(&path, &config, "draco", "first", START).unwrap();
+    let rampup_end = START + i64::try_from(config.capacity_rampup.as_millis()).unwrap();
+    let window = open_step(&path, &config, run_id, 2, None, START, rampup_end).unwrap();
+    for tick in 1..=12 {
+        record_saturation_samples(
+            &path,
+            &config,
+            rampup_end + i64::from(tick) * 300_000,
+            &[SaturationSampleInput {
+                host: "draco",
+                active_lanes: 2,
+                supplied_lanes: Some(0),
+                unsupplied_lanes: Some(2),
+                registry_current: true,
+                ready_buffer: Some(2),
+                ready_share: Some(2),
+                deficit: None,
+                source_basis: "{}".to_owned(),
+                reason: Some("deficit_unavailable"),
+                coverage: Some(1.0),
+            }],
+        )
+        .unwrap();
+    }
+    let request = WindowRequest {
+        host: window.host,
+        lanes: window.lanes,
+        start_ms: rampup_end,
+        end_ms: rampup_end + 3_600_000,
+        rampup_end_ms: rampup_end,
+    };
+    record_window(&path, &config, run_id, 1, None, &sample(&request)).unwrap();
+    let (valid, basis): (i64, String) = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT valid,source_basis FROM capacity_step WHERE run_id=?1 AND step_no=1",
+            [run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(valid, 1);
+    let basis: serde_json::Value = serde_json::from_str(&basis).unwrap();
+    assert_eq!(
+        basis["deficit_zero_throughout"]["availability"],
+        "unavailable"
+    );
+    assert_eq!(basis["demand_coverage"]["availability"], "available");
+}
+
+#[test]
+#[trace("FR-041-AC-11", "FR-041-AC-17")]
+fn discovery_start_view_requires_demand_and_an_available_run_slot() {
+    let (_dir, path) = path();
+    let config = capacity_config();
+    let now = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let sampled_at = now - 1_000;
+    record_saturation_samples(
+        &path,
+        &config,
+        sampled_at,
+        &[SaturationSampleInput {
+            host: "draco",
+            active_lanes: 0,
+            supplied_lanes: Some(0),
+            unsupplied_lanes: Some(0),
+            registry_current: true,
+            ready_buffer: Some(1),
+            ready_share: Some(1),
+            deficit: None,
+            source_basis: "{}".to_owned(),
+            reason: None,
+            coverage: Some(1.0),
+        }],
+    )
+    .unwrap();
+    assert_eq!(
+        query_ledger(&path, "unrecorded_hosts_without_discovery_run", None)
+            .unwrap()
+            .rows
+            .len(),
+        1
+    );
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO capacity_run(host,trigger,started_at)
+             VALUES('draco','first',?1)",
+            [now],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(
+        query_ledger(&path, "unrecorded_hosts_without_discovery_run", None)
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE capacity_run SET ended_at=?1,end_reason='inconclusive_no_demand'
+             WHERE ended_at IS NULL",
+            [now + 1],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO capacity_run(host,trigger,started_at,ended_at,end_reason)
+             VALUES('draco','first',?1,?2,'inconclusive_no_demand')",
+            rusqlite::params![now, now + 1],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(
+        query_ledger(&path, "unrecorded_hosts_without_discovery_run", None)
+            .unwrap()
+            .rows
+            .is_empty(),
+        "the cap is evaluated against today's runs"
+    );
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE saturation_sample SET at=?1 WHERE host='draco'",
+            [sampled_at - 600_001],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(
+        query_ledger(&path, "unrecorded_hosts_without_discovery_run", None)
+            .unwrap()
+            .rows
+            .is_empty(),
+        "stale samples cannot start a discovery run"
+    );
+}
+
+#[test]
+#[trace("FR-041-AC-11")]
+fn partial_host_coverage_cannot_certify_demand() {
+    let (_dir, path) = path();
+    let config = capacity_config();
+    let run_id = start(&path, &config, "draco", "first", START).unwrap();
+    let rampup_end = START + i64::try_from(config.capacity_rampup.as_millis()).unwrap();
+    let window = open_step(&path, &config, run_id, 2, None, START, rampup_end).unwrap();
+    for tick in 1..=12 {
+        let partial = tick == 1;
+        record_saturation_samples(
+            &path,
+            &config,
+            rampup_end + i64::from(tick) * 300_000,
+            &[SaturationSampleInput {
+                host: "draco",
+                active_lanes: 2,
+                supplied_lanes: Some(0),
+                unsupplied_lanes: Some(2),
+                registry_current: true,
+                ready_buffer: Some(2),
+                ready_share: Some(2),
+                deficit: Some(0),
+                source_basis: "{}".to_owned(),
+                reason: partial.then_some("partial_deficit_from_hosts_with_usable_supply_and_duty"),
+                coverage: Some(if partial { 0.5 } else { 1.0 }),
+            }],
+        )
+        .unwrap();
+    }
+    let request = WindowRequest {
+        host: window.host,
+        lanes: window.lanes,
+        start_ms: rampup_end,
+        end_ms: rampup_end + 3_600_000,
+        rampup_end_ms: rampup_end,
+    };
+    record_window(&path, &config, run_id, 1, None, &sample(&request)).unwrap();
+    let valid: i64 = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT valid FROM capacity_step WHERE run_id=?1 AND step_no=1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(valid, 0);
+}
+
+#[test]
+#[trace("FR-041-AC-11")]
+fn duplicate_and_clumped_saturation_samples_do_not_inflate_window_coverage() {
+    let (_dir, path) = path();
+    let config = capacity_config();
+    let run_id = start(&path, &config, "draco", "first", START).unwrap();
+    let rampup_end = START + i64::try_from(config.capacity_rampup.as_millis()).unwrap();
+    let window = open_step(&path, &config, run_id, 2, None, START, rampup_end).unwrap();
+    for sample_no in 0..6 {
+        for _duplicate in 0..2 {
+            record_saturation_samples(
+                &path,
+                &config,
+                rampup_end + 300_000 + i64::from(sample_no) * 10_000,
+                &[SaturationSampleInput {
+                    host: "draco",
+                    active_lanes: 2,
+                    supplied_lanes: Some(0),
+                    unsupplied_lanes: Some(2),
+                    registry_current: true,
+                    ready_buffer: Some(2),
+                    ready_share: Some(2),
+                    deficit: Some(0),
+                    source_basis: "{}".to_owned(),
+                    reason: None,
+                    coverage: Some(1.0),
+                }],
+            )
+            .unwrap();
+        }
+    }
+    let request = WindowRequest {
+        host: window.host,
+        lanes: window.lanes,
+        start_ms: rampup_end,
+        end_ms: rampup_end + 3_600_000,
+        rampup_end_ms: rampup_end,
+    };
+    record_window(&path, &config, run_id, 1, None, &sample(&request)).unwrap();
+    let (valid, reason, coverage): (i64, Option<String>, f64) = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT valid,inconclusive_reason,deficit_coverage
+             FROM capacity_step WHERE run_id=?1 AND step_no=1",
+            [run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(valid, 0);
+    assert_eq!(reason.as_deref(), Some("deficit_coverage"));
+    assert!(coverage < 0.9);
+}
+
+#[test]
+#[trace("FR-041-AC-11")]
+fn version_six_ledger_refreshes_output_share_provenance_columns() {
+    let (_dir, path) = path();
+    let config = capacity_config();
+    drop(Ledger::open(&path, &config).unwrap());
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "DROP VIEW host_output_share_of_recorded_level;
+             ALTER TABLE host_output_sample DROP COLUMN sample_interval_ms;
+             ALTER TABLE saturation_sample DROP COLUMN source_basis;
+             ALTER TABLE saturation_sample DROP COLUMN unavailable_reason;
+             ALTER TABLE saturation_sample DROP COLUMN coverage",
+        )
+        .unwrap();
+    drop(Ledger::open(&path, &config).unwrap());
+    let connection = Connection::open(&path).unwrap();
+    let columns = connection
+        .prepare("PRAGMA table_info(host_output_share_of_recorded_level)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(columns.iter().any(|column| column == "source_basis"));
+    assert!(columns.iter().any(|column| column == "unavailable_reason"));
+    assert!(columns.iter().any(|column| column == "sample_interval_ms"));
+    let saturation_columns = connection
+        .prepare("PRAGMA table_info(saturation_sample)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(
+        saturation_columns
+            .iter()
+            .any(|column| column == "source_basis")
+    );
+    assert!(
+        saturation_columns
+            .iter()
+            .any(|column| column == "unavailable_reason")
+    );
+    assert!(saturation_columns.iter().any(|column| column == "coverage"));
+}
+
+#[test]
+#[trace("FR-041-AC-21")]
+fn host_output_share_normalizes_multi_hour_samples() {
+    let (_dir, path) = path();
+    let config = capacity_config();
+    drop(Ledger::open(&path, &config).unwrap());
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO capacity_step(run_id,step_no,host,valid,output_basis,host_output_per_hour)
+               VALUES(1,1,'draco',1,'tickets_prs',3.0),(1,2,'draco',1,'tickets_prs',4.0);
+             INSERT INTO capacity_level(host,level,output_basis,recorded_at,run_id,reason,evidence_steps)
+               VALUES('draco',2,'tickets_prs',1000,1,'step_bound','[1,2]');
+             INSERT INTO host_output_sample(host,at,lanes,tickets_closed,prs_merged,commits_pushed,
+               source_basis,sample_interval_ms)
+               VALUES('draco',14401000,2,6,2,NULL,
+                 '{\"tickets_closed\":{\"availability\":\"available\"},\"prs_merged\":{\"availability\":\"available\"}}',
+                 14400000);",
+        )
+        .unwrap();
+    drop(connection);
+    let output_share = query_ledger(&path, "host_output_share_of_recorded_level", None).unwrap();
+    assert_eq!(output_share.rows.len(), 1);
+    assert_eq!(output_share.rows[0]["step_no"], 2);
+    assert_eq!(output_share.rows[0]["sample_interval_ms"], 14_400_000);
+    assert_eq!(output_share.rows[0]["output_per_hour"], 2.0);
+    assert_eq!(output_share.rows[0]["share_percent"], 50.0);
+    let exposition = metrics_at(&path, 14_401_000).unwrap();
+    assert!(
+        exposition.contains("ix_fleet_host_output_share_of_recorded_level{host=\"draco\"} 0.5")
+    );
+    assert!(exposition.contains(
+        "ix_fleet_host_output_share_of_recorded_level_timestamp_seconds{host=\"draco\"} 14401"
+    ));
 }
 
 #[test]
@@ -198,7 +666,16 @@ fn unavailable_saturation_deficit_is_not_exported_as_zero() {
         START,
         &[SaturationSampleInput {
             host: "draco",
+            active_lanes: 2,
+            supplied_lanes: Some(0),
+            unsupplied_lanes: Some(2),
+            registry_current: true,
+            ready_buffer: None,
+            ready_share: None,
             deficit: None,
+            source_basis: "{}".to_owned(),
+            reason: Some("supply_unavailable"),
+            coverage: Some(0.0),
         }],
     )
     .unwrap();
@@ -207,6 +684,54 @@ fn unavailable_saturation_deficit_is_not_exported_as_zero() {
             .unwrap()
             .contains("ix_fleet_ready_buffer_deficit{host=\"draco\"}")
     );
+}
+
+#[test]
+#[trace("FR-041-AC-7")]
+fn ready_deficit_export_requires_a_fresh_sample_and_exposes_its_timestamp() {
+    let (_dir, path) = path();
+    let config = capacity_config();
+    let now = 10_000_000_i64;
+    record_saturation_samples(
+        &path,
+        &config,
+        now - 601_000,
+        &[SaturationSampleInput {
+            host: "draco",
+            active_lanes: 2,
+            supplied_lanes: Some(0),
+            unsupplied_lanes: Some(2),
+            registry_current: true,
+            ready_buffer: Some(3),
+            ready_share: Some(2),
+            deficit: Some(3),
+            source_basis: r#"{"deficit":{"source":"fleet.capacity.known_hosts_only"}}"#.to_owned(),
+            reason: None,
+            coverage: Some(1.0),
+        }],
+    )
+    .unwrap();
+    let persisted: (String, Option<String>, Option<f64>) = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT source_basis,unavailable_reason,coverage FROM saturation_sample
+             WHERE lower(host)='draco' ORDER BY at DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        persisted.0,
+        r#"{"deficit":{"source":"fleet.capacity.known_hosts_only"}}"#
+    );
+    assert_eq!(persisted.1, None);
+    assert_eq!(persisted.2, Some(1.0));
+    let exposition = metrics_at(&path, now).unwrap();
+    assert!(!exposition.contains("ix_fleet_ready_buffer_deficit{host=\"draco\"}"));
+    assert!(exposition.contains("ix_fleet_ready_buffer_deficit_timestamp_seconds{host=\"draco\"}"));
+    assert!(exposition.contains(
+        "ix_fleet_ready_buffer_deficit_unavailable{host=\"draco\",reason=\"sample_stale\"} 1"
+    ));
 }
 
 #[test]

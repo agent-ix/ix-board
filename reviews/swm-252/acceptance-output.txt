@@ -1,0 +1,2223 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running tests/fleet_live_acceptance.rs (target/debug/deps/fleet_live_acceptance-4b27cdae84e8fbf9)
+
+running 1 test
+work-event coverage: host=draco lane=draco:QSL:arch ticket=Some("QSL-2997") available_from_ms=1795308489241 window_start_ms=1795631500000 pages=2 matched=true
+work-event coverage: host=titan lane=titan:QSL:lead-conf ticket=None available_from_ms=1795308489241 window_start_ms=1795631500000 pages=2 matched=false
+
+=== ix-board fleet saturation --json ===
+{
+  "complete": false,
+  "hosts": [
+    {
+      "active_lanes": 20,
+      "build_slots_busy": {
+        "coverage": null,
+        "reason": "series_missing",
+        "source": "prometheus.ix_build_slots_busy",
+        "value": null
+      },
+      "build_slots_configured": {
+        "coverage": null,
+        "reason": "series_missing",
+        "source": "prometheus.ix_build_slots_configured",
+        "value": null
+      },
+      "duty": {
+        "coverage": 0.975,
+        "reason": "excluded_11_of_20_lanes_for_coverage_or_minimum_observation",
+        "source": "prometheus.ix_fleet_lane_compile_seconds_total{job=ix-relay-watcher}/ix_fleet_lane_state_ratio_presence",
+        "value": 0.0557614548054345
+      },
+      "host": "draco",
+      "lane_capacity": {
+        "coverage": null,
+        "reason": "lane_capacity_not_configured",
+        "source": "relay.server_capacity.max_agents",
+        "value": null
+      },
+      "lanes_needed": {
+        "coverage": 0.975,
+        "reason": "lane_capacity_not_configured",
+        "source": "ceil(ix_board_config.fleet.capacity_limits.build_slots/mean_relay_watcher_lane_duty)",
+        "value": null
+      },
+      "ready_buffer": {
+        "coverage": null,
+        "reason": "project_buffer_pending",
+        "source": "linear.ready_queue",
+        "value": null
+      },
+      "ready_buffer_deficit": {
+        "coverage": null,
+        "reason": "project_buffer_pending",
+        "source": "fleet.capacity",
+        "value": null
+      },
+      "sustainable_slots": {
+        "coverage": 1.0,
+        "reason": null,
+        "source": "ix_board_config:fleet.capacity_limits.draco.build_slots",
+        "value": 6
+      },
+      "target_ready": {
+        "coverage": null,
+        "reason": "lanes_needed_unavailable",
+        "source": "fleet.capacity",
+        "value": null
+      }
+    },
+    {
+      "active_lanes": 13,
+      "build_slots_busy": {
+        "coverage": null,
+        "reason": "series_missing",
+        "source": "prometheus.ix_build_slots_busy",
+        "value": null
+      },
+      "build_slots_configured": {
+        "coverage": null,
+        "reason": "series_missing",
+        "source": "prometheus.ix_build_slots_configured",
+        "value": null
+      },
+      "duty": {
+        "coverage": 0.925,
+        "reason": "excluded_6_of_13_lanes_for_coverage_or_minimum_observation",
+        "source": "prometheus.ix_fleet_lane_compile_seconds_total{job=ix-relay-watcher}/ix_fleet_lane_state_ratio_presence",
+        "value": 0.1996966450959719
+      },
+      "host": "titan",
+      "lane_capacity": {
+        "coverage": null,
+        "reason": "lane_capacity_not_configured",
+        "source": "relay.server_capacity.max_agents",
+        "value": null
+      },
+      "lanes_needed": {
+        "coverage": 0.925,
+        "reason": "lane_capacity_not_configured",
+        "source": "ceil(ix_board_config.fleet.capacity_limits.build_slots/mean_relay_watcher_lane_duty)",
+        "value": null
+      },
+      "ready_buffer": {
+        "coverage": null,
+        "reason": "project_buffer_pending",
+        "source": "linear.ready_queue",
+        "value": null
+      },
+      "ready_buffer_deficit": {
+        "coverage": null,
+        "reason": "project_buffer_pending",
+        "source": "fleet.capacity",
+        "value": null
+      },
+      "sustainable_slots": {
+        "coverage": 1.0,
+        "reason": null,
+        "source": "ix_board_config:fleet.capacity_limits.titan.build_slots",
+        "value": 4
+      },
+      "target_ready": {
+        "coverage": null,
+        "reason": "lanes_needed_unavailable",
+        "source": "fleet.capacity",
+        "value": null
+      }
+    }
+  ],
+  "observed_at_ms": 1795639523372,
+  "projects": [
+    {
+      "lanes": 44,
+      "need": 0,
+      "planner": null,
+      "project": "FSL stability: red main and blowups",
+      "ready": 0
+    }
+  ],
+  "queue_depth": 2,
+  "ready_buffer": {
+    "coverage": 1.0,
+    "reason": null,
+    "source": "linear.ready_queue",
+    "value": 0
+  },
+  "ready_buffer_deficit": {
+    "coverage": null,
+    "reason": "required_supply_or_duty_unavailable",
+    "source": "fleet.capacity",
+    "value": null
+  },
+  "schema_version": 1,
+  "target_ready": {
+    "coverage": null,
+    "reason": "required_supply_or_duty_unavailable",
+    "source": "fleet.capacity",
+    "value": null
+  },
+  "window_secs": 3600
+}
+
+=== ix-board fleet saturation collect --json ===
+{
+  "complete": false,
+  "hosts": [
+    {
+      "active_lanes": 20,
+      "build_slots_busy": {
+        "coverage": null,
+        "reason": "series_missing",
+        "source": "prometheus.ix_build_slots_busy",
+        "value": null
+      },
+      "build_slots_configured": {
+        "coverage": null,
+        "reason": "series_missing",
+        "source": "prometheus.ix_build_slots_configured",
+        "value": null
+      },
+      "duty": {
+        "coverage": 0.975,
+        "reason": "excluded_11_of_20_lanes_for_coverage_or_minimum_observation",
+        "source": "prometheus.ix_fleet_lane_compile_seconds_total{job=ix-relay-watcher}/ix_fleet_lane_state_ratio_presence",
+        "value": 0.0557614548054345
+      },
+      "host": "draco",
+      "lane_capacity": {
+        "coverage": null,
+        "reason": "lane_capacity_not_configured",
+        "source": "relay.server_capacity.max_agents",
+        "value": null
+      },
+      "lanes_needed": {
+        "coverage": 0.975,
+        "reason": "lane_capacity_not_configured",
+        "source": "ceil(ix_board_config.fleet.capacity_limits.build_slots/mean_relay_watcher_lane_duty)",
+        "value": null
+      },
+      "ready_buffer": {
+        "coverage": null,
+        "reason": "project_buffer_pending",
+        "source": "linear.ready_queue",
+        "value": null
+      },
+      "ready_buffer_deficit": {
+        "coverage": null,
+        "reason": "project_buffer_pending",
+        "source": "fleet.capacity",
+        "value": null
+      },
+      "sustainable_slots": {
+        "coverage": 1.0,
+        "reason": null,
+        "source": "ix_board_config:fleet.capacity_limits.draco.build_slots",
+        "value": 6
+      },
+      "target_ready": {
+        "coverage": null,
+        "reason": "lanes_needed_unavailable",
+        "source": "fleet.capacity",
+        "value": null
+      }
+    },
+    {
+      "active_lanes": 13,
+      "build_slots_busy": {
+        "coverage": null,
+        "reason": "series_missing",
+        "source": "prometheus.ix_build_slots_busy",
+        "value": null
+      },
+      "build_slots_configured": {
+        "coverage": null,
+        "reason": "series_missing",
+        "source": "prometheus.ix_build_slots_configured",
+        "value": null
+      },
+      "duty": {
+        "coverage": 0.925,
+        "reason": "excluded_6_of_13_lanes_for_coverage_or_minimum_observation",
+        "source": "prometheus.ix_fleet_lane_compile_seconds_total{job=ix-relay-watcher}/ix_fleet_lane_state_ratio_presence",
+        "value": 0.19976057520918447
+      },
+      "host": "titan",
+      "lane_capacity": {
+        "coverage": null,
+        "reason": "lane_capacity_not_configured",
+        "source": "relay.server_capacity.max_agents",
+        "value": null
+      },
+      "lanes_needed": {
+        "coverage": 0.925,
+        "reason": "lane_capacity_not_configured",
+        "source": "ceil(ix_board_config.fleet.capacity_limits.build_slots/mean_relay_watcher_lane_duty)",
+        "value": null
+      },
+      "ready_buffer": {
+        "coverage": null,
+        "reason": "project_buffer_pending",
+        "source": "linear.ready_queue",
+        "value": null
+      },
+      "ready_buffer_deficit": {
+        "coverage": null,
+        "reason": "project_buffer_pending",
+        "source": "fleet.capacity",
+        "value": null
+      },
+      "sustainable_slots": {
+        "coverage": 1.0,
+        "reason": null,
+        "source": "ix_board_config:fleet.capacity_limits.titan.build_slots",
+        "value": 4
+      },
+      "target_ready": {
+        "coverage": null,
+        "reason": "lanes_needed_unavailable",
+        "source": "fleet.capacity",
+        "value": null
+      }
+    }
+  ],
+  "observed_at_ms": 1795639526431,
+  "projects": [
+    {
+      "lanes": 44,
+      "need": 0,
+      "planner": null,
+      "project": "FSL stability: red main and blowups",
+      "ready": 0
+    }
+  ],
+  "queue_depth": 2,
+  "ready_buffer": {
+    "coverage": 1.0,
+    "reason": null,
+    "source": "linear.ready_queue",
+    "value": 0
+  },
+  "ready_buffer_deficit": {
+    "coverage": null,
+    "reason": "required_supply_or_duty_unavailable",
+    "source": "fleet.capacity",
+    "value": null
+  },
+  "schema_version": 1,
+  "target_ready": {
+    "coverage": null,
+    "reason": "required_supply_or_duty_unavailable",
+    "source": "fleet.capacity",
+    "value": null
+  },
+  "window_secs": 3600
+}
+
+=== ix-board fleet capacity start draco --trigger first --at-ms 1795627900000 --json ===
+1
+
+=== ix-board fleet capacity step draco --lanes 19 --lane-added-at-ms 1795629700000 --rampup-end-ms 1795631500000 --json ===
+{
+  "host": "draco",
+  "lane_added_at_ms": 1795629700000,
+  "lanes": 19,
+  "rampup_end_ms": 1795631500000,
+  "repeat_of": null,
+  "run_id": 1,
+  "step_no": 1
+}
+
+=== ix-board fleet capacity window draco --end-ms 1795635100000 --json ===
+{
+  "build_slots_busy": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "slot_count_unavailable",
+    "source": "prometheus.ix_build_slots_busy",
+    "value": null
+  },
+  "build_slots_sustainable": {
+    "availability": "available",
+    "coverage": 1.0,
+    "observed_at_ms": 1795635100000,
+    "reason": null,
+    "source": "ix_board_config:fleet.capacity_limits.draco.build_slots",
+    "value": 6
+  },
+  "commits_pushed": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "GitHub PR https://github.com/agent-ix/filament-specification/pull/825 has no qsl-2916 ticket id in title or branch",
+    "source": "github.pull_request_commits",
+    "value": null
+  },
+  "derived_sources": {
+    "memory_reserve": "ix_board_config:fleet.capacity_limits.draco.memory_reserve_bytes=8589934592",
+    "thermal_limit": "ix_board_config:fleet.capacity_limits.draco.thermal_limit_celsius=100",
+    "throttled_share": "admission_only"
+  },
+  "host_output_per_hour": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "GitHub PR https://github.com/agent-ix/filament-specification/pull/825 has no qsl-2916 ticket id in title or branch",
+    "source": "capacity_output",
+    "value": null
+  },
+  "lane_output": [
+    {
+      "commits_pushed": {
+        "availability": "unavailable",
+        "coverage": null,
+        "observed_at_ms": null,
+        "reason": "GitHub PR https://github.com/agent-ix/filament-specification/pull/825 has no qsl-2916 ticket id in title or branch",
+        "source": "github.pull_request_commits",
+        "value": null
+      },
+      "lane": "draco:qsl:arch",
+      "prs_merged": {
+        "availability": "available",
+        "coverage": 1.0,
+        "observed_at_ms": 1795635100000,
+        "reason": null,
+        "source": "linear.pull_request.merged_at",
+        "value": 0
+      },
+      "tickets_closed": {
+        "availability": "available",
+        "coverage": 1.0,
+        "observed_at_ms": 1795635100000,
+        "reason": null,
+        "source": "linear.issue.completed_at",
+        "value": 0
+      }
+    }
+  ],
+  "lanes": {
+    "availability": "available",
+    "coverage": 1.0,
+    "observed_at_ms": 1795635100000,
+    "reason": null,
+    "source": "prometheus.ix_fleet_lane_state_ratio.distinct_lanes",
+    "value": 19
+  },
+  "memory_headroom_min": {
+    "availability": "available",
+    "coverage": 1.0,
+    "observed_at_ms": 1795635100000,
+    "reason": null,
+    "source": "host_memory-ix_board_config.memory_reserve_bytes",
+    "value": 19002966016.0
+  },
+  "output_basis": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "tickets_prs_below_threshold_and_commits_unavailable",
+    "source": "capacity_output",
+    "value": null
+  },
+  "prs_merged": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "GitHub PR https://github.com/agent-ix/filament-specification/pull/825 has no qsl-2916 ticket id in title or branch",
+    "source": "github.pull_request.merged_at_by_ticket",
+    "value": null
+  },
+  "queue_wait_p90_s": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "series_missing",
+    "source": "prometheus.ix_build_queue_wait_seconds",
+    "value": null
+  },
+  "rampup_end_ms": 1795631500000,
+  "slots_busy_equals_sustainable": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "slot_values_unavailable",
+    "source": "prometheus.ix_build_slots_busy/config:fleet.capacity_limits.build_slots",
+    "value": null
+  },
+  "thermal_headroom_min": {
+    "availability": "available",
+    "coverage": 1.0,
+    "observed_at_ms": 1795635100000,
+    "reason": null,
+    "source": "ix_board_config.thermal_limit_celsius-host_temperature",
+    "value": 9.6583251953125
+  },
+  "throttled_share": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "admission_blocked_source_unavailable",
+    "source": "admission_only:ix_build_admission_blocked_seconds_total",
+    "value": null
+  },
+  "tickets_closed": {
+    "availability": "available",
+    "coverage": 1.0,
+    "observed_at_ms": 1795635100000,
+    "reason": null,
+    "source": "linear.issue.completed_at",
+    "value": 0
+  },
+  "window_end_ms": 1795635100000,
+  "window_start_ms": 1795631500000
+}
+
+=== ix-board fleet capacity step draco --lanes 19 --lane-added-at-ms 1795629700000 --rampup-end-ms 1795631500000 --repeat-of 1 --json ===
+{
+  "host": "draco",
+  "lane_added_at_ms": 1795629700000,
+  "lanes": 19,
+  "rampup_end_ms": 1795631500000,
+  "repeat_of": 1,
+  "run_id": 1,
+  "step_no": 1
+}
+test live_acceptance_uses_temporary_state_and_prints_source_evidence has been running for over 60 seconds
+
+=== ix-board fleet capacity window draco --end-ms 1795638700000 --json ===
+{
+  "build_slots_busy": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "slot_count_unavailable",
+    "source": "prometheus.ix_build_slots_busy",
+    "value": null
+  },
+  "build_slots_sustainable": {
+    "availability": "available",
+    "coverage": 1.0,
+    "observed_at_ms": 1795638700000,
+    "reason": null,
+    "source": "ix_board_config:fleet.capacity_limits.draco.build_slots",
+    "value": 6
+  },
+  "commits_pushed": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "GitHub PR https://github.com/agent-ix/filament-specification/pull/825 has no qsl-2916 ticket id in title or branch",
+    "source": "github.pull_request_commits",
+    "value": null
+  },
+  "derived_sources": {
+    "memory_reserve": "ix_board_config:fleet.capacity_limits.draco.memory_reserve_bytes=8589934592",
+    "thermal_limit": "ix_board_config:fleet.capacity_limits.draco.thermal_limit_celsius=100",
+    "throttled_share": "admission_only"
+  },
+  "host_output_per_hour": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "GitHub PR https://github.com/agent-ix/filament-specification/pull/825 has no qsl-2916 ticket id in title or branch",
+    "source": "capacity_output",
+    "value": null
+  },
+  "lane_output": [
+    {
+      "commits_pushed": {
+        "availability": "unavailable",
+        "coverage": null,
+        "observed_at_ms": null,
+        "reason": "GitHub PR https://github.com/agent-ix/filament-specification/pull/825 has no qsl-2916 ticket id in title or branch",
+        "source": "github.pull_request_commits",
+        "value": null
+      },
+      "lane": "draco:qsl:arch",
+      "prs_merged": {
+        "availability": "available",
+        "coverage": 1.0,
+        "observed_at_ms": 1795638700000,
+        "reason": null,
+        "source": "linear.pull_request.merged_at",
+        "value": 0
+      },
+      "tickets_closed": {
+        "availability": "available",
+        "coverage": 1.0,
+        "observed_at_ms": 1795638700000,
+        "reason": null,
+        "source": "linear.issue.completed_at",
+        "value": 0
+      }
+    }
+  ],
+  "lanes": {
+    "availability": "available",
+    "coverage": 1.0,
+    "observed_at_ms": 1795638700000,
+    "reason": null,
+    "source": "prometheus.ix_fleet_lane_state_ratio.distinct_lanes",
+    "value": 19
+  },
+  "memory_headroom_min": {
+    "availability": "available",
+    "coverage": 1.0,
+    "observed_at_ms": 1795638700000,
+    "reason": null,
+    "source": "host_memory-ix_board_config.memory_reserve_bytes",
+    "value": 17928110080.0
+  },
+  "output_basis": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "tickets_prs_below_threshold_and_commits_unavailable",
+    "source": "capacity_output",
+    "value": null
+  },
+  "prs_merged": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "GitHub PR https://github.com/agent-ix/filament-specification/pull/825 has no qsl-2916 ticket id in title or branch",
+    "source": "github.pull_request.merged_at_by_ticket",
+    "value": null
+  },
+  "queue_wait_p90_s": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "series_missing",
+    "source": "prometheus.ix_build_queue_wait_seconds",
+    "value": null
+  },
+  "rampup_end_ms": 1795631500000,
+  "slots_busy_equals_sustainable": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "slot_values_unavailable",
+    "source": "prometheus.ix_build_slots_busy/config:fleet.capacity_limits.build_slots",
+    "value": null
+  },
+  "thermal_headroom_min": {
+    "availability": "available",
+    "coverage": 1.0,
+    "observed_at_ms": 1795638700000,
+    "reason": null,
+    "source": "ix_board_config.thermal_limit_celsius-host_temperature",
+    "value": -0.4164886474609375
+  },
+  "throttled_share": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "admission_blocked_source_unavailable",
+    "source": "admission_only:ix_build_admission_blocked_seconds_total",
+    "value": null
+  },
+  "tickets_closed": {
+    "availability": "available",
+    "coverage": 1.0,
+    "observed_at_ms": 1795638700000,
+    "reason": null,
+    "source": "linear.issue.completed_at",
+    "value": 0
+  },
+  "window_end_ms": 1795638700000,
+  "window_start_ms": 1795631500000
+}
+
+=== ix-board fleet capacity end draco --reason inconclusive_no_demand --at-ms 1795638700000 --json ===
+{
+  "recorded_level": null
+}
+
+=== ix-board fleet capacity start titan --trigger first --at-ms 1795627900000 --json ===
+2
+
+=== ix-board fleet capacity step titan --lanes 13 --lane-added-at-ms 1795629700000 --rampup-end-ms 1795631500000 --json ===
+{
+  "host": "titan",
+  "lane_added_at_ms": 1795629700000,
+  "lanes": 13,
+  "rampup_end_ms": 1795631500000,
+  "repeat_of": null,
+  "run_id": 2,
+  "step_no": 1
+}
+
+=== ix-board fleet capacity window titan --end-ms 1795635100000 --json ===
+{
+  "build_slots_busy": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "slot_count_unavailable",
+    "source": "prometheus.ix_build_slots_busy",
+    "value": null
+  },
+  "build_slots_sustainable": {
+    "availability": "available",
+    "coverage": 1.0,
+    "observed_at_ms": 1795635100000,
+    "reason": null,
+    "source": "ix_board_config:fleet.capacity_limits.titan.build_slots",
+    "value": 4
+  },
+  "commits_pushed": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "no assignment ticket maps to a work event in the output window",
+    "source": "github.ticket_linkage",
+    "value": null
+  },
+  "derived_sources": {
+    "memory_reserve": "ix_board_config:fleet.capacity_limits.titan.memory_reserve_bytes=8589934592",
+    "thermal_limit": "ix_board_config:fleet.capacity_limits.titan.thermal_limit_celsius=100",
+    "throttled_share": "admission_only"
+  },
+  "host_output_per_hour": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "no assignment ticket maps to a work event in the output window",
+    "source": "capacity_output",
+    "value": null
+  },
+  "lane_output": [],
+  "lanes": {
+    "availability": "available",
+    "coverage": 1.0,
+    "observed_at_ms": 1795635100000,
+    "reason": null,
+    "source": "prometheus.ix_fleet_lane_state_ratio.distinct_lanes",
+    "value": 13
+  },
+  "memory_headroom_min": {
+    "availability": "available",
+    "coverage": 1.0,
+    "observed_at_ms": 1795635100000,
+    "reason": null,
+    "source": "host_memory-ix_board_config.memory_reserve_bytes",
+    "value": 12634370048.0
+  },
+  "output_basis": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "tickets_prs_below_threshold_and_commits_unavailable",
+    "source": "capacity_output",
+    "value": null
+  },
+  "prs_merged": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "no assignment ticket maps to a work event in the output window",
+    "source": "ledger.assignment_history+agent-msg.work.events",
+    "value": null
+  },
+  "queue_wait_p90_s": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "series_missing",
+    "source": "prometheus.ix_build_queue_wait_seconds",
+    "value": null
+  },
+  "rampup_end_ms": 1795631500000,
+  "slots_busy_equals_sustainable": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "slot_values_unavailable",
+    "source": "prometheus.ix_build_slots_busy/config:fleet.capacity_limits.build_slots",
+    "value": null
+  },
+  "thermal_headroom_min": {
+    "availability": "available",
+    "coverage": 1.0,
+    "observed_at_ms": 1795635100000,
+    "reason": null,
+    "source": "ix_board_config.thermal_limit_celsius-host_temperature",
+    "value": 4.75
+  },
+  "throttled_share": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "admission_blocked_source_unavailable",
+    "source": "admission_only:ix_build_admission_blocked_seconds_total",
+    "value": null
+  },
+  "tickets_closed": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "no assignment ticket maps to a work event in the output window",
+    "source": "ledger.assignment_history+agent-msg.work.events",
+    "value": null
+  },
+  "window_end_ms": 1795635100000,
+  "window_start_ms": 1795631500000
+}
+
+=== ix-board fleet capacity step titan --lanes 13 --lane-added-at-ms 1795629700000 --rampup-end-ms 1795631500000 --repeat-of 1 --json ===
+{
+  "host": "titan",
+  "lane_added_at_ms": 1795629700000,
+  "lanes": 13,
+  "rampup_end_ms": 1795631500000,
+  "repeat_of": 1,
+  "run_id": 2,
+  "step_no": 1
+}
+
+=== ix-board fleet capacity window titan --end-ms 1795638700000 --json ===
+{
+  "build_slots_busy": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "slot_count_unavailable",
+    "source": "prometheus.ix_build_slots_busy",
+    "value": null
+  },
+  "build_slots_sustainable": {
+    "availability": "available",
+    "coverage": 1.0,
+    "observed_at_ms": 1795638700000,
+    "reason": null,
+    "source": "ix_board_config:fleet.capacity_limits.titan.build_slots",
+    "value": 4
+  },
+  "commits_pushed": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "no assignment ticket maps to a work event in the output window",
+    "source": "github.ticket_linkage",
+    "value": null
+  },
+  "derived_sources": {
+    "memory_reserve": "ix_board_config:fleet.capacity_limits.titan.memory_reserve_bytes=8589934592",
+    "thermal_limit": "ix_board_config:fleet.capacity_limits.titan.thermal_limit_celsius=100",
+    "throttled_share": "admission_only"
+  },
+  "host_output_per_hour": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "no assignment ticket maps to a work event in the output window",
+    "source": "capacity_output",
+    "value": null
+  },
+  "lane_output": [],
+  "lanes": {
+    "availability": "available",
+    "coverage": 1.0,
+    "observed_at_ms": 1795638700000,
+    "reason": null,
+    "source": "prometheus.ix_fleet_lane_state_ratio.distinct_lanes",
+    "value": 13
+  },
+  "memory_headroom_min": {
+    "availability": "available",
+    "coverage": 1.0,
+    "observed_at_ms": 1795638700000,
+    "reason": null,
+    "source": "host_memory-ix_board_config.memory_reserve_bytes",
+    "value": 10924376064.0
+  },
+  "output_basis": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "tickets_prs_below_threshold_and_commits_unavailable",
+    "source": "capacity_output",
+    "value": null
+  },
+  "prs_merged": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "no assignment ticket maps to a work event in the output window",
+    "source": "ledger.assignment_history+agent-msg.work.events",
+    "value": null
+  },
+  "queue_wait_p90_s": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "series_missing",
+    "source": "prometheus.ix_build_queue_wait_seconds",
+    "value": null
+  },
+  "rampup_end_ms": 1795631500000,
+  "slots_busy_equals_sustainable": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "slot_values_unavailable",
+    "source": "prometheus.ix_build_slots_busy/config:fleet.capacity_limits.build_slots",
+    "value": null
+  },
+  "thermal_headroom_min": {
+    "availability": "available",
+    "coverage": 1.0,
+    "observed_at_ms": 1795638700000,
+    "reason": null,
+    "source": "ix_board_config.thermal_limit_celsius-host_temperature",
+    "value": 4.625
+  },
+  "throttled_share": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "admission_blocked_source_unavailable",
+    "source": "admission_only:ix_build_admission_blocked_seconds_total",
+    "value": null
+  },
+  "tickets_closed": {
+    "availability": "unavailable",
+    "coverage": null,
+    "observed_at_ms": null,
+    "reason": "no assignment ticket maps to a work event in the output window",
+    "source": "ledger.assignment_history+agent-msg.work.events",
+    "value": null
+  },
+  "window_end_ms": 1795638700000,
+  "window_start_ms": 1795631500000
+}
+
+=== ix-board fleet capacity end titan --reason inconclusive_no_demand --at-ms 1795638700000 --json ===
+{
+  "recorded_level": null
+}
+
+=== ix-board fleet capacity status --json ===
+{
+  "events": [],
+  "hosts": [
+    {
+      "current_run": null,
+      "discovery_state": "ended",
+      "draining_lanes": [],
+      "host": "draco",
+      "recorded_level": null
+    },
+    {
+      "current_run": null,
+      "discovery_state": "none",
+      "draining_lanes": [],
+      "host": "luna",
+      "recorded_level": null
+    },
+    {
+      "current_run": null,
+      "discovery_state": "none",
+      "draining_lanes": [],
+      "host": "terra",
+      "recorded_level": null
+    },
+    {
+      "current_run": null,
+      "discovery_state": "ended",
+      "draining_lanes": [],
+      "host": "titan",
+      "recorded_level": null
+    }
+  ],
+  "levels": [],
+  "open_windows": [],
+  "runs": [
+    {
+      "end_reason": "inconclusive_no_demand",
+      "ended_at": 1795638700000,
+      "found_level": null,
+      "host": "titan",
+      "run_id": 2,
+      "started_at": 1795627900000,
+      "trigger": "first"
+    },
+    {
+      "end_reason": "inconclusive_no_demand",
+      "ended_at": 1795638700000,
+      "found_level": null,
+      "host": "draco",
+      "run_id": 1,
+      "started_at": 1795627900000,
+      "trigger": "first"
+    }
+  ],
+  "steps": [
+    {
+      "build_slots_busy": null,
+      "build_slots_sustainable": 4,
+      "commits_pushed": null,
+      "deficit_coverage": 0.0,
+      "deficit_zero_throughout": false,
+      "host": "titan",
+      "host_output_per_hour": null,
+      "inconclusive_reason": "deficit_coverage",
+      "knee_reason": null,
+      "knee_signal": false,
+      "lane_output": [],
+      "lanes": 13,
+      "measurement_values": {
+        "build_slots_busy": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "slot_count_unavailable",
+          "source": "prometheus.ix_build_slots_busy",
+          "value": null
+        },
+        "build_slots_sustainable": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795638700000,
+          "reason": null,
+          "source": "ix_board_config:fleet.capacity_limits.titan.build_slots",
+          "value": 4
+        },
+        "commits_pushed": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "no assignment ticket maps to a work event in the output window",
+          "source": "github.ticket_linkage",
+          "value": null
+        },
+        "derived_sources": {
+          "memory_reserve": "ix_board_config:fleet.capacity_limits.titan.memory_reserve_bytes=8589934592",
+          "thermal_limit": "ix_board_config:fleet.capacity_limits.titan.thermal_limit_celsius=100",
+          "throttled_share": "admission_only"
+        },
+        "host_output_per_hour": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "no assignment ticket maps to a work event in the output window",
+          "source": "capacity_output",
+          "value": null
+        },
+        "lane_output": [],
+        "lanes": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795638700000,
+          "reason": null,
+          "source": "prometheus.ix_fleet_lane_state_ratio.distinct_lanes",
+          "value": 13
+        },
+        "memory_headroom_min": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795638700000,
+          "reason": null,
+          "source": "host_memory-ix_board_config.memory_reserve_bytes",
+          "value": 10924376064.0
+        },
+        "output_basis": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "tickets_prs_below_threshold_and_commits_unavailable",
+          "source": "capacity_output",
+          "value": null
+        },
+        "prs_merged": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "no assignment ticket maps to a work event in the output window",
+          "source": "ledger.assignment_history+agent-msg.work.events",
+          "value": null
+        },
+        "queue_wait_p90_s": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "series_missing",
+          "source": "prometheus.ix_build_queue_wait_seconds",
+          "value": null
+        },
+        "rampup_end_ms": 1795631500000,
+        "slots_busy_equals_sustainable": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "slot_values_unavailable",
+          "source": "prometheus.ix_build_slots_busy/config:fleet.capacity_limits.build_slots",
+          "value": null
+        },
+        "thermal_headroom_min": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795638700000,
+          "reason": null,
+          "source": "ix_board_config.thermal_limit_celsius-host_temperature",
+          "value": 4.625
+        },
+        "throttled_share": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "admission_blocked_source_unavailable",
+          "source": "admission_only:ix_build_admission_blocked_seconds_total",
+          "value": null
+        },
+        "tickets_closed": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "no assignment ticket maps to a work event in the output window",
+          "source": "ledger.assignment_history+agent-msg.work.events",
+          "value": null
+        },
+        "window_end_ms": 1795638700000,
+        "window_start_ms": 1795631500000
+      },
+      "memory_headroom_min": 10924376064.0,
+      "output_basis": null,
+      "prs_merged": null,
+      "queue_wait_p90_s": null,
+      "rampup_end": 1795631500000,
+      "repeat_of": 1,
+      "run_id": 2,
+      "slots_busy_equals_sustainable": null,
+      "source_basis": {
+        "build_slots_busy": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "slot_count_unavailable",
+          "source": "prometheus.ix_build_slots_busy"
+        },
+        "build_slots_sustainable": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795638700000,
+          "reason": null,
+          "source": "ix_board_config:fleet.capacity_limits.titan.build_slots"
+        },
+        "commits_pushed": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "no assignment ticket maps to a work event in the output window",
+          "source": "github.ticket_linkage"
+        },
+        "deficit_coverage": {
+          "availability": "unavailable",
+          "coverage": 0.0,
+          "observed_at_ms": 1795638700000,
+          "reason": "coverage_below_90_percent",
+          "source": "ledger.saturation_sample"
+        },
+        "deficit_zero_throughout": {
+          "availability": "unavailable",
+          "coverage": 0.0,
+          "observed_at_ms": 1795638700000,
+          "reason": "deficit_sample_unavailable",
+          "source": "ledger.saturation_sample"
+        },
+        "host_output_per_hour": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "no assignment ticket maps to a work event in the output window",
+          "source": "capacity_output"
+        },
+        "knee_signal": {
+          "availability": "unavailable",
+          "coverage": 0.0,
+          "observed_at_ms": 1795638700000,
+          "reason": "knee_inputs_unavailable",
+          "source": "ix-board.FR-041.knee_rule"
+        },
+        "lanes": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795638700000,
+          "reason": null,
+          "source": "prometheus.ix_fleet_lane_state_ratio.distinct_lanes"
+        },
+        "memory_headroom_min": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795638700000,
+          "reason": null,
+          "source": "host_memory-ix_board_config.memory_reserve_bytes"
+        },
+        "memory_reserve": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795638700000,
+          "reason": null,
+          "source": "ix_board_config:fleet.capacity_limits.titan.memory_reserve_bytes=8589934592"
+        },
+        "output_basis": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "tickets_prs_below_threshold_and_commits_unavailable",
+          "source": "capacity_output"
+        },
+        "prs_merged": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "no assignment ticket maps to a work event in the output window",
+          "source": "ledger.assignment_history+agent-msg.work.events"
+        },
+        "queue_wait_p90_s": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "series_missing",
+          "source": "prometheus.ix_build_queue_wait_seconds"
+        },
+        "slots_busy_equals_sustainable": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "slot_values_unavailable",
+          "source": "ix-board.derived:build_slots_busy==build_slots_sustainable"
+        },
+        "thermal_headroom_min": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795638700000,
+          "reason": null,
+          "source": "ix_board_config.thermal_limit_celsius-host_temperature"
+        },
+        "thermal_limit": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795638700000,
+          "reason": null,
+          "source": "ix_board_config:fleet.capacity_limits.titan.thermal_limit_celsius=100"
+        },
+        "throttled_share": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "admission_blocked_source_unavailable",
+          "source": "admission_only:ix_build_admission_blocked_seconds_total"
+        },
+        "tickets_closed": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "no assignment ticket maps to a work event in the output window",
+          "source": "ledger.assignment_history+agent-msg.work.events"
+        }
+      },
+      "step_no": 1,
+      "thermal_headroom_min": 4.625,
+      "throttled_share": null,
+      "tickets_closed": null,
+      "valid": false,
+      "window_end": 1795638700000,
+      "window_start": 1795631500000
+    },
+    {
+      "build_slots_busy": null,
+      "build_slots_sustainable": 6,
+      "commits_pushed": null,
+      "deficit_coverage": 0.0,
+      "deficit_zero_throughout": false,
+      "host": "draco",
+      "host_output_per_hour": null,
+      "inconclusive_reason": "deficit_coverage",
+      "knee_reason": null,
+      "knee_signal": false,
+      "lane_output": [
+        {
+          "commits_pushed": null,
+          "lane": "draco:qsl:arch",
+          "prs_merged": 0,
+          "source_basis": {
+            "commits_pushed": {
+              "availability": "unavailable",
+              "coverage": null,
+              "observed_at_ms": null,
+              "reason": "GitHub PR https://github.com/agent-ix/filament-specification/pull/825 has no qsl-2916 ticket id in title or branch",
+              "source": "github.pull_request_commits"
+            },
+            "prs_merged": {
+              "availability": "available",
+              "coverage": 1.0,
+              "observed_at_ms": 1795635100000,
+              "reason": null,
+              "source": "linear.pull_request.merged_at"
+            },
+            "tickets_closed": {
+              "availability": "available",
+              "coverage": 1.0,
+              "observed_at_ms": 1795635100000,
+              "reason": null,
+              "source": "linear.issue.completed_at"
+            }
+          },
+          "tickets_closed": 0
+        },
+        {
+          "commits_pushed": null,
+          "lane": "draco:qsl:arch",
+          "prs_merged": 0,
+          "source_basis": {
+            "commits_pushed": {
+              "availability": "unavailable",
+              "coverage": null,
+              "observed_at_ms": null,
+              "reason": "GitHub PR https://github.com/agent-ix/filament-specification/pull/825 has no qsl-2916 ticket id in title or branch",
+              "source": "github.pull_request_commits"
+            },
+            "prs_merged": {
+              "availability": "available",
+              "coverage": 1.0,
+              "observed_at_ms": 1795638700000,
+              "reason": null,
+              "source": "linear.pull_request.merged_at"
+            },
+            "tickets_closed": {
+              "availability": "available",
+              "coverage": 1.0,
+              "observed_at_ms": 1795638700000,
+              "reason": null,
+              "source": "linear.issue.completed_at"
+            }
+          },
+          "tickets_closed": 0
+        }
+      ],
+      "lanes": 19,
+      "measurement_values": {
+        "build_slots_busy": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "slot_count_unavailable",
+          "source": "prometheus.ix_build_slots_busy",
+          "value": null
+        },
+        "build_slots_sustainable": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795638700000,
+          "reason": null,
+          "source": "ix_board_config:fleet.capacity_limits.draco.build_slots",
+          "value": 6
+        },
+        "commits_pushed": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "GitHub PR https://github.com/agent-ix/filament-specification/pull/825 has no qsl-2916 ticket id in title or branch",
+          "source": "github.pull_request_commits",
+          "value": null
+        },
+        "derived_sources": {
+          "memory_reserve": "ix_board_config:fleet.capacity_limits.draco.memory_reserve_bytes=8589934592",
+          "thermal_limit": "ix_board_config:fleet.capacity_limits.draco.thermal_limit_celsius=100",
+          "throttled_share": "admission_only"
+        },
+        "host_output_per_hour": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "GitHub PR https://github.com/agent-ix/filament-specification/pull/825 has no qsl-2916 ticket id in title or branch",
+          "source": "capacity_output",
+          "value": null
+        },
+        "lane_output": [
+          {
+            "commits_pushed": {
+              "availability": "unavailable",
+              "coverage": null,
+              "observed_at_ms": null,
+              "reason": "GitHub PR https://github.com/agent-ix/filament-specification/pull/825 has no qsl-2916 ticket id in title or branch",
+              "source": "github.pull_request_commits",
+              "value": null
+            },
+            "lane": "draco:qsl:arch",
+            "prs_merged": {
+              "availability": "available",
+              "coverage": 1.0,
+              "observed_at_ms": 1795638700000,
+              "reason": null,
+              "source": "linear.pull_request.merged_at",
+              "value": 0
+            },
+            "tickets_closed": {
+              "availability": "available",
+              "coverage": 1.0,
+              "observed_at_ms": 1795638700000,
+              "reason": null,
+              "source": "linear.issue.completed_at",
+              "value": 0
+            }
+          }
+        ],
+        "lanes": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795638700000,
+          "reason": null,
+          "source": "prometheus.ix_fleet_lane_state_ratio.distinct_lanes",
+          "value": 19
+        },
+        "memory_headroom_min": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795638700000,
+          "reason": null,
+          "source": "host_memory-ix_board_config.memory_reserve_bytes",
+          "value": 17928110080.0
+        },
+        "output_basis": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "tickets_prs_below_threshold_and_commits_unavailable",
+          "source": "capacity_output",
+          "value": null
+        },
+        "prs_merged": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "GitHub PR https://github.com/agent-ix/filament-specification/pull/825 has no qsl-2916 ticket id in title or branch",
+          "source": "github.pull_request.merged_at_by_ticket",
+          "value": null
+        },
+        "queue_wait_p90_s": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "series_missing",
+          "source": "prometheus.ix_build_queue_wait_seconds",
+          "value": null
+        },
+        "rampup_end_ms": 1795631500000,
+        "slots_busy_equals_sustainable": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "slot_values_unavailable",
+          "source": "prometheus.ix_build_slots_busy/config:fleet.capacity_limits.build_slots",
+          "value": null
+        },
+        "thermal_headroom_min": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795638700000,
+          "reason": null,
+          "source": "ix_board_config.thermal_limit_celsius-host_temperature",
+          "value": -0.4164886474609375
+        },
+        "throttled_share": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "admission_blocked_source_unavailable",
+          "source": "admission_only:ix_build_admission_blocked_seconds_total",
+          "value": null
+        },
+        "tickets_closed": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795638700000,
+          "reason": null,
+          "source": "linear.issue.completed_at",
+          "value": 0
+        },
+        "window_end_ms": 1795638700000,
+        "window_start_ms": 1795631500000
+      },
+      "memory_headroom_min": 17928110080.0,
+      "output_basis": null,
+      "prs_merged": null,
+      "queue_wait_p90_s": null,
+      "rampup_end": 1795631500000,
+      "repeat_of": 1,
+      "run_id": 1,
+      "slots_busy_equals_sustainable": null,
+      "source_basis": {
+        "build_slots_busy": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "slot_count_unavailable",
+          "source": "prometheus.ix_build_slots_busy"
+        },
+        "build_slots_sustainable": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795638700000,
+          "reason": null,
+          "source": "ix_board_config:fleet.capacity_limits.draco.build_slots"
+        },
+        "commits_pushed": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "GitHub PR https://github.com/agent-ix/filament-specification/pull/825 has no qsl-2916 ticket id in title or branch",
+          "source": "github.pull_request_commits"
+        },
+        "deficit_coverage": {
+          "availability": "unavailable",
+          "coverage": 0.0,
+          "observed_at_ms": 1795638700000,
+          "reason": "coverage_below_90_percent",
+          "source": "ledger.saturation_sample"
+        },
+        "deficit_zero_throughout": {
+          "availability": "unavailable",
+          "coverage": 0.0,
+          "observed_at_ms": 1795638700000,
+          "reason": "deficit_sample_unavailable",
+          "source": "ledger.saturation_sample"
+        },
+        "host_output_per_hour": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "GitHub PR https://github.com/agent-ix/filament-specification/pull/825 has no qsl-2916 ticket id in title or branch",
+          "source": "capacity_output"
+        },
+        "knee_signal": {
+          "availability": "unavailable",
+          "coverage": 0.0,
+          "observed_at_ms": 1795638700000,
+          "reason": "knee_inputs_unavailable",
+          "source": "ix-board.FR-041.knee_rule"
+        },
+        "lanes": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795638700000,
+          "reason": null,
+          "source": "prometheus.ix_fleet_lane_state_ratio.distinct_lanes"
+        },
+        "memory_headroom_min": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795638700000,
+          "reason": null,
+          "source": "host_memory-ix_board_config.memory_reserve_bytes"
+        },
+        "memory_reserve": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795638700000,
+          "reason": null,
+          "source": "ix_board_config:fleet.capacity_limits.draco.memory_reserve_bytes=8589934592"
+        },
+        "output_basis": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "tickets_prs_below_threshold_and_commits_unavailable",
+          "source": "capacity_output"
+        },
+        "prs_merged": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "GitHub PR https://github.com/agent-ix/filament-specification/pull/825 has no qsl-2916 ticket id in title or branch",
+          "source": "github.pull_request.merged_at_by_ticket"
+        },
+        "queue_wait_p90_s": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "series_missing",
+          "source": "prometheus.ix_build_queue_wait_seconds"
+        },
+        "slots_busy_equals_sustainable": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "slot_values_unavailable",
+          "source": "ix-board.derived:build_slots_busy==build_slots_sustainable"
+        },
+        "thermal_headroom_min": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795638700000,
+          "reason": null,
+          "source": "ix_board_config.thermal_limit_celsius-host_temperature"
+        },
+        "thermal_limit": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795638700000,
+          "reason": null,
+          "source": "ix_board_config:fleet.capacity_limits.draco.thermal_limit_celsius=100"
+        },
+        "throttled_share": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "admission_blocked_source_unavailable",
+          "source": "admission_only:ix_build_admission_blocked_seconds_total"
+        },
+        "tickets_closed": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795638700000,
+          "reason": null,
+          "source": "linear.issue.completed_at"
+        }
+      },
+      "step_no": 1,
+      "thermal_headroom_min": -0.4164886474609375,
+      "throttled_share": null,
+      "tickets_closed": 0,
+      "valid": false,
+      "window_end": 1795638700000,
+      "window_start": 1795631500000
+    },
+    {
+      "build_slots_busy": null,
+      "build_slots_sustainable": 4,
+      "commits_pushed": null,
+      "deficit_coverage": 0.0,
+      "deficit_zero_throughout": false,
+      "host": "titan",
+      "host_output_per_hour": null,
+      "inconclusive_reason": "deficit_coverage",
+      "knee_reason": null,
+      "knee_signal": false,
+      "lane_output": [],
+      "lanes": 13,
+      "measurement_values": {
+        "build_slots_busy": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "slot_count_unavailable",
+          "source": "prometheus.ix_build_slots_busy",
+          "value": null
+        },
+        "build_slots_sustainable": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795635100000,
+          "reason": null,
+          "source": "ix_board_config:fleet.capacity_limits.titan.build_slots",
+          "value": 4
+        },
+        "commits_pushed": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "no assignment ticket maps to a work event in the output window",
+          "source": "github.ticket_linkage",
+          "value": null
+        },
+        "derived_sources": {
+          "memory_reserve": "ix_board_config:fleet.capacity_limits.titan.memory_reserve_bytes=8589934592",
+          "thermal_limit": "ix_board_config:fleet.capacity_limits.titan.thermal_limit_celsius=100",
+          "throttled_share": "admission_only"
+        },
+        "host_output_per_hour": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "no assignment ticket maps to a work event in the output window",
+          "source": "capacity_output",
+          "value": null
+        },
+        "lane_output": [],
+        "lanes": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795635100000,
+          "reason": null,
+          "source": "prometheus.ix_fleet_lane_state_ratio.distinct_lanes",
+          "value": 13
+        },
+        "memory_headroom_min": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795635100000,
+          "reason": null,
+          "source": "host_memory-ix_board_config.memory_reserve_bytes",
+          "value": 12634370048.0
+        },
+        "output_basis": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "tickets_prs_below_threshold_and_commits_unavailable",
+          "source": "capacity_output",
+          "value": null
+        },
+        "prs_merged": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "no assignment ticket maps to a work event in the output window",
+          "source": "ledger.assignment_history+agent-msg.work.events",
+          "value": null
+        },
+        "queue_wait_p90_s": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "series_missing",
+          "source": "prometheus.ix_build_queue_wait_seconds",
+          "value": null
+        },
+        "rampup_end_ms": 1795631500000,
+        "slots_busy_equals_sustainable": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "slot_values_unavailable",
+          "source": "prometheus.ix_build_slots_busy/config:fleet.capacity_limits.build_slots",
+          "value": null
+        },
+        "thermal_headroom_min": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795635100000,
+          "reason": null,
+          "source": "ix_board_config.thermal_limit_celsius-host_temperature",
+          "value": 4.75
+        },
+        "throttled_share": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "admission_blocked_source_unavailable",
+          "source": "admission_only:ix_build_admission_blocked_seconds_total",
+          "value": null
+        },
+        "tickets_closed": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "no assignment ticket maps to a work event in the output window",
+          "source": "ledger.assignment_history+agent-msg.work.events",
+          "value": null
+        },
+        "window_end_ms": 1795635100000,
+        "window_start_ms": 1795631500000
+      },
+      "memory_headroom_min": 12634370048.0,
+      "output_basis": null,
+      "prs_merged": null,
+      "queue_wait_p90_s": null,
+      "rampup_end": 1795631500000,
+      "repeat_of": null,
+      "run_id": 2,
+      "slots_busy_equals_sustainable": null,
+      "source_basis": {
+        "build_slots_busy": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "slot_count_unavailable",
+          "source": "prometheus.ix_build_slots_busy"
+        },
+        "build_slots_sustainable": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795635100000,
+          "reason": null,
+          "source": "ix_board_config:fleet.capacity_limits.titan.build_slots"
+        },
+        "commits_pushed": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "no assignment ticket maps to a work event in the output window",
+          "source": "github.ticket_linkage"
+        },
+        "deficit_coverage": {
+          "availability": "unavailable",
+          "coverage": 0.0,
+          "observed_at_ms": 1795635100000,
+          "reason": "coverage_below_90_percent",
+          "source": "ledger.saturation_sample"
+        },
+        "deficit_zero_throughout": {
+          "availability": "unavailable",
+          "coverage": 0.0,
+          "observed_at_ms": 1795635100000,
+          "reason": "deficit_sample_unavailable",
+          "source": "ledger.saturation_sample"
+        },
+        "host_output_per_hour": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "no assignment ticket maps to a work event in the output window",
+          "source": "capacity_output"
+        },
+        "knee_signal": {
+          "availability": "unavailable",
+          "coverage": 0.0,
+          "observed_at_ms": 1795635100000,
+          "reason": "knee_inputs_unavailable",
+          "source": "ix-board.FR-041.knee_rule"
+        },
+        "lanes": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795635100000,
+          "reason": null,
+          "source": "prometheus.ix_fleet_lane_state_ratio.distinct_lanes"
+        },
+        "memory_headroom_min": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795635100000,
+          "reason": null,
+          "source": "host_memory-ix_board_config.memory_reserve_bytes"
+        },
+        "memory_reserve": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795635100000,
+          "reason": null,
+          "source": "ix_board_config:fleet.capacity_limits.titan.memory_reserve_bytes=8589934592"
+        },
+        "output_basis": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "tickets_prs_below_threshold_and_commits_unavailable",
+          "source": "capacity_output"
+        },
+        "prs_merged": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "no assignment ticket maps to a work event in the output window",
+          "source": "ledger.assignment_history+agent-msg.work.events"
+        },
+        "queue_wait_p90_s": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "series_missing",
+          "source": "prometheus.ix_build_queue_wait_seconds"
+        },
+        "slots_busy_equals_sustainable": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "slot_values_unavailable",
+          "source": "ix-board.derived:build_slots_busy==build_slots_sustainable"
+        },
+        "thermal_headroom_min": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795635100000,
+          "reason": null,
+          "source": "ix_board_config.thermal_limit_celsius-host_temperature"
+        },
+        "thermal_limit": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795635100000,
+          "reason": null,
+          "source": "ix_board_config:fleet.capacity_limits.titan.thermal_limit_celsius=100"
+        },
+        "throttled_share": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "admission_blocked_source_unavailable",
+          "source": "admission_only:ix_build_admission_blocked_seconds_total"
+        },
+        "tickets_closed": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "no assignment ticket maps to a work event in the output window",
+          "source": "ledger.assignment_history+agent-msg.work.events"
+        }
+      },
+      "step_no": 1,
+      "thermal_headroom_min": 4.75,
+      "throttled_share": null,
+      "tickets_closed": null,
+      "valid": false,
+      "window_end": 1795635100000,
+      "window_start": 1795631500000
+    },
+    {
+      "build_slots_busy": null,
+      "build_slots_sustainable": 6,
+      "commits_pushed": null,
+      "deficit_coverage": 0.0,
+      "deficit_zero_throughout": false,
+      "host": "draco",
+      "host_output_per_hour": null,
+      "inconclusive_reason": "deficit_coverage",
+      "knee_reason": null,
+      "knee_signal": false,
+      "lane_output": [
+        {
+          "commits_pushed": null,
+          "lane": "draco:qsl:arch",
+          "prs_merged": 0,
+          "source_basis": {
+            "commits_pushed": {
+              "availability": "unavailable",
+              "coverage": null,
+              "observed_at_ms": null,
+              "reason": "GitHub PR https://github.com/agent-ix/filament-specification/pull/825 has no qsl-2916 ticket id in title or branch",
+              "source": "github.pull_request_commits"
+            },
+            "prs_merged": {
+              "availability": "available",
+              "coverage": 1.0,
+              "observed_at_ms": 1795635100000,
+              "reason": null,
+              "source": "linear.pull_request.merged_at"
+            },
+            "tickets_closed": {
+              "availability": "available",
+              "coverage": 1.0,
+              "observed_at_ms": 1795635100000,
+              "reason": null,
+              "source": "linear.issue.completed_at"
+            }
+          },
+          "tickets_closed": 0
+        },
+        {
+          "commits_pushed": null,
+          "lane": "draco:qsl:arch",
+          "prs_merged": 0,
+          "source_basis": {
+            "commits_pushed": {
+              "availability": "unavailable",
+              "coverage": null,
+              "observed_at_ms": null,
+              "reason": "GitHub PR https://github.com/agent-ix/filament-specification/pull/825 has no qsl-2916 ticket id in title or branch",
+              "source": "github.pull_request_commits"
+            },
+            "prs_merged": {
+              "availability": "available",
+              "coverage": 1.0,
+              "observed_at_ms": 1795638700000,
+              "reason": null,
+              "source": "linear.pull_request.merged_at"
+            },
+            "tickets_closed": {
+              "availability": "available",
+              "coverage": 1.0,
+              "observed_at_ms": 1795638700000,
+              "reason": null,
+              "source": "linear.issue.completed_at"
+            }
+          },
+          "tickets_closed": 0
+        }
+      ],
+      "lanes": 19,
+      "measurement_values": {
+        "build_slots_busy": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "slot_count_unavailable",
+          "source": "prometheus.ix_build_slots_busy",
+          "value": null
+        },
+        "build_slots_sustainable": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795635100000,
+          "reason": null,
+          "source": "ix_board_config:fleet.capacity_limits.draco.build_slots",
+          "value": 6
+        },
+        "commits_pushed": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "GitHub PR https://github.com/agent-ix/filament-specification/pull/825 has no qsl-2916 ticket id in title or branch",
+          "source": "github.pull_request_commits",
+          "value": null
+        },
+        "derived_sources": {
+          "memory_reserve": "ix_board_config:fleet.capacity_limits.draco.memory_reserve_bytes=8589934592",
+          "thermal_limit": "ix_board_config:fleet.capacity_limits.draco.thermal_limit_celsius=100",
+          "throttled_share": "admission_only"
+        },
+        "host_output_per_hour": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "GitHub PR https://github.com/agent-ix/filament-specification/pull/825 has no qsl-2916 ticket id in title or branch",
+          "source": "capacity_output",
+          "value": null
+        },
+        "lane_output": [
+          {
+            "commits_pushed": {
+              "availability": "unavailable",
+              "coverage": null,
+              "observed_at_ms": null,
+              "reason": "GitHub PR https://github.com/agent-ix/filament-specification/pull/825 has no qsl-2916 ticket id in title or branch",
+              "source": "github.pull_request_commits",
+              "value": null
+            },
+            "lane": "draco:qsl:arch",
+            "prs_merged": {
+              "availability": "available",
+              "coverage": 1.0,
+              "observed_at_ms": 1795635100000,
+              "reason": null,
+              "source": "linear.pull_request.merged_at",
+              "value": 0
+            },
+            "tickets_closed": {
+              "availability": "available",
+              "coverage": 1.0,
+              "observed_at_ms": 1795635100000,
+              "reason": null,
+              "source": "linear.issue.completed_at",
+              "value": 0
+            }
+          }
+        ],
+        "lanes": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795635100000,
+          "reason": null,
+          "source": "prometheus.ix_fleet_lane_state_ratio.distinct_lanes",
+          "value": 19
+        },
+        "memory_headroom_min": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795635100000,
+          "reason": null,
+          "source": "host_memory-ix_board_config.memory_reserve_bytes",
+          "value": 19002966016.0
+        },
+        "output_basis": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "tickets_prs_below_threshold_and_commits_unavailable",
+          "source": "capacity_output",
+          "value": null
+        },
+        "prs_merged": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "GitHub PR https://github.com/agent-ix/filament-specification/pull/825 has no qsl-2916 ticket id in title or branch",
+          "source": "github.pull_request.merged_at_by_ticket",
+          "value": null
+        },
+        "queue_wait_p90_s": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "series_missing",
+          "source": "prometheus.ix_build_queue_wait_seconds",
+          "value": null
+        },
+        "rampup_end_ms": 1795631500000,
+        "slots_busy_equals_sustainable": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "slot_values_unavailable",
+          "source": "prometheus.ix_build_slots_busy/config:fleet.capacity_limits.build_slots",
+          "value": null
+        },
+        "thermal_headroom_min": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795635100000,
+          "reason": null,
+          "source": "ix_board_config.thermal_limit_celsius-host_temperature",
+          "value": 9.6583251953125
+        },
+        "throttled_share": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "admission_blocked_source_unavailable",
+          "source": "admission_only:ix_build_admission_blocked_seconds_total",
+          "value": null
+        },
+        "tickets_closed": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795635100000,
+          "reason": null,
+          "source": "linear.issue.completed_at",
+          "value": 0
+        },
+        "window_end_ms": 1795635100000,
+        "window_start_ms": 1795631500000
+      },
+      "memory_headroom_min": 19002966016.0,
+      "output_basis": null,
+      "prs_merged": null,
+      "queue_wait_p90_s": null,
+      "rampup_end": 1795631500000,
+      "repeat_of": null,
+      "run_id": 1,
+      "slots_busy_equals_sustainable": null,
+      "source_basis": {
+        "build_slots_busy": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "slot_count_unavailable",
+          "source": "prometheus.ix_build_slots_busy"
+        },
+        "build_slots_sustainable": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795635100000,
+          "reason": null,
+          "source": "ix_board_config:fleet.capacity_limits.draco.build_slots"
+        },
+        "commits_pushed": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "GitHub PR https://github.com/agent-ix/filament-specification/pull/825 has no qsl-2916 ticket id in title or branch",
+          "source": "github.pull_request_commits"
+        },
+        "deficit_coverage": {
+          "availability": "unavailable",
+          "coverage": 0.0,
+          "observed_at_ms": 1795635100000,
+          "reason": "coverage_below_90_percent",
+          "source": "ledger.saturation_sample"
+        },
+        "deficit_zero_throughout": {
+          "availability": "unavailable",
+          "coverage": 0.0,
+          "observed_at_ms": 1795635100000,
+          "reason": "deficit_sample_unavailable",
+          "source": "ledger.saturation_sample"
+        },
+        "host_output_per_hour": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "GitHub PR https://github.com/agent-ix/filament-specification/pull/825 has no qsl-2916 ticket id in title or branch",
+          "source": "capacity_output"
+        },
+        "knee_signal": {
+          "availability": "unavailable",
+          "coverage": 0.0,
+          "observed_at_ms": 1795635100000,
+          "reason": "knee_inputs_unavailable",
+          "source": "ix-board.FR-041.knee_rule"
+        },
+        "lanes": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795635100000,
+          "reason": null,
+          "source": "prometheus.ix_fleet_lane_state_ratio.distinct_lanes"
+        },
+        "memory_headroom_min": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795635100000,
+          "reason": null,
+          "source": "host_memory-ix_board_config.memory_reserve_bytes"
+        },
+        "memory_reserve": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795635100000,
+          "reason": null,
+          "source": "ix_board_config:fleet.capacity_limits.draco.memory_reserve_bytes=8589934592"
+        },
+        "output_basis": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "tickets_prs_below_threshold_and_commits_unavailable",
+          "source": "capacity_output"
+        },
+        "prs_merged": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "GitHub PR https://github.com/agent-ix/filament-specification/pull/825 has no qsl-2916 ticket id in title or branch",
+          "source": "github.pull_request.merged_at_by_ticket"
+        },
+        "queue_wait_p90_s": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "series_missing",
+          "source": "prometheus.ix_build_queue_wait_seconds"
+        },
+        "slots_busy_equals_sustainable": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "slot_values_unavailable",
+          "source": "ix-board.derived:build_slots_busy==build_slots_sustainable"
+        },
+        "thermal_headroom_min": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795635100000,
+          "reason": null,
+          "source": "ix_board_config.thermal_limit_celsius-host_temperature"
+        },
+        "thermal_limit": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795635100000,
+          "reason": null,
+          "source": "ix_board_config:fleet.capacity_limits.draco.thermal_limit_celsius=100"
+        },
+        "throttled_share": {
+          "availability": "unavailable",
+          "coverage": null,
+          "observed_at_ms": null,
+          "reason": "admission_blocked_source_unavailable",
+          "source": "admission_only:ix_build_admission_blocked_seconds_total"
+        },
+        "tickets_closed": {
+          "availability": "available",
+          "coverage": 1.0,
+          "observed_at_ms": 1795635100000,
+          "reason": null,
+          "source": "linear.issue.completed_at"
+        }
+      },
+      "step_no": 1,
+      "thermal_headroom_min": 9.6583251953125,
+      "throttled_share": null,
+      "tickets_closed": 0,
+      "valid": false,
+      "window_end": 1795635100000,
+      "window_start": 1795631500000
+    }
+  ]
+}
+test live_acceptance_uses_temporary_state_and_prints_source_evidence ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 64.33s

@@ -201,7 +201,10 @@ enum FleetCommand {
         session: Option<String>,
     },
     /// Read live supply, duty and ready-buffer deficit for configured projects.
-    Saturation,
+    Saturation {
+        #[command(subcommand)]
+        command: Option<SaturationCommand>,
+    },
     /// Read the fleet ledger.
     Ledger {
         #[command(subcommand)]
@@ -212,6 +215,12 @@ enum FleetCommand {
         #[command(subcommand)]
         command: CapacityCommand,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum SaturationCommand {
+    /// Collect one live saturation sample into the local fleet ledger.
+    Collect,
 }
 
 #[derive(Subcommand, Debug)]
@@ -803,8 +812,9 @@ fn run(command: Command) -> Result<Output, Error> {
             .map(Output::FleetTick)
             .map_err(Error::Fleet),
         Command::Fleet {
-            command: FleetCommand::Saturation,
-        } => run_fleet_saturation().map(Output::FleetSaturation),
+            command: FleetCommand::Saturation { command },
+        } => run_fleet_saturation(matches!(command, Some(SaturationCommand::Collect)))
+            .map(Output::FleetSaturation),
         Command::Fleet {
             command:
                 FleetCommand::Assign {
@@ -1121,8 +1131,23 @@ fn run_fleet_capacity_status() -> Result<ix_board::fleet::ledger::CapacityStatus
     ledger::capacity::status(&path).map_err(|e| Error::Fleet(FleetError::Ledger(e.to_string())))
 }
 
+#[derive(serde::Serialize)]
+struct SaturationSampleSourceBasis {
+    ready_buffer: ix_board::fleet::saturation::Evidence<u32>,
+    active_lanes: ix_board::fleet::saturation::Evidence<u32>,
+    supplied_lanes: ix_board::fleet::saturation::Evidence<u32>,
+    unsupplied_lanes: ix_board::fleet::saturation::Evidence<u32>,
+    ready_share: ix_board::fleet::saturation::Evidence<u32>,
+    registry_current: ix_board::fleet::saturation::Evidence<bool>,
+    deficit: ix_board::fleet::saturation::Evidence<u32>,
+}
+
 #[implements("FR-041-AC-5")]
-fn run_fleet_saturation() -> Result<ix_board::fleet::saturation::SaturationReport, Error> {
+#[implements("FR-041-AC-7")]
+#[implements("FR-041-AC-11")]
+fn run_fleet_saturation(
+    collect_sample: bool,
+) -> Result<ix_board::fleet::saturation::SaturationReport, Error> {
     use ix_board::fleet::tick::TickSettings;
     use ix_board::fleet::{FleetError, ledger};
     let settings_value = ix_board::settings_value()?;
@@ -1133,18 +1158,67 @@ fn run_fleet_saturation() -> Result<ix_board::fleet::saturation::SaturationRepor
     let tick_settings = TickSettings::from_toml(settings_value.as_ref())?;
     let report =
         ix_board::fleet::saturation::read_live(&config, &tick_settings).map_err(Error::Fleet)?;
-    let path = ledger::resolve_path(&config)
+    if collect_sample {
+        let path = ledger::resolve_path(&config)
+            .map_err(|error| Error::Fleet(FleetError::Ledger(error.to_string())))?;
+        let mut samples = Vec::with_capacity(report.hosts.len());
+        for host in &report.hosts {
+            let assignment_reason = host
+                .supplied_lanes
+                .is_none()
+                .then(|| host.ready_share.reason.clone())
+                .flatten();
+            let source_basis = SaturationSampleSourceBasis {
+                ready_buffer: report.ready_buffer.clone(),
+                active_lanes: ix_board::fleet::saturation::Evidence::available(
+                    host.active_lanes,
+                    "relay.current_lane_state",
+                    1.0,
+                ),
+                supplied_lanes: ix_board::fleet::saturation::Evidence {
+                    value: host.supplied_lanes,
+                    source: "relay.assignments+agent-msg.work.events+linear.issue_state".into(),
+                    reason: assignment_reason.clone(),
+                    coverage: host.ready_share.coverage,
+                },
+                unsupplied_lanes: ix_board::fleet::saturation::Evidence {
+                    value: host.unsupplied_lanes,
+                    source: "relay.assignments+agent-msg.work.events+relay.registry".into(),
+                    reason: assignment_reason,
+                    coverage: host.ready_share.coverage,
+                },
+                ready_share: host.ready_share.clone(),
+                registry_current: ix_board::fleet::saturation::Evidence::available(
+                    host.registry_current,
+                    "relay.registry",
+                    1.0,
+                ),
+                deficit: host.ready_buffer_deficit.clone(),
+            };
+            let source_basis = serde_json::to_string(&source_basis)
+                .map_err(|error| Error::Fleet(FleetError::Ledger(error.to_string())))?;
+            samples.push(ledger::capacity::SaturationSampleInput {
+                host: &host.host,
+                active_lanes: host.active_lanes,
+                supplied_lanes: host.supplied_lanes,
+                unsupplied_lanes: host.unsupplied_lanes,
+                registry_current: host.registry_current,
+                ready_buffer: report.ready_buffer.value,
+                ready_share: host.ready_share.value,
+                deficit: host.ready_buffer_deficit.value,
+                source_basis,
+                reason: host.ready_buffer_deficit.reason.as_deref(),
+                coverage: host.ready_share.coverage,
+            });
+        }
+        ledger::capacity::record_saturation_samples(
+            &path,
+            &config,
+            report.observed_at_ms,
+            &samples,
+        )
         .map_err(|error| Error::Fleet(FleetError::Ledger(error.to_string())))?;
-    let samples = report
-        .hosts
-        .iter()
-        .map(|host| ledger::capacity::SaturationSampleInput {
-            host: &host.host,
-            deficit: host.ready_buffer_deficit.value,
-        })
-        .collect::<Vec<_>>();
-    ledger::capacity::record_saturation_samples(&path, &config, report.observed_at_ms, &samples)
-        .map_err(|error| Error::Fleet(FleetError::Ledger(error.to_string())))?;
+    }
     Ok(report)
 }
 

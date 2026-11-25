@@ -4,9 +4,7 @@
 //! The live `fleet tick` run: `fleet status` evidence, the FR-072 lists through relay-core, one
 //! ledger commit.
 
-use super::{
-    LanePr, ReadyWork, StandingOrders, TickFacts, TickOutput, TickSettings, TickSources, Unread,
-};
+use super::{ReadyWork, StandingOrders, TickFacts, TickOutput, TickSettings, TickSources, Unread};
 use crate::fleet::ledger::{self, Ledger, TickCommit};
 use crate::fleet::{
     Coverage, FleetConfig, FleetError, FleetReport, SeriesSource, SourceError, Sources,
@@ -82,8 +80,24 @@ impl TickSources for LiveSources {
     }
 
     #[implements("FR-038-AC-5")]
-    fn lane_prs(&self) -> Result<Vec<LanePr>, Unread> {
-        super::pr::read_live(self.timeout).map_err(|error| Unread::Failed(SourceError(error)))
+    fn lane_prs(&self) -> Result<super::LanePrRead, Unread> {
+        let read = super::pr::read_live(self.timeout, &self.config)
+            .map_err(|error| Unread::Failed(SourceError(error)))?;
+        Ok(super::LanePrRead {
+            items: read.items,
+            unavailable: read
+                .unavailable
+                .into_iter()
+                .map(|unavailable| super::LanePrUnavailable {
+                    lane: unavailable.lane,
+                    ticket: unavailable.ticket,
+                    pr: unavailable.pr,
+                    source_basis: unavailable.source_basis,
+                    reason: unavailable.reason,
+                })
+                .collect(),
+            available_from_ms: read.available_from_ms,
+        })
     }
 
     fn ready_work(&self) -> Result<ReadyWork, Unread> {
@@ -91,7 +105,8 @@ impl TickSources for LiveSources {
     }
 
     #[implements("FR-041-AC-5")]
-    fn need_ready_tickets(&self) -> Result<Vec<super::NeedReadyTickets>, Unread> {
+    #[implements("FR-041-AC-24")]
+    fn need_ready_tickets(&self) -> Result<super::NeedReadyTicketsRead, Unread> {
         if self.config.saturation_projects.is_empty() {
             return Err(Unread::Failed(SourceError(
                 "fleet.saturation_projects is empty".to_owned(),
@@ -99,32 +114,53 @@ impl TickSources for LiveSources {
         }
         let report = crate::fleet::saturation::read_live(&self.config, &self.settings)
             .map_err(|error| Unread::Failed(SourceError(error.to_string())))?;
-        if !report.complete {
-            return Err(Unread::Failed(SourceError(
-                "fleet saturation source coverage is incomplete".to_owned(),
-            )));
-        }
         let mut needs = Vec::new();
-        for project in report
-            .projects
-            .into_iter()
-            .filter(|project| project.need > 0)
-        {
-            let Some(planner) = project.planner else {
-                return Err(Unread::Failed(SourceError(format!(
-                    "no planner configured for project {} with ready-buffer deficit {}",
-                    project.project, project.need
-                ))));
+        for project in report.projects.iter().filter(|project| project.need > 0) {
+            let Some(planner) = project.planner.as_deref() else {
+                continue;
             };
             needs.push(super::NeedReadyTickets {
-                project: project.project,
-                planner,
+                project: project.project.clone(),
+                planner: planner.to_owned(),
                 need: project.need,
                 ready: project.ready,
                 lanes: project.lanes,
             });
         }
-        Ok(needs)
+        let unavailable = if report.complete {
+            Vec::new()
+        } else {
+            let mut reasons = report
+                .hosts
+                .iter()
+                .filter_map(|host| {
+                    host.lanes_needed.reason.as_ref().map(|reason| {
+                        format!("host {} duty/supply unavailable: {reason}", host.host)
+                    })
+                })
+                .collect::<Vec<_>>();
+            reasons.extend(
+                report
+                    .projects
+                    .iter()
+                    .filter(|project| project.need > 0 && project.planner.is_none())
+                    .map(|project| {
+                        format!(
+                            "project {} has ready deficit {} but no configured planner",
+                            project.project, project.need
+                        )
+                    }),
+            );
+            if reasons.is_empty() {
+                reasons.push("saturation inputs incomplete; known host deficits only".to_owned());
+            }
+            reasons
+        };
+        Ok(super::NeedReadyTicketsRead {
+            projects: needs,
+            complete: report.complete,
+            unavailable,
+        })
     }
 
     #[implements("FR-041-AC-16")]

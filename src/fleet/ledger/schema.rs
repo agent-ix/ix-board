@@ -134,7 +134,7 @@ pub const V2: &[&str] = &[
        run_id INTEGER NOT NULL, step_no INTEGER NOT NULL, repeat_of INTEGER, host TEXT NOT NULL,
        lanes INTEGER, window_start INTEGER, window_end INTEGER, rampup_end INTEGER, valid INTEGER,
        inconclusive_reason TEXT CHECK(inconclusive_reason IS NULL OR inconclusive_reason IN
-         ('deficit_nonzero','deficit_coverage')),
+         ('demand_short','deficit_coverage')),
        deficit_coverage REAL, deficit_zero_throughout INTEGER, host_output_per_hour REAL,
        tickets_closed INTEGER, prs_merged INTEGER, commits_pushed INTEGER,
        output_basis TEXT CHECK(output_basis IS NULL OR output_basis IN ('tickets_prs','commits')),
@@ -189,12 +189,22 @@ pub const V5: &[&str] = &[
 pub const V6: &[&str] = &[
     "ALTER TABLE action ADD COLUMN project TEXT",
     "ALTER TABLE action ADD COLUMN requested_count INTEGER",
-    "CREATE TABLE capacity_throttle_sample(
+    "CREATE TABLE IF NOT EXISTS capacity_throttle_sample(
        host TEXT NOT NULL, at INTEGER NOT NULL, interval_s INTEGER NOT NULL,
        throttled_share REAL, coverage REAL, unavailable_reason TEXT,
        source_basis TEXT NOT NULL, PRIMARY KEY(host, at))",
     "ALTER TABLE capacity_event ADD COLUMN source_basis TEXT",
     "ALTER TABLE host_output_sample ADD COLUMN source_basis TEXT NOT NULL DEFAULT '{}'",
+    "ALTER TABLE host_output_sample ADD COLUMN sample_interval_ms INTEGER NOT NULL DEFAULT 3600000",
+    "ALTER TABLE saturation_sample ADD COLUMN source_basis TEXT NOT NULL DEFAULT 'unknown'",
+    "ALTER TABLE saturation_sample ADD COLUMN unavailable_reason TEXT",
+    "ALTER TABLE saturation_sample ADD COLUMN coverage REAL",
+    "ALTER TABLE saturation_sample ADD COLUMN ready_buffer INTEGER",
+    "ALTER TABLE saturation_sample ADD COLUMN active_lanes INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE saturation_sample ADD COLUMN supplied_lanes INTEGER",
+    "ALTER TABLE saturation_sample ADD COLUMN unsupplied_lanes INTEGER",
+    "ALTER TABLE saturation_sample ADD COLUMN ready_share INTEGER",
+    "ALTER TABLE saturation_sample ADD COLUMN registry_current INTEGER NOT NULL DEFAULT 0",
 ];
 
 /// Capacity-history views consumed by the orchestrator and minder role specs.
@@ -237,15 +247,27 @@ pub const CAPACITY_VIEWS: &[&str] = &[
        SELECT r.*,r.ended_at AS at_ms FROM capacity_run r
        WHERE r.ended_at IS NOT NULL AND r.found_level IS NOT NULL AND NOT EXISTS (
          SELECT 1 FROM capacity_level l WHERE l.run_id=r.run_id)",
-    "CREATE VIEW unrecorded_hosts_at_zero_deficit AS
+    "CREATE VIEW unrecorded_hosts_with_demand AS
        SELECT s.*,s.at AS at_ms FROM saturation_sample s
-       WHERE s.deficit=0 AND NOT EXISTS (
+       WHERE s.ready_buffer IS NOT NULL AND s.supplied_lanes IS NOT NULL
+         AND s.unsupplied_lanes IS NOT NULL AND s.ready_share IS NOT NULL
+         AND ((s.active_lanes>0 AND s.registry_current=1
+                 AND s.supplied_lanes+s.ready_share>=s.active_lanes)
+          OR (s.active_lanes=0 AND s.registry_current=1 AND s.ready_share>=1))
+         AND NOT EXISTS (
          SELECT 1 FROM capacity_level l WHERE lower(l.host)=lower(s.host)
            AND l.superseded_at IS NULL)",
     "CREATE VIEW unrecorded_hosts_without_discovery_run AS
-       SELECT s.*,s.at AS at_ms FROM unrecorded_hosts_at_zero_deficit s
-       WHERE NOT EXISTS (SELECT 1 FROM capacity_run r WHERE lower(r.host)=lower(s.host)
-         AND r.started_at BETWEEN s.at AND s.at+600000)",
+       SELECT s.*,s.at AS at_ms FROM unrecorded_hosts_with_demand s
+       WHERE s.at<=unixepoch('now')*1000
+         AND s.at>=unixepoch('now')*1000-600000
+         AND s.at=(SELECT MAX(latest.at) FROM saturation_sample latest
+                   WHERE lower(latest.host)=lower(s.host)
+                     AND latest.at<=unixepoch('now')*1000)
+         AND NOT EXISTS (SELECT 1 FROM capacity_run r WHERE lower(r.host)=lower(s.host)
+         AND r.ended_at IS NULL)
+         AND (SELECT COUNT(*) FROM capacity_run r WHERE lower(r.host)=lower(s.host)
+              AND date(r.started_at/1000,'unixepoch')=date('now'))<2",
     "CREATE VIEW hosts_with_recorded_level AS
        SELECT *,recorded_at AS at_ms FROM capacity_level WHERE superseded_at IS NULL",
     "CREATE VIEW host_step_downs AS
@@ -330,25 +352,57 @@ pub const CAPACITY_VIEWS: &[&str] = &[
        SELECT *,at AS at_ms FROM lane_count_reductions
        WHERE evidence_kind IS NULL OR reason='lane_change_unrecorded'",
     "CREATE VIEW host_output_share_of_recorded_level AS
-       WITH current_level AS (SELECT * FROM capacity_level WHERE superseded_at IS NULL),
-       level_step AS (SELECT l.host,l.output_basis,s.host_output_per_hour
+       WITH current_level_ranked AS (
+         SELECT l.*,ROW_NUMBER() OVER(PARTITION BY lower(host) ORDER BY recorded_at DESC,run_id DESC) AS level_rank
+         FROM capacity_level l WHERE superseded_at IS NULL),
+       current_level AS (SELECT * FROM current_level_ranked WHERE level_rank=1),
+       level_step_ranked AS (
+         SELECT l.host,l.output_basis,s.host_output_per_hour,s.step_no,
+           ROW_NUMBER() OVER(PARTITION BY lower(l.host) ORDER BY CAST(e.value AS INTEGER) DESC) AS evidence_rank
          FROM current_level l,json_each(l.evidence_steps) e
          JOIN capacity_step s ON s.run_id=l.run_id AND s.step_no=CAST(e.value AS INTEGER)),
+       level_step AS (SELECT * FROM level_step_ranked WHERE evidence_rank=1),
        latest AS (SELECT h.*,ROW_NUMBER() OVER(PARTITION BY lower(host) ORDER BY at DESC) AS rn
          FROM host_output_sample h)
-       SELECT l.host,l.output_basis,
-         CASE l.output_basis WHEN 'commits' THEN h.commits_pushed
-           ELSE CASE WHEN h.tickets_closed IS NOT NULL AND h.prs_merged IS NOT NULL
-             THEN h.tickets_closed+h.prs_merged END END AS output_per_hour,
+       SELECT l.host,l.output_basis,l.step_no,
+         CASE l.output_basis
+           WHEN 'commits' THEN h.commits_pushed*3600000.0/h.sample_interval_ms
+           WHEN 'tickets_prs' THEN CASE WHEN h.tickets_closed IS NOT NULL AND h.prs_merged IS NOT NULL
+             THEN (h.tickets_closed+h.prs_merged)*3600000.0/h.sample_interval_ms END
+         END AS output_per_hour,
+         h.sample_interval_ms AS sample_interval_ms,
          l.host_output_per_hour AS recorded_output_per_hour,
          CASE WHEN l.host_output_per_hour>0 AND (CASE l.output_basis
-           WHEN 'commits' THEN h.commits_pushed
-           ELSE CASE WHEN h.tickets_closed IS NOT NULL AND h.prs_merged IS NOT NULL
-             THEN h.tickets_closed+h.prs_merged END END) IS NOT NULL
-           THEN 100.0*(CASE l.output_basis WHEN 'commits' THEN h.commits_pushed
-           ELSE h.tickets_closed+h.prs_merged END)/l.host_output_per_hour
-           ELSE NULL END AS share_percent,h.at AS at_ms
-       FROM level_step l JOIN latest h ON lower(h.host)=lower(l.host) AND h.rn=1",
+           WHEN 'commits' THEN h.commits_pushed*3600000.0/h.sample_interval_ms
+           WHEN 'tickets_prs' THEN CASE WHEN h.tickets_closed IS NOT NULL AND h.prs_merged IS NOT NULL
+             THEN (h.tickets_closed+h.prs_merged)*3600000.0/h.sample_interval_ms END END) IS NOT NULL
+           THEN 100.0*(CASE l.output_basis
+           WHEN 'commits' THEN h.commits_pushed*3600000.0/h.sample_interval_ms
+           WHEN 'tickets_prs' THEN (h.tickets_closed+h.prs_merged)*3600000.0/h.sample_interval_ms END)/l.host_output_per_hour
+           ELSE NULL END AS share_percent,h.at AS at_ms,
+         CASE WHEN h.source_basis IS NULL OR h.source_basis='{}' THEN
+           CASE l.output_basis
+             WHEN 'commits' THEN json_object('commits_pushed',json_object(
+               'availability','unavailable','reason','no_current_host_output_sample'))
+             WHEN 'tickets_prs' THEN json_object(
+               'tickets_closed',json_object('availability','unavailable','reason','no_current_host_output_sample'),
+               'prs_merged',json_object('availability','unavailable','reason','no_current_host_output_sample'))
+             ELSE json_object('host_output_per_hour',json_object(
+               'availability','unavailable','reason','no_current_host_output_sample'))
+           END
+           ELSE h.source_basis END AS source_basis,
+         COALESCE(
+           json_extract(h.source_basis,'$.host_output_per_hour.reason'),
+           CASE l.output_basis WHEN 'commits'
+             THEN json_extract(h.source_basis,'$.commits_pushed.reason')
+             WHEN 'tickets_prs' THEN COALESCE(
+               json_extract(h.source_basis,'$.tickets_closed.reason'),
+               json_extract(h.source_basis,'$.prs_merged.reason'))
+           END,
+           CASE WHEN h.source_basis IS NULL THEN 'no_current_host_output_sample'
+                WHEN h.source_basis='{}' THEN 'source_basis_unavailable' END
+         ) AS unavailable_reason
+       FROM level_step l LEFT JOIN latest h ON lower(h.host)=lower(l.host) AND h.rn=1",
 ];
 
 /// The `open_cycles` formula of FR-039, `max(1, ceil((end - start - grace) / cycle))`, in
@@ -453,7 +507,7 @@ pub const QUERYABLE: &[&str] = &[
     "discovery_raised_past_knee",
     "discovery_runs_ended",
     "discovery_runs_without_recorded_level",
-    "unrecorded_hosts_at_zero_deficit",
+    "unrecorded_hosts_with_demand",
     "unrecorded_hosts_without_discovery_run",
     "hosts_with_recorded_level",
     "host_step_downs",

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.agentix.ix-board-saturation-collector</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/peter/.cargo/bin/ix-board</string>
+		<string>fleet</string>
+		<string>saturation</string>
+		<string>collect</string>
+		<string>--json</string>
+	</array>
+	<key>StartInterval</key>
+	<integer>300</integer>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/peter</string>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/Users/peter/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>/Users/peter/Library/Logs/ix-board-saturation-collector.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/peter/Library/Logs/ix-board-saturation-collector-error.log</string>
+</dict>
+</plist>
