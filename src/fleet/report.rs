@@ -358,6 +358,34 @@ fn host_of(addr: &str) -> String {
 
 type HostReads = BTreeMap<String, Result<HostSeries, SourceError>>;
 
+fn usable_busy_ratio(
+    series: &HostSeries,
+    stale_after: Duration,
+) -> Result<f64, (DefectKind, String)> {
+    if let Some(reason) = &series.busy_ratio_error {
+        return Err((DefectKind::UnreadableSource, reason.clone()));
+    }
+    let Some(ratio) = series.busy_ratio else {
+        return Err((
+            DefectKind::UnreadableSource,
+            "ix_fleet_host_busy_ratio has no sample".to_owned(),
+        ));
+    };
+    let Some(age) = series.busy_sample_age else {
+        return Err((
+            DefectKind::StaleSource,
+            "busy ratio sample age is unavailable".to_owned(),
+        ));
+    };
+    if age > stale_after {
+        return Err((
+            DefectKind::StaleSource,
+            format!("busy ratio sample is {}s old", age.as_secs()),
+        ));
+    }
+    Ok(ratio)
+}
+
 /// Reads every host in parallel, each bounded by `timeout`; a host that misses it is an error.
 fn read_hosts(
     series: &Arc<dyn SeriesSource>,
@@ -450,40 +478,10 @@ fn host_defects(ctx: &mut Ctx<'_>, host: &str, read: &Result<HostSeries, SourceE
                 ),
                 Some(_) => {}
             }
-            match (
-                &series.busy_ratio_error,
-                series.busy_ratio,
-                series.busy_sample_age,
-            ) {
-                (Some(reason), _, _) => ctx.defect(
-                    DefectKind::UnreadableSource,
-                    "prometheus.host_busy",
-                    Some(host),
-                    None,
-                    reason.clone(),
-                ),
-                (None, None, _) => ctx.defect(
-                    DefectKind::UnreadableSource,
-                    "prometheus.host_busy",
-                    Some(host),
-                    None,
-                    "ix_fleet_host_busy_ratio has no sample",
-                ),
-                (None, Some(_), None) => ctx.defect(
-                    DefectKind::StaleSource,
-                    "prometheus.host_busy",
-                    Some(host),
-                    None,
-                    "busy ratio sample age is unavailable",
-                ),
-                (None, Some(_), Some(age)) if age > ctx.cfg.push_interval * 2 => ctx.defect(
-                    DefectKind::StaleSource,
-                    "prometheus.host_busy",
-                    Some(host),
-                    None,
-                    format!("busy ratio sample is {}s old", age.as_secs()),
-                ),
-                _ => {}
+            if let Err((kind, reason)) =
+                usable_busy_ratio(series, ctx.cfg.push_interval.saturating_mul(2))
+            {
+                ctx.defect(kind, "prometheus.host_busy", Some(host), None, reason);
             }
             for probe in series.probes.iter().filter(|p| !p.ok) {
                 ctx.defect(
@@ -916,11 +914,7 @@ pub fn build_report(cfg: &FleetConfig, sources: &Sources<'_>, local_now_ms: i64)
     let mut report = finish(relay.now_ms, rows, ctx.defects);
     for (host, reading) in &reads {
         if let Ok(reading) = reading
-            && reading.busy_ratio_error.is_none()
-            && reading
-                .busy_sample_age
-                .is_some_and(|age| age <= cfg.push_interval * 2)
-            && let Some(ratio) = reading.busy_ratio
+            && let Ok(ratio) = usable_busy_ratio(reading, cfg.push_interval.saturating_mul(2))
         {
             report.host_busy.insert(host.to_lowercase(), ratio);
         }

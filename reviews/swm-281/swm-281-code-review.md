@@ -60,3 +60,23 @@ Live check: the built binary, `fleet tick --json` with a scratch ledger and
 | FND-004 | medium | The tick reads every host's series a second time, sequentially on the main thread, instead of using the ratio `build_report` just read and discarded. Each `host_series` call is 6 HTTP queries each bounded by `host_timeout` (20s default) with no per-host bound, so a Prometheus answering each query just inside the bound can cost 4 hosts x 6 x 20s = 480s, longer than the 300s tick interval, against the FR-034 per-host read bound that `read_hosts` enforces. The two reads can also disagree (rows and defects from one, busy ratios from the other), and `fleet status` itself carries the ratio nowhere. Keep the first read's `busy_ratio` in the report and have `LiveSources` use it. | src/fleet/tick/live.rs:53-57 |
 | FND-005 | low | With no Prometheus URL, which is the state of the installed ix-board config on this host, `build_report` already records a `prometheus` defect naming the remedy and `host_busy` now also returns `Failed`, adding a `tick.host_busy` defect: two `fix_source` actions for one missing setting. | src/fleet/tick/live.rs:47-52 |
 | FND-006 | low | The `LiveSources` doc comment still says only the FR-072 lists are wired and every other source reports why it is unread; the busy ratio is now wired. | src/fleet/tick/live.rs:20-21 |
+
+## New findings (disposition pass 1)
+
+| ID | Severity | Summary | Refs |
+| --- | --- | --- | --- |
+| FND-007 | high | The rule for a usable busy ratio is implemented twice: the `match` in `host_defects` decides which readings raise `prometheus.host_busy`, and a separate `if let` chain in `build_report` decides which enter `host_busy`; the bound `push_interval * 2` is written in both and already exists there as `stale_after`. A change to either needs the other, or a ratio is used while reported unusable, or dropped with no defect. The two agree today. Rated by the code-review duplication rule. Decide once (one function returning the ratio or the defect) and use it for both. | src/fleet/report.rs:453-487, src/fleet/report.rs:917-927 |
+| FND-008 | low | The test module was moved above `run()` in the middle of the file and `#[allow(clippy::items_after_test_module)]` added to silence the lint. Put the module at the end of the file and delete the `allow`. | src/fleet/tick/live.rs:109-111 |
+
+## Dispositions
+
+Round 1, head 336d282879937eb6ddb49566bb27b7b0f55679d8.
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-001 | fixed | Only usable readings enter `report.host_busy`; `host_busy()` returns that map. Live run: no `tick.host_busy`, defects for luna and titan only. |
+| FND-002 | fixed | The busy sample age is queried separately; a ratio older than `push_interval * 2` or with no age is excluded and raises `stale_source`. |
+| FND-003 | fixed | Invalid and duplicate samples set `busy_ratio_error`; the host read continues. |
+| FND-004 | fixed | The second read is gone; the tick uses the ratio from the bounded `read_hosts` read. |
+| FND-005 | fixed | Live run with no URL: one `prometheus` fix_source, no `tick.host_busy`. |
+| FND-006 | fixed | The doc comment describes the busy map. |

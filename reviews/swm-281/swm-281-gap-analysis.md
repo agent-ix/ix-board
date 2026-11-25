@@ -51,3 +51,22 @@ CLI reference still describe the reader as missing.
   remain named seams, so `add_lane` still cannot fire live until SWM-212.
 - Semantic review: skipped.
 - Plan completion: not assessed
+
+## New findings (disposition pass 1)
+
+| ID | Severity | Summary | Refs |
+| --- | --- | --- | --- |
+| FND-007 | medium | FR-038-AC-23 says a bad busy sample does not discard the host's status evidence, and no test asserts it. The new test cans empty blocked, probe and config results, so `assert!(invalid.config.working_window.is_none())` holds whatever the code does, and no assertion checks that blocked reasons, probes or thresholds survive beside an invalid or duplicate sample. | tests/fleet.rs:710-739 |
+
+## Dispositions
+
+Round 1, head 336d282879937eb6ddb49566bb27b7b0f55679d8.
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-001 | fixed | The new test drives `PrometheusSeries`, `build_report`, `TickFacts` and `plan` to one `add_lane` for draco. The single assignment in `run()` stays uncovered: replacing it with an empty map leaves the tests green. |
+| FND-002 | still-open: part of the refusals is still untested | NaN, duplicate, missing and stale now have tests. Mutation on this head: dropping the `[0, 1]` range check and emptying both the invalid/duplicate and the missing `prometheus.host_busy` defect arms leaves lib (255), fleet (37), fleet_cli (3) and fleet_tick (30) passing. Needed: an out-of-range sample such as 1.5, and a `build_report` assertion of the defect for an invalid and a missing sample. |
+| FND-003 | fixed | The FR-038 row, a behaviour paragraph and AC-23 state the new behaviour. |
+| FND-004 | fixed | The CLI reference describes the reader and the host-scoped defect. |
+| FND-005 | fixed | The replacement test asserts the `add_lane` result and is tagged AC-6 and AC-23. |
+| FND-006 | fixed | The fake returns an empty map. |
