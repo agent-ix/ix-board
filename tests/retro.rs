@@ -554,7 +554,7 @@ fn git_init(dir: &Path) {
 
 // ---- FR-024 ----------------------------------------------------------------------------
 
-/// Trace: FR-024-AC-1
+#[trace("FR-024-AC-1", "FR-024-AC-14")]
 #[test]
 fn snapshot_appends_one_record_with_every_catalog_id() {
     let rig = base_rig();
@@ -566,6 +566,14 @@ fn snapshot_appends_one_record_with_every_catalog_id() {
     let mut expected: Vec<_> = CATALOG.iter().map(|m| m.id.to_owned()).collect();
     expected.sort();
     assert_eq!(ids, expected);
+    let stored: serde_json::Value = serde_json::from_str(&lines(store.path())[0]).unwrap();
+    for (id, metric) in stored["metrics"].as_object().unwrap() {
+        assert!(metric.get("class").is_none(), "{id} stored class");
+        assert!(
+            metric.get("department_class").is_none(),
+            "{id} stored department class"
+        );
+    }
     assert_eq!(value(&record, "path_remaining"), Some(1.0));
     assert_eq!(value(&record, "prs_open"), Some(1.0));
     assert_eq!(value(&record, "fix_rounds_total"), Some(3.0));
@@ -1241,11 +1249,13 @@ fn a_pass_that_stops_before_the_last_page_is_an_error_not_a_shorter_list() {
     assert_eq!(result.unwrap(), vec![1, 1]);
 }
 
-/// Trace: FR-024-AC-14
+#[trace("FR-024-AC-14", "FR-024-AC-19")]
 #[test]
 fn json_exposes_every_metric_field_and_text_prints_one_line_each() {
     let record = snapshot(&base_rig());
-    let json = serde_json::to_value(&record).unwrap();
+    let stored_json = serde_json::to_value(&record).unwrap();
+    let output = ix_board::retro::SnapshotOutput::try_from_record(record.clone()).unwrap();
+    let json = serde_json::to_value(&output).unwrap();
     let metrics = json["metrics"].as_object().unwrap();
     assert_eq!(metrics.len(), CATALOG.len());
     for (id, metric) in metrics {
@@ -1257,17 +1267,67 @@ fn json_exposes_every_metric_field_and_text_prints_one_line_each() {
             "status",
             "source",
             "query",
+            "class",
         ] {
             assert!(metric.get(field).is_some(), "{id} lacks {field}");
         }
         assert_eq!(metric["id"], id.as_str());
+        assert_eq!(
+            metric["class"],
+            ix_board::retro::catalog::definition(id)
+                .expect("catalog id")
+                .family
+        );
+        if let Some(definition) = ix_board::retro::department::definition(id) {
+            assert_eq!(metric["department_class"], definition.class);
+        } else {
+            assert!(metric.get("department_class").is_none(), "{id}");
+        }
     }
+    let stored_metrics = stored_json["metrics"].as_object().unwrap();
+    for (id, metric) in stored_metrics {
+        assert!(metric.get("class").is_none(), "{id} stored class");
+        assert!(
+            metric.get("department_class").is_none(),
+            "{id} stored department class"
+        );
+    }
+    let saved_bytes = serde_json::to_vec(&json).unwrap();
+    let decoded = ix_board::retro::decode_saved_report(&saved_bytes, None)
+        .expect("the saved reader accepts the command's snapshot output");
+    assert_eq!(
+        decoded,
+        ix_board::retro::SavedReport::Record(record.clone())
+    );
+    let mut unknown_output = json.clone();
+    unknown_output["metrics"]["prs_open"]["unrecognized"] = serde_json::json!(true);
+    assert!(
+        ix_board::retro::decode_saved_report(&serde_json::to_vec(&unknown_output).unwrap(), None)
+            .is_err()
+    );
     assert_eq!(metrics["prs_open"]["direction"], "neutral");
     assert_eq!(metrics["path_remaining"]["direction"], "down");
     assert_eq!(
         ix_board::retro::render_text(&record).lines().count(),
         CATALOG.len()
     );
+}
+
+#[trace("FR-024-AC-14")]
+#[test]
+fn snapshot_output_rejects_metrics_outside_the_fixed_catalog_without_panicking() {
+    let mut record = snap("2026-11-07T12:00:00Z", &[("path_closed", Some(1.0), QUERY)]);
+    record.metrics.insert(
+        "external_metric".to_owned(),
+        Metric {
+            id: "external_metric".to_owned(),
+            ..stored("path_closed", Some(1.0), QUERY)
+        },
+    );
+    assert!(matches!(
+        ix_board::retro::SnapshotOutput::try_from_record(record),
+        Err(RetroError::UnknownMetricDefinition(id)) if id == "external_metric"
+    ));
 }
 
 /// A pull request merged before the window but updated inside it, as the live listing returns.
@@ -2058,9 +2118,9 @@ fn delta_resolves_catalog_classes_and_accepts_legacy_records_and_reports() {
             ("fix_rounds_total", Some(1.0), QUERY),
         ],
     );
-    let snapshot_output = serde_json::to_value(ix_board::retro::SnapshotOutput::from_record(
-        old_record.clone(),
-    ))
+    let snapshot_output = serde_json::to_value(
+        ix_board::retro::SnapshotOutput::try_from_record(old_record.clone()).unwrap(),
+    )
     .unwrap();
     assert_eq!(
         snapshot_output["metrics"]["path_closed"]["class"],

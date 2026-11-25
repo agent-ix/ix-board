@@ -52,3 +52,14 @@ Head a08cbe8d22a89747a362e1181f0be032d31f81f3; fix diff only.
 | FND-001 | fixed | `Metric`, the store and the record writers are identical to base 5075d92; classes are resolved only in delta output. |
 | FND-002 | fixed | Both `MetricDelta` fields are optional with serde default; the saved 0.10.0-shape delta decodes. |
 | FND-003 | fixed | Stored metrics have no class field, so the test's class assertions can only be met by catalog resolution. |
+| FND-004 | fixed | Root plugin manifests are back to 0.5.0, identical to base; nested ones unchanged at 0.3.0. |
+
+## New findings (disposition pass 2)
+
+Head f2e972f4099055b1946355247f0d2dc3aa0e15f8; this round's diff only.
+
+| ID | Severity | Summary | Refs |
+| --- | --- | --- | --- |
+| FND-005 | high | `retro snapshot --json` output can no longer be read by `read_saved_report`: the added metric keys hit `Metric`'s `deny_unknown_fields`. Reproduced offline: base 0.10.0 output decodes, head output fails with `unknown field class`. relay-tui documents this file as a `--report` input. | src/retro/catalog.rs:177-184 |
+| FND-006 | low | Public `SnapshotOutput::from_record` panics through `expect` on a metric id outside the compiled catalog, which a decoded record may carry. Reproduced through the library; the CLI caller cannot reach it. | src/retro/catalog.rs:193-195 |
+| FND-007 | low | `SnapshotOutput` restates the `Record` envelope field by field without destructuring, so a field added to `Record` compiles and is silently missing from `--json`. | src/retro/catalog.rs:209-218 |

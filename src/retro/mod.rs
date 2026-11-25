@@ -41,6 +41,9 @@ pub enum RetroError {
     /// Store problem.
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// A snapshot output was requested for a metric outside the fixed catalog.
+    #[error("metric {0:?} is not in the retro catalog")]
+    UnknownMetricDefinition(String),
     /// `baseline_taken_at` matches no stored record.
     #[error("baseline_taken_at {0:?} matches no record in the store")]
     BaselineNotFound(String),

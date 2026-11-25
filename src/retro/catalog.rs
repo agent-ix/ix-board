@@ -5,7 +5,8 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::ser::{Error as SerError, SerializeMap};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Record schema version this build writes and understands.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -105,7 +106,7 @@ pub fn definition(id: &str) -> Option<&'static MetricDef> {
 }
 
 /// One metric as stored in a record (FR-026).
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Metric {
     /// Stable metric id.
@@ -125,6 +126,55 @@ pub struct Metric {
     /// Failed or missing source, present when unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetricInput {
+    id: String,
+    status: Status,
+    value: Option<f64>,
+    unit: String,
+    direction: Direction,
+    source: String,
+    query: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(default)]
+    class: Option<String>,
+    #[serde(default)]
+    department_class: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for Metric {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let MetricInput {
+            id,
+            status,
+            value,
+            unit,
+            direction,
+            source,
+            query,
+            reason,
+            class,
+            department_class,
+        } = MetricInput::deserialize(deserializer)?;
+        let _ = (class, department_class);
+        Ok(Self {
+            id,
+            status,
+            value,
+            unit,
+            direction,
+            source,
+            query,
+            reason,
+        })
+    }
 }
 
 /// What kind of command wrote a record.
@@ -160,18 +210,10 @@ pub struct Record {
 
 /// Snapshot JSON projection. Catalog classes are added to command output while the stored
 /// [`Record`] stays compatible with older strict readers.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 pub struct SnapshotOutput {
-    schema_version: u32,
-    kind: RecordKind,
-    taken_at: String,
-    team: String,
-    window: String,
-    metrics: BTreeMap<String, SnapshotMetric>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    department: Option<super::department::Report>,
-    #[serde(skip)]
     record: Record,
+    metrics: BTreeMap<String, SnapshotMetric>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -185,42 +227,54 @@ struct SnapshotMetric {
 
 impl SnapshotOutput {
     /// Builds the `retro snapshot --json` projection without adding fields to the stored record.
-    pub fn from_record(record: Record) -> Self {
+    pub fn try_from_record(record: Record) -> Result<Self, super::RetroError> {
         let metrics = record
             .metrics
             .iter()
             .map(|(id, metric)| {
                 let class = definition(id)
-                    .expect("snapshot metrics come from the fixed catalog")
+                    .ok_or_else(|| super::RetroError::UnknownMetricDefinition(id.clone()))?
                     .family
                     .to_owned();
                 let department_class =
                     super::department::definition(id).map(|definition| definition.class.to_owned());
-                (
+                Ok((
                     id.clone(),
                     SnapshotMetric {
                         metric: metric.clone(),
                         class,
                         department_class,
                     },
-                )
+                ))
             })
-            .collect();
-        Self {
-            schema_version: record.schema_version,
-            kind: record.kind,
-            taken_at: record.taken_at.clone(),
-            team: record.team.clone(),
-            window: record.window.clone(),
-            metrics,
-            department: record.department.clone(),
-            record,
-        }
+            .collect::<Result<BTreeMap<_, _>, super::RetroError>>()?;
+        Ok(Self { metrics, record })
     }
 
     /// Returns the classless record for text rendering.
     pub fn record(&self) -> &Record {
         &self.record
+    }
+}
+
+impl Serialize for SnapshotOutput {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let record = serde_json::to_value(&self.record).map_err(S::Error::custom)?;
+        let fields = record
+            .as_object()
+            .ok_or_else(|| S::Error::custom("retro record did not serialize as an object"))?;
+        let mut output = serializer.serialize_map(Some(fields.len()))?;
+        for (key, value) in fields {
+            if key == "metrics" {
+                output.serialize_entry(key, &self.metrics)?;
+            } else {
+                output.serialize_entry(key, value)?;
+            }
+        }
+        output.end()
     }
 }
 

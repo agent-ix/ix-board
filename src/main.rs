@@ -1062,7 +1062,7 @@ fn run_retro_snapshot(config_path: &std::path::Path, window: &str) -> Result<Out
         eprintln!("{notice}");
     }
     Ok(label_cached(
-        Output::Retro(Box::new(retro::SnapshotOutput::from_record(record))),
+        Output::Retro(Box::new(retro::SnapshotOutput::try_from_record(record)?)),
         linear.cache_freshness().as_ref(),
     ))
 }

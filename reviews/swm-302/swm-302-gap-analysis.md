@@ -48,3 +48,12 @@ Head a08cbe8d22a89747a362e1181f0be032d31f81f3; fix diff only.
 | --- | --- | --- |
 | FND-001 | fixed | The test carries `#[trace(...)]`; `quire matrix` reports FR-027-AC-9 and AC-10 tagged. |
 | FND-002 | fixed | The FR-024-AC-19 tag is removed. |
+| FND-003 | fixed | `retro snapshot --json` carries both fields on output, stored lines stay classless and older records decode; the PR body and FR-024-AC-14 say so. |
+
+## New findings (disposition pass 2)
+
+Head f2e972f4099055b1946355247f0d2dc3aa0e15f8; this round's diff only.
+
+| ID | Severity | Summary | Refs |
+| --- | --- | --- | --- |
+| FND-004 | low | FR-024-AC-14 is bound only by a test that checks two class values; nothing asserts `class` on every metric or that `department_class` is omitted where undefined, and the older field test serializes `Record`, which `--json` no longer emits. | tests/retro.rs:2061-2072 |
