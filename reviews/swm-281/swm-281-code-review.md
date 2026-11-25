@@ -87,3 +87,9 @@ Round 2, head ba5546dbe9224ffb67dcbca130089df242ce1a24.
 | --- | --- | --- |
 | FND-007 | still-open: the staleness bound is still written separately | The predicate is now one function, `usable_busy_ratio`. Both callers still compute `cfg.push_interval.saturating_mul(2)` themselves (src/fleet/report.rs:482 and 917), beside `stale_after = push_interval * 2` at 463. Mutation: changing only the bound at 917 to 3 leaves lib (255), fleet (37) and fleet_tick (30) passing. Define the bound once, for example by passing `FleetConfig` to the function. |
 | FND-008 | fixed | The test module is declared last with its body in live_tests.rs; the allow is gone. |
+
+Round 3, head 69d825cc798d8e3eb3d68031a4a82007e22b53ad.
+
+| FND | outcome | reason |
+| --- | --- | --- |
+| FND-007 | fixed | `host_series_stale_after` is the one definition of the bound and `usable_busy_ratio` takes the config. Mutations diverging either caller's bound, or changing the shared multiplier, fail the fleet tests. |
