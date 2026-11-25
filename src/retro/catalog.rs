@@ -110,6 +110,12 @@ pub fn definition(id: &str) -> Option<&'static MetricDef> {
 pub struct Metric {
     /// Stable metric id.
     pub id: String,
+    /// Stable catalog class. Missing in records written before class metadata was added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
+    /// Department catalog class when this metric also has a department definition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub department_class: Option<String>,
     /// `ok` or `unavailable`.
     pub status: Status,
     /// The number, or null when unavailable.

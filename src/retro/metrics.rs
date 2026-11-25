@@ -142,6 +142,9 @@ impl Out<'_> {
             id.to_owned(),
             Metric {
                 id: id.to_owned(),
+                class: Some(entry.family.to_owned()),
+                department_class: super::department::definition(id)
+                    .map(|definition| definition.class.to_owned()),
                 status,
                 value,
                 unit: entry.unit.to_owned(),

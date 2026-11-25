@@ -1997,6 +1997,9 @@ fn stored(id: &str, value: Option<f64>, query: &str) -> Metric {
     let entry = definition(id).unwrap();
     Metric {
         id: id.to_owned(),
+        class: Some(entry.family.to_owned()),
+        department_class: ix_board::retro::department::definition(id)
+            .map(|definition| definition.class.to_owned()),
         status: if value.is_some() {
             Status::Ok
         } else {
@@ -2046,6 +2049,51 @@ fn delta(records: &[Record], extra: &str) -> Result<DeltaReport, RetroError> {
 
 fn one(report: &DeltaReport, id: &str) -> ix_board::retro::delta::MetricDelta {
     report.metrics.iter().find(|m| m.id == id).unwrap().clone()
+}
+
+/// Trace: FR-027-AC-9, FR-024-AC-19
+#[test]
+fn snapshot_and_delta_expose_catalog_classes_and_legacy_records_still_decode() {
+    let current = snapshot(&base_rig());
+    assert_eq!(
+        current.metrics["path_closed"].class.as_deref(),
+        Some("progress")
+    );
+    assert_eq!(
+        current.metrics["fix_rounds_total"]
+            .department_class
+            .as_deref(),
+        Some("review_rework")
+    );
+
+    let mut old_record = serde_json::to_value(snap(
+        "2026-11-05T12:00:00Z",
+        &[
+            ("path_closed", Some(1.0), QUERY),
+            ("fix_rounds_total", Some(1.0), QUERY),
+        ],
+    ))
+    .unwrap();
+    for metric in old_record["metrics"].as_object_mut().unwrap().values_mut() {
+        metric.as_object_mut().unwrap().remove("class");
+        metric.as_object_mut().unwrap().remove("department_class");
+    }
+    let old_record: Record = serde_json::from_value(old_record).expect("decode old stored record");
+    assert_eq!(old_record.metrics["path_closed"].class, None);
+
+    let latest = snap(
+        "2026-11-06T12:00:00Z",
+        &[
+            ("path_closed", Some(2.0), QUERY),
+            ("fix_rounds_total", Some(2.0), QUERY),
+        ],
+    );
+    let report = delta(&[old_record, latest], "{}").unwrap();
+    assert_eq!(one(&report, "path_closed").class, "progress");
+    assert_eq!(
+        one(&report, "fix_rounds_total").department_class.as_deref(),
+        Some("review_rework")
+    );
 }
 
 /// Three snapshots of `prs_idle` (down), `path_closed` (up) and `prs_open` (neutral).

@@ -385,6 +385,8 @@ fn windowed_metrics_are_gauges_and_expired_sources_lose_values() {
             "path_closed".into(),
             crate::retro::Metric {
                 id: "path_closed".into(),
+                class: Some("progress".into()),
+                department_class: None,
                 status: crate::retro::Status::Ok,
                 value: Some(5.0),
                 unit: "issues".into(),
