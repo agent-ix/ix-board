@@ -198,6 +198,8 @@ pub mod series {
     pub const CONFIG: &str = "ix_fleet_config_seconds";
     /// `ix.fleet.lane.compile_seconds`, monotonic sum, unit `s`.
     pub const COMPILE_SECONDS: &str = "ix_fleet_lane_compile_seconds_total";
+    /// `ix.fleet.host.busy_ratio`, gauge, unit `1`.
+    pub const HOST_BUSY_RATIO: &str = "ix_fleet_host_busy_ratio";
 }
 
 /// A series source that cannot read; the reason is the defect text of every host.
@@ -259,6 +261,23 @@ impl<Q: PromQuery> SeriesSource for PrometheusSeries<Q> {
             samples(&self.query.query(&expr)?)
         };
         let mut series = HostSeries::default();
+        let busy = read(format!("{}{{host=\"{host}\"}}", series::HOST_BUSY_RATIO))?;
+        match busy.as_slice() {
+            [] => series.absent.push(series::HOST_BUSY_RATIO.to_owned()),
+            [(_, value)] if value.is_finite() && (0.0..=1.0).contains(value) => {
+                series.busy_ratio = Some(*value);
+            }
+            [_] => {
+                return Err(SourceError(
+                    "host busy ratio must be finite and between 0 and 1".to_owned(),
+                ));
+            }
+            _ => {
+                return Err(SourceError(
+                    "multiple host busy ratio samples for one host".to_owned(),
+                ));
+            }
+        }
         for (labels, value) in read(format!("{}{{host=\"{host}\"}}", series::LANE_BLOCKED))? {
             if value >= 1.0
                 && let (Some(lane), Some(reason)) = (labels.get("lane"), labels.get("reason"))

@@ -21,6 +21,8 @@ use std::time::Duration;
 /// why it is unread, so the tick names the missing seam instead of emitting from an empty one.
 struct LiveSources {
     timeout: Duration,
+    series: Option<Arc<dyn SeriesSource>>,
+    hosts: Vec<String>,
 }
 
 impl TickSources for LiveSources {
@@ -42,7 +44,25 @@ impl TickSources for LiveSources {
     }
 
     fn host_busy(&self) -> Result<BTreeMap<String, f64>, Unread> {
-        Err(Unread::Unwired("SWM-281"))
+        let series = self.series.as_ref().ok_or_else(|| {
+            Unread::Failed(SourceError(
+                "set IX_PROMETHEUS_URL or [fleet] prometheus_url to read host busy ratios"
+                    .to_owned(),
+            ))
+        })?;
+        self.hosts
+            .iter()
+            .map(|host| {
+                let reading = series.host_series(host).map_err(Unread::Failed)?;
+                let ratio = reading.busy_ratio.ok_or_else(|| {
+                    Unread::Failed(SourceError(format!(
+                        "Prometheus series {} returned no busy ratio for host {host}",
+                        live::series::HOST_BUSY_RATIO
+                    )))
+                })?;
+                Ok((host.to_lowercase(), ratio))
+            })
+            .collect()
     }
 
     fn lane_prs(&self) -> Result<Vec<LanePr>, Unread> {
@@ -123,7 +143,7 @@ pub fn run(file: Option<&toml::Value>, session: Option<&str>) -> Result<TickOutp
     let (relay, receipts) = live::read_relay(config.host_timeout);
     let sources = Sources {
         relay,
-        series,
+        series: series.clone(),
         receipts: &receipts,
         weak: &live::NoWeakSignals,
     };
@@ -137,6 +157,8 @@ pub fn run(file: Option<&toml::Value>, session: Option<&str>) -> Result<TickOutp
     }
     let facts = TickFacts::read(&LiveSources {
         timeout: config.host_timeout,
+        series: series.clone(),
+        hosts: report.hosts.iter().map(|host| host.host.clone()).collect(),
     });
     let orders = StandingOrders::load(settings.standing_orders_path.as_deref());
     let mut bus = connect(config.host_timeout).map_err(FleetError::Tick)?;
@@ -237,4 +259,42 @@ pub fn commit_completing(
             focus: &focus,
         })
         .map_err(|e| FleetError::Ledger(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fleet::{HostSeries, SourceError};
+    use ix_trace_rs::trace;
+
+    struct BusySeries;
+
+    impl SeriesSource for BusySeries {
+        fn host_series(&self, host: &str) -> Result<HostSeries, SourceError> {
+            let busy_ratio = match host {
+                "draco" => 0.72,
+                "titan" => 0.91,
+                _ => return Err(SourceError(format!("unexpected host {host}"))),
+            };
+            Ok(HostSeries {
+                busy_ratio: Some(busy_ratio),
+                ..HostSeries::default()
+            })
+        }
+    }
+
+    #[trace("FR-038-AC-6")]
+    #[test]
+    fn live_tick_reads_busy_ratio_from_prometheus_for_each_host() {
+        let sources = LiveSources {
+            timeout: Duration::from_secs(1),
+            series: Some(Arc::new(BusySeries)),
+            hosts: vec!["draco".to_owned(), "titan".to_owned()],
+        };
+
+        assert_eq!(
+            sources.host_busy().unwrap(),
+            BTreeMap::from([("draco".to_owned(), 0.72), ("titan".to_owned(), 0.91)])
+        );
+    }
 }

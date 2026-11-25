@@ -100,6 +100,8 @@ pub struct ProbeReading {
 /// One host's watcher series.
 #[derive(Clone, Debug, Default)]
 pub struct HostSeries {
+    /// The watcher-reported busy ratio for the host.
+    pub busy_ratio: Option<f64>,
     /// Lane (lower case) to relay-resolved blocked reason.
     pub blocked: BTreeMap<String, String>,
     /// Probe readings.

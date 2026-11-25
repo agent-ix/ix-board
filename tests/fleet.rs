@@ -48,6 +48,7 @@ fn list(machine: &str, lanes: &[&str]) -> HostLaneList {
 
 fn series(window: u64, blocked: &[(&str, &str)]) -> HostSeries {
     HostSeries {
+        busy_ratio: None,
         blocked: blocked
             .iter()
             .map(|(lane, reason)| (lane.to_lowercase(), (*reason).to_owned()))
@@ -671,6 +672,10 @@ fn prometheus_responses_become_host_series_with_relay_thresholds() {
         vector(r#"{"metric":{"lane":"titan:wB:pN"},"value":[1,"42.5"]}"#),
     );
     canned.insert(
+        "ix_fleet_host_busy_ratio",
+        vector(r#"{"metric":{"host":"titan"},"value":[1,"0.73"]}"#),
+    );
+    canned.insert(
         "time() - timestamp",
         vector(r#"{"metric":{},"value":[1,"12"]}"#),
     );
@@ -685,6 +690,7 @@ fn prometheus_responses_become_host_series_with_relay_thresholds() {
     assert!(!read.blocked.contains_key("titan:wb:pm"));
     assert_eq!(read.config.working_window, Some(Duration::from_secs(300)));
     assert_eq!(read.compile_seconds.get("titan:wb:pn"), Some(&42.5));
+    assert_eq!(read.busy_ratio, Some(0.73));
     assert_eq!(read.sample_age, Some(Duration::from_secs(12)));
     assert_eq!(read.probes.iter().filter(|p| !p.ok).count(), 1);
     let failing = PrometheusSeries {
@@ -957,13 +963,19 @@ fn empty_prometheus_results_mark_the_required_series_absent_under_one_set_of_nam
             ("ix_fleet_probe_ok", empty),
             ("ix_fleet_config", empty),
             ("ix_fleet_lane_compile_seconds_total", empty),
+            ("ix_fleet_host_busy_ratio", empty),
             ("time() - timestamp", empty),
         ])),
     };
     let read = source.host_series("h").unwrap();
     assert_eq!(
         read.absent,
-        [series::PROBE_OK, series::CONFIG, series::COMPILE_SECONDS]
+        [
+            series::HOST_BUSY_RATIO,
+            series::PROBE_OK,
+            series::CONFIG,
+            series::COMPILE_SECONDS
+        ]
     );
     assert_eq!(series::LANE_BLOCKED, "ix_fleet_lane_blocked_ratio");
     assert_eq!(series::PROBE_OK, "ix_fleet_probe_ok_ratio");
@@ -972,6 +984,7 @@ fn empty_prometheus_results_mark_the_required_series_absent_under_one_set_of_nam
         series::COMPILE_SECONDS,
         "ix_fleet_lane_compile_seconds_total"
     );
+    assert_eq!(series::HOST_BUSY_RATIO, "ix_fleet_host_busy_ratio");
 }
 
 #[trace("FR-034-AC-20")]
