@@ -147,19 +147,17 @@ fn ack_expired_orders_are_read_from_a_real_relay_with_and_without_delivery() {
     relay.expire_orders(Now::Server).unwrap();
 
     let read = expired(&mut relay);
-    assert!(read.gaps.is_empty() && read.unresolved.is_empty());
+    assert!(!read.truncated && read.skipped == 0 && read.unresolved.is_empty());
     let mut orders = read.orders;
     orders.sort_by(|a, b| a.addr.cmp(&b.addr));
     let mut want = vec![
         ExpiredOrder {
             addr: delivered_addr,
             delivered: true,
-            gap_spanned: false,
         },
         ExpiredOrder {
             addr: undelivered_addr,
             delivered: false,
-            gap_spanned: false,
         },
     ];
     want.sort_by(|a, b| a.addr.cmp(&b.addr));

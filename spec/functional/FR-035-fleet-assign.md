@@ -69,6 +69,7 @@ The command SHALL NOT store assignments in `PLAN-*.md` or any prose file.
 | FR-035-AC-13 | An order body over 4096 bytes, ticket text with an unsafe character, the caller's own lane and a lane with several registered sessions are each refused before any send. | Test |
 | FR-035-AC-14 | A relay read that fails while waiting does not end the wait and is reported as a `relay_read_errors` defect; a ledger write that fails after the send is a `ledger_unwritable` defect and a non-zero exit; the exit codes are those of behavior 14. | Test |
 | FR-035-AC-15 | A lane with an event on another ticket before the order that then works the first ticket reaches `confirmed`; focus uses the configured team keys, and `focus_at_deadline` is the focus at the deadline, not at the confirming event. | Test |
+| FR-035-AC-16 | The receipt read spans relay retention and follows the page cursor until none remains; it is bounded at `RECEIPT_EVENT_CAP / RECEIPT_PAGE_CAP + 1` pages and fails when the bound is reached; a strict coverage reason fails the read while the remaining reasons are reported as gaps. | Test |
 
 ## Dependencies
 

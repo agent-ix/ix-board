@@ -45,8 +45,13 @@ emitted_at, executed_at, resolved_at), `defect`, `assignment_history`,
 - **Time.** All times are relay server time ([FR-034](./FR-034-fleet-lane-status.md)).
 - **Time to action.** The command computes `executed_at` as the first transition of
   the target lane into the action's expected state after emission: `push_next_ticket`
-  expects WORKING with a focus matching the pushed ticket, `resend_order` expects
-  a non-STALE-ORDER class, `answer_dialog` expects a class other than BLOCKED(dialog).
+  expects the lane focus ([FR-037](./FR-037-fleet-focus-and-drift.md)) to match the pushed ticket, `resend_order` expects an
+  `Acted` receipt for the resent order, `answer_dialog` expects the lane out of BLOCKED after an
+  `answer_dialog` action was emitted (a fallback to `escalate_block` is not execution) and
+  `act_on_undetermined` expects the lane's class to be determined again. Only positive evidence sets
+  `executed_at`: a `push_next_ticket` is executed when the lane is WORKING with its derived focus on the
+  pushed ticket (the head of its FR-072 list), never for any WORKING lane. Storing the pushed ticket on the action row and settling `executed_at` in a later tick within the focus window is deferred to SWM-255; until then a push is judged only in the tick its condition resolves, against the list head of that tick, so an execution can be missed but is never falsely credited. `resend_order` is deferred to SWM-255 (the `Acted` receipt join): until it lands a
+  `resend_order` has no `executed_at`.
   A lane already in the expected state at emission does not count. An action aimed
   at a lead or a project (`escalate_*`, `need_ready_tickets`, `fix_source`) has no
   `executed_at` and resolves when its condition clears. Time-to-action is the elapsed time from a lane entering a
@@ -75,13 +80,13 @@ under one retention rule; the relay holds transport records of bounded age only.
 | `lane_tick` | run sequence, `source` (`status` or `tick`), tick id (empty for a `status` row), lane, host, class, reason, `remaining_assigned`, `ready_work_available`, `observed_ms` (relay time of the run), evidence | `fleet tick` and `fleet status`; a `status` row leaves `remaining_assigned` and `ready_work_available` empty |
 | `drift_finding` | finding id, lane, rule, focus, `opened_tick`, `opened_at`, `closed_at`, evidence times | `fleet tick` ([FR-037](./FR-037-fleet-focus-and-drift.md)) |
 | `assignment_history` (extended) | adds `order_id`, `expect_ticket`, `sent_at`, `deadline_at`, `result` (`pending`, `confirmed`, `acted_not_focused`, `ack_expired`, `timed_out`), `result_at`, `confirm_latency_s` (empty for an unconfirmed result), `focus_at_deadline` | `fleet assign` ([FR-035](./FR-035-fleet-assign.md)) |
-| `order_focus_at_deadline` | `order_id`, `sender_role` (`orchestrator`, `minder`), `sender_addr`, lane, `expect_ticket`, `deadline_at`, `focus_ticket`, `focus_state`, `outcome` (`confirmed`, `acted_not_focused`, `ack_expired`, `timed_out`), `followup_at` | `fleet tick` and `fleet status` |
+| `order_focus_at_deadline` | `order_id`, `sender_role` (`orchestrator`, `minder`), `sender_addr`, lane, `expect_ticket`, `deadline_at`, `focus_ticket`, `focus_state`, `outcome` (`confirmed`, `acted_not_focused`, `ack_expired`, `timed_out`), `followup_at` | `fleet tick` and `fleet status`. **Deferred to SWM-255**: not written yet |
 | `action` (extended) | adds `severity`, `due_by`, `target_role` (`lane`, `lead`, `orchestrator`, `planner`, `host`), `target_addr`, `condition_started_at`, `parent_action_id`, `rung` (0 to 3) | `fleet tick` ([FR-038](./FR-038-fleet-tick.md)) |
-| `action_send` | `action_id`, `sent_at`, `sender_addr`, `recipient_addr`, receipt id | `fleet tick` and `fleet status`, from relay receipts |
+| `action_send` | `action_id`, `sent_at`, `sender_addr`, `recipient_addr`, receipt id | `fleet tick` and `fleet status`, from relay receipts. **Deferred to SWM-255**: not written yet |
 | `tick` (extended) | adds `session_addr` and `session_role` | `fleet tick` |
-| `session_turn` | `session_addr`, `session_role`, `started_at` | `fleet tick` and `fleet status`, from hook `prompt` events of the configured minder and orchestrator addresses |
+| `session_turn` | `session_addr`, `session_role`, `started_at` | `fleet tick` and `fleet status`, from hook `prompt` events of the configured minder and orchestrator addresses. **Deferred to SWM-255**: not written yet |
 | `cycle_event` | `cycle_id`, `session_addr`, `started_at`, `ended_at`, `ended_reason` (`ended`, `superseded`), `interval_s` | `fleet cycle` ([FR-044](./FR-044-fleet-cycle-and-dialog-answer-log.md)) |
-| `cycle_missed` | `session_addr`, `last_ended_at`, `expected_by`, `detected_at` | `fleet tick` (below) |
+| `cycle_missed` | `session_addr`, `last_ended_at`, `expected_by`, `detected_at` | `fleet tick` (below). **Deferred to SWM-255**: not written yet |
 | `defect` (existing, columns fixed) | `defect_id`, `source`, `host`, `lane`, `kind`, `first_seen_at`, `closed_at`, `routed_ticket`, `routed_at`; `first_seen_at` is relay time and is empty for a defect first seen in a run without relay time, whose host clock is kept in `first_seen_host_ms` | `fleet status` and `fleet tick` |
 | `dialog_answer` | see [FR-044](./FR-044-fleet-cycle-and-dialog-answer-log.md) | `fleet answer-log record` |
 | `capacity_run`, `capacity_step`, `capacity_step_lane_output`, `capacity_level`, `capacity_event`, `host_output_sample` | see [FR-041](./FR-041-fleet-saturation.md) | `fleet capacity` and `fleet tick` |
@@ -180,7 +185,7 @@ in [FR-041](./FR-041-fleet-saturation.md); `answer_dialog_latency_max` and
 | FR-039-AC-3 | Two concurrent writers serialize under the lock with strictly increasing sequence numbers; a writer that cannot take the lock in the bound fails without writing. | Test |
 | FR-039-AC-4 | A simulated crash between interval write and cursor update leaves the previous committed state. | Test |
 | FR-039-AC-5 | A ledger path inside a git work tree is refused, and the default path is outside any work tree. | Test |
-| FR-039-AC-6 | `executed_at` equals the first transition of the target lane into the expected state (push_next_ticket: WORKING with matching focus); a lane already in that state at emission yields none until a later transition; an action aimed at a lead or project has none and resolves when its condition clears. | Test |
+| FR-039-AC-6 | The `executed_at` of a `push_next_ticket` equals the first transition of the target lane into WORKING with focus on the pushed ticket, and WORKING on another ticket gives none; that of an `answer_dialog` equals the first transition out of BLOCKED after an emitted answer, and an `escalate_block` fallback gives none; that of an `act_on_undetermined` equals the first transition to a determined class; a lane already in the expected state at emission has none until a later transition; an action aimed at a lead or project has none and resolves when its condition clears; a `resend_order` has no `executed_at` until SWM-255 adds the `Acted` receipt join. | Test |
 | FR-039-AC-7 | `fleet ledger query` returns idle minutes per lane per day and actions with time-to-action in text and JSON without writing. | Test |
 | FR-039-AC-8 | An unsupported schema version is refused with no change, retention prunes only rows older than the configured age, and replaced assignments, defects and ground-truth samples are stored with their timestamps. | Test |
 | FR-039-AC-9 | Opening a version 1 ledger migrates it to version 2 in one transaction under the writer lock with every earlier row unchanged; a crash injected mid-migration leaves the version 1 ledger intact and openable; a ledger of a later version is refused without a change. | Test |

@@ -12,11 +12,10 @@ use super::report::{
 };
 use relay_core::config::{CoreFlags, load_core};
 use relay_core::receipts::{
-    RECEIPT_EVENT_CAP, RECEIPT_PAGE_CAP, RECEIPT_WINDOW_MS, ReceiptCoverageReason, ReceiptEvent,
-    ReceiptExport, ReceiptOutcome, ReceiptRequest,
+    ExpiredOrders, RECEIPT_EVENT_CAP, RECEIPT_PAGE_CAP, ReceiptCoverageReason, ReceiptEvent,
+    ReceiptExport,
 };
 use relay_core::{ACTIVITY_MAX_EVENTS, Address, Relay};
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 /// Reads the relay snapshot and the order receipts over one bounded connection. The URL and key
@@ -44,7 +43,7 @@ pub fn read_relay_on(
 ) -> (Result<RelaySnapshot, SourceError>, ReadReceipts) {
     let snapshot = read_snapshot(relay, timeout);
     let receipts = match &snapshot {
-        Ok(s) => read_receipts(relay, s.now_ms, &s.registrations),
+        Ok(s) => read_receipts(relay, &s.registrations),
         Err(error) => Err(error.clone()),
     };
     (snapshot, ReadReceipts(receipts))
@@ -316,69 +315,9 @@ impl<Q: PromQuery> SeriesSource for PrometheusSeries<Q> {
 /// the final partial page.
 const RECEIPT_MAX_PAGES: usize = RECEIPT_EVENT_CAP / RECEIPT_PAGE_CAP + 1;
 
-/// The `AckExpired` orders in `events`, per lane address, from the relay's own receipts (FR-067,
-/// FR-071): `lanes` maps a session queue identity to its lane address. An order that has an
-/// `Acted` receipt is not expired; one with no `Delivered` receipt is `timed_out`. An expired
-/// order whose recipient is not in `lanes` is returned as unresolved.
-///
-/// `gaps` are the history's coverage limits. A recording gap or a pending observation may hide a
-/// `Delivered` receipt of any order. A count-based `retention` boundary hides only receipts older
-/// than it, so it affects an order only when its `Queued` receipt is out of view. The returned gaps
-/// hold the limits that affect at least one `timed_out` order, plus every true recording gap or
-/// pending observation.
-#[must_use]
-pub fn expired_orders_from(
-    events: &[ReceiptEvent],
-    lanes: &BTreeMap<String, String>,
-    gaps: Vec<String>,
-) -> ReceiptRead {
-    let mut states: BTreeMap<&str, (bool, bool, bool)> = BTreeMap::new();
-    for event in events {
-        let state = states.entry(event.original_id.as_str()).or_default();
-        match event.outcome {
-            ReceiptOutcome::Delivered => state.0 = true,
-            ReceiptOutcome::Acted => state.1 = true,
-            ReceiptOutcome::Queued => state.2 = true,
-            _ => {}
-        }
-    }
-    let hard = gaps.iter().any(|g| g != "retention");
-    let retained = gaps.iter().any(|g| g == "retention");
-    let mut retention_spans = false;
-    let mut read = ReceiptRead {
-        gaps: gaps.iter().filter(|g| *g != "retention").cloned().collect(),
-        ..ReceiptRead::default()
-    };
-    for event in events {
-        let (delivered, acted, queued) = states[event.original_id.as_str()];
-        if event.outcome != ReceiptOutcome::AckExpired || acted {
-            continue;
-        }
-        match lanes.get(&event.target) {
-            Some(addr) => {
-                let beyond_retention = retained && !queued;
-                retention_spans |= beyond_retention && !delivered;
-                read.orders.push(ExpiredOrder {
-                    addr: addr.clone(),
-                    delivered,
-                    gap_spanned: !delivered && (hard || beyond_retention),
-                });
-            }
-            None => read.unresolved.push(UnresolvedOrder {
-                order_id: event.original_id.clone(),
-                target: event.target.clone(),
-            }),
-        }
-    }
-    if retention_spans {
-        read.gaps.push("retention".to_owned());
-    }
-    read
-}
-
 /// Reads every retained receipt through `fetch`, which returns the page after a cursor. The
-/// request spans the relay's whole receipt retention, so an expired order stays visible while the
-/// relay retains it and its `Delivered` receipt is in view.
+/// request spans the relay's whole receipt retention. `fleet assign` and the assignment
+/// completion read receipts through it.
 ///
 /// # Errors
 ///
@@ -423,27 +362,43 @@ pub fn collect_receipts(
     )))
 }
 
-fn read_receipts(
-    relay: &mut Relay,
-    now_ms: i64,
-    registrations: &[RegInfo],
-) -> Result<ReceiptRead, SourceError> {
-    let lanes: BTreeMap<String, String> = registrations
-        .iter()
-        .map(|reg| (reg.queue.clone(), reg.addr.clone()))
-        .collect();
-    let (events, gaps) = collect_receipts(|after| {
-        relay
-            .receipt_export(&ReceiptRequest {
-                since_ms: now_ms - RECEIPT_WINDOW_MS,
-                until_ms: now_ms,
-                now_ms,
-                page_size: RECEIPT_PAGE_CAP,
-                after,
-            })
-            .map_err(|e| SourceError(format!("relay receipts: {e}")))
-    })?;
-    Ok(expired_orders_from(&events, &lanes, gaps))
+fn read_receipts(relay: &mut Relay, registrations: &[RegInfo]) -> Result<ReceiptRead, SourceError> {
+    let listed = relay
+        .expired_orders()
+        .map_err(|e| SourceError(format!("relay expired orders: {e}")))?;
+    let addrs: Vec<String> = registrations.iter().map(|reg| reg.addr.clone()).collect();
+    Ok(receipt_read_from(&listed, &addrs))
+}
+
+/// Maps the relay's read-only expired-order list (`Relay::expired_orders`) to the report's
+/// receipt read. The relay applies the deadline and reports whether a `Delivered` receipt came
+/// before expiry, so `truncated`, `skipped` and an index that has not started are carried to the
+/// report as defects. A recipient that is not a registered lane address is unresolved.
+#[must_use]
+pub fn receipt_read_from(listed: &ExpiredOrders, lanes: &[String]) -> ReceiptRead {
+    let mut read = ReceiptRead {
+        truncated: listed.truncated,
+        skipped: listed.skipped,
+        index_not_started: listed.indexed_since_ms.is_none(),
+        ..ReceiptRead::default()
+    };
+    for order in &listed.orders {
+        let recipient: Option<Address> = order.recipient.parse().ok();
+        let lane = lanes
+            .iter()
+            .find(|lane| lane.parse::<Address>().ok() == recipient && recipient.is_some());
+        match lane {
+            Some(addr) => read.orders.push(ExpiredOrder {
+                addr: addr.clone(),
+                delivered: order.delivered_before_expiry,
+            }),
+            None => read.unresolved.push(UnresolvedOrder {
+                order_id: order.original_id.clone(),
+                target: order.recipient.clone(),
+            }),
+        }
+    }
+    read
 }
 
 /// The receipts read together with the relay snapshot, handed to the report as its order source.

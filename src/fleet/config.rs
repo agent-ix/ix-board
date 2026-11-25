@@ -137,7 +137,9 @@ fn strings(table: &toml::Table, key: &str) -> Result<Vec<String>, FleetError> {
 
 impl FleetConfig {
     /// Reads the `[fleet]` table of a parsed configuration file. `env_prometheus` is
-    /// `IX_PROMETHEUS_URL` and beats the file.
+    /// `IX_PROMETHEUS_URL` and beats the file; `IX_BOARD_LEDGER_PATH` beats `ledger_path`. The
+    /// ledger environment is read here, at configuration load, and nowhere else, so a
+    /// hand-built [`FleetConfig`] always names the ledger it writes.
     ///
     /// # Errors
     ///
@@ -199,6 +201,9 @@ impl FleetConfig {
                 .get("ledger_path")
                 .and_then(toml::Value::as_str)
                 .map(std::path::PathBuf::from);
+        }
+        if let Some(path) = std::env::var_os("IX_BOARD_LEDGER_PATH").filter(|p| !p.is_empty()) {
+            config.ledger_path = Some(std::path::PathBuf::from(path));
         }
         if let Some(url) = env_prometheus.filter(|url| !url.trim().is_empty()) {
             config.prometheus_url = Some(url);
