@@ -247,6 +247,12 @@ enum CapacityCommand {
         #[arg(long)]
         repeat_of: Option<u32>,
     },
+    /// Close and measure the active hold window from live sources.
+    Window {
+        host: String,
+        #[arg(long)]
+        end_ms: i64,
+    },
     /// End the open run and record its valid sustainable level, when established.
     End {
         host: String,
@@ -488,6 +494,7 @@ enum Output {
     FleetCapacity(ix_board::fleet::ledger::CapacityStatus),
     FleetCapacityRun(i64),
     FleetCapacityStep(ix_board::fleet::ledger::capacity::OpenCapacityWindow),
+    FleetCapacityMeasurement(ix_board::fleet::capacity::WindowMeasurements),
     FleetCapacityLevel {
         recorded_level: Option<u32>,
     },
@@ -822,6 +829,12 @@ fn run(command: Command) -> Result<Output, Error> {
         Command::Fleet {
             command:
                 FleetCommand::Capacity {
+                    command: CapacityCommand::Window { host, end_ms },
+                },
+        } => run_fleet_capacity_window(&host, end_ms).map(Output::FleetCapacityMeasurement),
+        Command::Fleet {
+            command:
+                FleetCommand::Capacity {
                     command:
                         CapacityCommand::End {
                             host,
@@ -1117,6 +1130,38 @@ fn run_fleet_capacity_end(host: &str, reason: &str, at_ms: i64) -> Result<Option
     let (config, path) = fleet_capacity_config()?;
     ix_board::fleet::ledger::capacity::end(&path, &config, host, reason, at_ms)
         .map_err(|error| Error::Fleet(ix_board::fleet::FleetError::Ledger(error.to_string())))
+}
+
+fn run_fleet_capacity_window(
+    host: &str,
+    end_ms: i64,
+) -> Result<ix_board::fleet::capacity::WindowMeasurements, Error> {
+    use ix_board::fleet::{FleetError, capacity::LiveMeasurementSource, ledger, live::PromHttp};
+    let (config, path) = fleet_capacity_config()?;
+    let status = ledger::capacity::status(&path)
+        .map_err(|error| Error::Fleet(FleetError::Ledger(error.to_string())))?;
+    let run_id = status
+        .hosts
+        .iter()
+        .find(|entry| entry.host.eq_ignore_ascii_case(host))
+        .and_then(|entry| entry.current_run)
+        .ok_or_else(|| {
+            Error::Fleet(FleetError::Ledger(format!(
+                "host {host} has no open capacity run"
+            )))
+        })?;
+    let prometheus = config
+        .prometheus_url
+        .as_deref()
+        .map(|url| PromHttp::new(url, config.host_timeout))
+        .transpose()
+        .map_err(|error| Error::Fleet(FleetError::Tick(error.to_string())))?;
+    let source = LiveMeasurementSource {
+        config: &config,
+        prometheus,
+    };
+    ledger::capacity::measure_open_step(&path, &config, run_id, end_ms, &source)
+        .map_err(|error| Error::Fleet(FleetError::Ledger(error.to_string())))
 }
 
 fn run_fleet_assign(

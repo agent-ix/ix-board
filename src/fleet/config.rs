@@ -61,7 +61,7 @@ pub const RELAY_DEFAULT_MAX_TOOL_RUNTIME: Duration = Duration::from_secs(2 * 60 
 pub const RELAY_DEFAULT_NO_EVENTS_AFTER: Duration = Duration::from_secs(30 * 60);
 
 /// ix-board-owned fleet settings and the configured lanes and hosts.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct FleetConfig {
     /// Prometheus base URL; unset makes the Prometheus source unreadable.
     pub prometheus_url: Option<String>,
@@ -226,7 +226,10 @@ impl FleetConfig {
                         FleetError::Config(format!("capacity_limits.{host} must be a table"))
                     })?;
                     if let Some(key) = fields.keys().find(|key| {
-                        !matches!(key.as_str(), "build_slots" | "memory_reserve_bytes" | "thermal_limit_celsius")
+                        !matches!(
+                            key.as_str(),
+                            "build_slots" | "memory_reserve_bytes" | "thermal_limit_celsius"
+                        )
                     }) {
                         return Err(FleetError::Config(format!(
                             "unknown key capacity_limits.{host}.{key}"
@@ -249,9 +252,11 @@ impl FleetConfig {
                     let build_slots = positive_u64("build_slots")?
                         .map(u32::try_from)
                         .transpose()
-                        .map_err(|_| FleetError::Config(format!(
-                            "capacity_limits.{host}.build_slots is too large"
-                        )))?;
+                        .map_err(|_| {
+                            FleetError::Config(format!(
+                                "capacity_limits.{host}.build_slots is too large"
+                            ))
+                        })?;
                     let thermal_limit_celsius = fields
                         .get("thermal_limit_celsius")
                         .map(|value| {

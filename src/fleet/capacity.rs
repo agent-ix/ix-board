@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error as ThisError;
 
+mod live;
+pub use live::LiveMeasurementSource;
+
 /// Whether a source supplied usable coverage for a capacity field.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
