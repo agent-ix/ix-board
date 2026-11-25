@@ -1752,6 +1752,7 @@ fn run_retro_eval(
     let specs_dir = retro::eval::resolve_role_spec_dir(&team, &settings);
     let mut specs = retro_eval_stage("role_specs", || retro::eval::read_role_specs(&specs_dir))
         .map_err(retro::RetroError::Evaluation)?;
+    let source_specs = retro::eval::specs_with_objective_metric_queries(&specs);
     let duration = retro::parse_window(since).map_err(retro::RetroError::from)?;
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1776,7 +1777,6 @@ fn run_retro_eval(
         }
         specs.retain(|spec| spec.role == role);
     }
-    let source_specs = retro::eval::specs_with_objective_metric_queries(&specs);
     let store_read = retro_eval_stage("retro_store", || {
         retro::Store::from_env(&team)
             .and_then(|store| store.read_all())

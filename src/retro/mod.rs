@@ -29,6 +29,7 @@ pub use catalog::{
 pub use config::{ConfigError, DEFAULT_WINDOW, RetroConfig, format_window, parse_window};
 pub use delta::{DeltaReport, render_delta_text, run_delta};
 pub use metrics::Frame;
+#[cfg(test)]
 pub(crate) use metrics::marker_fields;
 pub use saved::{SavedReport, SavedReportError, decode_saved_report, read_saved_report};
 pub use sources::Sources;

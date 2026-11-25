@@ -8,6 +8,9 @@ use ix_trace_rs::implements;
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub type LedgerViewRows = Result<Vec<Map<String, Value>>, String>;
+pub type LedgerViews = BTreeMap<String, LedgerViewRows>;
+
 /// Complete relay and ledger rows normalized by the live reader.
 ///
 /// A successful source result means the requested evaluation window has complete coverage.
@@ -25,7 +28,7 @@ pub struct RelayEvidence<'a> {
     pub action_sends: Result<&'a [Map<String, Value>], &'a str>,
     /// Ledger view rows keyed by the view name. Views required by an evaluated query must be
     /// present and complete; a missing or partial view is unavailable.
-    pub views: &'a BTreeMap<String, Result<Vec<Map<String, Value>>, String>>,
+    pub views: &'a LedgerViews,
     /// Assignment order ids recorded by fleet assign. Needed to distinguish ORCH orders sent
     /// through fleet assign from direct relay orders.
     pub fleet_assign_order_ids: Result<&'a BTreeSet<String>, &'a str>,
@@ -585,7 +588,7 @@ mod tests {
         orders: Result<&'a [Map<String, Value>], &'a str>,
         receipts: Result<&'a [Map<String, Value>], &'a str>,
         action_sends: Result<&'a [Map<String, Value>], &'a str>,
-        views: &'a BTreeMap<String, Result<Vec<Map<String, Value>>, String>>,
+        views: &'a LedgerViews,
         assigned: Result<&'a BTreeSet<String>, &'a str>,
     ) -> RelayEvidence<'a> {
         RelayEvidence {

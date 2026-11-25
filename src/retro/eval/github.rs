@@ -148,6 +148,7 @@ pub(crate) fn read_pull_requests(
 
 /// Filters PR rows by native merge time, returning unavailable for malformed
 /// timestamps instead of silently changing the event window.
+#[cfg(test)]
 pub(crate) fn merged_in_window<'a>(
     rows: &'a [PullRequestRow],
     window: &EvalWindow,

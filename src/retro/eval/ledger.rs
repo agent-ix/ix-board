@@ -16,7 +16,6 @@ pub(super) type ViewRows = BTreeMap<String, Result<Vec<Map<String, Value>>, Stri
 enum Reduction {
     Count,
     Sum(&'static str),
-    Max(&'static str),
     Ratio(&'static str, &'static str),
     NotApplicable(&'static str),
     Unsupported(&'static str),
@@ -79,7 +78,7 @@ struct ViewSpec<'a> {
 
 /// Returns the stable view to read for a supported query. Queries whose public
 /// view cannot be reduced over an event window are deliberately not queried.
-pub(super) fn readable_view<'a>(query: &'a str) -> Option<&'a str> {
+pub(super) fn readable_view(query: &str) -> Option<&str> {
     let view = view_for(query);
     (!matches!(
         view.reduction,
@@ -306,7 +305,7 @@ fn view_for(query: &str) -> ViewSpec<'_> {
     use Reduction::{Count, NotApplicable, Ratio, Sum, Unsupported};
 
     let short = query.strip_prefix("ledger.").unwrap_or_default();
-    let spec = match short {
+    match short {
         "idle_lane_episode_with_ready_work_max"
         | "plan_coverage_gap_open_cycles_max"
         | "short_queue_open_cycles_max"
@@ -433,8 +432,7 @@ fn view_for(query: &str) -> ViewSpec<'_> {
             name: short,
             reduction: Unsupported("ledger query has no registered window-correct reducer"),
         },
-    };
-    spec
+    }
 }
 
 fn reduce_view(
@@ -487,19 +485,6 @@ fn reduce_view(
                 total += value;
             }
             total
-        }
-        Reduction::Max(field) => {
-            let Some(maximum) = selected
-                .iter()
-                .filter_map(|row| row.get(field).and_then(Value::as_f64))
-                .reduce(f64::max)
-            else {
-                if selected.is_empty() {
-                    return value(0.0, evidence_refs);
-                }
-                return unavailable(format!("ledger view {view} has no numeric {field}"));
-            };
-            maximum
         }
         Reduction::Ratio(numerator, denominator) => {
             let mut numerator_total = 0.0;

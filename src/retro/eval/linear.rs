@@ -543,9 +543,9 @@ fn marker_fields(line: &str) -> Option<(&str, BTreeMap<&str, &str>)> {
     ))
 }
 
-fn reviewer_marker<'a>(
-    comment: &'a MarkerComment,
-) -> Result<(String, String, BTreeMap<&'a str, &'a str>), String> {
+fn reviewer_marker(
+    comment: &MarkerComment,
+) -> Result<(String, String, BTreeMap<&str, &str>), String> {
     let first_line = comment.body.lines().next().unwrap_or_default();
     let Some(("reviewer", fields)) = marker_fields(first_line) else {
         return Err("Linear returned an unsupported reviewer marker".into());
@@ -757,9 +757,12 @@ mod tests {
     fn post_merge_marker_does_not_count_as_review() {
         let pr = pull_request(7, Some(10.0));
         let comment = reviewer_comment("late", 20.0, &real_reviewer_body("ix-board#7", "run-a"));
-        let (without_review, evidence) =
-            merged_prs_without_review_count(&[pr.clone()], &[comment.clone()], &window())
-                .expect("complete data");
+        let (without_review, evidence) = merged_prs_without_review_count(
+            std::slice::from_ref(&pr),
+            std::slice::from_ref(&comment),
+            &window(),
+        )
+        .expect("complete data");
         assert_eq!(without_review, 1);
         assert_eq!(
             evidence,

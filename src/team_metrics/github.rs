@@ -110,6 +110,7 @@ impl<T: Transport> Guard<T> {
     ) -> Result<Self, String> {
         Self::with_storage(state_path, max_bytes, transport, Arc::new(SystemClock))
     }
+    #[cfg(test)]
     fn with_clock(config: &Config, transport: T, clock: Arc<dyn Clock>) -> Result<Self, String> {
         Self::with_storage(&config.state_path, config.max_bytes, transport, clock)
     }

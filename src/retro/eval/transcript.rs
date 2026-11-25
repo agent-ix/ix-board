@@ -1139,10 +1139,10 @@ fn parse_claude_record(record: &Value) -> Result<Vec<TranscriptEvent>, &'static 
                 .get("message")
                 .and_then(|message| message.get("content"));
             for block in content.and_then(Value::as_array).into_iter().flatten() {
-                if block.get("type").and_then(Value::as_str) == Some("tool_use") {
-                    if let Some(event) = claude_tool_event(block, at_ms) {
-                        events.push(event);
-                    }
+                if block.get("type").and_then(Value::as_str) == Some("tool_use")
+                    && let Some(event) = claude_tool_event(block, at_ms)
+                {
+                    events.push(event);
                 }
             }
             if let Some(body) = extract_message(content) {

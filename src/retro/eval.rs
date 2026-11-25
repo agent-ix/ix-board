@@ -1299,6 +1299,7 @@ fn read_linear_marker_metrics(
 }
 
 #[implements("FR-047-AC-1")]
+#[cfg(test)]
 fn parse_linear_marker_metrics(
     comments: &[crate::MarkerComment],
     start_secs: f64,
@@ -1516,6 +1517,7 @@ fn parse_linear_marker_metrics(
 }
 
 #[implements("FR-047-AC-1")]
+#[cfg(test)]
 fn marker_data_complete(kind: &str, data: &serde_json::Value) -> bool {
     let has_fields = |row: &serde_json::Value, fields: &[&str]| {
         fields.iter().all(|field| row.get(*field).is_some())
@@ -1577,6 +1579,7 @@ fn marker_data_complete(kind: &str, data: &serde_json::Value) -> bool {
 }
 
 #[implements("FR-047-AC-1")]
+#[cfg(test)]
 fn yaml_data_block(body: &str) -> Result<serde_json::Value, String> {
     let mut active = false;
     let mut width = 0;
@@ -1686,46 +1689,7 @@ fn read_pr_methods_with_multiple_runs(
     linear::pr_methods_with_multiple_runs(&prs, &comments, window)
 }
 
-fn reviewed_pr_ids(
-    prs: &[super::sources::PullRequest],
-    comments: &[crate::MarkerComment],
-    window: &EvalWindow,
-) -> Result<std::collections::BTreeSet<String>, String> {
-    let start_secs = window.start_ms as f64 / 1000.0;
-    let end_secs = window.end_ms as f64 / 1000.0;
-    let mut reviewed = std::collections::BTreeSet::new();
-    for comment in comments {
-        let at = comment
-            .created_at
-            .as_deref()
-            .ok_or_else(|| "review marker has no source timestamp".to_owned())
-            .and_then(|value| crate::drift::timestamp_epoch(value).map_err(|e| e.to_string()))?;
-        if at < start_secs || at >= end_secs {
-            continue;
-        }
-        let first_line = comment.body.lines().next().unwrap_or_default();
-        let Some(("reviewer", fields)) = super::marker_fields(first_line) else {
-            return Err("Linear returned an unsupported reviewer marker".into());
-        };
-        let repo = fields
-            .get("repo")
-            .ok_or_else(|| "reviewer marker has no repo".to_owned())?;
-        let pr = fields
-            .get("pr")
-            .ok_or_else(|| "reviewer marker has no PR".to_owned())?;
-        reviewed.insert(normalize_pr_key(repo, pr)?);
-    }
-    for pr in prs {
-        if pr
-            .merged_at
-            .is_some_and(|at| at >= start_secs && at < end_secs)
-        {
-            reviewed.insert(format!("{}#{}", pr.repo, pr.number));
-        }
-    }
-    Ok(reviewed)
-}
-
+#[cfg(test)]
 fn pr_methods_count(
     comments: &[crate::MarkerComment],
     allowed_prs: &std::collections::BTreeSet<String>,
@@ -1767,6 +1731,7 @@ fn pr_methods_count(
     Ok((count, evidence))
 }
 
+#[cfg(test)]
 fn normalize_pr_key(repo: &str, pr: &str) -> Result<String, String> {
     let number = if pr.starts_with(&format!("{repo}#")) {
         pr.strip_prefix(&format!("{repo}#"))
@@ -2275,19 +2240,7 @@ fn read_need_ready_tickets_due(
 }
 
 #[implements("FR-047-AC-6")]
-fn read_ledger_unavailable_reason(
-    ledger_path: Option<&Path>,
-    view: &str,
-) -> Result<Option<String>, String> {
-    let path = match ledger_path {
-        Some(path) => path.to_owned(),
-        None => crate::fleet::ledger::default_path().map_err(|error| error.to_string())?,
-    };
-    let rows = crate::fleet::ledger::query(&path, view, None).map_err(|error| error.to_string())?;
-    ledger_unavailable_reason(view, &rows.rows)
-}
-
-#[implements("FR-047-AC-6")]
+#[cfg(test)]
 fn ledger_unavailable_reason(
     view: &str,
     rows: &[serde_json::Map<String, serde_json::Value>],
