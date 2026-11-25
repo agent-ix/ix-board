@@ -552,9 +552,34 @@ Options:
 
 `fleet status` appends each run to a schema-versioned SQLite ledger (FR-039): a run record, one `lane_tick` row per lane (class, reason, evidence, relay time of the run), per-host lane counts, and the defects with their first-seen and close times. `fleet ledger query` reads it without writing, locking or migrating. Queryable views: `idle_minutes` (lane, host, day, minutes per non-WORKING class and minutes while ready work existed), `idle_lane_with_ready_work_ticks`, `lanes_with_ready_work`, `idle_lane_episodes_with_ready_work`, `idle_lane_episode_with_ready_work_max` and `defect_rows`. `--json` prints `{"view", "since_ms", "rows"}`; text prints one `column=value` line per row. `--since` is measured back from the newest run on the relay clock, never the local clock, and views without a time column (`idle_lane_episode_with_ready_work_max`) refuse it. Ready-work columns stay empty until `fleet tick` writes them. All stored times are relay server time; a run whose relay could not be read stores the host clock in `host_ms` with `relay_unavailable`, writes no lane rows, closes no defects and prunes nothing.
 
-The ledger lives at `IX_BOARD_LEDGER_PATH`, else `[fleet] ledger_path`, else `$XDG_STATE_HOME/ix-board/fleet-ledger.sqlite3` (`~/.local/state/ix-board/fleet-ledger.sqlite3`). A path inside a git work tree, or on a network filesystem (NFS, SMB/CIFS, 9p, a WSL `/mnt/<drive>` path, a Windows UNC share), is refused. Writers take an exclusive lock on `<ledger>.lock` and wait up to `ledger_lock_wait_secs`; on Windows a lock file whose process has exited is broken. A ledger of a newer schema version is refused without a change; a version 1 ledger migrates to version 2 in one transaction. `[fleet]` ledger keys: `ledger_path`, `ledger_retention_days` (default 30; closed and point-in-time rows older than this are pruned, open rows never), `ledger_lock_wait_secs` (default 10), `tick_interval_secs` (default 300), `cycle_interval_secs` (default 600) and `grace_secs` (default cycle plus tick). The tick and cycle intervals and grace are stored on each run, so a changed value applies to later runs only.
+The ledger lives at `IX_BOARD_LEDGER_PATH`, else `[fleet] ledger_path`, else `$XDG_STATE_HOME/ix-board/fleet-ledger.sqlite3` (`~/.local/state/ix-board/fleet-ledger.sqlite3`). A path inside a git work tree, or on a network filesystem (NFS, SMB/CIFS, 9p, a WSL `/mnt/<drive>` path, a Windows UNC share), is refused. Writers take an exclusive lock on `<ledger>.lock` and wait up to `ledger_lock_wait_secs`; on Windows a lock file whose process has exited is broken. A ledger of a newer schema version is refused without a change; version 1 through 3 ledgers migrate additively to the current version in a transaction. `[fleet]` ledger keys: `ledger_path`, `ledger_retention_days` (default 30; closed and point-in-time rows older than this are pruned, open rows never), `ledger_lock_wait_secs` (default 10), `tick_interval_secs` (default 300), `cycle_interval_secs` (default 600) and `grace_secs` (default cycle plus tick). The tick and cycle intervals and grace are stored on each run, so a changed value applies to later runs only.
 
 When the ledger cannot be opened or written, `fleet status` still prints the report and adds one `ledger_unwritable` defect carrying the reason (exit 1, or 4 when no row was produced). An unknown view, a missing ledger or `--since` on an untimed view exits 3.
+
+## ix-board fleet capacity
+
+```text
+Read and record capacity discovery history
+
+Usage: ix-board fleet capacity <COMMAND>
+
+Commands:
+  status  Print host state, discovery runs, measured steps and sustainable-level history
+  start   Open a host discovery run
+  step    Record a held lane count and its ramp-up boundary
+  end     Close a discovery run and record a supported level
+```
+
+Every timestamp argument is relay-clock milliseconds. `step` records the hold and ramp-up
+boundary; the orchestrator remains responsible for adding and removing lanes. Library callers
+provide a `MeasurementSource` to `measure_open_step`, which receives the persisted host, lane
+count and post-ramp-up window and returns each field with value, source, availability, coverage,
+observation time and an unavailable reason. Status JSON groups `hosts`, `runs`, `steps`, `levels`,
+`events` and `open_windows`; each step and lane-output field includes its `source_basis` object.
+Fields with under 90% coverage serialize as `null` with an explanation, never as zero. The
+textfile exporter reads the same ledger and emits `ix_fleet_capacity_recorded_level` (only when a
+level exists), `ix_fleet_capacity_recorded_level_timestamp_seconds`, one-hot
+`ix_fleet_capacity_discovery_state{host,state}`, and `ix_fleet_capacity_draining_lanes`.
 
 ## ix-board drift
 

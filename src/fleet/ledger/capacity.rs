@@ -1,0 +1,1299 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Agent-IX
+
+//! Capacity-discovery ledger reads and the Prometheus series exported from them (FR-041).
+
+use super::{Ledger, LedgerError, VERSION, user_version};
+use crate::fleet::FleetConfig;
+use crate::fleet::capacity::{
+    CapacityError, FieldBasis, MeasurementSource, WindowMeasurements, WindowRequest,
+};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+
+/// One complete read-only capacity history response.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct CapacityStatus {
+    /// Host state summaries, including hosts observed by fleet ticks.
+    pub hosts: Vec<CapacityHost>,
+    /// Discovery runs, newest first.
+    pub runs: Vec<CapacityRun>,
+    /// Measured steps, newest first.
+    pub steps: Vec<CapacityStep>,
+    /// Recorded sustainable levels, current and superseded.
+    pub levels: Vec<CapacityLevel>,
+    /// Capacity events, newest first.
+    pub events: Vec<CapacityEvent>,
+    /// Holds whose ramp-up or measurement window is still in progress.
+    pub open_windows: Vec<OpenCapacityWindow>,
+}
+
+/// Current discovery state and sustainable level of one host.
+#[derive(Clone, Debug, Serialize)]
+pub struct CapacityHost {
+    /// Host name.
+    pub host: String,
+    /// `none`, `running`, or `ended`.
+    pub discovery_state: String,
+    /// Latest open run, when discovering.
+    pub current_run: Option<i64>,
+    /// Current sustainable level and its measurement basis.
+    pub recorded_level: Option<CapacityLevel>,
+    /// Lanes currently marked as draining.
+    pub draining_lanes: Vec<String>,
+}
+
+/// One discovery run.
+#[derive(Clone, Debug, Serialize)]
+pub struct CapacityRun {
+    /// Ledger run id.
+    pub run_id: i64,
+    /// Host name.
+    pub host: String,
+    /// Why the discovery started.
+    pub trigger: Option<String>,
+    /// Start time in relay milliseconds.
+    pub started_at: i64,
+    /// End time in relay milliseconds.
+    pub ended_at: Option<i64>,
+    /// Why it ended.
+    pub end_reason: Option<String>,
+    /// Level found by the run.
+    pub found_level: Option<u32>,
+}
+
+/// One measured discovery window.
+#[derive(Clone, Debug, Serialize)]
+pub struct CapacityStep {
+    /// Run id.
+    pub run_id: i64,
+    /// Step number within the run.
+    pub step_no: u32,
+    /// Previous step repeated after an invalid window.
+    pub repeat_of: Option<u32>,
+    /// Host name.
+    pub host: String,
+    /// Concurrent lanes.
+    pub lanes: Option<u32>,
+    /// Window start in relay milliseconds.
+    pub window_start: Option<i64>,
+    /// Window end in relay milliseconds.
+    pub window_end: Option<i64>,
+    /// End of ramp-up in relay milliseconds.
+    pub rampup_end: Option<i64>,
+    /// Whether the window has enough zero-deficit coverage.
+    pub valid: Option<bool>,
+    /// Why the measurement was inconclusive.
+    pub inconclusive_reason: Option<String>,
+    /// Fraction of the window with usable saturation samples.
+    pub deficit_coverage: Option<f64>,
+    /// Whether every usable sample had no deficit.
+    pub deficit_zero_throughout: Option<bool>,
+    /// Host throughput per hour.
+    pub host_output_per_hour: Option<f64>,
+    /// Closed tickets in the window.
+    pub tickets_closed: Option<u64>,
+    /// Merged pull requests in the window.
+    pub prs_merged: Option<u64>,
+    /// Commits pushed in the window.
+    pub commits_pushed: Option<u64>,
+    /// Basis used for throughput.
+    pub output_basis: Option<String>,
+    /// 90th percentile build queue wait, seconds.
+    pub queue_wait_p90_s: Option<f64>,
+    /// Fraction of the window blocked or paused by the scheduler.
+    pub throttled_share: Option<f64>,
+    /// Minimum memory headroom over the window.
+    pub memory_headroom_min: Option<f64>,
+    /// Minimum thermal headroom over the window.
+    pub thermal_headroom_min: Option<f64>,
+    /// Whether busy slots equalled sustainable slots throughout.
+    pub slots_busy_equals_sustainable: Option<bool>,
+    /// Whether this step signalled a knee.
+    pub knee_signal: Option<bool>,
+    /// Why this step signalled a knee.
+    pub knee_reason: Option<String>,
+    /// Source basis per measurement field.
+    pub source_basis: BTreeMap<String, FieldBasis>,
+    /// Per-lane throughput attribution.
+    pub lane_output: Vec<LaneOutputMeasurement>,
+}
+
+/// One lane's output in a discovery window.
+#[derive(Clone, Debug, Serialize)]
+pub struct LaneOutputMeasurement {
+    /// Lane address.
+    pub lane: String,
+    /// Closed tickets.
+    pub tickets_closed: Option<u64>,
+    /// Merged pull requests.
+    pub prs_merged: Option<u64>,
+    /// Pushed commits.
+    pub commits_pushed: Option<u64>,
+    /// Source basis for the three lane output fields.
+    pub source_basis: BTreeMap<String, FieldBasis>,
+}
+
+/// One current or superseded sustainable-level record.
+#[derive(Clone, Debug, Serialize)]
+pub struct CapacityLevel {
+    /// Host name.
+    pub host: String,
+    /// Sustainable lane count.
+    pub level: u32,
+    /// Throughput basis for the evidence step.
+    pub output_basis: Option<String>,
+    /// Record time in relay milliseconds.
+    pub recorded_at: i64,
+    /// Discovery run that found the level.
+    pub run_id: Option<i64>,
+    /// Why the level was selected.
+    pub reason: Option<String>,
+    /// JSON array of supporting step numbers.
+    pub evidence_steps: Option<String>,
+    /// Time superseded, when historical.
+    pub superseded_at: Option<i64>,
+}
+
+/// One capacity event.
+#[derive(Clone, Debug, Serialize)]
+pub struct CapacityEvent {
+    /// Event id.
+    pub event_id: i64,
+    /// Host name.
+    pub host: String,
+    /// Lane, when the event is lane-specific.
+    pub lane: Option<String>,
+    /// Event kind.
+    pub kind: String,
+    /// Operator or system reason.
+    pub reason: Option<String>,
+    /// Evidence checked by ix-board.
+    pub evidence_kind: Option<String>,
+    /// Orchestrator cycle id.
+    pub cycle_id: Option<i64>,
+    /// Event time in relay milliseconds.
+    pub at: i64,
+    /// End of a cool-off ceiling.
+    pub ceiling_until: Option<i64>,
+}
+
+/// The currently open hold window for one capacity-discovery step.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OpenCapacityWindow {
+    /// Discovery run id.
+    pub run_id: i64,
+    /// Step number, preserved when repeating an invalid hold.
+    pub step_no: u32,
+    /// Step being repeated after an invalid window.
+    pub repeat_of: Option<u32>,
+    /// Host name.
+    pub host: String,
+    /// Lanes held during the step.
+    pub lanes: u32,
+    /// When the lane was added, relay milliseconds.
+    pub lane_added_at_ms: i64,
+    /// Measurement starts after ramp-up, relay milliseconds.
+    pub rampup_end_ms: i64,
+}
+
+/// Complete set of fields for one observed capacity event.
+pub struct CapacityEventInput<'a> {
+    /// Host where the event occurred.
+    pub host: &'a str,
+    /// Lane affected by the event.
+    pub lane: Option<&'a str>,
+    /// Event kind from the capacity-event contract.
+    pub kind: &'a str,
+    /// Operator or system reason.
+    pub reason: Option<&'a str>,
+    /// ix-board verified evidence kind.
+    pub evidence_kind: Option<&'a str>,
+    /// Orchestrator cycle, when available.
+    pub cycle_id: Option<i64>,
+    /// Relay-clock event time.
+    pub at_ms: i64,
+    /// Cool-off ceiling end.
+    pub ceiling_until: Option<i64>,
+}
+
+/// Opens a host discovery run and returns its ledger id.
+///
+/// # Errors
+///
+/// A blank host, an unknown trigger, an existing open run or a ledger failure.
+pub fn start(
+    path: &Path,
+    config: &FleetConfig,
+    host: &str,
+    trigger: &str,
+    at_ms: i64,
+) -> Result<i64, LedgerError> {
+    if host.trim().is_empty() || !matches!(trigger, "first" | "re_discovery" | "step_down") {
+        return Err(LedgerError::Capacity(
+            "host must be non-empty and trigger must be first, re_discovery or step_down".into(),
+        ));
+    }
+    let mut ledger = Ledger::open(path, config)?;
+    let tx = ledger.connection.transaction()?;
+    let open: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM capacity_run WHERE host=?1 AND ended_at IS NULL)",
+        [host],
+        |row| row.get(0),
+    )?;
+    if open {
+        return Err(LedgerError::Capacity(format!(
+            "host {host} already has an open run"
+        )));
+    }
+    let run_id = tx.query_row(
+        "INSERT INTO capacity_run(host,trigger,started_at) VALUES(?1,?2,?3)
+         RETURNING run_id",
+        params![host, trigger, at_ms],
+        |row| row.get(0),
+    )?;
+    tx.commit()?;
+    Ok(run_id)
+}
+
+/// Appends a capacity event with ix-board's verified evidence basis.
+///
+/// # Errors
+///
+/// The host or event fields are invalid or the ledger cannot write the event.
+pub fn record_event(
+    path: &Path,
+    config: &FleetConfig,
+    event: &CapacityEventInput<'_>,
+) -> Result<(), LedgerError> {
+    if event.host.trim().is_empty()
+        || !matches!(
+            event.kind,
+            "lane_added"
+                | "draining_mark"
+                | "drain_done"
+                | "lane_removed"
+                | "lane_lost"
+                | "step_down"
+                | "overload_event"
+        )
+    {
+        return Err(LedgerError::Capacity(
+            "invalid capacity event host or kind".into(),
+        ));
+    }
+    if event.evidence_kind.is_some_and(|evidence| {
+        !matches!(
+            evidence,
+            "admission_block"
+                | "build_abort"
+                | "memory_below_reserve"
+                | "thermal_abort"
+                | "knee"
+                | "throttle_share"
+        )
+    }) {
+        return Err(LedgerError::Capacity(
+            "evidence kind must be derived from a supported live source".into(),
+        ));
+    }
+    let ledger = Ledger::open(path, config)?;
+    ledger.connection.execute(
+        "INSERT INTO capacity_event(host,lane,kind,reason,evidence_kind,cycle_id,at,ceiling_until)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![
+            event.host,
+            event.lane,
+            event.kind,
+            event.reason,
+            event.evidence_kind,
+            event.cycle_id,
+            event.at_ms,
+            event.ceiling_until
+        ],
+    )?;
+    Ok(())
+}
+
+/// Opens the next held lane-count window for an active run.
+///
+/// # Errors
+///
+/// The run is closed or has an active window, the values are invalid, or the ledger fails.
+pub fn open_step(
+    path: &Path,
+    config: &FleetConfig,
+    run_id: i64,
+    lanes: u32,
+    repeat_of: Option<u32>,
+    lane_added_at_ms: i64,
+    rampup_end_ms: i64,
+) -> Result<OpenCapacityWindow, LedgerError> {
+    if lanes == 0 || rampup_end_ms < lane_added_at_ms {
+        return Err(LedgerError::Capacity(
+            "lanes must be positive and ramp-up cannot end before the lane was added".into(),
+        ));
+    }
+    let mut ledger = Ledger::open(path, config)?;
+    let tx = ledger.connection.transaction()?;
+    let host: Option<String> = tx
+        .query_row(
+            "SELECT host FROM capacity_run WHERE run_id=?1 AND ended_at IS NULL",
+            [run_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let host = host.ok_or_else(|| LedgerError::Capacity(format!("run {run_id} is not open")))?;
+    let current: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM capacity_window WHERE run_id=?1)",
+        [run_id],
+        |row| row.get(0),
+    )?;
+    if current {
+        return Err(LedgerError::Capacity(format!(
+            "run {run_id} already has an open window"
+        )));
+    }
+    let last: Option<i64> = tx.query_row(
+        "SELECT MAX(step_no) FROM capacity_step WHERE run_id=?1",
+        [run_id],
+        |row| row.get(0),
+    )?;
+    let step_no = last.unwrap_or(0).saturating_add(1);
+    if step_no > 8 {
+        return Err(LedgerError::Capacity(
+            "a discovery run is limited to 8 steps".into(),
+        ));
+    }
+    let window = OpenCapacityWindow {
+        run_id,
+        step_no: u32::try_from(step_no)
+            .map_err(|_| LedgerError::Capacity("step number overflow".into()))?,
+        repeat_of,
+        host: host.clone(),
+        lanes,
+        lane_added_at_ms,
+        rampup_end_ms,
+    };
+    tx.execute(
+        "INSERT INTO capacity_window(run_id,step_no,repeat_of,host,lanes,lane_added_at_ms,
+                                     rampup_end_ms)
+         VALUES(?1,?2,?3,?4,?5,?6,?7)",
+        params![
+            run_id,
+            step_no,
+            repeat_of.map(i64::from),
+            host,
+            i64::from(lanes),
+            lane_added_at_ms,
+            rampup_end_ms,
+        ],
+    )?;
+    tx.commit()?;
+    Ok(window)
+}
+
+/// Measures and commits the active window through an injected source implementation.
+///
+/// # Errors
+///
+/// There is no active window, the provider rejects the request, the measurement is malformed,
+/// or the ledger cannot commit it.
+pub fn measure_open_step(
+    path: &Path,
+    config: &FleetConfig,
+    run_id: i64,
+    window_end_ms: i64,
+    source: &dyn MeasurementSource,
+) -> Result<WindowMeasurements, LedgerError> {
+    let window = {
+        let Some(connection) = read_connection(path)? else {
+            return Err(LedgerError::Capacity(
+                "capacity ledger does not exist".into(),
+            ));
+        };
+        connection
+            .query_row(
+                "SELECT run_id, step_no, repeat_of, host, lanes, lane_added_at_ms, rampup_end_ms
+                 FROM capacity_window WHERE run_id=?1",
+                [run_id],
+                |row| {
+                    Ok(OpenCapacityWindow {
+                        run_id: row.get(0)?,
+                        step_no: u32::try_from(row.get::<_, i64>(1)?).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                1,
+                                rusqlite::types::Type::Integer,
+                                Box::new(error),
+                            )
+                        })?,
+                        repeat_of: row
+                            .get::<_, Option<i64>>(2)?
+                            .and_then(|n| u32::try_from(n).ok()),
+                        host: row.get(3)?,
+                        lanes: u32::try_from(row.get::<_, i64>(4)?).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                4,
+                                rusqlite::types::Type::Integer,
+                                Box::new(error),
+                            )
+                        })?,
+                        lane_added_at_ms: row.get(5)?,
+                        rampup_end_ms: row.get(6)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| LedgerError::Capacity(format!("run {run_id} has no open window")))?
+    };
+    let request = WindowRequest {
+        host: window.host.clone(),
+        lanes: window.lanes,
+        start_ms: window.rampup_end_ms,
+        end_ms: window_end_ms,
+        rampup_end_ms: window.rampup_end_ms,
+    };
+    let measurement = source
+        .measure(&request)
+        .map_err(|error: CapacityError| LedgerError::Capacity(error.to_string()))?;
+    if measurement.window_start_ms != request.start_ms
+        || measurement.window_end_ms != request.end_ms
+        || measurement.rampup_end_ms != request.rampup_end_ms
+        || measured(&measurement.lanes) != Some(window.lanes)
+    {
+        return Err(LedgerError::Capacity(
+            "measurement window does not match the open hold request".into(),
+        ));
+    }
+    record_window(
+        path,
+        config,
+        run_id,
+        window.step_no,
+        window.repeat_of,
+        &measurement,
+    )?;
+    let ledger = Ledger::open(path, config)?;
+    ledger.connection.execute(
+        "DELETE FROM capacity_window WHERE run_id=?1 AND step_no=?2",
+        params![run_id, i64::from(window.step_no)],
+    )?;
+    Ok(measurement)
+}
+
+/// Ends an active run and records a new sustainable level when the reason has valid evidence.
+///
+/// # Errors
+///
+/// The run is closed, its hold is still open, its reason is unknown, or the ledger fails.
+pub fn end(
+    path: &Path,
+    config: &FleetConfig,
+    host: &str,
+    reason: &str,
+    at_ms: i64,
+) -> Result<Option<u32>, LedgerError> {
+    if !matches!(
+        reason,
+        "knee" | "build_slots_saturated" | "step_bound" | "inconclusive_no_demand" | "throttled"
+    ) {
+        return Err(LedgerError::Capacity(format!(
+            "unknown discovery end reason {reason}"
+        )));
+    }
+    let mut ledger = Ledger::open(path, config)?;
+    let tx = ledger.connection.transaction()?;
+    let run_id: Option<i64> = tx
+        .query_row(
+            "SELECT run_id FROM capacity_run WHERE host=?1 AND ended_at IS NULL",
+            [host],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let run_id =
+        run_id.ok_or_else(|| LedgerError::Capacity(format!("host {host} has no open run")))?;
+    let has_window: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM capacity_window WHERE run_id=?1)",
+        [run_id],
+        |row| row.get(0),
+    )?;
+    if has_window {
+        return Err(LedgerError::Capacity(format!(
+            "run {run_id} still has an open window"
+        )));
+    }
+    let steps: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM capacity_step WHERE run_id=?1",
+        [run_id],
+        |row| row.get(0),
+    )?;
+    if reason == "step_bound" && steps < 8 {
+        return Err(LedgerError::Capacity(
+            "step_bound requires 8 measured steps".into(),
+        ));
+    }
+    if reason == "inconclusive_no_demand" {
+        let inconclusive: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM (SELECT valid FROM capacity_step WHERE run_id=?1
+             ORDER BY step_no DESC LIMIT 2) WHERE valid=0",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        if inconclusive < 2 {
+            return Err(LedgerError::Capacity(
+                "inconclusive_no_demand requires two consecutive inconclusive steps".into(),
+            ));
+        }
+    }
+    let level = if matches!(reason, "knee" | "build_slots_saturated" | "step_bound") {
+        tx.query_row(
+            "SELECT lanes FROM capacity_step WHERE run_id=?1 AND valid=1
+             ORDER BY step_no DESC LIMIT 1",
+            [run_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()?
+        .flatten()
+        .and_then(|lanes| u32::try_from(lanes).ok())
+    } else {
+        None
+    };
+    if matches!(reason, "knee" | "build_slots_saturated") && level.is_none() {
+        return Err(LedgerError::Capacity(format!(
+            "{reason} needs at least one valid measured step"
+        )));
+    }
+    if reason == "knee" {
+        let knee: bool = tx.query_row(
+            "SELECT knee_signal FROM capacity_step WHERE run_id=?1 AND valid=1
+             ORDER BY step_no DESC LIMIT 1",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        if !knee {
+            return Err(LedgerError::Capacity(
+                "knee end requires a knee signal on the latest valid step".into(),
+            ));
+        }
+    }
+    if reason == "build_slots_saturated" {
+        let slots_saturated: bool = tx.query_row(
+            "SELECT slots_busy_equals_sustainable FROM capacity_step
+             WHERE run_id=?1 AND valid=1 ORDER BY step_no DESC LIMIT 1",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        if !slots_saturated {
+            return Err(LedgerError::Capacity(
+                "build_slots_saturated end requires busy slots to equal sustainable slots".into(),
+            ));
+        }
+    }
+    tx.execute(
+        "UPDATE capacity_run SET ended_at=?1,end_reason=?2,found_level=?3 WHERE run_id=?4",
+        params![at_ms, reason, level.map(i64::from), run_id],
+    )?;
+    if let Some(level) = level {
+        let output_basis: Option<String> = tx
+            .query_row(
+                "SELECT output_basis FROM capacity_step WHERE run_id=?1 AND valid=1
+                 ORDER BY step_no DESC LIMIT 1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let evidence_steps = serde_json::to_string(&vec![tx.query_row(
+            "SELECT step_no FROM capacity_step WHERE run_id=?1 AND valid=1
+                 ORDER BY step_no DESC LIMIT 1",
+            [run_id],
+            |row| row.get::<_, i64>(0),
+        )?])?;
+        tx.execute(
+            "UPDATE capacity_level SET superseded_at=?1 WHERE host=?2 AND superseded_at IS NULL",
+            params![at_ms, host],
+        )?;
+        tx.execute(
+            "INSERT INTO capacity_level(host,level,output_basis,recorded_at,run_id,reason,evidence_steps)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![host, i64::from(level), output_basis, at_ms, run_id, reason, evidence_steps],
+        )?;
+    }
+    tx.commit()?;
+    Ok(level)
+}
+
+fn read_connection(path: &Path) -> Result<Option<Connection>, LedgerError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let found = user_version(&connection)?;
+    if found != VERSION {
+        return Err(LedgerError::UnsupportedVersion {
+            path: path.to_owned(),
+            found,
+        });
+    }
+    Ok(Some(connection))
+}
+
+/// Reads host discovery state and capacity history without locking or mutating the ledger.
+///
+/// # Errors
+///
+/// A newer, foreign or unreadable ledger.
+pub fn status(path: &Path) -> Result<CapacityStatus, LedgerError> {
+    let Some(connection) = read_connection(path)? else {
+        return Ok(CapacityStatus::default());
+    };
+    let mut runs = Vec::new();
+    {
+        let mut statement = connection.prepare(
+            "SELECT run_id, host, trigger, started_at, ended_at, end_reason, found_level
+             FROM capacity_run ORDER BY started_at DESC, run_id DESC",
+        )?;
+        for row in statement.query_map([], |r| {
+            Ok(CapacityRun {
+                run_id: r.get(0)?,
+                host: r.get(1)?,
+                trigger: r.get(2)?,
+                started_at: r.get(3)?,
+                ended_at: r.get(4)?,
+                end_reason: r.get(5)?,
+                found_level: r
+                    .get::<_, Option<i64>>(6)?
+                    .and_then(|n| u32::try_from(n).ok()),
+            })
+        })? {
+            runs.push(row?);
+        }
+    }
+    let mut steps = Vec::new();
+    {
+        let mut statement = connection.prepare(
+            "SELECT run_id, step_no, repeat_of, host, lanes, window_start, window_end, rampup_end,
+                    valid, inconclusive_reason, deficit_coverage, deficit_zero_throughout,
+                    host_output_per_hour, tickets_closed, prs_merged, commits_pushed, output_basis,
+                    queue_wait_p90_s, throttled_share, memory_headroom_min, thermal_headroom_min,
+                    slots_busy_equals_sustainable, knee_signal, knee_reason, source_basis
+             FROM capacity_step ORDER BY window_end DESC, run_id DESC, step_no DESC",
+        )?;
+        for row in statement.query_map([], |r| {
+            let source_json: String = r.get(24)?;
+            let source_basis = serde_json::from_str(&source_json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    24,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            Ok(CapacityStep {
+                run_id: r.get(0)?,
+                step_no: r.get::<_, i64>(1).and_then(|n| {
+                    u32::try_from(n).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Integer,
+                            Box::new(error),
+                        )
+                    })
+                })?,
+                repeat_of: r
+                    .get::<_, Option<i64>>(2)?
+                    .and_then(|n| u32::try_from(n).ok()),
+                host: r.get(3)?,
+                lanes: r
+                    .get::<_, Option<i64>>(4)?
+                    .and_then(|n| u32::try_from(n).ok()),
+                window_start: r.get(5)?,
+                window_end: r.get(6)?,
+                rampup_end: r.get(7)?,
+                valid: r.get::<_, Option<i64>>(8)?.map(|n| n != 0),
+                inconclusive_reason: r.get(9)?,
+                deficit_coverage: r.get(10)?,
+                deficit_zero_throughout: r.get::<_, Option<i64>>(11)?.map(|n| n != 0),
+                host_output_per_hour: r.get(12)?,
+                tickets_closed: r
+                    .get::<_, Option<i64>>(13)?
+                    .and_then(|n| u64::try_from(n).ok()),
+                prs_merged: r
+                    .get::<_, Option<i64>>(14)?
+                    .and_then(|n| u64::try_from(n).ok()),
+                commits_pushed: r
+                    .get::<_, Option<i64>>(15)?
+                    .and_then(|n| u64::try_from(n).ok()),
+                output_basis: r.get(16)?,
+                queue_wait_p90_s: r.get(17)?,
+                throttled_share: r.get(18)?,
+                memory_headroom_min: r.get(19)?,
+                thermal_headroom_min: r.get(20)?,
+                slots_busy_equals_sustainable: r.get::<_, Option<i64>>(21)?.map(|n| n != 0),
+                knee_signal: r.get::<_, Option<i64>>(22)?.map(|n| n != 0),
+                knee_reason: r.get(23)?,
+                source_basis,
+                lane_output: Vec::new(),
+            })
+        })? {
+            steps.push(row?);
+        }
+    }
+    let mut levels = Vec::new();
+    {
+        let mut statement = connection.prepare(
+            "SELECT host, level, output_basis, recorded_at, run_id, reason, evidence_steps,
+                    superseded_at
+             FROM capacity_level ORDER BY recorded_at DESC, host",
+        )?;
+        for row in statement.query_map([], |r| {
+            Ok(CapacityLevel {
+                host: r.get(0)?,
+                level: r.get::<_, i64>(1).and_then(|n| {
+                    u32::try_from(n).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Integer,
+                            Box::new(error),
+                        )
+                    })
+                })?,
+                output_basis: r.get(2)?,
+                recorded_at: r.get(3)?,
+                run_id: r.get(4)?,
+                reason: r.get(5)?,
+                evidence_steps: r.get(6)?,
+                superseded_at: r.get(7)?,
+            })
+        })? {
+            levels.push(row?);
+        }
+    }
+    let mut events = Vec::new();
+    {
+        let mut statement = connection.prepare(
+            "SELECT event_id, host, lane, kind, reason, evidence_kind, cycle_id, at, ceiling_until
+             FROM capacity_event ORDER BY at DESC, event_id DESC",
+        )?;
+        for row in statement.query_map([], |r| {
+            Ok(CapacityEvent {
+                event_id: r.get(0)?,
+                host: r.get(1)?,
+                lane: r.get(2)?,
+                kind: r.get(3)?,
+                reason: r.get(4)?,
+                evidence_kind: r.get(5)?,
+                cycle_id: r.get(6)?,
+                at: r.get(7)?,
+                ceiling_until: r.get(8)?,
+            })
+        })? {
+            events.push(row?);
+        }
+    }
+    let mut open_windows = Vec::new();
+    {
+        let mut statement = connection.prepare(
+            "SELECT run_id,step_no,repeat_of,host,lanes,lane_added_at_ms,rampup_end_ms
+             FROM capacity_window ORDER BY run_id",
+        )?;
+        for row in statement.query_map([], |row| {
+            Ok(OpenCapacityWindow {
+                run_id: row.get(0)?,
+                step_no: u32::try_from(row.get::<_, i64>(1)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Integer,
+                        Box::new(error),
+                    )
+                })?,
+                repeat_of: row
+                    .get::<_, Option<i64>>(2)?
+                    .and_then(|n| u32::try_from(n).ok()),
+                host: row.get(3)?,
+                lanes: u32::try_from(row.get::<_, i64>(4)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Integer,
+                        Box::new(error),
+                    )
+                })?,
+                lane_added_at_ms: row.get(5)?,
+                rampup_end_ms: row.get(6)?,
+            })
+        })? {
+            open_windows.push(row?);
+        }
+    }
+    let mut hosts = BTreeSet::new();
+    for run in &runs {
+        hosts.insert(run.host.clone());
+    }
+    for level in &levels {
+        hosts.insert(level.host.clone());
+    }
+    for event in &events {
+        hosts.insert(event.host.clone());
+    }
+    {
+        let mut statement = connection.prepare("SELECT DISTINCT host FROM host_tick")?;
+        for row in statement.query_map([], |r| r.get::<_, String>(0))? {
+            hosts.insert(row?);
+        }
+    }
+    let mut host_rows = Vec::new();
+    for host in hosts {
+        let current_run = runs
+            .iter()
+            .find(|run| run.host.eq_ignore_ascii_case(&host) && run.ended_at.is_none());
+        let latest_run = runs.iter().find(|run| run.host.eq_ignore_ascii_case(&host));
+        let recorded_level = levels
+            .iter()
+            .find(|level| level.host.eq_ignore_ascii_case(&host) && level.superseded_at.is_none())
+            .cloned();
+        let draining_lanes = events
+            .iter()
+            .filter(|event| {
+                event.host.eq_ignore_ascii_case(&host)
+                    && event.kind == "draining_mark"
+                    && !events.iter().any(|later| {
+                        later.lane == event.lane
+                            && matches!(later.kind.as_str(), "drain_done" | "lane_removed")
+                            && later.at >= event.at
+                    })
+            })
+            .filter_map(|event| event.lane.clone())
+            .collect();
+        host_rows.push(CapacityHost {
+            host,
+            discovery_state: if current_run.is_some() {
+                "running"
+            } else if latest_run.is_some() {
+                "ended"
+            } else {
+                "none"
+            }
+            .to_owned(),
+            current_run: current_run.map(|run| run.run_id),
+            recorded_level,
+            draining_lanes,
+        });
+    }
+    for step in &mut steps {
+        let mut statement = connection.prepare(
+            "SELECT lane, tickets_closed, prs_merged, commits_pushed, source_basis
+             FROM capacity_step_lane_output WHERE run_id=?1 AND step_no=?2 ORDER BY lane",
+        )?;
+        step.lane_output = statement
+            .query_map(params![step.run_id, i64::from(step.step_no)], |row| {
+                let source_json: String = row.get(4)?;
+                let source_basis = serde_json::from_str(&source_json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                Ok(LaneOutputMeasurement {
+                    lane: row.get(0)?,
+                    tickets_closed: row
+                        .get::<_, Option<i64>>(1)?
+                        .and_then(|n| u64::try_from(n).ok()),
+                    prs_merged: row
+                        .get::<_, Option<i64>>(2)?
+                        .and_then(|n| u64::try_from(n).ok()),
+                    commits_pushed: row
+                        .get::<_, Option<i64>>(3)?
+                        .and_then(|n| u64::try_from(n).ok()),
+                    source_basis,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+    }
+    Ok(CapacityStatus {
+        hosts: host_rows,
+        runs,
+        steps,
+        levels,
+        events,
+        open_windows,
+    })
+}
+
+fn label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+fn observation_basis<T>(observation: &crate::fleet::capacity::Observation<T>) -> FieldBasis {
+    let covered = observation.coverage.is_some_and(|coverage| coverage >= 0.9);
+    let available = observation.availability == crate::fleet::capacity::Availability::Available
+        && observation.value.is_some()
+        && covered;
+    FieldBasis {
+        availability: if available {
+            crate::fleet::capacity::Availability::Available
+        } else {
+            crate::fleet::capacity::Availability::Unavailable
+        },
+        source: observation.source.clone(),
+        reason: if available {
+            None
+        } else {
+            observation.reason.clone().or_else(|| {
+                Some(if !covered {
+                    "coverage_below_90_percent".to_owned()
+                } else {
+                    "source_value_unavailable".to_owned()
+                })
+            })
+        },
+        coverage: observation.coverage,
+        observed_at_ms: observation.observed_at_ms,
+    }
+}
+
+fn measured<T: Clone>(observation: &crate::fleet::capacity::Observation<T>) -> Option<T> {
+    (observation_basis(observation).availability == crate::fleet::capacity::Availability::Available)
+        .then(|| observation.value.clone())
+        .flatten()
+}
+
+/// Renders the capacity-level and discovery-state Prometheus series from the ledger.
+///
+/// # Errors
+///
+/// A newer, foreign or unreadable ledger.
+pub fn metrics(path: &Path) -> Result<String, LedgerError> {
+    let status = status(path)?;
+    let mut text = String::new();
+    text.push_str("# TYPE ix_fleet_capacity_recorded_level gauge\n");
+    text.push_str("# TYPE ix_fleet_capacity_recorded_level_timestamp_seconds gauge\n");
+    text.push_str("# TYPE ix_fleet_capacity_discovery_state gauge\n");
+    text.push_str("# TYPE ix_fleet_capacity_draining_lanes gauge\n");
+    for host in &status.hosts {
+        let escaped = label(&host.host);
+        if let Some(level) = &host.recorded_level {
+            text.push_str(&format!(
+                "ix_fleet_capacity_recorded_level{{host=\"{escaped}\"}} {}\nix_fleet_capacity_recorded_level_timestamp_seconds{{host=\"{escaped}\"}} {}\n",
+                level.level,
+                level.recorded_at / 1000
+            ));
+        }
+        for state in ["none", "running", "ended"] {
+            text.push_str(&format!(
+                "ix_fleet_capacity_discovery_state{{host=\"{escaped}\",state=\"{state}\"}} {}\n",
+                u8::from(host.discovery_state == state)
+            ));
+        }
+        text.push_str(&format!(
+            "ix_fleet_capacity_draining_lanes{{host=\"{escaped}\"}} {}\n",
+            host.draining_lanes.len()
+        ));
+    }
+    Ok(text)
+}
+
+/// Persists one source-backed hold window and deterministically judges its demand coverage and
+/// knee signal. The caller's source plugin supplies every observed field; the ledger supplies
+/// saturation coverage and the derived validity/knee fields.
+///
+/// # Errors
+///
+/// A malformed window, a closed or missing run, source-basis serialization, or a database error.
+pub fn record_window(
+    path: &Path,
+    config: &FleetConfig,
+    run_id: i64,
+    step_no: u32,
+    repeat_of: Option<u32>,
+    measurement: &WindowMeasurements,
+) -> Result<(), LedgerError> {
+    if measurement.window_end_ms <= measurement.window_start_ms
+        || measurement.rampup_end_ms > measurement.window_start_ms
+    {
+        return Err(LedgerError::Capacity(
+            "window end must follow its start, and ramp-up must finish before measurement".into(),
+        ));
+    }
+    let step_no = i64::from(step_no);
+    let repeat_of = repeat_of.map(i64::from);
+    let mut ledger = Ledger::open(path, config)?;
+    let tx = ledger.connection.transaction()?;
+    let host: Option<String> = tx
+        .query_row(
+            "SELECT host FROM capacity_run WHERE run_id=?1 AND ended_at IS NULL",
+            [run_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let host = host.ok_or_else(|| LedgerError::Capacity(format!("run {run_id} is not open")))?;
+
+    let interval_ms = ledger.tick_interval_s.saturating_mul(1000).max(1);
+    let (samples, unavailable, positive): (i64, i64, i64) = tx.query_row(
+        "SELECT COUNT(*), SUM(CASE WHEN deficit IS NULL THEN 1 ELSE 0 END),
+                SUM(CASE WHEN deficit > 0 THEN 1 ELSE 0 END)
+         FROM saturation_sample WHERE host=?1 AND at>=?2 AND at<=?3",
+        params![host, measurement.window_start_ms, measurement.window_end_ms],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+            ))
+        },
+    )?;
+    let span_ms = measurement
+        .window_end_ms
+        .saturating_sub(measurement.window_start_ms)
+        .max(1);
+    let covered_ms = samples.saturating_mul(interval_ms);
+    let coverage = (covered_ms as f64 / span_ms as f64).min(1.0);
+    let zero_throughout = samples > 0 && unavailable == 0 && positive == 0;
+    let valid = coverage >= 0.9 && zero_throughout;
+    let inconclusive_reason = if coverage < 0.9 || unavailable > 0 || samples == 0 {
+        Some("deficit_coverage")
+    } else if positive > 0 {
+        Some("deficit_nonzero")
+    } else {
+        None
+    };
+    let mut sources = BTreeMap::from([
+        ("lanes".to_owned(), observation_basis(&measurement.lanes)),
+        (
+            "build_slots_busy".to_owned(),
+            observation_basis(&measurement.build_slots_busy),
+        ),
+        (
+            "build_slots_sustainable".to_owned(),
+            observation_basis(&measurement.build_slots_sustainable),
+        ),
+        (
+            "tickets_closed".to_owned(),
+            observation_basis(&measurement.tickets_closed),
+        ),
+        (
+            "prs_merged".to_owned(),
+            observation_basis(&measurement.prs_merged),
+        ),
+        (
+            "commits_pushed".to_owned(),
+            observation_basis(&measurement.commits_pushed),
+        ),
+        (
+            "host_output_per_hour".to_owned(),
+            observation_basis(&measurement.host_output_per_hour),
+        ),
+        (
+            "output_basis".to_owned(),
+            observation_basis(&measurement.output_basis),
+        ),
+        (
+            "queue_wait_p90_s".to_owned(),
+            observation_basis(&measurement.queue_wait_p90_s),
+        ),
+        (
+            "throttled_share".to_owned(),
+            observation_basis(&measurement.throttled_share),
+        ),
+        (
+            "memory_headroom_min".to_owned(),
+            observation_basis(&measurement.memory_headroom_min),
+        ),
+        (
+            "thermal_headroom_min".to_owned(),
+            observation_basis(&measurement.thermal_headroom_min),
+        ),
+        (
+            "slots_busy_equals_sustainable".to_owned(),
+            observation_basis(&measurement.slots_busy_equals_sustainable),
+        ),
+        (
+            "deficit_coverage".to_owned(),
+            FieldBasis {
+                availability: if samples > 0 && coverage >= 0.9 {
+                    crate::fleet::capacity::Availability::Available
+                } else {
+                    crate::fleet::capacity::Availability::Unavailable
+                },
+                source: "ledger.saturation_sample".to_owned(),
+                reason: (samples == 0 || coverage < 0.9)
+                    .then(|| "coverage_below_90_percent".to_owned()),
+                coverage: Some(coverage),
+                observed_at_ms: Some(measurement.window_end_ms),
+            },
+        ),
+        (
+            "deficit_zero_throughout".to_owned(),
+            FieldBasis {
+                availability: if samples > 0 && unavailable == 0 {
+                    crate::fleet::capacity::Availability::Available
+                } else {
+                    crate::fleet::capacity::Availability::Unavailable
+                },
+                source: "ledger.saturation_sample".to_owned(),
+                reason: (samples == 0 || unavailable > 0)
+                    .then(|| "deficit_sample_unavailable".to_owned()),
+                coverage: Some(coverage),
+                observed_at_ms: Some(measurement.window_end_ms),
+            },
+        ),
+        (
+            "knee_signal".to_owned(),
+            FieldBasis {
+                availability: crate::fleet::capacity::Availability::Available,
+                source: "ix-board.FR-041".to_owned(),
+                reason: None,
+                coverage: Some(1.0),
+                observed_at_ms: Some(measurement.window_end_ms),
+            },
+        ),
+    ]);
+    for (field, source) in &measurement.derived_sources {
+        sources.entry(field.clone()).or_insert_with(|| FieldBasis {
+            availability: crate::fleet::capacity::Availability::Available,
+            source: source.clone(),
+            reason: None,
+            coverage: Some(1.0),
+            observed_at_ms: Some(measurement.window_end_ms),
+        });
+    }
+    let source_basis = serde_json::to_string(&sources)?;
+
+    let mut knee_reason = None;
+    if valid {
+        if measured(&measurement.throttled_share).is_some_and(|share| share > 0.05) {
+            knee_reason = Some("throttle");
+        } else if let Some((previous_lanes, previous_output)) = tx
+            .query_row(
+                "SELECT lanes, host_output_per_hour FROM capacity_step
+                 WHERE run_id=?1 AND valid=1 AND host_output_per_hour IS NOT NULL
+                   AND step_no < ?2 ORDER BY step_no DESC LIMIT 1",
+                params![run_id, step_no],
+                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, f64>(1)?)),
+            )
+            .optional()?
+            .and_then(|(lanes, output)| {
+                lanes
+                    .and_then(|n| u32::try_from(n).ok())
+                    .map(|n| (n, output))
+            })
+        {
+            let previous_per_lane = previous_output / f64::from(previous_lanes.max(1));
+            if measured(&measurement.host_output_per_hour)
+                .is_some_and(|output| output - previous_output < previous_per_lane * 0.5)
+            {
+                knee_reason = Some("output_gain");
+            }
+        }
+    }
+    let knee_signal = knee_reason.is_some();
+    let lanes = measured(&measurement.lanes).map(i64::from);
+    let tickets_closed = measured(&measurement.tickets_closed)
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| LedgerError::Capacity("tickets_closed does not fit SQLite INTEGER".into()))?;
+    let prs_merged = measured(&measurement.prs_merged)
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| LedgerError::Capacity("prs_merged does not fit SQLite INTEGER".into()))?;
+    let commits_pushed = measured(&measurement.commits_pushed)
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| LedgerError::Capacity("commits_pushed does not fit SQLite INTEGER".into()))?;
+    let slots_busy_equals_sustainable =
+        measured(&measurement.slots_busy_equals_sustainable).map(i64::from);
+    tx.execute(
+        "INSERT INTO capacity_step(
+           run_id,step_no,repeat_of,host,lanes,window_start,window_end,rampup_end,valid,
+           inconclusive_reason,deficit_coverage,deficit_zero_throughout,host_output_per_hour,
+           tickets_closed,prs_merged,commits_pushed,output_basis,queue_wait_p90_s,throttled_share,
+           memory_headroom_min,thermal_headroom_min,slots_busy_equals_sustainable,knee_signal,
+           knee_reason,source_basis)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,
+                ?22,?23,?24,?25)",
+        params![
+            run_id,
+            step_no,
+            repeat_of,
+            host,
+            lanes,
+            measurement.window_start_ms,
+            measurement.window_end_ms,
+            measurement.rampup_end_ms,
+            valid,
+            inconclusive_reason,
+            coverage,
+            zero_throughout,
+            measured(&measurement.host_output_per_hour),
+            tickets_closed,
+            prs_merged,
+            commits_pushed,
+            measured(&measurement.output_basis),
+            measured(&measurement.queue_wait_p90_s),
+            measured(&measurement.throttled_share),
+            measured(&measurement.memory_headroom_min),
+            measured(&measurement.thermal_headroom_min),
+            slots_busy_equals_sustainable,
+            knee_signal,
+            knee_reason,
+            source_basis,
+        ],
+    )?;
+    for lane in &measurement.lane_output {
+        let lane_sources = serde_json::to_string(&BTreeMap::from([
+            (
+                "tickets_closed".to_owned(),
+                observation_basis(&lane.tickets_closed),
+            ),
+            ("prs_merged".to_owned(), observation_basis(&lane.prs_merged)),
+            (
+                "commits_pushed".to_owned(),
+                observation_basis(&lane.commits_pushed),
+            ),
+        ]))?;
+        let tickets = measured(&lane.tickets_closed)
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| {
+                LedgerError::Capacity("lane tickets_closed does not fit SQLite INTEGER".into())
+            })?;
+        let prs = measured(&lane.prs_merged)
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| {
+                LedgerError::Capacity("lane prs_merged does not fit SQLite INTEGER".into())
+            })?;
+        let commits = measured(&lane.commits_pushed)
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| {
+                LedgerError::Capacity("lane commits_pushed does not fit SQLite INTEGER".into())
+            })?;
+        tx.execute(
+            "INSERT INTO capacity_step_lane_output(
+               run_id,step_no,lane,tickets_closed,prs_merged,commits_pushed,source_basis)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                run_id,
+                step_no,
+                lane.lane,
+                tickets,
+                prs,
+                commits,
+                lane_sources
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests;

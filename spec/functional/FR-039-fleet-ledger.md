@@ -73,6 +73,27 @@ evaluator reads stored facts and computes nothing itself. The ledger holds
 these records so that one store joins them to lane intervals, actions and ticks
 under one retention rule; the relay holds transport records of bounded age only.
 
+### Schema version 3: capacity measurement provenance
+
+Version 3 adds a `source_basis` JSON object to `capacity_step` and
+`capacity_step_lane_output`. It stores each measurement's availability, source,
+reason, coverage and observation time. The migration from version 2 is
+additive, preserves all rows and defaults provenance to an empty object only
+for historical records that predate this evidence. Newly recorded steps must
+include a basis for every field, including unavailable fields; a measurement
+with under 90% coverage is null with a reason, never a substituted zero. The
+capacity status JSON exposes these values and bases together. [FR-041](./FR-041-fleet-saturation.md)
+defines the capacity fields and their source contracts.
+
+### Schema version 4: resumable capacity holds
+
+Version 4 adds `capacity_window`, a single open hold per discovery run. It
+persists the step number, repeat reference, host, lane count, lane-added time
+and ramp-up end so a later orchestrator invocation can collect measurements
+through the injected capacity measurement source. A successful measurement
+and its lane-attributed output commit before the open hold is removed. The
+migration from version 3 is additive and preserves prior rows.
+
 | Table | Columns | Written by |
 |-------|---------|------------|
 | `plan_coverage_tick` | tick id, `unowned_ready_count`, `short_queue_count`, `stale_assignment_count`, `unavailable_lists` | `fleet tick` ([FR-036](./FR-036-fleet-plan-coverage.md)) |
@@ -89,7 +110,7 @@ under one retention rule; the relay holds transport records of bounded age only.
 | `cycle_missed` | `session_addr`, `last_ended_at`, `expected_by`, `detected_at` | `fleet tick` (below). **Deferred to SWM-255**: not written yet |
 | `defect` (existing, columns fixed) | `defect_id`, `source`, `host`, `lane`, `kind`, `first_seen_at`, `closed_at`, `routed_ticket`, `routed_at`; `first_seen_at` is relay time and is empty for a defect first seen in a run without relay time, whose host clock is kept in `first_seen_host_ms` | `fleet status` and `fleet tick` |
 | `dialog_answer` | see [FR-044](./FR-044-fleet-cycle-and-dialog-answer-log.md) | `fleet answer-log record` |
-| `capacity_run`, `capacity_step`, `capacity_step_lane_output`, `capacity_level`, `capacity_event`, `host_output_sample` | see [FR-041](./FR-041-fleet-saturation.md) | `fleet capacity` and `fleet tick` |
+| `capacity_run`, `capacity_window`, `capacity_step`, `capacity_step_lane_output`, `capacity_level`, `capacity_event`, `host_output_sample` | see [FR-041](./FR-041-fleet-saturation.md) | `fleet capacity` and `fleet tick` |
 
 - **Gap rows.** A `plan_coverage_gap` row is opened by the first tick whose report
   contains the gap and closed by the first later tick whose report does not. A
@@ -188,7 +209,9 @@ in [FR-041](./FR-041-fleet-saturation.md); `answer_dialog_latency_max` and
 | FR-039-AC-6 | The `executed_at` of a `push_next_ticket` equals the first transition of the target lane into WORKING with focus on the pushed ticket, and WORKING on another ticket gives none; that of an `answer_dialog` equals the first transition out of BLOCKED after an emitted answer, and an `escalate_block` fallback gives none; that of an `act_on_undetermined` equals the first transition to a determined class; a lane already in the expected state at emission has none until a later transition; an action aimed at a lead or project has none and resolves when its condition clears; a `resend_order` has no `executed_at` until SWM-255 adds the `Acted` receipt join. | Test |
 | FR-039-AC-7 | `fleet ledger query` returns idle minutes per lane per day and actions with time-to-action in text and JSON without writing. | Test |
 | FR-039-AC-8 | An unsupported schema version is refused with no change, retention prunes only rows older than the configured age, and replaced assignments, defects and ground-truth samples are stored with their timestamps. | Test |
-| FR-039-AC-9 | Opening a version 1 ledger migrates it to version 2 in one transaction under the writer lock with every earlier row unchanged; a crash injected mid-migration leaves the version 1 ledger intact and openable; a ledger of a later version is refused without a change. | Test |
+| FR-039-AC-9 | Opening a version 1 ledger migrates it to the current version in one transaction under the writer lock with every earlier row unchanged; a crash injected mid-migration leaves the version 1 ledger intact and openable; a ledger of a later version is refused without a change. | Test |
+| FR-039-AC-17 | Opening a version 2 ledger migrates it to version 3 under the writer lock, preserves every existing row, and adds provenance columns; a crash injected during migration leaves the version 2 ledger intact; new capacity steps expose one source-basis entry per measurement field in JSON. | Test |
+| FR-039-AC-18 | Opening a version 3 ledger migrates it to version 4 under the writer lock, preserves previous rows and creates the resumable capacity-window table; a start, hold, measurement-source response, end and status read preserve per-field and per-lane source basis, while failed measurement leaves the open window intact. | Test |
 | FR-039-AC-10 | A gap present in tick 1 and absent in tick 3 gives one `plan_coverage_gap` row with `opened_tick` 1 and `closed_tick` 3; an `unavailable` list in tick 2 neither closes nor reopens it; `open_cycles` equals `max(1, ceil((close_or_now - open - grace) / cycle_interval))` on the evaluation clock: with a 10 minute cycle and grace of 15 minutes (10 minutes plus a 5 minute tick) a gap closed at 4, 24 and 25 minutes counts 1 each (the later ones are an orchestrator that acted in its next cycle), one closed at 26 minutes counts 2, one closed at 36 minutes counts 3, and one still open counts by elapsed time while no `cycle_event` row is written. | Test |
 | FR-039-AC-16 | With the orchestrator session writing no `cycle_event.ended_at` for more than twice `interval_s`, `fleet tick` writes one `cycle_missed` row for the span and not a second on the next tick; a session that ends cycles on time writes none. | Test |
 | FR-039-AC-11 | `lane_tick` holds one row per lane per committed `fleet status` or `fleet tick` run with its `source`, class and `ready_work_available` (true exactly when the lane has a remaining ticket or an unowned ready ticket in one of the lane's eligible teams or projects exists, written by `fleet tick`; empty on a `status` row); a status row and a tick row at the same relay time count once in the views, the tick row winning; `idle_lane_with_ready_work_ticks` and `idle_lane_episode_with_ready_work_max` equal the hand-computed values on a fixture. | Test |

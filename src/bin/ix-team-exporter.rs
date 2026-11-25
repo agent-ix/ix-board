@@ -102,6 +102,10 @@ fn metrics_text(collector: &Collector, config: &Config, now: i64) -> Result<Stri
             Ok(tick) => text.push_str(&tick),
             Err(error) => eprintln!("fleet tick metrics: {error}"),
         }
+        match ix_board::fleet::ledger::capacity::metrics(path) {
+            Ok(capacity) => text.push_str(&capacity),
+            Err(error) => eprintln!("fleet capacity metrics: {error}"),
+        }
     }
     Ok(text)
 }

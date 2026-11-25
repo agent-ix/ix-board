@@ -7,7 +7,7 @@
 //! empty so the schema is one unit under one migration.
 
 /// The schema version this build writes.
-pub const VERSION: i64 = 2;
+pub const VERSION: i64 = 4;
 
 pub const V1: &str = "
 CREATE TABLE run(
@@ -157,6 +157,23 @@ pub const V2: &[&str] = &[
     "CREATE TABLE host_output_sample(
        host TEXT NOT NULL, at INTEGER NOT NULL, lanes INTEGER, tickets_closed INTEGER,
        prs_merged INTEGER, commits_pushed INTEGER, PRIMARY KEY(host, at))",
+];
+
+/// Version 3 adds source provenance for every recorded capacity-step measurement.
+pub const V3: &[&str] = &[
+    "ALTER TABLE capacity_step ADD COLUMN source_basis TEXT NOT NULL DEFAULT '{}'",
+    "ALTER TABLE capacity_step_lane_output ADD COLUMN source_basis TEXT NOT NULL DEFAULT '{}'",
+];
+
+/// Version 4 persists the currently open discovery hold so a later invocation can measure it.
+pub const V4: &[&str] = &[
+    "CREATE TABLE capacity_window(
+       run_id INTEGER PRIMARY KEY, step_no INTEGER NOT NULL, repeat_of INTEGER,
+       host TEXT NOT NULL, lanes INTEGER NOT NULL, lane_added_at_ms INTEGER NOT NULL,
+       rampup_end_ms INTEGER NOT NULL)",
+    "CREATE UNIQUE INDEX capacity_step_run_step ON capacity_step(run_id,step_no)",
+    "CREATE UNIQUE INDEX capacity_step_lane_output_run_step_lane
+       ON capacity_step_lane_output(run_id,step_no,lane)",
 ];
 
 /// The `open_cycles` formula of FR-039, `max(1, ceil((end - start - grace) / cycle))`, in

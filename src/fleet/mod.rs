@@ -8,6 +8,7 @@
 //! can be faked. Time is the relay server clock: no host-local timestamp enters an age.
 
 pub mod assign;
+pub mod capacity;
 mod classify;
 mod config;
 pub mod focus;

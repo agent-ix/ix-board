@@ -204,6 +204,11 @@ enum FleetCommand {
         #[command(subcommand)]
         command: LedgerCommand,
     },
+    /// Read capacity discovery runs, measurements and sustainable levels.
+    Capacity {
+        #[command(subcommand)]
+        command: CapacityCommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -215,6 +220,40 @@ enum LedgerCommand {
         /// Only rows within this window before the newest run (for example 90s, 20m, 4h).
         #[arg(long, value_parser = parse_duration)]
         since: Option<u64>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CapacityCommand {
+    /// Print capacity discovery state and retained measurement history.
+    Status,
+    /// Start a discovery run at relay time in milliseconds.
+    Start {
+        host: String,
+        #[arg(long)]
+        trigger: String,
+        #[arg(long)]
+        at_ms: i64,
+    },
+    /// Record that a new lane count is held after ramp-up.
+    Step {
+        host: String,
+        #[arg(long)]
+        lanes: u32,
+        #[arg(long)]
+        lane_added_at_ms: i64,
+        #[arg(long)]
+        rampup_end_ms: i64,
+        #[arg(long)]
+        repeat_of: Option<u32>,
+    },
+    /// End the open run and record its valid sustainable level, when established.
+    End {
+        host: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        at_ms: i64,
     },
 }
 
@@ -446,6 +485,12 @@ enum Output {
     FleetAssign(ix_board::fleet::assign::AssignReport),
     FleetTick(ix_board::fleet::tick::TickOutput),
     Retro(Box<retro::SnapshotOutput>),
+    FleetCapacity(ix_board::fleet::ledger::CapacityStatus),
+    FleetCapacityRun(i64),
+    FleetCapacityStep(ix_board::fleet::ledger::capacity::OpenCapacityWindow),
+    FleetCapacityLevel {
+        recorded_level: Option<u32>,
+    },
     RetroDelta(retro::DeltaReport),
     RetroBackfill(retro::BackfillReport),
     ProjectStatusUpdated {
@@ -743,6 +788,49 @@ fn run(command: Command) -> Result<Output, Error> {
                     command: LedgerCommand::Query { view, since },
                 },
         } => run_fleet_ledger_query(&view, since).map(Output::FleetLedger),
+        Command::Fleet {
+            command:
+                FleetCommand::Capacity {
+                    command: CapacityCommand::Status,
+                },
+        } => run_fleet_capacity_status().map(Output::FleetCapacity),
+        Command::Fleet {
+            command:
+                FleetCommand::Capacity {
+                    command:
+                        CapacityCommand::Start {
+                            host,
+                            trigger,
+                            at_ms,
+                        },
+                },
+        } => run_fleet_capacity_start(&host, &trigger, at_ms).map(Output::FleetCapacityRun),
+        Command::Fleet {
+            command:
+                FleetCommand::Capacity {
+                    command:
+                        CapacityCommand::Step {
+                            host,
+                            lanes,
+                            lane_added_at_ms,
+                            rampup_end_ms,
+                            repeat_of,
+                        },
+                },
+        } => run_fleet_capacity_step(&host, lanes, repeat_of, lane_added_at_ms, rampup_end_ms)
+            .map(Output::FleetCapacityStep),
+        Command::Fleet {
+            command:
+                FleetCommand::Capacity {
+                    command:
+                        CapacityCommand::End {
+                            host,
+                            reason,
+                            at_ms,
+                        },
+                },
+        } => run_fleet_capacity_end(&host, &reason, at_ms)
+            .map(|recorded_level| Output::FleetCapacityLevel { recorded_level }),
         Command::Retro {
             command: RetroCommand::Snapshot { config, window },
         } => run_retro_snapshot(&config, &window),
@@ -968,6 +1056,67 @@ fn run_fleet_ledger_query(
     let path = ledger::resolve_path(&config).map_err(|e| FleetError::Ledger(e.to_string()))?;
     ledger::query(&path, view, since.map(std::time::Duration::from_secs))
         .map_err(|e| Error::Fleet(FleetError::Ledger(e.to_string())))
+}
+
+fn run_fleet_capacity_status() -> Result<ix_board::fleet::ledger::CapacityStatus, Error> {
+    use ix_board::fleet::{FleetError, ledger};
+    let (_, path) = fleet_capacity_config()?;
+    ledger::capacity::status(&path).map_err(|e| Error::Fleet(FleetError::Ledger(e.to_string())))
+}
+
+fn fleet_capacity_config() -> Result<(ix_board::fleet::FleetConfig, PathBuf), Error> {
+    use ix_board::fleet::{FleetError, ledger};
+    let settings = ix_board::settings_value()?;
+    let config = ix_board::fleet::FleetConfig::from_toml(
+        settings.as_ref(),
+        std::env::var("IX_PROMETHEUS_URL").ok(),
+    )?;
+    let path = ledger::resolve_path(&config).map_err(|e| FleetError::Ledger(e.to_string()))?;
+    Ok((config, path))
+}
+
+fn run_fleet_capacity_start(host: &str, trigger: &str, at_ms: i64) -> Result<i64, Error> {
+    let (config, path) = fleet_capacity_config()?;
+    ix_board::fleet::ledger::capacity::start(&path, &config, host, trigger, at_ms)
+        .map_err(|error| Error::Fleet(ix_board::fleet::FleetError::Ledger(error.to_string())))
+}
+
+fn run_fleet_capacity_step(
+    host: &str,
+    lanes: u32,
+    repeat_of: Option<u32>,
+    lane_added_at_ms: i64,
+    rampup_end_ms: i64,
+) -> Result<ix_board::fleet::ledger::capacity::OpenCapacityWindow, Error> {
+    let (config, path) = fleet_capacity_config()?;
+    let status = ix_board::fleet::ledger::capacity::status(&path)
+        .map_err(|error| Error::Fleet(ix_board::fleet::FleetError::Ledger(error.to_string())))?;
+    let run_id = status
+        .hosts
+        .iter()
+        .find(|entry| entry.host == host)
+        .and_then(|entry| entry.current_run)
+        .ok_or_else(|| {
+            Error::Fleet(ix_board::fleet::FleetError::Ledger(format!(
+                "host {host} has no open capacity run"
+            )))
+        })?;
+    ix_board::fleet::ledger::capacity::open_step(
+        &path,
+        &config,
+        run_id,
+        lanes,
+        repeat_of,
+        lane_added_at_ms,
+        rampup_end_ms,
+    )
+    .map_err(|error| Error::Fleet(ix_board::fleet::FleetError::Ledger(error.to_string())))
+}
+
+fn run_fleet_capacity_end(host: &str, reason: &str, at_ms: i64) -> Result<Option<u32>, Error> {
+    let (config, path) = fleet_capacity_config()?;
+    ix_board::fleet::ledger::capacity::end(&path, &config, host, reason, at_ms)
+        .map_err(|error| Error::Fleet(ix_board::fleet::FleetError::Ledger(error.to_string())))
 }
 
 fn run_fleet_assign(
@@ -1443,6 +1592,39 @@ fn render_human(output: &Output) -> String {
         Output::FleetLedger(rows) => rows.render_text(),
         Output::FleetTick(tick) => tick.render_text(),
         Output::Retro(output) => retro::render_text(output.record()),
+        Output::FleetCapacity(status) => {
+            let mut lines = Vec::new();
+            for host in &status.hosts {
+                let level = host
+                    .recorded_level
+                    .as_ref()
+                    .map_or_else(|| "none".to_owned(), |level| level.level.to_string());
+                lines.push(format!(
+                    "{} state={} recorded_level={} draining={}",
+                    host.host,
+                    host.discovery_state,
+                    level,
+                    host.draining_lanes.len()
+                ));
+            }
+            lines.push(format!(
+                "runs={} steps={} levels={} events={}",
+                status.runs.len(),
+                status.steps.len(),
+                status.levels.len(),
+                status.events.len()
+            ));
+            lines.join("\n")
+        }
+        Output::FleetCapacityRun(run_id) => format!("capacity run {run_id} started"),
+        Output::FleetCapacityStep(window) => format!(
+            "capacity run {} step {} holds {} lanes on {} after ramp-up at {}",
+            window.run_id, window.step_no, window.lanes, window.host, window.rampup_end_ms
+        ),
+        Output::FleetCapacityLevel { recorded_level } => recorded_level.map_or_else(
+            || "capacity run ended without a new level".to_owned(),
+            |level| format!("recorded sustainable level: {level}"),
+        ),
         Output::RetroDelta(report) => retro::render_delta_text(report),
         Output::RetroBackfill(report) => retro::render_backfill_text(report),
         Output::ProgramScopeCheck(report) => {

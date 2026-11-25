@@ -9,6 +9,7 @@
 //! file read-only and never migrate.
 
 mod assign_rows;
+pub mod capacity;
 mod lock;
 mod schema;
 #[cfg(test)]
@@ -26,6 +27,9 @@ use std::time::Duration;
 use thiserror::Error as ThisError;
 
 pub use assign_rows::{AssignSink, complete_pending};
+pub use capacity::{
+    CapacityEvent, CapacityHost, CapacityLevel, CapacityRun, CapacityStatus, CapacityStep,
+};
 pub use schema::{QUERYABLE, VERSION};
 pub use tick::{TickCommit, tick_metrics};
 
@@ -96,6 +100,9 @@ pub enum LedgerError {
     /// A value could not be encoded.
     #[error("ledger value: {0}")]
     Json(#[from] serde_json::Error),
+    /// A capacity-ledger operation was refused by its state or input contract.
+    #[error("fleet capacity: {0}")]
+    Capacity(String),
 }
 
 /// The default ledger file under the user state directory.
@@ -196,6 +203,22 @@ fn apply_v2(tx: &rusqlite::Transaction<'_>, fail_at: Option<usize>) -> Result<()
         }
         tx.execute_batch(statement)?;
     }
+    tx.pragma_update(None, "user_version", 2)?;
+    Ok(())
+}
+
+fn apply_v3(tx: &rusqlite::Transaction<'_>) -> Result<(), LedgerError> {
+    for statement in schema::V3 {
+        tx.execute_batch(statement)?;
+    }
+    tx.pragma_update(None, "user_version", 3)?;
+    Ok(())
+}
+
+fn apply_v4(tx: &rusqlite::Transaction<'_>) -> Result<(), LedgerError> {
+    for statement in schema::V4 {
+        tx.execute_batch(statement)?;
+    }
     tx.pragma_update(None, "user_version", schema::VERSION)?;
     Ok(())
 }
@@ -212,9 +235,9 @@ pub struct Ledger {
 }
 
 impl Ledger {
-    /// Opens or creates the ledger as the writer, holding the lock until it is dropped. A
-    /// version 1 ledger migrates to version 2 in one transaction; a newer or foreign file is
-    /// refused unchanged.
+    /// Opens or creates the ledger as the writer, holding the lock until it is dropped. Older
+    /// supported versions migrate to the current schema in one transaction; a newer or foreign
+    /// file is refused unchanged.
     ///
     /// # Errors
     ///
@@ -250,14 +273,29 @@ impl Ledger {
                 let tx = connection.transaction()?;
                 tx.execute_batch(schema::V1)?;
                 apply_v2(&tx, fail_migration_at)?;
+                apply_v3(&tx)?;
+                apply_v4(&tx)?;
                 tx.commit()?;
             }
             1 => {
                 let tx = connection.transaction()?;
                 apply_v2(&tx, fail_migration_at)?;
+                apply_v3(&tx)?;
+                apply_v4(&tx)?;
                 tx.commit()?;
             }
-            2 => {}
+            2 => {
+                let tx = connection.transaction()?;
+                apply_v3(&tx)?;
+                apply_v4(&tx)?;
+                tx.commit()?;
+            }
+            3 => {
+                let tx = connection.transaction()?;
+                apply_v4(&tx)?;
+                tx.commit()?;
+            }
+            4 => {}
             found => {
                 return Err(LedgerError::UnsupportedVersion {
                     path: path.to_owned(),

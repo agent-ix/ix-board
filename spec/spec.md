@@ -190,7 +190,7 @@ Functional acceptance criteria include fixture checks for each drift signal,
 queue rules, and cache behavior; NFR-001 specifies a lightweight warm-cache
 fixture benchmark.
 
-SWM-208 adds US-011 and FR-034 through FR-043: FR-034 lane classes and source defects, FR-035 assign, FR-036 plan coverage, FR-037 hook-derived focus and drift inputs (constraining FR-008), FR-038 tick actions, FR-039 ledger, FR-040 calibration, FR-041 saturation, FR-042 replay, FR-043 script replacement. SWM-252, SWM-255, SWM-256, SWM-257 and SWM-258 extend FR-035 to FR-039 and FR-041 with the evidence the dev-team orchestrator and minder role specs evaluate (ledger version 2, capacity discovery history, tick ladder and undetermined action, assign order id) and add FR-044 for cycle events and the dialog answer log. FR-018 gains the SWM-210 evidence-completeness rules and FR-033 serves the fleet gauges.
+SWM-208 adds US-011 and FR-034 through FR-043: FR-034 lane classes and source defects, FR-035 assign, FR-036 plan coverage, FR-037 hook-derived focus and drift inputs (constraining FR-008), FR-038 tick actions, FR-039 ledger, FR-040 calibration, FR-041 saturation, FR-042 replay, FR-043 script replacement. SWM-252, SWM-255, SWM-256, SWM-257 and SWM-258 extend FR-035 to FR-039 and FR-041 with the evidence the dev-team orchestrator and minder role specs evaluate (ledger version 3, capacity discovery history and measurement-source provenance, tick ladder and undetermined action, assign order id) and add FR-044 for cycle events and the dialog answer log. FR-018 gains the SWM-210 evidence-completeness rules and FR-033 serves the fleet gauges.
 
 ## References
 

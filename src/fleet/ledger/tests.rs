@@ -354,7 +354,7 @@ fn a_crash_mid_migration_leaves_the_version_one_ledger_intact_and_openable() {
         assert_eq!(v1_rows(&path), (7, 9, 11));
     }
     drop(open(&path));
-    assert_eq!(count(&path, "PRAGMA user_version"), 2);
+    assert_eq!(count(&path, "PRAGMA user_version"), VERSION);
     assert_eq!(v1_rows(&path), (7, 9, 11));
     assert_eq!(
         count(&path, "SELECT COUNT(*) FROM defect WHERE closed_at IS NULL"),
@@ -387,6 +387,7 @@ fn migration_is_one_transaction_and_a_later_version_is_refused() {
         "capacity_level",
         "capacity_event",
         "host_output_sample",
+        "capacity_window",
     ] {
         assert_eq!(
             count(
@@ -401,11 +402,11 @@ fn migration_is_one_transaction_and_a_later_version_is_refused() {
     }
     Connection::open(&path)
         .unwrap()
-        .pragma_update(None, "user_version", 3)
+        .pragma_update(None, "user_version", VERSION + 1)
         .unwrap();
     assert!(matches!(
         Ledger::open(&path, &FleetConfig::default()),
-        Err(LedgerError::UnsupportedVersion { found: 3, .. })
+        Err(LedgerError::UnsupportedVersion { found: 5, .. })
     ));
 }
 
