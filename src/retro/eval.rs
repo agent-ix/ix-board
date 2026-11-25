@@ -1463,7 +1463,35 @@ fn read_linear_gate_record_metrics(
         let repo = fields
             .get("repo")
             .ok_or_else(|| "gate record has no repo".to_owned())?;
-        recorded_finished.insert(((*repo).to_owned(), (finished_at * 1000.0).round() as i64));
+        let pr = fields
+            .get("pr")
+            .ok_or_else(|| "gate record has no PR".to_owned())?;
+        let short_repo = repo.rsplit('/').next().unwrap_or(repo);
+        if !pr.starts_with(&format!("{repo}#")) && !pr.starts_with(&format!("{short_repo}#")) {
+            return Err(format!(
+                "gate record PR {pr:?} does not match repo {repo:?}"
+            ));
+        }
+        let pr_number = pr
+            .rsplit_once('#')
+            .and_then(|(_, number)| number.parse::<u64>().ok())
+            .ok_or_else(|| format!("gate record PR {pr:?} is invalid"))?;
+        let pr = format!("{repo}#{pr_number}");
+        let head = fields
+            .get("head")
+            .filter(|head| !head.is_empty())
+            .ok_or_else(|| "gate record has no head".to_owned())?;
+        let exit = fields
+            .get("exit")
+            .and_then(|exit| exit.parse::<i32>().ok())
+            .ok_or_else(|| "gate record has no valid exit status".to_owned())?;
+        let started = fields
+            .get("started")
+            .ok_or_else(|| "gate record has no started time".to_owned())?;
+        crate::drift::timestamp_epoch(started)
+            .map_err(|error| format!("gate record started time is invalid: {error}"))?;
+        let _ = (head, exit);
+        recorded_finished.insert((pr, (finished_at * 1000.0).round() as i64));
         let created = comment
             .created_at
             .as_deref()
@@ -1490,9 +1518,7 @@ fn read_linear_gate_record_metrics(
         .filter(|line| !line.repin && line.finished_at >= start_secs && line.finished_at < end_secs)
         .filter(|line| {
             let finished_ms = (line.finished_at * 1000.0).round() as i64;
-            !recorded_finished
-                .iter()
-                .any(|(repo, finished)| line.pr.starts_with(repo) && *finished == finished_ms)
+            !recorded_finished.contains(&(line.pr.clone(), finished_ms))
         })
         .collect::<Vec<_>>();
     let unrecorded_evidence = unrecorded
