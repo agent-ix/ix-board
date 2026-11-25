@@ -53,7 +53,7 @@ fn initiatives() -> Value {
 fn initiative_members(name: &str, ids: &[&str]) -> Value {
     let members = ids.iter().map(|id| json!({"id":id})).collect::<Vec<_>>();
     json!({"data":{"initiatives":page(json!([{
-        "id":"initiative-1", "name":name,"updatedAt":"2026-11-21T00:00:00Z",
+        "id":"initiative-1", "slugId":"slug-1", "name":name,"updatedAt":"2026-11-21T00:00:00Z",
         "archivedAt":null,"trashed":false,"status":"Active","health":"onTrack",
         "projects":page(json!(members))
     }]))}})
@@ -403,6 +403,14 @@ fn detailed_deltas_preserve_unchanged_records_and_update_blocking_edges_on_uncha
             .initiatives[0]
             .name,
         "Program"
+    );
+    assert!(
+        added
+            .projects
+            .iter()
+            .flat_map(|p| &p.initiatives)
+            .all(|i| i.identifier.is_empty()),
+        "a delta adds no initiative slug that a full detail read would not carry"
     );
     assert!(added.issues.iter().any(|i| i.identifier == "unchanged"));
     assert!(added.issues.iter().any(|i| i.identifier == "new-issue"));

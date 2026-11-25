@@ -3,7 +3,7 @@
 
 //! Deterministic hygiene findings and focus snapshot differences.
 
-use crate::{Issue, IssueId, ProjectId, WorkflowStateType, WorkspaceSnapshot};
+use crate::{Issue, IssueId, ProjectId, ReferenceWarning, WorkflowStateType, WorkspaceSnapshot};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -236,6 +236,9 @@ pub struct FocusHygieneReport {
     pub near_duplicate_titles: HygieneGroup<DuplicateTitleFinding>,
     /// Changes since the previous successful report.
     pub diff: HygieneGroup<FocusChange>,
+    /// Unavailable references of the focus; omitted when there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<ReferenceWarning>,
     /// Current snapshot to persist after a complete Linear diff.
     #[serde(skip)]
     pub baseline: Vec<FocusBaselineIssue>,
@@ -432,6 +435,7 @@ pub fn build_report(
         },
         baseline: current_baseline,
         baseline_advance,
+        warnings: Vec::new(),
     };
     let mut referenced = BTreeSet::new();
     referenced.extend(

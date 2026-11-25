@@ -65,8 +65,9 @@ identifier). FR-001 project order SHALL use project priority, project manual
 order, then stable project identifier. Within a project, milestone order SHALL
 use Linear milestone `sortOrder` ascending, then milestone identifier. This
 command's row order SHALL not use FR-001 ticket priority or ticket manual
-order. The stable issue identifier SHALL be the final tie-breaker. Missing
-blocker records and dependency cycles SHALL retain FR-002's errors.
+order. The stable issue identifier SHALL be the final tie-breaker. Dependency
+cycles SHALL retain FR-002's error; unavailable records follow
+[FR-045](FR-045-dangling-references.md).
 
 For each emitted issue, the output SHALL include its stable identifier, title,
 milestone name or `null`, readiness boolean and reasons, the stable identifiers
@@ -96,8 +97,8 @@ read or write GitHub Issues.
 - Complete structured Linear focus, issue-description, milestone-order, and
   blocker records.
 
-Empty focus, invalid size, incomplete source records, missing blocker records,
-and dependency cycles SHALL produce explicit errors and no partial chunk.
+Empty focus, invalid size, incomplete source reads, and dependency cycles SHALL
+produce explicit errors and no partial chunk.
 
 ## Outputs
 
@@ -110,8 +111,9 @@ and dependency cycles SHALL produce explicit errors and no partial chunk.
   sorted `unblocks` focus identifiers, and bounded acceptance-criteria excerpt.
 - The actual source snapshot fetch timestamp, preserving cache age under
   FR-010.
-- Explicit errors for empty focus, invalid size, incomplete source data, a
-  missing blocker, or a dependency cycle; no partial result on error.
+- Explicit errors for empty focus, invalid size, incomplete source data, or a
+  dependency cycle; no partial result on error.
+- FR-045 warnings for unavailable records.
 
 ## Acceptance Criteria
 
@@ -122,7 +124,7 @@ and dependency cycles SHALL produce explicit errors and no partial chunk.
 | FR-014-AC-3 | Given `--size N`, exactly the first min(N, candidate-count) issue rows appear after deterministic ordering; blocker-only nodes and completed/canceled focus issues do not count toward N. Omitted size returns all open focus issues; zero, negative, non-integer, and malformed values return an error with no partial chunk. | Test |
 | FR-014-AC-4 | Given a focus prerequisite with multiple transitive open focus dependents, its `unblocks` lists each dependent once in stable identifier order; unrelated and blocker-only issues are absent. | Test |
 | FR-014-AC-5 | Given descriptions with a matching Acceptance Criteria Markdown heading, the excerpt is the trimmed section body through the next heading, limited to 280 Unicode scalar values with `…` only when truncated; absent headings or empty bodies yield null, and description text does not change focus membership or readiness. | Test |
-| FR-014-AC-6 | Given identical complete Linear records and size, repeated calls return identical rows, readiness reasons, unblocks, excerpts, ordering, and source fetch timestamp; missing blocker data, a dependency cycle, incomplete input, or empty focus returns an explicit error without partial rows. | Test |
+| FR-014-AC-6 | Given identical complete Linear records and size, repeated calls return identical rows, readiness reasons, unblocks, excerpts, ordering, and source fetch timestamp; a dependency cycle, incomplete input, or empty focus returns an explicit error without partial rows. | Test |
 | FR-014-AC-7 | The operation uses only structured Linear reads and makes no GitHub Issues request or mutation. | Inspection |
 | FR-014-AC-8 | Given one focus issue with prerequisite paths of unequal lengths in its complete blocker closure and another focus issue on a shorter path, each node receives layer zero when it has no blocker prerequisites and otherwise one plus its deepest prerequisite layer; the longer path's focus issue sorts after the shorter-path issue regardless of milestone order. | Test |
 | FR-014-AC-9 | Given unmilestoned and milestone-assigned open focus issues across projects, dependency layer sorts first, FR-001 project priority/manual order/project identifier sorts next, and within each project milestone-assigned rows follow Linear milestone order before its unmilestoned rows; stable issue identifier resolves remaining ties. | Test |

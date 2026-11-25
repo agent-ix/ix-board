@@ -63,19 +63,43 @@ ix-board roadmap
 ix-board roadmap --scope program.toml
 ```
 
-`roadmap` lists initiatives with their projects. Each project row shows its
-status, progress percentage, open, done and canceled counts, and last activity,
-all derived from current issues. A shared project is listed once, under its
+`roadmap` lists initiatives with their projects. It reads Linear's project and
+initiative catalogs and makes no issue requests. Each project row shows its
+status and Linear's progress percentage, plus leaf task counts when the local
+cache holds an issue snapshot. A shared project is listed once, under its
 primary initiative, with its other initiatives noted. The report also names
 projects without an initiative and initiatives without projects. With `--scope`,
 it covers only the declared initiatives and projects, and it reports projects
 missing from the file and mismatches between the file and Linear's initiative
 memberships. Without `--scope`, it covers the whole workspace.
 
+With `--json`, every initiative and project entry carries `id` (the Linear UUID)
+and `identifier` (the Linear slug, or null). Each initiative also carries
+`member_project_ids`, the UUIDs of all its member projects, including projects
+whose row is listed under another initiative. A program that holds an initiative
+UUID can therefore find its projects and their counts in one call:
+
+```bash
+ix-board --json roadmap | jq '.result
+  | [.initiatives[].projects[], .unplaced_projects[]] as $rows
+  | .initiatives[]
+  | select(.id == "<initiative UUID>")
+  | .member_project_ids as $members
+  | $rows[] | select(.id as $id | $members | index($id))
+  | {id, identifier, name, done, total}'
+```
+
+`done`, `total`, `open` and `canceled` count leaf tasks the way `focus status`
+does. `counts_source` and `counts_observed_at` say where they came from and when
+those issues were read. `roadmap` never reads issues itself, so run a focus
+command first, or again when the counts are older than you want. Without a cached
+issue snapshot, or for a project the snapshot does not hold, the counts are null
+and `counts_unavailable_reason` says why. The slug is output only; selectors do
+not accept it.
+
 ```text
 QSL Core
-  QSL Compiler, Runtime & Tooling | Started | 62% | open 31 done 52 canceled 4 | last activity 2026-10-27T16:40:11Z
-unplaced project: Scratch | Paused | 0%
+  QSL Compiler, Runtime & Tooling | Started | progress 62.0% | source linear_native | observed 2026-10-28T09:12:03Z | leaf tasks done 52/83, open 31, canceled 4 (issues observed 2026-10-28T09:10:00Z) | issue last activity: unknown (…) | project updated 2026-10-27T16:40:11Z
 ```
 
 ## orphans

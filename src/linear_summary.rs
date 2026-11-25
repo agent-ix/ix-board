@@ -12,7 +12,7 @@ const PAGE_LIMIT: usize = 1_000;
 const PROJECTS: &str = r#"
 query SummaryProjects($first:Int!, $after:String, $filter:ProjectFilter, $includeArchived:Boolean!) {
  projects(first:$first, after:$after, filter:$filter, includeArchived:$includeArchived, orderBy:updatedAt) {
-  nodes { id name description updatedAt archivedAt trashed progress priority sortOrder targetDate
+  nodes { id slugId name description updatedAt archivedAt trashed progress priority sortOrder targetDate
    status { name type }
    initiatives(first:10, includeArchived:false) { nodes { id name } pageInfo { hasNextPage endCursor } }
   }
@@ -22,7 +22,7 @@ query SummaryProjects($first:Int!, $after:String, $filter:ProjectFilter, $includ
 const INITIATIVES: &str = r#"
 query SummaryInitiatives($first:Int!, $after:String, $filter:InitiativeFilter, $includeArchived:Boolean!) {
  initiatives(first:$first, after:$after, filter:$filter, includeArchived:$includeArchived, orderBy:updatedAt) {
-  nodes { id name updatedAt archivedAt trashed status health
+  nodes { id slugId name updatedAt archivedAt trashed status health
    projects(first:10, includeArchived:false, includeSubInitiatives:false) { nodes { id } pageInfo { hasNextPage endCursor } }
   }
   pageInfo { hasNextPage endCursor }
@@ -396,6 +396,8 @@ struct Status {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct RawProject {
     id: String,
+    #[serde(default)]
+    slug_id: Option<String>,
     name: String,
     description: String,
     updated_at: String,
@@ -427,7 +429,7 @@ impl RawProject {
             trashed: self.trashed.unwrap_or(false),
             project: Project {
                 id: ProjectId(self.id),
-                identifier: None,
+                identifier: self.slug_id,
                 name: self.name,
                 updated_at: Some(self.updated_at),
                 description: self.description,
@@ -454,6 +456,8 @@ impl RawProject {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct RawInitiative {
     id: String,
+    #[serde(default)]
+    slug_id: Option<String>,
     name: String,
     updated_at: String,
     archived_at: Option<String>,
@@ -466,7 +470,7 @@ impl RawInitiative {
     fn into_summary(self) -> InitiativeSummary {
         InitiativeSummary {
             initiative: Initiative {
-                identifier: String::new(),
+                identifier: self.slug_id.unwrap_or_default(),
                 id: self.id,
                 name: self.name,
             },

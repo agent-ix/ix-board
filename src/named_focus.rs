@@ -13,10 +13,11 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::read_bound::Budget;
+use crate::reference_warnings::focus_warnings;
 use crate::scope::{LeafClassification, classify_leaves_within};
 use crate::{
     Error, FocusBlocker, Issue, IssueId, NamedMember, NamedSelection, Project, ProjectId,
-    ProjectStatusCategory, TeamKey, WorkflowStateType, WorkspaceSnapshot,
+    ProjectStatusCategory, ReferenceWarning, TeamKey, WorkflowStateType, WorkspaceSnapshot,
 };
 
 /// What the snapshot's source enumerates authoritatively.
@@ -312,6 +313,9 @@ pub struct NamedBatch {
     pub selections: Vec<SelectionSummary>,
     /// One combined result per team, ordered by team. Teams are never combined.
     pub teams: Vec<TeamSummary>,
+    /// Unavailable references of the selections' issues; omitted when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<ReferenceWarning>,
 }
 
 /// One selection with the caller's opaque key (for example a focus ID and revision).
@@ -325,9 +329,10 @@ pub struct NamedFocusRequest {
 
 /// Evaluates every selection and every team union against one snapshot.
 ///
-/// Membership is recomputed from the snapshot and the stored identities. Any snapshot
-/// error the existing engines report (parent cycle, missing parent or blocker record,
-/// dependency cycle) fails the whole batch with that error and no partial result.
+/// Membership is recomputed from the snapshot and the stored identities. A parent cycle or
+/// dependency cycle fails the whole batch with that error and no partial result. An
+/// unavailable parent, blocker, project or milestone record is reported in
+/// [`NamedBatch::warnings`] and the batch is still evaluated (FR-045).
 pub fn evaluate_named_batch(
     snapshot: &WorkspaceSnapshot,
     evidence: &CatalogEvidence,
@@ -360,6 +365,7 @@ pub(crate) fn evaluate_batch(
             state: BatchState::None,
             selections: Vec::new(),
             teams: Vec::new(),
+            warnings: Vec::new(),
         });
     }
     let context = Context::new(snapshot, evidence, budget)?;
@@ -381,11 +387,17 @@ pub(crate) fn evaluate_batch(
     budget.check()?;
     mark_shared(&mut selections, budget)?;
     let teams = context.team_summaries(&selections, &readiness)?;
+    let members = drafts
+        .iter()
+        .flat_map(|draft| draft.effective.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let warnings = focus_warnings(snapshot, &members, budget)?;
     Ok(NamedBatch {
         fetched_at: snapshot.fetched_at,
         state: BatchState::Evaluated,
         selections,
         teams,
+        warnings,
     })
 }
 

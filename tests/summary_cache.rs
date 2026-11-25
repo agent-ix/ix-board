@@ -244,14 +244,14 @@ fn page(nodes: Value, cursor: Option<&str>) -> Value {
 }
 
 fn project(id: &str) -> Value {
-    json!({"id":id,"name":id,"description":"Goal","updatedAt":"2026-11-20T00:00:00Z",
+    json!({"id":id,"slugId":format!("slug-{id}"),"name":id,"description":"Goal","updatedAt":"2026-11-20T00:00:00Z",
         "archivedAt":null,"trashed":null,"progress":0.375,"priority":2,"sortOrder":1.0,
         "targetDate":null,"status":{"name":"Building","type":"started"},
         "initiatives":page(json!([{"id":"i1","name":"Program"}]),None)})
 }
 
 fn initiative() -> Value {
-    json!({"id":"i1","name":"Program","updatedAt":"2026-11-20T00:00:00Z",
+    json!({"id":"i1","slugId":"slug-i1","name":"Program","updatedAt":"2026-11-20T00:00:00Z",
         "archivedAt":null,"trashed":null,"status":"Active","health":"atRisk",
         "projects":page(json!([{"id":"p1"},{"id":"p2"}]),None)})
 }
@@ -355,8 +355,8 @@ fn fixture_responses(
     (source, receiver, cache, endpoint)
 }
 
-/// Trace: FR-020-AC-2, FR-030-AC-1, FR-019-AC-5
-#[trace("FR-020-AC-2")]
+/// Trace: FR-020-AC-2, FR-020-AC-7, FR-030-AC-1, FR-019-AC-5
+#[trace("FR-020-AC-2", "FR-020-AC-7")]
 #[test]
 fn native_catalog_pages_never_enumerate_tickets_and_keep_weighted_progress() {
     let (source, requests, _cache) = fixture(vec![
@@ -376,10 +376,22 @@ fn native_catalog_pages_never_enumerate_tickets_and_keep_weighted_progress() {
         let query = request["query"].as_str().expect("query text");
         assert!(!query.contains("issues") && !query.contains("history"));
         assert!(query.contains("includeArchived:$includeArchived"));
+        assert!(query.contains("slugId"));
         assert_eq!(request["variables"]["includeArchived"], false);
     }
     let summary = merge_summary(&SummarySnapshot::default(), snapshot);
     let roadmap = build_summary_roadmap(&summary, None, "2026-11-21T00:00:00Z");
+    assert_eq!(roadmap.initiatives[0].id, "i1");
+    assert_eq!(
+        roadmap.initiatives[0].identifier.as_deref(),
+        Some("slug-i1")
+    );
+    assert_eq!(roadmap.initiatives[0].member_project_ids, ["p1", "p2"]);
+    assert_eq!(roadmap.initiatives[0].projects[0].id, "p1");
+    assert_eq!(
+        roadmap.initiatives[0].projects[0].identifier.as_deref(),
+        Some("slug-p1")
+    );
     let row = &roadmap.initiatives[0].projects[0];
     assert_eq!(row.progress_percent, Some(37.5));
     assert_eq!(row.progress_source, "linear_native");

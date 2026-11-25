@@ -1572,7 +1572,12 @@ impl LinearGraphQlSource {
                         && !initiative.trashed
                         && initiative.project_ids.contains(&project.id)
                     {
-                        project.initiatives.push(initiative.initiative.clone());
+                        // Detail snapshots carry no initiative slug: a full read does
+                        // not fetch it, so a delta must not add it either.
+                        project.initiatives.push(Initiative {
+                            identifier: String::new(),
+                            ..initiative.initiative.clone()
+                        });
                         project.initiatives.sort_by(|a, b| a.id.cmp(&b.id));
                     }
                 }

@@ -878,7 +878,7 @@ fn an_unknown_status_category_is_kept_and_never_reported_healthy() {
     assert_eq!(batch.teams[0].causes[0].key, "k");
 }
 
-#[trace("FR-012-AC-19")]
+#[trace("FR-012-AC-19", "FR-045-AC-8")]
 #[test]
 fn snapshot_errors_fail_the_whole_batch_with_the_existing_error() {
     let healthy = selection("SWM", vec![proj("p2")], vec![]);
@@ -898,14 +898,6 @@ fn snapshot_errors_fail_the_whole_batch_with_the_existing_error() {
             child_of(open("SWM-2", "p1"), "SWM-1"),
         ]),
         Err(Error::ParentCycle { .. })
-    ));
-    assert!(matches!(
-        run(vec![child_of(open("SWM-1", "p1"), "SWM-404")]),
-        Err(Error::MissingParent { .. })
-    ));
-    assert!(matches!(
-        run(vec![blocked_by(open("SWM-1", "p1"), &["SWM-404"])]),
-        Err(Error::MissingDependency { .. })
     ));
     assert!(matches!(
         run(vec![

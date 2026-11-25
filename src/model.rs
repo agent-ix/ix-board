@@ -9,7 +9,7 @@ use std::cmp::Ordering;
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 
-use crate::Error;
+use crate::{Error, ReferenceWarning};
 
 /// Stable Linear issue UUID used for relationships.
 #[derive(
@@ -356,6 +356,9 @@ pub struct ProjectChunk {
     pub open_tickets: Vec<ChunkIssue>,
     /// Dependency layers reachable from open project tickets, prerequisites before dependents.
     pub blocker_layers: Vec<Vec<String>>,
+    /// Unavailable references of the open tickets; omitted when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<ReferenceWarning>,
 }
 
 /// Inline selectors resolved into a deterministic Linear workspace focus.
@@ -385,6 +388,9 @@ pub struct FocusExpansion {
     pub issue_selector_issues: Vec<FocusIssue>,
     /// Complete blocker closures, prerequisites before dependents.
     pub blocker_layers: Vec<Vec<String>>,
+    /// Unavailable references of the focus; omitted when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<ReferenceWarning>,
 }
 
 /// Combined focus status, blocker attribution, and eligible ready work.
@@ -403,6 +409,13 @@ pub struct FocusStatus {
     pub blocker_layers: Vec<Vec<FocusBlocker>>,
     /// Focus issues eligible under FR-001, in its deterministic order.
     pub ready_queue: Vec<ReadyItem>,
+    /// Focus issues held by no project row: unprojected, or referencing an unavailable
+    /// project. Omitted when there are none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outside_projects: Option<FocusUnmilestonedStatus>,
+    /// Unavailable references of the focus; omitted when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<ReferenceWarning>,
 }
 
 /// Versioned ix-board focus value for storage or transport by an opaque data service.
@@ -439,6 +452,10 @@ pub struct FocusPlanChunk {
     pub work_milestones: Vec<String>,
     /// Ordered open focus issues included in the handoff.
     pub issues: Vec<FocusPlanIssue>,
+    /// Unavailable references of the whole focus, regardless of the size limit; omitted
+    /// when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<ReferenceWarning>,
 }
 
 /// One open focus issue in a dependency-ordered handoff.
@@ -485,7 +502,7 @@ pub struct FocusProjectStatus {
     pub progress: FocusProgress,
     /// Selected milestone status, in Linear milestone order.
     pub milestones: Vec<FocusMilestoneStatus>,
-    /// Status of focus issues assigned to the project without a milestone.
+    /// Status of focus issues assigned to the project without a milestone of the project.
     pub unmilestoned: FocusUnmilestonedStatus,
 }
 
@@ -515,7 +532,8 @@ pub struct FocusMilestoneStatus {
     pub progress: FocusProgress,
 }
 
-/// Status of project focus issues without a milestone assignment.
+/// Status of a group of focus issues outside any milestone: a project's issues without
+/// one of its milestones, or the issues outside every project row.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FocusUnmilestonedStatus {

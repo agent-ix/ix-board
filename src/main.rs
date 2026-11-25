@@ -19,8 +19,8 @@ use ix_board::{
     DriftConfig, DriftError, DriftEvidenceFile, DriftReport, Error, FocusExpansion,
     FocusHygieneReport, FocusPlanChunk, FocusProjectMembership, FocusRecord, FocusSelection,
     FocusStatus, IssueBatch, LinearGraphQlSource, NextStep, ProjectChunk, ProjectPriority,
-    ProjectRunStatus, ReadService, ReadyItem, SearchResult, evaluate_drift, evaluate_drift_file,
-    render_drift_text,
+    ProjectRunStatus, ReadService, ReadyItem, ReferenceWarning, SearchResult, evaluate_drift,
+    evaluate_drift_file, render_drift_text,
 };
 use ix_cli_kit::exit::Outcome;
 use ix_cli_kit::secrets::{AppScope, SecretKey, SecretStore, SecretValue};
@@ -726,11 +726,12 @@ fn run(command: Command) -> Result<Output, Error> {
             })?;
             let source = LinearGraphQlSource::from_env()?;
             let read = source.summary_snapshot_cached()?;
-            let report = ix_board::program_review::build_summary_roadmap(
+            let mut report = ix_board::program_review::build_summary_roadmap(
                 &read.data,
                 scope.as_ref(),
                 &format_utc(read.last_successful_sync),
             );
+            count_roadmap_from_cache(&mut report, source);
             Ok(Output::Cached {
                 result: Box::new(Output::SummaryRoadmap(report)),
                 freshness: read.freshness,
@@ -826,6 +827,25 @@ fn run(command: Command) -> Result<Output, Error> {
                 .map_err(Error::from)
         }
         other => run_linear(other),
+    }
+}
+
+/// Adds ticket counts from the issue snapshot already in the local cache. It makes no
+/// Linear request; without a readable snapshot the counts stay unavailable (FR-020).
+fn count_roadmap_from_cache(
+    report: &mut ix_board::program_review::SummaryRoadmap,
+    source: LinearGraphQlSource,
+) {
+    match ReadService::open_default(source)
+        .and_then(|service| service.cached_workspace_snapshot())
+    {
+        Ok(Some(detail)) => report.count_from_issues(&detail, &format_utc(detail.fetched_at)),
+        Ok(None) => report.counts_unavailable(
+            "no cached issue snapshot; roadmap makes no issue requests, so run a focus command first",
+        ),
+        Err(error) => {
+            report.counts_unavailable(&format!("cached issue snapshot is unreadable: {error}"));
+        }
     }
 }
 
@@ -1089,7 +1109,13 @@ fn run_linear(command: Command) -> Result<Output, Error> {
         Command::Orphans { .. } => {
             unreachable!("program review commands are handled before Linear dispatch")
         }
-        Command::Next { team } => service.next(&team).map(Output::Queue),
+        // The queue's JSON is a bare list, so its warnings go to stderr (FR-045).
+        Command::Next { team } => service.next_with_warnings(&team).map(|(queue, warnings)| {
+            for warning in warnings {
+                eprintln!("warning: {warning}");
+            }
+            Output::Queue(queue)
+        }),
         Command::ProjectChunk { project } => service.project_chunk(&project).map(Output::Chunk),
         Command::Search { query } => service.search(&query).map(Output::Search),
         Command::Issues { identifiers } => service.issues(&identifiers).map(Output::Issues),
@@ -1511,8 +1537,20 @@ fn render_summary_roadmap(report: &ix_board::program_review::SummaryRoadmap) -> 
 }
 
 fn render_summary_project(project: &ix_board::program_review::SummaryRoadmapProject) -> String {
+    let counts = match (
+        project.done,
+        project.total,
+        project.open,
+        project.canceled,
+        &project.counts_observed_at,
+    ) {
+        (Some(done), Some(total), Some(open), Some(canceled), Some(observed)) => format!(
+            "leaf tasks done {done}/{total}, open {open}, canceled {canceled} (issues observed {observed})"
+        ),
+        _ => format!("counts unavailable: {}", project.counts_unavailable_reason),
+    };
     format!(
-        "{} | {} | progress {} | source {} | observed {} | counts unavailable: {} | issue last activity: {} ({}) | project updated {}",
+        "{} | {} | progress {} | source {} | observed {} | {counts} | issue last activity: {} ({}) | project updated {}",
         project.name,
         project.status,
         project.progress_percent.map_or_else(
@@ -1521,7 +1559,6 @@ fn render_summary_project(project: &ix_board::program_review::SummaryRoadmapProj
         ),
         project.progress_source,
         project.observed_at,
-        project.counts_unavailable_reason,
         project.last_activity.as_deref().unwrap_or("unknown"),
         project.activity_unavailable_reason,
         project.project_updated_at.as_deref().unwrap_or("unknown")
@@ -1771,6 +1808,15 @@ fn render_focus(expansion: &FocusExpansion) -> String {
                 .map(|(index, layer)| format!("  {}: {}", index, layer.join(", "))),
         );
     }
+    join_with_warnings(lines, &expansion.warnings)
+}
+
+/// Joins rendered lines, ending with the unavailable references when there are any.
+fn join_with_warnings(mut lines: Vec<String>, warnings: &[ReferenceWarning]) -> String {
+    if !warnings.is_empty() {
+        lines.push("Warnings:".to_owned());
+        lines.extend(warnings.iter().map(|warning| format!("  {warning}")));
+    }
     lines.join("\n")
 }
 
@@ -1833,6 +1879,16 @@ fn render_focus_status(status: &FocusStatus) -> String {
             );
         }
     }
+    if let Some(outside) = &status.outside_projects {
+        lines.push("Outside any available project:".to_owned());
+        render_status_group(
+            &mut lines,
+            "  ",
+            &outside.open_by_state,
+            &outside.in_progress,
+            outside.progress,
+        );
+    }
     lines.push("Blocker layers:".to_owned());
     for (index, layer) in status.blocker_layers.iter().enumerate() {
         lines.push(format!("  {index}:"));
@@ -1865,7 +1921,7 @@ fn render_focus_status(status: &FocusStatus) -> String {
             .iter()
             .map(|item| format!("  {} — {} ({})", item.identifier, item.title, item.reason)),
     );
-    lines.join("\n")
+    join_with_warnings(lines, &status.warnings)
 }
 
 fn render_focus_plan_chunk(chunk: &FocusPlanChunk) -> String {
@@ -1895,7 +1951,7 @@ fn render_focus_plan_chunk(chunk: &FocusPlanChunk) -> String {
             lines.push(format!("    acceptance criteria: {excerpt}"));
         }
     }
-    lines.join("\n")
+    join_with_warnings(lines, &chunk.warnings)
 }
 
 fn render_focus_hygiene(report: &FocusHygieneReport) -> String {
@@ -1981,7 +2037,7 @@ fn render_focus_hygiene(report: &FocusHygieneReport) -> String {
             issue_label(report, change_issue_id(finding))
         ));
     }
-    lines.join("\n")
+    join_with_warnings(lines, &report.warnings)
 }
 
 fn format_utc(epoch: i64) -> String {
@@ -2134,7 +2190,7 @@ fn render_chunk(chunk: &ProjectChunk) -> String {
                 .map(|(index, layer)| format!("  {}: {}", index, layer.join(", "))),
         );
     }
-    lines.join("\n")
+    join_with_warnings(lines, &chunk.warnings)
 }
 
 #[cfg(test)]
@@ -2157,6 +2213,11 @@ mod tests {
             SummaryRoadmap, SummaryRoadmapInitiative, SummaryRoadmapProject,
         };
         let row = |name: &str, progress| SummaryRoadmapProject {
+            id: name.to_owned(),
+            identifier: None,
+            total: None,
+            counts_source: None,
+            counts_observed_at: None,
             name: name.to_owned(),
             status: "Building".to_owned(),
             progress_percent: Some(progress),
@@ -2173,6 +2234,9 @@ mod tests {
         };
         let report = SummaryRoadmap {
             initiatives: vec![SummaryRoadmapInitiative {
+                id: "program-id".to_owned(),
+                identifier: None,
+                member_project_ids: Vec::new(),
                 name: "Program".to_owned(),
                 status: Some("Active".to_owned()),
                 health: None,
@@ -2239,6 +2303,8 @@ mod tests {
             projects: Vec::new(),
             blocker_layers: Vec::new(),
             ready_queue: Vec::new(),
+            outside_projects: None,
+            warnings: Vec::new(),
         };
         assert!(
             render_focus_status(&status).contains(
@@ -2246,6 +2312,42 @@ mod tests {
             )
         );
     }
+    /// Trace: FR-045-AC-6
+    #[test]
+    fn focus_status_text_lists_warnings_and_the_outside_group() {
+        let mut status = FocusStatus {
+            fetched_at: 1_791_232_484,
+            work_milestones: Vec::new(),
+            excluded_ready_count: 0,
+            projects: Vec::new(),
+            blocker_layers: Vec::new(),
+            ready_queue: Vec::new(),
+            outside_projects: None,
+            warnings: Vec::new(),
+        };
+        let clean = render_focus_status(&status);
+        assert!(!clean.contains("Warnings:") && !clean.contains("Outside any available project"));
+        status.outside_projects = Some(ix_board::FocusUnmilestonedStatus {
+            open_by_state: Vec::new(),
+            in_progress: Vec::new(),
+            progress: ix_board::FocusProgress {
+                done: 1,
+                total: 2,
+                completed_percent: Some(50.0),
+            },
+        });
+        status.warnings = vec![ix_board::ReferenceWarning::UnavailableMilestone {
+            issue: "QSL-3236".to_owned(),
+            milestone: "m-gone".to_owned(),
+            project: Some("p-1".to_owned()),
+        }];
+        let text = render_focus_status(&status);
+        assert!(text.contains("Outside any available project:\n  Progress: 1/2 leaf tasks"));
+        assert!(text.ends_with(
+            "Warnings:\n  issue QSL-3236 references unavailable milestone m-gone in project p-1"
+        ));
+    }
+
     /// Trace: FR-017-AC-4
     #[test]
     fn all_missing_issue_batch_exits_nonzero_after_rendering() {

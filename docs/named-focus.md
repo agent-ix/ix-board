@@ -80,8 +80,11 @@ ordered by key, and teams by team key.
   direct-ticket rows. `partial` says why a row covers only part of its object
   (`milestone_only`, `ticket_only`, `exclusion`, `team_boundary`). `shared` marks a
   project that appears in more than one placement.
-- **Failures.** A parent cycle, missing parent or prerequisite record, or dependency
-  cycle fails the whole batch with its usual error.
+- **Failures.** A parent cycle or a dependency cycle fails the whole batch with its
+  usual error.
+- **Unavailable references.** A missing parent, prerequisite, project or milestone
+  record does not fail the batch. Its `warnings` member lists them, as in
+  [focus reads](focus.md#unavailable-references).
 
 ### What is known
 

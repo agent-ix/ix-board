@@ -378,7 +378,7 @@ fn native_summary_envelope_keeps_legacy_api_and_captured_quota_outcome() {
     let data = ix_board::linear_summary::SummarySnapshot::default();
     connection.execute(
         "INSERT INTO summary_snapshot(cache_key,payload,synced_at,full_at) VALUES(?1,?2,1000,900)",
-        params![format!("{}:summary:v1",source.cache_namespace()),serde_json::to_vec(&data).expect("complete dataset")],
+        params![format!("{}:summary:v2",source.cache_namespace()),serde_json::to_vec(&data).expect("complete dataset")],
     ).expect("seed compatible summary partition");
     let clock = SourceClock(Arc::new(AtomicI64::new(1000)));
     let legacy: SummaryRead = source

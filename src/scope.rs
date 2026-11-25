@@ -446,11 +446,11 @@ pub(crate) fn classify_leaves_within(
                     identifier: issue.identifier.clone(),
                 });
             }
-            let ancestor = by_id.get(id).ok_or_else(|| Error::MissingParent {
-                identifier: issue.identifier.clone(),
-                parent: (*id).clone(),
-            })?;
-            next = ancestor.parent_id.as_ref();
+            // An unavailable parent ends the ancestry here (FR-045); reads that report
+            // warnings name it.
+            next = by_id
+                .get(id)
+                .and_then(|ancestor| ancestor.parent_id.as_ref());
         }
         checked.extend(seen);
     }

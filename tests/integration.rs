@@ -1472,40 +1472,16 @@ fn focus_plan_chunk_orders_full_closure_and_returns_handoff_facts() {
 
 /// Trace: FR-014-AC-6
 #[test]
-fn focus_plan_chunk_refuses_empty_missing_and_cyclic_input_without_partial_rows() {
+fn focus_plan_chunk_refuses_empty_and_cyclic_input_without_partial_rows() {
     let directory = TempDir::new().expect("temporary directory");
-    let incomplete = WorkspaceSnapshot {
-        fetched_at: 100,
-        projects: vec![project("p1", "IR-P1", "Started", 1, 1.0)],
-        issues: vec![issue(
-            "i1",
-            "IR-1",
-            Some("p1"),
-            "Specced",
-            1.0,
-            1.0,
-            None,
-            &["missing"],
-        )],
-    };
-    let mut missing_reads = service(
-        FixtureSource::new(incomplete),
+    let mut empty_reads = service(
+        FixtureSource::new(queue_fixture()),
         ManualClock::new(1_000),
         &directory,
     );
     assert!(matches!(
-        missing_reads.focus_plan_chunk(&ix_board::FocusSelection::default(), None),
+        empty_reads.focus_plan_chunk(&ix_board::FocusSelection::default(), None),
         Err(Error::EmptyFocus)
-    ));
-    assert!(matches!(
-        missing_reads.focus_plan_chunk(
-            &ix_board::FocusSelection {
-                projects: vec!["IR-P1".to_owned()],
-                ..Default::default()
-            },
-            None
-        ),
-        Err(Error::MissingDependency { issue }) if issue == "missing"
     ));
 
     let mut cycle_issue = issue("i2", "IR-2", Some("p2"), "Specced", 1.0, 1.0, None, &[]);
@@ -1734,32 +1710,9 @@ fn focus_expansion_rejects_empty_or_unresolved_selectors_without_partial_data() 
     ));
 }
 
-/// Trace: FR-011-AC-5, FR-012-AC-6
+/// Trace: FR-011-AC-5, FR-012-AC-6, FR-045-AC-8
 #[test]
-fn focus_expansion_refuses_missing_blockers_cycles_and_unknown_milestones() {
-    let directory = TempDir::new().expect("temporary directory");
-    let mut missing = queue_fixture();
-    missing.issues[0].blocked_by = vec![IssueId("absent".to_owned())];
-    let mut reads = service(
-        FixtureSource::new(missing),
-        ManualClock::new(2_000),
-        &directory,
-    );
-    assert!(matches!(
-        reads.focus_expand(&ix_board::FocusSelection {
-            issues: vec!["SWM-1".to_owned()],
-            ..ix_board::FocusSelection::default()
-        }),
-        Err(Error::MissingDependency { .. })
-    ));
-    assert!(matches!(
-        reads.focus_status(&ix_board::FocusSelection {
-            issues: vec!["SWM-1".to_owned()],
-            ..ix_board::FocusSelection::default()
-        }),
-        Err(Error::MissingDependency { .. })
-    ));
-
+fn focus_expansion_refuses_dependency_cycles() {
     let directory = TempDir::new().expect("temporary directory");
     let mut cycle = queue_fixture();
     let focus_id = cycle.issues[0].id.clone();
@@ -1785,29 +1738,6 @@ fn focus_expansion_refuses_missing_blockers_cycles_and_unknown_milestones() {
             ..ix_board::FocusSelection::default()
         }),
         Err(Error::DependencyCycle { .. })
-    ));
-
-    let directory = TempDir::new().expect("temporary directory");
-    let mut bad_milestone = queue_fixture();
-    bad_milestone.issues[0].project_milestone_id = Some("absent-milestone".to_owned());
-    let mut reads = service(
-        FixtureSource::new(bad_milestone),
-        ManualClock::new(2_000),
-        &directory,
-    );
-    assert!(matches!(
-        reads.focus_expand(&ix_board::FocusSelection {
-            projects: vec!["SWM-P1".to_owned()],
-            ..ix_board::FocusSelection::default()
-        }),
-        Err(Error::MissingProjectMilestone { .. })
-    ));
-    assert!(matches!(
-        reads.focus_status(&ix_board::FocusSelection {
-            projects: vec!["SWM-P1".to_owned()],
-            ..ix_board::FocusSelection::default()
-        }),
-        Err(Error::MissingProjectMilestone { .. })
     ));
 }
 

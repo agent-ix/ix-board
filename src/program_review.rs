@@ -3,6 +3,7 @@
 
 //! Program-level scope files and a live initiative/project roadmap.
 
+use crate::scope::classify_leaves;
 use crate::{Error, Initiative, Issue, Project, WorkflowStateType, WorkspaceSnapshot};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -794,6 +795,10 @@ pub struct SummaryRoadmap {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SummaryRoadmapInitiative {
+    /// Linear initiative UUID.
+    pub id: String,
+    /// Linear initiative URL slug; null when the source supplied none.
+    pub identifier: Option<String>,
     /// Initiative display name.
     pub name: String,
     /// Native lifecycle status when available.
@@ -802,12 +807,19 @@ pub struct SummaryRoadmapInitiative {
     pub health: Option<String>,
     /// Projects assigned to this primary initiative.
     pub projects: Vec<SummaryRoadmapProject>,
+    /// UUIDs of every listed project that belongs to this initiative, sorted, including
+    /// those listed under another primary initiative.
+    pub member_project_ids: Vec<String>,
 }
 
 /// Project facts from native Linear summaries, without enumerating tickets.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SummaryRoadmapProject {
+    /// Linear project UUID.
+    pub id: String,
+    /// Linear project URL slug; null when the source supplied none.
+    pub identifier: Option<String>,
     /// Project display name.
     pub name: String,
     /// Native lifecycle status.
@@ -818,13 +830,20 @@ pub struct SummaryRoadmapProject {
     pub progress_source: String,
     /// Time the source fetch began, retained from the summary dataset.
     pub observed_at: String,
-    /// Current open issue count; null because no native current aggregate exists.
+    /// Open leaf tasks in the cached issue snapshot; null when counts are unavailable.
     pub open: Option<usize>,
-    /// Current completed issue count; null because no native current aggregate exists.
+    /// Completed leaf tasks; null when counts are unavailable.
     pub done: Option<usize>,
-    /// Current canceled issue count; null because no native current aggregate exists.
+    /// Canceled and duplicate leaf tasks, not part of `total`; null when unavailable.
     pub canceled: Option<usize>,
-    /// Reason counts are unavailable.
+    /// Countable leaf tasks (`done` plus `open`), as `focus status` counts them; null
+    /// when counts are unavailable.
+    pub total: Option<usize>,
+    /// Where the counts came from; null when counts are unavailable.
+    pub counts_source: Option<String>,
+    /// Fetch time of the cached issue snapshot that was counted; null when unavailable.
+    pub counts_observed_at: Option<String>,
+    /// Reason counts are unavailable; empty when they are present.
     pub counts_unavailable_reason: String,
     /// Issue last activity; null because summaries do not expose this aggregate.
     pub last_activity: Option<String>,
@@ -834,6 +853,108 @@ pub struct SummaryRoadmapProject {
     pub project_updated_at: Option<String>,
     /// Other initiative memberships.
     pub also_in: Vec<String>,
+}
+
+/// `counts_source` of rows counted from the cached issue snapshot.
+const CACHED_COUNTS_SOURCE: &str = "ix_board_cached_issue_leaf_tasks";
+
+impl SummaryRoadmap {
+    /// Fills each project row's leaf-task counts from an already-held issue snapshot,
+    /// with the FR-010 leaf classification `focus status` uses. It reads nothing from
+    /// Linear. `observed_at` is when that snapshot's source read began.
+    pub fn count_from_issues(&mut self, detail: &WorkspaceSnapshot, observed_at: &str) {
+        let members = detail
+            .issues
+            .iter()
+            .filter(|issue| issue.project_id.is_some())
+            .map(|issue| issue.id.clone())
+            .collect::<BTreeSet<_>>();
+        let leaves = match classify_leaves(detail, &members) {
+            Ok(leaves) => leaves,
+            Err(error) => {
+                self.counts_unavailable(&error.to_string());
+                return;
+            }
+        };
+        let parents = detail
+            .issues
+            .iter()
+            .filter_map(|issue| issue.parent_id.as_ref())
+            .collect::<BTreeSet<_>>();
+        let mut counts = detail
+            .projects
+            .iter()
+            .map(|project| (project.id.0.as_str(), LeafTally::default()))
+            .collect::<BTreeMap<_, _>>();
+        for issue in &detail.issues {
+            let Some(tally) = issue
+                .project_id
+                .as_ref()
+                .and_then(|id| counts.get_mut(id.0.as_str()))
+            else {
+                continue;
+            };
+            if leaves.leaf_ids.contains(&issue.id) {
+                if issue.state_type == WorkflowStateType::Completed {
+                    tally.done += 1;
+                } else {
+                    tally.open += 1;
+                }
+            } else if !parents.contains(&issue.id) {
+                // A leaf that FR-010 does not count is canceled or a duplicate.
+                tally.canceled += 1;
+            }
+        }
+        for row in self.project_rows_mut() {
+            match counts.get(row.id.as_str()) {
+                Some(tally) => {
+                    row.open = Some(tally.open);
+                    row.done = Some(tally.done);
+                    row.canceled = Some(tally.canceled);
+                    row.total = Some(tally.done + tally.open);
+                    row.counts_source = Some(CACHED_COUNTS_SOURCE.to_owned());
+                    row.counts_observed_at = Some(observed_at.to_owned());
+                    row.counts_unavailable_reason = String::new();
+                }
+                None => {
+                    row.clear_counts("project is not in the cached issue snapshot");
+                }
+            }
+        }
+    }
+
+    /// Marks every project row's counts unavailable for `reason`.
+    pub fn counts_unavailable(&mut self, reason: &str) {
+        for row in self.project_rows_mut() {
+            row.clear_counts(reason);
+        }
+    }
+
+    fn project_rows_mut(&mut self) -> impl Iterator<Item = &mut SummaryRoadmapProject> {
+        self.initiatives
+            .iter_mut()
+            .flat_map(|initiative| &mut initiative.projects)
+            .chain(&mut self.unplaced_projects)
+    }
+}
+
+impl SummaryRoadmapProject {
+    fn clear_counts(&mut self, reason: &str) {
+        self.open = None;
+        self.done = None;
+        self.canceled = None;
+        self.total = None;
+        self.counts_source = None;
+        self.counts_observed_at = None;
+        self.counts_unavailable_reason = reason.to_owned();
+    }
+}
+
+#[derive(Default)]
+struct LeafTally {
+    open: usize,
+    done: usize,
+    canceled: usize,
 }
 
 /// Checks scope using only shared native summary catalogs and GitHub probes.
@@ -874,17 +995,42 @@ pub fn build_summary_roadmap(
     let native_row = |id: String, name: String, status: String, also_in: Vec<String>| {
         let project = summary.projects.iter().find(|p| p.project.id.0 == id);
         SummaryRoadmapProject {
-            name, status,
+            identifier: project.and_then(|p| p.project.identifier.clone()),
+            id, name, status,
             progress_percent: project.and_then(|p| p.progress).map(|fraction| fraction * 100.0),
             progress_source: "linear_native".to_owned(),
             observed_at: observed_at.to_owned(),
             open: None, done: None, canceled: None,
+            total: None, counts_source: None, counts_observed_at: None,
             counts_unavailable_reason: "Linear summary connections expose no current issue totalCount; estimate scope and history arrays are not current issue counts".to_owned(),
             last_activity: None,
             activity_unavailable_reason: "Linear project summaries expose no issue last-activity aggregate".to_owned(),
             project_updated_at: project.map(|p| p.updated_at.clone()),
             also_in,
         }
+    };
+    let listed = grouping
+        .initiatives
+        .iter()
+        .flat_map(|group| group.projects.iter().map(|p| p.source_id.as_str()))
+        .chain(
+            grouping
+                .unplaced_projects
+                .iter()
+                .map(|p| p.source_id.as_str()),
+        )
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    let member_project_ids = |initiative: &str| {
+        summary
+            .projects
+            .iter()
+            .filter(|p| listed.contains(&p.project.id.0))
+            .filter(|p| p.project.initiatives.iter().any(|i| i.id == initiative))
+            .map(|p| p.project.id.0.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
     };
     SummaryRoadmap {
         initiatives: grouping
@@ -896,6 +1042,11 @@ pub fn build_summary_roadmap(
                     .iter()
                     .find(|i| i.initiative.id == group.source_id);
                 SummaryRoadmapInitiative {
+                    member_project_ids: member_project_ids(&group.source_id),
+                    identifier: initiative
+                        .map(|i| i.initiative.identifier.clone())
+                        .filter(|identifier| !identifier.is_empty()),
+                    id: group.source_id,
                     name: group.name,
                     status: initiative.map(|i| i.status.clone()),
                     health: initiative.and_then(|i| i.health.clone()),
