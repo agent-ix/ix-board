@@ -1516,10 +1516,7 @@ fn read_linear_gate_record_metrics(
     let unrecorded = lines
         .iter()
         .filter(|line| !line.repin && line.finished_at >= start_secs && line.finished_at < end_secs)
-        .filter(|line| {
-            let finished_ms = (line.finished_at * 1000.0).round() as i64;
-            !recorded_finished.contains(&(line.pr.clone(), finished_ms))
-        })
+        .filter(|line| !has_gate_record(line, &recorded_finished))
         .collect::<Vec<_>>();
     let unrecorded_evidence = unrecorded
         .iter()
@@ -1560,6 +1557,11 @@ fn lead_record_fields(line: &str) -> Option<(&str, BTreeMap<&str, &str>)> {
     let kind = tokens.next()?;
     let fields = tokens.filter_map(|token| token.split_once('=')).collect();
     Some((kind, fields))
+}
+
+fn has_gate_record(line: &super::GateLine, records: &BTreeSet<(String, i64)>) -> bool {
+    let finished_ms = (line.finished_at * 1000.0).round() as i64;
+    records.contains(&(line.pr.clone(), finished_ms))
 }
 
 #[implements("FR-047-AC-1")]
@@ -2642,6 +2644,26 @@ mod tests {
         assert_eq!(fields.get("finished"), Some(&"2026-11-24T08:30:00Z"));
         assert!(lead_record_fields("<!-- reviewer repo=agent-ix/ix-board -->").is_some());
         assert!(lead_record_fields("not a marker").is_none());
+    }
+
+    #[test]
+    #[ix_trace_rs::trace("FR-047-AC-6")]
+    fn gate_record_join_requires_exact_pull_request_and_finish_time() {
+        let line = super::super::GateLine {
+            pr: "owner/repo#12".into(),
+            repin: false,
+            requested_lock_at: 1.0,
+            acquired_lock_at: 2.0,
+            started_at: 3.0,
+            finished_at: 20.0,
+        };
+        let records = BTreeSet::from([("owner/repo#12".to_owned(), 20_000)]);
+        assert!(has_gate_record(&line, &records));
+
+        let other_pr = BTreeSet::from([("owner/repo#13".to_owned(), 20_000)]);
+        assert!(!has_gate_record(&line, &other_pr));
+        let other_time = BTreeSet::from([("owner/repo#12".to_owned(), 20_001)]);
+        assert!(!has_gate_record(&line, &other_time));
     }
 
     #[test]
