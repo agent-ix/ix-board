@@ -620,6 +620,31 @@ fn unreadable_queue_is_reported_once_and_does_not_change_idle() {
     assert_eq!(r.ready_queue_error.as_deref(), Some("denied"));
     assert!(r.agents.iter().all(|r| r.verdict == Verdict::Idle));
 }
+#[trace("FR-046-AC-10")]
+#[test]
+fn ready_queue_warnings_are_listed_and_omitted_from_json_when_empty() {
+    let mut r = report(vec![machine()]);
+    assert!(r.ready_queue_warnings.is_empty());
+    assert!(
+        serde_json::to_value(&r)
+            .unwrap()
+            .get("ready_queue_warnings")
+            .is_none()
+    );
+    r.ready_queue_warnings = vec![ix_board::ReferenceWarning::UnavailableBlocker {
+        issue: "T-2".into(),
+        blocker: "gone".into(),
+    }];
+    assert!(
+        render_text(&r)
+            .contains("Ready queue warning: issue T-2 references unavailable blocker gone")
+    );
+    let json = serde_json::to_value(&r).unwrap();
+    assert_eq!(
+        json["ready_queue_warnings"][0]["kind"],
+        "unavailable_blocker"
+    );
+}
 #[trace("FR-018-AC-5", "FR-018-AC-20", "FR-018-AC-21", "FR-018-AC-23")]
 #[test]
 fn hidden_probe_round_trip_refuses_version_truncation_unknown_fields_and_input_limits() {

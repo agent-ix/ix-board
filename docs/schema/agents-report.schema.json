@@ -46,6 +46,13 @@
         "null"
       ]
     },
+    "ready_queue_warnings": {
+      "description": "Unavailable references met while reading the ready queue, which can keep work out\nof it; omitted when there are none.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ReferenceWarning"
+      }
+    },
     "schema_version": {
       "description": "Lifecycle schema identity.",
       "type": "integer",
@@ -413,6 +420,114 @@
       "required": [
         "identifier",
         "title"
+      ]
+    },
+    "ReferenceWarning": {
+      "description": "A Linear record that a read needed and the snapshot does not hold.\n\n`issue` is the human-readable identifier of the issue that holds the reference; the\nother fields are Linear UUIDs. The issue stays in the result and in its counts.",
+      "oneOf": [
+        {
+          "description": "The issue's milestone is not one of its project's milestones. It is counted at\nproject level, without a milestone.",
+          "type": "object",
+          "properties": {
+            "issue": {
+              "description": "Issue holding the reference.",
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "unavailable_milestone"
+            },
+            "milestone": {
+              "description": "Referenced milestone.",
+              "type": "string"
+            },
+            "project": {
+              "description": "The issue's project; null when it has none.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "issue",
+            "milestone"
+          ]
+        },
+        {
+          "description": "The issue's project has no record. The issue belongs to no project row.",
+          "type": "object",
+          "properties": {
+            "issue": {
+              "description": "Issue holding the reference.",
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "unavailable_project"
+            },
+            "project": {
+              "description": "Referenced project.",
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "issue",
+            "project"
+          ]
+        },
+        {
+          "description": "The issue's parent has no record. Ancestry stops at this issue.",
+          "type": "object",
+          "properties": {
+            "issue": {
+              "description": "Issue holding the reference.",
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "unavailable_parent"
+            },
+            "parent": {
+              "description": "Referenced parent issue.",
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "issue",
+            "parent"
+          ]
+        },
+        {
+          "description": "A prerequisite of the issue has no record. The issue is not ready, and the\nprerequisite appears in no blocker layer.",
+          "type": "object",
+          "properties": {
+            "blocker": {
+              "description": "Referenced blocking issue.",
+              "type": "string"
+            },
+            "issue": {
+              "description": "Issue holding the reference.",
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "unavailable_blocker"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "issue",
+            "blocker"
+          ]
+        }
       ]
     },
     "Verdict": {

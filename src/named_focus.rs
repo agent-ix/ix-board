@@ -13,10 +13,11 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::read_bound::Budget;
+use crate::reference_warnings::focus_warnings;
 use crate::scope::{LeafClassification, classify_leaves_within};
 use crate::{
     Error, FocusBlocker, Issue, IssueId, NamedMember, NamedSelection, Project, ProjectId,
-    ProjectStatusCategory, TeamKey, WorkflowStateType, WorkspaceSnapshot,
+    ProjectStatusCategory, ReferenceWarning, TeamKey, WorkflowStateType, WorkspaceSnapshot,
 };
 
 /// What the snapshot's source enumerates authoritatively.
@@ -159,6 +160,10 @@ pub enum UnknownFact {
     ProjectStatusCategory,
     /// The project's initiative links cannot be established from the snapshot.
     InitiativeLinks,
+    /// The selection reaches a blocker, parent or project without a record, or selects by
+    /// ticket in a team where a parent is missing, so its membership, readiness or
+    /// blocking is not fully known.
+    UnavailableReferences,
 }
 
 /// Initiative-link status of a standalone project row.
@@ -312,6 +317,9 @@ pub struct NamedBatch {
     pub selections: Vec<SelectionSummary>,
     /// One combined result per team, ordered by team. Teams are never combined.
     pub teams: Vec<TeamSummary>,
+    /// Unavailable references of the selections' issues; omitted when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<ReferenceWarning>,
 }
 
 /// One selection with the caller's opaque key (for example a focus ID and revision).
@@ -325,9 +333,12 @@ pub struct NamedFocusRequest {
 
 /// Evaluates every selection and every team union against one snapshot.
 ///
-/// Membership is recomputed from the snapshot and the stored identities. Any snapshot
-/// error the existing engines report (parent cycle, missing parent or blocker record,
-/// dependency cycle) fails the whole batch with that error and no partial result.
+/// Membership is recomputed from the snapshot and the stored identities. A parent cycle or
+/// dependency cycle fails the whole batch with that error and no partial result. An
+/// unavailable parent, blocker, project or milestone record is reported in
+/// [`NamedBatch::warnings`] and the batch is still evaluated; a selection that depends on
+/// such a parent, blocker or project is incomplete with
+/// [`UnknownFact::UnavailableReferences`] (FR-046).
 pub fn evaluate_named_batch(
     snapshot: &WorkspaceSnapshot,
     evidence: &CatalogEvidence,
@@ -360,6 +371,7 @@ pub(crate) fn evaluate_batch(
             state: BatchState::None,
             selections: Vec::new(),
             teams: Vec::new(),
+            warnings: Vec::new(),
         });
     }
     let context = Context::new(snapshot, evidence, budget)?;
@@ -381,11 +393,18 @@ pub(crate) fn evaluate_batch(
     budget.check()?;
     mark_shared(&mut selections, budget)?;
     let teams = context.team_summaries(&selections, &readiness)?;
+    let warnings = drafts
+        .iter()
+        .flat_map(|draft| draft.warnings.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
     Ok(NamedBatch {
         fetched_at: snapshot.fetched_at,
         state: BatchState::Evaluated,
         selections,
         teams,
+        warnings,
     })
 }
 
@@ -410,6 +429,10 @@ struct Draft<'a> {
     /// An initiative member resolved without established links, so hidden links may add
     /// leaves to it or to what its exclusion removes.
     links_uncertain: bool,
+    /// A reference this selection depends on has no record.
+    references_uncertain: bool,
+    /// Unavailable references of the effective issues.
+    warnings: Vec<ReferenceWarning>,
     members: Vec<MemberReport>,
     include: Vec<(NamedMember, Closure)>,
     included: BTreeSet<IssueId>,
@@ -662,6 +685,8 @@ impl<'a> Context<'a> {
             state,
             team_known,
             links_uncertain,
+            references_uncertain: false,
+            warnings: Vec::new(),
             members,
             included: closure_issues(&include),
             excluded: closure_issues(&exclude),
@@ -686,8 +711,52 @@ impl<'a> Context<'a> {
             .cloned()
             .collect();
         draft.leaves = classify_leaves_within(self.snapshot, &draft.effective, self.budget)?;
+        draft.warnings = focus_warnings(self.snapshot, &draft.effective, self.budget)?;
+        draft.references_uncertain =
+            state != SelectionState::Unavailable && self.references_uncertain(&draft, &exclude)?;
+        if draft.references_uncertain && draft.state == SelectionState::Complete {
+            draft.state = SelectionState::Incomplete;
+        }
         self.place_projects(&mut draft, &exclude)?;
         Ok(draft)
+    }
+
+    /// Whether the selection's membership, readiness or blocking rests on a record the
+    /// snapshot does not hold. A milestone reference changes none of them. A ticket
+    /// member covers its descendants through parent links, so a missing parent anywhere
+    /// among the team's issues may hide some of them.
+    fn references_uncertain(
+        &self,
+        draft: &Draft<'_>,
+        exclude: &[(NamedMember, Closure)],
+    ) -> Result<bool, Error> {
+        if draft
+            .warnings
+            .iter()
+            .any(|warning| !matches!(warning, ReferenceWarning::UnavailableMilestone { .. }))
+        {
+            return Ok(true);
+        }
+        let by_ticket = draft
+            .include
+            .iter()
+            .chain(exclude)
+            .any(|(member, _)| matches!(member, NamedMember::Issue { .. }));
+        if !by_ticket {
+            return Ok(false);
+        }
+        for issue in &self.snapshot.issues {
+            self.budget.check()?;
+            if issue.team_key == draft.request.selection.team
+                && issue
+                    .parent_id
+                    .as_ref()
+                    .is_some_and(|parent| !self.issues.contains_key(parent))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Whether an initiative include or exclude member may cover more than the snapshot
@@ -873,6 +942,11 @@ impl<'a> Context<'a> {
                 draft
                     .links_uncertain
                     .then_some(UnknownFact::InitiativeLinks),
+            )
+            .chain(
+                draft
+                    .references_uncertain
+                    .then_some(UnknownFact::UnavailableReferences),
             )
             .collect::<BTreeSet<_>>()
             .into_iter()

@@ -22,6 +22,7 @@ pub mod quota;
 mod quota_decision;
 mod read_bound;
 pub mod reconcile;
+mod reference_warnings;
 pub mod retro;
 mod scope;
 mod settings;
@@ -49,6 +50,7 @@ pub use named_selection::{
 };
 use read_bound::Budget;
 pub use read_bound::{Deadline, ReadPolicy};
+pub use reference_warnings::ReferenceWarning;
 pub use scope::{ScopeSelection, ScopeSummary, select_scope};
 pub use summary_cache::SummaryRead;
 
@@ -101,7 +103,8 @@ pub enum Error {
     /// Program scope or roadmap operation failed.
     #[error("program review failed: {message}")]
     ProgramReview { message: String },
-    /// A referenced ancestor was absent from the complete snapshot.
+    /// A referenced ancestor was absent from the complete snapshot. Reads no longer
+    /// return this: they report [`ReferenceWarning::UnavailableParent`].
     #[error("ticket {identifier} has an unavailable parent {parent:?}")]
     MissingParent {
         /// Descendant whose ancestry was incomplete.
@@ -313,7 +316,8 @@ pub enum Error {
     /// The report timestamp or stale threshold is invalid.
     #[error("focus hygiene requires an RFC 3339 report timestamp and positive stale threshold")]
     InvalidFocusHygieneTime,
-    /// An issue references a milestone absent from its selected project's records.
+    /// An issue references a milestone absent from its selected project's records. Reads
+    /// no longer return this: they report [`ReferenceWarning::UnavailableMilestone`].
     #[error("issue {issue} references unavailable milestone {milestone} in project {project}")]
     MissingProjectMilestone {
         /// Human-readable issue identifier.
@@ -682,11 +686,25 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
 
     /// Reads an ordered queue of eligible, not-yet-active tickets for team.
     pub fn next(&mut self, team: &str) -> Result<Vec<ReadyItem>, Error> {
+        self.next_with_warnings(team).map(|(queue, _)| queue)
+    }
+
+    /// [`ReadService::next`] with the unavailable references that kept a candidate out
+    /// of the queue (FR-046).
+    pub fn next_with_warnings(
+        &mut self,
+        team: &str,
+    ) -> Result<(Vec<ReadyItem>, Vec<ReferenceWarning>), Error> {
         if team.trim().is_empty() {
             return Err(Error::InvalidTeam);
         }
         let snapshot = self.snapshot()?;
-        ready_queue(&snapshot, team)
+        let warnings = reference_warnings::candidate_warnings(&snapshot, |issue| {
+            issue.team_key.0.eq_ignore_ascii_case(team)
+                && issue_is_open(issue)
+                && spec_step(&issue.state).is_some()
+        })?;
+        Ok((ready_queue(&snapshot, team)?, warnings))
     }
 
     /// Returns one project's goal, milestones, open tickets, and dependency layers.
@@ -928,6 +946,8 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
             }
             hygiene::HygieneError::InvalidTime => Error::InvalidFocusHygieneTime,
         })?;
+        report.warnings =
+            reference_warnings::focus_warnings(&snapshot, &scope.issue_ids, Budget::unbounded())?;
         let baseline = FocusBaseline {
             report_time: report.report_time.clone(),
             issues: std::mem::take(&mut report.baseline),
@@ -951,6 +971,12 @@ impl<S: WorkspaceSource, C: Clock> ReadService<S, C> {
     /// Returns the cached workspace snapshot, fetching it when the cache has expired.
     pub fn workspace_snapshot(&mut self) -> Result<WorkspaceSnapshot, Error> {
         self.snapshot()
+    }
+
+    /// Returns the last complete cached snapshot, however old, without any source
+    /// request. `None` when nothing is cached.
+    pub fn cached_workspace_snapshot(&self) -> Result<Option<WorkspaceSnapshot>, Error> {
+        self.cache.last_complete()
     }
 
     /// Fetches a new workspace snapshot even when the cache is still fresh.
@@ -1451,9 +1477,9 @@ fn unresolved_blockers_within(
             continue;
         }
         let Some(blocker) = issues.get(&blocker_id) else {
-            return Err(Error::MissingDependency {
-                issue: blocker_id.0,
-            });
+            // A prerequisite with no record is not proven Completed (FR-046).
+            unresolved.insert(unavailable_label(&blocker_id.0));
+            continue;
         };
         if blocker.state_type != WorkflowStateType::Completed {
             unresolved.insert(blocker.identifier.clone());
@@ -1461,6 +1487,14 @@ fn unresolved_blockers_within(
         pending.extend(blocker.blocked_by.iter().cloned());
     }
     Ok(unresolved)
+}
+
+/// Project name of an activity event whose issue has no project.
+const NO_PROJECT_LABEL: &str = "no project";
+
+/// How a prerequisite or project without a record is named in place of an identifier.
+fn unavailable_label(id: &str) -> String {
+    format!("{id} (unavailable)")
 }
 
 fn canonical_selectors(
@@ -1551,8 +1585,10 @@ fn make_project_chunk(
             blocked_by: issue
                 .blocked_by
                 .iter()
-                .filter_map(|id| issues.get(id))
-                .map(|dependency| dependency.identifier.clone())
+                .map(|id| match issues.get(id) {
+                    Some(dependency) => dependency.identifier.clone(),
+                    None => unavailable_label(&id.0),
+                })
                 .collect(),
         })
         .collect::<Vec<_>>();
@@ -1562,6 +1598,14 @@ fn make_project_chunk(
         .filter(|issue| issue_is_open(issue))
         .collect::<Vec<_>>();
     let layers = dependency_layers(snapshot, &open_project_issues)?;
+    let warnings = reference_warnings::focus_warnings(
+        snapshot,
+        &open_project_issues
+            .iter()
+            .map(|issue| issue.id.clone())
+            .collect(),
+        Budget::unbounded(),
+    )?;
     let mut milestones = project.milestones.clone();
     milestones.sort_by(|left, right| {
         compare_f64(left.sort_order, right.sort_order).then_with(|| left.id.cmp(&right.id))
@@ -1576,6 +1620,7 @@ fn make_project_chunk(
         milestones,
         open_tickets,
         blocker_layers: layers,
+        warnings,
     })
 }
 
@@ -1651,17 +1696,14 @@ fn make_focus_expansion(
             scope.issue_ids.contains(&issue.id) && issue.project_id.as_ref() == Some(&project.id)
         }) {
             let summary = focus_issue(issue);
-            if let Some(milestone_id) = &issue.project_milestone_id {
-                let Some(milestone) = milestones.iter_mut().find(|m| &m.id == milestone_id) else {
-                    return Err(Error::MissingProjectMilestone {
-                        issue: issue.identifier.clone(),
-                        milestone: milestone_id.clone(),
-                        project: project.id.0.clone(),
-                    });
-                };
-                milestone.issues.push(summary);
-            } else {
-                project_level_issues.push(summary);
+            // An issue whose milestone this project does not hold stays at project
+            // level (FR-046).
+            match milestones
+                .iter_mut()
+                .find(|m| issue.project_milestone_id.as_ref() == Some(&m.id))
+            {
+                Some(milestone) => milestone.issues.push(summary),
+                None => project_level_issues.push(summary),
             }
         }
         for milestone in &mut milestones {
@@ -1686,12 +1728,15 @@ fn make_focus_expansion(
             .cmp(&right.identifier)
             .then_with(|| left.id.cmp(&right.id))
     });
+    let warnings =
+        reference_warnings::focus_warnings(snapshot, &scope.issue_ids, Budget::unbounded())?;
     Ok(FocusExpansion {
         fetched_at: snapshot.fetched_at,
         projects,
         focus_issues,
         issue_selector_issues,
         blocker_layers,
+        warnings,
     })
 }
 
@@ -1795,10 +1840,16 @@ fn make_focus_status(
                     }
                 })
                 .collect();
+            // No milestone, or one this project does not hold (FR-046).
             let without_milestone = member_issues
                 .iter()
                 .copied()
-                .filter(|issue| issue.project_milestone_id.is_none())
+                .filter(|issue| {
+                    !project
+                        .milestones
+                        .iter()
+                        .any(|m| issue.project_milestone_id.as_ref() == Some(&m.id))
+                })
                 .collect::<Vec<_>>();
             FocusProjectStatus {
                 id: project.id.clone(),
@@ -1814,12 +1865,7 @@ fn make_focus_status(
                 recently_closed: recently_closed(&member_issues, window),
                 progress: leaf_progress(&member_issues, &leaf_ids),
                 milestones: milestone_status,
-                unmilestoned: FocusUnmilestonedStatus {
-                    open_by_state: open_state_counts(&without_milestone),
-                    in_progress: started_issues(&without_milestone),
-                    recently_closed: recently_closed(&without_milestone, window),
-                    progress: leaf_progress(&without_milestone, &leaf_ids),
-                },
+                unmilestoned: unmilestoned_status(&without_milestone, &leaf_ids, window),
             }
         })
         .collect::<Vec<_>>();
@@ -1828,6 +1874,33 @@ fn make_focus_status(
             .cmp(&right.identifier)
             .then_with(|| left.id.cmp(&right.id))
     });
+    // Members no project row holds, so row totals plus this group equal `select_scope`.
+    let row_ids = projects.iter().map(|p| &p.id).collect::<BTreeSet<_>>();
+    let outside = snapshot
+        .issues
+        .iter()
+        .filter(|issue| {
+            scope.issue_ids.contains(&issue.id)
+                && !issue
+                    .project_id
+                    .as_ref()
+                    .is_some_and(|id| row_ids.contains(id))
+        })
+        .collect::<Vec<_>>();
+    // They belong to no project row, but their events are still focus activity (FR-045).
+    for issue in &outside {
+        let project = match &issue.project_id {
+            Some(id) => unavailable_label(&id.0),
+            None => NO_PROJECT_LABEL.to_owned(),
+        };
+        events.extend(project_events(
+            &project,
+            std::slice::from_ref(issue),
+            window,
+        ));
+    }
+    let outside_projects =
+        (!outside.is_empty()).then(|| unmilestoned_status(&outside, &leaf_ids, window));
 
     let work_ids = scope
         .issue_ids
@@ -1871,8 +1944,23 @@ fn make_focus_status(
         projects,
         blocker_layers,
         ready_queue,
+        outside_projects,
+        warnings: expansion.warnings,
         activity: finish_activity(events),
     })
+}
+
+fn unmilestoned_status(
+    issues: &[&Issue],
+    leaf_ids: &BTreeSet<IssueId>,
+    window: ActivityWindow,
+) -> FocusUnmilestonedStatus {
+    FocusUnmilestonedStatus {
+        open_by_state: open_state_counts(issues),
+        in_progress: started_issues(issues),
+        recently_closed: recently_closed(issues, window),
+        progress: leaf_progress(issues, leaf_ids),
+    }
 }
 
 fn resolve_work_milestones(
@@ -1976,7 +2064,7 @@ fn make_focus_plan_chunk(
             .then_with(|| left.identifier.cmp(&right.identifier))
             .then_with(|| left.id.cmp(&right.id))
     });
-    let unblocks_by_id = focus_unblocks(&candidates, &issues)?;
+    let unblocks_by_id = focus_unblocks(&candidates, &issues);
 
     let rows =
         candidates
@@ -1988,7 +2076,7 @@ fn make_focus_plan_chunk(
                         field: "dependency layer",
                     }
                 })?;
-                let milestone = plan_milestone(issue, &projects)?;
+                let milestone = plan_milestone(issue, &projects);
                 let (ready, reasons) = plan_readiness(issue, &projects, &issues)?;
                 Ok(FocusPlanIssue {
                     identifier: issue.identifier.clone(),
@@ -2009,8 +2097,11 @@ fn make_focus_plan_chunk(
         Some(size) => rows.into_iter().take(size.get()).collect(),
         None => rows,
     };
+    let warnings =
+        reference_warnings::focus_warnings(snapshot, &scope.issue_ids, Budget::unbounded())?;
     Ok(FocusPlanChunk {
         fetched_at: snapshot.fetched_at,
+        warnings,
         work_milestones: {
             let mut selectors = work_milestones.to_vec();
             selectors.sort();
@@ -2087,33 +2178,16 @@ fn compare_plan_milestone_order(
     }
 }
 
-fn plan_milestone(
-    issue: &Issue,
-    projects: &HashMap<&ProjectId, &Project>,
-) -> Result<Option<String>, Error> {
-    let Some(milestone_id) = &issue.project_milestone_id else {
-        return Ok(None);
-    };
-    let Some(project_id) = &issue.project_id else {
-        return Err(Error::FocusPlanIncomplete {
-            issue: issue.identifier.clone(),
-            field: "project for milestone",
-        });
-    };
-    let Some(project) = projects.get(project_id).copied() else {
-        return Err(Error::FocusPlanIncomplete {
-            issue: issue.identifier.clone(),
-            field: "project record",
-        });
-    };
-    let Some(milestone) = project.milestones.iter().find(|m| m.id == *milestone_id) else {
-        return Err(Error::MissingProjectMilestone {
-            issue: issue.identifier.clone(),
-            milestone: milestone_id.clone(),
-            project: project_id.0.clone(),
-        });
-    };
-    Ok(Some(milestone.name.clone()))
+/// The name of the issue's milestone, or `None` when it has none or its project does
+/// not hold the referenced one (FR-046).
+fn plan_milestone(issue: &Issue, projects: &HashMap<&ProjectId, &Project>) -> Option<String> {
+    let milestone_id = issue.project_milestone_id.as_ref()?;
+    projects
+        .get(issue.project_id.as_ref()?)?
+        .milestones
+        .iter()
+        .find(|m| m.id == *milestone_id)
+        .map(|m| m.name.clone())
 }
 
 fn plan_readiness(
@@ -2129,21 +2203,20 @@ fn plan_readiness(
         format!("workflow state {} is terminal", issue.state_name)
     });
     let project_running = match &issue.project_id {
-        Some(project_id) => {
-            let Some(project) = projects.get(project_id).copied() else {
-                return Err(Error::FocusPlanIncomplete {
-                    issue: issue.identifier.clone(),
-                    field: "project record",
-                });
-            };
-            let started = project.status == "Started";
-            reasons.push(format!(
-                "owning project {} is {}",
-                project.identifier.as_deref().unwrap_or(&project.name),
-                project.status
-            ));
-            started
-        }
+        Some(project_id) => match projects.get(project_id).copied() {
+            Some(project) => {
+                reasons.push(format!(
+                    "owning project {} is {}",
+                    project.identifier.as_deref().unwrap_or(&project.name),
+                    project.status
+                ));
+                project.status == "Started"
+            }
+            None => {
+                reasons.push(format!("owning project {} is unavailable", project_id.0));
+                false
+            }
+        },
         None => {
             reasons.push("issue has no owning project".to_owned());
             false
@@ -2174,7 +2247,7 @@ fn plan_readiness(
 fn focus_unblocks(
     candidates: &[&Issue],
     issues: &HashMap<&IssueId, &Issue>,
-) -> Result<BTreeMap<IssueId, BTreeSet<String>>, Error> {
+) -> BTreeMap<IssueId, BTreeSet<String>> {
     let focus_ids = candidates
         .iter()
         .map(|issue| issue.id.clone())
@@ -2188,7 +2261,7 @@ fn focus_unblocks(
                 continue;
             }
             let Some(blocker) = issues.get(&id).copied() else {
-                return Err(Error::MissingDependency { issue: id.0 });
+                continue;
             };
             if focus_ids.contains(&id) && id != dependent.id {
                 unblocks
@@ -2199,7 +2272,7 @@ fn focus_unblocks(
             pending.extend(blocker.blocked_by.iter().cloned());
         }
     }
-    Ok(unblocks)
+    unblocks
 }
 
 fn acceptance_criteria_excerpt(description: Option<&str>) -> Option<String> {
@@ -2410,12 +2483,10 @@ fn focus_blocker_layers_within(
             if !visited.insert(id.clone()) {
                 continue;
             }
-            let blocker = issues
-                .get(&id)
-                .copied()
-                .ok_or_else(|| Error::MissingDependency {
-                    issue: id.0.clone(),
-                })?;
+            // An unavailable prerequisite has no row (FR-046).
+            let Some(blocker) = issues.get(&id).copied() else {
+                continue;
+            };
             roots_by_blocker
                 .entry(id)
                 .or_default()
@@ -2428,15 +2499,11 @@ fn focus_blocker_layers_within(
         .map(|layer| {
             layer
                 .into_iter()
-                .map(|id| {
+                // A prerequisite without a record has no row; its layer stays, so its
+                // dependents keep their depth (FR-046).
+                .filter_map(|id| issues.get(&id).copied().map(|issue| (id, issue)))
+                .map(|(id, issue)| {
                     budget.check()?;
-                    let issue =
-                        issues
-                            .get(&id)
-                            .copied()
-                            .ok_or_else(|| Error::MissingDependency {
-                                issue: id.0.clone(),
-                            })?;
                     let classification = match issue.state_type {
                         WorkflowStateType::Completed => FocusIssueClassification::Completed,
                         WorkflowStateType::Canceled => FocusIssueClassification::Canceled,
@@ -2501,20 +2568,18 @@ fn dependency_layers(
         .iter()
         .map(|issue| (&issue.id, issue))
         .collect();
-    layers
+    Ok(layers
         .into_iter()
         .map(|layer| {
             layer
                 .into_iter()
-                .map(|id| {
-                    issues
-                        .get(&id)
-                        .map(|issue| issue.identifier.clone())
-                        .ok_or_else(|| Error::MissingDependency { issue: id.0 })
+                .map(|id| match issues.get(&id) {
+                    Some(issue) => issue.identifier.clone(),
+                    None => unavailable_label(&id.0),
                 })
                 .collect()
         })
-        .collect()
+        .collect())
 }
 
 fn dependency_layer_ids(
@@ -2545,21 +2610,20 @@ fn dependency_layers_within(
         if !closure.insert(id.clone()) {
             continue;
         }
-        let Some(issue) = issues.get(&id) else {
-            return Err(Error::MissingDependency { issue: id.0 });
-        };
-        pending.extend(issue.blocked_by.iter().cloned());
+        // A prerequisite without a record stays in the closure with no prerequisites
+        // of its own, so its dependents never fall into layer zero (FR-046).
+        if let Some(issue) = issues.get(&id) {
+            pending.extend(issue.blocked_by.iter().cloned());
+        }
     }
     let mut indegree: BTreeMap<IssueId, usize> =
         closure.iter().cloned().map(|id| (id, 0)).collect();
     let mut dependents: BTreeMap<IssueId, Vec<IssueId>> = BTreeMap::new();
     for issue_id in &closure {
         budget.check()?;
-        let issue = issues
-            .get(issue_id)
-            .ok_or_else(|| Error::MissingDependency {
-                issue: issue_id.0.clone(),
-            })?;
+        let Some(issue) = issues.get(issue_id) else {
+            continue;
+        };
         for blocker in &issue.blocked_by {
             if closure.contains(blocker) {
                 *indegree.entry(issue_id.clone()).or_default() += 1;
@@ -2582,9 +2646,6 @@ fn dependency_layers_within(
         let mut ordered_layer = Vec::with_capacity(current.len());
         for id in &current {
             budget.check()?;
-            let _issue = issues.get(id).ok_or_else(|| Error::MissingDependency {
-                issue: id.0.clone(),
-            })?;
             ordered_layer.push(id.clone());
             emitted += 1;
             if let Some(children) = dependents.get(id) {

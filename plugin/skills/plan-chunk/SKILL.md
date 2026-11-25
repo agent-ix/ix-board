@@ -27,6 +27,7 @@ If this plugin is not initialized or an Agent IX command fails, read [the ix-boa
    is identified, present the chunk as ready for handoff and state that the
    recipient is required.
 5. If the command fails or returns partial/unavailable data, report the error or limitation and do not present an incomplete result as a complete chunk.
+6. When the result carries `warnings` (terminal output: `Warnings:`), include every one in the handoff. An `unavailable_blocker` warning means the named issue and its dependents are not ready.
 
 ## Handoff contents
 

@@ -68,8 +68,9 @@ ordering and include blockers from every project and team, including completed
 and canceled blockers. The result SHALL report the aggregate FR-011 blocker
 layers, with each blocker included once in its layer and a `focus_root_ids`
 list sorted by stable Linear issue identifier, naming every resolved focus
-issue whose transitive `blocked_by` closure contains that blocker. Missing
-blocker records and dependency cycles SHALL produce the FR-002 errors.
+issue whose transitive `blocked_by` closure contains that blocker. Dependency
+cycles SHALL produce the FR-002 error; unavailable records follow
+[FR-046](FR-046-dangling-references.md).
 
 The ready queue SHALL contain focus issues that satisfy FR-001's full ready
 eligibility rules, including project-running state, issue and spec state, and
@@ -160,9 +161,11 @@ category. It introduces no second calculator and no store.
   classification in its row. Counts that depend on unresolved, unavailable, or
   unknown facts are marked unavailable or partial, never complete, healthy, or
   zero.
-- **Failures.** A snapshot that is incomplete, a parent cycle, a missing parent,
-  a missing blocker record, or a dependency cycle returns the existing explicit
-  error for the whole batch and no partial result. A failed or timed-out read
+- **Failures.** A snapshot that is incomplete, a parent cycle, or a dependency
+  cycle returns the existing explicit error for the whole batch and no partial
+  result. An unavailable record is an [FR-046](FR-046-dangling-references.md)
+  warning on the batch, and a selection that depends on it is `incomplete`.
+  A failed or timed-out read
   returns the FR-004 error and no result. The library keeps no last-good result
   and no revision cache; the caller keeps any last-good result with its original
   fetch time.
@@ -201,7 +204,7 @@ produce an explicit error and no partial status result.
 | FR-012-AC-3 | Given two focus issues with a shared transitive blocker and other blockers across projects and teams in open, completed, and canceled states, aggregate layers include the full FR-002 closure, each blocker appears once in its layer, and each blocker row reports its identifier, title, state, FR-001 classification, and sorted `focus_root_ids`. The shared blocker row lists both focus issues in identifier order; other blockers list only the focus issue whose closure contains them. | Test |
 | FR-012-AC-4 | Given focus issues with different project, spec, and blocker eligibility, the ready queue includes exactly the focus issues eligible under FR-001, applies FR-001 ordering, and includes its readiness reasons; blocker-only issues are excluded. | Test |
 | FR-012-AC-5 | Given identical complete Linear records, repeated `focus status` calls return identical project and milestone groups, issue lists, blocker layers, ready queue order, and reasons; the result reports the source snapshot's actual fetch timestamp. | Test |
-| FR-012-AC-6 | An empty focus, incomplete source snapshot, missing blocker record, or dependency cycle returns an explicit error and no partial status result. | Test |
+| FR-012-AC-6 | An empty focus, incomplete source snapshot, or dependency cycle returns an explicit error and no partial status result. | Test |
 | FR-012-AC-7 | Project focus issues without a milestone appear in `unmilestoned` with open-state, in-progress, and leaf-progress facts; parent issues contribute to open-state counts but not leaf progress, and terminal output explains the difference. The terminal fetch time is readable UTC with age while JSON retains `fetched_at`. | Test |
 | FR-012-AC-8 | A work-milestone selector keeps full project and milestone progress but restricts blocker roots and ready issues to matching milestones, preserving cross-milestone prerequisites; an unknown selector fails explicitly. | Test |
 | FR-012-AC-9 | An empty filtered ready queue reports that it is empty and counts otherwise-ready issues excluded by the selected milestones. | Test |
@@ -214,7 +217,7 @@ produce an explicit error and no partial status result.
 | FR-012-AC-16 | Given an included leaf whose only open prerequisite is excluded by the selection, the leaf is not ready and is counted blocked, the prerequisite appears in the complete blocker closure and is not counted in the selection's totals; the same holds for an excluded prerequisite in another project or team; excluding a completed prerequisite changes no readiness. | Test |
 | FR-012-AC-17 | An explicit empty selection returns state `empty` with no rows and a valid zero leaf count; a batch with zero selections returns `none` with no totals at all; a selection with an unresolved or unavailable member or an unknown team returns `incomplete` or `unavailable` with counts marked unavailable or partial; the four results are distinguishable, and no result that depends on an unresolved, unavailable, or unknown fact is reported as complete, healthy, or zero. | Test |
 | FR-012-AC-18 | A project whose native status category is `Unknown` is reported with that classification and its row is not reported as complete or healthy; the existing status category derivation is reused and not changed. | Test |
-| FR-012-AC-19 | A parent cycle, a missing parent or blocker record, a dependency cycle, or an incomplete snapshot fails the whole batch with the existing explicit error and no partial result; a bounded-read timeout or rate limit returns its FR-004 error and no result; the library stores no last-good result, revision cache, or named definition. | Test |
+| FR-012-AC-19 | A parent cycle, a dependency cycle, or an incomplete snapshot fails the whole batch with the existing explicit error and no partial result; a bounded-read timeout or rate limit returns its FR-004 error and no result; the library stores no last-good result, revision cache, or named definition. | Test |
 | FR-012-AC-20 | Inspection confirms the batch evaluation reuses the FR-010 resolvers and leaf classification, the FR-001 readiness evaluation, the FR-002 closure, and the existing status category, and adds no second calculator, store, service, or raw tracker read. | Inspection |
 | FR-012-AC-21 | Given a batch of team X with a `complete` selection A and a selection B whose exclude member is unresolved, team X's union is `incomplete`, is not reported complete or healthy, names B's key and cause, and marks its counts partial; A's own result stays `complete`; a team Y group with only complete selections stays `complete`; a team whose selections are all `empty` reports union `empty`; a `complete` selection A plus an `empty` selection B yields a `complete` union; an `incomplete` A plus an `empty` B yields an `incomplete` union (`unavailable` when no selection has a usable result). | Test |
 | FR-012-AC-22 | Given a selection that includes only project P directly and no initiative, the result contains a standalone project row for P with initiative-link status `none selected`; given a snapshot whose initiative links for P cannot be established, the row reports `unavailable` instead; the two are distinguishable, and in neither case is P's row omitted or P's leaves counted as a direct ticket row; given a selection that includes P and also excludes P, no standalone row for P appears; given a selection that directly includes an authoritatively known-empty P without excluding it, the standalone row for P is retained with zero counts. Direct-ticket placement is unchanged. | Test |

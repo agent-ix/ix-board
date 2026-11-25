@@ -39,7 +39,9 @@ The first established rule determines its verdict.
 
 `--idle-after` accepts positive seconds, minutes or hours, such as `90s`, `20m`
 or `2h`. It defaults to `20m`. `IDLE` rows show the team's next ready ticket.
-Queue failures appear once and leave verdicts unchanged.
+Queue failures appear once and leave verdicts unchanged. A blocker or project
+without a record keeps work out of the queue; `agents` lists each one in
+`ready_queue_warnings` (see [unavailable references](focus.md#unavailable-references)).
 
 ### Worker counts and coverage
 

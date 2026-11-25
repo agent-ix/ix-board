@@ -32,8 +32,53 @@ For every issue in the focus, ix-board follows the full transitive `blocked-by`
 graph. The closure includes blockers from other projects and teams, and blockers
 that are completed or canceled. Layer 0 holds issues without blockers. Every
 other issue is one layer above its deepest blocker. Blockers that are not part of
-the focus stay visible and are marked as blocker-only. A missing blocker record
-or a dependency cycle is an error.
+the focus stay visible and are marked as blocker-only. A blocker without a record
+still takes layer 0, so nothing that waits on it is in layer 0 (see
+[unavailable references](#unavailable-references)). A dependency cycle is an
+error.
+
+## Unavailable references
+
+A snapshot can hold an issue that points at a record the snapshot does not hold,
+such as an archived parent or blocker, or a milestone that its project does not
+list. The read succeeds, keeps the issue in its counts, and adds one warning for
+each such reference.
+
+| Warning kind | Effect on the issue |
+|--------------|---------------------|
+| `unavailable_milestone` | Counted at project level, with no milestone |
+| `unavailable_project` | Not ready; counted outside every project row |
+| `unavailable_parent` | Ancestry ends at the issue |
+| `unavailable_blocker` | The issue and its dependents are not ready |
+
+A blocker without a record appears as `<uuid> (unavailable)` in the layers of
+`expand` and `project-chunk` and in `project-chunk`'s `blocked_by`. `status`
+keeps its layer without a row.
+
+```json
+"warnings": [
+  {
+    "kind": "unavailable_milestone",
+    "issue": "ENG-44",
+    "milestone": "1b6c…",
+    "project": "8f20…"
+  }
+]
+```
+
+The `warnings` member is omitted when there is nothing to report, and terminal
+output lists the same entries under `Warnings:`. `status` counts the selected
+issues that no project row holds, including issues without a project, in
+`outside_projects`, so project rows plus that group equal the whole focus. Their
+activity events name the project `<uuid> (unavailable)` or `no project`. `next`
+prints its warnings as diagnostics on standard error, in the format set by
+`--diagnostics-format`, and `agents` lists them in `ready_queue_warnings`. A
+parent cycle or a dependency cycle is still an error.
+
+Linear does not mark a project as updated when a milestone is added to it. An
+incremental refresh therefore adds a new milestone from the changed issues that
+name it. A cache that missed a milestone before this behavior keeps reporting it
+until one of its issues changes or the daily full reconciliation runs.
 
 ## Work milestones
 

@@ -451,6 +451,7 @@ fn agents_report(rows: Vec<AgentRow>) -> AgentsReport {
         errors: Vec::new(),
         missing_hosts: Vec::new(),
         ready_queue_error: None,
+        ready_queue_warnings: Vec::new(),
     }
 }
 

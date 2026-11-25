@@ -244,7 +244,7 @@ fn tc_010_01_overlapping_selectors_count_leaves_once_and_exclude_terminal_nonwor
     assert_eq!(by_identifier, by_name);
 }
 
-/// Trace: FR-010-AC-3
+/// Trace: FR-010-AC-3, FR-046-AC-4, FR-046-AC-8
 #[test]
 fn tc_010_02_unknown_ambiguous_and_cyclic_scope_is_refused() {
     let mut snapshot = WorkspaceSnapshot {
@@ -278,17 +278,17 @@ fn tc_010_02_unknown_ambiguous_and_cyclic_scope_is_refused() {
         ),
         Err(ix_board::Error::ParentCycle { .. })
     ));
+    // With SWM-2 gone, SWM-1's ancestry ends at it and it counts as a leaf.
     snapshot.issues.pop();
-    assert!(matches!(
-        select_scope(
-            &snapshot,
-            &ScopeSelection {
-                tickets: vec!["SWM-1".into()],
-                ..ScopeSelection::default()
-            }
-        ),
-        Err(ix_board::Error::MissingParent { .. })
-    ));
+    let scope = select_scope(
+        &snapshot,
+        &ScopeSelection {
+            tickets: vec!["SWM-1".into()],
+            ..ScopeSelection::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(scope.leaf_ids, [IssueId("SWM-1".into())].into());
 }
 
 /// Trace: FR-010-AC-5

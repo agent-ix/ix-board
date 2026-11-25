@@ -67,7 +67,7 @@ query WorkspaceIssues($first: Int!, $relationFirst: Int!, $after: String, $filte
       team { key }
       assignee { id name }
       project { id }
-      projectMilestone { id }
+      projectMilestone { id name sortOrder targetDate project { id } }
       parent { id }
       relations(first: $relationFirst) {
         nodes { type issue { id } relatedIssue { id } }
@@ -1503,6 +1503,7 @@ impl LinearGraphQlSource {
         }
 
         let blocked_by = collect_blocked_by(&raw_issues);
+        let mut referenced_milestones = Vec::new();
         let changed_issue_ids: BTreeSet<_> = raw_issues
             .iter()
             .map(|issue| IssueId(issue.id.clone()))
@@ -1526,7 +1527,11 @@ impl LinearGraphQlSource {
                     assignee_id: raw.assignee.as_ref().map(|assignee| assignee.id.clone()),
                     assignee_name: raw.assignee.and_then(|assignee| assignee.name),
                     project_id: raw.project.map(|project| ProjectId(project.id)),
-                    project_milestone_id: raw.project_milestone.map(|milestone| milestone.id),
+                    project_milestone_id: raw.project_milestone.map(|milestone| {
+                        let id = milestone.id.clone();
+                        referenced_milestones.push(milestone);
+                        id
+                    }),
                     priority: raw.priority,
                     sort_order: raw.sort_order,
                     blocked_by: blocked_by
@@ -1576,7 +1581,12 @@ impl LinearGraphQlSource {
                         && !initiative.trashed
                         && initiative.project_ids.contains(&project.id)
                     {
-                        project.initiatives.push(initiative.initiative.clone());
+                        // Detail snapshots carry no initiative slug: a full read does
+                        // not fetch it, so a delta must not add it either.
+                        project.initiatives.push(Initiative {
+                            identifier: String::new(),
+                            ..initiative.initiative.clone()
+                        });
                         project.initiatives.sort_by(|a, b| a.id.cmp(&b.id));
                     }
                 }
@@ -1620,12 +1630,14 @@ impl LinearGraphQlSource {
                     issue
                 })
                 .collect();
+            add_referenced_milestones(&mut projects, &referenced_milestones);
             return Ok(WorkspaceSnapshot {
                 projects,
                 issues,
                 fetched_at: SystemClock.now_epoch_seconds(),
             });
         }
+        add_referenced_milestones(&mut projects, &referenced_milestones);
         Ok(WorkspaceSnapshot {
             projects,
             issues,
@@ -2244,7 +2256,7 @@ struct RawIssue {
     team: RawTeam,
     assignee: Option<RawUser>,
     project: Option<RawIssueProject>,
-    project_milestone: Option<RawIssueProject>,
+    project_milestone: Option<RawIssueMilestone>,
     parent: Option<RawIssueProject>,
     relations: Connection<RawRelation>,
     inverse_relations: Connection<RawRelation>,
@@ -2376,6 +2388,56 @@ fn linear_cli_token() -> Option<String> {
 #[serde(rename_all = "camelCase")]
 struct RawIssueProject {
     id: String,
+}
+
+/// An issue's milestone, with enough of its record to add one the cached project lacks.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct RawIssueMilestone {
+    id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    sort_order: Option<f64>,
+    #[serde(default)]
+    target_date: Option<String>,
+    #[serde(default)]
+    project: Option<RawIssueProject>,
+}
+
+/// Adds each referenced milestone that its project does not hold yet. Creating a milestone
+/// does not move its project's `updatedAt`, so an incremental project read can miss it
+/// while the changed issues already name it. Records without a name, order or owning
+/// project add nothing.
+fn add_referenced_milestones<'a>(
+    projects: &mut [Project],
+    referenced: impl IntoIterator<Item = &'a RawIssueMilestone>,
+) {
+    for milestone in referenced {
+        let (Some(name), Some(sort_order), Some(owner)) =
+            (&milestone.name, milestone.sort_order, &milestone.project)
+        else {
+            continue;
+        };
+        let Some(project) = projects.iter_mut().find(|project| project.id.0 == owner.id) else {
+            continue;
+        };
+        if project
+            .milestones
+            .iter()
+            .any(|held| held.id == milestone.id)
+        {
+            continue;
+        }
+        project.milestones.push(Milestone {
+            id: milestone.id.clone(),
+            name: name.clone(),
+            // The issue query leaves it out; the next full read of the project fills it.
+            description: None,
+            sort_order,
+            target_date: milestone.target_date.clone(),
+        });
+    }
 }
 
 #[derive(Deserialize)]
@@ -2991,7 +3053,7 @@ mod tests {
             requests[1]["query"]
                 .as_str()
                 .unwrap()
-                .contains("projectMilestone { id }")
+                .contains("projectMilestone { id name sortOrder targetDate project { id } }")
         );
         assert_eq!(requests[0]["variables"]["first"], PROJECT_PAGE_SIZE);
         assert_eq!(requests[1]["variables"]["first"], ISSUE_PAGE_SIZE);

@@ -65,7 +65,7 @@ impl LinearGraphQlSource {
             full_at INTEGER NOT NULL)",
             )
             .map_err(Error::Cache)?;
-        let key = format!("{}:summary:v1", self.cache_namespace());
+        let key = format!("{}:summary:v2", self.cache_namespace());
         let load = |connection: &Connection| -> Result<Option<(SummarySnapshot, i64, i64)>, Error> {
             let row = connection
                 .query_row(

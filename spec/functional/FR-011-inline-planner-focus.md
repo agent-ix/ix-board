@@ -68,7 +68,8 @@ behavior follow FR-010. Empty focus input SHALL be rejected.
 - The snapshot fetch timestamp so callers can identify the age of the source
   data.
 - Explicit errors for invalid input, missing or ambiguous selectors,
-  incomplete source records, missing blocker records, or dependency cycles.
+  incomplete source reads, or dependency cycles.
+- [FR-046](FR-046-dangling-references.md) warnings for unavailable records.
 
 ## Acceptance Criteria
 
@@ -78,7 +79,7 @@ behavior follow FR-010. Empty focus input SHALL be rejected.
 | FR-011-AC-2 | Given an initiative with assigned projects, each project's milestones and issues assigned to those projects are present; issues assigned to a milestone are grouped under it, and issues without a milestone are identified as project-level work. | Test |
 | FR-011-AC-3 | Given an explicit issue with descendants, the issue and its descendants are included under FR-010 rules; every resolved focus issue roots a complete FR-002 blocker closure, including cross-project, cross-team, completed, and canceled prerequisites. Layers order prerequisites before dependents and entries by stable Linear issue identifier. | Test |
 | FR-011-AC-4 | Empty selector input or any missing or ambiguous selector produces an explicit error and no partial expansion. | Test |
-| FR-011-AC-5 | An incomplete snapshot, missing blocker record, or dependency cycle returns an explicit error and no partial expansion; repeated expansion of identical complete Linear data returns identical output and ordering. | Test |
+| FR-011-AC-5 | An incomplete snapshot or dependency cycle returns an explicit error and no partial expansion; an unavailable record is reported as an FR-046 warning; repeated expansion of identical complete Linear data returns identical output and ordering. | Test |
 | FR-011-AC-6 | Recorded Linear project, initiative, milestone, issue, project-milestone association, and relation fixtures produce the expansion without a GitHub Issues request; transport evidence shows separate paginated project and issue queries, client-side relationship joins, and each issued query remains below 10,000 complexity. | Test |
 
 ## Dependencies

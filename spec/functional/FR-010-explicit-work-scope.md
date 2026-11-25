@@ -99,7 +99,7 @@ stores selector identities only, never expanded issue IDs.
 |----|----------|--------------|
 | FR-010-AC-1 | Initiative, project and ticket selectors resolve from structured relationships; overlapping selectors count a ticket only once. | Test |
 | FR-010-AC-2 | Progress excludes parents, canceled and duplicate leaves and groups remaining leaves by workflow stage. | Test |
-| FR-010-AC-3 | Missing or ambiguous selectors, cyclic ancestry and missing ancestors return explicit errors. | Test |
+| FR-010-AC-3 | Missing or ambiguous selectors and cyclic ancestry return explicit errors; ancestry ends at an unavailable parent (FR-046). | Test |
 | FR-010-AC-4 | Transport retains initiative identities, parent IDs and workflow categories; cached reads preserve actual fetch age and forced refresh replaces it. | Test |
 | FR-010-AC-5 | A team boundary selects only tickets owned by that team, including unprojected tickets when no narrower selectors exist; project, initiative and ticket selectors intersect that boundary, while leaf classification retains full snapshot ancestry. Unknown teams are refused. | Test |
 | FR-010-AC-6 | Project and initiative membership follows assigned project IDs without expanding into descendants in other projects. Explicit ticket selection includes descendants across projects within the team boundary; global ancestry still prevents counting parents as leaves. | Test |

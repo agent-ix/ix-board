@@ -50,7 +50,7 @@ ix-board roadmap
 
 Program convention: every project in a reviewed initiative belongs in the scope file, every in-scope ticket belongs to a project, and each project has exactly one primary initiative in the scope file. Put secondary initiative memberships in `also_in`. `roadmap` reports projects missing from the scope file and mismatches between the scope file and Linear initiative memberships; `orphans` reports in-scope tickets without projects.
 
-Projects appear once under their primary initiative. The report includes their other initiative memberships, current Linear issue-state counts, progress, and last activity. It also reports projects with no initiative and initiatives with no projects. When old tickets are bulk-filed into a project, describe the filing in a project update so a lower completion percentage is understood as a change in the project denominator rather than lost progress.
+Projects appear once under their primary initiative. The report includes their other initiative memberships and Linear's progress percentage. Leaf task counts come from the cached issue snapshot, with `counts_observed_at` as their age; without one they are null with `counts_unavailable_reason`, which is not zero. `ix-board --json roadmap` gives each initiative and project its `id` and `identifier`, and each initiative its `member_project_ids`. It also reports projects with no initiative and initiatives with no projects. When old tickets are bulk-filed into a project, describe the filing in a project update so a lower completion percentage is understood as a change in the project denominator rather than lost progress.
 
 Find unprojected open and completed tickets in the teams represented by scoped projects with `orphans`. Each row includes a project suggestion and its reason. A title-prefix suggestion can point to a project that does not include the ticket's team; the command warns because Linear will reject that move. The command is read-only:
 
@@ -93,6 +93,8 @@ Reconcile is read-only. It groups merged PRs with open tickets, completed ticket
    ```bash
    ix-board next --team <TEAM>
    ```
+
+   Report any warning diagnostic from `next`, and any `warnings` from `project-chunk`: each names a reference to an unavailable record that can keep work out of the queue.
 
 4. For a project's goal, open issues, and dependency layers, use its Linear project identifier, UUID, or exact name with `project-chunk`. For structured discovery, use `search`:
 
