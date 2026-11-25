@@ -49,6 +49,8 @@ fn list(machine: &str, lanes: &[&str]) -> HostLaneList {
 fn series(window: u64, blocked: &[(&str, &str)]) -> HostSeries {
     HostSeries {
         busy_ratio: None,
+        busy_ratio_error: None,
+        busy_sample_age: None,
         blocked: blocked
             .iter()
             .map(|(lane, reason)| (lane.to_lowercase(), (*reason).to_owned()))
@@ -701,6 +703,72 @@ fn prometheus_responses_become_host_series_with_relay_thresholds() {
         query: CannedProm(BTreeMap::from([("ix_fleet", r#"{"status":"error"}"#)])),
     };
     assert!(bad.host_series("titan").is_err());
+}
+
+#[trace("FR-038-AC-23")]
+#[test]
+fn invalid_duplicate_and_missing_busy_samples_are_busy_only_reading_errors() {
+    let read = |busy: &'static str| {
+        PrometheusSeries {
+            query: CannedProm(BTreeMap::from([
+                ("ix_fleet_host_busy_ratio", vector(busy)),
+                ("ix_fleet_lane_blocked", vector("")),
+                ("ix_fleet_probe_ok", vector("")),
+                ("ix_fleet_config", vector("")),
+                ("ix_fleet_lane_compile_seconds_total", vector("")),
+                (
+                    "time() - timestamp(ix_fleet_host_busy_ratio",
+                    vector(r#"{"metric":{},"value":[1,"12"]}"#),
+                ),
+                (
+                    "time() - timestamp",
+                    vector(r#"{"metric":{},"value":[1,"12"]}"#),
+                ),
+            ])),
+        }
+        .host_series("draco")
+        .unwrap()
+    };
+
+    let invalid = read(r#"{"metric":{"host":"draco"},"value":[1,"NaN"]}"#);
+    assert!(invalid.busy_ratio.is_none());
+    assert!(invalid.busy_ratio_error.is_some());
+    assert!(invalid.config.working_window.is_none());
+
+    let duplicate = read(
+        r#"{"metric":{"host":"draco","job":"watcher"},"value":[1,"0.2"]},{"metric":{"host":"draco","job":"other"},"value":[1,"0.3"]}"#,
+    );
+    assert!(duplicate.busy_ratio.is_none());
+    assert!(duplicate.busy_ratio_error.is_some());
+    assert_eq!(duplicate.busy_sample_age, Some(Duration::from_secs(12)));
+
+    let missing = read("");
+    assert!(missing.busy_ratio.is_none());
+    assert!(missing.busy_ratio_error.is_none());
+    assert!(
+        missing
+            .absent
+            .iter()
+            .any(|name| name == live::series::HOST_BUSY_RATIO)
+    );
+}
+
+#[trace("FR-038-AC-23")]
+#[test]
+fn stale_busy_ratio_is_a_host_defect_and_not_used_by_the_tick() {
+    let mut world = World::one_host(&["h:w:1"], vec![], &[]);
+    let reading = world.series.hosts.get_mut("h").unwrap().as_mut().unwrap();
+    reading.busy_ratio = Some(0.2);
+    reading.busy_sample_age = Some(Duration::from_secs(121));
+
+    let report = world.run();
+
+    assert!(!report.host_busy.contains_key("h"));
+    assert!(report.defects.iter().any(|defect| {
+        defect.kind == DefectKind::StaleSource
+            && defect.source == "prometheus.host_busy"
+            && defect.host.as_deref() == Some("h")
+    }));
 }
 
 #[trace("FR-034-AC-9")]

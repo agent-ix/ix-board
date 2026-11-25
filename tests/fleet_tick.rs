@@ -74,6 +74,7 @@ fn report(now: i64, rows: Vec<LaneRow>, defects: Vec<Defect>) -> FleetReport {
             })
             .collect(),
         defects,
+        host_busy: BTreeMap::new(),
         relay_unavailable: false,
     }
 }
@@ -1223,7 +1224,7 @@ impl TickSources for FailingAssignments {
         Err(Unread::Failed(SourceError("redis down".to_owned())))
     }
     fn host_busy(&self) -> Result<BTreeMap<String, f64>, Unread> {
-        Err(Unread::Unwired("SWM-281"))
+        Ok(BTreeMap::new())
     }
     fn lane_prs(&self) -> Result<Vec<LanePr>, Unread> {
         Err(Unread::Unwired("SWM-282"))
@@ -1241,7 +1242,7 @@ fn a_failed_source_read_is_a_defect_routed_in_its_tick_and_a_named_seam_is_not()
     let out = rig.tick(&report(T0, vec![idle(LANE)], vec![]));
     assert!(!out.complete, "a failed read is a defect, not a clean tick");
     let fixes = of(&out, ActionKind::FixSource);
-    assert_eq!(fixes.len(), 1, "the three seams raise nothing");
+    assert_eq!(fixes.len(), 1, "the remaining named seams raise nothing");
     assert_eq!(fixes[0].detail["source"], "tick.assignments");
     assert_eq!(fixes[0].target.addr.as_deref(), Some(ORCH));
     assert!(of(&out, ActionKind::PushNextTicket).is_empty());

@@ -42,6 +42,7 @@ fn report(at_min: i64, lanes: &[(&str, ClassKind)]) -> FleetReport {
                 .count(),
         }],
         defects: Vec::new(),
+        host_busy: BTreeMap::new(),
         relay_unavailable: false,
     }
 }

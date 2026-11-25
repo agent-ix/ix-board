@@ -37,7 +37,7 @@ its condition persists. Kinds and rules:
 | `escalate_block` | lane is BLOCKED(login), BLOCKED(usage_limit) or BLOCKED(question); or BLOCKED(dialog) with no matching standing order; or the SWM-226 file is missing or unreadable. Severity high; carries the block reason | the lane's lead |
 | `escalate_stuck` | lane is STUCK or LOOP | the lane's lead |
 | `resend_order` | the lane's order is STALE-ORDER | the lane |
-| `add_lane` | a host's busy ratio is below its target busy ratio (per-host configuration, default 0.85), ready unassigned tickets exist and a lane slot is free. The busy-ratio reader is owned by SWM-281 and the ready-work reader by SWM-212; until they land the tick reports each as `unavailable` and emits no `add_lane` | the host |
+| `add_lane` | a host's fresh busy ratio is below its target busy ratio (per-host configuration, default 0.85), ready unassigned tickets exist and a lane slot is free. Busy ratio comes from `ix_fleet_host_busy_ratio{host}` in the bounded per-host FR-034 read. Missing, invalid, duplicate or stale readings create a host-scoped `prometheus.host_busy` defect and make only that host ineligible. Ready-work reading is owned by SWM-212. | the host |
 | `escalate_stale_pr` | a lane-owned pull request has had no head or review activity longer than `stale_pr_after` (configurable, default 3h). The pull-request activity reader is owned by SWM-282; until it lands the tick reports it as `unavailable` | the lane's lead |
 | `need_ready_tickets` | ready-buffer deficit greater than zero ([FR-041](./FR-041-fleet-saturation.md)). **Deferred to SWM-217**: the tick does not emit it yet | the owning planner project |
 | `act_on_undetermined` | a reachable lane, on a host that is not `UNREACHABLE`, has a lane-scoped evidence defect: `no_events`, or a `missing_lane`, `stale_source` or `unreadable_source` defect naming that lane. Carries the defect, the lane's remaining assigned ticket if any, and `treat_as: idle`. A relay message to a BLOCKED pane is pane input, so for a lane whose class is BLOCKED the action is addressed to the lane's lead instead, with reason `lane_blocked_route_to_lead` | the lane, or its lead when the lane is BLOCKED |
@@ -50,6 +50,13 @@ its condition persists. Kinds and rules:
 Actions are sorted by severity, lane and kind. The output for identical evidence is
 identical. A lane with an unresolved defect is not excluded. An unreadable
 SWM-226 configuration never produces `answer_dialog`.
+
+The busy-ratio input is read once per host with the FR-034 watcher series. A
+ratio is usable only when exactly one finite sample in `[0, 1]` exists and its
+age is no more than twice the configured push interval. A missing, malformed,
+duplicate or stale ratio records a host-scoped `prometheus.host_busy` defect;
+the tick keeps other hosts' valid ratios and status evidence. It reuses the
+status read and does not issue another Prometheus query for busy ratios.
 
 ### Undetermined lanes
 
@@ -104,6 +111,7 @@ no tick record.
 | FR-038-AC-20 | An IDLE lane whose readable FR-072 list is empty emits `route_idle_lane` to the orchestrator; an IDLE lane with a ticket emits `push_next_ticket`; an unreadable list emits neither. | Test |
 | FR-038-AC-21 | `act_on_undetermined` for a BLOCKED lane is addressed to the lane's lead and never to the lane; for any other class it is addressed to the lane. | Test |
 | FR-038-AC-22 | A failed read of a source the tick reads itself is a source defect in its own tick (`complete` false, one `fix_source` to the orchestrator, closed when the read works again), and a source with no reader yet raises no defect. | Test |
+| FR-038-AC-23 | The tick reuses bounded status host-series reads for busy ratios; missing, invalid, duplicate or older-than-two-push-interval ratios produce a defect for that host and do not discard another host's valid ratio or status evidence. | Test |
 
 ## Dependencies
 

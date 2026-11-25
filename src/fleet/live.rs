@@ -268,16 +268,22 @@ impl<Q: PromQuery> SeriesSource for PrometheusSeries<Q> {
                 series.busy_ratio = Some(*value);
             }
             [_] => {
-                return Err(SourceError(
-                    "host busy ratio must be finite and between 0 and 1".to_owned(),
-                ));
+                series.busy_ratio_error =
+                    Some("host busy ratio must be finite and between 0 and 1".to_owned());
             }
             _ => {
-                return Err(SourceError(
-                    "multiple host busy ratio samples for one host".to_owned(),
-                ));
+                series.busy_ratio_error =
+                    Some("multiple host busy ratio samples for one host".to_owned());
             }
         }
+        let busy_ages = read(format!(
+            "time() - timestamp({}{{host=\"{host}\"}})",
+            series::HOST_BUSY_RATIO
+        ))?;
+        series.busy_sample_age = busy_ages
+            .into_iter()
+            .filter_map(|(_, value)| secs(value))
+            .max();
         for (labels, value) in read(format!("{}{{host=\"{host}\"}}", series::LANE_BLOCKED))? {
             if value >= 1.0
                 && let (Some(lane), Some(reason)) = (labels.get("lane"), labels.get("reason"))
