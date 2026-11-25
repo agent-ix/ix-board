@@ -191,7 +191,32 @@ pub fn evaluate_sessions(
                     continue;
                 }
                 let query = &rule.query_or_rubric;
-                let value = if role_sessions_count(&by_role, &spec.role) == 1
+                let value = if query == "hooks.role_turns" {
+                    let evidence_refs = ledger_rows
+                        .iter()
+                        .filter_map(|row| {
+                            let started_at =
+                                row.get("started_at").and_then(serde_json::Value::as_i64)?;
+                            let address = row
+                                .get("session_addr")
+                                .and_then(serde_json::Value::as_str)?;
+                            let role = row
+                                .get("session_role")
+                                .and_then(serde_json::Value::as_str)?;
+                            (address == session_id
+                                && role == spec.role
+                                && started_at >= window.start_ms
+                                && started_at < window.end_ms)
+                                .then(|| {
+                                    format!("fleet-ledger:session_turn:{address}:{started_at}")
+                                })
+                        })
+                        .collect::<Vec<_>>();
+                    QueryValue::Value {
+                        value: evidence_refs.len() as f64,
+                        evidence_refs,
+                    }
+                } else if role_sessions_count(&by_role, &spec.role) == 1
                     && (query.starts_with("retro.") || query.starts_with("prom."))
                 {
                     role_adapters
@@ -2928,6 +2953,62 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("session-specific")
+        );
+    }
+
+    #[test]
+    #[ix_trace_rs::trace("FR-047-AC-5")]
+    fn role_turns_are_counted_from_session_attributed_prompt_events() {
+        let spec = RoleSpec {
+            role: "minder".into(),
+            rules: vec![EvaluationRule {
+                id: "MIND-R7".into(),
+                rule: "turns".into(),
+                evidence_source: "hooks".into(),
+                trigger: "hooks.role_turns".into(),
+                method: "deterministic".into(),
+                query_or_rubric: "hooks.role_turns".into(),
+                comparator: "=".into(),
+                target: 2.0,
+                unit: "turns".into(),
+            }],
+        };
+        let event = |address: &str, role: &str, started_at: i64| {
+            serde_json::Map::from_iter([
+                (
+                    "session_addr".into(),
+                    serde_json::Value::String(address.into()),
+                ),
+                (
+                    "session_role".into(),
+                    serde_json::Value::String(role.into()),
+                ),
+                ("started_at".into(), serde_json::Value::from(started_at)),
+            ])
+        };
+        let session = "test:workspace:minder";
+        let rows = [
+            event(session, "minder", 110),
+            event(session, "minder", 120),
+            event("test:workspace:other", "minder", 130),
+            event(session, "coder", 140),
+            event(session, "minder", 200),
+        ];
+        let window = EvalWindow {
+            start_ms: 100,
+            end_ms: 200,
+        };
+        let results = evaluate_sessions(&[spec], &BTreeMap::new(), &rows, &window, Some(session));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, session);
+        assert_eq!(results[0].rules[0].status, RuleStatus::Pass);
+        assert_eq!(results[0].rules[0].value, Some(2.0));
+        assert_eq!(
+            results[0].rules[0].evidence_refs,
+            [
+                "fleet-ledger:session_turn:test:workspace:minder:110",
+                "fleet-ledger:session_turn:test:workspace:minder:120",
+            ]
         );
     }
 }
