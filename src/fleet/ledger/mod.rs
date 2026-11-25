@@ -286,9 +286,10 @@ fn apply_v7(tx: &rusqlite::Transaction<'_>) -> Result<(), LedgerError> {
         tx.execute_batch(&format!("DROP VIEW IF EXISTS {name}"))?;
     }
     for statement in schema::CAPACITY_VIEWS {
-        let view = statement.split_whitespace().nth(2).ok_or_else(|| {
-            LedgerError::Capacity("invalid capacity view definition".to_owned())
-        })?;
+        let view = statement
+            .split_whitespace()
+            .nth(2)
+            .ok_or_else(|| LedgerError::Capacity("invalid capacity view definition".to_owned()))?;
         tx.execute_batch(&format!("DROP VIEW IF EXISTS {view}"))?;
     }
     for statement in schema::views() {

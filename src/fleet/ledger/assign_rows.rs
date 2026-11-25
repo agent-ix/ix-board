@@ -995,8 +995,7 @@ mod tests {
                 lanes: Vec::new(),
                 registrations: vec![
                     (
-                        AgentName::try_from("session/74657374/636f646572".to_owned())
-                            .unwrap(),
+                        AgentName::try_from("session/74657374/636f646572".to_owned()).unwrap(),
                         "test-server:test-workspace:test-coder".to_owned(),
                     ),
                     (
