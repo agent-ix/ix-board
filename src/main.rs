@@ -1831,6 +1831,7 @@ fn run_retro_eval(
         &specs,
         fleet_ledger_path.as_deref(),
         settings.ready_state.as_deref(),
+        &config.projects,
         &window,
     ));
     let mut previous_adapters = retro::eval::declared_adapters(&specs);
@@ -1883,6 +1884,7 @@ fn run_retro_eval(
         &specs,
         fleet_ledger_path.as_deref(),
         settings.ready_state.as_deref(),
+        &config.projects,
         &previous_window,
     ));
     let session_ledger_rows = fleet_ledger_path
@@ -1923,12 +1925,7 @@ fn run_retro_eval(
             let previous_rules = retro::eval::evaluate_rules(&spec.rules, &previous_role_adapters);
             let score = retro::eval::score(&rules);
             let previous_score = retro::eval::score(&previous_rules);
-            let trend = retro::eval::complete_score(&rules)
-                .and_then(|current| {
-                    retro::eval::complete_score(&previous_rules).map(|previous| (current, previous))
-                })
-                .and_then(|(current, previous)| current.pass_rate.zip(previous.pass_rate))
-                .map(|(current, previous)| current - previous);
+            let (trend, trend_matched_rules) = retro::eval::trend_delta(&rules, &previous_rules);
             let failing_rules = rules
                 .iter()
                 .filter(|rule| rule.status == retro::eval::RuleStatus::Fail)
@@ -1940,6 +1937,7 @@ fn run_retro_eval(
                 previous_score,
                 score,
                 trend,
+                trend_matched_rules,
                 rules,
                 failing_rules,
                 session_ids: sessions
@@ -3293,13 +3291,31 @@ mod tests {
                 start_ms: 0,
                 end_ms: 10,
             },
-            roles: Vec::new(),
+            roles: vec![ix_board::retro::eval::RoleResult {
+                role: "coder".into(),
+                score: ix_board::retro::eval::Score {
+                    passed: 2,
+                    evaluated: 3,
+                    pass_rate: Some(2.0 / 3.0),
+                },
+                previous_score: ix_board::retro::eval::Score {
+                    passed: 1,
+                    evaluated: 3,
+                    pass_rate: Some(1.0 / 3.0),
+                },
+                trend: Some(1.0 / 3.0),
+                trend_matched_rules: 3,
+                rules: Vec::new(),
+                failing_rules: Vec::new(),
+                session_ids: Vec::new(),
+            }],
             sessions: Vec::new(),
         };
         let encoded = encode_output_json(&Output::RetroEval(report)).unwrap();
         let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
         assert_eq!(value["team"], "TEST");
         assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["roles"][0]["trend_matched_rules"], 3);
         assert!(value.get("RetroEval").is_none());
     }
 

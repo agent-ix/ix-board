@@ -59,10 +59,14 @@ or partial evidence and SHALL NOT write to source systems.
   is truncated, missing or cannot be attributed makes transcript queries
   unavailable for that session.
 - Role results report deterministic pass rate by rule, the current and prior
-  window scores, the direction of change, and failing rule ids. Trend is
-  unavailable if either window lacks enough complete evidence.
+  window scores, the direction of change, and failing rule ids. Trend compares
+  only the same deterministic rule ids with pass/fail outcomes in both windows;
+  unavailable and not-applicable rules do not prevent comparing the remaining
+  matched rules. `trend_matched_rules` reports that intersection size. Trend is
+  unavailable only when no rule is scored in both windows.
 - The JSON document has `schema_version`, `team`, `window`, `previous_window`,
-  `roles`, and `sessions`. A role row has `role`, `score`, `trend`, `rules`,
+  `roles`, and `sessions`. A role row has `role`, `score`, `previous_score`,
+  `trend`, `trend_matched_rules`, `rules`,
   `failing_rules`, and its session ids. A rule row has `id`, `query`, `status`,
   `value`, `comparator`, `target`, `evidence_refs`, and optional `reason` or
   `rubric_id`. A session row has `id`, `role`, `score`, `rules`, and
@@ -76,7 +80,7 @@ or partial evidence and SHALL NOT write to source systems.
 |---|---|---|
 | FR-047-AC-1 | Given role specs containing deterministic, judgement-only and unknown query references, JSON has one result per rule; deterministic status and evidence follow the query registry, judgement-only rows are marked for the director and excluded from scores, and unknown references are unavailable with their names. | Test |
 | FR-047-AC-2 | A hand-computed fixture with passing, failing, not-applicable and unavailable rules yields the expected per-rule rows, role score, failing rule ids and session rows; unavailable and not-applicable rows do not enter the pass-rate denominator. | Test |
-| FR-047-AC-3 | The previous score uses the immediately preceding equal-duration window and reports the correct signed change; missing or incomplete evidence in either window makes trend unavailable. | Test |
+| FR-047-AC-3 | The previous score uses the immediately preceding equal-duration window. Trend is the signed change over deterministic rule ids scored in both windows, with the matched count reported; an unavailable rule does not erase a comparison of other matched rules, and no matched rules makes trend unavailable. | Test |
 | FR-047-AC-4 | `review_age_limit_hours`, `gate_commands` and `ready_state` are loaded from `eval.json`; defaults and missing `ready_state` follow the behavior above, and `config.json` is unchanged. | Test |
 | FR-047-AC-5 | Session query rows use source event time, explicit session attribution and complete transcript boundaries; a missing session, ambiguous role session, truncated transcript or unreadable source is unavailable rather than pass or zero. | Test |
 | FR-047-AC-6 | Every role evaluation query in the configured role specs resolves to a registered source adapter; every unknown source or query returns an unavailable row with a diagnostic and no panic. | Test |

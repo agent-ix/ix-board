@@ -111,6 +111,7 @@ pub struct RoleResult {
     pub score: Score,
     pub previous_score: Score,
     pub trend: Option<f64>,
+    pub trend_matched_rules: usize,
     pub rules: Vec<RuleResult>,
     pub failing_rules: Vec<String>,
     pub session_ids: Vec<String>,
@@ -542,6 +543,35 @@ pub fn score(results: &[RuleResult]) -> Score {
         evaluated,
         pass_rate: (evaluated > 0).then_some(passed as f64 / evaluated as f64),
     }
+}
+
+/// Compares only deterministic rules with pass/fail results in both windows.
+pub fn trend_delta(current: &[RuleResult], previous: &[RuleResult]) -> (Option<f64>, usize) {
+    let previous = previous
+        .iter()
+        .filter(|rule| {
+            rule.judgement_required != Some(true)
+                && matches!(rule.status, RuleStatus::Pass | RuleStatus::Fail)
+        })
+        .map(|rule| (rule.id.as_str(), rule.status == RuleStatus::Pass))
+        .collect::<BTreeMap<_, _>>();
+    let mut matched = 0_usize;
+    let mut current_passed = 0_usize;
+    let mut previous_passed = 0_usize;
+    for rule in current.iter().filter(|rule| {
+        rule.judgement_required != Some(true)
+            && matches!(rule.status, RuleStatus::Pass | RuleStatus::Fail)
+    }) {
+        let Some(previous_passed_for_rule) = previous.get(rule.id.as_str()) else {
+            continue;
+        };
+        matched += 1;
+        current_passed += usize::from(rule.status == RuleStatus::Pass);
+        previous_passed += usize::from(*previous_passed_for_rule);
+    }
+    let trend =
+        (matched > 0).then(|| (current_passed as f64 - previous_passed as f64) / matched as f64);
+    (trend, matched)
 }
 
 /// Reports a score only when every deterministic rule has complete evidence.
@@ -1705,6 +1735,7 @@ pub fn ledger_adapters(
     specs: &[RoleSpec],
     ledger_path: Option<&Path>,
     ready_state: Option<&str>,
+    projects: &[String],
     window: &EvalWindow,
 ) -> BTreeMap<String, QueryValue> {
     let queries = [
@@ -1734,27 +1765,36 @@ pub fn ledger_adapters(
         {
             continue;
         }
-        values.insert(
-            query.to_owned(),
-            match read_ledger_unavailable_reason(ledger_path, view) {
-                Ok(Some(reason)) => QueryValue::NotApplicable {
+        let value = if query == "ledger.need_ready_tickets_due" {
+            read_need_ready_tickets_due(ledger_path, projects, window)
+                .map(|(value, evidence)| QueryValue::Value {
+                    value: value as f64,
+                    evidence_refs: evidence,
+                })
+                .unwrap_or_else(|reason| QueryValue::Unavailable {
                     reason,
                     evidence_refs: Vec::new(),
-                },
-                availability => match availability
-                    .and_then(|_| read_ledger_view(ledger_path, view, id_field, window))
-                {
-                    Ok((value, evidence_refs)) => QueryValue::Value {
-                        value: value as f64,
-                        evidence_refs,
-                    },
-                    Err(reason) => QueryValue::Unavailable {
+                })
+        } else {
+            read_ledger_unavailable_reason(ledger_path, view)
+                .and_then(|availability| match availability {
+                    Some(reason) => Ok(QueryValue::NotApplicable {
                         reason,
                         evidence_refs: Vec::new(),
-                    },
-                },
-            },
-        );
+                    }),
+                    None => read_ledger_view(ledger_path, view, id_field, window).map(
+                        |(value, evidence_refs)| QueryValue::Value {
+                            value: value as f64,
+                            evidence_refs,
+                        },
+                    ),
+                })
+                .unwrap_or_else(|reason| QueryValue::Unavailable {
+                    reason,
+                    evidence_refs: Vec::new(),
+                })
+        };
+        values.insert(query.to_owned(), value);
     }
     if specs.iter().flat_map(|spec| &spec.rules).any(|rule| {
         rule.method == "deterministic"
@@ -1762,7 +1802,7 @@ pub fn ledger_adapters(
     }) {
         values.insert(
             "ledger.need_ready_tickets_unanswered".to_owned(),
-            match read_need_ready_tickets_unanswered(ledger_path, ready_state, window) {
+            match read_need_ready_tickets_unanswered(ledger_path, ready_state, projects, window) {
                 Ok((value, evidence_refs)) => QueryValue::Value {
                     value: value as f64,
                     evidence_refs,
@@ -1775,6 +1815,57 @@ pub fn ledger_adapters(
         );
     }
     values
+}
+
+fn read_need_ready_tickets_due(
+    ledger_path: Option<&Path>,
+    projects: &[String],
+    window: &EvalWindow,
+) -> Result<(usize, Vec<String>), String> {
+    if projects.is_empty() {
+        return Err("retro config has no projects for need_ready_tickets actions".into());
+    }
+    let path = match ledger_path {
+        Some(path) => path.to_owned(),
+        None => crate::fleet::ledger::default_path().map_err(|error| error.to_string())?,
+    };
+    let due = crate::fleet::ledger::query(&path, "need_ready_tickets_due", None)
+        .map_err(|error| error.to_string())?;
+    let project_names = projects
+        .iter()
+        .map(|project| project.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    let mut evidence = Vec::new();
+    for row in due.rows {
+        let at_ms = row
+            .get("at_ms")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| "need_ready_tickets_due row has no integer at_ms".to_owned())?;
+        if at_ms < window.start_ms || at_ms >= window.end_ms {
+            continue;
+        }
+        let project = row
+            .get("project")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "need_ready_tickets_due row has no project".to_owned())?;
+        if !project_names.contains(&project.to_ascii_lowercase()) {
+            continue;
+        }
+        let action_id = row
+            .get("action_id")
+            .and_then(serde_json::Value::as_i64)
+            .map(|value| value.to_string())
+            .or_else(|| {
+                row.get("action_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .ok_or_else(|| "need_ready_tickets_due row has no scalar action_id".to_owned())?;
+        evidence.push(format!("fleet-ledger:need_ready_tickets_due:{action_id}"));
+    }
+    evidence.sort();
+    evidence.dedup();
+    Ok((evidence.len(), evidence))
 }
 
 #[implements("FR-047-AC-6")]
@@ -1819,6 +1910,7 @@ fn ledger_unavailable_reason(
 fn read_need_ready_tickets_unanswered(
     ledger_path: Option<&Path>,
     ready_state: Option<&str>,
+    projects: &[String],
     window: &EvalWindow,
 ) -> Result<(usize, Vec<String>), String> {
     let ready_state = ready_state
@@ -1826,6 +1918,13 @@ fn read_need_ready_tickets_unanswered(
         .ok_or_else(|| {
             "eval.json has no ready_state; Linear ready-state history cannot be counted".to_owned()
         })?;
+    if projects.is_empty() {
+        return Err("retro config has no projects for need_ready_tickets actions".into());
+    }
+    let project_names = projects
+        .iter()
+        .map(|project| project.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
     let path = match ledger_path {
         Some(path) => path.to_owned(),
         None => crate::fleet::ledger::default_path().map_err(|error| error.to_string())?,
@@ -1839,6 +1938,10 @@ fn read_need_ready_tickets_unanswered(
             row.get("at_ms")
                 .and_then(serde_json::Value::as_i64)
                 .is_some_and(|at_ms| at_ms >= window.start_ms && at_ms < window.end_ms)
+                && row
+                    .get("project")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|project| project_names.contains(&project.to_ascii_lowercase()))
         })
         .collect::<Vec<_>>();
     if actions.is_empty() {
@@ -2390,6 +2493,44 @@ mod tests {
     }
 
     #[test]
+    #[ix_trace_rs::trace("FR-047-AC-3")]
+    fn trend_uses_rules_scored_in_both_windows_despite_other_unavailable_rules() {
+        let row = |id: &str, status, judgement_required| RuleResult {
+            id: id.into(),
+            query: format!("query.{id}"),
+            status,
+            value: None,
+            comparator: "=".into(),
+            target: 1.0,
+            evidence_refs: Vec::new(),
+            reason: None,
+            rubric_id: None,
+            judgement_required,
+        };
+        let current = [
+            row("A", RuleStatus::Pass, Some(false)),
+            row("B", RuleStatus::Unavailable, Some(false)),
+            row("C", RuleStatus::Fail, Some(false)),
+            row("D", RuleStatus::Pass, Some(false)),
+            row("J", RuleStatus::JudgementRequired, Some(true)),
+        ];
+        let previous = [
+            row("A", RuleStatus::Fail, Some(false)),
+            row("B", RuleStatus::Pass, Some(false)),
+            row("C", RuleStatus::Fail, Some(false)),
+            row("E", RuleStatus::Pass, Some(false)),
+        ];
+        assert_eq!(trend_delta(&current, &previous), (Some(0.5), 2));
+        assert_eq!(
+            trend_delta(
+                &[row("A", RuleStatus::Unavailable, Some(false))],
+                &[row("A", RuleStatus::Pass, Some(false))]
+            ),
+            (None, 0)
+        );
+    }
+
+    #[test]
     #[ix_trace_rs::trace("FR-047-AC-4")]
     fn evaluator_settings_keep_defaults_and_scope_gate_commands_by_repository() {
         let settings: EvalSettings = serde_json::from_str(
@@ -2810,7 +2951,8 @@ mod tests {
             .execute_batch(
                 "INSERT INTO tick(started_at,committed_at) VALUES(0,0);
                  INSERT INTO action(tick_id,kind,emitted_at,project,requested_count)
-                   VALUES(1,'need_ready_tickets',1000,'Project A',3);",
+                   VALUES(1,'need_ready_tickets',1000,'Project A',3),
+                         (1,'need_ready_tickets',1000,'Project B',2);",
             )
             .unwrap();
         drop(connection);
@@ -2834,6 +2976,7 @@ mod tests {
             &specs,
             Some(&path),
             Some("Ready"),
+            &["Project A".into()],
             &EvalWindow {
                 start_ms: due,
                 end_ms: due + 1,
