@@ -182,6 +182,9 @@ fn issue(id: &str, parent: Option<&str>, category: WorkflowStateType) -> Issue {
         updated_at: None,
         attachment_urls: vec![],
         attachments_complete: true,
+        started_at: None,
+        completed_at: None,
+        pull_requests: Vec::new(),
     }
 }
 
