@@ -15,6 +15,7 @@ pub mod ledger;
 pub mod live;
 mod render;
 mod report;
+pub mod tick;
 
 pub use classify::{
     Class, ClassKind, Classification, Evidence, HookEvent, HookKind, LaneInput, Thresholds,
@@ -42,6 +43,9 @@ pub enum FleetError {
     /// The ledger could not be read.
     #[error("fleet ledger: {0}")]
     Ledger(String),
+    /// The tick could not evaluate the fleet and committed nothing.
+    #[error("fleet tick could not evaluate: {0}")]
+    Tick(String),
 }
 
 /// A source that could not be read; the text is the defect reason.

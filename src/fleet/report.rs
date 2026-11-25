@@ -122,9 +122,6 @@ pub struct ExpiredOrder {
     pub addr: String,
     /// Whether a `Delivered` receipt exists; `false` is `timed_out`.
     pub delivered: bool,
-    /// The order is `timed_out` and its `Delivered` receipt may sit in a part of the history the
-    /// relay did not record or no longer retains.
-    pub gap_spanned: bool,
 }
 
 /// An `AckExpired` receipt whose recipient queue has no registered lane address.
@@ -143,9 +140,13 @@ pub struct ReceiptRead {
     pub orders: Vec<ExpiredOrder>,
     /// Expired orders whose recipient has no lane address.
     pub unresolved: Vec<UnresolvedOrder>,
-    /// Coverage limits of the history (recording gap, pending observation, evicted range). A
-    /// `timed_out` derived while any exists may be a lost `Delivered` receipt.
-    pub gaps: Vec<String>,
+    /// The relay says qualifying expired orders may be missing from `orders` (more exist than it
+    /// returned, its scan bound was hit or its index dropped live rows).
+    pub truncated: bool,
+    /// Rows the relay could not decode; they are not in `orders`.
+    pub skipped: u64,
+    /// The relay has not run its first expiry scan, so it lists no order yet.
+    pub index_not_started: bool,
 }
 
 /// Watcher series by host (Prometheus HTTP API).
@@ -216,8 +217,6 @@ pub enum DefectKind {
     UnreadableSource,
     /// A lane's host registry lease expired.
     StaleHostRegistry,
-    /// The relay receipt history has a recording gap, a pending observation or an evicted range.
-    ReceiptsRecordingGap,
     /// The fleet ledger could not be opened or written; the rest of the report stands.
     LedgerUnwritable,
 }
@@ -266,9 +265,6 @@ pub struct LaneRow {
     pub focus: Option<String>,
     /// The class used the documented relay defaults because the relay thresholds were not read.
     pub thresholds_defaulted: bool,
-    /// The lane is `STALE-ORDER` as `timed_out` while the receipt history has a coverage gap, so
-    /// a `Delivered` receipt may have been lost.
-    pub receipt_gap: bool,
     /// Evidence schema version.
     pub schema_version: u32,
 }
@@ -700,15 +696,35 @@ pub fn build_report(cfg: &FleetConfig, sources: &Sources<'_>, local_now_ms: i64)
         }
     };
     let orders = &read.orders;
-    if !read.gaps.is_empty() {
+    if read.index_not_started {
         ctx.defect(
-            DefectKind::ReceiptsRecordingGap,
+            DefectKind::UnreadableSource,
+            "relay.receipts",
+            None,
+            None,
+            "the relay has not indexed expired orders yet; a STALE-ORDER lane may be missing"
+                .to_owned(),
+        );
+    }
+    if read.truncated {
+        ctx.defect(
+            DefectKind::UnreadableSource,
+            "relay.receipts",
+            None,
+            None,
+            "the relay's expired-order list is truncated; a STALE-ORDER lane may be missing"
+                .to_owned(),
+        );
+    }
+    if read.skipped > 0 {
+        ctx.defect(
+            DefectKind::UnreadableSource,
             "relay.receipts",
             None,
             None,
             format!(
-                "receipt history is not complete ({}); a timed_out order may have lost its Delivered receipt",
-                read.gaps.join(", ")
+                "{} expired-order rows could not be decoded by the relay; a STALE-ORDER lane may be missing",
+                read.skipped
             ),
         );
     }
@@ -850,10 +866,6 @@ pub fn build_report(cfg: &FleetConfig, sources: &Sources<'_>, local_now_ms: i64)
             compile_seconds: series.and_then(|s| s.compile_seconds.get(&key).copied()),
             focus: None,
             thresholds_defaulted: defaulted,
-            receipt_gap: result.class.kind == ClassKind::StaleOrder
-                && orders
-                    .iter()
-                    .any(|o| o.addr.to_lowercase() == key && !o.delivered && o.gap_spanned),
             schema_version: SCHEMA_VERSION,
         });
     }

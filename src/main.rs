@@ -193,6 +193,12 @@ enum FleetCommand {
         #[arg(long, default_value = "5m", value_parser = parse_duration)]
         deadline: u64,
     },
+    /// Evaluate the fleet once and emit the minder's action list; records the tick in the ledger.
+    Tick {
+        /// Address of the session running the tick, recorded with it.
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// Read the fleet ledger.
     Ledger {
         #[command(subcommand)]
@@ -438,6 +444,7 @@ enum Output {
     Fleet(ix_board::fleet::FleetReport),
     FleetLedger(ix_board::fleet::ledger::LedgerRows),
     FleetAssign(ix_board::fleet::assign::AssignReport),
+    FleetTick(ix_board::fleet::tick::TickOutput),
     Retro(retro::Record),
     RetroDelta(retro::DeltaReport),
     RetroBackfill(retro::BackfillReport),
@@ -548,6 +555,7 @@ fn main() -> std::process::ExitCode {
             }
             std::process::ExitCode::from(match error {
                 Error::Assign(ref assign) if assign.operational() => Outcome::Internal,
+                Error::Fleet(ix_board::fleet::FleetError::Tick(_)) => Outcome::Internal,
                 Error::InvalidTeam
                 | Error::InvalidQuery
                 | Error::ProjectNotFound { .. }
@@ -584,6 +592,7 @@ fn output_outcome(output: &Output) -> Outcome {
         Output::FleetAssign(report) if report.confirmed() => Outcome::Ok,
         Output::FleetAssign(report) if report.operational_failure() => Outcome::Internal,
         Output::FleetAssign(_) => Outcome::Partial,
+        Output::FleetTick(tick) if !tick.complete => Outcome::Partial,
         Output::Agents(report) => match report.coverage() {
             ix_board::agents::Coverage::Complete => Outcome::Ok,
             ix_board::agents::Coverage::Partial => Outcome::Partial,
@@ -715,6 +724,11 @@ fn run(command: Command) -> Result<Output, Error> {
         Command::Fleet {
             command: FleetCommand::Status,
         } => run_fleet_status().map(Output::Fleet),
+        Command::Fleet {
+            command: FleetCommand::Tick { session },
+        } => ix_board::fleet::tick::run(ix_board::settings_value()?.as_ref(), session.as_deref())
+            .map(Output::FleetTick)
+            .map_err(Error::Fleet),
         Command::Fleet {
             command:
                 FleetCommand::Assign {
@@ -1427,6 +1441,7 @@ fn render_human(output: &Output) -> String {
         Output::Fleet(report) => ix_board::fleet::render_text(report),
         Output::FleetAssign(report) => ix_board::fleet::assign::render_text(report),
         Output::FleetLedger(rows) => rows.render_text(),
+        Output::FleetTick(tick) => tick.render_text(),
         Output::Retro(record) => retro::render_text(record),
         Output::RetroDelta(report) => retro::render_delta_text(report),
         Output::RetroBackfill(report) => retro::render_backfill_text(report),

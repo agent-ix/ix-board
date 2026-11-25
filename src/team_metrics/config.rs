@@ -21,6 +21,9 @@ fn interval() -> u64 {
 fn tracker_interval() -> u64 {
     300
 }
+fn tick_interval() -> u64 {
+    300
+}
 
 /// Runtime configuration, with no credential values in the wire payload.
 #[derive(Clone, Debug, Deserialize)]
@@ -44,6 +47,12 @@ pub struct Config {
     /// Tracker/VCS polling interval, in seconds.
     #[serde(default = "tracker_interval")]
     pub tracker_interval_seconds: u64,
+    /// Fleet ledger whose last committed `fleet tick` the exporter serves (FR-038); unset serves none.
+    #[serde(default)]
+    pub fleet_ledger: Option<PathBuf>,
+    /// The configured `fleet tick` interval; a tick older than twice this is not served.
+    #[serde(default = "tick_interval")]
+    pub fleet_tick_interval_seconds: u64,
     /// At most four explicitly monitored scopes within the initial 1,000-series budget.
     pub scopes: Vec<ScopeConfig>,
 }
@@ -120,6 +129,7 @@ impl Config {
             || self.retention_seconds > 604800
             || !(10..=60).contains(&self.activity_interval_seconds)
             || !(60..=3600).contains(&self.tracker_interval_seconds)
+            || self.fleet_tick_interval_seconds == 0
         {
             return Err(Error::Invalid(
                 "invalid retention, storage budget or polling interval",
