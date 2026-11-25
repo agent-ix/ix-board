@@ -25,11 +25,13 @@ an error naming the value, before it checks the number of snapshot records. When
 fewer than two snapshot records exist, the command SHALL
 report that no delta exists and exit zero.
 
-Each metric in the delta output SHALL include its catalog `class` from FR-024 and,
-when the metric also appears in the FR-029 department catalog, its
-`department_class`. The snapshot records used by delta SHALL persist the same
-fields on each metric. Readers SHALL accept older stored metrics that omit these
-fields; delta SHALL resolve their classes from the current catalogs.
+The `ix-board retro delta` command SHALL include each metric's family from the
+FR-024 catalog as `class` in the delta output, and SHALL include the FR-029
+department catalog class as `department_class` when that metric has a department
+definition. When a stored metric has no class metadata, `ix-board retro delta`
+SHALL resolve these output fields from the current catalogs. The
+`ix-board::retro::decode_saved_report` reader SHALL accept earlier delta JSON
+that omits `class` and `department_class`.
 
 For a metric with direction `up` or `down`, the command SHALL set `regressing`
 when the change since the previous record moved against the direction in each of
@@ -53,7 +55,8 @@ print no single combined health score.
 | FR-027-AC-6 | The command makes no network request: it is run with source readers that fail the test if invoked, and still succeeds from the store alone. | Test |
 | FR-027-AC-7 | A backfill run after a snapshot leaves the snapshot as the latest record, and a backfilled record can serve as the baseline. | Test |
 | FR-027-AC-8 | A `baseline_taken_at` matching no record stops the command with an error naming the value. | Test |
-| FR-027-AC-9 | Snapshot records and delta output include each metric's FR-024 catalog class and, where defined, FR-029 department class; older records without either field decode and delta resolves the class from the catalogs. | Test |
+| FR-027-AC-9 | `ix-board retro delta` output includes each metric's FR-024 catalog family as `class` and the FR-029 department class as `department_class` where defined, resolving both from catalogs when stored metrics omit class metadata. | Test |
+| FR-027-AC-10 | `ix-board::retro::decode_saved_report` decodes delta JSON written before the `class` and `department_class` output fields existed. | Test |
 
 ## Dependencies
 

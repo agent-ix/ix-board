@@ -544,8 +544,6 @@ fn review_round1_decision_waiters_have_nonzero_scoped_deduplicated_native_oracle
             id.into(),
             crate::retro::Metric {
                 id: id.into(),
-                class: None,
-                department_class: None,
                 status: Status::Ok,
                 value: Some(value),
                 unit: unit.into(),
