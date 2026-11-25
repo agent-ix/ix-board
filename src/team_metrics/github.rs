@@ -16,13 +16,15 @@ use std::time::{Duration, Instant};
 pub(super) const TTL_MS: i64 = 900_000;
 const HOUR_MS: i64 = 3_600_000;
 pub(super) const MAX_BODY: usize = 1024 * 1024;
-const MAX_REQUESTS: i64 = 40;
+// Leave ten percent of GitHub's documented 5,000-point user/hour primary
+// GraphQL allowance for other clients; each attempt reserves 25 points.
+const MAX_REQUESTS: i64 = 180;
 // Fixed selections expose at most 50 PR nodes and two one-item timeline
 // connections per PR (or 25 flat linked PR aliases). Reserve 25 points even
 // though GitHub's documented connection calculation yields a few points.
 const RESERVED_COST: i64 = 25;
-const MAX_COST: i64 = 1000;
-const MAX_PAGES: usize = 4;
+const MAX_COST: i64 = 4500;
+const MAX_PAGES: usize = 10;
 const MAX_OLD: usize = 50;
 const MAX_REPOS: usize = 32;
 pub(super) const MAX_QUERY: usize = 16 * 1024;
@@ -550,7 +552,7 @@ impl<T: Transport> SelectedGithub<T> {
             let mut variables = BTreeMap::new();
             if open_more {
                 fields.push(format!(
-                    "open: pullRequests(first: 50, states: [OPEN], after: $openAfter, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{ {PR_FIELDS} }}"
+                    "open: pullRequests(first: 100, states: [OPEN], after: $openAfter, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{ {PR_FIELDS} }}"
                 ));
                 variables.insert(
                     "openAfter".to_owned(),
@@ -559,7 +561,7 @@ impl<T: Transport> SelectedGithub<T> {
             }
             if closed_more {
                 fields.push(format!(
-                    "recent: pullRequests(first: 50, states: [MERGED, CLOSED], after: $recentAfter, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{ {PR_FIELDS} }}"
+                    "recent: pullRequests(first: 100, states: [MERGED, CLOSED], after: $recentAfter, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{ {PR_FIELDS} }}"
                 ));
                 variables.insert(
                     "recentAfter".to_owned(),
@@ -1087,7 +1089,7 @@ mod tests {
         let cfg = config(dir.path());
         let fake = Fake::new(|_, _| Ok(response("{}".into())));
         let guard = open(&cfg, fake.clone()).unwrap();
-        for n in 0..40 {
+        for n in 0..usize::try_from(MAX_REQUESTS).unwrap() {
             guard
                 .request_at(&request(n, false), 1000, valid_json)
                 .unwrap();
@@ -1096,16 +1098,20 @@ mod tests {
         let guard = open(&cfg, fake.clone()).unwrap();
         assert!(
             guard
-                .request_at(&request(41, false), 1001, valid_json)
+                .request_at(
+                    &request(usize::try_from(MAX_REQUESTS).unwrap() + 1, false),
+                    1001,
+                    valid_json,
+                )
                 .is_err()
         );
-        assert_eq!(fake.count(), 40);
+        assert_eq!(fake.count(), usize::try_from(MAX_REQUESTS).unwrap());
         let cost: i64 = guard
             .db
             .borrow()
             .query_row("SELECT sum(cost) FROM github_sends", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(cost, 1000);
+        assert_eq!(cost, MAX_COST);
     }
 
     #[trace("FR-033-AC-12")]
@@ -1605,11 +1611,11 @@ mod tests {
         let cfg = config(dir.path());
         let fake = Fake::new(|_, _| Ok(response("{}".into())));
         let guard = open(&cfg, fake.clone()).unwrap();
-        for n in 0..40 {
+        for n in 0..MAX_REQUESTS {
             guard
                 .request_at(
-                    &request(n, false),
-                    1000 + i64::try_from(n).unwrap() * 1000,
+                    &request(usize::try_from(n).unwrap(), false),
+                    1000 + n * 1000,
                     valid_json,
                 )
                 .unwrap();
@@ -1617,19 +1623,31 @@ mod tests {
         drop(guard);
         let guard = open(&cfg, fake.clone()).unwrap();
         guard
-            .request_at(&request(40, false), HOUR_MS + 2000, valid_json)
+            .request_at(
+                &request(usize::try_from(MAX_REQUESTS).unwrap(), false),
+                HOUR_MS + 2000,
+                valid_json,
+            )
             .unwrap();
         guard
-            .request_at(&request(41, false), HOUR_MS + 2000, valid_json)
+            .request_at(
+                &request(usize::try_from(MAX_REQUESTS).unwrap() + 1, false),
+                HOUR_MS + 2000,
+                valid_json,
+            )
             .unwrap();
         assert!(
             guard
-                .request_at(&request(42, false), HOUR_MS + 2000, valid_json)
+                .request_at(
+                    &request(usize::try_from(MAX_REQUESTS).unwrap() + 2, false),
+                    HOUR_MS + 2000,
+                    valid_json
+                )
                 .is_err()
         );
         assert_eq!(
             fake.count(),
-            42,
+            usize::try_from(MAX_REQUESTS).unwrap() + 2,
             "only the first two charges have aged out of the rolling hour"
         );
 
@@ -1746,9 +1764,13 @@ mod tests {
         );
         fake.namespace = "first".into();
         let guard = open(&cfg, fake.clone()).unwrap();
-        for n in 0..40 {
+        for n in 0..MAX_REQUESTS {
             guard
-                .request_at(&request(n, false), 1000, valid_json)
+                .request_at(
+                    &request(usize::try_from(n).unwrap(), false),
+                    1000,
+                    valid_json,
+                )
                 .unwrap();
         }
         drop(guard);
@@ -1761,7 +1783,7 @@ mod tests {
         );
         assert_eq!(
             fake.count(),
-            40,
+            usize::try_from(MAX_REQUESTS).unwrap(),
             "account switches cannot reset shared request accounting"
         );
     }
@@ -1771,7 +1793,7 @@ mod tests {
     fn the_fortieth_actual_http_attempt_cannot_hide_an_extra_redirect_send() {
         use super::super::github_http::tests::{Fixture, reply};
         let server = Fixture::start(|n, _| {
-            if n == 40 {
+            if n == usize::try_from(MAX_REQUESTS).unwrap() {
                 reply(302, "Location: /again\r\n", "{}")
             } else {
                 reply(200, "", "{}")
@@ -1782,20 +1804,34 @@ mod tests {
         let http = Http::fixture(&server.endpoint, "offline-credential").unwrap();
         let clock = Arc::new(TestClock(std::sync::atomic::AtomicI64::new(1000)));
         let guard = Guard::with_clock(&cfg, http, clock).unwrap();
-        for n in 0..39 {
+        for n in 0..usize::try_from(MAX_REQUESTS - 1).unwrap() {
             guard.request(&request(n, false), valid_json).unwrap();
         }
-        assert!(guard.request(&request(39, false), valid_json).is_err());
-        assert!(guard.request(&request(40, false), valid_json).is_err());
+        assert!(
+            guard
+                .request(
+                    &request(usize::try_from(MAX_REQUESTS - 1).unwrap(), false),
+                    valid_json
+                )
+                .is_err()
+        );
+        assert!(
+            guard
+                .request(
+                    &request(usize::try_from(MAX_REQUESTS).unwrap(), false),
+                    valid_json
+                )
+                .is_err()
+        );
         let ledger: i64 = guard
             .db
             .borrow()
             .query_row("SELECT count(*) FROM github_sends", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(ledger, 40);
+        assert_eq!(ledger, MAX_REQUESTS);
         assert_eq!(
             server.finish().len(),
-            40,
+            usize::try_from(MAX_REQUESTS).unwrap(),
             "wire requests, including redirects, must match admitted debits"
         );
     }

@@ -36,6 +36,10 @@ pub struct ScopeState {
     pub(crate) record: Option<Record>,
     pub(crate) pr_stats: Option<super::pr_stats::PrStats>,
     pub(crate) review_stats: Option<super::reviews::ReviewStats>,
+    #[serde(default)]
+    pub(crate) closures_daily: Option<Vec<usize>>,
+    #[serde(default)]
+    pub(crate) merged_prs_daily: Option<Vec<usize>>,
     pub(crate) pr_success_at_ms: i64,
     pub(crate) review_success_at_ms: i64,
     #[serde(default)]
@@ -50,6 +54,18 @@ pub struct ScopeState {
     pub(crate) lifecycle_ok: bool,
     pub(crate) lifecycle_success_at_ms: i64,
     pub(crate) population_observed: bool,
+    #[serde(default)]
+    pub(crate) relay_leads_expected: usize,
+    #[serde(default)]
+    pub(crate) relay_leads_observed: usize,
+    #[serde(default)]
+    pub(crate) relay_leads_not_running: usize,
+    #[serde(default)]
+    pub(crate) execution_observed_count: usize,
+    #[serde(default)]
+    pub(crate) execution_working_count: usize,
+    #[serde(default)]
+    pub(crate) execution_observed_at_ms: i64,
     pub(crate) unattributed_executing_agents: usize,
     pub(crate) covered_seconds: f64,
     pub(crate) effort_points: Vec<(i64, f64, f64)>,

@@ -5,7 +5,7 @@ use super::history::CommandHistory;
 use super::timeline::{ExecutionSample, Member};
 use super::{Config, Error, Event, History, Journal, ScopeState, State};
 use crate::retro::sources::{AgentSource, GithubSource, LinearSource};
-use crate::{WorkflowStateType, WorkspaceSnapshot, retro};
+use crate::{Issue, Project, ProjectStatusCategory, WorkflowStateType, WorkspaceSnapshot, retro};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A completed tracker refresh, passed across a bounded worker channel.
@@ -23,6 +23,8 @@ struct TrackerResult {
     resolved_selectors: super::Selectors,
     pr_stats: Option<super::pr_stats::PrStats>,
     review_stats: Option<super::reviews::ReviewStats>,
+    closures_daily: Option<Vec<usize>>,
+    merged_prs_daily: Option<Vec<usize>>,
     github_at_ms: i64,
 }
 
@@ -138,6 +140,46 @@ impl Collector {
     }
     /// Polls the installed relay command and lifecycle sources on their own cadence.
     pub fn activity(&mut self, now: i64) -> Result<(), Error> {
+        let mut lead_observations = BTreeMap::new();
+        let mut lead_population_complete = true;
+        for scope in &mut self.config.scopes {
+            if !scope.derive_leads_from_relay {
+                continue;
+            }
+            let Some(team) = scope.selectors.team.as_deref() else {
+                lead_population_complete = false;
+                continue;
+            };
+            match discover_relay_leads(team) {
+                Ok(leads) if !leads.is_empty() => match observe_live_leads(team, &leads) {
+                    Ok(observation) => {
+                        let complete = observation.expected > 0 && observation.coverage() >= 0.95;
+                        scope.leads = observation.live.clone();
+                        lead_population_complete &= complete;
+                        lead_observations.insert(
+                            scope.key(),
+                            (
+                                observation.expected,
+                                observation.observed,
+                                observation.not_running,
+                            ),
+                        );
+                    }
+                    Err(error) => {
+                        lead_population_complete = false;
+                        eprintln!("Herdr lead observation for {team}: {error}");
+                    }
+                },
+                Ok(_) => {
+                    lead_population_complete = false;
+                    eprintln!("relay lead directory returned no addresses for {team}");
+                }
+                Err(error) => {
+                    lead_population_complete = false;
+                    eprintln!("relay lead directory for {team}: {error}");
+                }
+            }
+        }
         self.state.quota_frontier = crate::default_cache_path()
             .ok()
             .and_then(|path| super::quota_frontier::read(&path, now).ok());
@@ -191,9 +233,10 @@ impl Collector {
         }
         let mut samples = Vec::new();
         // A missing machine keeps the healthy machines' rows but makes coverage partial.
-        let complete = result
-            .as_ref()
-            .is_ok_and(|report| report.missing_hosts.is_empty());
+        let complete = lead_population_complete
+            && result
+                .as_ref()
+                .is_ok_and(|report| report.missing_hosts.is_empty());
         if let Ok(report) = result {
             for missing in &report.missing_hosts {
                 eprintln!(
@@ -265,6 +308,54 @@ impl Collector {
             now,
             complete && self.state.history_ok,
         );
+        let execution_counts = self
+            .config
+            .scopes
+            .iter()
+            .map(|scope| {
+                let key = scope.key();
+                let not_running = lead_observations
+                    .get(&key)
+                    .map(|(_, _, not_running)| *not_running)
+                    .unwrap_or_default();
+                let observed_sessions: Vec<_> = scope
+                    .leads
+                    .iter()
+                    .filter_map(|lead| {
+                        self.state
+                            .scopes
+                            .get(&key)?
+                            .bindings
+                            .get(&lead.to_lowercase())
+                    })
+                    .filter_map(|binding| {
+                        samples.iter().find(|sample| {
+                            sample.machine == binding.machine && sample.session == binding.session
+                        })
+                    })
+                    .collect();
+                let observed = not_running + observed_sessions.len();
+                let working = observed_sessions
+                    .iter()
+                    .filter(|sample| sample.working)
+                    .count();
+                (key, observed, working)
+            })
+            .collect::<Vec<_>>();
+        for (key, (expected, observed, not_running)) in lead_observations {
+            if let Some(scope) = self.state.scopes.get_mut(&key) {
+                scope.relay_leads_expected = expected;
+                scope.relay_leads_observed = observed;
+                scope.relay_leads_not_running = not_running;
+            }
+        }
+        for (key, observed, working) in execution_counts {
+            if let Some(scope) = self.state.scopes.get_mut(&key) {
+                scope.execution_observed_count = observed;
+                scope.execution_working_count = working;
+                scope.execution_observed_at_ms = now;
+            }
+        }
         self.journal.checkpoint(&self.state, &[], now)?;
         history
     }
@@ -283,8 +374,16 @@ impl Collector {
             .map(|scope| {
                 let result = (|| {
                     let workspace = workspace.as_ref().map_err(Clone::clone)?;
-                    let summary = crate::select_scope(workspace, &scope.selectors.selection())
-                        .map_err(|e| e.to_string())?;
+                    let mut selection = scope.selectors.selection();
+                    if scope.selectors.current_release_project {
+                        let project = current_release_project(
+                            workspace,
+                            scope.selectors.team.as_deref().unwrap_or_default(),
+                        )?;
+                        selection.projects.push(project.id.0.clone());
+                    }
+                    let summary =
+                        crate::select_scope(workspace, &selection).map_err(|e| e.to_string())?;
                     let resolved_selectors = super::Selectors {
                         team: scope.selectors.team.clone(),
                         initiatives: scope
@@ -296,8 +395,7 @@ impl Collector {
                                     .map_err(|e| e.to_string())
                             })
                             .collect::<Result<_, _>>()?,
-                        projects: scope
-                            .selectors
+                        projects: selection
                             .projects
                             .iter()
                             .map(|s| {
@@ -316,6 +414,7 @@ impl Collector {
                                     .map_err(|e| e.to_string())
                             })
                             .collect::<Result<_, _>>()?,
+                        current_release_project: scope.selectors.current_release_project,
                     };
                     let mut cfg =
                         retro::RetroConfig::load(&scope.retro_config).map_err(|e| e.to_string())?;
@@ -335,6 +434,23 @@ impl Collector {
                         .filter(|i| summary.issue_ids.contains(&i.id))
                         .cloned()
                         .collect();
+                    let closures_daily =
+                        daily_linear_closures(source.as_ref(), &selected, now as f64 / 1000.0);
+                    if scope.selectors.current_release_project {
+                        cfg.gate_tickets = selected
+                            .iter()
+                            .filter(|issue| {
+                                summary.leaf_ids.contains(&issue.id)
+                                    && !matches!(
+                                        issue.state_type,
+                                        WorkflowStateType::Completed
+                                            | WorkflowStateType::Canceled
+                                            | WorkflowStateType::Duplicate
+                                    )
+                            })
+                            .map(|issue| issue.identifier.clone())
+                            .collect();
+                    }
                     let selected_ids: BTreeSet<_> =
                         selected.iter().map(|i| i.identifier.as_str()).collect();
                     let teams: BTreeSet<_> =
@@ -393,13 +509,10 @@ impl Collector {
                     let linear = SelectedLinear {
                         inner: source.as_ref(),
                         snapshot: WorkspaceSnapshot {
-                            issues: selected.clone(),
-                            projects: workspace
-                                .projects
-                                .iter()
-                                .filter(|p| summary.project_ids.contains(&p.id))
-                                .cloned()
-                                .collect(),
+                            // Keep blockers outside the selected release available to the
+                            // path evaluator; RetroConfig still limits project metrics.
+                            issues: workspace.issues.clone(),
+                            projects: workspace.projects.clone(),
                             fetched_at: workspace.fetched_at,
                         },
                     };
@@ -507,7 +620,7 @@ impl Collector {
                     let mut all_prs = Vec::new();
                     let mut successful_repos = 0usize;
                     for repo in &cfg.repos {
-                        match github.pull_requests(repo, now as f64 / 1000.0 - 86400.0) {
+                        match github.pull_requests(repo, now as f64 / 1000.0 - 604800.0) {
                             Ok(rows) => {
                                 successful_repos += 1;
                                 all_prs.extend(rows);
@@ -515,7 +628,10 @@ impl Collector {
                             Err(error) => eprintln!("GitHub evidence for {repo}: {error}"),
                         }
                     }
-                    let all_prs = (successful_repos > 0).then_some(all_prs);
+                    let all_prs = (!cfg.repos.is_empty()
+                        && attachments_complete
+                        && successful_repos == cfg.repos.len())
+                    .then_some(all_prs);
                     let pr_stats = all_prs
                         .as_ref()
                         .filter(|_| github.observed_at() > 0)
@@ -534,20 +650,21 @@ impl Collector {
                             .iter()
                             .map(|p| (format!("{}#{}", p.repo, p.number), p.created_at))
                             .collect();
-                        let mut comments = client.fetch_marker_comments(
-                            "<!-- reviewer ",
-                            "repo=",
-                            Some(now as f64 / 1000.0 - 86400.0),
-                        )?;
+                        let mut comments =
+                            client.fetch_marker_comments("<!-- reviewer ", "repo=", None)?;
                         comments.extend(client.fetch_marker_comments(
                             "<!-- reviewer-dispositions ",
                             "repo=",
-                            Some(now as f64 / 1000.0 - 86400.0),
+                            None,
                         )?);
                         super::reviews::calculate(
                             &comments,
                             &allowed,
                             &created,
+                            &prs.iter()
+                                .filter(|pr| pr.open && !pr.draft)
+                                .map(|pr| format!("{}#{}", pr.repo, pr.number))
+                                .collect(),
                             now as f64 / 1000.0,
                         )
                     })()
@@ -577,6 +694,10 @@ impl Collector {
                         resolved_selectors,
                         pr_stats,
                         review_stats,
+                        closures_daily,
+                        merged_prs_daily: all_prs
+                            .as_ref()
+                            .map(|prs| daily_github_merges(prs, now as f64 / 1000.0)),
                         github_at_ms: github.observed_at(),
                     })
                 })();
@@ -618,6 +739,8 @@ impl Collector {
                     state.record = Some(result.record);
                     state.pr_stats = result.pr_stats;
                     state.review_stats = result.review_stats;
+                    state.closures_daily = result.closures_daily;
+                    state.merged_prs_daily = result.merged_prs_daily;
                     state.github_observed_at_ms = result.github_at_ms;
                     if state.pr_stats.is_some() && result.github_at_ms > 0 {
                         state.pr_success_at_ms = result.github_at_ms;
@@ -647,6 +770,245 @@ impl Collector {
         &self.config
     }
 }
+
+#[derive(serde::Deserialize)]
+struct RelayDirectoryLead {
+    address: String,
+    workspace_label: String,
+}
+
+struct LeadObservation {
+    expected: usize,
+    observed: usize,
+    not_running: usize,
+    live: Vec<String>,
+}
+impl LeadObservation {
+    fn coverage(&self) -> f64 {
+        self.observed as f64 / self.expected.max(1) as f64
+    }
+}
+
+/// Returns the registered addresses in the exact Linear team workspace.
+fn discover_relay_leads(team: &str) -> Result<Vec<String>, String> {
+    let output = super::history::read_history(
+        "agent-msg",
+        &["find", "--json", team],
+        std::time::Duration::from_secs(10),
+    )
+    .map_err(|error| error.to_string())?;
+    let text = std::str::from_utf8(&output).map_err(|_| "relay directory is not UTF-8")?;
+    let mut leads = BTreeSet::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let row: RelayDirectoryLead = serde_json::from_str(line)
+            .map_err(|_| "relay directory returned an invalid lead row")?;
+        if !row.workspace_label.eq_ignore_ascii_case(team) {
+            continue;
+        }
+        if row.address.split(':').count() != 3 || row.address.split(':').any(str::is_empty) {
+            return Err("relay directory returned an invalid address".into());
+        }
+        leads.insert(row.address);
+        if leads.len() > 32 {
+            return Err("relay directory lead count exceeds configured bound".into());
+        }
+    }
+    Ok(leads.into_iter().collect())
+}
+
+/// Classifies relay-directory addresses against complete Herdr snapshots per machine.
+fn observe_live_leads(team: &str, leads: &[String]) -> Result<LeadObservation, String> {
+    let whoami = super::history::read_history(
+        "agent-msg",
+        &["whoami", "--json"],
+        std::time::Duration::from_secs(10),
+    )
+    .map_err(|error| error.to_string())?;
+    let identity: serde_json::Value =
+        serde_json::from_slice(&whoami).map_err(|_| "invalid relay identity")?;
+    let local_host = identity
+        .get("address")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|address| address.split(':').next())
+        .ok_or("relay identity has no server label")?;
+    let mut by_host: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for lead in leads {
+        let mut parts = lead.split(':');
+        let (Some(host), Some(workspace), Some(tab)) = (parts.next(), parts.next(), parts.next())
+        else {
+            return Err("relay directory returned an invalid address".into());
+        };
+        if parts.next().is_some() || workspace.is_empty() || tab.is_empty() {
+            return Err("relay directory returned an invalid address".into());
+        }
+        by_host.entry(host).or_default().push(lead);
+    }
+    let mut observed = 0;
+    let mut not_running = 0;
+    let mut live = Vec::new();
+    for (host, addresses) in by_host {
+        let (program, args): (&str, Vec<&str>) = if host.eq_ignore_ascii_case(local_host) {
+            ("herdr", vec!["api", "snapshot"])
+        } else {
+            ("herdr", vec!["--machine", host, "api", "snapshot"])
+        };
+        let Ok(output) =
+            super::history::read_history(program, &args, std::time::Duration::from_secs(20))
+        else {
+            continue;
+        };
+        let Ok(envelope) = serde_json::from_slice::<serde_json::Value>(&output) else {
+            continue;
+        };
+        let Some(snapshot) = envelope
+            .get("result")
+            .and_then(|result| result.get("snapshot"))
+        else {
+            continue;
+        };
+        let Some(workspaces) = snapshot
+            .get("workspaces")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        let Some(tabs) = snapshot.get("tabs").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        let workspace_labels: BTreeMap<_, _> = workspaces
+            .iter()
+            .filter_map(|workspace| {
+                Some((
+                    workspace.get("workspace_id")?.as_str()?,
+                    workspace.get("label")?.as_str()?,
+                ))
+            })
+            .collect();
+        let team_workspace_present = workspace_labels
+            .values()
+            .any(|label| label.eq_ignore_ascii_case(team));
+        let live_tabs: BTreeSet<_> = tabs
+            .iter()
+            .filter(|tab| {
+                tab.get("pane_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+                    > 0
+            })
+            .filter_map(|tab| {
+                let workspace = workspace_labels.get(tab.get("workspace_id")?.as_str()?)?;
+                let tab_label = tab.get("label")?.as_str()?;
+                Some((*workspace, tab_label))
+            })
+            .collect();
+        for address in addresses {
+            let mut parts = address.split(':');
+            let _host = parts.next();
+            let workspace = parts.next().unwrap_or_default();
+            let tab = parts.next().unwrap_or_default();
+            if !workspace.eq_ignore_ascii_case(team) {
+                continue;
+            }
+            if !team_workspace_present {
+                continue;
+            }
+            observed += 1;
+            if live_tabs
+                .iter()
+                .any(|(w, t)| w.eq_ignore_ascii_case(workspace) && t.eq_ignore_ascii_case(tab))
+            {
+                live.push((*address).to_owned());
+            } else {
+                not_running += 1;
+            }
+        }
+    }
+    live.sort();
+    Ok(LeadObservation {
+        expected: leads.len(),
+        observed,
+        not_running,
+        live,
+    })
+}
+
+/// Selects the only started release project for the team; ambiguity fails closed.
+fn current_release_project<'a>(
+    workspace: &'a WorkspaceSnapshot,
+    team: &str,
+) -> Result<&'a Project, String> {
+    let mut candidates = workspace.projects.iter().filter(|project| {
+        project.status_category == ProjectStatusCategory::Started
+            && project.name.to_ascii_lowercase().contains("release")
+            && project
+                .team_keys
+                .iter()
+                .any(|key| key.0.eq_ignore_ascii_case(team))
+    });
+    let project = candidates
+        .next()
+        .ok_or_else(|| format!("no started release project found for team {team}"))?;
+    if candidates.next().is_some() {
+        return Err(format!(
+            "multiple started release projects found for team {team}"
+        ));
+    }
+    Ok(project)
+}
+
+/// Returns seven UTC-day completion counts only when every selected ticket history is readable.
+fn daily_linear_closures(
+    source: &dyn LinearSource,
+    issues: &[Issue],
+    now: f64,
+) -> Option<Vec<usize>> {
+    let ids = issues
+        .iter()
+        .map(|issue| issue.id.0.clone())
+        .collect::<Vec<_>>();
+    let histories = source.state_histories(&ids);
+    if histories.len() != issues.len() {
+        return None;
+    }
+    let day_now = (now / 86400.0).floor() as i64;
+    let mut counts = vec![0usize; 7];
+    for history in histories {
+        let history = history.ok()?;
+        for change in history {
+            if change.to != Some(WorkflowStateType::Completed)
+                || change.from == Some(WorkflowStateType::Completed)
+                || !change.at.is_finite()
+                || change.at > now
+            {
+                continue;
+            }
+            let days_ago = day_now - (change.at / 86400.0).floor() as i64;
+            if (0..7).contains(&days_ago) {
+                counts[usize::try_from(days_ago).ok()?] += 1;
+            }
+        }
+    }
+    Some(counts)
+}
+
+/// Counts GitHub merge timestamps by UTC day for the trailing seven calendar days.
+fn daily_github_merges(prs: &[crate::retro::sources::PullRequest], now: f64) -> Vec<usize> {
+    let day_now = (now / 86400.0).floor() as i64;
+    let mut counts = vec![0usize; 7];
+    for pr in prs {
+        let Some(merged_at) = pr.merged_at.filter(|at| at.is_finite() && *at <= now) else {
+            continue;
+        };
+        let days_ago = day_now - (merged_at / 86400.0).floor() as i64;
+        if (0..7).contains(&days_ago)
+            && let Ok(index) = usize::try_from(days_ago)
+        {
+            counts[index] += 1;
+        }
+    }
+    counts
+}
+
 fn update_members(
     state: &mut ScopeState,
     new: &BTreeMap<String, Member>,
@@ -808,6 +1170,45 @@ impl LinearSource for SelectedLinear<'_> {
 mod tests {
     use super::*;
     use ix_trace_rs::trace;
+    #[test]
+    fn current_release_selector_requires_one_started_team_release_project() {
+        let project = |id: &str, name: &str, status_category: &str| {
+            serde_json::from_value::<Project>(serde_json::json!({
+                "id": id,
+                "identifier": null,
+                "name": name,
+                "updated_at": null,
+                "description": "",
+                "content": null,
+                "status": "Started",
+                "status_name": null,
+                "status_category": status_category,
+                "priority": 0,
+                "sort_order": 0.0,
+                "target_date": null,
+                "team_keys": ["QSL"],
+                "milestones": [],
+                "initiatives": []
+            }))
+            .unwrap()
+        };
+        let selected = project("release", "FSL alpha release", "started");
+        let planned = project("planned", "QSL next release", "planned");
+        let workspace = WorkspaceSnapshot {
+            projects: vec![selected.clone(), planned],
+            ..Default::default()
+        };
+        assert_eq!(
+            current_release_project(&workspace, "QSL").unwrap().id,
+            selected.id
+        );
+
+        let ambiguous = WorkspaceSnapshot {
+            projects: vec![selected, project("other", "QSL beta release", "started")],
+            ..Default::default()
+        };
+        assert!(current_release_project(&ambiguous, "QSL").is_err());
+    }
     #[trace("FR-033-AC-15")]
     #[test]
     fn execution_samples_ignore_unrelated_partial_git_and_process_sources() {
@@ -853,6 +1254,8 @@ mod tests {
                         resolved_selectors: super::super::Selectors::default(),
                         pr_stats: available.then(|| super::super::pr_stats::calculate(&[], 0.0)),
                         review_stats: None,
+                        closures_daily: None,
+                        merged_prs_daily: None,
                         github_at_ms: github_at,
                     }),
                 )],

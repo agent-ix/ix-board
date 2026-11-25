@@ -38,6 +38,8 @@ pub(crate) const NAMES: &[&str] = &[
 struct ReviewData {
     clean: bool,
     findings: Vec<Finding>,
+    #[serde(default)]
+    mergeable: Option<bool>,
 }
 #[derive(Deserialize)]
 struct Finding {
@@ -58,6 +60,9 @@ struct Review {
     pr: String,
     at: f64,
     clean: bool,
+    mergeable: Option<bool>,
+    repo: String,
+    artifact: String,
     findings: BTreeMap<String, String>,
 }
 
@@ -108,6 +113,7 @@ pub(crate) fn calculate(
     comments: &[MarkerComment],
     allowed: &BTreeSet<String>,
     created: &BTreeMap<String, f64>,
+    open_prs: &BTreeSet<String>,
     now: f64,
 ) -> Result<ReviewStats, String> {
     let mut reviews: BTreeMap<(String, String), Review> = BTreeMap::new();
@@ -137,7 +143,7 @@ pub(crate) fn calculate(
             skipped += 1;
             continue;
         };
-        if at <= now - 86400.0 || at > now {
+        if at > now {
             continue;
         }
         let Some((kind, fields)) = marker_fields(first_line(&comment.body)) else {
@@ -198,6 +204,9 @@ pub(crate) fn calculate(
                     pr: full,
                     at,
                     clean: data.clean,
+                    mergeable: data.mergeable,
+                    repo: (*repo).to_owned(),
+                    artifact: (*artifact).to_owned(),
                     findings,
                 },
             );
@@ -240,8 +249,18 @@ pub(crate) fn calculate(
         ("low".into(), 0),
         ("unknown".into(), 0),
     ]);
+    let mut latest_reviews: BTreeMap<String, &Review> = BTreeMap::new();
     let (mut pending, mut rejected) = (0usize, 0usize);
     for ((repo, id), review) in &reviews {
+        if latest_reviews
+            .get(&review.pr)
+            .is_none_or(|old| review.at > old.at)
+        {
+            latest_reviews.insert(review.pr.clone(), review);
+        }
+        if review.at <= now - 86400.0 {
+            continue;
+        }
         let row = prs
             .entry(review.pr.clone())
             .or_insert((false, false, true, review.at));
@@ -290,9 +309,38 @@ pub(crate) fn calculate(
             "review_prs_with_findings_share_24h".into(),
             prs.values().filter(|p| p.0).count() as f64 / prs.len() as f64,
         );
+    }
+    let reviewed_open: Vec<_> = open_prs
+        .iter()
+        .filter_map(|pr| latest_reviews.get(pr).copied())
+        .collect();
+    let open_review_coverage = if open_prs.is_empty() {
+        1.0
+    } else {
+        reviewed_open.len() as f64 / open_prs.len() as f64
+    };
+    values.insert("pr_changes_requested_coverage".into(), open_review_coverage);
+    if !reviewed_open.is_empty() {
+        let requested = reviewed_open
+            .iter()
+            .filter(|review| {
+                review.mergeable == Some(false)
+                    || review.findings.keys().any(|finding| {
+                        outcomes
+                            .get(&(
+                                review.repo.clone(),
+                                review.artifact.clone(),
+                                finding.clone(),
+                            ))
+                            .is_none_or(|(_, _, disposition)| {
+                                matches!(disposition.outcome.as_str(), "still-open" | "deferred")
+                            })
+                    })
+            })
+            .count();
         values.insert(
             "pr_changes_requested_share".into(),
-            prs.values().filter(|p| p.0).count() as f64 / prs.len() as f64,
+            requested as f64 / reviewed_open.len() as f64,
         );
     }
     if classified > 0 {
@@ -301,18 +349,31 @@ pub(crate) fn calculate(
             prs.values().filter(|p| p.1 && p.2).count() as f64 / classified as f64,
         );
     }
-    let mut delays: Vec<_> = prs
+    let eligible_new_prs = created
+        .values()
+        .filter(|at| **at > now - 86400.0 && **at <= now)
+        .count();
+    let mut delays: Vec<_> = created
         .iter()
-        .filter_map(|(pr, row)| {
-            created
-                .get(pr)
-                .filter(|at| **at > now - 86400.0 && **at <= row.3)
-                .map(|at| row.3 - at)
+        .filter(|(_, at)| **at > now - 86400.0 && **at <= now)
+        .filter_map(|(pr, at)| {
+            prs.get(pr)
+                .filter(|row| row.3 >= *at)
+                .map(|row| row.3 - *at)
         })
         .collect();
     delays.sort_by(f64::total_cmp);
+    let first_review_coverage = if eligible_new_prs == 0 {
+        1.0
+    } else {
+        delays.len() as f64 / eligible_new_prs as f64
+    };
+    values.insert(
+        "new_pr_first_review_coverage_24h".into(),
+        first_review_coverage,
+    );
     values.insert("new_pr_first_review_count_24h".into(), delays.len() as f64);
-    if !delays.is_empty() {
+    if !delays.is_empty() && first_review_coverage >= 0.95 {
         for (name, fraction) in [
             ("new_pr_first_review_median_seconds_24h", 0.5),
             ("new_pr_first_review_p90_seconds_24h", 0.9),
@@ -351,12 +412,19 @@ mod tests {
     #[trace("FR-033-AC-10")]
     #[test]
     fn pending_findings_are_not_fabricated_as_confirmed_or_clean() {
-        let v = calculate(&[review()], &allowed(), &BTreeMap::new(), 100000.0)
-            .unwrap()
-            .values;
+        let v = calculate(
+            &[review()],
+            &allowed(),
+            &BTreeMap::new(),
+            &allowed(),
+            100000.0,
+        )
+        .unwrap()
+        .values;
         assert_eq!(v["review_recorded_prs_24h"], 1.0);
         assert_eq!(v["review_findings_pending_24h"], 1.0);
         assert_eq!(v["review_classifiable_prs_24h"], 0.0);
+        assert_eq!(v["pr_changes_requested_coverage"], 1.0);
         assert_eq!(v["pr_changes_requested_share"], 1.0);
         assert_eq!(v["review_records_skipped_24h"], 0.0);
         assert!(!v.contains_key("review_confirmed_finding_pr_share_24h"));
@@ -380,6 +448,7 @@ mod tests {
             &[review(), review(), rejected, fixed],
             &allowed(),
             &BTreeMap::new(),
+            &allowed(),
             100000.0,
         )
         .unwrap()
@@ -402,6 +471,7 @@ mod tests {
             &[review(), fixed],
             &allowed(),
             &BTreeMap::from([("owner/repo#1".into(), 98000.0)]),
+            &allowed(),
             100000.0,
         )
         .unwrap()
@@ -417,7 +487,7 @@ mod tests {
         r.body =
             "<!-- reviewer repo=owner/repo id=SR-1 pr=repo#1 -->\nHigh severity defect in prose"
                 .into();
-        let v = calculate(&[r], &allowed(), &BTreeMap::new(), 100000.0)
+        let v = calculate(&[r], &allowed(), &BTreeMap::new(), &allowed(), 100000.0)
             .unwrap()
             .values;
         assert_eq!(v["review_records_skipped_24h"], 1.0);
@@ -428,7 +498,7 @@ mod tests {
             "<!-- reviewer repo=owner/repo id=SR-1 pr=repo#1 -->",
             "clean: true\nfindings:\n  - fnd: FND-1\n    severity: high",
         );
-        let v = calculate(&[bad], &allowed(), &BTreeMap::new(), 100000.0)
+        let v = calculate(&[bad], &allowed(), &BTreeMap::new(), &allowed(), 100000.0)
             .unwrap()
             .values;
         assert_eq!(v["review_records_skipped_24h"], 1.0);
@@ -447,6 +517,7 @@ mod tests {
             &[no_id, duplicate, another],
             &allowed(),
             &BTreeMap::new(),
+            &allowed(),
             100000.0,
         )
         .unwrap()
@@ -454,5 +525,53 @@ mod tests {
         assert_eq!(v["review_records_skipped_24h"], 2.0);
         assert_eq!(v["review_recorded_prs_24h"], 1.0);
         assert_eq!(v["pr_changes_requested_share"], 1.0);
+    }
+
+    #[test]
+    fn changes_requested_uses_latest_mergeability_not_the_findings_share() {
+        let not_mergeable = comment(
+            "not-mergeable",
+            99000.0,
+            "<!-- reviewer repo=owner/repo id=SR-2 pr=repo#1 method=rust-review run=b -->",
+            "clean: true\nmergeable: false\nfindings: []",
+        );
+        let open_prs = BTreeSet::from(["owner/repo#1".into(), "owner/repo#2".into()]);
+        let values = calculate(
+            &[not_mergeable],
+            &allowed(),
+            &BTreeMap::new(),
+            &open_prs,
+            100000.0,
+        )
+        .unwrap()
+        .values;
+        assert_eq!(values["pr_changes_requested_share"], 1.0);
+        assert_eq!(values["pr_changes_requested_coverage"], 0.5);
+        assert_eq!(values["review_prs_with_findings_share_24h"], 0.0);
+    }
+
+    #[test]
+    fn changes_requested_share_remains_visible_with_partial_coverage() {
+        let open: BTreeSet<_> = (1..=20)
+            .map(|number| format!("owner/repo#{number}"))
+            .collect();
+        let mut comments = Vec::new();
+        let mut created = BTreeMap::new();
+        for number in 1..=19 {
+            let mergeable = number != 1;
+            let pr = format!("owner/repo#{number}");
+            created.insert(pr, 90_000.0);
+            comments.push(comment(
+                &format!("review-{number}"),
+                99_000.0,
+                &format!("<!-- reviewer repo=owner/repo id=SR-{number} pr=repo#{number} method=rust-review run=a -->"),
+                &format!("clean: true\nfindings: []\nmergeable: {mergeable}"),
+            ));
+        }
+        let values = calculate(&comments, &open, &created, &open, 100_000.0)
+            .unwrap()
+            .values;
+        assert_eq!(values["pr_changes_requested_coverage"], 0.95);
+        assert_eq!(values["pr_changes_requested_share"], 1.0 / 19.0);
     }
 }

@@ -32,6 +32,15 @@ impl Text {
 fn flag(value: bool) -> f64 {
     if value { 1.0 } else { 0.0 }
 }
+
+fn coverage(text: &mut Text, labels: &str, metric: &str, value: f64) -> Result<(), Error> {
+    text.metric(
+        "ix_team_metric_coverage",
+        &format!("{labels},metric=\"{metric}\""),
+        value.clamp(0.0, 1.0),
+        false,
+    )
+}
 const LEGACY: &[(&str, &str, f64)] = &[
     ("path_remaining", "path_remaining", 1.0),
     ("path_closed", "path_closed_24h", 1.0),
@@ -262,8 +271,21 @@ pub fn render(
                 false,
             )?;
         }
-        let executing_agents =
-            life_fresh.then(|| s.samples.values().filter(|v| v.working).count() as f64);
+        let execution_observation_fresh = s.execution_observed_at_ms > 0
+            && (0..=90000).contains(&now.saturating_sub(s.execution_observed_at_ms));
+        let expected_leads = if scope.derive_leads_from_relay {
+            s.relay_leads_expected
+        } else {
+            scope.leads.len()
+        };
+        let execution_coverage = if execution_observation_fresh && expected_leads > 0 {
+            (s.execution_observed_count as f64 / expected_leads as f64).min(1.0)
+        } else {
+            0.0
+        };
+        let executing_agents = (execution_observation_fresh && s.execution_observed_count > 0)
+            .then_some(s.execution_working_count as f64);
+        coverage(&mut out, &labels, "executing_agents", execution_coverage)?;
         out.metric(
             "ix_team_metric_available",
             &format!("{labels},metric=\"executing_agents\""),
@@ -388,6 +410,18 @@ pub fn render(
             } else {
                 oldest.map(|age| age as f64 / 1000.0)
             };
+            let known = active.iter().filter(|a| a.start_known).count();
+            let age_coverage = if active.is_empty() {
+                if age.is_some() { 1.0 } else { 0.0 }
+            } else {
+                known as f64 / active.len() as f64
+            };
+            coverage(
+                &mut out,
+                &labels,
+                &format!("stage_oldest_age_seconds_{stage}"),
+                age_coverage,
+            )?;
             out.metric(
                 "ix_team_metric_available",
                 &format!("{labels},metric=\"stage_oldest_age_seconds\",stage=\"{stage}\""),
@@ -459,6 +493,19 @@ pub fn render(
         ] {
             for name in names {
                 let value = values.filter(|_| tracker_fresh).and_then(|v| v.get(*name));
+                if *name == "pr_changes_requested_share" {
+                    let ratio = values
+                        .and_then(|v| v.get("pr_changes_requested_coverage"))
+                        .copied()
+                        .unwrap_or(0.0);
+                    coverage(&mut out, &labels, name, ratio)?;
+                } else if *name == "new_pr_first_review_median_seconds_24h" {
+                    let ratio = values
+                        .and_then(|v| v.get("new_pr_first_review_coverage_24h"))
+                        .copied()
+                        .unwrap_or(0.0);
+                    coverage(&mut out, &labels, name, ratio)?;
+                }
                 let value = value.filter(|_| {
                     !name.starts_with("review_findings_")
                         || values
@@ -501,6 +548,19 @@ pub fn render(
                         (s.totals.get("execution_seconds").unwrap_or(&0.0) - execution) / closures
                     })
             });
+        let effort_coverage = s
+            .effort_points
+            .iter()
+            .rev()
+            .find(|p| p.0 <= now - 86400000 && p.0 >= now - 86700000)
+            .map(|(_, _, covered)| ((s.covered_seconds - covered).max(0.0) / 86400.0).min(1.0))
+            .unwrap_or(0.0);
+        coverage(
+            &mut out,
+            &labels,
+            "effort_per_verified_path_closure_seconds_24h",
+            effort_coverage,
+        )?;
         out.metric(
             "ix_team_metric_available",
             &format!("{labels},metric=\"effort_per_verified_path_closure_seconds_24h\""),
@@ -517,6 +577,44 @@ pub fn render(
                 value,
                 false,
             )?;
+        }
+        for days_ago in 0..7 {
+            let closures = tracker_fresh
+                .then_some(s.closures_daily.as_ref())
+                .flatten()
+                .and_then(|values| values.get(days_ago));
+            let merges = github_fresh
+                .then_some(s.merged_prs_daily.as_ref())
+                .flatten()
+                .and_then(|values| values.get(days_ago));
+            coverage(
+                &mut out,
+                &labels,
+                &format!("closures_day_{days_ago}"),
+                flag(closures.is_some()),
+            )?;
+            coverage(
+                &mut out,
+                &labels,
+                &format!("merged_prs_day_{days_ago}"),
+                flag(merges.is_some()),
+            )?;
+            if let Some(value) = closures {
+                out.metric(
+                    "ix_team_closures_day",
+                    &format!("{labels},days_ago=\"{days_ago}\""),
+                    *value as f64,
+                    false,
+                )?;
+            }
+            if let Some(value) = merges {
+                out.metric(
+                    "ix_team_merged_prs_day",
+                    &format!("{labels},days_ago=\"{days_ago}\""),
+                    *value as f64,
+                    false,
+                )?;
+            }
         }
         if tracker_fresh && let Some(seconds) = s.build_execution_seconds_24h {
             out.metric(

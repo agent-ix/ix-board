@@ -27,6 +27,7 @@ fn config(path: &std::path::Path) -> Config {
                 ..Default::default()
             },
             leads: vec!["draco:QSL:code".into()],
+            derive_leads_from_relay: false,
             herdr_teams: vec!["QSL".into()],
             retro_config: path.join("retro.json"),
         }],
@@ -365,6 +366,64 @@ fn unsupported_journal_and_unknown_config_fields_are_refused() {
     assert!(config.validate().is_ok());
 }
 
+#[test]
+fn current_release_and_relay_lead_discovery_can_replace_static_config_lists() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config(dir.path());
+    let scope = &mut config.scopes[0];
+    scope.leads.clear();
+    scope.derive_leads_from_relay = true;
+    scope.selectors.current_release_project = true;
+    assert!(config.validate().is_ok());
+    let selectors: Selectors =
+        serde_json::from_str(r#"{"team":"QSL","current_release_project":true}"#).unwrap();
+    assert!(selectors.current_release_project);
+}
+
+#[test]
+fn low_relay_lead_coverage_publishes_partial_execution_value_and_exposes_ratio() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config(dir.path());
+    config.scopes[0].derive_leads_from_relay = true;
+    let mut state = state(&config);
+    let scope = state.scopes.get_mut("factory:completion").unwrap();
+    scope.relay_leads_expected = 2;
+    scope.relay_leads_observed = 1;
+    scope.execution_observed_count = 1;
+    scope.execution_working_count = 1;
+    scope.execution_observed_at_ms = 1_000;
+    let text = render(&config, &state, 0, 1_000).unwrap();
+    assert!(text.contains(
+        "ix_team_metric_coverage{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\",metric=\"executing_agents\"} 0.5"
+    ));
+    assert!(text.contains(
+        "ix_team_executing_agents{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\"} 1"
+    ));
+}
+
+#[test]
+fn daily_velocity_emits_seven_days_with_day_labels_and_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(dir.path());
+    let mut state = state(&config);
+    let scope = state.scopes.get_mut("factory:completion").unwrap();
+    scope.tracker_ok = true;
+    scope.tracker_at_ms = 1_000;
+    scope.github_observed_at_ms = 1_000;
+    scope.closures_daily = Some(vec![0, 1, 2, 3, 4, 5, 6]);
+    scope.merged_prs_daily = Some(vec![6, 5, 4, 3, 2, 1, 0]);
+    let text = render(&config, &state, 0, 1_000).unwrap();
+    assert!(text.contains(
+        "ix_team_closures_day{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\",days_ago=\"0\"} 0"
+    ));
+    assert!(text.contains(
+        "ix_team_merged_prs_day{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\",days_ago=\"6\"} 0"
+    ));
+    assert!(text.contains(
+        "ix_team_metric_coverage{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\",metric=\"closures_day_6\"} 1"
+    ));
+}
+
 /// Provenance: SWM-181; scalar throughput snapshots retain gauge semantics.
 #[trace("FR-033-AC-5")]
 #[test]
@@ -565,6 +624,8 @@ fn team_series_have_linear_team_labels_and_explicit_empty_population_status() {
     scope.lifecycle_ok = true;
     scope.lifecycle_success_at_ms = 100_000;
     scope.population_observed = true;
+    scope.execution_observed_count = 1;
+    scope.execution_observed_at_ms = 100_000;
     let text = render(&config, &state, 0, 100_000).unwrap();
 
     assert!(text.contains("team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\""));
