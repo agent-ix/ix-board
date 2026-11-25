@@ -2797,6 +2797,12 @@ fn apply_transcript_dispatch_joins(
     };
     let complete_code_lead_coverage = transcript_id_column_present == &Ok(true)
         && inventory.complete
+        // `session_turn` has no separate coverage marker. Empty history therefore cannot
+        // establish that missing dispatch evidence means no dispatch occurred.
+        && inventory
+            .turns
+            .iter()
+            .any(|turn| turn.session_role == "code-lead")
         && inventory.turns.iter().all(|turn| {
             turn.session_role != "code-lead"
                 || turn.started_at_ms < window.start_ms
@@ -4564,6 +4570,47 @@ mod tests {
 
         assert_eq!(evidence[0].reviewer_or_dispatch_by_deadline, Some(true));
         assert_eq!(evidence[0].reviewer_or_dispatch_by_window_end, Some(true));
+    }
+
+    #[trace("FR-047-AC-5")]
+    #[test]
+    fn retro_eval_keeps_empty_transcript_history_unavailable_for_dispatch() {
+        use super::apply_transcript_dispatch_joins;
+        use ix_board::retro::eval::EvalWindow;
+        use ix_board::retro::eval::github_rules::PullRequestEvidence;
+        use ix_board::retro::eval::transcript::TranscriptInventory;
+        use std::collections::BTreeMap;
+
+        let at_ms = 1_700_000_000_000_i64;
+        let mut evidence = vec![PullRequestEvidence {
+            repository: "agent-ix/ix-board".to_owned(),
+            number: 42,
+            url: "https://github.com/agent-ix/ix-board/pull/42".to_owned(),
+            ready_at_ms: Some(at_ms),
+            ..Default::default()
+        }];
+        let window = EvalWindow {
+            start_ms: at_ms,
+            end_ms: at_ms + 7_200_000,
+        };
+        let empty_inventory = TranscriptInventory {
+            turns: Vec::new(),
+            transcripts: BTreeMap::new(),
+            complete: true,
+            unavailable_reasons: Vec::new(),
+        };
+
+        apply_transcript_dispatch_joins(
+            &mut evidence,
+            &Ok(empty_inventory),
+            &Ok(true),
+            at_ms - 1,
+            &window,
+            1,
+        );
+
+        assert_eq!(evidence[0].reviewer_or_dispatch_by_deadline, None);
+        assert_eq!(evidence[0].reviewer_or_dispatch_by_window_end, None);
     }
 
     #[trace("FR-047-AC-9")]
