@@ -70,3 +70,14 @@ Plan completion: not assessed. Matrix: FR-047-AC-7 tagged; AC-1 to AC-6 and AC-8
 | FND-005 | still-open | AC-8 remains untagged. |
 | FND-006 | still-open | No test exercises the composed command adapter assembly. |
 | FND-007 | still-open | The requested `_lead-bin` shell-script replacement remains outside this diff. |
+
+### Round 3
+
+Reviewed head: `81e2852d82a2c128fdb3e5f8c05fc2a7d58f6811`. No semantic product-code changes since round 2.
+
+| FND | Outcome | Reason |
+| --- | --- | --- |
+| FND-001 | still-open | Relay/transcript adapters remain absent from command assembly. |
+| FND-005 | still-open | AC-8 remains untagged. |
+| FND-006 | still-open | No composed-command integration test was added. |
+| FND-007 | still-open | The `_lead-bin` script replacement remains absent. |

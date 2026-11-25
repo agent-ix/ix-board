@@ -110,3 +110,14 @@ Ticket: SWM-221. Code review with the rust-review lane folded in, of PR agent-ix
 | FND-020 | fixed | `source_specs` is now derived before presentation filters, so `--role` does not reduce source selection. |
 | FND-021 | still-open | This change does not wire relay or transcript reducers into `run_retro_eval`; their rules remain unavailable even with source data. |
 | FND-022 | fixed | `cargo clippy --workspace --all-targets --all-features -- -D warnings` passes on this head. |
+
+### Round 3
+
+Reviewed head: `81e2852d82a2c128fdb3e5f8c05fc2a7d58f6811`. The only product-code change since round 2 is rustfmt layout in `src/fleet/ledger/mod.rs`; no semantic behavior changed.
+
+| FND | Outcome | Reason |
+| --- | --- | --- |
+| FND-001 | still-open | No evaluator-wide deadline was added. |
+| FND-002 | still-open | Linear history queries remain without a shared request budget. |
+| FND-008 | still-open | Lane-order rows remain unscoped. |
+| FND-021 | still-open | Relay/transcript adapters remain unintegrated. |

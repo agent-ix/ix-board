@@ -58,3 +58,12 @@ Ticket: SWM-221. Base spec review of the new FR-047 against the ticket, dev-team
 | --- | --- | --- |
 | FND-004 | still-open | The spec still leaves the accepted duration maximum and total runtime/response bounds unstated. |
 | FND-005 | still-open | The spec still lacks a query-by-query method, unit and window registry. |
+
+### Round 3
+
+Reviewed head: `81e2852d82a2c128fdb3e5f8c05fc2a7d58f6811`. No spec changes since round 2.
+
+| FND | Outcome | Reason |
+| --- | --- | --- |
+| FND-004 | still-open | Duration maximum and total runtime/response bounds remain unspecified. |
+| FND-005 | still-open | The query/unit/window registry remains undefined in the spec. |

@@ -45,3 +45,12 @@ Ticket: SWM-221. EARS grammar conformance of FR-047 description and behaviour st
 | --- | --- | --- |
 | FND-001 | still-open | Compound SHALL obligations remain in the Description. |
 | FND-002 | still-open | Behavior remains descriptive and “bounded duration” remains unbounded. |
+
+### Round 3
+
+Reviewed head: `81e2852d82a2c128fdb3e5f8c05fc2a7d58f6811`. No spec changes since round 2.
+
+| FND | Outcome | Reason |
+| --- | --- | --- |
+| FND-001 | still-open | Compound SHALL clauses remain. |
+| FND-002 | still-open | Descriptive behavior and unbounded duration remain. |
