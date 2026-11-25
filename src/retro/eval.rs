@@ -2465,43 +2465,6 @@ fn ready_ticket_after_action(
     })
 }
 
-#[implements("FR-047-AC-1")]
-fn read_ledger_view(
-    ledger_path: Option<&Path>,
-    view: &str,
-    id_field: &str,
-    window: &EvalWindow,
-) -> Result<(usize, Vec<String>), String> {
-    let path = match ledger_path {
-        Some(path) => path.to_owned(),
-        None => crate::fleet::ledger::default_path().map_err(|error| error.to_string())?,
-    };
-    let rows = crate::fleet::ledger::query(&path, view, None).map_err(|error| error.to_string())?;
-    let mut evidence = Vec::new();
-    for row in rows.rows {
-        let Some(at_ms) = row.get("at_ms").and_then(serde_json::Value::as_i64) else {
-            return Err(format!("fleet ledger {view} row has no integer at_ms"));
-        };
-        if at_ms < window.start_ms || at_ms >= window.end_ms {
-            continue;
-        }
-        let id = row
-            .get(id_field)
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| {
-                row.get(id_field)
-                    .and_then(serde_json::Value::as_i64)
-                    .map(|value| value.to_string())
-            })
-            .ok_or_else(|| format!("fleet ledger {view} row has no scalar {id_field}"))?;
-        evidence.push(format!("fleet-ledger:{view}:{id}"));
-    }
-    evidence.sort();
-    evidence.dedup();
-    Ok((evidence.len(), evidence))
-}
-
 fn read_merged_prs(
     repositories: &[String],
     window: &EvalWindow,
@@ -3539,40 +3502,6 @@ mod tests {
                 evidence_refs: vec!["fleet-ledger:need_ready_tickets_due:1".into()],
             }
         );
-    }
-
-    #[test]
-    #[trace("FR-047-AC-1")]
-    fn lane_order_ledger_view_accepts_text_order_id() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("ledger.sqlite3");
-        let config = crate::fleet::FleetConfig {
-            ledger_path: Some(path.clone()),
-            ..Default::default()
-        };
-        drop(crate::fleet::ledger::Ledger::open(&path, &config).unwrap());
-        let connection = rusqlite::Connection::open(&path).unwrap();
-        connection
-            .execute(
-                "INSERT INTO order_focus_at_deadline(order_id,sender_role,sender_addr,lane,expect_ticket,deadline_at,outcome)
-                 VALUES('ord-abc','orchestrator','server:workspace:tab','server:workspace:lane','SWM-1',150,'confirmed')",
-                [],
-            )
-            .unwrap();
-        drop(connection);
-
-        let (count, evidence) = read_ledger_view(
-            Some(&path),
-            "lane_orders_due",
-            "order_id",
-            &EvalWindow {
-                start_ms: 100,
-                end_ms: 200,
-            },
-        )
-        .unwrap();
-        assert_eq!(count, 1);
-        assert_eq!(evidence, ["fleet-ledger:lane_orders_due:ord-abc"]);
     }
 
     #[test]

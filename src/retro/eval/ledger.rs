@@ -703,6 +703,36 @@ mod tests {
     }
 
     #[test]
+    #[trace("FR-047-AC-1")]
+    fn lane_order_view_keeps_text_order_ids_as_evidence() {
+        let views = BTreeMap::from([(
+            "lane_orders_due".to_owned(),
+            Ok(vec![row(&[
+                ("order_id", Value::from("ord-abc")),
+                ("at_ms", Value::from(150)),
+                ("available", Value::from(1)),
+            ])]),
+        )]);
+        let result = adapters(
+            &[spec("ledger.lane_orders_due")],
+            &views,
+            &EvalWindow {
+                start_ms: 100,
+                end_ms: 200,
+            },
+            Ok(()),
+            Ok(()),
+        );
+        assert_eq!(
+            result["ledger.lane_orders_due"],
+            QueryValue::Value {
+                value: 1.0,
+                evidence_refs: vec!["fleet-ledger:lane_orders_due:ord-abc".to_owned()],
+            }
+        );
+    }
+
+    #[test]
     #[trace("FR-047-AC-6")]
     fn source_failure_and_missing_view_are_unavailable_not_zero() {
         let views = BTreeMap::from([(
