@@ -3790,7 +3790,7 @@ mod tests {
                 live[&format!("retro.{metric_id}")],
                 QueryValue::Value {
                     value,
-                    evidence_refs: vec![format!("retro:{metric_id}:2026-11-14T22:13:20Z").into()],
+                    evidence_refs: vec![format!("retro:{metric_id}:2026-11-14T22:13:20Z")],
                 },
                 "{metric_id}"
             );
