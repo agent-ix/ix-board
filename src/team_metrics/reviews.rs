@@ -49,6 +49,8 @@ struct Finding {
 }
 #[derive(Deserialize)]
 struct DispositionData {
+    #[serde(default)]
+    mergeable: Option<bool>,
     dispositions: Vec<Disposition>,
 }
 #[derive(Clone, Deserialize)]
@@ -61,9 +63,6 @@ struct Review {
     pr: String,
     at: f64,
     clean: bool,
-    mergeable: Option<bool>,
-    repo: String,
-    artifact: String,
     findings: BTreeMap<String, String>,
 }
 
@@ -120,6 +119,7 @@ pub(crate) fn calculate(
 ) -> Result<ReviewStats, String> {
     let mut reviews: BTreeMap<(String, String), Review> = BTreeMap::new();
     let mut outcomes: BTreeMap<(String, String, String), (u64, f64, Disposition)> = BTreeMap::new();
+    let mut latest_records = BTreeMap::<String, (f64, Option<bool>)>::new();
     let mut seen = BTreeSet::new();
     let mut skipped = 0usize;
     // Resolve attributed review artifacts before their dispositions, regardless
@@ -203,19 +203,24 @@ pub(crate) fn calculate(
             reviews.insert(
                 key,
                 Review {
-                    pr: full,
+                    pr: full.clone(),
                     at,
                     clean: data.clean,
-                    mergeable: data.mergeable,
-                    repo: (*repo).to_owned(),
-                    artifact: (*artifact).to_owned(),
                     findings,
                 },
             );
-        } else if kind == "reviewer-dispositions" {
-            if !reviews.contains_key(&((*repo).to_string(), (*artifact).to_string())) {
-                continue;
+            if latest_records
+                .get(&full)
+                .is_none_or(|(old_at, _)| at > *old_at)
+            {
+                latest_records.insert(full, (at, data.mergeable));
             }
+        } else if kind == "reviewer-dispositions" {
+            let artifact_key = ((*repo).to_string(), (*artifact).to_string());
+            let Some(review) = reviews.get(&artifact_key) else {
+                continue;
+            };
+            let pr = review.pr.clone();
             let Some(round) = fields.get("round").and_then(|r| r.parse::<u64>().ok()) else {
                 skipped += 1;
                 continue;
@@ -232,6 +237,12 @@ pub(crate) fn calculate(
             }) {
                 skipped += 1;
                 continue;
+            }
+            if latest_records
+                .get(&pr)
+                .is_none_or(|(old_at, _)| at > *old_at)
+            {
+                latest_records.insert(pr, (at, data.mergeable));
             }
             for d in data.dispositions {
                 let key = ((*repo).to_string(), (*artifact).to_string(), d.fnd.clone());
@@ -289,6 +300,31 @@ pub(crate) fn calculate(
             }
         }
     }
+    let mut latest_finding_state = BTreeMap::<(String, String), (u64, f64, bool)>::new();
+    for ((repo, artifact), review) in &reviews {
+        for fnd in review.findings.keys() {
+            let disposition = outcomes.get(&(repo.clone(), artifact.clone(), fnd.clone()));
+            let (round, at, unresolved) = match disposition {
+                Some((round, at, disposition)) => (
+                    *round,
+                    *at,
+                    matches!(disposition.outcome.as_str(), "still-open" | "deferred"),
+                ),
+                None => (0, review.at, true),
+            };
+            let key = (review.pr.clone(), fnd.clone());
+            if latest_finding_state
+                .get(&key)
+                .is_none_or(|old| (at, round) > (old.1, old.0))
+            {
+                latest_finding_state.insert(key, (round, at, unresolved));
+            }
+        }
+    }
+    let unresolved_prs = latest_finding_state
+        .into_iter()
+        .filter_map(|((pr, _), (_, _, unresolved))| unresolved.then_some(pr))
+        .collect::<BTreeSet<_>>();
     let mut values = BTreeMap::new();
     values.insert("review_records_skipped_24h".into(), skipped as f64);
     let classified = prs.values().filter(|p| p.2).count();
@@ -326,18 +362,10 @@ pub(crate) fn calculate(
         let requested = reviewed_open
             .iter()
             .filter(|review| {
-                review.mergeable == Some(false)
-                    || review.findings.keys().any(|finding| {
-                        outcomes
-                            .get(&(
-                                review.repo.clone(),
-                                review.artifact.clone(),
-                                finding.clone(),
-                            ))
-                            .is_none_or(|(_, _, disposition)| {
-                                matches!(disposition.outcome.as_str(), "still-open" | "deferred")
-                            })
-                    })
+                latest_records
+                    .get(&review.pr)
+                    .is_some_and(|(_, mergeable)| *mergeable == Some(false))
+                    || unresolved_prs.contains(&review.pr)
             })
             .count();
         values.insert(
@@ -552,6 +580,54 @@ mod tests {
         assert_eq!(values["pr_changes_requested_share"], 1.0);
         assert_eq!(values["pr_changes_requested_coverage"], 0.5);
         assert_eq!(values["review_prs_with_findings_share_24h"], 0.0);
+    }
+
+    #[test]
+    fn later_clean_review_does_not_hide_an_unresolved_older_finding() {
+        let older = comment(
+            "older",
+            98_000.0,
+            "<!-- reviewer repo=owner/repo id=SR-older pr=repo#1 method=rust-review run=a -->",
+            "clean: false\nfindings:\n  - fnd: FND-1\n    severity: high\nmergeable: true",
+        );
+        let newer = comment(
+            "newer",
+            99_000.0,
+            "<!-- reviewer repo=owner/repo id=SR-newer pr=repo#1 method=rust-review run=b -->",
+            "clean: true\nfindings: []\nmergeable: true",
+        );
+        let open = allowed();
+        let values = calculate(&[older, newer], &open, &BTreeMap::new(), &open, 100_000.0)
+            .unwrap()
+            .values;
+        assert_eq!(values["pr_changes_requested_share"], 1.0);
+    }
+
+    #[test]
+    fn latest_disposition_mergeability_marks_the_open_pr() {
+        let review = comment(
+            "review",
+            98_000.0,
+            "<!-- reviewer repo=owner/repo id=SR-1 pr=repo#1 method=rust-review run=a -->",
+            "clean: true\nfindings: []\nmergeable: true",
+        );
+        let disposition = comment(
+            "disposition",
+            99_000.0,
+            "<!-- reviewer-dispositions repo=owner/repo id=SR-1 round=1 run=b -->",
+            "mergeable: false\ndispositions: []",
+        );
+        let open = allowed();
+        let values = calculate(
+            &[review, disposition],
+            &open,
+            &BTreeMap::new(),
+            &open,
+            100_000.0,
+        )
+        .unwrap()
+        .values;
+        assert_eq!(values["pr_changes_requested_share"], 1.0);
     }
 
     #[trace("FR-033-AC-17")]

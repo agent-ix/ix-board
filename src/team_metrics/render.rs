@@ -673,11 +673,11 @@ pub fn render(
             )?;
         }
         for days_ago in 0..7 {
-            let closures = tracker_fresh
+            let closures = (tracker_fresh && s.closures_daily_coverage > 0.0)
                 .then_some(s.closures_daily.as_ref())
                 .flatten()
                 .and_then(|values| values.get(days_ago));
-            let merges = github_fresh
+            let merges = (github_fresh && s.merged_prs_daily_coverage > 0.0)
                 .then_some(s.merged_prs_daily.as_ref())
                 .flatten()
                 .and_then(|values| values.get(days_ago));
@@ -685,13 +685,21 @@ pub fn render(
                 &mut out,
                 &labels,
                 &format!("closures_day_{days_ago}"),
-                flag(closures.is_some()),
+                if closures.is_some() {
+                    s.closures_daily_coverage
+                } else {
+                    0.0
+                },
             )?;
             coverage(
                 &mut out,
                 &labels,
                 &format!("merged_prs_day_{days_ago}"),
-                flag(merges.is_some()),
+                if merges.is_some() {
+                    s.merged_prs_daily_coverage.min(s.github_repo_coverage)
+                } else {
+                    0.0
+                },
             )?;
             if let Some(value) = closures {
                 out.metric(

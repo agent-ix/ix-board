@@ -28,6 +28,8 @@ struct TrackerResult {
     review_stats_reason: Option<String>,
     closures_daily_reason: Option<String>,
     merged_prs_daily_reason: Option<String>,
+    closures_daily_coverage: f64,
+    merged_prs_daily_coverage: f64,
     build_execution_seconds_24h: Option<f64>,
     ready_issues: Option<usize>,
     blocked_issues: Option<usize>,
@@ -43,6 +45,12 @@ struct TrackerResult {
     effort_range_reason: Option<String>,
     github_repo_coverage: f64,
     github_at_ms: i64,
+}
+
+struct DailyClosureResult {
+    values: Vec<usize>,
+    coverage: f64,
+    reason: Option<String>,
 }
 
 const REVIEW_MARKER_PAGE_BUDGET: usize = 1;
@@ -716,11 +724,13 @@ impl Collector {
                     let (record, record_reason) = latest_retro_record(&cfg.team, now);
                     let mut all_prs = Vec::new();
                     let mut successful_repos = 0usize;
+                    let mut successful_repo_names = BTreeSet::new();
                     let mut github_errors = Vec::new();
                     for repo in &cfg.repos {
                         match github.pull_requests(repo, now as f64 / 1000.0 - 604800.0) {
                             Ok(rows) => {
                                 successful_repos += 1;
+                                successful_repo_names.insert(repo.clone());
                                 all_prs.extend(rows);
                             }
                             Err(error) => {
@@ -739,17 +749,38 @@ impl Collector {
                         .as_ref()
                         .filter(|_| github.observed_at() > 0)
                         .map(|prs| super::pr_stats::calculate(prs, now as f64 / 1000.0));
-                    let (closures_daily, closures_daily_reason) =
+                    let (closures_daily, mut closures_daily_reason, closures_daily_coverage) =
                         match daily_verified_linear_closures(
                             source.as_ref(),
                             &closure_candidates,
                             &github,
                             &cfg.repos,
+                            &successful_repo_names,
+                            &verified_closure_history_path()?,
                             now as f64 / 1000.0,
                         ) {
-                            Ok(values) => (Some(values), None),
-                            Err(reason) => (None, Some(reason)),
+                            Ok(result) if result.coverage > 0.0 => {
+                                (Some(result.values), result.reason, result.coverage)
+                            }
+                            Ok(result) => (
+                                None,
+                                result.reason.or_else(|| {
+                                    Some(
+                                        "no configured repository or issue history is covered"
+                                            .to_owned(),
+                                    )
+                                }),
+                                0.0,
+                            ),
+                            Err(reason) => (None, Some(reason), 0.0),
                         };
+                    if !github_errors.is_empty() {
+                        let reason = github_errors.join("; ");
+                        closures_daily_reason = Some(match closures_daily_reason {
+                            Some(existing) => format!("{existing}; {reason}"),
+                            None => reason,
+                        });
+                    }
                     let pr_stats_reason = pr_stats.is_none().then(|| {
                         if !github_errors.is_empty() {
                             github_errors.join("; ")
@@ -768,10 +799,7 @@ impl Collector {
                                 .iter()
                                 .map(|p| format!("{}#{}", p.repo, p.number))
                                 .collect();
-                            let created = prs
-                                .iter()
-                                .map(|p| (format!("{}#{}", p.repo, p.number), p.created_at))
-                                .collect();
+                            let created = first_review_population(prs);
                             let refreshed = sync_review_markers(
                                 &client,
                                 &config.state_path,
@@ -853,10 +881,12 @@ impl Collector {
                         review_stats,
                         closures_daily,
                         closures_daily_reason,
+                        closures_daily_coverage,
                         merged_prs_daily: all_prs
                             .as_ref()
                             .map(|prs| daily_github_merges(prs, now as f64 / 1000.0)),
                         merged_prs_daily_reason: pr_stats_reason.clone(),
+                        merged_prs_daily_coverage: github_repo_coverage,
                         pr_stats_reason,
                         review_stats_reason,
                         linear_stage_ages,
@@ -909,6 +939,8 @@ impl Collector {
                     state.review_stats_reason = result.review_stats_reason;
                     state.closures_daily_reason = result.closures_daily_reason;
                     state.merged_prs_daily_reason = result.merged_prs_daily_reason;
+                    state.closures_daily_coverage = result.closures_daily_coverage;
+                    state.merged_prs_daily_coverage = result.merged_prs_daily_coverage;
                     state.pr_stats = result.pr_stats;
                     state.review_stats = result.review_stats;
                     state.closures_daily = result.closures_daily;
@@ -956,6 +988,7 @@ pub(super) struct PrometheusLeadStatus {
 pub(super) struct PrometheusSample {
     pub(super) labels: BTreeMap<String, String>,
     pub(super) timestamp_seconds: f64,
+    pub(super) value: f64,
 }
 
 #[implements("FR-033-AC-16")]
@@ -968,12 +1001,33 @@ fn read_prometheus_status(teams: &BTreeSet<String>) -> Result<PrometheusLeadStat
         .map(|team| format!(".*:{}:.*", regex_escape(team)))
         .collect::<Vec<_>>()
         .join("|");
-    let lane_query = format!("timestamp(ix_fleet_lane_state_ratio{{lane=~\"{lane_filter}\"}})");
-    Ok(PrometheusLeadStatus {
-        lane_status: parse_prometheus_samples(
-            &client.query(&lane_query).map_err(|e| e.to_string())?,
-        )?,
-    })
+    let lane_query = format!("ix_fleet_lane_state_ratio{{lane=~\"{lane_filter}\"}}");
+    let values = client.query(&lane_query).map_err(|e| e.to_string())?;
+    let timestamps = client
+        .query(&format!("timestamp({lane_query})"))
+        .map_err(|e| e.to_string())?;
+    let lane_status = join_prometheus_samples(&values, &timestamps)?;
+    Ok(PrometheusLeadStatus { lane_status })
+}
+
+pub(super) fn join_prometheus_samples(
+    values_body: &str,
+    timestamps_body: &str,
+) -> Result<Vec<PrometheusSample>, String> {
+    let values = parse_prometheus_samples(values_body)?;
+    let timestamps = parse_prometheus_samples(timestamps_body)?
+        .into_iter()
+        .map(|sample| (sample.labels, sample.value))
+        .collect::<BTreeMap<_, _>>();
+    values
+        .into_iter()
+        .map(|mut sample| {
+            sample.timestamp_seconds = *timestamps
+                .get(&sample.labels)
+                .ok_or_else(|| "Prometheus timestamp query omitted a lane series".to_owned())?;
+            Ok(sample)
+        })
+        .collect()
 }
 
 #[implements("FR-033-AC-16")]
@@ -1033,7 +1087,8 @@ fn parse_prometheus_samples(body: &str) -> Result<Vec<PrometheusSample>, String>
             }
             Ok(PrometheusSample {
                 labels,
-                timestamp_seconds: value,
+                timestamp_seconds: evaluation_seconds,
+                value,
             })
         })
         .collect()
@@ -1057,7 +1112,7 @@ pub(super) fn classify_team_lanes(
     team: &str,
     now_ms: i64,
 ) -> (usize, usize, usize) {
-    let mut latest = BTreeMap::<String, &PrometheusSample>::new();
+    let mut latest = BTreeMap::<String, (f64, BTreeSet<String>, bool)>::new();
     for sample in &status.lane_status {
         let Some(lane) = sample.labels.get("lane") else {
             continue;
@@ -1072,40 +1127,75 @@ pub(super) fn classify_team_lanes(
             continue;
         }
         let key = lane.to_ascii_lowercase();
-        if latest
-            .get(&key)
-            .is_none_or(|previous| sample.timestamp_seconds > previous.timestamp_seconds)
-        {
-            latest.insert(key, sample);
+        let Some(state) = sample.labels.get("state") else {
+            continue;
+        };
+        if sample.value <= 0.0 {
+            continue;
+        }
+        match latest.get_mut(&key) {
+            Some((timestamp, states, fresh)) if sample.timestamp_seconds > *timestamp => {
+                *timestamp = sample.timestamp_seconds;
+                states.clear();
+                states.insert(state.clone());
+                *fresh = status_is_fresh(sample, now_ms);
+            }
+            Some((timestamp, states, fresh)) if sample.timestamp_seconds == *timestamp => {
+                states.insert(state.clone());
+                *fresh |= status_is_fresh(sample, now_ms);
+            }
+            Some(_) => {}
+            None => {
+                latest.insert(
+                    key,
+                    (
+                        sample.timestamp_seconds,
+                        BTreeSet::from([state.clone()]),
+                        status_is_fresh(sample, now_ms),
+                    ),
+                );
+            }
         }
     }
     let expected = latest.len();
     let mut observed = 0;
     let mut working = 0;
-    for sample in latest.into_values() {
-        if status_is_fresh(sample, now_ms) {
+    for (_, states, fresh) in latest.into_values() {
+        if fresh && states.len() == 1 {
             observed += 1;
-            working += usize::from(sample.labels.get("state").is_some_and(|s| s == "working"));
+            working += usize::from(states.contains("working"));
         }
     }
     (expected, observed, working)
 }
 
+fn first_review_population(prs: &[retro::sources::PullRequest]) -> BTreeMap<String, f64> {
+    prs.iter()
+        .filter(|pr| !pr.draft)
+        .map(|pr| (format!("{}#{}", pr.repo, pr.number), pr.created_at))
+        .collect()
+}
+
 /// Counts verified path closures by UTC day from retained Linear histories and configured repos.
+fn verified_closure_history_path() -> Result<PathBuf, String> {
+    let cache_path = match std::env::var_os("IX_BOARD_CACHE_PATH") {
+        Some(path) => PathBuf::from(path),
+        None => crate::default_cache_path().map_err(|error| error.to_string())?,
+    };
+    Ok(cache_path.with_extension("verified-closure-histories.json"))
+}
+
 #[implements("FR-033-AC-18")]
 fn daily_verified_linear_closures(
     source: &dyn LinearSource,
     issues: &[Issue],
     github: &dyn GithubSource,
     repos: &[String],
+    successful_repos: &BTreeSet<String>,
+    cache_path: &std::path::Path,
     now: f64,
-) -> Result<Vec<usize>, String> {
-    let cache_path = match std::env::var_os("IX_BOARD_CACHE_PATH") {
-        Some(path) => PathBuf::from(path),
-        None => crate::default_cache_path().map_err(|error| error.to_string())?,
-    }
-    .with_extension("verified-closure-histories.json");
-    let mut cache: BTreeMap<String, ClosureHistoryCache> = std::fs::read(&cache_path)
+) -> Result<DailyClosureResult, String> {
+    let mut cache: BTreeMap<String, ClosureHistoryCache> = std::fs::read(cache_path)
         .ok()
         .filter(|bytes| bytes.len() <= REVIEW_MARKER_STORE_LIMIT)
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
@@ -1131,7 +1221,7 @@ fn daily_verified_linear_closures(
     if fetched.len() != missing.len() {
         return Err("Linear returned a different number of path histories than requested".into());
     }
-    let mut fetch_errors = Vec::new();
+    let mut history_errors = Vec::new();
     for (issue, history) in missing.into_iter().zip(fetched) {
         match history {
             Ok(history) => {
@@ -1143,14 +1233,8 @@ fn daily_verified_linear_closures(
                     },
                 );
             }
-            Err(error) => fetch_errors.push(format!("{}: {error}", issue.identifier)),
+            Err(error) => history_errors.push(format!("{}: {error}", issue.identifier)),
         }
-    }
-    if !fetch_errors.is_empty() {
-        return Err(format!(
-            "Linear history unavailable: {}",
-            fetch_errors.join("; ")
-        ));
     }
     let histories = issues
         .iter()
@@ -1159,9 +1243,8 @@ fn daily_verified_linear_closures(
                 .get(&issue.id.0)
                 .filter(|cached| cached.updated_at == issue.updated_at)
                 .map(|cached| cached.history.clone())
-                .ok_or_else(|| format!("no retained Linear history for {}", issue.identifier))
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Vec<_>>();
     let bytes = serde_json::to_vec(&cache).map_err(|error| error.to_string())?;
     if bytes.len() > REVIEW_MARKER_STORE_LIMIT {
         return Err("verified closure history cache exceeds 16 MiB".into());
@@ -1176,13 +1259,18 @@ fn daily_verified_linear_closures(
     std::fs::rename(temporary, cache_path).map_err(|error| error.to_string())?;
     let configured: BTreeSet<_> = repos.iter().map(String::as_str).collect();
     let mut refs = BTreeSet::new();
-    let mut completed_histories = Vec::with_capacity(histories.len());
+    let mut covered_issues = Vec::new();
+    let mut completed_histories = Vec::new();
     for (issue, history) in issues.iter().zip(histories) {
+        let Some(history) = history else {
+            continue;
+        };
         if !issue.attachments_complete {
-            return Err(format!(
-                "Linear PR attachments incomplete for {}",
+            history_errors.push(format!(
+                "{}: Linear PR attachments incomplete",
                 issue.identifier
             ));
+            continue;
         }
         refs.extend(
             issue
@@ -1191,21 +1279,75 @@ fn daily_verified_linear_closures(
                 .filter_map(|url| retro::metrics::pull_request_ref(url))
                 .filter(|(repo, _)| configured.contains(repo.as_str())),
         );
+        covered_issues.push(issue.clone());
         completed_histories.push(history);
     }
-    let mut merged = BTreeSet::new();
+    let mut merged_by_repo = BTreeMap::<String, BTreeSet<u64>>::new();
+    let mut failed_repos = BTreeSet::new();
+    let mut github_errors = Vec::new();
     for (repo, number) in refs {
-        let info = github.pull_request(&repo, number).map_err(|error| {
-            format!(
-                "GitHub verification for {}#{number} unavailable: {error}",
-                repo
-            )
-        })?;
-        if info.merged {
-            merged.insert((repo, number));
+        if !successful_repos.contains(&repo) {
+            failed_repos.insert(repo.clone());
+            continue;
+        }
+        match github.pull_request(&repo, number) {
+            Ok(info) if info.merged => {
+                merged_by_repo.entry(repo).or_default().insert(number);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                failed_repos.insert(repo.clone());
+                github_errors.push(format!("{repo}#{number}: {error}"));
+            }
         }
     }
-    verified_daily_closure_counts(issues, &completed_histories, &merged, &configured, now)
+    let complete_repos = successful_repos
+        .iter()
+        .filter(|repo| !failed_repos.contains(*repo))
+        .collect::<BTreeSet<_>>();
+    let repo_coverage = if configured.is_empty() {
+        0.0
+    } else {
+        complete_repos.len() as f64 / configured.len() as f64
+    };
+    let history_coverage = if issues.is_empty() {
+        1.0
+    } else {
+        covered_issues.len() as f64 / issues.len() as f64
+    };
+    let coverage = repo_coverage.min(history_coverage).clamp(0.0, 1.0);
+    let effective_repos = complete_repos
+        .iter()
+        .map(|repo| repo.as_str())
+        .collect::<BTreeSet<_>>();
+    let merged = merged_by_repo
+        .into_iter()
+        .filter(|(repo, _)| effective_repos.contains(repo.as_str()))
+        .flat_map(|(repo, numbers)| {
+            numbers
+                .into_iter()
+                .map(move |number| (repo.clone(), number))
+        })
+        .collect::<BTreeSet<_>>();
+    let values = verified_daily_closure_counts(
+        &covered_issues,
+        &completed_histories,
+        &merged,
+        &effective_repos,
+        now,
+    )?;
+    let reason = (!history_errors.is_empty() || !github_errors.is_empty()).then(|| {
+        history_errors
+            .into_iter()
+            .chain(github_errors)
+            .collect::<Vec<_>>()
+            .join("; ")
+    });
+    Ok(DailyClosureResult {
+        values,
+        coverage,
+        reason,
+    })
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1558,26 +1700,37 @@ fn prometheus_effort_range(
     let start = end - 86400.0;
     let filter = regex_escape(team);
     let selector = format!("ix_fleet_lane_state_ratio{{lane=~\".*:{filter}:.*\"}}");
-    let working_selector =
-        format!("ix_fleet_lane_state_ratio{{lane=~\".*:{filter}:.*\",state=\"working\"}}");
+    let current_values = client.query(&selector).map_err(|e| e.to_string())?;
+    let current_timestamps = client
+        .query(&format!("timestamp({selector})"))
+        .map_err(|e| e.to_string())?;
+    let expected_hosts = join_prometheus_samples(&current_values, &current_timestamps)?
+        .into_iter()
+        .filter(|sample| status_is_fresh(sample, now_ms))
+        .filter_map(|sample| {
+            sample.labels.get("host").cloned().or_else(|| {
+                sample
+                    .labels
+                    .get("lane")
+                    .and_then(|lane| lane.split(':').next())
+                    .map(str::to_owned)
+            })
+        })
+        .collect::<BTreeSet<_>>();
     let timestamps = client
         .query_range(&format!("timestamp({selector})"), start, end, 60)
         .map_err(|e| e.to_string())?;
-    let working = client
-        .query_range(
-            &format!("{working_selector} * timestamp({working_selector})"),
-            start,
-            end,
-            60,
-        )
+    let values = client
+        .query_range(&selector, start, end, 60)
         .map_err(|e| e.to_string())?;
-    parse_effort_range(&timestamps, &working, start, end)
+    parse_effort_range(&timestamps, &values, &expected_hosts, start, end)
 }
 
 #[implements("FR-033-AC-15")]
 pub(super) fn parse_effort_range(
     timestamp_body: &str,
-    working_body: &str,
+    value_body: &str,
+    expected_hosts: &BTreeSet<String>,
     start_seconds: f64,
     end_seconds: f64,
 ) -> Result<super::timeline::EffortRange, String> {
@@ -1593,7 +1746,7 @@ pub(super) fn parse_effort_range(
             .ok_or_else(|| "Prometheus range response omitted result rows".to_owned())
     }
     let timestamp_rows = rows(timestamp_body)?;
-    let working_rows = rows(working_body)?;
+    let value_rows = rows(value_body)?;
     let first_slot = (start_seconds / 60.0).ceil() as i64;
     let last_slot = (end_seconds / 60.0).floor() as i64;
     let slot_count = usize::try_from(last_slot.saturating_sub(first_slot))
@@ -1601,9 +1754,8 @@ pub(super) fn parse_effort_range(
     if slot_count == 0 || slot_count > 1440 {
         return Err("Prometheus range has invalid one-minute coverage grid".into());
     }
-    let mut expected_hosts = BTreeSet::new();
-    let mut observed_slots = BTreeSet::<(String, String, i64)>::new();
-    let mut working_slots = BTreeSet::<(String, String, i64)>::new();
+    let mut fresh_states = BTreeMap::<(String, String, i64), BTreeSet<String>>::new();
+    let mut active_states = BTreeMap::<(String, String, i64), BTreeSet<String>>::new();
     for row in &timestamp_rows {
         let labels = row
             .get("metric")
@@ -1616,11 +1768,11 @@ pub(super) fn parse_effort_range(
                 .map(str::to_owned)
         };
         let lane = label("lane").ok_or_else(|| "Prometheus range row omitted lane".to_owned())?;
-        let _state = label("state");
+        let state =
+            label("state").ok_or_else(|| "Prometheus range row omitted state".to_owned())?;
         let host = label("host")
             .or_else(|| lane.split(':').next().map(str::to_owned))
             .ok_or_else(|| "Prometheus range row omitted host".to_owned())?;
-        expected_hosts.insert(host.clone());
         let values = row
             .get("values")
             .and_then(serde_json::Value::as_array)
@@ -1642,13 +1794,16 @@ pub(super) fn parse_effort_range(
             if slot < first_slot || slot >= last_slot || evaluated - source_at > 90.0 {
                 continue;
             }
-            observed_slots.insert((host.clone(), lane.clone(), slot));
+            fresh_states
+                .entry((host.clone(), lane.clone(), slot))
+                .or_default()
+                .insert(state.clone());
         }
     }
     if expected_hosts.is_empty() {
-        return Err("no retained QSL lane samples in the trailing day".into());
+        return Err("no current QSL host inventory from Prometheus lane states".into());
     }
-    for row in &working_rows {
+    for row in &value_rows {
         let labels = row
             .get("metric")
             .and_then(serde_json::Value::as_object)
@@ -1660,14 +1815,16 @@ pub(super) fn parse_effort_range(
                 .map(str::to_owned)
         };
         let lane =
-            label("lane").ok_or_else(|| "Prometheus working range row omitted lane".to_owned())?;
+            label("lane").ok_or_else(|| "Prometheus state range row omitted lane".to_owned())?;
+        let state =
+            label("state").ok_or_else(|| "Prometheus state range row omitted state".to_owned())?;
         let host = label("host")
             .or_else(|| lane.split(':').next().map(str::to_owned))
             .ok_or_else(|| "Prometheus working range row omitted host".to_owned())?;
         let values = row
             .get("values")
             .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| "Prometheus working range row omitted values".to_owned())?;
+            .ok_or_else(|| "Prometheus state range row omitted values".to_owned())?;
         for pair in values {
             let Some(pair) = pair.as_array().filter(|pair| pair.len() == 2) else {
                 continue;
@@ -1675,36 +1832,45 @@ pub(super) fn parse_effort_range(
             let Some(evaluated) = pair[0].as_f64() else {
                 continue;
             };
-            let source_at = pair[1]
+            let value = pair[1]
                 .as_f64()
                 .or_else(|| pair[1].as_str().and_then(|s| s.parse::<f64>().ok()));
-            let Some(source_at) = source_at.filter(|at| at.is_finite() && *at > 0.0) else {
+            let Some(value) = value.filter(|value| value.is_finite()) else {
                 continue;
             };
             let slot = (evaluated / 60.0).round() as i64;
-            if slot >= first_slot
-                && slot < last_slot
-                && evaluated - source_at <= 90.0
-                && observed_slots.contains(&(host.clone(), lane.clone(), slot))
-            {
-                working_slots.insert((host.clone(), lane.clone(), slot));
+            if slot >= first_slot && slot < last_slot && value > 0.0 {
+                active_states
+                    .entry((host.clone(), lane.clone(), slot))
+                    .or_default()
+                    .insert(state.clone());
             }
         }
     }
     let mut covered_host_slots = 0usize;
     let mut working_lane_seconds = 0.0;
+    let mut covered_hosts_by_slot = BTreeMap::<i64, BTreeSet<String>>::new();
     for slot in first_slot..last_slot {
-        let mut hosts = BTreeSet::new();
-        for (host, lane, observed_slot) in &observed_slots {
-            if *observed_slot == slot {
-                hosts.insert(host);
+        for (key @ (host, lane, observed_slot), states) in &fresh_states {
+            if *observed_slot != slot {
+                continue;
             }
-            if *observed_slot == slot && working_slots.contains(&(host.clone(), lane.clone(), slot))
-            {
+            let Some(active) = active_states.get(key) else {
+                continue;
+            };
+            if active.len() != 1 || states.is_disjoint(active) {
+                continue;
+            }
+            covered_hosts_by_slot
+                .entry(slot)
+                .or_default()
+                .insert(host.clone());
+            if active.contains("working") {
                 working_lane_seconds += 60.0;
             }
+            let _ = lane;
         }
-        covered_host_slots += hosts.len();
+        covered_host_slots += covered_hosts_by_slot.get(&slot).map_or(0, BTreeSet::len);
     }
     let coverage = covered_host_slots as f64 / (expected_hosts.len() * slot_count) as f64;
     Ok(super::timeline::EffortRange {
@@ -1799,6 +1965,160 @@ fn execution_evidence_usable(
 mod tests {
     use super::*;
     use ix_trace_rs::trace;
+
+    struct ClosureTestLinear {
+        history: Vec<retro::sources::StateChange>,
+    }
+
+    impl retro::sources::LinearSource for ClosureTestLinear {
+        fn workspace(&self, _since: f64) -> Result<WorkspaceSnapshot, String> {
+            Err("not used".into())
+        }
+
+        fn project_open_count(&self, _project: &str) -> Result<usize, String> {
+            Err("not used".into())
+        }
+
+        fn state_history(
+            &self,
+            _issue_id: &str,
+        ) -> Result<Vec<retro::sources::StateChange>, String> {
+            Ok(self.history.clone())
+        }
+
+        fn marker_lines(&self, _prefix: &str, _needle: &str) -> Result<Vec<String>, String> {
+            Err("not used".into())
+        }
+
+        fn open_issues_with_label(
+            &self,
+            _label: &str,
+        ) -> Result<Vec<retro::sources::LabeledIssue>, String> {
+            Err("not used".into())
+        }
+    }
+
+    struct ClosureTestGithub;
+
+    impl retro::sources::GithubSource for ClosureTestGithub {
+        fn pull_requests(
+            &self,
+            _repo: &str,
+            _since: f64,
+        ) -> Result<Vec<retro::sources::PullRequest>, String> {
+            Ok(Vec::new())
+        }
+
+        fn pull_request(
+            &self,
+            repo: &str,
+            _number: u64,
+        ) -> Result<retro::sources::PullRequestInfo, String> {
+            if repo == "owner/bad" {
+                return Err("repository unavailable".into());
+            }
+            Ok(retro::sources::PullRequestInfo {
+                merged: true,
+                updated_at: 100_000.0,
+            })
+        }
+
+        fn main_commits(
+            &self,
+            _repo: &str,
+            _branch: &str,
+            _since: f64,
+        ) -> Result<Vec<retro::sources::MainCommit>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn first_review_population_excludes_draft_pull_requests() {
+        let pull_request = |number, draft| retro::sources::PullRequest {
+            closed_at: None,
+            reopen_events: None,
+            repo: "owner/repo".into(),
+            number,
+            open: true,
+            draft,
+            created_at: 10.0,
+            merged_at: None,
+            updated_at: 10.0,
+            additions: 0,
+            deletions: 0,
+            review_decision: None,
+            force_pushes: None,
+        };
+        let created = first_review_population(&[
+            pull_request(1, false),
+            pull_request(2, true),
+            pull_request(3, false),
+        ]);
+        assert_eq!(
+            created.keys().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from(["owner/repo#1".into(), "owner/repo#3".into()])
+        );
+    }
+
+    #[test]
+    fn daily_closures_keep_successful_repositories_when_one_verification_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let issue = |id: &str, identifier: &str, repo: &str, number: u64| {
+            serde_json::from_value::<Issue>(serde_json::json!({
+                "id": id,
+                "identifier": identifier,
+                "title": "closed path",
+                "description": null,
+                "state": "Done",
+                "state_name": "Done",
+                "state_type": "completed",
+                "parent_id": null,
+                "team_key": "QSL",
+                "assignee_id": null,
+                "assignee_name": null,
+                "project_id": null,
+                "project_milestone_id": null,
+                "priority": 0,
+                "sort_order": 0,
+                "blocked_by": [],
+                "created_at": "2026-11-20T00:00:00Z",
+                "updated_at": "2026-11-25T00:00:00Z",
+                "attachment_urls": [format!("https://github.com/{repo}/pull/{number}")],
+                "attachments_complete": true,
+                "started_at": null,
+                "completed_at": "2026-11-25T00:00:00Z",
+                "pull_requests": []
+            }))
+            .unwrap()
+        };
+        let issues = vec![
+            issue("good", "QSL-1", "owner/good", 1),
+            issue("bad", "QSL-2", "owner/bad", 2),
+        ];
+        let linear = ClosureTestLinear {
+            history: vec![retro::sources::StateChange {
+                at: 99_900.0,
+                from: Some(WorkflowStateType::Started),
+                to: Some(WorkflowStateType::Completed),
+                to_name: Some("Done".into()),
+            }],
+        };
+        let result = daily_verified_linear_closures(
+            &linear,
+            &issues,
+            &ClosureTestGithub,
+            &["owner/good".into(), "owner/bad".into()],
+            &BTreeSet::from(["owner/good".into(), "owner/bad".into()]),
+            &directory.path().join("closure-history.json"),
+            100_000.0,
+        )
+        .unwrap();
+        assert_eq!(result.values[0], 1);
+        assert_eq!(result.coverage, 0.5);
+        assert!(result.reason.unwrap().contains("owner/bad#2"));
+    }
+
     #[trace("FR-033-AC-16")]
     #[test]
     fn linear_stage_age_only_emits_started_workflow_states_with_measurements() {
@@ -1948,6 +2268,8 @@ mod tests {
                         review_stats_reason: None,
                         closures_daily_reason: None,
                         merged_prs_daily_reason: None,
+                        closures_daily_coverage: 0.0,
+                        merged_prs_daily_coverage: 0.0,
                         build_execution_seconds_24h: None,
                         ready_issues: None,
                         blocked_issues: None,

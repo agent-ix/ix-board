@@ -52,6 +52,10 @@ pub struct ScopeState {
     pub(crate) closures_daily: Option<Vec<usize>>,
     #[serde(default)]
     pub(crate) merged_prs_daily: Option<Vec<usize>>,
+    #[serde(default)]
+    pub(crate) closures_daily_coverage: f64,
+    #[serde(default)]
+    pub(crate) merged_prs_daily_coverage: f64,
     pub(crate) pr_success_at_ms: i64,
     pub(crate) review_success_at_ms: i64,
     #[serde(default)]

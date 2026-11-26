@@ -78,9 +78,11 @@ Undefined ratios/distributions and stale values omit their numeric series.
 
 For `executing_agents`, current `ix_fleet_lane_state_ratio` rows whose lane
 workspace label exactly matches the configured Linear team define the observed
-lane population; the latest row per lane classifies it. Only `working` counts
-as executing. A stale or missing feed reduces coverage; a fresh feed whose
-latest state is not `working` observes a non-executing lane. The partial count
+lane population; the latest timestamp per lane classifies it. Only `working`
+counts as executing. If multiple distinct state labels have positive values at
+that timestamp, the lane is uncovered instead of selecting an arbitrary row. A
+stale or missing feed reduces coverage; a fresh unambiguous state other than
+`working` observes a non-executing lane. The partial count
 is published over covered lanes whenever at least one lane is covered. At zero
 coverage the count is unavailable. The gauge
 `ix_team_metric_coverage{team_id,team_key,scope_id,metric}` carries observed over
@@ -97,13 +99,17 @@ coverage gauge. Below 50%, the age is withheld with an unavailable reason. No
 fixed stage set or synthetic stage population is emitted.
 
 `pr_changes_requested_share` uses open, non-draft PRs whose latest Linear review
-marker says `mergeable: false` or retains an open finding as the numerator, over
-open, non-draft PRs with a valid review record as the denominator. Its coverage
+or disposition record says `mergeable: false`, or that retain an unresolved
+finding in any review artifact, as the numerator. A finding remains unresolved
+until a later disposition for that finding marks it fixed, rejected or
+accepted-no-change; a later clean review artifact alone does not clear it. The
+denominator is open, non-draft PRs with a valid review record. Its coverage
 gauge reports reviewed PRs over the full open, non-draft PR population. This is a
 current mergeability share; `review_prs_with_findings_share_24h` is a separate
 24-hour share of PRs with findings in the recent review-record population. The
 first-review median is emitted over covered new non-draft PRs whenever at
-least one is covered; its coverage gauge accompanies the value. The seven-day gauges
+least one is covered; draft PRs are excluded from both its denominator and
+numerator, and its coverage gauge accompanies the value. The seven-day gauges
 `ix_team_merged_prs_day{team_id,team_key,scope_id,days_ago}` and
 `ix_team_closures_day{team_id,team_key,scope_id,days_ago}` have one row per UTC
 calendar day with `days_ago` from 0 through 6. They emit zero only when the full
@@ -128,10 +134,10 @@ was read successfully for the entire cohort.
 | FR-033-AC-12 | Every exporter GitHub read uses shared persistent admission and response caching. A rolling-hour ceiling of 180 sends and 4,500 pessimistically reserved GraphQL points leaves 10% of GitHub's 5,000-point user/hour primary limit for other clients, and survives concurrent workers and restarts. Per-PR REST polling and cache-miss fallbacks are prohibited; historical links use batches of at most 25, with at most 50 older links per repository per collection. Every actual HTTP attempt is admitted once with automatic redirects/retries disabled. Debits and leases use the current admission clock; Retry-After uses the response receipt clock. Server reset/Retry-After cooldowns survive HTTP errors and restart; cooldown or exhausted budget admits zero sends. Unsupported expensive department and commit/check evidence remains explicitly unavailable. | Test |
 | FR-033-AC-13 | Repository state uses at most ten 100-row pages per open/recent cohort; incomplete, malformed, absent or stale evidence cannot certify an empty, clean or unmerged population. Required nullable native fields must be present and PR state/timestamps consistent. Cache representations bind the provider and effective credential; unknown credentials cannot reuse private bodies. Cache hits retain source observation times, conditional 304 responses require an existing valid representation, and stale values are omitted after 15 minutes. Query/output/time and shared SQLite storage limits are enforced: 16 KiB requests, 1 MiB response bodies, 20-second transport deadlines and a 45-second collection admission deadline; response storage is at most one eighth of the journal ceiling capped at 4 MiB and 128 entries, retained at most seven days. | Test |
 | FR-033-AC-14 | The exporter serves the fleet tick gauges from the last committed tick in the fleet ledger, omits them when it is older than twice the tick interval, serves the ready-buffer deficit with bounded labels, and omits each value whose source is unavailable. | Test |
-| FR-033-AC-15 | All scope metrics include `team_key` from the configured Linear selector. Execution counts use fresh classified Prometheus lane status even if unrelated git/process evidence is partial. Effort uses retained Prometheus lane history and verified path closures; missing/stale history publishes availability and coverage without fabricating zero. Linear reviewer markers supply changes-requested share; malformed or duplicate records are skipped and counted. | Test |
+| FR-033-AC-15 | All scope metrics include `team_key` from the configured Linear selector. Execution counts use fresh classified Prometheus lane status even if unrelated git/process evidence is partial; multiple active state labels at the same latest timestamp make that lane uncovered instead of choosing arbitrarily. Effort uses retained Prometheus lane history and verified path closures; expected hosts come from the current QSL lane inventory, including hosts with no samples in the trailing range. Missing/stale history publishes availability and coverage without fabricating zero. Linear reviewer markers supply changes-requested share; malformed or duplicate records are skipped and counted. | Test |
 | FR-033-AC-16 | WIP counts open selected-team issues whose Linear workflow state type is `started`; the gauge is `ix_team_wip_active`. Ready and blocked counts use the selected team issue population. Team lanes are read from current Prometheus status without relay identity. The latest state per exact-team lane classifies `working` as executing and all other fresh states as not executing. Coverage reports observed over expected lanes. Stage age uses open team issues' current Linear state entry times and emits labels only for measured workflow states of type `started`, in lowercase snake case. | Test |
-| FR-033-AC-17 | The changes-requested share uses latest Linear review markers for open, non-draft PRs, with numerator not-mergeable or open-finding records and denominator PRs with valid review records; coverage is reviewed PRs over open non-draft PRs. Marker backfill persists page cursors across refreshes and source failures; subsequent reads filter on native comment update time after a persisted watermark. Per-refresh pages are bounded so steady-state Linear request use remains below 150 requests per hour at the configured tracker cadence. The share and first-review median are published over any nonempty covered population, including partial coverage; first-review coverage accompanies the value. | Test |
-| FR-033-AC-18 | The exporter emits seven daily gauges for merged PRs and verified Linear path closures, with the same bounded team labels and `days_ago` 0..6. Partial configured-source failures lower coverage while preserving values over covered data; zero is emitted only when the covered source has no matching events. | Test |
+| FR-033-AC-17 | The changes-requested share uses latest Linear review/disposition records for open, non-draft PRs, with numerator not-mergeable or unresolved-finding records and denominator PRs with valid review records; coverage is reviewed PRs over open non-draft PRs. Unresolved findings survive later clean reviews until a terminal disposition closes them. Marker backfill persists page cursors across refreshes and source failures; subsequent reads filter on native comment update time after a persisted watermark. Per-refresh pages are bounded so steady-state Linear request use remains below 150 requests per hour at the configured tracker cadence. The share and first-review median are published over any nonempty covered population, including partial coverage; draft PRs are excluded from first-review coverage. | Test |
+| FR-033-AC-18 | The exporter emits seven daily gauges for merged PRs and verified Linear path closures, with the same bounded team labels and `days_ago` 0..6. Partial configured-source failures lower each daily series coverage while preserving values computed from covered repositories and histories; zero is emitted only when the covered source has no matching events. | Test |
 
 ## Dependencies
 

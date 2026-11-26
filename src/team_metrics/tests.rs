@@ -7,7 +7,7 @@ use super::{
 };
 use crate::WorkflowStateType;
 use ix_trace_rs::trace;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 fn config(path: &std::path::Path) -> Config {
     Config {
         version: 1,
@@ -411,6 +411,7 @@ fn team_lane_classification_uses_latest_state_and_exact_workspace() {
                     ("state".into(), "blocked".into()),
                 ]),
                 timestamp_seconds: 100.0,
+                value: 1.0,
             },
             PrometheusSample {
                 labels: BTreeMap::from([
@@ -418,6 +419,7 @@ fn team_lane_classification_uses_latest_state_and_exact_workspace() {
                     ("state".into(), "working".into()),
                 ]),
                 timestamp_seconds: 110.0,
+                value: 1.0,
             },
             PrometheusSample {
                 labels: BTreeMap::from([
@@ -425,12 +427,56 @@ fn team_lane_classification_uses_latest_state_and_exact_workspace() {
                     ("state".into(), "working".into()),
                 ]),
                 timestamp_seconds: 110.0,
+                value: 1.0,
             },
         ],
     };
     assert_eq!(
         super::collect::classify_team_lanes(&status, "QSL", 110_000),
         (1, 1, 1)
+    );
+}
+
+#[test]
+fn prometheus_lane_join_keeps_gauge_value_and_source_timestamp() {
+    let labels = serde_json::json!({
+        "lane": "draco:QSL:arch",
+        "state": "working"
+    });
+    let values = serde_json::json!({
+        "status": "success",
+        "data": {"result": [{"metric": labels.clone(), "value": [200, "1"]}]}
+    })
+    .to_string();
+    let timestamps = serde_json::json!({
+        "status": "success",
+        "data": {"result": [{"metric": labels, "value": [200, "190"]}]}
+    })
+    .to_string();
+    let joined = super::collect::join_prometheus_samples(&values, &timestamps).unwrap();
+    assert_eq!(joined[0].timestamp_seconds, 190.0);
+    assert_eq!(joined[0].value, 1.0);
+}
+
+#[test]
+fn conflicting_fresh_lane_states_are_not_classified() {
+    use super::collect::{PrometheusLeadStatus, PrometheusSample};
+    let status = PrometheusLeadStatus {
+        lane_status: ["working", "blocked"]
+            .into_iter()
+            .map(|state| PrometheusSample {
+                labels: BTreeMap::from([
+                    ("lane".into(), "draco:QSL:arch".into()),
+                    ("state".into(), state.into()),
+                ]),
+                timestamp_seconds: 110.0,
+                value: 1.0,
+            })
+            .collect(),
+    };
+    assert_eq!(
+        super::collect::classify_team_lanes(&status, "QSL", 110_000),
+        (1, 0, 0)
     );
 }
 
@@ -444,15 +490,20 @@ fn retained_lane_range_integrates_working_time_and_host_coverage() {
             {"metric":{"host":"luna","lane":"luna:QSL:code","state":"blocked"},"values":[[960,"960"],[1020,"1020"]]}
         ]}
     }).to_string();
-    let working = serde_json::json!({
+    let values = serde_json::json!({
         "status":"success",
         "data":{"resultType":"matrix","result":[
-            {"metric":{"host":"draco","lane":"draco:QSL:arch","state":"working"},"values":[[900, "900"],[960,"960"]]}
+            {"metric":{"host":"draco","lane":"draco:QSL:arch","state":"working"},"values":[[900, "1"],[960,"1"]]},
+            {"metric":{"host":"luna","lane":"luna:QSL:code","state":"blocked"},"values":[[960,"1"],[1020,"1"]]}
         ]}
     }).to_string();
-    let range = super::collect::parse_effort_range(&timestamps, &working, 900.0, 1080.0).unwrap();
+    let expected_hosts =
+        BTreeSet::from(["draco".to_owned(), "luna".to_owned(), "terra".to_owned()]);
+    let range =
+        super::collect::parse_effort_range(&timestamps, &values, &expected_hosts, 900.0, 1080.0)
+            .unwrap();
     assert_eq!(range.working_lane_seconds, 120.0);
-    assert!((range.coverage - (4.0 / 6.0)).abs() < f64::EPSILON);
+    assert!((range.coverage - (4.0 / 9.0)).abs() < f64::EPSILON);
 }
 
 #[trace("FR-033-AC-18")]
@@ -467,6 +518,9 @@ fn daily_velocity_emits_seven_days_with_day_labels_and_coverage() {
     scope.github_observed_at_ms = 1_000;
     scope.closures_daily = Some(vec![0, 1, 2, 3, 4, 5, 6]);
     scope.merged_prs_daily = Some(vec![6, 5, 4, 3, 2, 1, 0]);
+    scope.closures_daily_coverage = 0.5;
+    scope.merged_prs_daily_coverage = 0.75;
+    scope.github_repo_coverage = 0.75;
     let text = render(&config, &state, 0, 1_000).unwrap();
     assert!(text.contains(
         "ix_team_closures_day{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\",days_ago=\"0\"} 0"
@@ -475,7 +529,13 @@ fn daily_velocity_emits_seven_days_with_day_labels_and_coverage() {
         "ix_team_merged_prs_day{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\",days_ago=\"6\"} 0"
     ));
     assert!(text.contains(
-        "ix_team_metric_coverage{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\",metric=\"closures_day_6\"} 1"
+        "ix_team_metric_coverage{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\",metric=\"closures_day_0\"} 0.5"
+    ));
+    assert!(text.contains(
+        "ix_team_metric_coverage{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\",metric=\"merged_prs_day_0\"} 0.75"
+    ));
+    assert!(text.contains(
+        "ix_team_metric_coverage{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\",metric=\"closures_day_6\"} 0.5"
     ));
 }
 
