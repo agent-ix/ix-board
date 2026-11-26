@@ -3,6 +3,7 @@
 use super::wire::AssignmentStatus;
 use super::{Assignment, Binding, Change, Config, Error, Event, Selectors};
 use crate::retro::Record;
+use ix_trace_rs::implements;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -171,6 +172,7 @@ fn state_label(status: AssignmentStatus) -> &'static str {
 fn add(totals: &mut BTreeMap<String, f64>, key: &str, value: f64) {
     *totals.entry(key.into()).or_default() += value;
 }
+#[implements("FR-033-AC-16")]
 pub(super) fn scope_matches(
     selected: &Selectors,
     reported: &relay_work_wire::ReportedScope,

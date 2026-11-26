@@ -326,6 +326,7 @@ impl<T: Transport> Guard<T> {
         result
     }
 }
+#[implements("FR-033-AC-12")]
 fn response_body_reports_rate_limit(body: &str) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
         return false;
@@ -753,6 +754,7 @@ impl<T: Transport> SelectedGithub<T> {
     }
 }
 
+#[implements("FR-033-AC-13")]
 fn validate_population_cursor(
     page: &crate::retro::sources::Page<PullRequest>,
     previous_cursor: Option<&str>,

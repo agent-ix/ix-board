@@ -48,6 +48,7 @@ fn label_value(value: &str) -> String {
         .collect()
 }
 
+#[implements("FR-033-AC-17")]
 fn coverage(text: &mut Text, labels: &str, metric: &str, value: f64) -> Result<(), Error> {
     text.metric(
         "ix_team_metric_coverage",

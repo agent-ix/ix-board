@@ -48,6 +48,7 @@ fn config_rejects_unsafe_linear_team_keys_and_allows_missing_team_label() {
     assert!(text.contains("team_key=\"\""));
 }
 
+#[trace("FR-033-AC-15", "FR-033-AC-17")]
 #[test]
 fn review_metric_values_and_partial_coverage_are_rendered_together() {
     let dir = tempfile::tempdir().unwrap();
@@ -82,6 +83,7 @@ fn review_metric_values_and_partial_coverage_are_rendered_together() {
     assert!(text.contains("metric=\"review_findings_confirmed_high_24h\"} 0.5"));
 }
 
+#[trace("FR-033-AC-17")]
 #[test]
 fn stale_review_evidence_omits_values_and_coverage() {
     let dir = tempfile::tempdir().unwrap();
@@ -105,6 +107,7 @@ fn stale_review_evidence_omits_values_and_coverage() {
     assert!(text.contains("metric=\"pr_changes_requested_share\"} 0"));
 }
 
+#[trace("FR-033-AC-16")]
 #[test]
 fn empty_stage_history_population_does_not_publish_a_zero_age() {
     let dir = tempfile::tempdir().unwrap();
@@ -602,6 +605,7 @@ fn live_pane_without_a_status_is_uncovered_while_idle_is_observed() {
     );
 }
 
+#[trace("FR-033-AC-16")]
 #[test]
 fn pane_status_accepts_small_source_clock_skew_and_rejects_future_data() {
     use super::collect::{PrometheusLeadStatus, PrometheusSample};
@@ -679,6 +683,7 @@ fn effort_coverage_includes_hosts_found_only_in_retained_range_samples() {
     assert!((range.coverage - (2.0 / 3.0)).abs() < f64::EPSILON);
 }
 
+#[trace("FR-033-AC-15")]
 #[test]
 fn stale_effort_state_series_do_not_conflict_with_fresh_state_after_change() {
     let timestamps = serde_json::json!({

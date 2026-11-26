@@ -121,6 +121,7 @@ fn marker_channel_rotation_visits_every_channel_before_repeating() {
     assert_eq!(marker_channel_rotation(0, 0), None);
 }
 
+#[trace("FR-033-AC-17")]
 #[test]
 fn marker_sync_rotates_across_repositories_and_record_kinds() {
     let dir = tempfile::tempdir().unwrap();
@@ -154,6 +155,7 @@ fn marker_sync_rotates_across_repositories_and_record_kinds() {
     );
 }
 
+#[trace("FR-033-AC-17")]
 #[test]
 fn marker_sync_persists_cursor_when_a_later_page_fails() {
     let dir = tempfile::tempdir().unwrap();
@@ -202,6 +204,7 @@ fn sync_review_markers(
     )
 }
 
+#[implements("FR-033-AC-17")]
 fn sync_review_markers_with_fetch(
     state_path: &std::path::Path,
     scope: &str,
@@ -1240,6 +1243,7 @@ fn read_prometheus_status(
     Ok(PrometheusLeadStatus { lane_status })
 }
 
+#[implements("FR-033-AC-16")]
 fn pane_lane_key(labels: &BTreeMap<String, String>) -> Result<String, String> {
     let machine = labels
         .get("machine")
@@ -1434,6 +1438,7 @@ pub(super) fn classify_team_lanes(
     (expected, observed, working)
 }
 
+#[implements("FR-033-AC-13")]
 fn aggregate_repository_pull_requests(
     results: Vec<(String, Result<Vec<retro::sources::PullRequest>, String>)>,
 ) -> (
@@ -2289,6 +2294,7 @@ mod tests {
         );
     }
 
+    #[trace("FR-033-AC-13")]
     #[test]
     fn partial_repository_population_keeps_covered_rows_and_errors() {
         let pull_request = |repo: &str, number| retro::sources::PullRequest {
@@ -2352,6 +2358,7 @@ mod tests {
         );
     }
 
+    #[trace("FR-033-AC-18")]
     #[test]
     fn seven_day_merge_window_includes_day_four_and_deduplicates_pull_requests() {
         let now = 10.0 * 86_400.0 + 1_000.0;
