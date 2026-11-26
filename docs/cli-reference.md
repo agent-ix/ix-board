@@ -1,6 +1,6 @@
 # CLI reference
 
-Generated from the `--help` output of `ix-board` 0.4.0. Run `ix-board <command> --help` for the same text.
+Run `ix-board <command> --help` for current usage.
 
 ## ix-board
 
@@ -16,6 +16,8 @@ Commands:
   search         Search structured project and issue fields
   issues         Read multiple exact Linear issues in one cached workspace request
   agents         Say whether each agent in a team's herdr workspaces is working right now
+  hygiene        Inspect or clean build-host worktree output
+  build          Compare build-host capacity telemetry
   fleet          Fleet lane commands
   drift          Render a deterministic drift report from versioned structured evidence
   focus          Resolve an inline Linear initiative/project/issue focus
@@ -479,6 +481,38 @@ Options:
 ```
 
 Exit status: zero when every machine was read. When some machines are missing (they time out after 45 seconds or cannot be read) but other machines returned rows, the command prints those rows, lists the missing machines in `missing_hosts` with reason and elapsed time, and exits with the partial code. When no row could be read it exits with the internal-error code.
+
+## ix-board hygiene check
+
+```text
+ix-board hygiene check --host <HOST> --free-floor-gb <GIB> [--root <WORKTREES>] [--idle-minutes <MINUTES>]
+```
+
+Reports free disk space, target directories and their ages, prunable worktrees, and build
+processes without a Herdr pane association. The worktree root must be named `worktrees`.
+The free-space floor and idle age are explicit policy values. Exit status is 0 when clear,
+1 when findings exist, 2 when required evidence is unavailable, and 3 on unsupported Windows.
+
+## ix-board hygiene clean
+
+```text
+ix-board hygiene clean --host <HOST> --free-floor-gb <GIB> [--root <WORKTREES>] [--idle-minutes <MINUTES>] [--apply]
+```
+
+Dry-run by default. `--apply` removes only old `target/` directories under discovered Git
+worktrees when complete process evidence proves they are unused.
+
+## ix-board build status
+
+```text
+ix-board build status --metrics-url <URL> --policy <HOST:MAX_LOAD1:HEAVY_GATE_SLOTS>...
+```
+
+Reads Prometheus text exposition from the configured endpoint and reports per-host one-minute
+load per core, root filesystem free space, memory, swap, queued requests, running locked-build
+leases and policy eligibility.
+Pass one `--policy` for each host. For luna's current rule use `luna:8:1` (raw load must be
+below 8 and no heavy gate may already be running).
 
 ## ix-board fleet status
 

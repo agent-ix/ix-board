@@ -3359,8 +3359,8 @@ fn run_hygiene(
     apply: bool,
 ) -> Result<ix_board::host_hygiene::HygieneReport, Error> {
     use ix_board::host_hygiene::{
-        CleanDecision, HostPolicy, HygieneReport, clean_decision, free_disk_bytes,
-        system_process_table,
+        CleanDecision, HostPolicy, HygieneReport, apply_clean_decision, clean_decision,
+        free_disk_bytes, system_process_table,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -3456,10 +3456,11 @@ fn run_hygiene(
                 &latest,
             );
             if decision.eligible {
-                match std::fs::remove_dir_all(&target) {
-                    Ok(()) => decision.reason = "removed".to_owned(),
-                    Err(error) => decision.reason = format!("remove_failed:{}", error.kind()),
-                }
+                decision = apply_clean_decision(&decision, true).unwrap_or_else(|error| {
+                    let mut failed = decision.clone();
+                    failed.reason = format!("remove_failed:{}", error.kind());
+                    failed
+                });
             }
         }
         targets.push(decision);
@@ -3524,14 +3525,28 @@ fn run_build_status(
     Error,
 > {
     use ix_board::host_hygiene::{BuildPolicy, Eligibility, parse_build_metrics};
+    const MAX_METRICS_BYTES: u64 = 8 * 1024 * 1024;
     let response = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .redirect(reqwest::redirect::Policy::none())
         .build()?
         .get(metrics_url)
         .send()?
-        .error_for_status()?
-        .text()?;
+        .error_for_status()?;
+    let mut bytes = Vec::new();
+    std::io::Read::take(response, MAX_METRICS_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| Error::ProgramReview {
+            message: format!("cannot read metrics exposition: {error}"),
+        })?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_METRICS_BYTES {
+        return Err(Error::ProgramReview {
+            message: "metrics exposition exceeds 8 MiB".to_owned(),
+        });
+    }
+    let response = String::from_utf8(bytes).map_err(|error| Error::ProgramReview {
+        message: format!("metrics exposition is not UTF-8: {error}"),
+    })?;
     let configured = policies
         .iter()
         .map(|policy| {
@@ -3703,12 +3718,13 @@ fn render_human(output: &Output) -> String {
             .iter()
             .map(|(row, verdict)| {
                 format!(
-                    "{} load/core={:.2} memory={:?}/{:?} swap={:?}/{:?} queue={} leases={} owners={:?} {:?}",
+                    "{} load/core={:.2} disk_free={:?} memory={:?}/{:?} swap={:?}/{:?} queue={} leases={} owners={:?} {:?}",
                     row.host,
                     row.load1
                         .zip(row.cores)
                         .filter(|(_, cores)| *cores > 0.0)
                         .map_or(f64::NAN, |(load, cores)| load / cores),
+                    row.disk_available_bytes,
                     row.memory_available_bytes,
                     row.memory_total_bytes,
                     row.swap_free_bytes,

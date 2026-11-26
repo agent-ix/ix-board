@@ -89,6 +89,8 @@ pub struct BuildHostMetrics {
     pub swap_total_bytes: Option<u64>,
     /// Free swap bytes.
     pub swap_free_bytes: Option<u64>,
+    /// Available bytes on the host root filesystem.
+    pub disk_available_bytes: Option<u64>,
     /// Number of queued build requests.
     pub queue_depth: u64,
     /// Running locked-build lease count.
@@ -405,6 +407,17 @@ pub fn clean_decision(
     }
 }
 
+/// Applies a previously checked cleanup decision, preserving dry-run behavior by default.
+#[implements("FR-048-AC-5")]
+pub fn apply_clean_decision(decision: &CleanDecision, apply: bool) -> io::Result<CleanDecision> {
+    let mut result = decision.clone();
+    if apply && decision.eligible {
+        std::fs::remove_dir_all(&decision.target)?;
+        result.reason = "removed".to_owned();
+    }
+    Ok(result)
+}
+
 /// Parses the Prometheus text exposition emitted by locked-build and node-exporter.
 #[implements("FR-048-AC-7")]
 pub fn parse_build_metrics(text: &str) -> BTreeMap<String, BuildHostMetrics> {
@@ -447,6 +460,12 @@ pub fn parse_build_metrics(text: &str) -> BTreeMap<String, BuildHostMetrics> {
             "node_memory_MemAvailable_bytes" => row.memory_available_bytes = value_u64(value),
             "node_memory_SwapTotal_bytes" => row.swap_total_bytes = value_u64(value),
             "node_memory_SwapFree_bytes" => row.swap_free_bytes = value_u64(value),
+            "node_filesystem_avail_bytes"
+                if label(labels, "mountpoint") == Some("/")
+                    && !matches!(label(labels, "fstype"), Some("tmpfs" | "overlay")) =>
+            {
+                row.disk_available_bytes = value_u64(value)
+            }
             "ix_build_queue_depth" => {
                 row.queue_depth = row
                     .queue_depth
@@ -629,6 +648,12 @@ mod tests {
         assert_eq!(decision.age_secs, 3601);
         assert!(worktree.join("src.rs").exists());
         assert!(worktree.join(".git").exists());
+        let dry_run = apply_clean_decision(&decision, false).expect("dry run");
+        assert_eq!(dry_run.reason, "eligible");
+        assert!(target.exists());
+        let applied = apply_clean_decision(&decision, true).expect("apply cleanup");
+        assert_eq!(applied.reason, "removed");
+        assert!(!target.exists());
     }
 
     #[test]
@@ -642,6 +667,7 @@ mod tests {
             "node_memory_MemAvailable_bytes{host=\"luna\"} 400\n",
             "node_memory_SwapTotal_bytes{host=\"luna\"} 200\n",
             "node_memory_SwapFree_bytes{host=\"luna\"} 10\n",
+            "node_filesystem_avail_bytes{host=\"luna\",mountpoint=\"/\",fstype=\"ext4\"} 700\n",
             "ix_build_queue_depth{host=\"luna\",priority=\"must-fix\"} 2\n",
             "ix_build_queue_depth{host=\"luna\",priority=\"periodic\"} 3\n",
             "ix_build_lane_running{host=\"luna\",lane=\"luna:team:coder\"} 1\n",
@@ -651,6 +677,7 @@ mod tests {
         assert_eq!(row.cores, Some(2.0));
         assert_eq!(row.memory_available_bytes, Some(400));
         assert_eq!(row.swap_free_bytes, Some(10));
+        assert_eq!(row.disk_available_bytes, Some(700));
         assert_eq!(row.queue_depth, 5);
         assert_eq!(row.running_leases, 1);
         assert_eq!(row.leases_by_lane["luna:team:coder"], 1);
