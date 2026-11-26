@@ -6,10 +6,10 @@
 use ix_trace_rs::implements;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
-use std::{fs, io};
 
 /// Process paths and command evidence needed to decide whether a target is in use.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -178,6 +178,7 @@ pub fn system_process_table() -> io::Result<ProcessTable> {
 
 #[cfg(target_os = "linux")]
 fn linux_process_table(proc_root: &Path) -> io::Result<ProcessTable> {
+    use std::fs;
     let mut table = ProcessTable {
         processes: Vec::new(),
         complete: true,
@@ -441,7 +442,7 @@ fn value_u64(value: f64) -> Option<u64> {
         .then_some(value as u64)
 }
 
-fn label(labels: &str, wanted: &str) -> Option<&str> {
+fn label<'a>(labels: &'a str, wanted: &str) -> Option<&'a str> {
     labels.split(',').find_map(|pair| {
         let (key, value) = pair.trim().split_once('=')?;
         (key == wanted).then(|| value.trim_matches('"'))
