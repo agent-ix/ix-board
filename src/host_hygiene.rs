@@ -63,6 +63,8 @@ pub struct HostPolicy {
 pub struct CleanDecision {
     /// Target directory.
     pub target: PathBuf,
+    /// Age of the directory in whole seconds at the observation time.
+    pub age_secs: u64,
     /// Whether applying this decision would remove the target.
     pub eligible: bool,
     /// Stable machine-readable reason.
@@ -397,6 +399,7 @@ pub fn clean_decision(
     };
     CleanDecision {
         target: target.to_owned(),
+        age_secs: now.duration_since(modified).map_or(0, |age| age.as_secs()),
         eligible: reason == "eligible",
         reason: reason.to_owned(),
     }
@@ -566,6 +569,7 @@ mod tests {
             decision,
             CleanDecision {
                 target: target.into(),
+                age_secs: 3601,
                 eligible: true,
                 reason: "eligible".into()
             }
@@ -622,6 +626,7 @@ mod tests {
             },
         );
         assert!(decision.eligible);
+        assert_eq!(decision.age_secs, 3601);
         assert!(worktree.join("src.rs").exists());
         assert!(worktree.join(".git").exists());
     }

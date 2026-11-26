@@ -3446,9 +3446,20 @@ fn run_hygiene(
         let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
         let mut decision = clean_decision(&target, &worktree, now, modified, &policy, &processes);
         if apply && decision.eligible {
-            match std::fs::remove_dir_all(&target) {
-                Ok(()) => decision.reason = "removed".to_owned(),
-                Err(error) => decision.reason = format!("remove_failed:{}", error.kind()),
+            let latest = system_process_table().unwrap_or_default();
+            decision = clean_decision(
+                &target,
+                &worktree,
+                SystemTime::now(),
+                modified,
+                &policy,
+                &latest,
+            );
+            if decision.eligible {
+                match std::fs::remove_dir_all(&target) {
+                    Ok(()) => decision.reason = "removed".to_owned(),
+                    Err(error) => decision.reason = format!("remove_failed:{}", error.kind()),
+                }
             }
         }
         targets.push(decision);
@@ -3501,6 +3512,7 @@ fn find_prunable_worktrees(root: &std::path::Path) -> Vec<PathBuf> {
     found.into_iter().collect()
 }
 
+#[implements("FR-048-AC-7", "FR-048-AC-8")]
 fn run_build_status(
     metrics_url: &str,
     policies: &[String],
@@ -3664,7 +3676,14 @@ fn render_human(output: &Output) -> String {
             ) + &report
                 .targets
                 .iter()
-                .map(|target| format!("\n{} {}", target.reason, target.target.display()))
+                .map(|target| {
+                    format!(
+                        "\n{} age={}s {}",
+                        target.reason,
+                        target.age_secs,
+                        target.target.display()
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("")
                 + &report
@@ -3684,7 +3703,7 @@ fn render_human(output: &Output) -> String {
             .iter()
             .map(|(row, verdict)| {
                 format!(
-                    "{} load/core={:.2} memory={:?}/{:?} swap={:?}/{:?} queue={} leases={} {:?}",
+                    "{} load/core={:.2} memory={:?}/{:?} swap={:?}/{:?} queue={} leases={} owners={:?} {:?}",
                     row.host,
                     row.load1
                         .zip(row.cores)
@@ -3696,6 +3715,7 @@ fn render_human(output: &Output) -> String {
                     row.swap_total_bytes,
                     row.queue_depth,
                     row.running_leases,
+                    row.leases_by_lane,
                     verdict,
                 )
             })
