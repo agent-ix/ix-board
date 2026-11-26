@@ -907,7 +907,10 @@ fn session_turn_rows_are_readable_with_relay_time_filtering() {
 
     let rows = query(&path, "session_turn_rows", Some(Duration::from_millis(1))).unwrap();
     assert_eq!(rows.rows.len(), 1);
-    assert_eq!(rows.rows[0]["session_addr"], "test-server:test-workspace:test-minder");
+    assert_eq!(
+        rows.rows[0]["session_addr"],
+        "test-server:test-workspace:test-minder"
+    );
     assert_eq!(rows.rows[0]["session_role"], "minder");
     assert_eq!(rows.rows[0]["started_at"], 1200);
     assert_eq!(rows.rows[0]["transcript_id"], "session-1200");
@@ -947,7 +950,10 @@ fn version_seven_migration_adds_nullable_transcript_id_without_rewriting_turns()
     assert_eq!(count(&path, "PRAGMA user_version"), 9);
     let rows = query(&path, "session_turn_rows", Some(Duration::from_millis(1))).unwrap();
     assert_eq!(rows.rows.len(), 1);
-    assert_eq!(rows.rows[0]["session_addr"], "test-server:test-workspace:test-minder");
+    assert_eq!(
+        rows.rows[0]["session_addr"],
+        "test-server:test-workspace:test-minder"
+    );
     assert_eq!(rows.rows[0]["started_at"], 1200);
     assert!(rows.rows[0]["transcript_id"].is_null());
 }
