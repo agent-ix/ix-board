@@ -2697,13 +2697,14 @@ fn running_the_same_range_twice_appends_nothing_and_reports_each_skipped_day() {
 fn live_state_metrics_are_not_reconstructible_in_every_backfill_record() {
     let (_dir, store) = store_with(&[]);
     let report = backfill_range(&base_rig(), &store, ("2026-11-02", "2026-11-04"), DAY).unwrap();
-    const KEPT: [&str; 7] = [
+    const KEPT: [&str; 8] = [
         "prs_merged_per_hour",
         "pr_cycle_median_hours",
         "pr_cycle_p90_hours",
         "path_closed",
         "intake_new",
         "net_closed_minus_new",
+        "tickets_closed_per_hour",
         "done_reopened",
     ];
     for record in &report.appended {
