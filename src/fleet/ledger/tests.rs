@@ -7,6 +7,7 @@ use crate::fleet::report::{DefectKind, HostSummary, LaneRow};
 use ix_trace_rs::trace;
 
 const MIN: i64 = 60_000;
+const NEXT_VERSION: i64 = VERSION + 1;
 
 fn row(lane: &str, class: ClassKind) -> LaneRow {
     LaneRow {
@@ -214,6 +215,7 @@ fn version_five_ledger_adds_planner_action_columns_without_losing_rows() {
              DROP TABLE capacity_throttle_sample;
              DROP TABLE session_turn_stream_state;
              DROP TABLE session_turn_session_role;
+             DROP TABLE cadence_job_run;
              ALTER TABLE capacity_event DROP COLUMN source_basis;
              ALTER TABLE host_output_sample DROP COLUMN source_basis;
              PRAGMA user_version=5;",
@@ -361,19 +363,46 @@ fn an_unsupported_schema_version_is_refused_without_a_change() {
     drop(open(&path));
     Connection::open(&path)
         .unwrap()
-        .pragma_update(None, "user_version", 10)
+        .pragma_update(None, "user_version", NEXT_VERSION)
         .unwrap();
     let before = std::fs::read(&path).unwrap();
     let error = Ledger::open(&path, &FleetConfig::default()).err().unwrap();
     assert!(matches!(
         error,
-        LedgerError::UnsupportedVersion { found: 10, .. }
+        LedgerError::UnsupportedVersion {
+            found: NEXT_VERSION,
+            ..
+        }
     ));
     assert!(matches!(
         query(&path, "defect_rows", None),
-        Err(LedgerError::UnsupportedVersion { found: 10, .. })
+        Err(LedgerError::UnsupportedVersion {
+            found: NEXT_VERSION,
+            ..
+        })
     ));
     assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+#[trace("FR-049-AC-2")]
+fn version_nine_ledger_migrates_additively_to_cadence_storage() {
+    let (_dir, path) = path();
+    let ledger = open(&path);
+    drop(ledger);
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("DROP TABLE cadence_job_run; PRAGMA user_version=9;")
+        .unwrap();
+    drop(open(&path));
+    assert_eq!(count(&path, "PRAGMA user_version"), VERSION);
+    assert_eq!(
+        count(
+            &path,
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='cadence_job_run'"
+        ),
+        1
+    );
 }
 
 #[test]
@@ -939,6 +968,7 @@ fn version_seven_migration_adds_nullable_transcript_id_without_rewriting_turns()
              DROP VIEW session_turn_rows;
              DROP TABLE session_turn_stream_state;
              DROP TABLE session_turn_session_role;
+             DROP TABLE cadence_job_run;
              ALTER TABLE session_turn DROP COLUMN transcript_id;
              CREATE VIEW session_turn_rows AS
                SELECT session_addr,session_role,started_at,started_at AS at_ms FROM session_turn;
@@ -947,7 +977,7 @@ fn version_seven_migration_adds_nullable_transcript_id_without_rewriting_turns()
         .unwrap();
 
     drop(open(&path));
-    assert_eq!(count(&path, "PRAGMA user_version"), 9);
+    assert_eq!(count(&path, "PRAGMA user_version"), VERSION);
     let rows = query(&path, "session_turn_rows", Some(Duration::from_millis(1))).unwrap();
     assert_eq!(rows.rows.len(), 1);
     assert_eq!(
