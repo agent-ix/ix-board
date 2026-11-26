@@ -282,6 +282,7 @@ impl LinearSource for LiveLinear {
         self.source.fetch_state_changes(issue_id)
     }
 
+    #[implements("FR-033-AC-18")]
     fn state_histories(&self, issue_ids: &[String]) -> Vec<Result<Vec<StateChange>, String>> {
         self.source.fetch_state_changes_batch(issue_ids)
     }

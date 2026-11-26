@@ -850,6 +850,7 @@ mod tests {
         assert_eq!(values["pr_changes_requested_share"], 1.0);
     }
 
+    #[trace("FR-033-AC-17")]
     #[test]
     fn same_artifact_id_on_distinct_prs_keeps_findings_separate() {
         let finding = comment(
@@ -872,6 +873,7 @@ mod tests {
         assert_eq!(values["pr_changes_requested_share"], 0.5);
     }
 
+    #[trace("FR-033-AC-17")]
     #[test]
     fn disposition_round_is_part_of_the_semantic_deduplication_key() {
         let review = comment(
@@ -905,6 +907,7 @@ mod tests {
         assert_eq!(values["review_findings_confirmed_high_24h"], 1.0);
     }
 
+    #[trace("FR-033-AC-17")]
     #[test]
     fn later_review_without_mergeability_preserves_latest_explicit_verdict() {
         let blocked = comment(

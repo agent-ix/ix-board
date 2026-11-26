@@ -133,6 +133,7 @@ fn empty_open_review_population_reports_why_changes_share_is_unavailable() {
     ));
 }
 
+#[trace("FR-033-AC-17")]
 #[test]
 fn review_findings_are_unavailable_when_marker_backfill_has_no_coverage() {
     let dir = tempfile::tempdir().unwrap();
@@ -601,6 +602,7 @@ fn prometheus_lane_join_keeps_gauge_value_and_source_timestamp() {
     assert_eq!(joined[0].value, 1.0);
 }
 
+#[trace("FR-033-AC-16")]
 #[test]
 fn pane_status_uses_the_original_scrape_timestamp_from_timestamp_query_value() {
     let values = serde_json::json!({

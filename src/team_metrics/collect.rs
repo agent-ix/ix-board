@@ -156,6 +156,7 @@ fn marker_sync_rotates_across_repositories_and_record_kinds() {
     );
 }
 
+#[trace("FR-033-AC-17")]
 #[test]
 fn marker_sync_keeps_two_scope_cursors_coverage_and_comments_separate() {
     let dir = tempfile::tempdir().unwrap();
@@ -1398,6 +1399,7 @@ fn read_prometheus_status(
     Ok(PrometheusLeadStatus { lane_status })
 }
 
+#[implements("FR-033-AC-16")]
 pub(super) fn join_pane_status_timestamps(
     status_values: &str,
     timestamp_values: &str,
@@ -1677,6 +1679,7 @@ fn verified_closure_history_path(scope: &str) -> Result<PathBuf, String> {
     Ok(scoped_closure_history_path(&cache_path, scope))
 }
 
+#[implements("FR-033-AC-18")]
 fn scoped_closure_history_path(cache_path: &std::path::Path, scope: &str) -> PathBuf {
     cache_path.with_extension(format!(
         "closure-window-v2-{}.json",
@@ -2579,6 +2582,7 @@ mod tests {
         );
     }
 
+    #[trace("FR-033-AC-18")]
     #[test]
     fn daily_closure_histories_keep_two_scope_caches_independent() {
         let directory = tempfile::tempdir().unwrap();

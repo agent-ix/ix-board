@@ -1027,6 +1027,7 @@ impl LinearGraphQlSource {
 
     /// Reads histories for bounded issue batches and falls back to complete pagination when a
     /// batch result reports more than the first 50 events.
+    #[implements("FR-033-AC-18")]
     pub fn fetch_state_changes_batch(
         &self,
         issue_ids: &[String],
@@ -1082,6 +1083,7 @@ impl LinearGraphQlSource {
         results
     }
 
+    #[implements("FR-033-AC-18")]
     fn state_changes_from_events(
         events: Vec<RawIssueHistoryEvent>,
     ) -> Result<Vec<crate::retro::sources::StateChange>, String> {
@@ -3129,6 +3131,7 @@ mod tests {
         )
     }
 
+    #[trace("FR-033-AC-18")]
     #[test]
     fn batched_issue_histories_fall_back_to_pagination_when_a_history_has_more() {
         let event = |id: &str, at: &str| {
