@@ -107,8 +107,10 @@ mod tests {
     #[trace("FR-039-AC-14")]
     #[test]
     fn parse_event_does_not_infer_transcript_id_from_address() {
-        let event = parse_event(r#"{"addr":"test-server:test-workspace:test-minder","server_ms":42,"kind":"prompt"}"#)
-            .expect("well-formed relay prompt event without a session field");
+        let event = parse_event(
+            r#"{"addr":"test-server:test-workspace:test-minder","server_ms":42,"kind":"prompt"}"#,
+        )
+        .expect("well-formed relay prompt event without a session field");
 
         assert_eq!(event.transcript_id, None);
     }
