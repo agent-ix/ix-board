@@ -258,6 +258,7 @@ fn cadence_skips_delta_after_snapshot_failure_and_records_follow_up_failure() {
             .outcome,
         "failed"
     );
+    drop(ledger);
 
     let failed_delta_manifest = directory.path().join("failed-delta.json");
     let failed_delta = json!({
