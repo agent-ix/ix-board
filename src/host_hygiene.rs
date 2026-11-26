@@ -99,7 +99,7 @@ pub struct CleanDecision {
 pub struct BuildHostMetrics {
     /// Host label from the exposition.
     pub host: String,
-    /// Latest explicit sample timestamp, in Unix seconds, when supplied.
+    /// Oldest explicit sample timestamp, in Unix seconds, when supplied.
     pub observed_at_epoch_secs: Option<u64>,
     /// One-minute load average.
     pub load1: Option<f64>,
@@ -377,7 +377,7 @@ pub fn parse_mount_table(text: &str) -> io::Result<Vec<MountEntry>> {
             let left = before.split_whitespace().collect::<Vec<_>>();
             let right = after.split_whitespace().collect::<Vec<_>>();
             if left.len() < 5 || right.len() < 2 {
-                continue;
+                return Err(io::Error::other("mount table contains a malformed row"));
             }
             (
                 left[0].to_owned(),
@@ -386,8 +386,8 @@ pub fn parse_mount_table(text: &str) -> io::Result<Vec<MountEntry>> {
             )
         } else {
             let fields = line.split_whitespace().collect::<Vec<_>>();
-            if fields.len() < 3 {
-                continue;
+            if fields.len() < 6 {
+                return Err(io::Error::other("mount table contains a malformed row"));
             }
             (
                 unescape_mount_field(fields[0]),
@@ -395,6 +395,9 @@ pub fn parse_mount_table(text: &str) -> io::Result<Vec<MountEntry>> {
                 fields[2].to_owned(),
             )
         };
+        if fields.0.is_empty() || fields.1.is_empty() || fields.2.is_empty() {
+            return Err(io::Error::other("mount table contains an incomplete row"));
+        }
         entries.push(MountEntry {
             source: fields.0,
             mount_point: PathBuf::from(fields.1),
@@ -956,14 +959,25 @@ pub fn parse_build_metrics(text: &str) -> BTreeMap<String, BuildHostMetrics> {
                 host: host.clone(),
                 ..BuildHostMetrics::default()
             });
-        if let Some(timestamp) = raw_timestamp
+        if matches!(
+            name,
+            "node_load1"
+                | "node_cpu_seconds_total"
+                | "node_memory_MemTotal_bytes"
+                | "node_memory_MemAvailable_bytes"
+                | "node_memory_SwapTotal_bytes"
+                | "node_memory_SwapFree_bytes"
+                | "ix_build_queue_depth"
+                | "ix_build_slots_busy"
+                | "ix_build_lane_running"
+        ) && let Some(timestamp) = raw_timestamp
             .and_then(|value| value.parse::<f64>().ok())
             .and_then(value_u64)
         {
             let timestamp_secs = timestamp / 1000;
             row.observed_at_epoch_secs = Some(
                 row.observed_at_epoch_secs
-                    .map_or(timestamp_secs, |current| current.max(timestamp_secs)),
+                    .map_or(timestamp_secs, |current| current.min(timestamp_secs)),
             );
         }
         if name == "node_cpu_seconds_total"
@@ -1679,6 +1693,34 @@ mod tests {
     }
 
     #[test]
+    #[trace("FR-048-AC-8", "FR-050-AC-3")]
+    fn one_stale_required_metric_cannot_be_hidden_by_a_fresh_sample() {
+        let rows = parse_build_metrics(concat!(
+            "node_load1{host=\"luna\"} 1 1700000000000\n",
+            "node_cpu_seconds_total{host=\"luna\",cpu=\"0\",mode=\"idle\"} 1 1700000000000\n",
+            "node_memory_MemTotal_bytes{host=\"luna\"} 1000 1700000000000\n",
+            "node_memory_MemAvailable_bytes{host=\"luna\"} 800 1700000000000\n",
+            "node_memory_SwapTotal_bytes{host=\"luna\"} 0 1700000000000\n",
+            "node_memory_SwapFree_bytes{host=\"luna\"} 0 1699999000000\n",
+            "ix_build_queue_depth{host=\"luna\",class=\"must-fix\"} 0 1700000000000\n",
+            "ix_build_slots_busy{host=\"luna\"} 0 1700000000000\n",
+        ));
+        let metrics = &rows["luna"];
+        assert_eq!(metrics.observed_at_epoch_secs, Some(1_699_999_000));
+        assert_eq!(
+            eligibility_at(
+                metrics,
+                BuildPolicy {
+                    max_load1: 8.0,
+                    heavy_gate_slots: 1,
+                },
+                1_700_000_000,
+            ),
+            Eligibility::Unknown
+        );
+    }
+
+    #[test]
     #[trace("FR-048-AC-7", "FR-048-AC-8", "FR-050-AC-3")]
     fn empty_locked_build_lease_gauge_is_known_zero() {
         let rows = parse_build_metrics(concat!(
@@ -1763,7 +1805,17 @@ mod tests {
     }
 
     #[test]
-    #[trace("FR-048-AC-1", "FR-048-AC-10")]
+    #[trace("FR-048-AC-10")]
+    fn mount_table_rejects_malformed_row_after_valid_root() {
+        let mounts = concat!(
+            "36 25 8:1 / / rw,relatime - ext4 /dev/root rw\n",
+            "malformed nested mount row\n",
+        );
+        assert!(parse_mount_table(mounts).is_err());
+    }
+
+    #[test]
+    #[trace("FR-048-AC-1", "FR-048-AC-4", "FR-048-AC-10")]
     fn check_exit_code_compares_free_bytes_with_policy_floor() {
         let report = |free_bytes| HygieneReport {
             host: "draco".into(),

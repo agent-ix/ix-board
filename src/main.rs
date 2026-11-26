@@ -3837,52 +3837,49 @@ fn run_host_check() -> ix_board::host_check::HostCheckReport {
         source: None,
     };
 
-    let linear_source = match ix_board::LinearGraphQlSource::credential_source() {
-        Ok(source) => source,
-        Err(Error::Credential(ix_cli_kit::secrets::SecretError::Locked)) => {
-            Some("keyring_locked".to_owned())
-        }
-        Err(_) => Some("unavailable".to_owned()),
-    };
-    let linear_state = match linear_source.as_deref() {
-        Some("keyring_locked") => auth_state(true, true, true, None, false),
-        Some("unavailable") => auth_state(true, false, true, None, false),
-        Some(_) => match ix_board::LinearGraphQlSource::from_env()
-            .and_then(|linear| linear.auth_status())
-        {
-            Ok(status) => auth_state(
-                true,
-                false,
-                true,
-                Some(status),
-                (200..300).contains(&status),
-            ),
-            Err(Error::Credential(ix_cli_kit::secrets::SecretError::Locked)) => {
-                auth_state(true, true, true, None, false)
-            }
-            Err(Error::Credential(_)) | Err(Error::MissingApiKey) => {
-                auth_state(false, false, true, None, false)
-            }
-            Err(Error::Http(error))
-                if error.status() == Some(reqwest::StatusCode::UNAUTHORIZED) =>
+    let (linear_state, linear_source) = match ix_board::LinearGraphQlSource::credential_source() {
+        Ok(Some(source)) => {
+            let state = match ix_board::LinearGraphQlSource::from_env()
+                .and_then(|linear| linear.auth_status())
             {
-                auth_state(true, false, true, Some(401), false)
-            }
-            Err(_) => auth_state(true, false, true, None, false),
-        },
-        None => auth_state(
-            false,
-            false,
-            find_executable(&path, "linear").is_some(),
+                Ok(status) => auth_state(
+                    true,
+                    false,
+                    true,
+                    Some(status),
+                    (200..300).contains(&status),
+                ),
+                Err(Error::Credential(ix_cli_kit::secrets::SecretError::Locked)) => {
+                    auth_state(true, true, true, None, false)
+                }
+                Err(Error::Credential(_)) | Err(Error::MissingApiKey) => {
+                    auth_state(false, false, true, None, false)
+                }
+                Err(Error::Http(error))
+                    if error.status() == Some(reqwest::StatusCode::UNAUTHORIZED) =>
+                {
+                    auth_state(true, false, true, Some(401), false)
+                }
+                Err(_) => auth_state(true, false, true, None, false),
+            };
+            (state, Some(source))
+        }
+        Ok(None) => (
+            auth_state(
+                false,
+                false,
+                find_executable(&path, "linear").is_some(),
+                None,
+                false,
+            ),
             None,
-            false,
         ),
+        Err(error) => (linear_credential_error_state(&error), None),
     };
     let linear = AuthCheck {
         service: "linear".to_owned(),
         state: linear_state,
-        source: linear_source
-            .filter(|source| !matches!(source.as_str(), "keyring_locked" | "unavailable")),
+        source: linear_source,
     };
     let auth = vec![gh, linear];
 
@@ -3925,6 +3922,19 @@ fn run_host_check() -> ix_board::host_check::HostCheckReport {
         dev_processes,
         process_table_complete: process_table.complete,
         exit_code,
+    }
+}
+
+#[implements("FR-050-AC-2")]
+fn linear_credential_error_state(error: &ix_board::Error) -> ix_board::host_check::AuthState {
+    use ix_board::host_check::{AuthState, auth_state};
+    match error {
+        Error::Credential(ix_cli_kit::secrets::SecretError::Locked) => {
+            auth_state(true, true, true, None, false)
+        }
+        Error::Credential(_) | Error::MissingApiKey => auth_state(false, false, true, None, false),
+        Error::LinearCliUnavailable => AuthState::Unavailable,
+        _ => AuthState::Unavailable,
     }
 }
 
@@ -3974,7 +3984,6 @@ fn find_prunable_worktrees(
     root: &std::path::Path,
     mounts: &[ix_board::host_hygiene::MountEntry],
 ) -> Vec<PathBuf> {
-    use ix_board::host_hygiene::{MountSafety, mount_safety};
     let mut found = std::collections::BTreeSet::new();
     let Ok(entries) = std::fs::read_dir(root) else {
         return Vec::new();
@@ -3994,19 +4003,35 @@ fn find_prunable_worktrees(
         if !output.status.success() {
             continue;
         }
-        let mut current = None;
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            if let Some(path) = line.strip_prefix("worktree ") {
-                let path = PathBuf::from(path);
-                current = (mount_safety(&path, root, mounts) == MountSafety::Safe).then_some(path);
-            } else if line.starts_with("prunable")
-                && let Some(path) = current.as_ref().filter(|path| path.starts_with(root))
-            {
-                found.insert(path.clone());
-            }
-        }
+        found.extend(prunable_paths_from_git_output(
+            root,
+            mounts,
+            &String::from_utf8_lossy(&output.stdout),
+        ));
     }
     found.into_iter().collect()
+}
+
+#[implements("FR-048-AC-4", "FR-048-AC-10")]
+fn prunable_paths_from_git_output(
+    root: &std::path::Path,
+    mounts: &[ix_board::host_hygiene::MountEntry],
+    output: &str,
+) -> std::collections::BTreeSet<PathBuf> {
+    use ix_board::host_hygiene::{MountSafety, mount_safety};
+    let mut found = std::collections::BTreeSet::new();
+    let mut current = None;
+    for line in output.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            let path = PathBuf::from(path);
+            current = (mount_safety(&path, root, mounts) == MountSafety::Safe).then_some(path);
+        } else if line.starts_with("prunable")
+            && let Some(path) = current.as_ref().filter(|path| path.starts_with(root))
+        {
+            found.insert(path.clone());
+        }
+    }
+    found
 }
 
 #[implements("FR-048-AC-7", "FR-048-AC-8")]
@@ -5198,7 +5223,8 @@ fn render_chunk(chunk: &ProjectChunk) -> String {
 mod tests {
     use super::{
         Cli, Command, FocusCommand, HostCommand, Output, ProgramRoadmap, ProgramScopeCommand,
-        encode_output_json, format_issue_ref, format_snapshot_time_at, output_outcome,
+        encode_output_json, format_issue_ref, format_snapshot_time_at,
+        linear_credential_error_state, output_outcome, prunable_paths_from_git_output,
         render_chain, render_closed, render_focus_status, render_human, render_orphans,
         render_reconcile, render_roadmap,
     };
@@ -5219,6 +5245,55 @@ mod tests {
             }
         ));
         assert!(Cli::try_parse_from(["ix-board", "host", "check", "--host", "terra"]).is_err());
+    }
+
+    #[test]
+    #[trace("FR-050-AC-2")]
+    fn linear_cli_failure_is_not_reported_as_missing_credentials() {
+        assert_eq!(
+            linear_credential_error_state(&ix_board::Error::LinearCliUnavailable),
+            ix_board::host_check::AuthState::Unavailable
+        );
+        assert_eq!(
+            linear_credential_error_state(&ix_board::Error::MissingApiKey),
+            ix_board::host_check::AuthState::Missing
+        );
+    }
+
+    #[test]
+    #[trace("FR-048-AC-4", "FR-048-AC-10")]
+    fn prunable_worktree_report_excludes_mount_boundaries() {
+        let mounts = vec![
+            ix_board::host_hygiene::MountEntry {
+                source: "/dev/root".to_owned(),
+                mount_point: std::path::PathBuf::from("/Users/peter/dev"),
+                fs_type: "apfs".to_owned(),
+            },
+            ix_board::host_hygiene::MountEntry {
+                source: "/dev/external".to_owned(),
+                mount_point: std::path::PathBuf::from("/Users/peter/dev/worktrees/nested"),
+                fs_type: "apfs".to_owned(),
+            },
+        ];
+        let output = concat!(
+            "worktree /Users/peter/dev/worktrees/safe\n",
+            "HEAD abc\n",
+            "prunable gitdir file points to missing location\n",
+            "\n",
+            "worktree /Users/peter/dev/worktrees/nested/unsafe\n",
+            "HEAD def\n",
+            "prunable gitdir file points to missing location\n",
+        );
+        assert_eq!(
+            prunable_paths_from_git_output(
+                std::path::Path::new("/Users/peter/dev/worktrees"),
+                &mounts,
+                output,
+            ),
+            [std::path::PathBuf::from("/Users/peter/dev/worktrees/safe")]
+                .into_iter()
+                .collect()
+        );
     }
 
     #[test]
