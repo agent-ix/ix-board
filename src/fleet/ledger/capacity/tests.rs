@@ -489,6 +489,7 @@ fn demand_coverage_does_not_depend_on_deficit_availability() {
 }
 
 #[test]
+#[trace("FR-041-AC-18")]
 fn judged_without_demand_view_reports_each_invalid_transition_once() {
     let (_dir, path) = path();
     Ledger::open(&path, &capacity_config()).unwrap();
@@ -1399,7 +1400,7 @@ fn live_drain_records_missing_evidence_idempotently_and_knee_has_no_ceiling() {
     assert_eq!(violations.rows.len(), 4);
 }
 
-#[trace("FR-041-AC-19")]
+#[trace("FR-041-AC-15")]
 #[test]
 fn lane_removal_view_requires_a_drain_for_each_removal() {
     let (_dir, path) = path();

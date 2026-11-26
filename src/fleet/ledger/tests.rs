@@ -447,7 +447,7 @@ fn a_crash_mid_migration_leaves_the_version_one_ledger_intact_and_openable() {
     );
 }
 
-#[trace("FR-039-AC-18")]
+#[trace("FR-039-AC-17")]
 #[test]
 fn a_v3_migration_failure_rolls_back_and_preserves_v2_capacity_rows() {
     let (_dir, path) = path();
@@ -482,7 +482,7 @@ fn a_v3_migration_failure_rolls_back_and_preserves_v2_capacity_rows() {
     );
 }
 
-#[trace("FR-039-AC-18")]
+#[trace("FR-039-AC-17", "FR-039-AC-18")]
 #[test]
 fn v3_migration_preserves_seeded_runs_steps_and_levels() {
     let (_dir, path) = path();

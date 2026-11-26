@@ -1082,6 +1082,7 @@ fn read_connection(path: &Path) -> Result<Option<Connection>, LedgerError> {
 /// # Errors
 ///
 /// A newer, foreign or unreadable ledger.
+#[implements("FR-041-AC-14")]
 pub fn status(path: &Path) -> Result<CapacityStatus, LedgerError> {
     let Some(connection) = read_connection(path)? else {
         return Ok(CapacityStatus::default());
