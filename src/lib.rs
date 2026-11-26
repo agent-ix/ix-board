@@ -6,6 +6,7 @@
 pub mod agents;
 mod cache;
 pub mod cache_status;
+pub mod cadence;
 pub mod chain;
 mod drift;
 pub mod fleet;
@@ -103,6 +104,9 @@ pub enum Error {
     /// Program scope or roadmap operation failed.
     #[error("program review failed: {message}")]
     ProgramReview { message: String },
+    /// Cadence configuration, ledger or job operation failed.
+    #[error("cadence failed: {0}")]
+    Cadence(String),
     /// A referenced ancestor was absent from the complete snapshot. Reads no longer
     /// return this: they report [`ReferenceWarning::UnavailableParent`].
     #[error("ticket {identifier} has an unavailable parent {parent:?}")]

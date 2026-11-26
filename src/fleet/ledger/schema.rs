@@ -9,7 +9,7 @@
 use ix_trace_rs::implements;
 
 /// The schema version this build writes.
-pub const VERSION: i64 = 9;
+pub const VERSION: i64 = 10;
 
 pub const V1: &str = "
 CREATE TABLE run(
@@ -244,6 +244,15 @@ pub const V9: &[&str] = &[
                    ELSE 'observed_since_stream_start' END AS status,
               last_read_ms AS at_ms
        FROM session_turn_stream_state WHERE singleton=1",
+];
+
+/// Version 10 adds the last-run cadence record for each program/team/job tuple.
+pub const V10: &[&str] = &[
+    "CREATE TABLE cadence_job_run(
+       program TEXT NOT NULL, team TEXT NOT NULL, job_id TEXT NOT NULL,
+       started_at_ms INTEGER NOT NULL, finished_at_ms INTEGER,
+       outcome TEXT NOT NULL CHECK(outcome IN ('running','succeeded','failed')),
+       detail TEXT, PRIMARY KEY(program, team, job_id))",
 ];
 
 /// Views replaced when installing the version 7 definitions.

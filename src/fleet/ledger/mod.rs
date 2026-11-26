@@ -24,6 +24,7 @@ use super::classify::ClassKind;
 use super::report::{Defect, FleetReport};
 use ix_trace_rs::implements;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -316,6 +317,14 @@ fn apply_v9(tx: &rusqlite::Transaction<'_>) -> Result<(), LedgerError> {
     for statement in schema::V9 {
         tx.execute_batch(statement)?;
     }
+    tx.pragma_update(None, "user_version", 9)?;
+    Ok(())
+}
+
+fn apply_v10(tx: &rusqlite::Transaction<'_>) -> Result<(), LedgerError> {
+    for statement in schema::V10 {
+        tx.execute_batch(statement)?;
+    }
     tx.pragma_update(None, "user_version", schema::VERSION)?;
     Ok(())
 }
@@ -531,6 +540,20 @@ pub struct Ledger {
     _lock: WriterLock,
 }
 
+/// The most recent cadence invocation recorded for a manifest job.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CadenceRun {
+    /// Unix time when the invocation started, in milliseconds.
+    pub started_at_ms: i64,
+    /// Unix time when the invocation completed, in milliseconds.
+    pub finished_at_ms: Option<i64>,
+    /// `running`, `succeeded`, or `failed`.
+    pub outcome: String,
+    /// Process exit status or failure detail, when available.
+    pub detail: Option<String>,
+}
+
 impl Ledger {
     /// Opens or creates the ledger as the writer, holding the lock until it is dropped. Older
     /// supported versions migrate to the current schema in one transaction; a newer or foreign
@@ -543,6 +566,76 @@ impl Ledger {
     #[implements("FR-039-AC-19")]
     pub fn open(path: &Path, config: &FleetConfig) -> Result<Self, LedgerError> {
         Self::open_with(path, config, None)
+    }
+
+    /// Returns the latest cadence invocation for a program/team/job tuple.
+    #[implements("FR-048-AC-2")]
+    pub fn cadence_last_run(
+        &self,
+        program: &str,
+        team: &str,
+        job_id: &str,
+    ) -> Result<Option<CadenceRun>, LedgerError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT started_at_ms, finished_at_ms, outcome, detail
+                 FROM cadence_job_run WHERE program=?1 AND team=?2 AND job_id=?3",
+                params![program, team, job_id],
+                |row| {
+                    Ok(CadenceRun {
+                        started_at_ms: row.get(0)?,
+                        finished_at_ms: row.get(1)?,
+                        outcome: row.get(2)?,
+                        detail: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Starts a cadence invocation, replacing the job's latest run row.
+    #[implements("FR-048-AC-2")]
+    pub fn cadence_start(
+        &mut self,
+        program: &str,
+        team: &str,
+        job_id: &str,
+        started_at_ms: i64,
+    ) -> Result<(), LedgerError> {
+        self.connection.execute(
+            "INSERT INTO cadence_job_run(
+               program,team,job_id,started_at_ms,finished_at_ms,outcome,detail
+             ) VALUES (?1,?2,?3,?4,NULL,'running',NULL)
+             ON CONFLICT(program,team,job_id) DO UPDATE SET
+               started_at_ms=excluded.started_at_ms,finished_at_ms=NULL,
+               outcome='running',detail=NULL",
+            params![program, team, job_id, started_at_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Finishes the active cadence invocation with its process outcome.
+    #[implements("FR-048-AC-2")]
+    pub fn cadence_finish(
+        &mut self,
+        program: &str,
+        team: &str,
+        job_id: &str,
+        finished_at_ms: i64,
+        succeeded: bool,
+        detail: Option<&str>,
+    ) -> Result<(), LedgerError> {
+        let outcome = if succeeded { "succeeded" } else { "failed" };
+        let changed = self.connection.execute(
+            "UPDATE cadence_job_run SET finished_at_ms=?4,outcome=?5,detail=?6
+             WHERE program=?1 AND team=?2 AND job_id=?3",
+            params![program, team, job_id, finished_at_ms, outcome, detail],
+        )?;
+        if changed == 0 {
+            return Err(LedgerError::Capacity("cadence run was not started".to_owned()));
+        }
+        Ok(())
     }
 
     fn open_with(
@@ -578,6 +671,7 @@ impl Ledger {
                 apply_v7(&tx)?;
                 apply_v8(&tx)?;
                 apply_v9(&tx)?;
+                apply_v10(&tx)?;
                 tx.commit()?;
             }
             1 => {
@@ -590,6 +684,7 @@ impl Ledger {
                 apply_v7(&tx)?;
                 apply_v8(&tx)?;
                 apply_v9(&tx)?;
+                apply_v10(&tx)?;
                 tx.commit()?;
             }
             2 => {
@@ -601,6 +696,7 @@ impl Ledger {
                 apply_v7(&tx)?;
                 apply_v8(&tx)?;
                 apply_v9(&tx)?;
+                apply_v10(&tx)?;
                 tx.commit()?;
             }
             3 => {
@@ -611,6 +707,7 @@ impl Ledger {
                 apply_v7(&tx)?;
                 apply_v8(&tx)?;
                 apply_v9(&tx)?;
+                apply_v10(&tx)?;
                 tx.commit()?;
             }
             4 => {
@@ -620,6 +717,7 @@ impl Ledger {
                 apply_v7(&tx)?;
                 apply_v8(&tx)?;
                 apply_v9(&tx)?;
+                apply_v10(&tx)?;
                 tx.commit()?;
             }
             5 => {
@@ -628,6 +726,7 @@ impl Ledger {
                 apply_v7(&tx)?;
                 apply_v8(&tx)?;
                 apply_v9(&tx)?;
+                apply_v10(&tx)?;
                 tx.commit()?;
             }
             6 => {
@@ -636,20 +735,28 @@ impl Ledger {
                 refresh_v6_host_output_view(&tx)?;
                 apply_v8(&tx)?;
                 apply_v9(&tx)?;
+                apply_v10(&tx)?;
                 tx.commit()?;
             }
             7 => {
                 let tx = connection.transaction()?;
                 apply_v8(&tx)?;
                 apply_v9(&tx)?;
+                apply_v10(&tx)?;
                 tx.commit()?;
             }
             8 => {
                 let tx = connection.transaction()?;
                 apply_v9(&tx)?;
+                apply_v10(&tx)?;
                 tx.commit()?;
             }
-            9 => {}
+            9 => {
+                let tx = connection.transaction()?;
+                apply_v10(&tx)?;
+                tx.commit()?;
+            }
+            10 => {}
             found => {
                 return Err(LedgerError::UnsupportedVersion {
                     path: path.to_owned(),
