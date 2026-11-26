@@ -9,6 +9,7 @@ use super::lifecycle::{
     AgentId, Availability, Lifecycle, WorkerObservation, WorkerRole, WorkerState,
 };
 use super::probe::{GitTimes, PaneProcess, Probe, ProbeRequest, SessionFiles, run};
+use ix_trace_rs::implements;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -475,6 +476,7 @@ fn read_transcript(
 }
 
 /// Collects one bounded request against an explicit home, without changing files.
+#[implements("FR-018-AC-30")]
 pub fn collect_probe(home: &Path, request: &ProbeRequest) -> Result<Probe, AgentsError> {
     request.validate()?;
     let start = epoch_now();
