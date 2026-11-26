@@ -1769,6 +1769,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn repository_population_includes_merges_from_the_full_seven_day_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-26T04:00:00Z")
+            .unwrap()
+            .timestamp() as f64;
+        let within = crate::drift::format_timestamp(now - 4.0 * 86_400.0);
+        let outside = crate::drift::format_timestamp(now - 8.0 * 86_400.0);
+        let fake = Fake::new(move |request, _| {
+            assert!(request.query.contains("recent: pullRequests"));
+            let connection = |nodes| serde_json::json!({"nodes":nodes,"pageInfo":{"hasNextPage":false,"endCursor":null}});
+            let node = |number, merged_at: &str| {
+                serde_json::json!({
+                    "number":number,
+                    "state":"MERGED",
+                    "createdAt":merged_at,
+                    "updatedAt":merged_at,
+                    "mergedAt":merged_at,
+                    "closedAt":merged_at,
+                    "isDraft":false,
+                    "additions":4,
+                    "deletions":2,
+                    "reviewDecision":null,
+                    "timelineItems":{"totalCount":0},
+                    "reopenEvents":{"totalCount":0}
+                })
+            };
+            let repository = serde_json::json!({
+                "open":connection(Vec::<serde_json::Value>::new()),
+                "recent":connection(vec![node(4, &within), node(8, &outside)])
+            });
+            Ok(response(serde_json::json!({
+                "data":{"rateLimit":{"cost":3,"remaining":100,"resetAt":"2030-01-01T00:00:00Z"},"repository":repository}
+            }).to_string()))
+        });
+        let at = (now * 1000.0) as i64;
+        let source = source(
+            open(&cfg, fake),
+            BTreeSet::from([("owner/repo".into(), 4), ("owner/repo".into(), 8)]),
+            true,
+            at,
+        );
+        let rows = source
+            .pull_requests("owner/repo", now - DAILY_PR_WINDOW_SECONDS)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].number, 4);
+        assert_eq!(rows[0].merged_at, Some(now - 4.0 * 86_400.0));
+    }
+
     #[trace("FR-033-AC-12", "FR-033-AC-13")]
     #[test]
     fn later_requests_use_admission_and_receipt_clocks_instead_of_the_collection_frame() {

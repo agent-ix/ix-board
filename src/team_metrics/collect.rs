@@ -56,6 +56,7 @@ struct DailyClosureResult {
 
 const REVIEW_MARKER_PAGE_BUDGET: usize = 1;
 const REVIEW_MARKER_STORE_LIMIT: usize = 4 * 1024 * 1024;
+const REVIEW_MARKER_RETENTION_MS: i64 = 90 * 86_400_000;
 const DAILY_CLOSURE_HISTORY_BUDGET: usize = 2;
 const STAGE_HISTORY_ISSUE_BUDGET: usize = 4;
 const MIN_STAGE_AGE_COVERAGE: f64 = 0.25;
@@ -218,6 +219,15 @@ fn sync_review_markers_with_fetch(
     ) -> Result<crate::retro::sources::Page<crate::MarkerComment>, String>,
 ) -> ReviewMarkerRefresh {
     let mut sync = load_review_marker_sync(state_path);
+    let retention_floor = now_ms.saturating_sub(REVIEW_MARKER_RETENTION_MS);
+    prune_review_marker_age(&mut sync, retention_floor);
+    for channel in sync.channels.values_mut() {
+        if !channel.backfill_complete && channel.scan_since_ms.is_none() {
+            channel.scan_started_ms = Some(now_ms);
+            channel.scan_since_ms = Some(retention_floor);
+            channel.next_cursor = None;
+        }
+    }
     let mut requests = 0u64;
     let mut reasons = Vec::new();
     let mut channels = repos
@@ -239,9 +249,14 @@ fn sync_review_markers_with_fetch(
         let mut channel = sync.channels.get(&key).cloned().unwrap_or_default();
         if channel.scan_started_ms.is_none() {
             channel.scan_started_ms = Some(now_ms);
-            channel.scan_since_ms = channel
-                .backfill_complete
-                .then_some(channel.watermark_ms.saturating_sub(2_000));
+            channel.scan_since_ms = Some(if channel.backfill_complete {
+                channel
+                    .watermark_ms
+                    .saturating_sub(2_000)
+                    .max(retention_floor)
+            } else {
+                retention_floor
+            });
             channel.next_cursor = None;
         }
         while requests < REVIEW_MARKER_PAGE_BUDGET as u64 {
@@ -261,10 +276,14 @@ fn sync_review_markers_with_fetch(
                             channel.comments.insert(id, compact);
                         }
                     }
+                    prune_marker_channel_age(
+                        &mut channel,
+                        now_ms.saturating_sub(REVIEW_MARKER_RETENTION_MS),
+                    );
                     if page.has_next {
                         channel.next_cursor = page.cursor;
                         sync.channels.insert(key.clone(), channel.clone());
-                        if let Err(error) = save_review_marker_sync(state_path, &sync) {
+                        if let Err(error) = save_review_marker_sync(state_path, &mut sync) {
                             reasons.push(error);
                             break;
                         }
@@ -278,7 +297,7 @@ fn sync_review_markers_with_fetch(
                         channel.scan_since_ms = None;
                         channel.next_cursor = None;
                         sync.channels.insert(key.clone(), channel.clone());
-                        if let Err(error) = save_review_marker_sync(state_path, &sync) {
+                        if let Err(error) = save_review_marker_sync(state_path, &mut sync) {
                             reasons.push(error);
                             break;
                         }
@@ -288,7 +307,7 @@ fn sync_review_markers_with_fetch(
                 Err(error) => {
                     // The cursor was checkpointed after the prior successful page.
                     sync.channels.insert(key.clone(), channel.clone());
-                    let _ = save_review_marker_sync(state_path, &sync);
+                    let _ = save_review_marker_sync(state_path, &mut sync);
                     reasons.push(error);
                     break;
                 }
@@ -347,15 +366,64 @@ fn load_review_marker_sync(state_path: &std::path::Path) -> ReviewMarkerSync {
     sync
 }
 
+fn prune_review_marker_age(sync: &mut ReviewMarkerSync, cutoff_ms: i64) {
+    for channel in sync.channels.values_mut() {
+        prune_marker_channel_age(channel, cutoff_ms);
+    }
+}
+
+fn prune_marker_channel_age(channel: &mut ReviewMarkerChannel, cutoff_ms: i64) {
+    channel.comments.retain(|_, comment| {
+        comment
+            .updated_at
+            .as_deref()
+            .or(comment.created_at.as_deref())
+            .and_then(|at| crate::drift::timestamp_epoch(at).ok())
+            .and_then(|at| (at * 1000.0).is_finite().then_some((at * 1000.0) as i64))
+            .is_none_or(|at| at >= cutoff_ms)
+    });
+}
+
+fn prune_oldest_marker_comments(
+    sync: &mut ReviewMarkerSync,
+    max_bytes: usize,
+) -> Result<(), String> {
+    loop {
+        let bytes = serde_json::to_vec(sync).map_err(|error| error.to_string())?;
+        if bytes.len() <= max_bytes {
+            return Ok(());
+        }
+        let oldest = sync
+            .channels
+            .iter()
+            .flat_map(|(channel_key, channel)| {
+                channel.comments.iter().map(move |(comment_id, comment)| {
+                    let at = comment
+                        .updated_at
+                        .as_deref()
+                        .or(comment.created_at.as_deref())
+                        .and_then(|at| crate::drift::timestamp_epoch(at).ok())
+                        .unwrap_or(f64::NEG_INFINITY);
+                    (channel_key.clone(), comment_id.clone(), at)
+                })
+            })
+            .min_by(|left, right| left.2.total_cmp(&right.2));
+        let Some((channel_key, comment_id, _)) = oldest else {
+            return Err("review marker channel metadata exceeds store limit".into());
+        };
+        if let Some(channel) = sync.channels.get_mut(&channel_key) {
+            channel.comments.remove(&comment_id);
+        }
+    }
+}
+
 fn save_review_marker_sync(
     state_path: &std::path::Path,
-    sync: &ReviewMarkerSync,
+    sync: &mut ReviewMarkerSync,
 ) -> Result<(), String> {
     let path = review_marker_path(state_path);
+    prune_oldest_marker_comments(sync, REVIEW_MARKER_STORE_LIMIT)?;
     let bytes = serde_json::to_vec(sync).map_err(|error| error.to_string())?;
-    if bytes.len() > REVIEW_MARKER_STORE_LIMIT {
-        return Err("review marker cursor store exceeds 4 MiB".into());
-    }
     let temporary = path.with_extension("markers.json.tmp");
     let mut file = std::fs::File::create(&temporary).map_err(|error| error.to_string())?;
     file.write_all(&bytes).map_err(|error| error.to_string())?;
@@ -1957,30 +2025,45 @@ fn prometheus_effort_range(
     let end = now_ms as f64 / 1000.0;
     let start = end - 86400.0;
     let filter = regex_escape(team);
-    let selector = format!("ix_fleet_lane_state_ratio{{lane=~\".*:{filter}:.*\"}}");
-    let current_values = client.query(&selector).map_err(|e| e.to_string())?;
-    let current_timestamps = client
-        .query(&format!("timestamp({selector})"))
+    let inventory = format!("herdr_pane_info_ratio{{workspace_label=~\"^({filter})$\"}}");
+    let inventory_values = client.query(&inventory).map_err(|e| e.to_string())?;
+    let inventory_timestamps = client
+        .query(&format!("timestamp({inventory})"))
         .map_err(|e| e.to_string())?;
-    let known_current_hosts = join_prometheus_samples(&current_values, &current_timestamps)?
-        .into_iter()
-        .filter_map(|sample| {
-            sample.labels.get("host").cloned().or_else(|| {
-                sample
-                    .labels
-                    .get("lane")
-                    .and_then(|lane| lane.split(':').next())
-                    .map(str::to_owned)
-            })
-        })
-        .collect::<BTreeSet<_>>();
+    let expected_hosts =
+        expected_effort_hosts(&inventory_values, &inventory_timestamps, team, now_ms)?;
+    if expected_hosts.is_empty() {
+        return Err("no fresh team host inventory is available".into());
+    }
+    let selector = format!("ix_fleet_lane_state_ratio{{lane=~\".*:{filter}:.*\"}}");
     let timestamps = client
         .query_range(&format!("timestamp({selector})"), start, end, 60)
         .map_err(|e| e.to_string())?;
     let values = client
         .query_range(&selector, start, end, 60)
         .map_err(|e| e.to_string())?;
-    parse_effort_range(&timestamps, &values, &known_current_hosts, start, end)
+    parse_effort_range(&timestamps, &values, &expected_hosts, start, end)
+}
+
+fn expected_effort_hosts(
+    inventory_values: &str,
+    inventory_timestamps: &str,
+    team: &str,
+    now_ms: i64,
+) -> Result<BTreeSet<String>, String> {
+    Ok(
+        join_prometheus_samples(inventory_values, inventory_timestamps)?
+            .into_iter()
+            .filter(|sample| {
+                status_is_fresh(sample, now_ms)
+                    && sample
+                        .labels
+                        .get("workspace_label")
+                        .is_some_and(|workspace| workspace.eq_ignore_ascii_case(team))
+            })
+            .filter_map(|sample| sample.labels.get("machine").cloned())
+            .collect(),
+    )
 }
 
 #[implements("FR-033-AC-15")]
@@ -2750,7 +2833,7 @@ mod tests {
                 )]),
             },
         );
-        save_review_marker_sync(&state_path, &sync).unwrap();
+        save_review_marker_sync(&state_path, &mut sync).unwrap();
         let restored = load_review_marker_sync(&state_path);
         let channel = &restored.channels["fsl:agent-ix/repo:reviewer"];
         assert_eq!(channel.next_cursor.as_deref(), Some("opaque-cursor"));
@@ -2761,6 +2844,81 @@ mod tests {
                 .contains("private prose")
         );
         assert!(!channel.comments["comment-id"].body.contains("more prose"));
+    }
+
+    #[test]
+    fn marker_backfill_starts_at_the_retention_floor_and_store_prunes_oldest_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("exporter.sqlite");
+        let mut captured_since = None;
+        let result = sync_review_markers_with_fetch(
+            directory.path(),
+            "qsl:completion",
+            &["owner/repo".into()],
+            200 * 86_400_000,
+            |_, _, since, _| {
+                captured_since = since;
+                Ok(crate::retro::sources::Page {
+                    items: Vec::new(),
+                    has_next: true,
+                    cursor: Some("resume".into()),
+                })
+            },
+        );
+        assert_eq!(result.requests, 1);
+        assert_eq!(
+            captured_since,
+            Some((200 * 86_400_000 - REVIEW_MARKER_RETENTION_MS) as f64 / 1000.0)
+        );
+        let mut sync = load_review_marker_sync(directory.path());
+        let channel = sync.channels.values_mut().next().unwrap();
+        for n in 0..20 {
+            channel.comments.insert(
+                format!("comment-{n:02}"),
+                crate::MarkerComment {
+                    id: Some(format!("comment-{n:02}")),
+                    created_at: Some(crate::drift::format_timestamp(n as f64)),
+                    updated_at: Some(crate::drift::format_timestamp(n as f64)),
+                    body: format!(
+                        "<!-- reviewer repo=owner/repo id=SR-{n} -->\n{}",
+                        "x".repeat(120)
+                    ),
+                },
+            );
+        }
+        prune_oldest_marker_comments(&mut sync, 2_000).unwrap();
+        let channel = sync.channels.values().next().unwrap();
+        assert!(!channel.comments.contains_key("comment-00"));
+        assert!(channel.comments.len() < 20);
+        save_review_marker_sync(&state_path, &mut sync).unwrap();
+        assert!(
+            std::fs::metadata(review_marker_path(&state_path))
+                .unwrap()
+                .len()
+                <= 2_000
+        );
+    }
+
+    #[test]
+    fn effort_host_inventory_includes_hosts_without_current_lane_rows() {
+        let values = serde_json::json!({
+            "status":"success",
+            "data":{"result":[
+                {"metric":{"machine":"draco","workspace_label":"QSL"},"value":[1000,"1"]},
+                {"metric":{"machine":"luna","workspace_label":"QSL"},"value":[1000,"1"]}
+            ]}
+        })
+        .to_string();
+        let timestamps = serde_json::json!({
+            "status":"success",
+            "data":{"result":[
+                {"metric":{"machine":"draco","workspace_label":"QSL"},"value":[1000,"1000"]},
+                {"metric":{"machine":"luna","workspace_label":"QSL"},"value":[1000,"1000"]}
+            ]}
+        })
+        .to_string();
+        let hosts = expected_effort_hosts(&values, &timestamps, "QSL", 1_000_000).unwrap();
+        assert_eq!(hosts, BTreeSet::from(["draco".into(), "luna".into()]));
     }
 }
 

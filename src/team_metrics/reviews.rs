@@ -67,6 +67,9 @@ struct Review {
     clean: bool,
     findings: BTreeMap<String, String>,
 }
+type ReviewArtifactKey = (String, String, String);
+type ReviewFindingKey = (String, String, String, String);
+type LatestFindingKey = (String, String, String, String, String);
 
 pub(super) fn compact_marker_body(body: &str) -> String {
     let first = first_line(body);
@@ -137,10 +140,10 @@ pub(crate) fn calculate(
     open_prs: &BTreeSet<String>,
     now: f64,
 ) -> Result<ReviewStats, String> {
-    let mut reviews: BTreeMap<(String, String), Review> = BTreeMap::new();
-    let mut outcomes: BTreeMap<(String, String, String), (u64, f64, Disposition)> = BTreeMap::new();
+    let mut reviews: BTreeMap<ReviewArtifactKey, Review> = BTreeMap::new();
+    let mut outcomes: BTreeMap<ReviewFindingKey, (u64, f64, Disposition)> = BTreeMap::new();
     let mut latest_records = BTreeMap::<String, (f64, Option<bool>)>::new();
-    let mut artifact_findings = BTreeMap::<(String, String), BTreeMap<String, String>>::new();
+    let mut artifact_findings = BTreeMap::<ReviewArtifactKey, BTreeMap<String, String>>::new();
     let mut seen = BTreeSet::new();
     let mut semantic_seen = BTreeSet::new();
     let mut skipped = 0usize;
@@ -204,6 +207,11 @@ pub(crate) fn calculate(
             && !semantic_seen.insert((
                 kind.to_owned(),
                 (*repo).to_owned(),
+                fields
+                    .get("method")
+                    .copied()
+                    .unwrap_or("unknown")
+                    .to_owned(),
                 (*artifact).to_owned(),
                 (*run).to_owned(),
             ))
@@ -250,7 +258,15 @@ pub(crate) fn calculate(
                     break;
                 }
             }
-            let key = (repo.to_string(), artifact.to_string());
+            let key = (
+                repo.to_string(),
+                fields
+                    .get("method")
+                    .copied()
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                artifact.to_string(),
+            );
             if !valid {
                 skipped += 1;
                 continue;
@@ -281,7 +297,28 @@ pub(crate) fn calculate(
                 latest_records.insert(full, (at, marker_mergeable));
             }
         } else if kind == "reviewer-dispositions" {
-            let artifact_key = ((*repo).to_string(), (*artifact).to_string());
+            let artifact_key = if let Some(method) = fields.get("method") {
+                (
+                    (*repo).to_string(),
+                    (*method).to_string(),
+                    (*artifact).to_string(),
+                )
+            } else {
+                let mut candidates = reviews
+                    .keys()
+                    .filter(|(review_repo, _, review_id)| {
+                        review_repo == repo && review_id == artifact
+                    })
+                    .cloned();
+                let Some(key) = candidates.next() else {
+                    continue;
+                };
+                if candidates.next().is_some() {
+                    skipped += 1;
+                    continue;
+                }
+                key
+            };
             let Some(review) = reviews.get(&artifact_key) else {
                 continue;
             };
@@ -329,7 +366,12 @@ pub(crate) fn calculate(
                 }
             }
             for d in data.dispositions {
-                let key = ((*repo).to_string(), (*artifact).to_string(), d.fnd.clone());
+                let key = (
+                    artifact_key.0.clone(),
+                    artifact_key.1.clone(),
+                    artifact_key.2.clone(),
+                    d.fnd.clone(),
+                );
                 finding_states
                     .entry(d.fnd.clone())
                     .or_insert_with(|| "unknown".into());
@@ -351,7 +393,7 @@ pub(crate) fn calculate(
     ]);
     let mut latest_reviews: BTreeMap<String, &Review> = BTreeMap::new();
     let (mut pending, mut rejected) = (0usize, 0usize);
-    for ((repo, id), review) in &reviews {
+    for ((repo, method, id), review) in &reviews {
         if latest_reviews
             .get(&review.pr)
             .is_none_or(|old| review.at > old.at)
@@ -368,7 +410,7 @@ pub(crate) fn calculate(
         row.3 = row.3.min(review.at);
         let mut findings = review.findings.clone();
         for fnd in artifact_findings
-            .get(&(repo.clone(), id.clone()))
+            .get(&(repo.clone(), method.clone(), id.clone()))
             .into_iter()
             .flat_map(|findings| findings.keys())
         {
@@ -378,7 +420,7 @@ pub(crate) fn calculate(
         }
         row.0 |= !findings.is_empty();
         for (fnd, severity) in findings {
-            match outcomes.get(&(repo.clone(), id.clone(), fnd)) {
+            match outcomes.get(&(repo.clone(), method.clone(), id.clone(), fnd)) {
                 Some((_, _, d)) if d.outcome == "rejected" => rejected += 1,
                 Some((_, _, d)) if matches!(d.outcome.as_str(), "still-open" | "deferred") => {
                     pending += 1;
@@ -395,14 +437,14 @@ pub(crate) fn calculate(
             }
         }
     }
-    let mut latest_finding_state =
-        BTreeMap::<(String, String, String, String), (u64, f64, bool)>::new();
-    for ((repo, artifact), findings) in &artifact_findings {
-        let Some(review) = reviews.get(&(repo.clone(), artifact.clone())) else {
+    let mut latest_finding_state = BTreeMap::<LatestFindingKey, (u64, f64, bool)>::new();
+    for ((repo, method, artifact), findings) in &artifact_findings {
+        let Some(review) = reviews.get(&(repo.clone(), method.clone(), artifact.clone())) else {
             continue;
         };
         for fnd in findings.keys() {
-            let disposition = outcomes.get(&(repo.clone(), artifact.clone(), fnd.clone()));
+            let disposition =
+                outcomes.get(&(repo.clone(), method.clone(), artifact.clone(), fnd.clone()));
             let (round, at, unresolved) = match disposition {
                 Some((round, at, disposition)) => (
                     *round,
@@ -414,6 +456,7 @@ pub(crate) fn calculate(
             let key = (
                 review.pr.clone(),
                 repo.clone(),
+                method.clone(),
                 artifact.clone(),
                 fnd.clone(),
             );
@@ -427,7 +470,7 @@ pub(crate) fn calculate(
     }
     let unresolved_prs = latest_finding_state
         .into_iter()
-        .filter_map(|((pr, _, _, _), (_, _, unresolved))| unresolved.then_some(pr))
+        .filter_map(|((pr, _, _, _, _), (_, _, unresolved))| unresolved.then_some(pr))
         .collect::<BTreeSet<_>>();
     let mut values = BTreeMap::new();
     values.insert("review_records_skipped_24h".into(), skipped as f64);
@@ -782,6 +825,32 @@ mod tests {
         let values = calculate(&[older, newer], &open, &BTreeMap::new(), &open, 100_000.0)
             .unwrap()
             .values;
+        assert_eq!(values["pr_changes_requested_share"], 1.0);
+    }
+
+    #[test]
+    fn same_artifact_id_in_distinct_review_methods_keeps_findings_separate() {
+        let first = comment(
+            "review-a",
+            99_000.0,
+            "<!-- reviewer repo=owner/repo id=SR-1 pr=repo#1 method=rust-review run=a -->",
+            "clean: false\nfindings:\n  - fnd: FND-1\n    severity: high",
+        );
+        let second = comment(
+            "review-b",
+            99_500.0,
+            "<!-- reviewer repo=owner/repo id=SR-1 pr=repo#1 method=code-review run=b -->",
+            "clean: true\nfindings: []",
+        );
+        let values = calculate(
+            &[first, second],
+            &allowed(),
+            &BTreeMap::from([("owner/repo#1".into(), 90_000.0)]),
+            &allowed(),
+            100_000.0,
+        )
+        .unwrap()
+        .values;
         assert_eq!(values["pr_changes_requested_share"], 1.0);
     }
 

@@ -3899,6 +3899,7 @@ mod tests {
         let comments = ["a", "b"].map(|id| crate::MarkerComment {
             id: Some(id.into()),
             created_at: Some(crate::drift::format_timestamp(20.0)),
+            updated_at: None,
             body: "<!-- reviewer repo=owner/repo id=SR-1 pr=repo#2 method=review run=1 -->\n\n```yaml\nclean: true\nfindings: []\n```".into(),
         });
         let window = EvalWindow {
@@ -3934,6 +3935,7 @@ mod tests {
         let comment = crate::MarkerComment {
             id: Some("review".into()),
             created_at: Some(crate::drift::format_timestamp(15.0)),
+            updated_at: None,
             body:
                 "<!-- reviewer repo=owner/repo id=SR-1 pr=repo#1 method=review run=a head=abc -->"
                     .into(),
@@ -4022,6 +4024,7 @@ mod tests {
         let comment = |id: &str, run: &str, pr: &str| crate::MarkerComment {
             id: Some(id.into()),
             created_at: Some(crate::drift::format_timestamp(20.0)),
+            updated_at: None,
             body: format!(
                 "<!-- reviewer repo=owner/repo id=SR-{id} pr=repo#{pr} method=review run={run} -->"
             ),
@@ -4189,11 +4192,13 @@ mod tests {
             crate::MarkerComment {
                 id: Some("review".into()),
                 created_at: Some(crate::drift::format_timestamp(20.0)),
+                updated_at: None,
                 body: "<!-- reviewer repo=owner/repo id=SR-1 method=review pr=repo#7 run=a head=abc -->\n\n```yaml\nclean: false\nscope: full\nfindings:\n  - fnd: FND-1\n    severity: high\n    confidence: high\n    method: review\n    check: behavior\n    artifact_id: A-1\n    path: ''\n    lines: ''\n    excerpt: example\n    finding: example\n```".into(),
             },
             crate::MarkerComment {
                 id: Some("disposition".into()),
                 created_at: Some(crate::drift::format_timestamp(30.0)),
+                updated_at: None,
                 body: "<!-- reviewer-dispositions repo=owner/repo id=SR-1 round=1 run=b head=abc mergeable=no -->\n\n```yaml\ndispositions: []\n```".into(),
             },
         ];

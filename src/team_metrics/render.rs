@@ -620,7 +620,14 @@ pub fn render(
                 if let Some(value) = value {
                     out.metric(&format!("ix_team_{name}"), &labels, *value, false)?;
                 } else {
-                    let reason = if values.and_then(|v| v.get(*name)).is_none() {
+                    let reason = if is_review_metric_set
+                        && *name == "pr_changes_requested_share"
+                        && values
+                            .and_then(|v| v.get("pr_changes_requested_coverage"))
+                            .is_some_and(|coverage| *coverage == 0.0)
+                    {
+                        "no open non-draft PR has a retained valid Linear review record"
+                    } else if values.and_then(|v| v.get(*name)).is_none() {
                         missing_reason
                     } else {
                         "metric has no qualifying observations"

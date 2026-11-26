@@ -182,9 +182,19 @@ pub(super) fn scope_matches(
         && selected.projects.is_empty()
         && selected.tickets.is_empty()
     {
-        // Team-only selection follows the whole current team; lead snapshots may
-        // report narrower initiative/project slices over time.
-        return true;
+        // A team-only selection accepts a narrower ticket slice only when its
+        // issue keys prove the selected team. Project and initiative labels alone
+        // do not carry reliable team identity in the relay wire format.
+        let Some(team) = selected.team.as_deref() else {
+            return false;
+        };
+        let prefix = format!("{}-", team.to_ascii_uppercase());
+        return reported
+            .tickets
+            .iter()
+            .all(|ticket| ticket.to_ascii_uppercase().starts_with(&prefix))
+            && (!reported.tickets.is_empty()
+                || (reported.initiatives.is_empty() && reported.projects.is_empty()));
     }
     let same = |a: &[String], b: &[String]| {
         a.iter().collect::<BTreeSet<_>>() == b.iter().collect::<BTreeSet<_>>()

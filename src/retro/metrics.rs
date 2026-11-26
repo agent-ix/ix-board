@@ -1658,6 +1658,7 @@ mod selected_tests {
                 at: 5_000.0,
                 from: Some(WorkflowStateType::Started),
                 to: Some(WorkflowStateType::Completed),
+                to_name: None,
             }])
         }
         fn marker_lines(&self, _: &str, _: &str) -> Result<Vec<String>, String> {

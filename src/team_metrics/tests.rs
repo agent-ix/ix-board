@@ -107,6 +107,31 @@ fn stale_review_evidence_omits_values_and_coverage() {
     assert!(text.contains("metric=\"pr_changes_requested_share\"} 0"));
 }
 
+#[test]
+fn empty_open_review_population_reports_why_changes_share_is_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(dir.path());
+    let mut state = state(&config);
+    let scope = state.scopes.get_mut("factory:completion").unwrap();
+    scope.tracker_ok = true;
+    scope.tracker_at_ms = 1_000_000;
+    scope.github_observed_at_ms = 1_000_000;
+    scope.pr_success_at_ms = 1_000_000;
+    scope.review_success_at_ms = 1_000_000;
+    scope.github_repo_coverage = 1.0;
+    scope.review_stats = Some(super::reviews::ReviewStats {
+        values: BTreeMap::from([
+            ("pr_changes_requested_coverage".into(), 0.0),
+            ("review_marker_backfill_coverage".into(), 0.0),
+        ]),
+    });
+    let text = render(&config, &state, 0, 1_000_000).unwrap();
+    assert!(text.contains("metric=\"pr_changes_requested_share\"} 0"));
+    assert!(text.contains(
+        "metric=\"pr_changes_requested_share\",reason=\"no open non-draft PR has a retained valid Linear review record\"} 1"
+    ));
+}
+
 #[trace("FR-033-AC-16")]
 #[test]
 fn empty_stage_history_population_does_not_publish_a_zero_age() {
@@ -1208,6 +1233,31 @@ fn team_only_scope_accepts_narrower_reported_work_slices() {
         reported_at_ms: 1000,
     };
     assert!(super::timeline::scope_matches(&selected, &reported));
+}
+
+#[test]
+fn team_only_scope_rejects_unattributed_or_other_team_ticket_slices() {
+    let selected = Selectors {
+        team: Some("QSL".into()),
+        ..Default::default()
+    };
+    let unrelated_ticket = relay_work_wire::ReportedScope {
+        initiatives: vec![],
+        projects: vec![],
+        tickets: vec!["SWM-42".into()],
+        reported_at_ms: 1000,
+    };
+    let project_only = relay_work_wire::ReportedScope {
+        initiatives: vec!["unknown-initiative".into()],
+        projects: vec!["unknown-project".into()],
+        tickets: vec![],
+        reported_at_ms: 1000,
+    };
+    assert!(!super::timeline::scope_matches(
+        &selected,
+        &unrelated_ticket
+    ));
+    assert!(!super::timeline::scope_matches(&selected, &project_only));
 }
 
 #[trace("FR-033-AC-5", "FR-033-AC-13")]
