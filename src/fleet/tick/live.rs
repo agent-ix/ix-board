@@ -57,6 +57,16 @@ fn live_sources(
     }
 }
 
+impl LiveSources {
+    /// Hosts with lanes in the relay registry plus the optional `[fleet] hosts` extras.
+    fn hosts(&self) -> Vec<String> {
+        let mut hosts: std::collections::BTreeSet<String> =
+            self.host_lane_counts.keys().cloned().collect();
+        hosts.extend(self.config.hosts.iter().map(|h| h.to_lowercase()));
+        hosts.into_iter().collect()
+    }
+}
+
 impl TickSources for LiveSources {
     fn assignments(&self) -> Result<BTreeMap<String, Vec<String>>, Unread> {
         let failed = |e: String| Unread::Failed(SourceError(e));
@@ -346,7 +356,7 @@ impl TickSources for LiveSources {
                 .map(|query| query as &dyn live::PromQuery),
         };
         let mut events = Vec::new();
-        for host in &self.config.hosts {
+        for host in &self.hosts() {
             let request = WindowRequest {
                 host: host.to_lowercase(),
                 lanes: self

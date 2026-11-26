@@ -78,6 +78,23 @@ mod tests {
 
     use super::*;
 
+    #[trace("FR-041-AC-9")]
+    #[test]
+    fn covered_hosts_come_from_the_registry_with_config_hosts_as_optional_extra() {
+        let host = |name: &str, lanes| HostSummary {
+            host: name.to_owned(),
+            lanes,
+            working: 0,
+            not_working: lanes,
+        };
+        let mut report = finish(1, Vec::new(), Vec::new());
+        report.hosts = vec![host("draco", 2), host("terra", 1)];
+
+        assert_eq!(covered_hosts(&report, &[]), ["draco", "terra"]);
+        let extra = ["Titan".to_owned(), "DRACO".to_owned()];
+        assert_eq!(covered_hosts(&report, &extra), ["draco", "terra", "titan"]);
+    }
+
     #[trace("FR-039-AC-14")]
     #[test]
     fn parse_event_copies_only_the_authoritative_session_field_as_transcript_id() {
@@ -429,6 +446,15 @@ impl FleetReport {
             Coverage::Partial
         }
     }
+}
+
+/// The hosts a run covers: every host that has lanes in the relay registry, plus the optional
+/// `[fleet] hosts` extras, lower-cased and sorted. `[fleet] hosts` is not required.
+#[must_use]
+pub fn covered_hosts(report: &FleetReport, extra: &[String]) -> Vec<String> {
+    let mut hosts: BTreeSet<String> = report.hosts.iter().map(|h| h.host.to_lowercase()).collect();
+    hosts.extend(extra.iter().map(|h| h.to_lowercase()));
+    hosts.into_iter().collect()
 }
 
 fn host_of(addr: &str) -> String {

@@ -151,3 +151,21 @@ fn live_busy_ratio_read_emits_add_lane_without_discarding_other_hosts() {
     assert_eq!(add_lanes.len(), 1);
     assert_eq!(add_lanes[0].action.subject, "draco");
 }
+
+#[trace("FR-041-AC-16")]
+#[test]
+fn live_tick_hosts_come_from_registry_lanes_without_fleet_hosts() {
+    let mut sources = LiveSources {
+        timeout: Duration::from_secs(1),
+        config: FleetConfig::default(),
+        settings: TickSettings::default(),
+        host_busy: BTreeMap::new(),
+        lanes: Vec::new(),
+        host_lane_counts: BTreeMap::from([("draco".to_owned(), 2), ("terra".to_owned(), 1)]),
+    };
+    assert!(sources.config.hosts.is_empty());
+    assert_eq!(sources.hosts(), ["draco", "terra"]);
+
+    sources.config.hosts = vec!["Titan".to_owned()];
+    assert_eq!(sources.hosts(), ["draco", "terra", "titan"]);
+}

@@ -31,7 +31,8 @@ pub use render::render_text;
 pub use report::{
     Coverage, Defect, DefectKind, ExpiredOrder, FleetReport, HostSeries, HostSummary, LaneRow,
     OrderReceipts, ProbeReading, RawEvent, ReceiptRead, RegInfo, RelayConfig, RelaySnapshot,
-    SCHEMA_VERSION, SeriesSource, Sources, UnresolvedOrder, WeakSignals, build_report, parse_event,
+    SCHEMA_VERSION, SeriesSource, Sources, UnresolvedOrder, WeakSignals, build_report,
+    covered_hosts, parse_event,
 };
 
 use thiserror::Error as ThisError;

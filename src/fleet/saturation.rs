@@ -1234,7 +1234,7 @@ pub fn read_live(
     let now = report.run_ms;
     let window = config.saturation_window.as_secs();
     let mut hosts = Vec::new();
-    for host in &config.hosts {
+    for host in &crate::fleet::covered_hosts(&report, &config.hosts) {
         let host_key = host.to_lowercase();
         let lanes: Vec<String> = reachable_lanes
             .iter()
