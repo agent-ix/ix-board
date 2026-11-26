@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Agent-IX
 
-//! Deterministic recurring jobs backed by the fleet ledger (FR-048).
+//! Deterministic recurring jobs backed by the fleet ledger (FR-049).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -136,7 +136,7 @@ pub struct DueReport {
 
 impl DueReport {
     /// Required process exit code: 0 clear, 1 due, 2 overdue.
-    #[implements("FR-048-AC-1")]
+    #[implements("FR-049-AC-1")]
     pub fn exit_code(&self) -> u8 {
         if self.jobs.iter().any(|job| job.state == DueState::Overdue) {
             2
@@ -148,7 +148,7 @@ impl DueReport {
     }
 
     /// Renders a stable human-readable report.
-    #[implements("FR-048-AC-1")]
+    #[implements("FR-049-AC-1")]
     pub fn render_text(&self) -> String {
         let mut lines = self
             .jobs
@@ -173,7 +173,7 @@ impl DueReport {
 ///
 /// # Errors
 /// Returns an error when the notification transport refuses the alert.
-#[implements("FR-048-AC-5")]
+#[implements("FR-049-AC-5")]
 pub fn notify_if_alert(
     report: &DueReport,
     recipient: Option<&str>,
@@ -222,7 +222,7 @@ pub fn manifest_path(override_path: Option<&Path>) -> Result<PathBuf, CadenceErr
 }
 
 /// Loads and validates a cadence manifest.
-#[implements("FR-048-AC-4")]
+#[implements("FR-049-AC-4")]
 pub fn load_manifest(path: &Path) -> Result<Manifest, CadenceError> {
     let content = std::fs::read_to_string(path).map_err(|source| CadenceError::Read {
         path: path.to_owned(),
@@ -235,7 +235,7 @@ pub fn load_manifest(path: &Path) -> Result<Manifest, CadenceError> {
 }
 
 /// Validates cadence job identity, interval and supported argv shape.
-#[implements("FR-048-AC-4")]
+#[implements("FR-049-AC-4")]
 pub fn validate_manifest(manifest: &Manifest) -> Result<(), CadenceError> {
     if manifest
         .alert_recipient
@@ -297,7 +297,7 @@ fn command_matches_kind(kind: JobKind, command: &[String]) -> bool {
 }
 
 /// Computes due state for the exact requested program and team.
-#[implements("FR-048-AC-1")]
+#[implements("FR-049-AC-1")]
 pub fn due(
     manifest: &Manifest,
     ledger: &Ledger,
@@ -354,7 +354,7 @@ fn classify_due(interval_secs: u64, last_run: Option<&CadenceRun>, now_ms: i64) 
 }
 
 /// Runs one uniquely identified job and records its process outcome.
-#[implements("FR-048-AC-3")]
+#[implements("FR-049-AC-3")]
 pub fn run_job(
     manifest: &Manifest,
     mut open_ledger: impl FnMut() -> Result<Ledger, CadenceError>,
@@ -485,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    #[trace("FR-048-AC-1")]
+    #[trace("FR-049-AC-1")]
     fn due_classification_distinguishes_missing_due_and_overdue() {
         assert_eq!(classify_due(1800, None, 0), DueState::Due);
         let recent = crate::fleet::ledger::CadenceRun {
@@ -506,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    #[trace("FR-048-AC-1", "FR-048-AC-5")]
+    #[trace("FR-049-AC-1", "FR-049-AC-5")]
     fn due_report_exit_codes_and_checker_alert_are_explicit() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("ledger.sqlite3");
@@ -541,7 +541,7 @@ mod tests {
     }
 
     #[test]
-    #[trace("FR-048-AC-5")]
+    #[trace("FR-049-AC-5")]
     fn checker_notification_is_sent_only_when_report_alerts() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("ledger.sqlite3");
@@ -610,7 +610,7 @@ mod tests {
     }
 
     #[test]
-    #[trace("FR-048-AC-2")]
+    #[trace("FR-049-AC-2")]
     fn ledger_reopen_preserves_outcome_and_running_job_ages_to_overdue() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("ledger.sqlite3");
@@ -640,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    #[trace("FR-048-AC-4")]
+    #[trace("FR-049-AC-4")]
     fn manifest_rejects_duplicate_and_invalid_job_entries() {
         let mut manifest = Manifest {
             alert_recipient: None,

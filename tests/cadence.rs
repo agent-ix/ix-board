@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Agent-IX
 
-//! Acceptance tests for cadence scheduling and ledger behavior (FR-048).
+//! Acceptance tests for cadence scheduling and ledger behavior (FR-049).
 
 use ix_board::fleet::FleetConfig;
 use ix_board::fleet::ledger::Ledger;
@@ -51,7 +51,7 @@ fn due_command(manifest: &Path, ledger: &Path) -> std::process::Output {
 }
 
 #[test]
-#[trace("FR-048-AC-3", "FR-048-AC-6")]
+#[trace("FR-049-AC-3", "FR-049-AC-6")]
 fn cadence_run_releases_ledger_for_fleet_tick_and_concurrent_due() {
     let directory = tempfile::tempdir().unwrap();
     let manifest_path = directory.path().join("cadence.json");
@@ -100,7 +100,7 @@ fn cadence_run_releases_ledger_for_fleet_tick_and_concurrent_due() {
 }
 
 #[test]
-#[trace("FR-048-AC-3")]
+#[trace("FR-049-AC-3")]
 fn cadence_hygiene_job_runs_the_focus_hygiene_argv() {
     let directory = tempfile::tempdir().unwrap();
     let manifest_path = directory.path().join("cadence.json");
@@ -138,7 +138,7 @@ fn cadence_hygiene_job_runs_the_focus_hygiene_argv() {
 }
 
 #[test]
-#[trace("FR-048-AC-3")]
+#[trace("FR-049-AC-3")]
 fn cadence_run_records_a_child_failure() {
     let directory = tempfile::tempdir().unwrap();
     let manifest_path = directory.path().join("cadence.json");
@@ -172,7 +172,7 @@ fn cadence_run_records_a_child_failure() {
 }
 
 #[test]
-#[trace("FR-048-AC-1")]
+#[trace("FR-049-AC-1")]
 fn cadence_due_cli_uses_exit_codes_zero_one_and_two() {
     let clear_dir = tempfile::tempdir().unwrap();
     let clear_manifest = clear_dir.path().join("cadence.json");

@@ -186,7 +186,7 @@ snapshot, FR-025 the append-only store outside git, FR-026 the
 unavailable-not-zero rule with per-metric query provenance, FR-027 the delta
 against the previous snapshot and baseline, and FR-028 the baseline backfill.
 They reuse the readers behind FR-018, FR-021, FR-022 and FR-023.
-FR-048 defines recurring cadence manifests and their persistent run ledger.
+FR-049 defines recurring cadence manifests and their persistent run ledger.
 Functional acceptance criteria include fixture checks for each drift signal,
 queue rules, and cache behavior; NFR-001 specifies a lightweight warm-cache
 fixture benchmark.

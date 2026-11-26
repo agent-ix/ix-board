@@ -1,5 +1,5 @@
 ---
-id: FR-048
+id: FR-049
 title: Run recurring program jobs from a persistent cadence ledger
 type: FR
 relationships:
@@ -8,7 +8,7 @@ relationships:
   - target: "ix://agent-ix/ix-board/FR-024"
     type: depends_on
 ---
-# FR-048: Run recurring program jobs from a persistent cadence ledger
+# FR-049: Run recurring program jobs from a persistent cadence ledger
 
 ## Description
 
@@ -46,12 +46,12 @@ manifest is shared configuration and is not stored in the fleet ledger.
 
 | ID | Criteria | Verification |
 |----|----------|--------------|
-| FR-048-AC-1 | Due exits 0 with no due jobs, 1 with a due job, and 2 with an overdue job; an absent run is due and exactly one interval elapsed is due rather than overdue. | Test |
-| FR-048-AC-2 | A completed run's outcome and timestamps survive reopening the fleet ledger, and a stopped job becomes overdue as its recorded completion ages. | Test |
-| FR-048-AC-3 | A run executes the declared argv without shell interpretation and records both success and failure outcomes. | Test |
-| FR-048-AC-4 | Program/team selection, unknown jobs, duplicate jobs, invalid intervals and malformed manifest fields are handled deterministically before running a job. | Test |
-| FR-048-AC-5 | `--alert` emits an alert only when the configured cadence checker job is overdue. | Test |
-| FR-048-AC-6 | Cadence uses the existing fleet ledger and does not create a scheduler or write state into a repository. | Test |
+| FR-049-AC-1 | Due exits 0 with no due jobs, 1 with a due job, and 2 with an overdue job; an absent run is due and exactly one interval elapsed is due rather than overdue. | Test |
+| FR-049-AC-2 | A completed run's outcome and timestamps survive reopening the fleet ledger, and a stopped job becomes overdue as its recorded completion ages. | Test |
+| FR-049-AC-3 | A run executes the declared argv without shell interpretation and records both success and failure outcomes. | Test |
+| FR-049-AC-4 | Program/team selection, unknown jobs, duplicate jobs, invalid intervals and malformed manifest fields are handled deterministically before running a job. | Test |
+| FR-049-AC-5 | `--alert` emits an alert only when the configured cadence checker job is overdue. | Test |
+| FR-049-AC-6 | Cadence uses the existing fleet ledger and does not create a scheduler or write state into a repository. | Test |
 
 ## Dependencies
 

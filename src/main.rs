@@ -841,7 +841,7 @@ fn encode_output_json(output: &Output) -> Result<String, String> {
     }
 }
 
-#[implements("FR-048-AC-1")]
+#[implements("FR-049-AC-1")]
 fn output_outcome(output: &Output) -> Outcome {
     match output {
         Output::Cached { result, .. } => output_outcome(result),
@@ -3242,8 +3242,8 @@ fn run_auth(command: AuthCommand) -> Result<Output, Error> {
     }
 }
 
-#[implements("FR-048-AC-3")]
-#[implements("FR-048-AC-5")]
+#[implements("FR-049-AC-3")]
+#[implements("FR-049-AC-5")]
 fn run_cadence(command: CadenceCommand) -> Result<Output, Error> {
     let manifest_override = match &command {
         CadenceCommand::Due { manifest, .. } | CadenceCommand::Run { manifest, .. } => {

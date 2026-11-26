@@ -321,7 +321,7 @@ fn apply_v9(tx: &rusqlite::Transaction<'_>) -> Result<(), LedgerError> {
     Ok(())
 }
 
-#[implements("FR-048-AC-2")]
+#[implements("FR-049-AC-2")]
 fn apply_v10(tx: &rusqlite::Transaction<'_>) -> Result<(), LedgerError> {
     for statement in schema::V10 {
         tx.execute_batch(statement)?;
@@ -570,7 +570,7 @@ impl Ledger {
     }
 
     /// Returns the latest cadence invocation for a program/team/job tuple.
-    #[implements("FR-048-AC-2")]
+    #[implements("FR-049-AC-2")]
     pub fn cadence_last_run(
         &self,
         program: &str,
@@ -596,7 +596,7 @@ impl Ledger {
     }
 
     /// Starts a cadence invocation, replacing the job's latest run row.
-    #[implements("FR-048-AC-2")]
+    #[implements("FR-049-AC-2")]
     pub fn cadence_start(
         &mut self,
         program: &str,
@@ -617,7 +617,7 @@ impl Ledger {
     }
 
     /// Finishes the active cadence invocation with its process outcome.
-    #[implements("FR-048-AC-2")]
+    #[implements("FR-049-AC-2")]
     pub fn cadence_finish(
         &mut self,
         program: &str,

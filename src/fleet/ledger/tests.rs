@@ -385,7 +385,7 @@ fn an_unsupported_schema_version_is_refused_without_a_change() {
 }
 
 #[test]
-#[trace("FR-048-AC-2")]
+#[trace("FR-049-AC-2")]
 fn version_nine_ledger_migrates_additively_to_cadence_storage() {
     let (_dir, path) = path();
     let ledger = open(&path);
