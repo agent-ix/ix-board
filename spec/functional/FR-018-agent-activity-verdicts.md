@@ -251,7 +251,7 @@ instead of treating a partial or failed command as a complete zero-worker report
 | FR-018-AC-27 | A herdr `done` pane with no prompt, question, worker or attributed process is IDLE (RECENT within idle-after) and not UNKNOWN; with a pending prompt or question PROMPT/ASKING still take precedence. | Test |
 | FR-018-AC-28 | A Codex rollout larger than the byte limit yields the latest lifecycle state from its tail; when no lifecycle record is found within the limit the evidence is unavailable with a reason and the row is partial. | Test |
 | FR-018-AC-29 | With one machine timing out and others healthy, the healthy machines' rows are returned unchanged within the per-machine timeout, `missing_hosts` lists the failed machine with reason and elapsed time, and the exit status is non-zero. | Test |
-| FR-018-AC-30 | A locked-build owner matching the current Herdr machine/workspace/tab labels is reported as active process evidence; `locked-build.sh` command text and a pane id used as a tab label do not establish a lease. Missing metrics are explicit. | Test |
+| FR-018-AC-30 | A locked-build owner matching the current Herdr machine/workspace/tab labels is reported as active process evidence independently of process-name collection; only known work-command executables enter process evidence, `locked-build.sh` text alone and a pane id used as a tab label do not establish a lease, and missing metrics are explicit. | Test |
 
 ## Dependencies
 

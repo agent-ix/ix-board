@@ -41,5 +41,5 @@ the local Herdr server identity is not discoverable, and configure
 | `defect-rate.sh` | `retro eval --config <file>` | Use configured retro metrics and evidence sources. |
 | `probe-linux.sh` | `host check` / cadence `host_check` | Replaced by the same host-local command on Linux, macOS and WSL. |
 
-The wrappers `hosts-status.sh`, `status-qsl.sh`, and `probe-linux.sh` contain no
-independent policy and are marked for deletion after the command migration.
+`status-qsl.sh` is a thin wrapper with no independent host or lane analysis and
+is marked for deletion after the `agents QSL` view is adopted.

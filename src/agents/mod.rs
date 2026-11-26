@@ -50,7 +50,7 @@ const TAIL_LINES: &str = "30";
 /// Characters kept in an excerpt.
 const EXCERPT_CHARS: usize = 600;
 /// Commands whose presence in a pane means a build or gate is running.
-const WORK_COMMANDS: [&str; 9] = [
+pub(super) const WORK_COMMANDS: [&str; 9] = [
     "cargo", "rustc", "make", "gh", "flock", "pytest", "npm", "pnpm", "kani",
 ];
 
