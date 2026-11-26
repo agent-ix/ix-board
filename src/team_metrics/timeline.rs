@@ -188,13 +188,14 @@ pub(super) fn scope_matches(
         let Some(team) = selected.team.as_deref() else {
             return false;
         };
+        if reported.tickets.is_empty() {
+            return false;
+        }
         let prefix = format!("{}-", team.to_ascii_uppercase());
         return reported
             .tickets
             .iter()
-            .all(|ticket| ticket.to_ascii_uppercase().starts_with(&prefix))
-            && (!reported.tickets.is_empty()
-                || (reported.initiatives.is_empty() && reported.projects.is_empty()));
+            .all(|ticket| ticket.to_ascii_uppercase().starts_with(&prefix));
     }
     let same = |a: &[String], b: &[String]| {
         a.iter().collect::<BTreeSet<_>>() == b.iter().collect::<BTreeSet<_>>()

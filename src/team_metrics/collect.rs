@@ -57,7 +57,7 @@ struct DailyClosureResult {
 const REVIEW_MARKER_PAGE_BUDGET: usize = 1;
 const REVIEW_MARKER_STORE_LIMIT: usize = 4 * 1024 * 1024;
 const REVIEW_MARKER_RETENTION_MS: i64 = 90 * 86_400_000;
-const DAILY_CLOSURE_HISTORY_BUDGET: usize = 2;
+const DAILY_CLOSURE_HISTORY_BUDGET: usize = 50;
 const STAGE_HISTORY_ISSUE_BUDGET: usize = 4;
 const MIN_STAGE_AGE_COVERAGE: f64 = 0.25;
 const PROMETHEUS_CLOCK_SKEW_MS: i64 = 5_000;
@@ -70,7 +70,7 @@ struct ReviewMarkerSync {
     #[serde(default)]
     channels: BTreeMap<String, ReviewMarkerChannel>,
     #[serde(default)]
-    next_channel: usize,
+    next_by_scope: BTreeMap<String, usize>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -154,6 +154,89 @@ fn marker_sync_rotates_across_repositories_and_record_kinds() {
             .values()
             .all(|channel| channel.backfill_complete)
     );
+}
+
+#[test]
+fn marker_sync_keeps_two_scope_cursors_coverage_and_comments_separate() {
+    let dir = tempfile::tempdir().unwrap();
+    let qsl_repos = (0..3).map(|i| format!("owner/qsl-{i}")).collect::<Vec<_>>();
+    let swm_repos = (0..4).map(|i| format!("owner/swm-{i}")).collect::<Vec<_>>();
+    let mut qsl_seen = BTreeSet::new();
+    let mut swm_seen = BTreeSet::new();
+    let mut qsl_result = None;
+    let mut swm_result = None;
+
+    for _ in 0..8 {
+        if qsl_seen.len() < 6 {
+            qsl_result = Some(sync_review_markers_with_fetch(
+                dir.path(),
+                "qsl:completion",
+                &qsl_repos,
+                10_000,
+                |prefix, needle, _, _| {
+                    qsl_seen.insert(format!("{prefix}:{needle}"));
+                    Ok(crate::retro::sources::Page {
+                        items: vec![crate::MarkerComment {
+                            id: Some(format!("qsl:{}", needle.trim_start_matches("repo="))),
+                            created_at: Some(crate::drift::format_timestamp(9.0)),
+                            updated_at: Some(crate::drift::format_timestamp(9.0)),
+                            body: format!(
+                                "{prefix} repo={} id=SR-1 -->",
+                                needle.trim_start_matches("repo=")
+                            ),
+                        }],
+                        has_next: false,
+                        cursor: None,
+                    })
+                },
+            ));
+        }
+        if swm_seen.len() < 8 {
+            swm_result = Some(sync_review_markers_with_fetch(
+                dir.path(),
+                "swarm-tools:department-monitoring",
+                &swm_repos,
+                10_000,
+                |prefix, needle, _, _| {
+                    swm_seen.insert(format!("{prefix}:{needle}"));
+                    Ok(crate::retro::sources::Page {
+                        items: vec![crate::MarkerComment {
+                            id: Some(format!("swm:{}", needle.trim_start_matches("repo="))),
+                            created_at: Some(crate::drift::format_timestamp(9.0)),
+                            updated_at: Some(crate::drift::format_timestamp(9.0)),
+                            body: format!(
+                                "{prefix} repo={} id=SR-1 -->",
+                                needle.trim_start_matches("repo=")
+                            ),
+                        }],
+                        has_next: false,
+                        cursor: None,
+                    })
+                },
+            ));
+        }
+    }
+
+    let qsl_result = qsl_result.unwrap();
+    let swm_result = swm_result.unwrap();
+    assert_eq!(qsl_seen.len(), 6);
+    assert_eq!(swm_seen.len(), 8);
+    assert!(qsl_result.complete);
+    assert!(swm_result.complete);
+    assert_eq!(qsl_result.coverage, 1.0);
+    assert_eq!(swm_result.coverage, 1.0);
+    assert!(qsl_result.comments.iter().all(|comment| {
+        comment
+            .id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("qsl:"))
+    }));
+    assert!(swm_result.comments.iter().all(|comment| {
+        comment
+            .id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("swm:"))
+    }));
 }
 
 #[trace("FR-033-AC-17")]
@@ -241,9 +324,14 @@ fn sync_review_markers_with_fetch(
             .map(move |(prefix, name)| (format!("{scope}:{repo}:{name}"), prefix, repo))
         })
         .collect::<Vec<_>>();
-    if let Some((rotate, next)) = marker_channel_rotation(channels.len(), sync.next_channel) {
+    let own = channels
+        .iter()
+        .map(|(key, ..)| key.clone())
+        .collect::<BTreeSet<_>>();
+    let cursor = sync.next_by_scope.get(scope).copied().unwrap_or(0);
+    if let Some((rotate, next)) = marker_channel_rotation(channels.len(), cursor) {
         channels.rotate_left(rotate);
-        sync.next_channel = next;
+        sync.next_by_scope.insert(scope.to_owned(), next);
     }
     for (key, prefix, repo) in channels.into_iter().take(REVIEW_MARKER_PAGE_BUDGET) {
         let mut channel = sync.channels.get(&key).cloned().unwrap_or_default();
@@ -314,23 +402,19 @@ fn sync_review_markers_with_fetch(
             }
         }
     }
-    let complete = sync.channels.len() == repos.len() * 2
-        && sync
-            .channels
-            .values()
-            .all(|channel| channel.backfill_complete);
-    let coverage = if repos.is_empty() {
+    let done = own
+        .iter()
+        .filter(|key| sync.channels.get(*key).is_some_and(|c| c.backfill_complete))
+        .count();
+    let complete = done == own.len();
+    let coverage = if own.is_empty() {
         1.0
     } else {
-        sync.channels
-            .values()
-            .filter(|channel| channel.backfill_complete)
-            .count() as f64
-            / (repos.len() * 2) as f64
+        done as f64 / own.len() as f64
     };
-    let comments = sync
-        .channels
-        .values()
+    let comments = own
+        .iter()
+        .filter_map(|key| sync.channels.get(key))
         .flat_map(|channel| channel.comments.values().cloned())
         .collect();
     ReviewMarkerRefresh {
@@ -975,7 +1059,7 @@ impl Collector {
                         match daily_linear_closures(
                             source.as_ref(),
                             &daily_candidates,
-                            &verified_closure_history_path()?,
+                            &verified_closure_history_path(&scope.key())?,
                             now as f64 / 1000.0,
                         ) {
                             Ok(result) if result.coverage > 0.0 => {
@@ -1285,9 +1369,9 @@ fn read_prometheus_status(
     );
     let status_values = client.query(&status_query).map_err(|e| e.to_string())?;
     let status_timestamps = client
-        .query(&format!("timestamp({status_query})"))
+        .query("timestamp(herdr_pane_status_ratio)")
         .map_err(|e| e.to_string())?;
-    let mut pane_status = join_prometheus_samples(&status_values, &status_timestamps)?;
+    let mut pane_status = join_pane_status_timestamps(&status_values, &status_timestamps)?;
     let present = pane_status
         .iter()
         .filter_map(|sample| pane_lane_key(&sample.labels).ok())
@@ -1312,6 +1396,49 @@ fn read_prometheus_status(
     }
     let lane_status = pane_status;
     Ok(PrometheusLeadStatus { lane_status })
+}
+
+pub(super) fn join_pane_status_timestamps(
+    status_values: &str,
+    timestamp_values: &str,
+) -> Result<Vec<PrometheusSample>, String> {
+    let mut values = parse_prometheus_samples(status_values)?;
+    let timestamps = parse_prometheus_samples(timestamp_values)?
+        .into_iter()
+        .filter_map(|sample| {
+            Some((
+                (
+                    sample.labels.get("machine")?.clone(),
+                    sample.labels.get("pane")?.clone(),
+                    sample.labels.get("status")?.clone(),
+                ),
+                sample.value,
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for sample in &mut values {
+        let key = (
+            sample
+                .labels
+                .get("machine")
+                .ok_or("Prometheus pane status omitted machine")?
+                .clone(),
+            sample
+                .labels
+                .get("pane")
+                .ok_or("Prometheus pane status omitted pane")?
+                .clone(),
+            sample
+                .labels
+                .get("status")
+                .ok_or("Prometheus pane status omitted status")?
+                .clone(),
+        );
+        sample.timestamp_seconds = *timestamps
+            .get(&key)
+            .ok_or("Prometheus pane status timestamp is unavailable")?;
+    }
+    Ok(values)
 }
 
 #[implements("FR-033-AC-16")]
@@ -1542,12 +1669,19 @@ fn first_review_population(prs: &[retro::sources::PullRequest]) -> BTreeMap<Stri
 
 /// Counts verified path closures by UTC day from retained Linear histories and configured repos.
 #[implements("FR-033-AC-18")]
-fn verified_closure_history_path() -> Result<PathBuf, String> {
+fn verified_closure_history_path(scope: &str) -> Result<PathBuf, String> {
     let cache_path = match std::env::var_os("IX_BOARD_CACHE_PATH") {
         Some(path) => PathBuf::from(path),
         None => crate::default_cache_path().map_err(|error| error.to_string())?,
     };
-    Ok(cache_path.with_extension("closure-window-v2.json"))
+    Ok(scoped_closure_history_path(&cache_path, scope))
+}
+
+fn scoped_closure_history_path(cache_path: &std::path::Path, scope: &str) -> PathBuf {
+    cache_path.with_extension(format!(
+        "closure-window-v2-{}.json",
+        scope.replace(':', "-")
+    ))
 }
 
 #[implements("FR-033-AC-18")]
@@ -2443,6 +2577,62 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from(["QSL-recent", "QSL-unknown"])
         );
+    }
+
+    #[test]
+    fn daily_closure_histories_keep_two_scope_caches_independent() {
+        let directory = tempfile::tempdir().unwrap();
+        let issue = |id: &str, key: &str| {
+            serde_json::from_value::<Issue>(serde_json::json!({
+                "id": id,
+                "identifier": format!("{key}-{id}"),
+                "title": "closed path",
+                "description": null,
+                "state": "Done",
+                "state_name": "Done",
+                "state_type": "completed",
+                "parent_id": null,
+                "team_key": key,
+                "assignee_id": null,
+                "assignee_name": null,
+                "project_id": null,
+                "project_milestone_id": null,
+                "priority": 0,
+                "sort_order": 0,
+                "blocked_by": [],
+                "created_at": "2026-11-20T00:00:00Z",
+                "updated_at": "2026-11-25T00:00:00Z",
+                "attachment_urls": [],
+                "attachments_complete": true,
+                "started_at": null,
+                "completed_at": null,
+                "pull_requests": []
+            }))
+            .unwrap()
+        };
+        let base = directory.path().join("linear.sqlite3");
+        let qsl_path = scoped_closure_history_path(&base, "fsl:completion");
+        let swm_path = scoped_closure_history_path(&base, "swarm-tools:department-monitoring");
+        let qsl_issues = vec![issue("q1", "QSL"), issue("q2", "QSL")];
+        let swm_issues = vec![issue("s1", "SWM"), issue("s2", "SWM"), issue("s3", "SWM")];
+        let source = ClosureTestLinear {
+            history: Vec::new(),
+            fail_issue_id: None,
+        };
+
+        let qsl_first = daily_linear_closures(&source, &qsl_issues, &qsl_path, 200_000.0).unwrap();
+        let swm = daily_linear_closures(&source, &swm_issues, &swm_path, 200_000.0).unwrap();
+        let qsl_again = daily_linear_closures(&source, &qsl_issues, &qsl_path, 200_000.0).unwrap();
+        let qsl_cache: ClosureHistoryStore =
+            serde_json::from_slice(&std::fs::read(qsl_path).unwrap()).unwrap();
+        let swm_cache: ClosureHistoryStore =
+            serde_json::from_slice(&std::fs::read(swm_path).unwrap()).unwrap();
+
+        assert_eq!(qsl_first.coverage, 1.0);
+        assert_eq!(swm.coverage, 1.0);
+        assert_eq!(qsl_again.coverage, 1.0);
+        assert_eq!(qsl_cache.entries.len(), 2);
+        assert_eq!(swm_cache.entries.len(), 3);
     }
 
     #[trace("FR-033-AC-18")]

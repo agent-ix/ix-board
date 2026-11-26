@@ -133,6 +133,30 @@ fn empty_open_review_population_reports_why_changes_share_is_unavailable() {
     ));
 }
 
+#[test]
+fn review_findings_are_unavailable_when_marker_backfill_has_no_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(dir.path());
+    let mut state = state(&config);
+    let scope = state.scopes.get_mut("factory:completion").unwrap();
+    scope.tracker_ok = true;
+    scope.tracker_at_ms = 1_000_000;
+    scope.review_success_at_ms = 1_000_000;
+    scope.review_stats = Some(super::reviews::ReviewStats {
+        values: BTreeMap::from([
+            ("review_recorded_prs_24h".into(), 0.0),
+            ("review_marker_backfill_coverage".into(), 0.0),
+            ("review_findings_confirmed_high_24h".into(), 0.0),
+        ]),
+    });
+
+    let text = render(&config, &state, 0, 1_000_000).unwrap();
+    assert!(!text.contains("ix_team_review_findings_confirmed_high_24h{"));
+    assert!(text.contains(
+        "ix_team_metric_available{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\",metric=\"review_findings_confirmed_high_24h\"} 0"
+    ));
+}
+
 #[trace("FR-033-AC-16")]
 #[test]
 fn empty_stage_history_population_does_not_publish_a_zero_age() {
@@ -574,6 +598,24 @@ fn prometheus_lane_join_keeps_gauge_value_and_source_timestamp() {
     .to_string();
     let joined = super::collect::join_prometheus_samples(&values, &timestamps).unwrap();
     assert_eq!(joined[0].timestamp_seconds, 190.0);
+    assert_eq!(joined[0].value, 1.0);
+}
+
+#[test]
+fn pane_status_uses_the_original_scrape_timestamp_from_timestamp_query_value() {
+    let values = serde_json::json!({
+        "status": "success",
+        "data": {"result": [{"metric": {"machine": "host-a", "pane": "2", "status": "working", "workspace_label": "QSL", "tab_label": "code"}, "value": [2000, "1"]}]}
+    })
+    .to_string();
+    let timestamps = serde_json::json!({
+        "status": "success",
+        "data": {"result": [{"metric": {"__name__": "timestamp", "machine": "host-a", "pane": "2", "status": "working"}, "value": [2000, "1811"]}]}
+    })
+    .to_string();
+
+    let joined = super::collect::join_pane_status_timestamps(&values, &timestamps).unwrap();
+    assert_eq!(joined[0].timestamp_seconds, 1811.0);
     assert_eq!(joined[0].value, 1.0);
 }
 
@@ -1255,11 +1297,18 @@ fn team_only_scope_rejects_unattributed_or_other_team_ticket_slices() {
         tickets: vec![],
         reported_at_ms: 1000,
     };
+    let empty = relay_work_wire::ReportedScope {
+        initiatives: vec![],
+        projects: vec![],
+        tickets: vec![],
+        reported_at_ms: 1000,
+    };
     assert!(!super::timeline::scope_matches(
         &selected,
         &unrelated_ticket
     ));
     assert!(!super::timeline::scope_matches(&selected, &project_only));
+    assert!(!super::timeline::scope_matches(&selected, &empty));
 }
 
 #[trace("FR-033-AC-5", "FR-033-AC-13")]

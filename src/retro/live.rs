@@ -283,7 +283,7 @@ impl LinearSource for LiveLinear {
     }
 
     fn state_histories(&self, issue_ids: &[String]) -> Vec<Result<Vec<StateChange>, String>> {
-        parallel_map(issue_ids, |id| self.source.fetch_state_changes(id))
+        self.source.fetch_state_changes_batch(issue_ids)
     }
 
     fn marker_lines(&self, prefix: &str, needle: &str) -> Result<Vec<String>, String> {

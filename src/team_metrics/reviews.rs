@@ -67,8 +67,8 @@ struct Review {
     clean: bool,
     findings: BTreeMap<String, String>,
 }
-type ReviewArtifactKey = (String, String, String);
-type ReviewFindingKey = (String, String, String, String);
+type ReviewArtifactKey = (String, String, String, String);
+type ReviewFindingKey = (String, String, String, String, String);
 type LatestFindingKey = (String, String, String, String, String);
 
 pub(super) fn compact_marker_body(body: &str) -> String {
@@ -142,7 +142,7 @@ pub(crate) fn calculate(
 ) -> Result<ReviewStats, String> {
     let mut reviews: BTreeMap<ReviewArtifactKey, Review> = BTreeMap::new();
     let mut outcomes: BTreeMap<ReviewFindingKey, (u64, f64, Disposition)> = BTreeMap::new();
-    let mut latest_records = BTreeMap::<String, (f64, Option<bool>)>::new();
+    let mut verdicts = Vec::<(String, f64, bool)>::new();
     let mut artifact_findings = BTreeMap::<ReviewArtifactKey, BTreeMap<String, String>>::new();
     let mut seen = BTreeSet::new();
     let mut semantic_seen = BTreeSet::new();
@@ -213,7 +213,7 @@ pub(crate) fn calculate(
                     .unwrap_or("unknown")
                     .to_owned(),
                 (*artifact).to_owned(),
-                (*run).to_owned(),
+                format!("{run}:{}", fields.get("round").copied().unwrap_or("0")),
             ))
         {
             skipped += 1;
@@ -266,6 +266,7 @@ pub(crate) fn calculate(
                     .unwrap_or("unknown")
                     .to_owned(),
                 artifact.to_string(),
+                full.clone(),
             );
             if !valid {
                 skipped += 1;
@@ -288,40 +289,26 @@ pub(crate) fn calculate(
                     "no" | "false" => Some(false),
                     _ => None,
                 })
-                .or(data.mergeable)
-                .or_else(|| latest_records.get(&full).and_then(|(_, value)| *value));
-            if latest_records
-                .get(&full)
-                .is_none_or(|(old_at, _)| at > *old_at)
-            {
-                latest_records.insert(full, (at, marker_mergeable));
+                .or(data.mergeable);
+            if let Some(mergeable) = marker_mergeable {
+                verdicts.push((full, at, mergeable));
             }
         } else if kind == "reviewer-dispositions" {
-            let artifact_key = if let Some(method) = fields.get("method") {
-                (
-                    (*repo).to_string(),
-                    (*method).to_string(),
-                    (*artifact).to_string(),
-                )
-            } else {
-                let mut candidates = reviews
-                    .keys()
-                    .filter(|(review_repo, _, review_id)| {
-                        review_repo == repo && review_id == artifact
-                    })
-                    .cloned();
-                let Some(key) = candidates.next() else {
-                    continue;
-                };
-                if candidates.next().is_some() {
-                    skipped += 1;
-                    continue;
-                }
-                key
-            };
-            let Some(review) = reviews.get(&artifact_key) else {
+            let Some((artifact_key, review)) = reviews
+                .iter()
+                .filter(|((review_repo, method, review_id, _), review)| {
+                    review_repo.as_str() == *repo
+                        && review_id.as_str() == *artifact
+                        && fields
+                            .get("method")
+                            .is_none_or(|value| *value == method.as_str())
+                        && review.at <= at
+                })
+                .max_by(|left, right| left.1.at.total_cmp(&right.1.at))
+            else {
                 continue;
             };
+            let artifact_key = artifact_key.clone();
             let pr = review.pr.clone();
             let Some(round) = fields.get("round").and_then(|r| r.parse::<u64>().ok()) else {
                 skipped += 1;
@@ -340,20 +327,16 @@ pub(crate) fn calculate(
                 skipped += 1;
                 continue;
             }
-            if latest_records
-                .get(&pr)
-                .is_none_or(|(old_at, _)| at > *old_at)
-            {
-                let marker_mergeable = fields
-                    .get("mergeable")
-                    .and_then(|value| match *value {
-                        "yes" | "true" => Some(true),
-                        "no" | "false" => Some(false),
-                        _ => None,
-                    })
-                    .or(data.mergeable)
-                    .or_else(|| latest_records.get(&pr).and_then(|(_, value)| *value));
-                latest_records.insert(pr, (at, marker_mergeable));
+            let marker_mergeable = fields
+                .get("mergeable")
+                .and_then(|value| match *value {
+                    "yes" | "true" => Some(true),
+                    "no" | "false" => Some(false),
+                    _ => None,
+                })
+                .or(data.mergeable);
+            if let Some(mergeable) = marker_mergeable {
+                verdicts.push((pr, at, mergeable));
             }
             let finding_states = artifact_findings.entry(artifact_key.clone()).or_default();
             for finding in data.new_findings {
@@ -370,6 +353,7 @@ pub(crate) fn calculate(
                     artifact_key.0.clone(),
                     artifact_key.1.clone(),
                     artifact_key.2.clone(),
+                    artifact_key.3.clone(),
                     d.fnd.clone(),
                 );
                 finding_states
@@ -384,6 +368,11 @@ pub(crate) fn calculate(
             }
         }
     }
+    verdicts.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let latest: BTreeMap<String, bool> = verdicts
+        .into_iter()
+        .map(|(pr, _, mergeable)| (pr, mergeable))
+        .collect();
     let mut prs: BTreeMap<String, (bool, bool, bool, f64)> = BTreeMap::new();
     let mut confirmed: BTreeMap<String, usize> = BTreeMap::from([
         ("high".into(), 0),
@@ -393,7 +382,7 @@ pub(crate) fn calculate(
     ]);
     let mut latest_reviews: BTreeMap<String, &Review> = BTreeMap::new();
     let (mut pending, mut rejected) = (0usize, 0usize);
-    for ((repo, method, id), review) in &reviews {
+    for ((repo, method, id, _pr), review) in &reviews {
         if latest_reviews
             .get(&review.pr)
             .is_none_or(|old| review.at > old.at)
@@ -409,23 +398,25 @@ pub(crate) fn calculate(
         row.0 |= !review.clean;
         row.3 = row.3.min(review.at);
         let mut findings = review.findings.clone();
-        for fnd in artifact_findings
-            .get(&(repo.clone(), method.clone(), id.clone()))
+        for (fnd, severity) in artifact_findings
+            .get(&(repo.clone(), method.clone(), id.clone(), review.pr.clone()))
             .into_iter()
-            .flat_map(|findings| findings.keys())
+            .flat_map(|findings| findings.iter())
         {
             findings
                 .entry(fnd.clone())
-                .or_insert_with(|| "unknown".into());
+                .or_insert_with(|| severity.clone());
         }
         row.0 |= !findings.is_empty();
         for (fnd, severity) in findings {
-            match outcomes.get(&(repo.clone(), method.clone(), id.clone(), fnd)) {
+            match outcomes.get(&(
+                repo.clone(),
+                method.clone(),
+                id.clone(),
+                review.pr.clone(),
+                fnd,
+            )) {
                 Some((_, _, d)) if d.outcome == "rejected" => rejected += 1,
-                Some((_, _, d)) if matches!(d.outcome.as_str(), "still-open" | "deferred") => {
-                    pending += 1;
-                    row.2 = false;
-                }
                 Some(_) => {
                     row.1 = true;
                     *confirmed.entry(severity).or_default() += 1;
@@ -438,13 +429,20 @@ pub(crate) fn calculate(
         }
     }
     let mut latest_finding_state = BTreeMap::<LatestFindingKey, (u64, f64, bool)>::new();
-    for ((repo, method, artifact), findings) in &artifact_findings {
-        let Some(review) = reviews.get(&(repo.clone(), method.clone(), artifact.clone())) else {
+    for ((repo, method, artifact, pr), findings) in &artifact_findings {
+        let Some(review) =
+            reviews.get(&(repo.clone(), method.clone(), artifact.clone(), pr.clone()))
+        else {
             continue;
         };
         for fnd in findings.keys() {
-            let disposition =
-                outcomes.get(&(repo.clone(), method.clone(), artifact.clone(), fnd.clone()));
+            let disposition = outcomes.get(&(
+                repo.clone(),
+                method.clone(),
+                artifact.clone(),
+                pr.clone(),
+                fnd.clone(),
+            ));
             let (round, at, unresolved) = match disposition {
                 Some((round, at, disposition)) => (
                     *round,
@@ -509,10 +507,7 @@ pub(crate) fn calculate(
         let requested = reviewed_open
             .iter()
             .filter(|review| {
-                latest_records
-                    .get(&review.pr)
-                    .is_some_and(|(_, mergeable)| *mergeable == Some(false))
-                    || unresolved_prs.contains(&review.pr)
+                latest.get(&review.pr) == Some(&false) || unresolved_prs.contains(&review.pr)
             })
             .count();
         values.insert(
@@ -803,7 +798,7 @@ mod tests {
         .unwrap()
         .values;
         assert_eq!(values["pr_changes_requested_share"], 1.0);
-        assert_eq!(values["review_findings_pending_24h"], 1.0);
+        assert_eq!(values["review_findings_confirmed_medium_24h"], 1.0);
     }
 
     #[trace("FR-033-AC-17")]
@@ -847,6 +842,87 @@ mod tests {
             &[first, second],
             &allowed(),
             &BTreeMap::from([("owner/repo#1".into(), 90_000.0)]),
+            &allowed(),
+            100_000.0,
+        )
+        .unwrap()
+        .values;
+        assert_eq!(values["pr_changes_requested_share"], 1.0);
+    }
+
+    #[test]
+    fn same_artifact_id_on_distinct_prs_keeps_findings_separate() {
+        let finding = comment(
+            "review-a",
+            99_000.0,
+            "<!-- reviewer repo=owner/repo id=SR-1 pr=repo#1 method=rust-review run=a -->",
+            "clean: false\nfindings:\n  - fnd: FND-1\n    severity: high",
+        );
+        let clean = comment(
+            "review-b",
+            99_500.0,
+            "<!-- reviewer repo=owner/repo id=SR-1 pr=repo#2 method=rust-review run=b -->",
+            "clean: true\nfindings: []",
+        );
+        let open = BTreeSet::from(["owner/repo#1".into(), "owner/repo#2".into()]);
+        let values = calculate(&[finding, clean], &open, &BTreeMap::new(), &open, 100_000.0)
+            .unwrap()
+            .values;
+        assert_eq!(values["pr_changes_requested_coverage"], 1.0);
+        assert_eq!(values["pr_changes_requested_share"], 0.5);
+    }
+
+    #[test]
+    fn disposition_round_is_part_of_the_semantic_deduplication_key() {
+        let review = comment(
+            "review",
+            99_000.0,
+            "<!-- reviewer repo=owner/repo id=SR-1 pr=repo#1 method=rust-review run=review -->",
+            "clean: false\nfindings:\n  - fnd: FND-1\n    severity: high",
+        );
+        let first_round = comment(
+            "round-one",
+            99_100.0,
+            "<!-- reviewer-dispositions repo=owner/repo id=SR-1 method=rust-review round=1 run=resume -->",
+            "dispositions:\n  - fnd: FND-1\n    outcome: still-open",
+        );
+        let second_round = comment(
+            "round-two",
+            99_200.0,
+            "<!-- reviewer-dispositions repo=owner/repo id=SR-1 method=rust-review round=2 run=resume -->",
+            "dispositions:\n  - fnd: FND-1\n    outcome: fixed",
+        );
+        let values = calculate(
+            &[review, first_round, second_round],
+            &allowed(),
+            &BTreeMap::new(),
+            &allowed(),
+            100_000.0,
+        )
+        .unwrap()
+        .values;
+        assert_eq!(values["pr_changes_requested_share"], 0.0);
+        assert_eq!(values["review_findings_confirmed_high_24h"], 1.0);
+    }
+
+    #[test]
+    fn later_review_without_mergeability_preserves_latest_explicit_verdict() {
+        let blocked = comment(
+            "blocked",
+            99_000.0,
+            "<!-- reviewer repo=owner/repo id=SR-1 pr=repo#1 method=rust-review run=a mergeable=no -->",
+            "clean: true\nfindings: []",
+        );
+        let later = comment(
+            "later",
+            99_500.0,
+            "<!-- reviewer repo=owner/repo id=SR-2 pr=repo#1 method=rust-review run=b -->",
+            "clean: true\nfindings: []",
+        );
+        let values = calculate(
+            &[blocked, later],
+            &allowed(),
+            &BTreeMap::new(),
             &allowed(),
             100_000.0,
         )

@@ -25,6 +25,7 @@ const MAX_REQUESTS: i64 = 180;
 const RESERVED_COST: i64 = 25;
 const MAX_COST: i64 = 4500;
 const MAX_PAGES: usize = 10;
+const MAX_RECENT_PAGES: usize = 30;
 const MAX_OLD: usize = 50;
 const MAX_REPOS: usize = 32;
 const DAILY_PR_WINDOW_SECONDS: f64 = 7.0 * 86_400.0;
@@ -569,7 +570,7 @@ impl<T: Transport> SelectedGithub<T> {
             self.start.set(Some(started));
             started
         });
-        if start.elapsed() >= Duration::from_secs(45) {
+        if start.elapsed() >= Duration::from_secs(120) {
             return Err("GitHub collection time budget exhausted".into());
         }
         if self.allowed.len() > 10_000 {
@@ -593,15 +594,18 @@ impl<T: Transport> SelectedGithub<T> {
         let mut closed_after: Option<String> = None;
         let mut open_more = true;
         let mut closed_more = true;
-        let mut rows = Vec::new();
-        let mut open_numbers = BTreeSet::new();
-        let mut closed_numbers = BTreeSet::new();
+        let mut rows = Vec::<PullRequest>::new();
         let mut open_cursors = BTreeSet::new();
         let mut closed_cursors = BTreeSet::new();
         let mut open_last_updated = f64::INFINITY;
         let mut closed_last_updated = f64::INFINITY;
-        for _ in 0..MAX_PAGES {
+        for page_index in 0..MAX_RECENT_PAGES {
+            if page_index == MAX_PAGES && open_more {
+                return Err("GitHub open PR page budget exhausted; incomplete population".into());
+            }
             if !open_more && !closed_more {
+                let mut seen = BTreeSet::new();
+                rows.retain(|pr| seen.insert(pr.number));
                 return Ok(rows);
             }
             let mut fields = Vec::new();
@@ -648,7 +652,6 @@ impl<T: Transport> SelectedGithub<T> {
                     &page,
                     open_after.as_deref(),
                     &mut open_cursors,
-                    &mut open_numbers,
                     &mut open_last_updated,
                 )?;
                 rows.extend(page.items);
@@ -661,7 +664,6 @@ impl<T: Transport> SelectedGithub<T> {
                     &page,
                     closed_after.as_deref(),
                     &mut closed_cursors,
-                    &mut closed_numbers,
                     &mut closed_last_updated,
                 )?;
                 rows.extend(page.items);
@@ -669,8 +671,10 @@ impl<T: Transport> SelectedGithub<T> {
                 closed_more = page.has_next;
             }
         }
+        let mut seen = BTreeSet::new();
+        rows.retain(|pr| seen.insert(pr.number));
         if open_more || closed_more {
-            Err("GitHub repository page budget exhausted; incomplete population".into())
+            Err("GitHub recent PR page budget exhausted; incomplete population".into())
         } else {
             Ok(rows)
         }
@@ -759,7 +763,6 @@ fn validate_population_cursor(
     page: &crate::retro::sources::Page<PullRequest>,
     previous_cursor: Option<&str>,
     cursors: &mut BTreeSet<String>,
-    numbers: &mut BTreeSet<u64>,
     last_updated: &mut f64,
 ) -> Result<(), String> {
     if page.has_next {
@@ -773,9 +776,6 @@ fn validate_population_cursor(
         }
     }
     for pr in &page.items {
-        if !numbers.insert(pr.number) {
-            return Err("GitHub population page repeated a pull request".into());
-        }
         if pr.updated_at > *last_updated {
             return Err("GitHub population pages are not newest-first".into());
         }
@@ -1623,7 +1623,6 @@ mod tests {
             force_pushes: None,
         };
         let mut cursors = BTreeSet::new();
-        let mut numbers = BTreeSet::new();
         let mut last_updated = f64::INFINITY;
         let missing = crate::retro::sources::Page {
             items: vec![row(1, 10.0)],
@@ -1631,31 +1630,17 @@ mod tests {
             cursor: None,
         };
         assert!(
-            validate_population_cursor(
-                &missing,
-                None,
-                &mut cursors,
-                &mut numbers,
-                &mut last_updated
-            )
-            .is_err()
+            validate_population_cursor(&missing, None, &mut cursors, &mut last_updated).is_err()
         );
         let first = crate::retro::sources::Page {
             items: vec![row(1, 10.0)],
             has_next: true,
             cursor: Some("cursor-a".into()),
         };
-        validate_population_cursor(&first, None, &mut cursors, &mut numbers, &mut last_updated)
-            .unwrap();
+        validate_population_cursor(&first, None, &mut cursors, &mut last_updated).unwrap();
         assert!(
-            validate_population_cursor(
-                &first,
-                Some("cursor-a"),
-                &mut cursors,
-                &mut numbers,
-                &mut last_updated
-            )
-            .is_err()
+            validate_population_cursor(&first, Some("cursor-a"), &mut cursors, &mut last_updated)
+                .is_err()
         );
         let duplicate = crate::retro::sources::Page {
             items: vec![row(1, 9.0)],
@@ -1667,10 +1652,9 @@ mod tests {
                 &duplicate,
                 Some("cursor-a"),
                 &mut cursors,
-                &mut numbers,
                 &mut last_updated
             )
-            .is_err()
+            .is_ok()
         );
         let out_of_order = crate::retro::sources::Page {
             items: vec![row(2, 11.0)],
@@ -1682,7 +1666,6 @@ mod tests {
                 &out_of_order,
                 Some("cursor-a"),
                 &mut cursors,
-                &mut numbers,
                 &mut last_updated
             )
             .is_err()

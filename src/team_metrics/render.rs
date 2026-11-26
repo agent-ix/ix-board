@@ -607,9 +607,12 @@ pub fn render(
                 }
                 let value = value.filter(|_| {
                     !name.starts_with("review_findings_")
-                        || values
+                        || (values
                             .and_then(|v| v.get("review_recorded_prs_24h"))
                             .is_some_and(|n| *n > 0.0)
+                            && values
+                                .and_then(|v| v.get("review_marker_backfill_coverage"))
+                                .is_some_and(|coverage| *coverage > 0.0))
                 });
                 out.metric(
                     "ix_team_metric_available",
