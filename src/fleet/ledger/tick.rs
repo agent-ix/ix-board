@@ -13,7 +13,8 @@ use crate::fleet::tick::{
     TickFacts, TickOutput, TickSettings, plan,
 };
 use crate::fleet::{ClassKind, FleetReport};
-use rusqlite::{Connection, OpenFlags, Transaction, params};
+use ix_trace_rs::implements;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -34,9 +35,10 @@ pub struct TickCommit<'a> {
     pub focus: &'a BTreeMap<String, String>,
 }
 
+#[implements("FR-038-AC-24")]
 fn load_open(tx: &Transaction<'_>) -> Result<Vec<OpenAction>, LedgerError> {
     let mut statement = tx.prepare(
-        "SELECT id, kind, lane, condition_started_at, due_by, rung, parent_action_id
+        "SELECT id, kind, COALESCE(project, lane), condition_started_at, due_by, rung, parent_action_id
          FROM action WHERE resolved_at IS NULL AND tick_id IS NOT NULL ORDER BY id",
     )?;
     let rows = statement.query_map([], |r| {
@@ -172,6 +174,9 @@ impl Ledger {
     /// # Errors
     ///
     /// A database failure; nothing of the tick is written then.
+    #[implements("FR-038-AC-24")]
+    #[implements("FR-041-AC-15")]
+    #[implements("FR-041-AC-21")]
     pub fn commit_tick(&mut self, commit: &TickCommit<'_>) -> Result<TickOutput, LedgerError> {
         let run_ms = commit.report.run_ms;
         let facts = commit.facts;
@@ -207,6 +212,90 @@ impl Ledger {
             params![run_ms, commit.session, role],
         )?;
         let tick_id = tx.last_insert_rowid();
+        record_lane_capacity_events(&tx, report)?;
+        for event in &facts.drain_done {
+            tx.execute(
+                "INSERT INTO capacity_event(host,lane,kind,reason,evidence_kind,at,source_basis)
+                 VALUES(?1,?2,?3,?4,NULL,?5,?6)",
+                params![
+                    event.host.to_lowercase(),
+                    event.lane.to_lowercase(),
+                    if event.lane_lost {
+                        "lane_lost"
+                    } else {
+                        "drain_done"
+                    },
+                    if event.lane_lost {
+                        "assignment_disappeared"
+                    } else {
+                        "current_non_working_no_build"
+                    },
+                    run_ms,
+                    event.source_basis
+                ],
+            )?;
+        }
+        for sample in &facts.host_output_samples {
+            tx.execute(
+                "INSERT INTO host_output_sample(host,at,lanes,tickets_closed,prs_merged,
+                   commits_pushed,source_basis) VALUES(?1,?2,?3,?4,?5,?6,?7)
+                 ON CONFLICT(host,at) DO UPDATE SET lanes=excluded.lanes,
+                   tickets_closed=excluded.tickets_closed,prs_merged=excluded.prs_merged,
+                   commits_pushed=excluded.commits_pushed,source_basis=excluded.source_basis",
+                params![
+                    sample.host.to_lowercase(),
+                    sample.at_ms,
+                    sample.lanes.map(i64::from),
+                    sample.tickets_closed.and_then(|n| i64::try_from(n).ok()),
+                    sample.prs_merged.and_then(|n| i64::try_from(n).ok()),
+                    sample.commits_pushed.and_then(|n| i64::try_from(n).ok()),
+                    sample.source_basis,
+                ],
+            )?;
+        }
+        for event in &facts.overload_events {
+            let host = event.host.to_lowercase();
+            let previous_active = tx
+                .query_row(
+                    "SELECT active FROM capacity_overload_state WHERE lower(host)=lower(?1) AND cause=?2",
+                    params![host, event.cause],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .is_some_and(|active| active != 0);
+            if event.active && !previous_active {
+                tx.execute(
+                    "INSERT INTO capacity_event(host,kind,reason,evidence_kind,at,source_basis)
+                     VALUES(?1,'overload_event',?2,?2,?3,?4)",
+                    params![host, event.cause, run_ms, event.source_basis],
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO capacity_overload_state(host,cause,active,updated_at,source_basis)
+                 VALUES(?1,?2,?3,?4,?5) ON CONFLICT(host,cause) DO UPDATE SET
+                 active=excluded.active,updated_at=excluded.updated_at,source_basis=excluded.source_basis",
+                params![host, event.cause, i64::from(event.active), run_ms, event.source_basis],
+            )?;
+        }
+        for sample in &facts.capacity_throttle_samples {
+            tx.execute(
+                "INSERT INTO capacity_throttle_sample(host,at,interval_s,throttled_share,
+                   coverage,unavailable_reason,source_basis)
+                 VALUES(?1,?2,?3,?4,?5,?6,'admission_only')
+                 ON CONFLICT(host,at) DO UPDATE SET interval_s=excluded.interval_s,
+                   throttled_share=excluded.throttled_share,coverage=excluded.coverage,
+                   unavailable_reason=excluded.unavailable_reason,
+                   source_basis=excluded.source_basis",
+                params![
+                    sample.host.to_lowercase(),
+                    sample.at_ms,
+                    i64::try_from(sample.interval_secs).unwrap_or(i64::MAX),
+                    sample.share,
+                    sample.coverage,
+                    sample.unavailable_reason,
+                ],
+            )?;
+        }
         {
             let mut lane = tx.prepare(
                 "INSERT INTO lane_tick(run_seq, tick_id, source, lane, host, class, reason,
@@ -280,6 +369,11 @@ impl Ledger {
             if item.is_new && action.kind != ActionKind::LadderRung {
                 action.id = insert_action(&tx, tick_id, run_ms, &action)?;
                 ids.insert(item.key.clone(), action.id);
+            } else if action.kind == ActionKind::NeedReadyTickets {
+                tx.execute(
+                    "UPDATE action SET project = ?1, requested_count = ?2 WHERE id = ?3",
+                    params![action.subject, requested_count(&action), action.id],
+                )?;
             }
             if action.kind == ActionKind::LadderRung {
                 action.parent_action_id = ids.get(&item.key).copied();
@@ -330,6 +424,7 @@ impl Ledger {
     }
 }
 
+#[implements("FR-038-AC-24")]
 fn insert_action(
     tx: &Transaction<'_>,
     tick_id: i64,
@@ -338,12 +433,12 @@ fn insert_action(
 ) -> Result<i64, LedgerError> {
     tx.execute(
         "INSERT INTO action(tick_id, kind, lane, emitted_at, severity, due_by, target_role,
-           target_addr, condition_started_at, parent_action_id, rung)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+           target_addr, condition_started_at, parent_action_id, rung, project, requested_count)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
         params![
             tick_id,
             action.kind.name(),
-            action.subject,
+            (action.kind != ActionKind::NeedReadyTickets).then_some(action.subject.as_str()),
             run_ms,
             action.severity.name(),
             action.due_by,
@@ -352,9 +447,157 @@ fn insert_action(
             action.condition_started_at,
             action.parent_action_id,
             action.rung.map(i64::from),
+            (action.kind == ActionKind::NeedReadyTickets).then_some(action.subject.as_str()),
+            requested_count(action),
         ],
     )?;
     Ok(tx.last_insert_rowid())
+}
+
+#[implements("FR-038-AC-24")]
+fn requested_count(action: &Action) -> Option<i64> {
+    (action.kind == ActionKind::NeedReadyTickets)
+        .then(|| {
+            action
+                .detail
+                .get("need")
+                .and_then(serde_json::Value::as_i64)
+        })
+        .flatten()
+}
+
+#[implements("FR-041-AC-19")]
+#[implements("FR-041-AC-23")]
+#[implements("FR-041-AC-22")]
+fn record_lane_capacity_events(
+    tx: &Transaction<'_>,
+    report: &FleetReport,
+) -> Result<(), LedgerError> {
+    let previous_ms: Option<i64> = tx.query_row(
+        "SELECT MAX(observed_ms) FROM lane_tick WHERE source='tick'",
+        [],
+        |row| row.get(0),
+    )?;
+    let Some(previous_ms) = previous_ms else {
+        return Ok(());
+    };
+    let mut previous = BTreeMap::new();
+    {
+        let mut statement = tx.prepare(
+            "SELECT lane,host,class FROM lane_tick
+             WHERE source='tick' AND observed_ms=?1",
+        )?;
+        for row in statement.query_map([previous_ms], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })? {
+            let (lane, host, class) = row?;
+            previous.insert(lane.to_lowercase(), (host.to_lowercase(), class));
+        }
+    }
+    let current: BTreeMap<String, (&str, crate::fleet::ClassKind)> = report
+        .rows
+        .iter()
+        .map(|row| (row.lane.to_lowercase(), (row.host.as_str(), row.class)))
+        .collect();
+    let active_counts = report.rows.iter().try_fold(
+        BTreeMap::<String, u32>::new(),
+        |mut counts, row| -> Result<_, LedgerError> {
+            let draining: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM capacity_event e
+                 WHERE lower(e.lane)=lower(?1) AND e.kind='draining_mark'
+                   AND NOT EXISTS (SELECT 1 FROM capacity_event f
+                     WHERE lower(f.lane)=lower(e.lane)
+                       AND f.kind IN ('drain_done','lane_removed') AND f.at>=e.at))",
+                [row.lane.as_str()],
+                |result| result.get(0),
+            )?;
+            if !draining {
+                let count = counts.entry(row.host.to_lowercase()).or_default();
+                *count = count.saturating_add(1);
+            }
+            Ok(counts)
+        },
+    )?;
+
+    for (lane, (host, _class)) in &current {
+        if previous.contains_key(lane) {
+            continue;
+        }
+        let active = active_counts
+            .get(&host.to_lowercase())
+            .copied()
+            .unwrap_or(0);
+        let step_pending: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM capacity_window
+             WHERE lower(host)=lower(?1) AND lanes=?2)",
+            params![host, i64::from(active)],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO capacity_event(host,lane,kind,reason,at,source_basis)
+             VALUES(?1,?2,'lane_added',?3,?4,'relay.fleet_status+lane_tick')",
+            params![
+                host.to_lowercase(),
+                lane,
+                if step_pending {
+                    "capacity_step"
+                } else {
+                    "lane_change_unrecorded"
+                },
+                report.run_ms,
+            ],
+        )?;
+    }
+
+    for (lane, (host, previous_class)) in &previous {
+        if current.contains_key(lane) {
+            continue;
+        }
+        let recorded_remove: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM capacity_event
+             WHERE lower(lane)=lower(?1) AND kind='lane_removed' AND at>=?2)",
+            params![lane, previous_ms],
+            |row| row.get(0),
+        )?;
+        if recorded_remove {
+            continue;
+        }
+        let draining_mark: Option<(Option<String>, Option<String>)> = tx
+            .query_row(
+                "SELECT e.reason,e.evidence_kind FROM capacity_event e
+                 WHERE lower(e.lane)=lower(?1) AND e.kind='draining_mark'
+                   AND NOT EXISTS (SELECT 1 FROM capacity_event f
+                     WHERE lower(f.lane)=lower(e.lane)
+                       AND f.kind IN ('drain_done','lane_removed') AND f.at>=e.at)
+                 ORDER BY e.at DESC,e.event_id DESC LIMIT 1",
+                [lane],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let lost =
+            draining_mark.is_some() || matches!(previous_class.as_str(), "DEAD" | "UNREACHABLE");
+        let (kind, reason, evidence) = if let Some((reason, evidence)) = draining_mark {
+            ("lane_removed", reason, evidence)
+        } else if lost {
+            ("lane_lost", Some(previous_class.clone()), None)
+        } else {
+            (
+                "lane_removed",
+                Some("lane_change_unrecorded".to_owned()),
+                None,
+            )
+        };
+        tx.execute(
+            "INSERT INTO capacity_event(host,lane,kind,reason,evidence_kind,at,source_basis)
+             VALUES(?1,?2,?3,?4,?5,?6,'relay.fleet_status+lane_tick')",
+            params![host, lane, kind, reason, evidence, report.run_ms],
+        )?;
+    }
+    Ok(())
 }
 
 /// The tick metrics of the last committed tick, in Prometheus text format, for the exporter
@@ -419,4 +662,379 @@ pub fn tick_metrics(
         text.push_str(&format!("ix_fleet_tick_actions{{kind=\"{kind}\"}} {n}\n"));
     }
     Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fleet::report::{HostSummary, LaneRow};
+    use crate::fleet::tick::{NeedReadyTickets, TickSettings};
+    use crate::fleet::{ClassKind, FleetConfig, FleetReport};
+    use ix_trace_rs::trace;
+
+    #[trace("FR-041-AC-16")]
+    #[test]
+    fn overload_events_record_only_breach_transitions() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ledger.sqlite3");
+        let mut ledger = Ledger::open(&path, &FleetConfig::default()).unwrap();
+        let report = |run_ms| FleetReport {
+            schema_version: 1,
+            complete: true,
+            run_ms,
+            rows: Vec::new(),
+            hosts: Vec::new(),
+            defects: Vec::new(),
+            host_busy: BTreeMap::new(),
+            relay_unavailable: false,
+        };
+        let settings = TickSettings::default();
+        let orders = StandingOrders::Missing;
+        let focus = BTreeMap::new();
+        let event = |active| crate::fleet::tick::OverloadEventSample {
+            host: "host-a".to_owned(),
+            cause: "thermal_limit_breach".to_owned(),
+            active,
+            source_basis: "temperature_and_configured_limit".to_owned(),
+        };
+        for (at, active) in [
+            (10_000, true),
+            (20_000, true),
+            (30_000, false),
+            (40_000, true),
+        ] {
+            let facts = TickFacts {
+                overload_events: vec![event(active)],
+                ..TickFacts::default()
+            };
+            ledger
+                .commit_tick(&TickCommit {
+                    report: &report(at),
+                    settings: &settings,
+                    facts: &facts,
+                    orders: &orders,
+                    session: None,
+                    focus: &focus,
+                })
+                .unwrap();
+        }
+        let connection = Connection::open(&path).unwrap();
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM capacity_event WHERE kind='overload_event'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[trace("FR-038-AC-24")]
+    #[test]
+    fn need_ready_ticket_action_persists_requested_count_and_resolution_times() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ledger.sqlite3");
+        let mut ledger = Ledger::open(&path, &FleetConfig::default()).unwrap();
+        let report = |run_ms| FleetReport {
+            schema_version: 1,
+            complete: true,
+            run_ms,
+            rows: Vec::new(),
+            hosts: Vec::new(),
+            defects: Vec::new(),
+            host_busy: BTreeMap::new(),
+            relay_unavailable: false,
+        };
+        let settings = TickSettings::default();
+        let orders = StandingOrders::Missing;
+        let focus = BTreeMap::new();
+        let facts = TickFacts {
+            need_ready_tickets: Some(vec![NeedReadyTickets {
+                project: "SWM".to_owned(),
+                planner: "draco:workspace:planner".to_owned(),
+                need: 7,
+                ready: 1,
+                lanes: 3,
+            }]),
+            ..TickFacts::default()
+        };
+        let emitted = ledger
+            .commit_tick(&TickCommit {
+                report: &report(10_000),
+                settings: &settings,
+                facts: &facts,
+                orders: &orders,
+                session: None,
+                focus: &focus,
+            })
+            .unwrap();
+        assert_eq!(emitted.actions.len(), 1);
+        assert_eq!(emitted.actions[0].kind, ActionKind::NeedReadyTickets);
+
+        let reduced = TickFacts {
+            need_ready_tickets: Some(vec![NeedReadyTickets {
+                project: "SWM".to_owned(),
+                planner: "draco:workspace:planner".to_owned(),
+                need: 5,
+                ready: 3,
+                lanes: 3,
+            }]),
+            ..TickFacts::default()
+        };
+        let persisted = ledger
+            .commit_tick(&TickCommit {
+                report: &report(20_000),
+                settings: &settings,
+                facts: &reduced,
+                orders: &orders,
+                session: None,
+                focus: &focus,
+            })
+            .unwrap();
+        assert_eq!(persisted.actions[0].id, emitted.actions[0].id);
+
+        let empty = TickFacts {
+            need_ready_tickets: Some(Vec::new()),
+            ..TickFacts::default()
+        };
+        ledger
+            .commit_tick(&TickCommit {
+                report: &report(30_000),
+                settings: &settings,
+                facts: &empty,
+                orders: &orders,
+                session: None,
+                focus: &focus,
+            })
+            .unwrap();
+
+        let connection = Connection::open(&path).unwrap();
+        let row: (Option<String>, String, i64, i64, i64) = connection
+            .query_row(
+                "SELECT lane, project, requested_count, emitted_at, resolved_at FROM action
+                 WHERE kind='need_ready_tickets' AND project='SWM'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row, (None, "SWM".to_owned(), 5, 10_000, 30_000));
+    }
+
+    #[trace("FR-041-AC-15", "FR-041-AC-21")]
+    #[test]
+    fn tick_persists_drain_completion_and_host_output_source_basis() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ledger.sqlite3");
+        let mut ledger = Ledger::open(&path, &FleetConfig::default()).unwrap();
+        let report = FleetReport {
+            schema_version: 1,
+            complete: true,
+            run_ms: 40_000,
+            rows: Vec::new(),
+            hosts: Vec::new(),
+            defects: Vec::new(),
+            host_busy: BTreeMap::new(),
+            relay_unavailable: false,
+        };
+        let facts = TickFacts {
+            drain_done: vec![crate::fleet::tick::DrainDoneSample {
+                host: "draco".to_owned(),
+                lane: "draco:workspace:build".to_owned(),
+                source_basis: "watcher_state+compile_increase_300s".to_owned(),
+                lane_lost: false,
+            }],
+            host_output_samples: vec![crate::fleet::tick::HostOutputSample {
+                host: "draco".to_owned(),
+                at_ms: 40_000,
+                lanes: Some(1),
+                tickets_closed: None,
+                prs_merged: Some(2),
+                commits_pushed: None,
+                source_basis: r#"{"prs_merged":{"source":"github.ticket_id"}}"#.to_owned(),
+            }],
+            ..TickFacts::default()
+        };
+        ledger
+            .commit_tick(&TickCommit {
+                report: &report,
+                settings: &TickSettings::default(),
+                facts: &facts,
+                orders: &StandingOrders::Missing,
+                session: None,
+                focus: &BTreeMap::new(),
+            })
+            .unwrap();
+        let event_basis: String = ledger
+            .connection
+            .query_row(
+                "SELECT source_basis FROM capacity_event WHERE kind='drain_done'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_basis, "watcher_state+compile_increase_300s");
+        let output: (Option<i64>, Option<i64>, String) = ledger
+            .connection
+            .query_row(
+                "SELECT tickets_closed,prs_merged,source_basis FROM host_output_sample
+                 WHERE host='draco' AND at=40000",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(output.0, None);
+        assert_eq!(output.1, Some(2));
+        assert!(output.2.contains("github.ticket_id"));
+    }
+
+    #[trace("FR-041-AC-19", "FR-041-AC-22", "FR-041-AC-23")]
+    #[test]
+    fn tick_records_lane_additions_and_losses_from_consecutive_reports() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ledger.sqlite3");
+        let mut ledger = Ledger::open(&path, &FleetConfig::default()).unwrap();
+        let report = |run_ms, lanes: &[(&str, ClassKind)]| {
+            let rows: Vec<_> = lanes
+                .iter()
+                .map(|(lane, class)| LaneRow {
+                    lane: (*lane).to_owned(),
+                    host: "draco".to_owned(),
+                    class: *class,
+                    reason: None,
+                    state_age_secs: None,
+                    last_event_ms: None,
+                    evidence: Vec::new(),
+                    compile_seconds: None,
+                    focus: None,
+                    thresholds_defaulted: false,
+                    schema_version: 1,
+                })
+                .collect();
+            let working = lanes
+                .iter()
+                .filter(|(_, class)| *class == ClassKind::Working)
+                .count();
+            FleetReport {
+                schema_version: 1,
+                complete: true,
+                run_ms,
+                rows,
+                hosts: vec![HostSummary {
+                    host: "draco".to_owned(),
+                    lanes: lanes.len(),
+                    working,
+                    not_working: lanes.len().saturating_sub(working),
+                }],
+                defects: Vec::new(),
+                host_busy: BTreeMap::new(),
+                relay_unavailable: false,
+            }
+        };
+        let settings = TickSettings::default();
+        let orders = StandingOrders::Missing;
+        let facts = TickFacts::default();
+        let focus = BTreeMap::new();
+        for report in [
+            report(10_000, &[("draco:workspace:a", ClassKind::Working)]),
+            report(
+                20_000,
+                &[
+                    ("draco:workspace:a", ClassKind::Working),
+                    ("draco:workspace:b", ClassKind::Working),
+                ],
+            ),
+            report(
+                30_000,
+                &[
+                    ("draco:workspace:a", ClassKind::Dead),
+                    ("draco:workspace:b", ClassKind::Working),
+                ],
+            ),
+            report(40_000, &[("draco:workspace:b", ClassKind::Working)]),
+        ] {
+            ledger
+                .commit_tick(&TickCommit {
+                    report: &report,
+                    settings: &settings,
+                    facts: &facts,
+                    orders: &orders,
+                    session: None,
+                    focus: &focus,
+                })
+                .unwrap();
+        }
+        let connection = Connection::open(&path).unwrap();
+        let events: Vec<(String, String, String)> = connection
+            .prepare("SELECT lane,kind,reason FROM capacity_event ORDER BY at,event_id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                (
+                    "draco:workspace:b".to_owned(),
+                    "lane_added".to_owned(),
+                    "lane_change_unrecorded".to_owned()
+                ),
+                (
+                    "draco:workspace:a".to_owned(),
+                    "lane_lost".to_owned(),
+                    "DEAD".to_owned()
+                )
+            ]
+        );
+        ledger
+            .connection
+            .execute(
+                "INSERT INTO capacity_event(host,lane,kind,reason,evidence_kind,at)
+                 VALUES('draco','draco:workspace:b','draining_mark','thermal_abort','build_abort',45000)",
+                [],
+            )
+            .unwrap();
+        let drained_report = report(50_000, &[]);
+        ledger
+            .commit_tick(&TickCommit {
+                report: &drained_report,
+                settings: &settings,
+                facts: &facts,
+                orders: &orders,
+                session: None,
+                focus: &focus,
+            })
+            .unwrap();
+        let removed: (String, String) = ledger
+            .connection
+            .query_row(
+                "SELECT reason,evidence_kind FROM capacity_event
+                 WHERE lane='draco:workspace:b' AND kind='lane_removed'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            removed,
+            ("thermal_abort".to_owned(), "build_abort".to_owned())
+        );
+        let violations: i64 = ledger
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM lane_reductions_without_throttle_evidence
+                 WHERE lane='draco:workspace:b'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(violations, 0);
+    }
 }

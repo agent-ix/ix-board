@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Agent-IX
 
+use super::super::LanePrRead;
 use super::*;
 use crate::fleet::live::{NoWeakSignals, PromQuery, PrometheusSeries, ReadReceipts};
 use crate::fleet::report::{RegInfo, Sources};
@@ -38,7 +39,7 @@ impl TickSources for TickSourcesWithReady<'_> {
         self.0.host_busy()
     }
 
-    fn lane_prs(&self) -> Result<Vec<LanePr>, Unread> {
+    fn lane_prs(&self) -> Result<LanePrRead, Unread> {
         Err(Unread::Unwired("test"))
     }
 
@@ -48,6 +49,20 @@ impl TickSources for TickSourcesWithReady<'_> {
             lanes: BTreeSet::new(),
         })
     }
+}
+
+#[test]
+fn live_ready_buffer_requires_configured_projects() {
+    let sources = LiveSources {
+        timeout: Duration::from_secs(1),
+        config: FleetConfig::default(),
+        settings: TickSettings::default(),
+        host_busy: BTreeMap::new(),
+        lanes: Vec::new(),
+        host_lane_counts: BTreeMap::new(),
+    };
+    let error = sources.need_ready_tickets().unwrap_err();
+    assert!(matches!(error, Unread::Failed(_)));
 }
 
 #[trace("FR-038-AC-6", "FR-038-AC-23")]
@@ -94,13 +109,19 @@ fn live_busy_ratio_read_emits_add_lane_without_discarding_other_hosts() {
         },
         1_000,
     );
-    let facts = TickFacts::read(&TickSourcesWithReady(&live_sources(
-        &report,
-        Duration::from_secs(1),
-    )));
     let mut settings = TickSettings::default();
     settings.lane_capacity.insert("draco".to_owned(), 2);
     settings.lane_capacity.insert("luna".to_owned(), 2);
+    let facts = TickFacts::read(
+        &TickSourcesWithReady(&live_sources(
+            &report,
+            Duration::from_secs(1),
+            &config,
+            &settings,
+        )),
+        report.run_ms,
+        config.tick_interval.as_secs(),
+    );
     let capacity = Capacity {
         open_runs: BTreeSet::new(),
         levels: BTreeMap::from([("draco".to_owned(), 2)]),

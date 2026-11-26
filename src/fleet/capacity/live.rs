@@ -1,0 +1,1334 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Agent-IX
+
+//! Production Prometheus, relay and Linear measurement source for FR-041.
+
+use super::{
+    CapacityError, LaneOutputMeasurement, MeasurementSource, Observation, WindowMeasurements,
+    WindowRequest,
+};
+use crate::fleet::{FleetConfig, live::PromQuery};
+use crate::team_metrics::wire::AssignmentStatus;
+use crate::team_metrics::{Change, EventPage};
+use crate::{LinearGraphQlSource, ReadService};
+use ix_trace_rs::implements;
+use rusqlite::{Connection, OpenFlags};
+use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Real host measurements from Prometheus and ix-relay, with Linear issue/PR output.
+pub struct LiveMeasurementSource<'a> {
+    /// Explicit ix-board thresholds and interim slot limits.
+    pub config: &'a FleetConfig,
+    /// Bounded Prometheus client.
+    pub prometheus: Option<&'a dyn PromQuery>,
+}
+
+impl LiveMeasurementSource<'_> {
+    /// Evidence kind derived from the live host source; absent data never becomes a zero event.
+    #[implements("FR-041-AC-20")]
+    pub fn derived_evidence_kind(&self, host: &str) -> Option<&'static str> {
+        let query = self.prometheus?;
+        let host = host.to_lowercase();
+        let label = esc(&host);
+        let admission = query_value(
+            query,
+            &format!(
+                "sum(increase(ix_build_admission_blocked_seconds_total{{host=\"{label}\"}}[15m]))"
+            ),
+        )
+        .ok()
+        .flatten()
+        .is_some_and(|value| value > 0.0);
+        if admission {
+            return Some("admission_block");
+        }
+        let aborted = query_value(
+            query,
+            &format!("sum(increase(ix_build_builds_total{{host=\"{label}\",outcome=~\"aborted_memory|aborted_thermal|aborted_rss_cap|aborted_pause_exceeded\"}}[15m]))"),
+        )
+        .ok()
+        .flatten()
+        .is_some_and(|value| value > 0.0);
+        if aborted {
+            return Some("build_abort");
+        }
+        let limits = self.config.capacity_limits.get(&host)?;
+        if let Some(reserve) = limits.memory_reserve_bytes {
+            let available = query_value(
+                query,
+                &format!("min(min_over_time(node_memory_MemAvailable_bytes{{instance=\"{label}\"}}[15m]))"),
+            )
+            .ok()
+            .flatten()
+            .or_else(|| {
+                query_value(
+                    query,
+                    &format!("min_over_time((ix_fleet_host_memory_total_bytes{{host=\"{label}\"}} - ix_fleet_host_memory_used_bytes{{host=\"{label}\"}})[15m:30s])"),
+                )
+                .ok()
+                .flatten()
+            });
+            if available.is_some_and(|available| available < reserve as f64) {
+                return Some("memory_below_reserve");
+            }
+        }
+        // A temperature at the configured limit is a safety signal, not proof that the
+        // scheduler aborted a build. FR-041-AC-20 only corroborates thermal_abort from the
+        // closed ix_build_builds_total outcome set above.
+        let throttle = query_value(
+            query,
+            &format!(
+                "sum(increase(ix_build_admission_blocked_seconds_total{{host=\"{label}\"}}[1h])) / 3600"
+            ),
+        )
+        .ok()
+        .flatten()
+        .is_some_and(|share| share > 0.05);
+        throttle.then_some("throttle_share")
+    }
+}
+
+fn query_value(query: &dyn PromQuery, expression: &str) -> Result<Option<f64>, String> {
+    let body = query.query(expression).map_err(|error| error.to_string())?;
+    let value: Value = serde_json::from_str(&body).map_err(|error| error.to_string())?;
+    if value["status"] != "success" {
+        return Err("Prometheus query did not succeed".to_owned());
+    }
+    let result = value["data"]["result"]
+        .as_array()
+        .ok_or_else(|| "Prometheus response has no result vector".to_owned())?;
+    if result.len() > 1 {
+        return Err("Prometheus query returned multiple host values".to_owned());
+    }
+    result.first().map_or(Ok(None), |sample| {
+        sample["value"][1]
+            .as_str()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite())
+            .map(Some)
+            .ok_or_else(|| "Prometheus value is not finite numeric data".to_owned())
+    })
+}
+
+#[implements("FR-041-AC-10")]
+fn query_value_at(
+    query: &dyn PromQuery,
+    expression: &str,
+    timestamp_ms: i64,
+) -> Result<Option<f64>, String> {
+    let body = query
+        .query_at(expression, timestamp_ms)
+        .map_err(|error| error.to_string())?;
+    let value: Value = serde_json::from_str(&body).map_err(|error| error.to_string())?;
+    if value["status"] != "success" {
+        return Err("Prometheus query did not succeed".to_owned());
+    }
+    let result = value["data"]["result"]
+        .as_array()
+        .ok_or_else(|| "Prometheus response has no result vector".to_owned())?;
+    if result.len() > 1 {
+        return Err("Prometheus query returned multiple host values".to_owned());
+    }
+    result.first().map_or(Ok(None), |sample| {
+        sample["value"][1]
+            .as_str()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite())
+            .map(Some)
+            .ok_or_else(|| "Prometheus value is not finite numeric data".to_owned())
+    })
+}
+
+fn esc(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn unavailable<T>(source: impl Into<String>, reason: impl Into<String>) -> Observation<T> {
+    Observation::unavailable(source, reason, None)
+}
+
+fn observed<T>(value: Option<T>, source: &str, reason: &str, at: i64) -> Observation<T> {
+    value.map_or_else(
+        || unavailable(source, reason),
+        |value| Observation::available(value, source, at),
+    )
+}
+
+fn duration(window: &WindowRequest) -> Result<(String, u64), CapacityError> {
+    let seconds = window.end_ms.saturating_sub(window.start_ms) / 1000;
+    if seconds < 60 {
+        return Err(CapacityError::Invalid(
+            "capacity measurement window must be at least one minute".to_owned(),
+        ));
+    }
+    let seconds = u64::try_from(seconds).map_err(|_| {
+        CapacityError::Invalid("capacity measurement window is negative".to_owned())
+    })?;
+    Ok((format!("{seconds}s"), seconds))
+}
+
+#[implements("FR-041-AC-10")]
+fn output_rate(
+    request: &WindowRequest,
+    tickets_closed: &Observation<u64>,
+    prs_merged: &Observation<u64>,
+    commits_pushed: &Observation<u64>,
+) -> (Observation<f64>, Observation<String>) {
+    let hours = (request.end_ms - request.start_ms) as f64 / 3_600_000.0;
+    match tickets_closed
+        .value
+        .zip(prs_merged.value)
+        .map(|(tickets, prs)| tickets.saturating_add(prs))
+    {
+        Some(output) if output >= 5 => (
+            Observation::available(
+                output as f64 / hours,
+                "linear.tickets_plus_merged_prs",
+                request.end_ms,
+            ),
+            Observation::available(
+                "tickets_prs".to_owned(),
+                "ix-board.FR-041.output_basis",
+                request.end_ms,
+            ),
+        ),
+        Some(_) => commits_pushed.value.map_or_else(
+            || {
+                (
+                    unavailable(
+                        "capacity_output",
+                        commits_pushed
+                            .reason
+                            .clone()
+                            .unwrap_or_else(|| "output_sources_unavailable".to_owned()),
+                    ),
+                    unavailable(
+                        "capacity_output",
+                        "tickets_prs_below_threshold_and_commits_unavailable",
+                    ),
+                )
+            },
+            |commits| {
+                (
+                    Observation::available(
+                        commits as f64 / hours,
+                        "github.pull_request_commits",
+                        request.end_ms,
+                    ),
+                    Observation::available(
+                        "commits".to_owned(),
+                        "ix-board.FR-041.output_basis",
+                        request.end_ms,
+                    ),
+                )
+            },
+        ),
+        None => {
+            let reason = tickets_closed
+                .reason
+                .as_deref()
+                .or(prs_merged.reason.as_deref())
+                .unwrap_or("tickets_prs_total_unavailable");
+            (
+                unavailable("capacity_output", reason),
+                unavailable("capacity_output", "tickets_prs_total_unavailable"),
+            )
+        }
+    }
+}
+
+#[implements("FR-041-AC-10")]
+fn coverage_query(selectors: &[&str], span_secs: u64, step_secs: u64) -> String {
+    let step = step_secs.max(1);
+    let present = selectors
+        .iter()
+        .map(|selector| format!("max(present_over_time({selector}[{step}s]))"))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    format!(
+        "count_over_time(({present})[{span_secs}s:{step}s]) / {}",
+        (span_secs / step).max(1)
+    )
+}
+
+#[implements("FR-041-AC-10")]
+fn validate_evaluation_time(end_ms: i64) -> Result<(), CapacityError> {
+    let now_ms = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| CapacityError::Invalid("system clock predates Unix epoch".into()))?
+            .as_millis(),
+    )
+    .map_err(|_| CapacityError::Invalid("system time exceeds supported range".into()))?;
+    if end_ms > now_ms {
+        return Err(CapacityError::Invalid(
+            "capacity measurement end is in the future".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[implements("FR-041-AC-10")]
+fn temp_query(host: &str, selector: &str, span: &str) -> String {
+    match host.to_lowercase().as_str() {
+        "titan" => format!(
+            "max(max_over_time(node_hwmon_temp_celsius{{instance=\"{}\",chip=\"pci0000:00_0000:00:18_3\",sensor=\"temp1\"}}[{span}]))",
+            esc(host)
+        ),
+        "luna" => format!(
+            "max(max_over_time(node_thermal_zone_temp{{instance=\"{}\",type=\"x86_pkg_temp\"}}[{span}]))",
+            esc(host)
+        ),
+        "terra" => format!(
+            "max(max_over_time(node_thermal_zone_temp{{instance=\"{}\",sensor=\"CPU Package\"}}[{span}]))",
+            esc(host)
+        ),
+        "draco" => format!(
+            "max(max_over_time(node_thermal_temperature_celsius{{instance=\"{}\",sensor=~\"PMU tdie.*\"}}[{span}]))",
+            esc(host)
+        ),
+        _ => format!(
+            "max_over_time({selector}{{host=\"{}\"}}[{span}])",
+            esc(host)
+        ),
+    }
+}
+
+#[implements("FR-041-AC-10")]
+fn source_observation(
+    query: Option<&dyn PromQuery>,
+    host: &str,
+    expression: String,
+    coverage_expression: String,
+    source: &str,
+    at: i64,
+) -> Observation<f64> {
+    let Some(query) = query else {
+        return unavailable(source, "prometheus_url_unconfigured");
+    };
+    match query_value_at(query, &expression, at) {
+        Ok(Some(value)) => match query_value_at(query, &coverage_expression, at) {
+            Ok(Some(coverage)) if coverage >= 0.9 => Observation {
+                value: Some(value),
+                availability: super::Availability::Available,
+                source: source.to_owned(),
+                reason: None,
+                coverage: Some(coverage.min(1.0)),
+                observed_at_ms: Some(at),
+            },
+            Ok(coverage) => Observation::unavailable(source, "coverage_below_90_percent", coverage),
+            Err(error) => unavailable(source, format!("{host}: coverage read failed: {error}")),
+        },
+        Ok(None) => unavailable(source, "series_missing"),
+        Err(error) => unavailable(source, format!("{host}: {error}")),
+    }
+}
+
+#[implements("FR-041-AC-10")]
+fn github_commit_count(
+    client: &reqwest::blocking::Client,
+    token: &str,
+    pull_request_url: &str,
+    start: i64,
+    end: i64,
+) -> Result<u64, String> {
+    let parsed = reqwest::Url::parse(pull_request_url).map_err(|error| error.to_string())?;
+    let parts = parsed
+        .path_segments()
+        .ok_or_else(|| "pull request URL has no path".to_owned())?
+        .collect::<Vec<_>>();
+    if parts.len() < 4 || parts[2] != "pull" {
+        return Err("pull request URL is not a GitHub pull request".to_owned());
+    }
+    let mut count = 0_u64;
+    for page in 1..=100 {
+        let page = page.to_string();
+        let response = client
+            .get(format!(
+                "https://api.github.com/repos/{}/{}/pulls/{}/commits",
+                parts[0], parts[1], parts[3]
+            ))
+            .bearer_auth(token)
+            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+            .header(reqwest::header::USER_AGENT, "ix-board")
+            .query(&[("per_page", "100"), ("page", page.as_str())])
+            .send()
+            .map_err(|error| format!("GitHub commit read: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!("GitHub commit read: HTTP {}", response.status()));
+        }
+        let commits: Vec<Value> = response
+            .json()
+            .map_err(|error| format!("GitHub commit response: {error}"))?;
+        let page_len = commits.len();
+        for commit in commits {
+            let date = commit["commit"]["author"]["date"]
+                .as_str()
+                .or_else(|| commit["commit"]["committer"]["date"].as_str())
+                .ok_or_else(|| "GitHub commit has no author or committer date".to_owned())?;
+            let timestamp = chrono::DateTime::parse_from_rfc3339(date)
+                .map_err(|error| format!("GitHub commit timestamp: {error}"))?
+                .timestamp();
+            if (start..=end).contains(&timestamp) {
+                count = count.saturating_add(1);
+            }
+        }
+        if page_len < 100 {
+            return Ok(count);
+        }
+    }
+    Err("GitHub commit pagination exceeded 100 pages".to_owned())
+}
+
+#[implements("FR-041-AC-10")]
+fn github_pull_request_details(
+    client: &reqwest::blocking::Client,
+    token: &str,
+    pull_request_url: &str,
+) -> Result<(String, String, Option<i64>), String> {
+    let parsed = reqwest::Url::parse(pull_request_url).map_err(|error| error.to_string())?;
+    let parts = parsed
+        .path_segments()
+        .ok_or_else(|| "pull request URL has no path".to_owned())?
+        .collect::<Vec<_>>();
+    if parsed.host_str() != Some("github.com") || parts.len() != 4 || parts[2] != "pull" {
+        return Err("pull request URL is not a GitHub pull request".to_owned());
+    }
+    let response = client
+        .get(format!(
+            "https://api.github.com/repos/{}/{}/pulls/{}",
+            parts[0], parts[1], parts[3]
+        ))
+        .bearer_auth(token)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header(reqwest::header::USER_AGENT, "ix-board")
+        .send()
+        .map_err(|error| format!("GitHub pull request read: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "GitHub pull request read: HTTP {}",
+            response.status()
+        ));
+    }
+    let detail: Value = response
+        .json()
+        .map_err(|error| format!("GitHub pull request response: {error}"))?;
+    let title = detail["title"]
+        .as_str()
+        .ok_or_else(|| "GitHub pull request has no title".to_owned())?
+        .to_owned();
+    let branch = detail["head"]["ref"]
+        .as_str()
+        .ok_or_else(|| "GitHub pull request has no head branch".to_owned())?
+        .to_owned();
+    let merged_at = detail["merged_at"]
+        .as_str()
+        .map(|time| {
+            chrono::DateTime::parse_from_rfc3339(time)
+                .map(|parsed| parsed.timestamp())
+                .map_err(|error| format!("GitHub merged_at timestamp: {error}"))
+        })
+        .transpose()?;
+    Ok((title, branch, merged_at))
+}
+
+fn github_token() -> Option<String> {
+    std::env::var("GITHUB_TOKEN")
+        .or_else(|_| std::env::var("GH_TOKEN"))
+        .ok()
+        .filter(|token| !token.trim().is_empty())
+        .or_else(|| {
+            let output = Command::new("gh")
+                .args(["auth", "token"])
+                .stdin(Stdio::null())
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let token = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+            (!token.is_empty()).then_some(token)
+        })
+}
+
+#[derive(Default)]
+struct LaneOutputCounts {
+    tickets: u64,
+    pull_requests: u64,
+    commits: u64,
+    tickets_complete: bool,
+    pull_requests_complete: bool,
+    commits_complete: bool,
+}
+
+impl LaneOutputCounts {
+    fn complete() -> Self {
+        Self {
+            tickets_complete: true,
+            pull_requests_complete: true,
+            commits_complete: true,
+            ..Self::default()
+        }
+    }
+}
+
+type LinearOutput = (
+    Observation<u64>,
+    Observation<u64>,
+    Observation<u64>,
+    Vec<LaneOutputMeasurement>,
+    BTreeMap<String, String>,
+);
+
+#[implements("FR-041-AC-10")]
+fn linear_output(request: &WindowRequest, config: &FleetConfig) -> LinearOutput {
+    let timeout = config.host_timeout;
+    let fail = |source: &str, reason: String| unavailable(source, reason);
+    let source = match LinearGraphQlSource::from_env() {
+        Ok(source) => source,
+        Err(error) => {
+            return (
+                fail("linear.issue_completed_at", error.to_string()),
+                fail("linear.pull_request.merged_at", error.to_string()),
+                fail(
+                    "github.pull_request_commits",
+                    "linear_source_unavailable".to_owned(),
+                ),
+                Vec::new(),
+                BTreeMap::new(),
+            );
+        }
+    };
+    let mut service = match ReadService::open_default(source) {
+        Ok(service) => service,
+        Err(error) => {
+            return (
+                fail("linear.issue_completed_at", error.to_string()),
+                fail("linear.pull_request.merged_at", error.to_string()),
+                fail(
+                    "github.pull_request_commits",
+                    "linear_source_unavailable".to_owned(),
+                ),
+                Vec::new(),
+                BTreeMap::new(),
+            );
+        }
+    };
+    let snapshot = match service.workspace_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return (
+                fail("linear.issue_completed_at", error.to_string()),
+                fail("linear.pull_request.merged_at", error.to_string()),
+                fail(
+                    "github.pull_request_commits",
+                    "linear_source_unavailable".to_owned(),
+                ),
+                Vec::new(),
+                BTreeMap::new(),
+            );
+        }
+    };
+    let assignments = match lane_ticket_history(config, request) {
+        Ok(assignments) => assignments,
+        Err(reason) => {
+            return (
+                fail(
+                    "ledger.assignment_history+agent-msg.work.events",
+                    reason.clone(),
+                ),
+                fail(
+                    "ledger.assignment_history+agent-msg.work.events",
+                    reason.clone(),
+                ),
+                fail("github.ticket_linkage", reason),
+                Vec::new(),
+                BTreeMap::new(),
+            );
+        }
+    };
+    let start = request.start_ms / 1000;
+    let end = request.end_ms / 1000;
+    let closed_at = |time: Option<&str>| {
+        time.and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok())
+            .is_some_and(|parsed| (start..=end).contains(&parsed.timestamp()))
+    };
+    let issue_map: HashMap<String, _> = snapshot
+        .issues
+        .iter()
+        .map(|issue| (issue.identifier.to_lowercase(), issue))
+        .collect();
+    let github_token = github_token();
+    let github_client = reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .ok();
+    let mut unattributed_tickets = 0_u64;
+    let mut unattributed_pull_requests = 0_u64;
+    let mut unattributed_commit_lists = 0_u64;
+    let mut incomplete_attachment_lists = 0_u64;
+    let mut lane_counts: BTreeMap<String, LaneOutputCounts> = BTreeMap::new();
+    for (lane, ticket) in assignments {
+        let counts = lane_counts
+            .entry(lane.clone())
+            .or_insert_with(LaneOutputCounts::complete);
+        {
+            let key = ticket.rsplit('/').next().unwrap_or(&ticket).to_lowercase();
+            let Some(issue) = issue_map.get(&key) else {
+                unattributed_tickets = unattributed_tickets.saturating_add(1);
+                counts.tickets_complete = false;
+                counts.pull_requests_complete = false;
+                counts.commits_complete = false;
+                continue;
+            };
+            if closed_at(issue.completed_at.as_deref()) {
+                counts.tickets = counts.tickets.saturating_add(1);
+            }
+            if !issue.attachments_complete {
+                incomplete_attachment_lists = incomplete_attachment_lists.saturating_add(1);
+                counts.pull_requests_complete = false;
+                counts.commits_complete = false;
+            }
+            for pr in &issue.pull_requests {
+                let (Some(client), Some(token)) = (&github_client, &github_token) else {
+                    unattributed_pull_requests = unattributed_pull_requests.saturating_add(1);
+                    unattributed_commit_lists = unattributed_commit_lists.saturating_add(1);
+                    counts.pull_requests_complete = false;
+                    counts.commits_complete = false;
+                    continue;
+                };
+                match github_pull_request_details(client, token, &pr.url) {
+                    // The Linear issue attachment links the PR to this ticket even when the PR
+                    // title and branch omit the ticket identifier.
+                    Ok((_title, _branch, merged_at)) => {
+                        if merged_at.is_some_and(|merged| (start..=end).contains(&merged)) {
+                            counts.pull_requests = counts.pull_requests.saturating_add(1);
+                        }
+                    }
+                    Err(_) => {
+                        unattributed_pull_requests = unattributed_pull_requests.saturating_add(1);
+                        unattributed_commit_lists = unattributed_commit_lists.saturating_add(1);
+                        counts.pull_requests_complete = false;
+                        counts.commits_complete = false;
+                        continue;
+                    }
+                }
+                match github_commit_count(client, token, &pr.url, start, end) {
+                    Ok(commits) => counts.commits = counts.commits.saturating_add(commits),
+                    Err(_) => {
+                        unattributed_commit_lists = unattributed_commit_lists.saturating_add(1);
+                        counts.commits_complete = false;
+                    }
+                }
+            }
+        }
+    }
+    if lane_counts.is_empty() {
+        let reason = "no_ticket_mapping_for_host_window".to_owned();
+        return (
+            fail("linear.issue_completed_at", reason.clone()),
+            fail("linear.pull_request.merged_at", reason.clone()),
+            fail("github.pull_request_commits", reason),
+            Vec::new(),
+            BTreeMap::new(),
+        );
+    }
+    let completed = lane_counts.values().map(|counts| counts.tickets).sum();
+    let merged = lane_counts
+        .values()
+        .map(|counts| counts.pull_requests)
+        .sum();
+    let commits: u64 = lane_counts.values().map(|counts| counts.commits).sum();
+    let tickets_complete =
+        unattributed_tickets == 0 && lane_counts.values().all(|counts| counts.tickets_complete);
+    let prs_complete = unattributed_pull_requests == 0
+        && incomplete_attachment_lists == 0
+        && lane_counts
+            .values()
+            .all(|counts| counts.pull_requests_complete);
+    let commits_complete = unattributed_commit_lists == 0
+        && incomplete_attachment_lists == 0
+        && lane_counts.values().all(|counts| counts.commits_complete);
+    let tickets_observation = if tickets_complete {
+        Observation::available(completed, "linear.issue.completed_at", request.end_ms)
+    } else {
+        unavailable("linear.issue.completed_at", "ticket_output_incomplete")
+    };
+    let prs_observation = if prs_complete {
+        Observation::available(
+            merged,
+            "linear.pull_request_attachment+github.pull_request.merged_at",
+            request.end_ms,
+        )
+    } else {
+        unavailable(
+            "linear.pull_request_attachment+github.pull_request.merged_at",
+            "pull_request_output_incomplete",
+        )
+    };
+    let commits_observation = if commits_complete {
+        Observation::available(
+            commits,
+            "linear.pull_request_attachment+github.pull_request_commits",
+            request.end_ms,
+        )
+    } else {
+        unavailable(
+            "linear.pull_request_attachment+github.pull_request_commits",
+            "commit_output_incomplete",
+        )
+    };
+    let lane_output = lane_counts
+        .into_iter()
+        .map(|(lane, counts)| LaneOutputMeasurement {
+            lane,
+            tickets_closed: if counts.tickets_complete {
+                Observation::available(counts.tickets, "linear.issue.completed_at", request.end_ms)
+            } else {
+                unavailable("linear.issue.completed_at", "ticket_output_incomplete")
+            },
+            prs_merged: if counts.pull_requests_complete {
+                Observation::available(
+                    counts.pull_requests,
+                    "github.pull_request.merged_at",
+                    request.end_ms,
+                )
+            } else {
+                unavailable(
+                    "github.pull_request.merged_at",
+                    "pull_request_output_incomplete",
+                )
+            },
+            commits_pushed: if counts.commits_complete {
+                Observation::available(
+                    counts.commits,
+                    "github.pull_request_commits",
+                    request.end_ms,
+                )
+            } else {
+                unavailable("github.pull_request_commits", "commit_output_incomplete")
+            },
+        })
+        .collect();
+    let attribution_basis = BTreeMap::from([
+        (
+            "output_attribution_basis".to_owned(),
+            "relay_work_event_or_ledger_assignment+linear_pull_request_attachment+github"
+                .to_owned(),
+        ),
+        (
+            "unattributed_ticket_count".to_owned(),
+            unattributed_tickets.to_string(),
+        ),
+        (
+            "unattributed_pull_request_count".to_owned(),
+            unattributed_pull_requests.to_string(),
+        ),
+        (
+            "unattributed_commit_list_count".to_owned(),
+            unattributed_commit_lists.to_string(),
+        ),
+        (
+            "incomplete_attachment_list_count".to_owned(),
+            incomplete_attachment_lists.to_string(),
+        ),
+    ]);
+    (
+        tickets_observation,
+        prs_observation,
+        commits_observation,
+        lane_output,
+        attribution_basis,
+    )
+}
+
+#[implements("FR-041-AC-10")]
+fn lane_ticket_history(
+    config: &FleetConfig,
+    request: &WindowRequest,
+) -> Result<Vec<(String, String)>, String> {
+    let path = crate::fleet::ledger::resolve_path(config).map_err(|error| error.to_string())?;
+    if !path.exists() {
+        return Err("fleet ledger has no assignment history".to_owned());
+    }
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut statement = connection
+        .prepare(
+            "SELECT lower(lane),ticket FROM assignment_history
+             WHERE lower(lane) LIKE lower(?1) AND assigned_at<=?2
+               AND (replaced_at IS NULL OR replaced_at>=?3)",
+        )
+        .map_err(|error| error.to_string())?;
+    let host_prefix = format!("{}:%", request.host);
+    let assignments = statement
+        .query_map(
+            rusqlite::params![host_prefix, request.end_ms, request.start_ms],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let mut cursor: Option<String> = None;
+    let mut work_tickets = BTreeSet::new();
+    let mut event_assignments = BTreeSet::new();
+    let mut active_before_window = BTreeSet::new();
+    let mut covered = false;
+    let mut finished = false;
+    for _ in 0..20 {
+        let mut args = vec!["work", "events", "--limit", "500"];
+        if let Some(cursor) = &cursor {
+            args.extend(["--after", cursor]);
+        }
+        let bytes = crate::team_metrics::read_history("agent-msg", &args, config.host_timeout)
+            .map_err(|error| error.to_string())?;
+        let page: EventPage = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        if page.version != 1 || page.events.len() > 500 || page.truncated {
+            return Err("agent-msg work-event history is incomplete".to_owned());
+        }
+        if !page
+            .available_from_ms
+            .is_some_and(|from| from <= request.start_ms)
+        {
+            return Err("agent-msg work-event retention starts after output window".to_owned());
+        }
+        covered = true;
+        for event in &page.events {
+            if event.at_ms > request.end_ms {
+                continue;
+            }
+            if let Change::Agent { agent } = &event.change
+                && matches!(
+                    agent.status,
+                    AssignmentStatus::Running | AssignmentStatus::Done
+                )
+            {
+                let ticket = normalized_ticket_key(&agent.ticket);
+                let host_prefix = format!("{}:", request.host.to_lowercase());
+                let address = event.binding.address.trim().to_lowercase();
+                if !address.is_empty() && address.starts_with(&host_prefix) {
+                    let pair = (address, ticket.clone());
+                    if event.at_ms >= request.start_ms {
+                        work_tickets.insert(ticket);
+                        event_assignments.insert(pair);
+                    } else if agent.status == AssignmentStatus::Running {
+                        active_before_window.insert(pair);
+                    } else {
+                        active_before_window.remove(&pair);
+                    }
+                }
+            }
+        }
+        if !page.has_more {
+            finished = true;
+            break;
+        }
+        if cursor.as_deref() == Some(page.next_cursor.as_str()) {
+            return Err("agent-msg work-event cursor did not advance".to_owned());
+        }
+        cursor = Some(page.next_cursor);
+    }
+    if !covered || !finished {
+        return Err(
+            "agent-msg work-event history is unavailable or exceeded page limit".to_owned(),
+        );
+    }
+    let mut matched = BTreeSet::new();
+    for (lane, ticket) in assignments {
+        for ticket in normalized_ticket_keys(&ticket) {
+            if work_tickets.contains(&ticket) {
+                matched.insert((lane.to_lowercase(), ticket));
+            }
+        }
+    }
+    matched.extend(
+        event_assignments
+            .into_iter()
+            .map(|(lane, ticket)| (lane.to_lowercase(), normalized_ticket_key(&ticket))),
+    );
+    matched.extend(
+        active_before_window
+            .into_iter()
+            .map(|(lane, ticket)| (lane.to_lowercase(), normalized_ticket_key(&ticket))),
+    );
+    if matched.is_empty() {
+        return Err("no assignment ticket maps to a work event in the output window".to_owned());
+    }
+    Ok(matched.into_iter().collect())
+}
+
+#[implements("FR-041-AC-10")]
+fn normalized_ticket_key(ticket: &str) -> String {
+    ticket
+        .trim()
+        .rsplit('/')
+        .next()
+        .unwrap_or(ticket)
+        .trim()
+        .to_lowercase()
+}
+
+#[implements("FR-041-AC-10")]
+fn normalized_ticket_keys(ticket: &str) -> impl Iterator<Item = String> + '_ {
+    ticket
+        .split([',', ';'])
+        .map(normalized_ticket_key)
+        .filter(|ticket| !ticket.is_empty())
+}
+
+impl MeasurementSource for LiveMeasurementSource<'_> {
+    #[implements("FR-041-AC-10")]
+    fn measure(&self, request: &WindowRequest) -> Result<WindowMeasurements, CapacityError> {
+        if request.end_ms <= request.start_ms || request.rampup_end_ms > request.start_ms {
+            return Err(CapacityError::Invalid(
+                "measurement interval is empty or precedes ramp-up completion".to_owned(),
+            ));
+        }
+        let (span, span_secs) = duration(request)?;
+        validate_evaluation_time(request.end_ms)?;
+        let host = request.host.to_lowercase();
+        let label = esc(&host);
+        let at = request.end_ms;
+        let limits = self.config.capacity_limits.get(&host);
+        let configured_slots = limits.and_then(|limit| limit.build_slots);
+        let sustainable = observed(
+            configured_slots,
+            &format!("ix_board_config:fleet.capacity_limits.{host}.build_slots"),
+            "build_slots_not_configured",
+            at,
+        );
+        let source = |metric: &str, operation: &str| {
+            let selector = format!("{metric}{{host=\"{label}\"}}");
+            let expression = format!("{operation}({selector}[{span}])");
+            let coverage = coverage_query(
+                &[selector.as_str()],
+                span_secs,
+                self.config.push_interval.as_secs(),
+            );
+            (expression, coverage)
+        };
+        let (busy_query, busy_coverage) = source("ix_build_slots_busy", "min_over_time");
+        let busy = source_observation(
+            self.prometheus,
+            &host,
+            busy_query,
+            busy_coverage,
+            "prometheus.ix_build_slots_busy",
+            at,
+        );
+        let queue_selector = format!("ix_build_queue_wait_seconds_bucket{{host=\"{label}\"}}");
+        let queue_wait_query = format!(
+            "histogram_quantile(0.9, sum by (le) (increase(ix_build_queue_wait_seconds_bucket{{host=\"{label}\"}}[{span}])))"
+        );
+        let queue_wait_coverage = coverage_query(
+            &[queue_selector.as_str()],
+            span_secs,
+            self.config.push_interval.as_secs(),
+        );
+        let queue_wait = source_observation(
+            self.prometheus,
+            &host,
+            queue_wait_query,
+            queue_wait_coverage,
+            "prometheus.ix_build_queue_wait_seconds",
+            at,
+        );
+        let admission_selector =
+            format!("ix_build_admission_blocked_seconds_total{{host=\"{label}\"}}");
+        let admission_query = format!("sum(increase({admission_selector}[{span}]))");
+        let admission_coverage = coverage_query(
+            &[admission_selector.as_str()],
+            span_secs,
+            self.config.push_interval.as_secs(),
+        );
+        let admission = source_observation(
+            self.prometheus,
+            &host,
+            admission_query,
+            admission_coverage,
+            "prometheus.ix_build_admission_blocked_seconds_total",
+            at,
+        );
+        let throttled_share = match (
+            admission.value,
+            request.end_ms.checked_sub(request.start_ms),
+        ) {
+            (Some(blocked), Some(milliseconds)) if milliseconds > 0 => Observation::available(
+                (blocked / (milliseconds as f64 / 1000.0)).clamp(0.0, 1.0),
+                "admission_only:ix_build_admission_blocked_seconds_total",
+                at,
+            ),
+            _ => unavailable(
+                "admission_only:ix_build_admission_blocked_seconds_total",
+                "admission_blocked_source_unavailable",
+            ),
+        };
+        let memory_selector = format!("node_memory_MemAvailable_bytes{{instance=\"{label}\"}}");
+        let memory_coverage = coverage_query(
+            &[memory_selector.as_str()],
+            span_secs,
+            self.config.push_interval.as_secs(),
+        );
+        let memory = source_observation(
+            self.prometheus,
+            &host,
+            format!("min(min_over_time({memory_selector}[{span}]))"),
+            memory_coverage,
+            "node_exporter.node_memory_MemAvailable_bytes",
+            at,
+        );
+        let memory = if memory.value.is_some() {
+            memory
+        } else {
+            source_observation(
+                self.prometheus,
+                &host,
+                format!(
+                    "min_over_time((ix_fleet_host_memory_total_bytes{{host=\"{label}\"}} - ix_fleet_host_memory_used_bytes{{host=\"{label}\"}})[{span}:{}])",
+                    self.config.push_interval.as_secs()
+                ),
+                coverage_query(
+                    &[
+                        &format!("ix_fleet_host_memory_total_bytes{{host=\"{label}\"}}"),
+                        &format!("ix_fleet_host_memory_used_bytes{{host=\"{label}\"}}"),
+                    ],
+                    span_secs,
+                    self.config.push_interval.as_secs(),
+                ),
+                "relay_watcher.ix_fleet_host_memory_total_bytes-ix_fleet_host_memory_used_bytes",
+                at,
+            )
+        };
+        let temperature_expression = temp_query(&host, "node_thermal_temperature_celsius", &span);
+        let temperature_selector = match host.as_str() {
+            "titan" => format!(
+                "node_hwmon_temp_celsius{{instance=\"{label}\",chip=\"pci0000:00_0000:00:18_3\",sensor=\"temp1\"}}"
+            ),
+            "luna" => {
+                format!("node_thermal_zone_temp{{instance=\"{label}\",type=\"x86_pkg_temp\"}}")
+            }
+            "terra" => {
+                format!("node_thermal_zone_temp{{instance=\"{label}\",sensor=\"CPU Package\"}}")
+            }
+            "draco" => format!(
+                "node_thermal_temperature_celsius{{instance=\"{label}\",sensor=~\"PMU tdie.*\"}}"
+            ),
+            _ => format!("node_thermal_temperature_celsius{{instance=\"{label}\"}}"),
+        };
+        let temperature_coverage = coverage_query(
+            &[temperature_selector.as_str()],
+            span_secs,
+            self.config.push_interval.as_secs(),
+        );
+        let temperature = source_observation(
+            self.prometheus,
+            &host,
+            temperature_expression,
+            temperature_coverage,
+            match host.as_str() {
+                "draco" => "node_exporter.node_thermal_temperature_celsius",
+                "titan" => "node_exporter.node_hwmon_temp_celsius:cpu_chip_temp1",
+                "luna" => "node_exporter.node_thermal_zone_temp:x86_pkg_temp",
+                "terra" => "windows_sensors.physical_cpu",
+                _ => "node_exporter.host_temperature",
+            },
+            at,
+        );
+        let memory_headroom = limits
+            .and_then(|limit| limit.memory_reserve_bytes)
+            .zip(memory.value)
+            .map(|(reserve, available)| available - reserve as f64);
+        let thermal_headroom = limits
+            .and_then(|limit| limit.thermal_limit_celsius)
+            .zip(temperature.value)
+            .map(|(limit, current)| limit - current);
+        let (tickets_closed, prs_merged, commits_pushed, lane_output, output_attribution_basis) =
+            linear_output(request, self.config);
+        let (host_output_per_hour, output_basis) =
+            output_rate(request, &tickets_closed, &prs_merged, &commits_pushed);
+        let slot_equal = match (busy.value, sustainable.value) {
+            (Some(busy), Some(sustainable)) => Observation::available(
+                busy == f64::from(sustainable),
+                "prometheus.ix_build_slots_busy/config:fleet.capacity_limits.build_slots",
+                at,
+            ),
+            _ => unavailable(
+                "prometheus.ix_build_slots_busy/config:fleet.capacity_limits.build_slots",
+                "slot_values_unavailable",
+            ),
+        };
+        let mut derived_sources = output_attribution_basis;
+        derived_sources.insert("throttled_share".to_owned(), "admission_only".to_owned());
+        derived_sources.insert(
+            "memory_reserve".to_owned(),
+            format!(
+                "ix_board_config:fleet.capacity_limits.{host}.memory_reserve_bytes={}",
+                limits
+                    .and_then(|limit| limit.memory_reserve_bytes)
+                    .map_or_else(|| "unconfigured".to_owned(), |value| value.to_string())
+            ),
+        );
+        derived_sources.insert(
+            "thermal_limit".to_owned(),
+            format!(
+                "ix_board_config:fleet.capacity_limits.{host}.thermal_limit_celsius={}",
+                limits
+                    .and_then(|limit| limit.thermal_limit_celsius)
+                    .map_or_else(|| "unconfigured".to_owned(), |value| value.to_string())
+            ),
+        );
+        let build_slots_busy = match busy.value {
+            Some(value) if value >= 0.0 && value.fract() == 0.0 && value <= f64::from(u32::MAX) => {
+                Observation {
+                    value: Some(value as u32),
+                    availability: busy.availability,
+                    source: busy.source.clone(),
+                    reason: busy.reason.clone(),
+                    coverage: busy.coverage,
+                    observed_at_ms: busy.observed_at_ms,
+                }
+            }
+            _ => unavailable("prometheus.ix_build_slots_busy", "slot_count_unavailable"),
+        };
+        let lane_selector =
+            format!("ix_fleet_lane_state_ratio{{host=\"{label}\",job=\"ix-relay-watcher\"}}");
+        let lane_count_expression = format!(
+            "count(count by (lane) (last_over_time({lane_selector}[{}s])))",
+            self.config.push_interval.as_secs().saturating_mul(2).max(1)
+        );
+        let lane_count = source_observation(
+            self.prometheus,
+            &host,
+            lane_count_expression,
+            "vector(1)".to_owned(),
+            "prometheus.ix_fleet_lane_state_ratio.distinct_lanes",
+            at,
+        );
+        let lanes = match lane_count.value {
+            Some(value) if value >= 0.0 && value.fract() == 0.0 && value <= f64::from(u32::MAX) => {
+                Observation::available(value as u32, &lane_count.source, at)
+            }
+            _ => unavailable(
+                "prometheus.ix_fleet_lane_state_ratio.distinct_lanes",
+                "lane_count_unavailable",
+            ),
+        };
+        Ok(WindowMeasurements {
+            lanes,
+            build_slots_busy,
+            build_slots_sustainable: sustainable,
+            window_start_ms: request.start_ms,
+            window_end_ms: request.end_ms,
+            rampup_end_ms: request.rampup_end_ms,
+            tickets_closed,
+            prs_merged,
+            commits_pushed,
+            host_output_per_hour,
+            output_basis,
+            queue_wait_p90_s: queue_wait,
+            throttled_share,
+            memory_headroom_min: observed(
+                memory_headroom,
+                "host_memory-ix_board_config.memory_reserve_bytes",
+                "memory_reading_or_reserve_unavailable",
+                at,
+            ),
+            thermal_headroom_min: observed(
+                thermal_headroom,
+                "ix_board_config.thermal_limit_celsius-host_temperature",
+                "temperature_or_limit_unavailable",
+                at,
+            ),
+            slots_busy_equals_sustainable: slot_equal,
+            derived_sources,
+            lane_output,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fleet::SourceError;
+    use crate::fleet::config::HostCapacityLimits;
+    use crate::fleet::live::PromQuery;
+    use ix_trace_rs::trace;
+    use std::time::Duration;
+
+    #[test]
+    #[trace("FR-041-AC-10")]
+    fn output_ticket_keys_are_case_insensitive_and_split_aggregated_rows() {
+        assert_eq!(
+            normalized_ticket_keys("https://linear.app/team/issue/SWM-1, qsl-2")
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["qsl-2".to_owned(), "swm-1".to_owned()]),
+        );
+    }
+
+    #[test]
+    #[trace("FR-041-AC-10")]
+    fn unavailable_ticket_totals_do_not_fall_back_to_commits() {
+        let request = WindowRequest {
+            host: "example-host".to_owned(),
+            lanes: 1,
+            start_ms: 1_000,
+            end_ms: 3_601_000,
+            rampup_end_ms: 1_000,
+        };
+        let tickets = Observation::unavailable(
+            "linear.issue.completed_at",
+            "ticket_output_incomplete",
+            None,
+        );
+        let prs = Observation::available(0, "linear.pull_request_attachment", request.end_ms);
+        let commits = Observation::available(8, "github.pull_request_commits", request.end_ms);
+        let (output, basis) = output_rate(&request, &tickets, &prs, &commits);
+        assert!(output.value.is_none());
+        assert!(basis.value.is_none());
+        assert_eq!(output.reason.as_deref(), Some("ticket_output_incomplete"));
+
+        let tickets = Observation::available(2, "linear.issue.completed_at", request.end_ms);
+        let prs = Observation::available(1, "linear.pull_request_attachment", request.end_ms);
+        let (output, basis) = output_rate(&request, &tickets, &prs, &commits);
+        assert_eq!(output.value, Some(8.0));
+        assert_eq!(basis.value.as_deref(), Some("commits"));
+    }
+
+    #[test]
+    #[trace("FR-041-AC-10")]
+    fn capacity_window_rejects_a_future_prometheus_evaluation_time() {
+        assert!(validate_evaluation_time(i64::MAX).is_err());
+    }
+
+    #[test]
+    #[trace("FR-041-AC-10")]
+    fn coverage_query_uses_valid_subqueries_for_series_and_fallback_selectors() {
+        assert_eq!(
+            coverage_query(&["ix_build_slots_busy{host=\"draco\"}"], 3600, 30),
+            "count_over_time((max(present_over_time(ix_build_slots_busy{host=\"draco\"}[30s])))[3600s:30s]) / 120"
+        );
+        assert_eq!(
+            coverage_query(
+                &["ix_build_admission_blocked_seconds_total{host=\"draco\"}"],
+                3600,
+                30,
+            ),
+            "count_over_time((max(present_over_time(ix_build_admission_blocked_seconds_total{host=\"draco\"}[30s])))[3600s:30s]) / 120"
+        );
+        assert_eq!(
+            coverage_query(
+                &[
+                    "ix_fleet_host_memory_total_bytes{host=\"draco\"}",
+                    "ix_fleet_host_memory_used_bytes{host=\"draco\"}",
+                ],
+                3600,
+                30,
+            ),
+            "count_over_time((max(present_over_time(ix_fleet_host_memory_total_bytes{host=\"draco\"}[30s])) and max(present_over_time(ix_fleet_host_memory_used_bytes{host=\"draco\"}[30s])))[3600s:30s]) / 120"
+        );
+    }
+
+    struct MockPrometheus {
+        values: HashMap<String, f64>,
+    }
+
+    impl PromQuery for MockPrometheus {
+        fn query(&self, expression: &str) -> Result<String, SourceError> {
+            let value = self
+                .values
+                .get(expression)
+                .copied()
+                .ok_or_else(|| SourceError(format!("unexpected query: {expression}")))?;
+            Ok(format!(
+                r#"{{"status":"success","data":{{"result":[{{"value":[0,"{value}"]}}]}}}}"#
+            ))
+        }
+
+        fn query_at(&self, expression: &str, _: i64) -> Result<String, SourceError> {
+            self.query(expression)
+        }
+    }
+
+    #[test]
+    #[trace("FR-041-AC-10")]
+    fn live_measurement_reads_host_build_memory_and_thermal_series() {
+        let mut config = FleetConfig {
+            hosts: vec!["draco".to_owned()],
+            push_interval: Duration::from_secs(30),
+            ..FleetConfig::default()
+        };
+        config.capacity_limits.insert(
+            "draco".to_owned(),
+            HostCapacityLimits {
+                build_slots: Some(3),
+                lane_capacity: None,
+                memory_reserve_bytes: Some(1_073_741_824),
+                thermal_limit_celsius: Some(85.0),
+            },
+        );
+        let busy_selector = "ix_build_slots_busy{host=\"draco\"}";
+        let queue_selector = "ix_build_queue_wait_seconds_bucket{host=\"draco\"}";
+        let admission_selector = "ix_build_admission_blocked_seconds_total{host=\"draco\"}";
+        let memory_selector = "node_memory_MemAvailable_bytes{instance=\"draco\"}";
+        let temperature_selector =
+            "node_thermal_temperature_celsius{instance=\"draco\",sensor=~\"PMU tdie.*\"}";
+        let values = HashMap::from([
+            (
+                "min_over_time(ix_build_slots_busy{host=\"draco\"}[3600s])".to_owned(),
+                2.0,
+            ),
+            (coverage_query(&[busy_selector], 3600, 30), 1.0),
+            (
+                "histogram_quantile(0.9, sum by (le) (increase(ix_build_queue_wait_seconds_bucket{host=\"draco\"}[3600s])))".to_owned(),
+                4.0,
+            ),
+            (coverage_query(&[queue_selector], 3600, 30), 1.0),
+            (
+                "sum(increase(ix_build_admission_blocked_seconds_total{host=\"draco\"}[3600s]))".to_owned(),
+                0.0,
+            ),
+            (coverage_query(&[admission_selector], 3600, 30), 1.0),
+            (
+                "min(min_over_time(node_memory_MemAvailable_bytes{instance=\"draco\"}[3600s]))".to_owned(),
+                2_147_483_648.0,
+            ),
+            (coverage_query(&[memory_selector], 3600, 30), 1.0),
+            (
+                "max(max_over_time(node_thermal_temperature_celsius{instance=\"draco\",sensor=~\"PMU tdie.*\"}[3600s]))".to_owned(),
+                70.0,
+            ),
+            (coverage_query(&[temperature_selector], 3600, 30), 1.0),
+            (
+                "count(count by (lane) (last_over_time(ix_fleet_lane_state_ratio{host=\"draco\",job=\"ix-relay-watcher\"}[60s])))".to_owned(),
+                2.0,
+            ),
+            ("vector(1)".to_owned(), 1.0),
+        ]);
+        let prometheus = MockPrometheus { values };
+        let source = LiveMeasurementSource {
+            config: &config,
+            prometheus: Some(&prometheus),
+        };
+        let request = WindowRequest {
+            host: "draco".to_owned(),
+            lanes: 2,
+            start_ms: 1_000,
+            end_ms: 3_601_000,
+            rampup_end_ms: 1_000,
+        };
+        let measurement = source.measure(&request).unwrap();
+        assert_eq!(measurement.build_slots_busy.value, Some(2));
+        assert_eq!(measurement.build_slots_sustainable.value, Some(3));
+        assert_eq!(measurement.queue_wait_p90_s.value, Some(4.0));
+        assert_eq!(measurement.throttled_share.value, Some(0.0));
+        assert_eq!(measurement.memory_headroom_min.value, Some(1_073_741_824.0));
+        assert_eq!(measurement.thermal_headroom_min.value, Some(15.0));
+    }
+}

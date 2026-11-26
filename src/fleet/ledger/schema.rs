@@ -7,7 +7,7 @@
 //! empty so the schema is one unit under one migration.
 
 /// The schema version this build writes.
-pub const VERSION: i64 = 2;
+pub const VERSION: i64 = 6;
 
 pub const V1: &str = "
 CREATE TABLE run(
@@ -134,7 +134,7 @@ pub const V2: &[&str] = &[
        run_id INTEGER NOT NULL, step_no INTEGER NOT NULL, repeat_of INTEGER, host TEXT NOT NULL,
        lanes INTEGER, window_start INTEGER, window_end INTEGER, rampup_end INTEGER, valid INTEGER,
        inconclusive_reason TEXT CHECK(inconclusive_reason IS NULL OR inconclusive_reason IN
-         ('deficit_nonzero','deficit_coverage')),
+         ('demand_short','deficit_coverage')),
        deficit_coverage REAL, deficit_zero_throughout INTEGER, host_output_per_hour REAL,
        tickets_closed INTEGER, prs_merged INTEGER, commits_pushed INTEGER,
        output_basis TEXT CHECK(output_basis IS NULL OR output_basis IN ('tickets_prs','commits')),
@@ -153,10 +153,324 @@ pub const V2: &[&str] = &[
        event_id INTEGER PRIMARY KEY AUTOINCREMENT, host TEXT NOT NULL, lane TEXT,
        kind TEXT NOT NULL CHECK(kind IN ('lane_added','draining_mark','drain_done',
          'lane_removed','lane_lost','step_down','overload_event')),
-       reason TEXT, evidence_kind TEXT, cycle_id INTEGER, at INTEGER NOT NULL, ceiling_until INTEGER)",
+       reason TEXT, evidence_kind TEXT, cycle_id INTEGER, at INTEGER NOT NULL,
+       ceiling_until INTEGER)",
     "CREATE TABLE host_output_sample(
        host TEXT NOT NULL, at INTEGER NOT NULL, lanes INTEGER, tickets_closed INTEGER,
        prs_merged INTEGER, commits_pushed INTEGER, PRIMARY KEY(host, at))",
+];
+
+/// Version 3 adds source provenance for every recorded capacity-step measurement.
+pub const V3: &[&str] = &[
+    "ALTER TABLE capacity_step ADD COLUMN source_basis TEXT NOT NULL DEFAULT '{}'",
+    "ALTER TABLE capacity_step_lane_output ADD COLUMN source_basis TEXT NOT NULL DEFAULT '{}'",
+];
+
+/// Version 4 persists the currently open discovery hold so a later invocation can measure it.
+pub const V4: &[&str] = &[
+    "CREATE TABLE capacity_window(
+       run_id INTEGER PRIMARY KEY, step_no INTEGER NOT NULL, repeat_of INTEGER,
+       host TEXT NOT NULL, lanes INTEGER NOT NULL, lane_added_at_ms INTEGER NOT NULL,
+       rampup_end_ms INTEGER NOT NULL)",
+    "CREATE UNIQUE INDEX capacity_step_run_step ON capacity_step(run_id,step_no)",
+    "CREATE UNIQUE INDEX capacity_step_lane_output_run_step_lane
+       ON capacity_step_lane_output(run_id,step_no,lane)",
+];
+
+/// Version 5 persists scheduler slot values separately from their provenance.
+pub const V5: &[&str] = &[
+    "ALTER TABLE capacity_step ADD COLUMN build_slots_busy INTEGER",
+    "ALTER TABLE capacity_step ADD COLUMN build_slots_sustainable INTEGER",
+    "ALTER TABLE capacity_step ADD COLUMN measurement_values TEXT NOT NULL DEFAULT '{}'",
+    "DROP INDEX capacity_step_run_step",
+    "DROP INDEX capacity_step_lane_output_run_step_lane",
+];
+
+/// Version 6 stores the requested ticket count on planner buffer actions.
+pub const V6: &[&str] = &[
+    "ALTER TABLE action ADD COLUMN project TEXT",
+    "ALTER TABLE action ADD COLUMN requested_count INTEGER",
+    "CREATE TABLE IF NOT EXISTS capacity_throttle_sample(
+       host TEXT NOT NULL, at INTEGER NOT NULL, interval_s INTEGER NOT NULL,
+       throttled_share REAL, coverage REAL, unavailable_reason TEXT,
+       source_basis TEXT NOT NULL, PRIMARY KEY(host, at))",
+    "CREATE TABLE IF NOT EXISTS capacity_overload_state(
+       host TEXT NOT NULL, cause TEXT NOT NULL, active INTEGER NOT NULL,
+       updated_at INTEGER NOT NULL, source_basis TEXT NOT NULL,
+       PRIMARY KEY(host,cause))",
+    "ALTER TABLE capacity_event ADD COLUMN source_basis TEXT",
+    "ALTER TABLE capacity_event ADD COLUMN drain_cap_ms INTEGER NOT NULL DEFAULT 14400000",
+    "ALTER TABLE capacity_event ADD COLUMN ceiling_lanes INTEGER",
+    "ALTER TABLE host_output_sample ADD COLUMN source_basis TEXT NOT NULL DEFAULT '{}'",
+    "ALTER TABLE host_output_sample ADD COLUMN sample_interval_ms INTEGER NOT NULL DEFAULT 3600000",
+    "ALTER TABLE capacity_step_lane_output ADD COLUMN window_end INTEGER",
+    "ALTER TABLE capacity_step ADD COLUMN window_min_ms INTEGER NOT NULL DEFAULT 3600000",
+    "UPDATE capacity_step_lane_output SET window_end=(
+       SELECT s.window_end FROM capacity_step s WHERE s.run_id=capacity_step_lane_output.run_id
+         AND s.step_no=capacity_step_lane_output.step_no LIMIT 1)
+       WHERE window_end IS NULL AND (SELECT COUNT(*) FROM capacity_step s
+         WHERE s.run_id=capacity_step_lane_output.run_id
+           AND s.step_no=capacity_step_lane_output.step_no)=1",
+    "ALTER TABLE saturation_sample ADD COLUMN source_basis TEXT NOT NULL DEFAULT 'unknown'",
+    "ALTER TABLE saturation_sample ADD COLUMN unavailable_reason TEXT",
+    "ALTER TABLE saturation_sample ADD COLUMN coverage REAL",
+    "ALTER TABLE saturation_sample ADD COLUMN ready_buffer INTEGER",
+    "ALTER TABLE saturation_sample ADD COLUMN active_lanes INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE saturation_sample ADD COLUMN supplied_lanes INTEGER",
+    "ALTER TABLE saturation_sample ADD COLUMN unsupplied_lanes INTEGER",
+    "ALTER TABLE saturation_sample ADD COLUMN ready_share INTEGER",
+    "ALTER TABLE saturation_sample ADD COLUMN registry_current INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE saturation_sample ADD COLUMN queued_behind_first INTEGER",
+    "ALTER TABLE saturation_sample ADD COLUMN bootstrap_ticket_pool INTEGER",
+];
+
+/// Capacity-history views consumed by the orchestrator and minder role specs.
+pub const CAPACITY_VIEWS: &[&str] = &[
+    "CREATE VIEW discovery_steps AS
+       SELECT s.*, s.window_end AS at_ms FROM capacity_step s",
+    "CREATE VIEW discovery_steps_violating_ramp AS
+       WITH ordered AS (
+         SELECT s.*, LAG(lanes) OVER (PARTITION BY run_id ORDER BY step_no) AS previous_lanes
+         FROM capacity_step s)
+       SELECT *, window_end AS at_ms FROM ordered
+       WHERE repeat_of IS NULL AND
+         ((previous_lanes IS NOT NULL AND lanes <> previous_lanes + 1)
+          OR window_end - window_start < window_min_ms)",
+    "CREATE VIEW discovery_steps_judged_without_demand AS
+       SELECT s.run_id,s.step_no,s.host,s.lanes,s.valid,s.knee_signal,s.window_end AS at_ms,
+              'new_step_after_invalid' AS violation
+       FROM capacity_step s WHERE s.repeat_of IS NULL AND EXISTS (
+         SELECT 1 FROM capacity_step p WHERE p.run_id=s.run_id
+           AND p.step_no=(SELECT MAX(x.step_no) FROM capacity_step x
+                          WHERE x.run_id=s.run_id AND x.step_no<s.step_no)
+           AND p.valid=0 AND p.window_end=(SELECT MAX(x.window_end) FROM capacity_step x
+             WHERE x.run_id=p.run_id AND x.step_no=p.step_no))
+       UNION ALL
+       SELECT run_id,step_no,host,lanes,valid,knee_signal,window_end,'knee_on_invalid'
+       FROM capacity_step WHERE knee_signal=1 AND valid<>1
+       UNION ALL
+       SELECT s.run_id,s.step_no,s.host,s.lanes,s.valid,s.knee_signal,s.window_end,
+              'level_uses_invalid_step'
+       FROM capacity_level l,json_each(l.evidence_steps) e
+       JOIN capacity_step s ON s.run_id=l.run_id AND s.step_no=CAST(e.value AS INTEGER)
+       WHERE s.valid<>1",
+    "CREATE VIEW discovery_knee_signals AS
+       SELECT *, window_end AS at_ms FROM capacity_step WHERE knee_signal=1",
+    "CREATE VIEW discovery_raised_past_knee AS
+       SELECT s.*,s.window_end AS at_ms FROM capacity_step s
+       JOIN capacity_step k ON k.run_id=s.run_id AND k.knee_signal=1
+         AND s.step_no>k.step_no AND s.lanes>k.lanes",
+    "CREATE VIEW discovery_runs_ended AS
+       SELECT *,ended_at AS at_ms FROM capacity_run WHERE ended_at IS NOT NULL",
+    "CREATE VIEW discovery_runs_without_recorded_level AS
+       SELECT r.*,r.ended_at AS at_ms FROM capacity_run r
+       WHERE r.ended_at IS NOT NULL AND r.found_level IS NOT NULL AND NOT EXISTS (
+         SELECT 1 FROM capacity_level l WHERE l.run_id=r.run_id)",
+    "CREATE VIEW unrecorded_hosts_with_demand AS
+       SELECT s.*,s.at AS at_ms FROM saturation_sample s
+       WHERE s.ready_buffer IS NOT NULL AND s.supplied_lanes IS NOT NULL
+         AND s.unsupplied_lanes IS NOT NULL AND s.ready_share IS NOT NULL
+         AND ((s.active_lanes>0 AND s.registry_current=1
+                 AND s.supplied_lanes+s.ready_share>=s.active_lanes)
+          OR (s.active_lanes=0 AND s.registry_current=1
+              AND s.bootstrap_ticket_pool>=1))
+         AND NOT EXISTS (
+         SELECT 1 FROM capacity_level l WHERE lower(l.host)=lower(s.host)
+           AND l.recorded_at<=s.at
+           AND (l.superseded_at IS NULL OR l.superseded_at>s.at))",
+    "CREATE VIEW unrecorded_hosts_without_discovery_run AS
+       SELECT s.*,s.at AS at_ms FROM unrecorded_hosts_with_demand s
+       WHERE s.at+2*COALESCE((SELECT tick_interval_s FROM run WHERE kind='status'
+                               ORDER BY sequence DESC LIMIT 1),300)*1000<=unixepoch('now')*1000
+         AND NOT EXISTS (SELECT 1 FROM capacity_run r WHERE lower(r.host)=lower(s.host)
+              AND r.started_at>=s.at AND r.started_at<=s.at+2*COALESCE((SELECT tick_interval_s FROM run WHERE kind='status'
+                               ORDER BY sequence DESC LIMIT 1),300)*1000)
+         AND NOT EXISTS (SELECT 1 FROM capacity_run r WHERE lower(r.host)=lower(s.host)
+              AND r.started_at<=s.at AND (r.ended_at IS NULL OR r.ended_at>s.at))
+         AND (SELECT COUNT(*) FROM capacity_run r WHERE lower(r.host)=lower(s.host)
+              AND date(r.started_at/1000,'unixepoch')=date(s.at/1000,'unixepoch')
+              AND r.started_at<=s.at)<2
+         AND NOT EXISTS (SELECT 1 FROM capacity_event e WHERE lower(e.host)=lower(s.host)
+              AND e.kind='step_down' AND e.at<=s.at AND e.ceiling_until>s.at)",
+    "CREATE VIEW unrecorded_hosts_ready_for_discovery AS
+       SELECT s.*,s.at AS at_ms FROM unrecorded_hosts_with_demand s
+       WHERE s.at<=unixepoch('now')*1000
+         AND s.at>=unixepoch('now')*1000-2*COALESCE((SELECT tick_interval_s FROM run WHERE kind='status'
+                               ORDER BY sequence DESC LIMIT 1),300)*1000
+         AND s.at=(SELECT MAX(latest.at) FROM saturation_sample latest
+                   WHERE lower(latest.host)=lower(s.host)
+                     AND latest.at<=unixepoch('now')*1000)
+         AND NOT EXISTS (SELECT 1 FROM capacity_run r WHERE lower(r.host)=lower(s.host)
+              AND r.started_at<=unixepoch('now')*1000+999
+              AND (r.ended_at IS NULL OR r.ended_at>unixepoch('now')*1000+999))
+         AND NOT EXISTS (SELECT 1 FROM capacity_level l WHERE lower(l.host)=lower(s.host)
+              AND l.recorded_at<=s.at
+              AND (l.superseded_at IS NULL OR l.superseded_at>s.at))
+         AND NOT EXISTS (SELECT 1 FROM capacity_run r WHERE lower(r.host)=lower(s.host)
+              AND r.started_at<=s.at AND (r.ended_at IS NULL OR r.ended_at>s.at))
+         AND (SELECT COUNT(*) FROM capacity_run r WHERE lower(r.host)=lower(s.host)
+              AND date(r.started_at/1000,'unixepoch')=date(unixepoch('now'),'unixepoch')
+              AND r.started_at<=unixepoch('now')*1000+999)<2
+         AND NOT EXISTS (SELECT 1 FROM capacity_event e WHERE lower(e.host)=lower(s.host)
+              AND e.kind='step_down' AND e.at<=unixepoch('now')*1000+999
+              AND e.ceiling_until>unixepoch('now')*1000+999)",
+    "CREATE VIEW hosts_with_recorded_level AS
+       SELECT *,recorded_at AS at_ms FROM capacity_level WHERE superseded_at IS NULL",
+    "CREATE VIEW host_step_downs AS
+       SELECT *,at AS at_ms FROM capacity_event WHERE kind='step_down'",
+    "CREATE VIEW raises_during_cool_off AS
+       SELECT DISTINCT a.*,a.at AS at_ms FROM capacity_event a JOIN capacity_event d
+         ON lower(d.host)=lower(a.host) AND d.kind='step_down' AND a.kind='lane_added'
+          AND a.at>=d.at AND d.ceiling_until IS NOT NULL AND a.at<d.ceiling_until
+       WHERE EXISTS (SELECT 1 FROM lane_tick_rows sample
+         WHERE lower(sample.host)=lower(a.host) AND sample.observed_ms=(
+           SELECT MIN(t.observed_ms) FROM lane_tick_rows t
+           WHERE lower(t.host)=lower(a.host) AND t.observed_ms>=a.at
+             AND t.observed_ms<=a.at+t.tick_ms)
+         AND (d.ceiling_lanes IS NULL OR (SELECT COUNT(DISTINCT t.lane) FROM lane_tick_rows t
+           WHERE lower(t.host)=lower(a.host) AND t.observed_ms=sample.observed_ms
+             AND NOT EXISTS (SELECT 1 FROM capacity_event draining
+               WHERE lower(draining.lane)=lower(t.lane) AND draining.kind='draining_mark'
+                 AND draining.at<=sample.observed_ms AND NOT EXISTS (
+                   SELECT 1 FROM capacity_event finished WHERE lower(finished.lane)=lower(t.lane)
+                     AND finished.kind IN ('drain_done','lane_removed','lane_lost')
+                     AND finished.at>=draining.at AND finished.at<=sample.observed_ms)))
+             > d.ceiling_lanes))",
+    "CREATE VIEW discovery_runs AS SELECT *,started_at AS at_ms FROM capacity_run",
+    "CREATE VIEW discovery_steps_ended AS
+       SELECT s.*,s.window_end AS at_ms FROM capacity_step s",
+    "CREATE VIEW discovery_runs_per_host_day AS
+       SELECT lower(host) AS host,date(started_at/1000,'unixepoch') AS day,
+              COUNT(*) AS runs,MAX(started_at) AS at_ms FROM capacity_run
+       GROUP BY lower(host),day",
+    "CREATE VIEW discovery_runs_per_host_day_max AS
+       SELECT host,day,runs,at_ms FROM discovery_runs_per_host_day
+       WHERE runs=(SELECT MAX(runs) FROM discovery_runs_per_host_day)",
+    "CREATE VIEW host_minutes_above_recorded_level_outside_bounded_discovery AS
+       WITH lane_counts AS (
+         SELECT host,observed_ms,COUNT(DISTINCT lane) AS lanes
+         FROM lane_tick_rows t WHERE NOT EXISTS (
+           SELECT 1 FROM capacity_event d WHERE lower(d.lane)=lower(t.lane)
+             AND d.kind='draining_mark' AND NOT EXISTS (
+               SELECT 1 FROM capacity_event f WHERE lower(f.lane)=lower(d.lane)
+                 AND f.kind IN ('drain_done','lane_removed','lane_lost') AND f.at>=d.at))
+         GROUP BY lower(host),observed_ms),
+       spans AS (
+         SELECT host,observed_ms,lanes,
+           LEAD(observed_ms) OVER(PARTITION BY lower(host) ORDER BY observed_ms) AS next_ms
+         FROM lane_counts)
+       SELECT l.host,l.level,
+         SUM(CASE WHEN s.lanes>l.level AND NOT EXISTS (
+           SELECT 1 FROM capacity_run r WHERE lower(r.host)=lower(l.host)
+             AND r.started_at<=s.observed_ms
+             AND (r.ended_at IS NULL OR r.ended_at>s.observed_ms)
+             AND (SELECT COUNT(*) FROM capacity_step step WHERE step.run_id=r.run_id)<=8)
+           THEN s.next_ms-s.observed_ms ELSE 0 END)/60000.0 AS minutes,
+         MAX(s.observed_ms) AS at_ms
+       FROM spans s JOIN capacity_level l ON lower(l.host)=lower(s.host)
+       WHERE l.superseded_at IS NULL AND s.next_ms IS NOT NULL
+       GROUP BY l.host,l.level",
+    "CREATE VIEW overload_events_without_draining_mark_in_cycle AS
+       SELECT o.*,o.at AS at_ms FROM capacity_event o WHERE o.kind='overload_event'
+         AND NOT EXISTS (SELECT 1 FROM capacity_event d WHERE lower(d.host)=lower(o.host)
+           AND d.kind='draining_mark' AND d.at>=o.at AND d.at<=o.at+2*COALESCE(
+             (SELECT tick_interval_s FROM run WHERE kind='status' ORDER BY sequence DESC LIMIT 1),300)*1000)",
+    "CREATE VIEW lane_removals AS
+       SELECT *,at AS at_ms FROM capacity_event WHERE kind='lane_removed'",
+    "CREATE VIEW lane_removals_before_drain AS
+       SELECT r.*,r.at AS at_ms FROM capacity_event r WHERE r.kind='lane_removed'
+         AND NOT EXISTS (SELECT 1 FROM capacity_event d WHERE lower(d.lane)=lower(r.lane)
+           AND d.kind='draining_mark' AND d.at<=r.at
+           AND EXISTS (SELECT 1 FROM capacity_event f WHERE lower(f.lane)=lower(d.lane)
+             AND f.kind IN ('drain_done','lane_lost') AND f.at>=d.at AND f.at<=r.at)
+           AND NOT EXISTS (SELECT 1 FROM capacity_event x WHERE lower(x.lane)=lower(d.lane)
+             AND x.kind='lane_removed' AND x.at>d.at AND x.at<r.at))",
+    "CREATE VIEW lane_change_unrecorded AS
+       SELECT *,at AS at_ms FROM capacity_event
+       WHERE kind IN ('lane_added','lane_removed') AND reason='lane_change_unrecorded'",
+    "CREATE VIEW lanes_lost AS
+       SELECT *,at AS at_ms FROM capacity_event WHERE kind='lane_lost'",
+    "CREATE VIEW draining_lanes AS
+       SELECT d.*,d.at AS at_ms FROM capacity_event d WHERE d.kind='draining_mark'
+         AND NOT EXISTS (SELECT 1 FROM capacity_event f WHERE lower(f.lane)=lower(d.lane)
+           AND f.kind IN ('drain_done','lane_removed','lane_lost') AND f.at>=d.at)",
+    "CREATE VIEW drains_over_cap_without_escalation AS
+       SELECT d.*,d.at AS at_ms FROM draining_lanes d
+       WHERE d.at+d.drain_cap_ms<=(SELECT MAX(relay_ms) FROM run) AND NOT EXISTS (
+           SELECT 1 FROM action_send x JOIN action a ON a.id=x.action_id
+           WHERE a.kind='escalate_drain' AND lower(a.lane)=lower(d.lane))",
+    "CREATE VIEW discovery_inconclusive_windows AS
+       SELECT *,window_end AS at_ms FROM capacity_step WHERE valid=0",
+    "CREATE VIEW no_demand_runs_not_ended AS
+       SELECT r.*,r.started_at AS at_ms FROM capacity_run r
+         WHERE r.end_reason IS NOT 'inconclusive_no_demand'
+         AND (SELECT COUNT(*) FROM (SELECT valid FROM capacity_step s
+           WHERE s.run_id=r.run_id ORDER BY step_no DESC LIMIT 2) WHERE valid=0)>=2",
+    "CREATE VIEW discovery_slot_saturated_windows AS
+       SELECT *,window_end AS at_ms FROM capacity_step
+       WHERE valid=1 AND slots_busy_equals_sustainable=1",
+    "CREATE VIEW discovery_raised_past_slot_saturation AS
+       SELECT s.*,s.window_end AS at_ms FROM capacity_step s
+       JOIN capacity_step c ON c.run_id=s.run_id AND c.slots_busy_equals_sustainable=1
+         AND c.valid=1 AND s.step_no>c.step_no AND s.lanes>c.lanes",
+    "CREATE VIEW lane_count_reductions AS
+       SELECT *,at AS at_ms FROM capacity_event WHERE kind IN
+         ('lane_removed','draining_mark','step_down')",
+    "CREATE VIEW lane_reductions_without_throttle_evidence AS
+       SELECT *,at AS at_ms FROM lane_count_reductions
+       WHERE evidence_kind IS NULL OR reason='lane_change_unrecorded'",
+    "CREATE VIEW host_output_share_of_recorded_level AS
+       WITH current_level_ranked AS (
+         SELECT l.*,ROW_NUMBER() OVER(PARTITION BY lower(host) ORDER BY recorded_at DESC,run_id DESC) AS level_rank
+         FROM capacity_level l WHERE superseded_at IS NULL),
+       current_level AS (SELECT * FROM current_level_ranked WHERE level_rank=1),
+       level_step_ranked AS (
+         SELECT l.host,l.output_basis,s.host_output_per_hour,s.step_no,
+           ROW_NUMBER() OVER(PARTITION BY lower(l.host) ORDER BY CAST(e.value AS INTEGER) DESC) AS evidence_rank
+         FROM current_level l,json_each(l.evidence_steps) e
+         JOIN capacity_step s ON s.run_id=l.run_id AND s.step_no=CAST(e.value AS INTEGER)),
+       level_step AS (SELECT * FROM level_step_ranked WHERE evidence_rank=1),
+       latest AS (SELECT h.*,ROW_NUMBER() OVER(PARTITION BY lower(host) ORDER BY at DESC) AS rn
+         FROM host_output_sample h)
+       SELECT l.host,l.output_basis,l.step_no,
+         CASE l.output_basis
+           WHEN 'commits' THEN h.commits_pushed*3600000.0/h.sample_interval_ms
+           WHEN 'tickets_prs' THEN CASE WHEN h.tickets_closed IS NOT NULL AND h.prs_merged IS NOT NULL
+             THEN (h.tickets_closed+h.prs_merged)*3600000.0/h.sample_interval_ms END
+         END AS output_per_hour,
+         h.sample_interval_ms AS sample_interval_ms,
+         l.host_output_per_hour AS recorded_output_per_hour,
+         CASE WHEN l.host_output_per_hour>0 AND (CASE l.output_basis
+           WHEN 'commits' THEN h.commits_pushed*3600000.0/h.sample_interval_ms
+           WHEN 'tickets_prs' THEN CASE WHEN h.tickets_closed IS NOT NULL AND h.prs_merged IS NOT NULL
+             THEN (h.tickets_closed+h.prs_merged)*3600000.0/h.sample_interval_ms END END) IS NOT NULL
+           THEN 100.0*(CASE l.output_basis
+           WHEN 'commits' THEN h.commits_pushed*3600000.0/h.sample_interval_ms
+           WHEN 'tickets_prs' THEN (h.tickets_closed+h.prs_merged)*3600000.0/h.sample_interval_ms END)/l.host_output_per_hour
+           ELSE NULL END AS share_percent,h.at AS at_ms,
+         CASE WHEN h.source_basis IS NULL OR h.source_basis='{}' THEN
+           CASE l.output_basis
+             WHEN 'commits' THEN json_object('commits_pushed',json_object(
+               'availability','unavailable','reason','no_current_host_output_sample'))
+             WHEN 'tickets_prs' THEN json_object(
+               'tickets_closed',json_object('availability','unavailable','reason','no_current_host_output_sample'),
+               'prs_merged',json_object('availability','unavailable','reason','no_current_host_output_sample'))
+             ELSE json_object('host_output_per_hour',json_object(
+               'availability','unavailable','reason','no_current_host_output_sample'))
+           END
+           ELSE h.source_basis END AS source_basis,
+         COALESCE(
+           json_extract(h.source_basis,'$.host_output_per_hour.reason'),
+           CASE l.output_basis WHEN 'commits'
+             THEN json_extract(h.source_basis,'$.commits_pushed.reason')
+             WHEN 'tickets_prs' THEN COALESCE(
+               json_extract(h.source_basis,'$.tickets_closed.reason'),
+               json_extract(h.source_basis,'$.prs_merged.reason'))
+           END,
+           CASE WHEN h.source_basis IS NULL THEN 'no_current_host_output_sample'
+                WHEN h.source_basis='{}' THEN 'source_basis_unavailable' END
+         ) AS unavailable_reason
+       FROM level_step l LEFT JOIN latest h ON lower(h.host)=lower(l.host) AND h.rn=1",
 ];
 
 /// The `open_cycles` formula of FR-039, `max(1, ceil((end - start - grace) / cycle))`, in
@@ -254,6 +568,37 @@ pub const QUERYABLE: &[&str] = &[
     "idle_lane_episode_with_ready_work_max",
     "idle_minutes",
     "defect_rows",
+    "discovery_steps",
+    "discovery_steps_violating_ramp",
+    "discovery_steps_judged_without_demand",
+    "discovery_knee_signals",
+    "discovery_raised_past_knee",
+    "discovery_runs_ended",
+    "discovery_runs_without_recorded_level",
+    "unrecorded_hosts_with_demand",
+    "unrecorded_hosts_without_discovery_run",
+    "unrecorded_hosts_ready_for_discovery",
+    "hosts_with_recorded_level",
+    "host_step_downs",
+    "raises_during_cool_off",
+    "discovery_runs",
+    "discovery_runs_per_host_day",
+    "discovery_runs_per_host_day_max",
+    "host_minutes_above_recorded_level_outside_bounded_discovery",
+    "overload_events_without_draining_mark_in_cycle",
+    "lane_removals",
+    "lane_removals_before_drain",
+    "lane_change_unrecorded",
+    "lanes_lost",
+    "draining_lanes",
+    "drains_over_cap_without_escalation",
+    "discovery_inconclusive_windows",
+    "no_demand_runs_not_ended",
+    "discovery_slot_saturated_windows",
+    "discovery_raised_past_slot_saturation",
+    "lane_count_reductions",
+    "lane_reductions_without_throttle_evidence",
+    "host_output_share_of_recorded_level",
 ];
 
 /// Views without an `at_ms` column, which refuse `--since`.
@@ -281,10 +626,6 @@ pub const PRUNE: &[(&str, &str)] = &[
     ("cycle_event", "ended_at"),
     ("cycle_missed", "detected_at"),
     ("dialog_answer", "answered_at"),
-    ("capacity_run", "ended_at"),
-    ("capacity_step", "window_end"),
-    ("capacity_level", "superseded_at"),
-    ("capacity_event", "at"),
-    ("host_output_sample", "at"),
+    ("capacity_throttle_sample", "at"),
     ("tick", "committed_at"),
 ];

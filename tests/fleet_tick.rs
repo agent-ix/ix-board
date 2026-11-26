@@ -5,8 +5,8 @@
 
 use ix_board::fleet::ledger::{Ledger, TickCommit, tick_metrics};
 use ix_board::fleet::tick::{
-    Action, ActionKind, LanePr, ReadyWork, StandingOrders, TickFacts, TickOutput, TickSettings,
-    TickSources, Unread, caller_from,
+    Action, ActionKind, LanePr, LanePrRead, NeedReadyTicketsRead, ReadyWork, StandingOrders,
+    TickFacts, TickOutput, TickSettings, TickSources, Unread, caller_from,
 };
 use ix_board::fleet::{
     ClassKind, Defect, DefectKind, Evidence, FleetConfig, FleetReport, HostSummary, LaneRow,
@@ -871,13 +871,28 @@ impl TickSources for Recording {
         self.calls.set(self.calls.get() + 1);
         Err(Unread::Failed(SourceError("down".to_owned())))
     }
-    fn lane_prs(&self) -> Result<Vec<LanePr>, Unread> {
+    fn lane_prs(&self) -> Result<LanePrRead, Unread> {
         self.calls.set(self.calls.get() + 1);
         Err(Unread::Unwired("SWM-282"))
     }
     fn ready_work(&self) -> Result<ReadyWork, Unread> {
         self.calls.set(self.calls.get() + 1);
         Ok(ReadyWork::default())
+    }
+    fn need_ready_tickets(&self) -> Result<NeedReadyTicketsRead, Unread> {
+        self.calls.set(self.calls.get() + 1);
+        Ok(NeedReadyTicketsRead {
+            complete: true,
+            ..NeedReadyTicketsRead::default()
+        })
+    }
+    fn capacity_throttle_samples(
+        &self,
+        _: i64,
+        _: u64,
+    ) -> Vec<ix_board::fleet::tick::CapacityThrottleSample> {
+        self.calls.set(self.calls.get() + 1);
+        Vec::new()
     }
 }
 
@@ -889,8 +904,8 @@ fn the_tick_reads_each_source_once_writes_only_the_ledger_and_names_an_unread_so
     let sources = Recording {
         calls: Cell::new(0),
     };
-    let facts = TickFacts::read(&sources);
-    assert_eq!(sources.calls.get(), 4);
+    let facts = TickFacts::read(&sources, 1_000, 300);
+    assert_eq!(sources.calls.get(), 6);
     assert_eq!(facts.unavailable.len(), 2);
     assert_eq!(facts.unavailable[0].source, "host_busy");
     assert!(!facts.unavailable[0].unwired, "a failed read");
@@ -1226,7 +1241,7 @@ impl TickSources for FailingAssignments {
     fn host_busy(&self) -> Result<BTreeMap<String, f64>, Unread> {
         Ok(BTreeMap::new())
     }
-    fn lane_prs(&self) -> Result<Vec<LanePr>, Unread> {
+    fn lane_prs(&self) -> Result<LanePrRead, Unread> {
         Err(Unread::Unwired("SWM-282"))
     }
     fn ready_work(&self) -> Result<ReadyWork, Unread> {
@@ -1238,7 +1253,7 @@ impl TickSources for FailingAssignments {
 #[test]
 fn a_failed_source_read_is_a_defect_routed_in_its_tick_and_a_named_seam_is_not() {
     let mut rig = Rig::new(300);
-    rig.facts = TickFacts::read(&FailingAssignments);
+    rig.facts = TickFacts::read(&FailingAssignments, 1_000, 300);
     let out = rig.tick(&report(T0, vec![idle(LANE)], vec![]));
     assert!(!out.complete, "a failed read is a defect, not a clean tick");
     let fixes = of(&out, ActionKind::FixSource);
@@ -1353,7 +1368,7 @@ fn every_other_action_kind_is_emitted_by_its_condition_and_not_by_its_negation()
 #[test]
 fn a_status_run_between_two_ticks_neither_closes_nor_resets_a_tick_owned_defect() {
     let mut rig = Rig::new(300);
-    rig.facts = TickFacts::read(&FailingAssignments);
+    rig.facts = TickFacts::read(&FailingAssignments, 1_000, 300);
     rig.tick(&report(T0, vec![idle(LANE)], vec![]));
     let first = |rig: &Rig| {
         rig.sql(

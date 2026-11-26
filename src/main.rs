@@ -27,6 +27,7 @@ use ix_cli_kit::secrets::{AppScope, SecretKey, SecretStore, SecretValue};
 use ix_cli_kit::streams::{
     ColorChoice, Diagnostics, DiagnosticsFormat, emit_diagnostic, emit_result, emit_warning,
 };
+use ix_trace_rs::implements;
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::io::Read;
@@ -199,11 +200,27 @@ enum FleetCommand {
         #[arg(long)]
         session: Option<String>,
     },
+    /// Read live supply, duty and ready-buffer deficit for configured projects.
+    Saturation {
+        #[command(subcommand)]
+        command: Option<SaturationCommand>,
+    },
     /// Read the fleet ledger.
     Ledger {
         #[command(subcommand)]
         command: LedgerCommand,
     },
+    /// Read capacity discovery runs, measurements and sustainable levels.
+    Capacity {
+        #[command(subcommand)]
+        command: CapacityCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SaturationCommand {
+    /// Collect one live saturation sample into the local fleet ledger.
+    Collect,
 }
 
 #[derive(Subcommand, Debug)]
@@ -215,6 +232,62 @@ enum LedgerCommand {
         /// Only rows within this window before the newest run (for example 90s, 20m, 4h).
         #[arg(long, value_parser = parse_duration)]
         since: Option<u64>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CapacityCommand {
+    /// Print capacity discovery state and retained measurement history.
+    Status,
+    /// Start a discovery run at relay time in milliseconds.
+    Start {
+        host: String,
+        #[arg(long)]
+        trigger: String,
+        #[arg(long)]
+        at_ms: i64,
+    },
+    /// Record that a new lane count is held after ramp-up.
+    Step {
+        host: String,
+        #[arg(long)]
+        lanes: u32,
+        #[arg(long)]
+        lane_added_at_ms: i64,
+        #[arg(long)]
+        rampup_end_ms: i64,
+        #[arg(long)]
+        repeat_of: Option<u32>,
+    },
+    /// Close and measure the active hold window from live sources.
+    Window {
+        host: String,
+        #[arg(long)]
+        end_ms: i64,
+    },
+    /// End the open run and record its valid sustainable level, when established.
+    End {
+        host: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        at_ms: i64,
+    },
+    /// Mark a lane draining and lower the six-hour lane ceiling.
+    Drain {
+        host: String,
+        lane: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        at_ms: i64,
+    },
+    /// Record an orchestrator-directed lane removal.
+    Remove {
+        host: String,
+        lane: String,
+        #[arg(long)]
+        at_ms: i64,
     },
 }
 
@@ -445,7 +518,15 @@ enum Output {
     FleetLedger(ix_board::fleet::ledger::LedgerRows),
     FleetAssign(ix_board::fleet::assign::AssignReport),
     FleetTick(ix_board::fleet::tick::TickOutput),
+    FleetSaturation(ix_board::fleet::saturation::SaturationReport),
     Retro(Box<retro::SnapshotOutput>),
+    FleetCapacity(ix_board::fleet::ledger::CapacityStatus),
+    FleetCapacityRun(i64),
+    FleetCapacityStep(ix_board::fleet::ledger::capacity::OpenCapacityWindow),
+    FleetCapacityMeasurement(Box<ix_board::fleet::capacity::WindowMeasurements>),
+    FleetCapacityLevel {
+        recorded_level: Option<u32>,
+    },
     RetroDelta(retro::DeltaReport),
     RetroBackfill(retro::BackfillReport),
     ProjectStatusUpdated {
@@ -593,6 +674,7 @@ fn output_outcome(output: &Output) -> Outcome {
         Output::FleetAssign(report) if report.operational_failure() => Outcome::Internal,
         Output::FleetAssign(_) => Outcome::Partial,
         Output::FleetTick(tick) if !tick.complete => Outcome::Partial,
+        Output::FleetSaturation(report) if !report.complete => Outcome::Partial,
         Output::Agents(report) => match report.coverage() {
             ix_board::agents::Coverage::Complete => Outcome::Ok,
             ix_board::agents::Coverage::Partial => Outcome::Partial,
@@ -730,6 +812,10 @@ fn run(command: Command) -> Result<Output, Error> {
             .map(Output::FleetTick)
             .map_err(Error::Fleet),
         Command::Fleet {
+            command: FleetCommand::Saturation { command },
+        } => run_fleet_saturation(matches!(command, Some(SaturationCommand::Collect)))
+            .map(Output::FleetSaturation),
+        Command::Fleet {
             command:
                 FleetCommand::Assign {
                     lane,
@@ -743,6 +829,74 @@ fn run(command: Command) -> Result<Output, Error> {
                     command: LedgerCommand::Query { view, since },
                 },
         } => run_fleet_ledger_query(&view, since).map(Output::FleetLedger),
+        Command::Fleet {
+            command:
+                FleetCommand::Capacity {
+                    command: CapacityCommand::Status,
+                },
+        } => run_fleet_capacity_status().map(Output::FleetCapacity),
+        Command::Fleet {
+            command:
+                FleetCommand::Capacity {
+                    command:
+                        CapacityCommand::Start {
+                            host,
+                            trigger,
+                            at_ms,
+                        },
+                },
+        } => run_fleet_capacity_start(&host, &trigger, at_ms).map(Output::FleetCapacityRun),
+        Command::Fleet {
+            command:
+                FleetCommand::Capacity {
+                    command:
+                        CapacityCommand::Step {
+                            host,
+                            lanes,
+                            lane_added_at_ms,
+                            rampup_end_ms,
+                            repeat_of,
+                        },
+                },
+        } => run_fleet_capacity_step(&host, lanes, repeat_of, lane_added_at_ms, rampup_end_ms)
+            .map(Output::FleetCapacityStep),
+        Command::Fleet {
+            command:
+                FleetCommand::Capacity {
+                    command: CapacityCommand::Window { host, end_ms },
+                },
+        } => run_fleet_capacity_window(&host, end_ms)
+            .map(|measurement| Output::FleetCapacityMeasurement(Box::new(measurement))),
+        Command::Fleet {
+            command:
+                FleetCommand::Capacity {
+                    command:
+                        CapacityCommand::End {
+                            host,
+                            reason,
+                            at_ms,
+                        },
+                },
+        } => run_fleet_capacity_end(&host, &reason, at_ms)
+            .map(|recorded_level| Output::FleetCapacityLevel { recorded_level }),
+        Command::Fleet {
+            command:
+                FleetCommand::Capacity {
+                    command:
+                        CapacityCommand::Drain {
+                            host,
+                            lane,
+                            reason,
+                            at_ms,
+                        },
+                },
+        } => run_fleet_capacity_drain(&host, &lane, &reason, at_ms).map(Output::FleetCapacity),
+        Command::Fleet {
+            command:
+                FleetCommand::Capacity {
+                    command: CapacityCommand::Remove { host, lane, at_ms },
+                },
+        } => run_fleet_capacity_remove(&host, &lane, at_ms).map(Output::FleetCapacity),
         Command::Retro {
             command: RetroCommand::Snapshot { config, window },
         } => run_retro_snapshot(&config, &window),
@@ -968,6 +1122,254 @@ fn run_fleet_ledger_query(
     let path = ledger::resolve_path(&config).map_err(|e| FleetError::Ledger(e.to_string()))?;
     ledger::query(&path, view, since.map(std::time::Duration::from_secs))
         .map_err(|e| Error::Fleet(FleetError::Ledger(e.to_string())))
+}
+
+#[implements("FR-041-AC-17")]
+fn run_fleet_capacity_status() -> Result<ix_board::fleet::ledger::CapacityStatus, Error> {
+    use ix_board::fleet::{FleetError, ledger};
+    let (_, path) = fleet_capacity_config()?;
+    ledger::capacity::status(&path).map_err(|e| Error::Fleet(FleetError::Ledger(e.to_string())))
+}
+
+#[derive(serde::Serialize)]
+struct SaturationSampleSourceBasis {
+    ready_buffer: ix_board::fleet::saturation::Evidence<u32>,
+    active_lanes: ix_board::fleet::saturation::Evidence<u32>,
+    supplied_lanes: ix_board::fleet::saturation::Evidence<u32>,
+    unsupplied_lanes: ix_board::fleet::saturation::Evidence<u32>,
+    ready_share: ix_board::fleet::saturation::Evidence<u32>,
+    queued_behind_first: ix_board::fleet::saturation::Evidence<u32>,
+    bootstrap_ticket_pool: ix_board::fleet::saturation::Evidence<u32>,
+    registry_current: ix_board::fleet::saturation::Evidence<bool>,
+    deficit: ix_board::fleet::saturation::Evidence<u32>,
+}
+
+#[implements("FR-041-AC-5")]
+#[implements("FR-041-AC-7")]
+#[implements("FR-041-AC-11")]
+fn run_fleet_saturation(
+    collect_sample: bool,
+) -> Result<ix_board::fleet::saturation::SaturationReport, Error> {
+    use ix_board::fleet::tick::TickSettings;
+    use ix_board::fleet::{FleetError, ledger};
+    let settings_value = ix_board::settings_value()?;
+    let config = ix_board::fleet::FleetConfig::from_toml(
+        settings_value.as_ref(),
+        std::env::var("IX_PROMETHEUS_URL").ok(),
+    )?;
+    let tick_settings = TickSettings::from_toml(settings_value.as_ref())?;
+    let report =
+        ix_board::fleet::saturation::read_live(&config, &tick_settings).map_err(Error::Fleet)?;
+    if collect_sample {
+        let path = ledger::resolve_path(&config)
+            .map_err(|error| Error::Fleet(FleetError::Ledger(error.to_string())))?;
+        let mut samples = Vec::with_capacity(report.hosts.len());
+        for host in &report.hosts {
+            let assignment_reason = host
+                .supplied_lanes
+                .is_none()
+                .then(|| host.ready_share.reason.clone())
+                .flatten();
+            let source_basis = SaturationSampleSourceBasis {
+                ready_buffer: report.ready_buffer.clone(),
+                active_lanes: ix_board::fleet::saturation::Evidence::available(
+                    host.active_lanes,
+                    "relay.current_lane_state",
+                    1.0,
+                ),
+                supplied_lanes: ix_board::fleet::saturation::Evidence {
+                    value: host.supplied_lanes,
+                    source: "relay.assignments+agent-msg.work.events+linear.issue_state".into(),
+                    reason: assignment_reason.clone(),
+                    coverage: host.ready_share.coverage,
+                },
+                unsupplied_lanes: ix_board::fleet::saturation::Evidence {
+                    value: host.unsupplied_lanes,
+                    source: "relay.assignments+agent-msg.work.events+relay.registry".into(),
+                    reason: assignment_reason,
+                    coverage: host.ready_share.coverage,
+                },
+                ready_share: host.ready_share.clone(),
+                queued_behind_first: host.queued_behind_first.clone(),
+                bootstrap_ticket_pool: host.bootstrap_ticket_pool.clone(),
+                registry_current: ix_board::fleet::saturation::Evidence::available(
+                    host.registry_current,
+                    "relay.registry",
+                    1.0,
+                ),
+                deficit: host.ready_buffer_deficit.clone(),
+            };
+            let source_basis = serde_json::to_string(&source_basis)
+                .map_err(|error| Error::Fleet(FleetError::Ledger(error.to_string())))?;
+            samples.push(ledger::capacity::SaturationSampleInput {
+                host: &host.host,
+                active_lanes: host.active_lanes,
+                supplied_lanes: host.supplied_lanes,
+                unsupplied_lanes: host.unsupplied_lanes,
+                registry_current: host.registry_current,
+                ready_buffer: report.ready_buffer.value,
+                ready_share: host.ready_share.value,
+                queued_behind_first: host.queued_behind_first.value,
+                bootstrap_ticket_pool: host.bootstrap_ticket_pool.value,
+                deficit: host.ready_buffer_deficit.value,
+                source_basis,
+                reason: host.ready_buffer_deficit.reason.as_deref(),
+                coverage: host.ready_share.coverage,
+            });
+        }
+        ledger::capacity::record_saturation_samples(
+            &path,
+            &config,
+            report.observed_at_ms,
+            &samples,
+        )
+        .map_err(|error| Error::Fleet(FleetError::Ledger(error.to_string())))?;
+    }
+    Ok(report)
+}
+
+fn fleet_capacity_config() -> Result<(ix_board::fleet::FleetConfig, PathBuf), Error> {
+    use ix_board::fleet::{FleetError, ledger};
+    let settings = ix_board::settings_value()?;
+    let config = ix_board::fleet::FleetConfig::from_toml(
+        settings.as_ref(),
+        std::env::var("IX_PROMETHEUS_URL").ok(),
+    )?;
+    let path = ledger::resolve_path(&config).map_err(|e| FleetError::Ledger(e.to_string()))?;
+    Ok((config, path))
+}
+
+#[implements("FR-041-AC-14")]
+fn run_fleet_capacity_start(host: &str, trigger: &str, at_ms: i64) -> Result<i64, Error> {
+    let (config, path) = fleet_capacity_config()?;
+    ix_board::fleet::ledger::capacity::start(&path, &config, host, trigger, at_ms)
+        .map_err(|error| Error::Fleet(ix_board::fleet::FleetError::Ledger(error.to_string())))
+}
+
+#[implements("FR-041-AC-11")]
+fn run_fleet_capacity_step(
+    host: &str,
+    lanes: u32,
+    repeat_of: Option<u32>,
+    lane_added_at_ms: i64,
+    rampup_end_ms: i64,
+) -> Result<ix_board::fleet::ledger::capacity::OpenCapacityWindow, Error> {
+    let (config, path) = fleet_capacity_config()?;
+    let status = ix_board::fleet::ledger::capacity::status(&path)
+        .map_err(|error| Error::Fleet(ix_board::fleet::FleetError::Ledger(error.to_string())))?;
+    let run_id = status
+        .hosts
+        .iter()
+        .find(|entry| entry.host == host)
+        .and_then(|entry| entry.current_run)
+        .ok_or_else(|| {
+            Error::Fleet(ix_board::fleet::FleetError::Ledger(format!(
+                "host {host} has no open capacity run"
+            )))
+        })?;
+    ix_board::fleet::ledger::capacity::open_step(
+        &path,
+        &config,
+        run_id,
+        lanes,
+        repeat_of,
+        lane_added_at_ms,
+        rampup_end_ms,
+    )
+    .map_err(|error| Error::Fleet(ix_board::fleet::FleetError::Ledger(error.to_string())))
+}
+
+#[implements("FR-041-AC-13")]
+fn run_fleet_capacity_end(host: &str, reason: &str, at_ms: i64) -> Result<Option<u32>, Error> {
+    let (config, path) = fleet_capacity_config()?;
+    ix_board::fleet::ledger::capacity::end(&path, &config, host, reason, at_ms)
+        .map_err(|error| Error::Fleet(ix_board::fleet::FleetError::Ledger(error.to_string())))
+}
+
+#[implements("FR-041-AC-14")]
+fn run_fleet_capacity_drain(
+    host: &str,
+    lane: &str,
+    reason: &str,
+    at_ms: i64,
+) -> Result<ix_board::fleet::ledger::CapacityStatus, Error> {
+    let (config, path) = fleet_capacity_config()?;
+    let settings_value = ix_board::settings_value()?;
+    let tick_settings = ix_board::fleet::tick::TickSettings::from_toml(settings_value.as_ref())?;
+    ix_board::fleet::ledger::capacity::mark_draining(
+        &path,
+        &config,
+        host,
+        lane,
+        reason,
+        at_ms,
+        tick_settings.drain_cap,
+    )
+    .map_err(|error| Error::Fleet(ix_board::fleet::FleetError::Ledger(error.to_string())))?;
+    ix_board::fleet::ledger::capacity::status(&path)
+        .map_err(|error| Error::Fleet(ix_board::fleet::FleetError::Ledger(error.to_string())))
+}
+
+#[implements("FR-041-AC-19")]
+fn run_fleet_capacity_remove(
+    host: &str,
+    lane: &str,
+    at_ms: i64,
+) -> Result<ix_board::fleet::ledger::CapacityStatus, Error> {
+    use ix_board::fleet::ledger::capacity::CapacityEventInput;
+    let (config, path) = fleet_capacity_config()?;
+    ix_board::fleet::ledger::capacity::record_event(
+        &path,
+        &config,
+        &CapacityEventInput {
+            host,
+            lane: Some(lane),
+            kind: "lane_removed",
+            reason: Some("fleet_capacity_remove"),
+            evidence_kind: None,
+            cycle_id: None,
+            at_ms,
+            ceiling_until: None,
+        },
+    )
+    .map_err(|error| Error::Fleet(ix_board::fleet::FleetError::Ledger(error.to_string())))?;
+    ix_board::fleet::ledger::capacity::status(&path)
+        .map_err(|error| Error::Fleet(ix_board::fleet::FleetError::Ledger(error.to_string())))
+}
+
+#[implements("FR-041-AC-10")]
+fn run_fleet_capacity_window(
+    host: &str,
+    end_ms: i64,
+) -> Result<ix_board::fleet::capacity::WindowMeasurements, Error> {
+    use ix_board::fleet::{FleetError, capacity::LiveMeasurementSource, ledger, live::PromHttp};
+    let (config, path) = fleet_capacity_config()?;
+    let status = ledger::capacity::status(&path)
+        .map_err(|error| Error::Fleet(FleetError::Ledger(error.to_string())))?;
+    let run_id = status
+        .hosts
+        .iter()
+        .find(|entry| entry.host.eq_ignore_ascii_case(host))
+        .and_then(|entry| entry.current_run)
+        .ok_or_else(|| {
+            Error::Fleet(FleetError::Ledger(format!(
+                "host {host} has no open capacity run"
+            )))
+        })?;
+    let prometheus = config
+        .prometheus_url
+        .as_deref()
+        .map(|url| PromHttp::new(url, config.host_timeout))
+        .transpose()
+        .map_err(|error| Error::Fleet(FleetError::Tick(error.to_string())))?;
+    let source = LiveMeasurementSource {
+        config: &config,
+        prometheus: prometheus
+            .as_ref()
+            .map(|query| query as &dyn ix_board::fleet::live::PromQuery),
+    };
+    ledger::capacity::measure_open_step(&path, &config, run_id, end_ms, &source)
+        .map_err(|error| Error::Fleet(FleetError::Ledger(error.to_string())))
 }
 
 fn run_fleet_assign(
@@ -1442,7 +1844,104 @@ fn render_human(output: &Output) -> String {
         Output::FleetAssign(report) => ix_board::fleet::assign::render_text(report),
         Output::FleetLedger(rows) => rows.render_text(),
         Output::FleetTick(tick) => tick.render_text(),
+        Output::FleetSaturation(report) => serde_json::to_string_pretty(report)
+            .unwrap_or_else(|error| format!("could not render fleet saturation JSON: {error}")),
         Output::Retro(output) => retro::render_text(output.record()),
+        Output::FleetCapacity(status) => {
+            let mut lines = Vec::new();
+            for host in &status.hosts {
+                let level = host
+                    .recorded_level
+                    .as_ref()
+                    .map_or_else(|| "none".to_owned(), |level| level.level.to_string());
+                lines.push(format!(
+                    "{} state={} recorded_level={} draining={}",
+                    host.host,
+                    host.discovery_state,
+                    level,
+                    host.draining_lanes.len()
+                ));
+            }
+            for run in &status.runs {
+                lines.push(format!(
+                    "run {} host={} trigger={} started_at={} ended_at={:?} end_reason={:?} found_level={:?}",
+                    run.run_id,
+                    run.host,
+                    run.trigger.as_deref().unwrap_or("unknown"),
+                    run.started_at,
+                    run.ended_at,
+                    run.end_reason,
+                    run.found_level
+                ));
+            }
+            for step in &status.steps {
+                lines.push(format!(
+                    "step run={} no={} host={} lanes={:?} valid={:?} output_per_hour={:?} basis={:?} knee={:?} reason={:?}",
+                    step.run_id,
+                    step.step_no,
+                    step.host,
+                    step.lanes,
+                    step.valid,
+                    step.host_output_per_hour,
+                    step.output_basis,
+                    step.knee_signal,
+                    step.knee_reason
+                ));
+            }
+            for level in &status.levels {
+                lines.push(format!(
+                    "level host={} lanes={} recorded_at={} basis={:?} run={:?} reason={:?} superseded_at={:?}",
+                    level.host,
+                    level.level,
+                    level.recorded_at,
+                    level.output_basis,
+                    level.run_id,
+                    level.reason,
+                    level.superseded_at
+                ));
+            }
+            for event in &status.events {
+                lines.push(format!(
+                    "event {} host={} lane={:?} kind={} at={} reason={:?} evidence={:?}",
+                    event.event_id,
+                    event.host,
+                    event.lane,
+                    event.kind,
+                    event.at,
+                    event.reason,
+                    event.evidence_kind
+                ));
+            }
+            for window in &status.open_windows {
+                lines.push(format!(
+                    "open_window run={} step={} host={} lanes={} added_at={} rampup_end={}",
+                    window.run_id,
+                    window.step_no,
+                    window.host,
+                    window.lanes,
+                    window.lane_added_at_ms,
+                    window.rampup_end_ms
+                ));
+            }
+            lines.join("\n")
+        }
+        Output::FleetCapacityRun(run_id) => format!("capacity run {run_id} started"),
+        Output::FleetCapacityStep(window) => format!(
+            "capacity run {} step {} holds {} lanes on {} after ramp-up at {}",
+            window.run_id, window.step_no, window.lanes, window.host, window.rampup_end_ms
+        ),
+        Output::FleetCapacityMeasurement(measurement) => format!(
+            "measured window {}..{} lanes={:?} output_per_hour={:?} basis={:?} throttle_basis=admission_only",
+            measurement.window_start_ms,
+            measurement.window_end_ms,
+            measurement.lanes.value,
+            measurement.host_output_per_hour.value,
+            measurement.output_basis.value,
+        ),
+        Output::FleetCapacityLevel { recorded_level } => recorded_level.map_or_else(
+            || "capacity run ended without a new level".to_owned(),
+            |level| format!("recorded sustainable level: {level}"),
+        ),
         Output::RetroDelta(report) => retro::render_delta_text(report),
         Output::RetroBackfill(report) => retro::render_backfill_text(report),
         Output::ProgramScopeCheck(report) => {
