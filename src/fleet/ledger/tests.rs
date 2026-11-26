@@ -206,7 +206,6 @@ fn version_five_ledger_adds_planner_action_columns_without_losing_rows() {
 }
 
 #[test]
-#[trace("FR-041-AC-17")]
 fn fresh_ledger_exposes_every_queryable_capacity_view() {
     let (_dir, path) = path();
     drop(open(&path));
@@ -391,6 +390,29 @@ fn v1_rows(path: &Path) -> (i64, i64, i64) {
     )
 }
 
+fn seed_v2_capacity_rows(path: &Path) {
+    let mut connection = Connection::open(path).unwrap();
+    connection.execute_batch(schema::V1).unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO run(kind,relay_ms) VALUES('status',17);
+             INSERT INTO defect(source,kind,first_seen_at) VALUES('relay','unreadable_source',7);",
+        )
+        .unwrap();
+    let tx = connection.transaction().unwrap();
+    super::apply_v2(&tx, None).unwrap();
+    tx.commit().unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO capacity_run(host,trigger,started_at) VALUES('draco','first',11);
+             INSERT INTO capacity_step(run_id,step_no,host,lanes,window_end,valid)
+               VALUES(1,1,'draco',2,13,1);
+             INSERT INTO capacity_level(host,level,recorded_at,run_id,reason)
+               VALUES('draco',2,15,1,'step_bound');",
+        )
+        .unwrap();
+}
+
 #[trace("FR-039-AC-9")]
 #[test]
 fn a_crash_mid_migration_leaves_the_version_one_ledger_intact_and_openable() {
@@ -398,7 +420,7 @@ fn a_crash_mid_migration_leaves_the_version_one_ledger_intact_and_openable() {
     seed_v1(&path);
     let total = schema::V2.len() + schema::views().len();
     for fail_at in [0, 20, total - 1] {
-        let error = Ledger::open_with(&path, &FleetConfig::default(), Some(fail_at))
+        let error = Ledger::open_with(&path, &FleetConfig::default(), Some((fail_at, usize::MAX)))
             .err()
             .unwrap();
         assert!(matches!(error, LedgerError::Sqlite(_)));
@@ -423,6 +445,73 @@ fn a_crash_mid_migration_leaves_the_version_one_ledger_intact_and_openable() {
         count(&path, "SELECT COUNT(*) FROM defect WHERE closed_at IS NULL"),
         1
     );
+}
+
+#[trace("FR-039-AC-18")]
+#[test]
+fn a_v3_migration_failure_rolls_back_and_preserves_v2_capacity_rows() {
+    let (_dir, path) = path();
+    seed_v2_capacity_rows(&path);
+    for fail_at in 0..schema::V3.len() {
+        let error = Ledger::open_with(&path, &FleetConfig::default(), Some((usize::MAX, fail_at)))
+            .err()
+            .unwrap();
+        assert!(matches!(error, LedgerError::Sqlite(_)));
+        assert_eq!(count(&path, "PRAGMA user_version"), 2);
+        assert_eq!(
+            count(&path, "SELECT lanes FROM capacity_step WHERE run_id=1"),
+            2
+        );
+        assert_eq!(
+            count(&path, "SELECT level FROM capacity_level WHERE host='draco'"),
+            2
+        );
+        assert_eq!(
+            count(&path, "SELECT relay_ms FROM run WHERE sequence=1"),
+            17
+        );
+    }
+    drop(open(&path));
+    assert_eq!(
+        count(&path, "SELECT lanes FROM capacity_step WHERE run_id=1"),
+        2
+    );
+    assert_eq!(
+        count(&path, "SELECT level FROM capacity_level WHERE host='draco'"),
+        2
+    );
+}
+
+#[trace("FR-039-AC-18")]
+#[test]
+fn v3_migration_preserves_seeded_runs_steps_and_levels() {
+    let (_dir, path) = path();
+    seed_v2_capacity_rows(&path);
+    {
+        let mut connection = Connection::open(&path).unwrap();
+        let tx = connection.transaction().unwrap();
+        super::apply_v3(&tx, None).unwrap();
+        tx.commit().unwrap();
+    }
+    assert_eq!(count(&path, "PRAGMA user_version"), 3);
+    assert_eq!(
+        count(&path, "SELECT lanes FROM capacity_step WHERE run_id=1"),
+        2
+    );
+    assert_eq!(
+        count(&path, "SELECT level FROM capacity_level WHERE host='draco'"),
+        2
+    );
+    drop(open(&path));
+    assert_eq!(
+        count(&path, "SELECT lanes FROM capacity_step WHERE run_id=1"),
+        2
+    );
+    assert_eq!(
+        count(&path, "SELECT level FROM capacity_level WHERE host='draco'"),
+        2
+    );
+    assert_eq!(count(&path, "SELECT COUNT(*) FROM capacity_window"), 0);
 }
 
 #[trace("FR-039-AC-9")]

@@ -582,6 +582,7 @@ tick action and stores `project`, `requested_count`, `emitted_at` and `resolved_
 action ledger row. The read-only command does not collect history; install the included
 300-second LaunchAgent on the collector host to run `fleet saturation collect` independently
 of panel reads.
+This command replaces no `_lead-bin` script.
 
 ## ix-board fleet capacity
 

@@ -750,11 +750,10 @@ pub fn plan(input: &PlanInput<'_>) -> Plan {
             ActionKind::EscalateStalePr => {
                 input.facts.prs.is_none()
                     || input.facts.pr_unavailable.iter().any(|unavailable| {
-                        unavailable.pr.is_none()
-                            && unavailable
-                                .lane
-                                .as_deref()
-                                .is_none_or(|lane| lane.eq_ignore_ascii_case(&open.subject))
+                        unavailable
+                            .lane
+                            .as_deref()
+                            .is_some_and(|lane| lane.eq_ignore_ascii_case(&open.subject))
                     })
             }
             _ => false,
@@ -805,9 +804,9 @@ mod tests {
             pr_unavailable: vec![LanePrUnavailable {
                 lane: None,
                 ticket: Some("QSL-1".to_owned()),
-                pr: Some("https://example.invalid/pr/1".to_owned()),
+                pr: None,
                 source_basis: "linear.pull_request_attachment".to_owned(),
-                reason: "ticket-to-lane mapping unavailable".to_owned(),
+                reason: "repository scan scope unavailable".to_owned(),
             }],
             ..TickFacts::default()
         };
@@ -831,8 +830,36 @@ mod tests {
             open: &open,
         });
         assert_eq!(result.resolved, open);
+
+        let mapped_unavailable = TickFacts {
+            prs: Some(vec![super::super::LanePr {
+                lane: "draco:ws:lane".to_owned(),
+                pr: "https://example.invalid/pr/1".to_owned(),
+                last_activity_ms: 0,
+            }]),
+            pr_unavailable: vec![LanePrUnavailable {
+                lane: Some("draco:ws:lane".to_owned()),
+                ticket: Some("QSL-1".to_owned()),
+                pr: Some("https://example.invalid/pr/1".to_owned()),
+                source_basis: "github_repository_title_branch_scan".to_owned(),
+                reason: "repository scan scope unavailable".to_owned(),
+            }],
+            ..TickFacts::default()
+        };
+        let still_open = plan(&PlanInput {
+            report: &report,
+            first_seen: &[],
+            settings: &settings,
+            interval_ms: 300_000,
+            facts: &mapped_unavailable,
+            capacity: &Capacity::default(),
+            orders: &StandingOrders::Missing,
+            open: &open,
+        });
+        assert!(still_open.resolved.is_empty());
     }
 
+    #[trace("FR-038-AC-24")]
     #[test]
     fn positive_ready_buffer_deficit_routes_to_its_project_planner() {
         let report = FleetReport {

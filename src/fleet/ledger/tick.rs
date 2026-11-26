@@ -894,7 +894,7 @@ mod tests {
         assert!(output.2.contains("github.ticket_id"));
     }
 
-    #[trace("FR-041-AC-19", "FR-041-AC-23")]
+    #[trace("FR-041-AC-19", "FR-041-AC-22", "FR-041-AC-23")]
     #[test]
     fn tick_records_lane_additions_and_losses_from_consecutive_reports() {
         let directory = tempfile::tempdir().unwrap();
@@ -993,5 +993,47 @@ mod tests {
                 )
             ]
         );
+        ledger
+            .connection
+            .execute(
+                "INSERT INTO capacity_event(host,lane,kind,reason,evidence_kind,at)
+                 VALUES('draco','draco:workspace:b','draining_mark','thermal_abort','build_abort',45000)",
+                [],
+            )
+            .unwrap();
+        let drained_report = report(50_000, &[]);
+        ledger
+            .commit_tick(&TickCommit {
+                report: &drained_report,
+                settings: &settings,
+                facts: &facts,
+                orders: &orders,
+                session: None,
+                focus: &focus,
+            })
+            .unwrap();
+        let removed: (String, String) = ledger
+            .connection
+            .query_row(
+                "SELECT reason,evidence_kind FROM capacity_event
+                 WHERE lane='draco:workspace:b' AND kind='lane_removed'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            removed,
+            ("thermal_abort".to_owned(), "build_abort".to_owned())
+        );
+        let violations: i64 = ledger
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM lane_reductions_without_throttle_evidence
+                 WHERE lane='draco:workspace:b'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(violations, 0);
     }
 }

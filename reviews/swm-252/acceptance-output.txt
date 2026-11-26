@@ -1,5 +1,0 @@
-# SWM-252 real-source acceptance (redacted)
-
-The live-source acceptance runner used a temporary configuration and scratch ledger. It read Prometheus, Linear, GitHub, and relay sources. It did not write the default fleet ledger or issue relay actions. Raw host names, lane addresses, ticket identifiers, timestamps, and metric values are intentionally omitted from this public repository artifact.
-
-The previous run is not retained as acceptance evidence because its windows were correctly rejected for insufficient demand coverage. Re-run after the review fixes with a valid sample window before treating this artifact as a passing acceptance result.

@@ -430,6 +430,7 @@ pub fn mark_draining(
     lane: &str,
     reason: &str,
     at_ms: i64,
+    drain_cap: Duration,
 ) -> Result<(), LedgerError> {
     let host = host.trim().to_lowercase();
     if host.is_empty()
@@ -466,28 +467,23 @@ pub fn mark_draining(
             .as_ref()
             .map(|query| query as &dyn crate::fleet::live::PromQuery),
     };
-    let evidence = live
-        .derived_evidence_kind(&host)
-        .or_else(|| {
-            if reason == "knee_step_back" {
-                status(path).ok().and_then(|status| {
-                    status
-                        .steps
-                        .iter()
-                        .any(|step| {
-                            step.host.eq_ignore_ascii_case(&host)
-                                && step.valid == Some(true)
-                                && step.knee_signal == Some(true)
-                        })
-                        .then_some("knee")
-                })
-            } else {
-                None
-            }
-        })
-        .ok_or_else(|| {
-            LedgerError::Capacity("drain requires current source-backed evidence".to_owned())
-        })?;
+    let evidence = live.derived_evidence_kind(&host).or_else(|| {
+        if reason == "knee_step_back" {
+            status(path).ok().and_then(|status| {
+                status
+                    .steps
+                    .iter()
+                    .any(|step| {
+                        step.host.eq_ignore_ascii_case(&host)
+                            && step.valid == Some(true)
+                            && step.knee_signal == Some(true)
+                    })
+                    .then_some("knee")
+            })
+        } else {
+            None
+        }
+    });
     let ceiling_until =
         (reason != "knee_step_back").then_some(at_ms.saturating_add(6 * 60 * 60 * 1000));
     let mut ledger = Ledger::open(path, config)?;
@@ -506,7 +502,7 @@ pub fn mark_draining(
     for kind in ["draining_mark", "step_down"] {
         tx.execute(
             "INSERT INTO capacity_event(host,lane,kind,reason,evidence_kind,at,ceiling_until,
-               source_basis) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+               source_basis,drain_cap_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
                 host,
                 lane,
@@ -515,8 +511,13 @@ pub fn mark_draining(
                 evidence,
                 at_ms,
                 ceiling_until,
-                serde_json::json!({"source":"fleet.capacity.drain","evidence_kind":evidence})
-                    .to_string()
+                serde_json::json!({
+                    "source":"fleet.capacity.drain",
+                    "evidence_kind":evidence,
+                    "drain_cap_ms": i64::try_from(drain_cap.as_millis()).unwrap_or(i64::MAX)
+                })
+                .to_string(),
+                i64::try_from(drain_cap.as_millis()).unwrap_or(i64::MAX)
             ],
         )?;
     }
@@ -533,7 +534,7 @@ fn live_lane_current(
     push_interval: Duration,
 ) -> bool {
     let expression = format!(
-        "max(ix_fleet_lane_state_ratio{{host=\"{}\",lane=\"{}\",job=\"ix-relay-watcher\"}})",
+        "max(timestamp(ix_fleet_lane_state_ratio{{host=\"{}\",lane=\"{}\",job=\"ix-relay-watcher\"}}))",
         host.replace('"', "\\\""),
         lane.replace('"', "\\\"")
     );
@@ -548,10 +549,13 @@ fn live_lane_current(
     };
     let max_age = push_interval.as_millis().saturating_mul(2) as f64 / 1000.0;
     samples.iter().any(|sample| {
-        sample["value"][0].as_f64().is_some_and(|timestamp| {
-            let age = at_ms as f64 / 1000.0 - timestamp;
-            (0.0..=max_age).contains(&age)
-        })
+        sample["value"][1]
+            .as_str()
+            .and_then(|value| value.parse::<f64>().ok())
+            .is_some_and(|timestamp| {
+                let age = at_ms as f64 / 1000.0 - timestamp;
+                (0.0..=max_age).contains(&age)
+            })
     })
 }
 

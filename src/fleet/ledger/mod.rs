@@ -208,8 +208,11 @@ fn apply_v2(tx: &rusqlite::Transaction<'_>, fail_at: Option<usize>) -> Result<()
     Ok(())
 }
 
-fn apply_v3(tx: &rusqlite::Transaction<'_>) -> Result<(), LedgerError> {
-    for statement in schema::V3 {
+fn apply_v3(tx: &rusqlite::Transaction<'_>, fail_at: Option<usize>) -> Result<(), LedgerError> {
+    for (index, statement) in schema::V3.iter().enumerate() {
+        if fail_at == Some(index) {
+            return Err(LedgerError::Sqlite(rusqlite::Error::ExecuteReturnedResults));
+        }
         tx.execute_batch(statement)?;
     }
     tx.pragma_update(None, "user_version", 3)?;
@@ -269,6 +272,16 @@ fn refresh_v6_host_output_view(tx: &rusqlite::Transaction<'_>) -> Result<(), Led
            updated_at INTEGER NOT NULL, source_basis TEXT NOT NULL,
            PRIMARY KEY(host,cause))",
     )?;
+    let drain_cap_column: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('capacity_event') WHERE name='drain_cap_ms'",
+        [],
+        |row| row.get(0),
+    )?;
+    if drain_cap_column == 0 {
+        tx.execute_batch(
+            "ALTER TABLE capacity_event ADD COLUMN drain_cap_ms INTEGER NOT NULL DEFAULT 14400000",
+        )?;
+    }
     let sample_interval_column: i64 = tx.query_row(
         "SELECT COUNT(*) FROM pragma_table_info('host_output_sample')
          WHERE name='sample_interval_ms'",
@@ -471,7 +484,7 @@ impl Ledger {
     fn open_with(
         path: &Path,
         config: &FleetConfig,
-        fail_migration_at: Option<usize>,
+        fail_migration_at: Option<(usize, usize)>,
     ) -> Result<Self, LedgerError> {
         refuse_inside_git(path)?;
         if let Some(parent) = path.parent() {
@@ -493,8 +506,8 @@ impl Ledger {
             0 => {
                 let tx = connection.transaction()?;
                 tx.execute_batch(schema::V1)?;
-                apply_v2(&tx, fail_migration_at)?;
-                apply_v3(&tx)?;
+                apply_v2(&tx, fail_migration_at.map(|(v2, _)| v2))?;
+                apply_v3(&tx, fail_migration_at.map(|(_, v3)| v3))?;
                 apply_v4(&tx)?;
                 apply_v5(&tx)?;
                 apply_v6(&tx)?;
@@ -502,8 +515,8 @@ impl Ledger {
             }
             1 => {
                 let tx = connection.transaction()?;
-                apply_v2(&tx, fail_migration_at)?;
-                apply_v3(&tx)?;
+                apply_v2(&tx, fail_migration_at.map(|(v2, _)| v2))?;
+                apply_v3(&tx, fail_migration_at.map(|(_, v3)| v3))?;
                 apply_v4(&tx)?;
                 apply_v5(&tx)?;
                 apply_v6(&tx)?;
@@ -511,7 +524,7 @@ impl Ledger {
             }
             2 => {
                 let tx = connection.transaction()?;
-                apply_v3(&tx)?;
+                apply_v3(&tx, fail_migration_at.map(|(_, v3)| v3))?;
                 apply_v4(&tx)?;
                 apply_v5(&tx)?;
                 apply_v6(&tx)?;

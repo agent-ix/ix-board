@@ -157,14 +157,17 @@ fn observed<T>(value: Option<T>, source: &str, reason: &str, at: i64) -> Observa
     )
 }
 
-fn duration(window: &WindowRequest) -> Result<String, CapacityError> {
+fn duration(window: &WindowRequest) -> Result<(String, u64), CapacityError> {
     let seconds = window.end_ms.saturating_sub(window.start_ms) / 1000;
     if seconds < 60 {
         return Err(CapacityError::Invalid(
             "capacity measurement window must be at least one minute".to_owned(),
         ));
     }
-    Ok(format!("{seconds}s"))
+    let seconds = u64::try_from(seconds).map_err(|_| {
+        CapacityError::Invalid("capacity measurement window is negative".to_owned())
+    })?;
+    Ok((format!("{seconds}s"), seconds))
 }
 
 #[implements("FR-041-AC-10")]
@@ -238,11 +241,16 @@ fn output_rate(
 }
 
 #[implements("FR-041-AC-10")]
-fn coverage_query(expression: &str, span: &str, sample_interval_secs: u64) -> String {
+fn coverage_query(selectors: &[&str], span_secs: u64, step_secs: u64) -> String {
+    let step = step_secs.max(1);
+    let present = selectors
+        .iter()
+        .map(|selector| format!("max(present_over_time({selector}[{step}s]))"))
+        .collect::<Vec<_>>()
+        .join(" and ");
     format!(
-        "avg_over_time((max(present_over_time(({expression})[{}s])))[{span}:{}s])",
-        sample_interval_secs.max(1),
-        sample_interval_secs.max(1)
+        "count_over_time(({present})[{span_secs}s:{step}s]) / {}",
+        (span_secs / step).max(1)
     )
 }
 
@@ -883,7 +891,7 @@ impl MeasurementSource for LiveMeasurementSource<'_> {
                 "measurement interval is empty or precedes ramp-up completion".to_owned(),
             ));
         }
-        let span = duration(request)?;
+        let (span, span_secs) = duration(request)?;
         validate_evaluation_time(request.end_ms)?;
         let host = request.host.to_lowercase();
         let label = esc(&host);
@@ -899,7 +907,11 @@ impl MeasurementSource for LiveMeasurementSource<'_> {
         let source = |metric: &str, operation: &str| {
             let selector = format!("{metric}{{host=\"{label}\"}}");
             let expression = format!("{operation}({selector}[{span}])");
-            let coverage = coverage_query(&selector, &span, self.config.push_interval.as_secs());
+            let coverage = coverage_query(
+                &[selector.as_str()],
+                span_secs,
+                self.config.push_interval.as_secs(),
+            );
             (expression, coverage)
         };
         let (busy_query, busy_coverage) = source("ix_build_slots_busy", "min_over_time");
@@ -911,12 +923,15 @@ impl MeasurementSource for LiveMeasurementSource<'_> {
             "prometheus.ix_build_slots_busy",
             at,
         );
-        let queue_selector = format!("ix_build_queue_wait_seconds_count{{host=\"{label}\"}}");
+        let queue_selector = format!("ix_build_queue_wait_seconds_bucket{{host=\"{label}\"}}");
         let queue_wait_query = format!(
             "histogram_quantile(0.9, sum by (le) (increase(ix_build_queue_wait_seconds_bucket{{host=\"{label}\"}}[{span}])))"
         );
-        let queue_wait_coverage =
-            coverage_query(&queue_selector, &span, self.config.push_interval.as_secs());
+        let queue_wait_coverage = coverage_query(
+            &[queue_selector.as_str()],
+            span_secs,
+            self.config.push_interval.as_secs(),
+        );
         let queue_wait = source_observation(
             self.prometheus,
             &host,
@@ -929,8 +944,8 @@ impl MeasurementSource for LiveMeasurementSource<'_> {
             format!("ix_build_admission_blocked_seconds_total{{host=\"{label}\"}}");
         let admission_query = format!("sum(increase({admission_selector}[{span}]))");
         let admission_coverage = coverage_query(
-            &format!("sum by (host) ({admission_selector})"),
-            &span,
+            &[admission_selector.as_str()],
+            span_secs,
             self.config.push_interval.as_secs(),
         );
         let admission = source_observation(
@@ -956,8 +971,11 @@ impl MeasurementSource for LiveMeasurementSource<'_> {
             ),
         };
         let memory_selector = format!("node_memory_MemAvailable_bytes{{instance=\"{label}\"}}");
-        let memory_coverage =
-            coverage_query(&memory_selector, &span, self.config.push_interval.as_secs());
+        let memory_coverage = coverage_query(
+            &[memory_selector.as_str()],
+            span_secs,
+            self.config.push_interval.as_secs(),
+        );
         let memory = source_observation(
             self.prometheus,
             &host,
@@ -977,10 +995,11 @@ impl MeasurementSource for LiveMeasurementSource<'_> {
                     self.config.push_interval.as_secs()
                 ),
                 coverage_query(
-                    &format!(
-                        "ix_fleet_host_memory_total_bytes{{host=\"{label}\"}} - ix_fleet_host_memory_used_bytes{{host=\"{label}\"}}"
-                    ),
-                    &span,
+                    &[
+                        &format!("ix_fleet_host_memory_total_bytes{{host=\"{label}\"}}"),
+                        &format!("ix_fleet_host_memory_used_bytes{{host=\"{label}\"}}"),
+                    ],
+                    span_secs,
                     self.config.push_interval.as_secs(),
                 ),
                 "relay_watcher.ix_fleet_host_memory_total_bytes-ix_fleet_host_memory_used_bytes",
@@ -1004,8 +1023,8 @@ impl MeasurementSource for LiveMeasurementSource<'_> {
             _ => format!("node_thermal_temperature_celsius{{instance=\"{label}\"}}"),
         };
         let temperature_coverage = coverage_query(
-            &temperature_selector,
-            &span,
+            &[temperature_selector.as_str()],
+            span_secs,
             self.config.push_interval.as_secs(),
         );
         let temperature = source_observation(
@@ -1188,27 +1207,45 @@ mod tests {
         assert!(validate_evaluation_time(i64::MAX).is_err());
     }
 
-    struct MockPrometheus;
+    #[test]
+    #[trace("FR-041-AC-10")]
+    fn coverage_query_uses_valid_subqueries_for_series_and_fallback_selectors() {
+        assert_eq!(
+            coverage_query(&["ix_build_slots_busy{host=\"draco\"}"], 3600, 30),
+            "count_over_time((max(present_over_time(ix_build_slots_busy{host=\"draco\"}[30s])))[3600s:30s]) / 120"
+        );
+        assert_eq!(
+            coverage_query(
+                &["ix_build_admission_blocked_seconds_total{host=\"draco\"}"],
+                3600,
+                30,
+            ),
+            "count_over_time((max(present_over_time(ix_build_admission_blocked_seconds_total{host=\"draco\"}[30s])))[3600s:30s]) / 120"
+        );
+        assert_eq!(
+            coverage_query(
+                &[
+                    "ix_fleet_host_memory_total_bytes{host=\"draco\"}",
+                    "ix_fleet_host_memory_used_bytes{host=\"draco\"}",
+                ],
+                3600,
+                30,
+            ),
+            "count_over_time((max(present_over_time(ix_fleet_host_memory_total_bytes{host=\"draco\"}[30s])) and max(present_over_time(ix_fleet_host_memory_used_bytes{host=\"draco\"}[30s])))[3600s:30s]) / 120"
+        );
+    }
+
+    struct MockPrometheus {
+        values: HashMap<String, f64>,
+    }
 
     impl PromQuery for MockPrometheus {
         fn query(&self, expression: &str) -> Result<String, SourceError> {
-            let value = if expression.contains("count_over_time") {
-                108.0
-            } else if expression.contains("present_over_time") {
-                1.0
-            } else if expression.contains("ix_build_slots_busy") {
-                2.0
-            } else if expression.contains("ix_build_queue_wait_seconds") {
-                4.0
-            } else if expression.contains("ix_build_admission_blocked_seconds_total") {
-                0.0
-            } else if expression.contains("node_memory_MemAvailable_bytes") {
-                2_147_483_648.0
-            } else if expression.contains("node_thermal_temperature_celsius") {
-                70.0
-            } else {
-                return Err(SourceError(format!("unexpected query: {expression}")));
-            };
+            let value = self
+                .values
+                .get(expression)
+                .copied()
+                .ok_or_else(|| SourceError(format!("unexpected query: {expression}")))?;
             Ok(format!(
                 r#"{{"status":"success","data":{{"result":[{{"value":[0,"{value}"]}}]}}}}"#
             ))
@@ -1236,7 +1273,45 @@ mod tests {
                 thermal_limit_celsius: Some(85.0),
             },
         );
-        let prometheus = MockPrometheus;
+        let busy_selector = "ix_build_slots_busy{host=\"draco\"}";
+        let queue_selector = "ix_build_queue_wait_seconds_bucket{host=\"draco\"}";
+        let admission_selector = "ix_build_admission_blocked_seconds_total{host=\"draco\"}";
+        let memory_selector = "node_memory_MemAvailable_bytes{instance=\"draco\"}";
+        let temperature_selector =
+            "node_thermal_temperature_celsius{instance=\"draco\",sensor=~\"PMU tdie.*\"}";
+        let values = HashMap::from([
+            (
+                "min_over_time(ix_build_slots_busy{host=\"draco\"}[3600s])".to_owned(),
+                2.0,
+            ),
+            (coverage_query(&[busy_selector], 3600, 30), 1.0),
+            (
+                "histogram_quantile(0.9, sum by (le) (increase(ix_build_queue_wait_seconds_bucket{host=\"draco\"}[3600s])))".to_owned(),
+                4.0,
+            ),
+            (coverage_query(&[queue_selector], 3600, 30), 1.0),
+            (
+                "sum(increase(ix_build_admission_blocked_seconds_total{host=\"draco\"}[3600s]))".to_owned(),
+                0.0,
+            ),
+            (coverage_query(&[admission_selector], 3600, 30), 1.0),
+            (
+                "min(min_over_time(node_memory_MemAvailable_bytes{instance=\"draco\"}[3600s]))".to_owned(),
+                2_147_483_648.0,
+            ),
+            (coverage_query(&[memory_selector], 3600, 30), 1.0),
+            (
+                "max(max_over_time(node_thermal_temperature_celsius{instance=\"draco\",sensor=~\"PMU tdie.*\"}[3600s]))".to_owned(),
+                70.0,
+            ),
+            (coverage_query(&[temperature_selector], 3600, 30), 1.0),
+            (
+                "count(count by (lane) (last_over_time(ix_fleet_lane_state_ratio{host=\"draco\",job=\"ix-relay-watcher\"}[60s])))".to_owned(),
+                2.0,
+            ),
+            ("vector(1)".to_owned(), 1.0),
+        ]);
+        let prometheus = MockPrometheus { values };
         let source = LiveMeasurementSource {
             config: &config,
             prometheus: Some(&prometheus),

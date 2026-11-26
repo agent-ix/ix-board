@@ -6,12 +6,9 @@
 	<string>com.agentix.ix-board-saturation-collector</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/usr/bin/env</string>
-		<string>ix-board</string>
-		<string>fleet</string>
-		<string>saturation</string>
-		<string>collect</string>
-		<string>--json</string>
+		<string>/bin/sh</string>
+		<string>-c</string>
+		<string>PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH" exec ix-board fleet saturation collect --json</string>
 	</array>
 	<key>StartInterval</key>
 	<integer>300</integer>
@@ -20,7 +17,7 @@
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>PATH</key>
-		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
 	</dict>
 	<key>StandardOutPath</key>
 	<string>/tmp/ix-board-saturation-collector.log</string>

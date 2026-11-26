@@ -7,7 +7,7 @@ use crate::fleet::live::PromQuery;
 use ix_trace_rs::implements;
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A source value with its availability and basis, retained in the JSON contract.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -231,6 +231,25 @@ fn fr001_ready_candidate(
         && !reachable_assignment
 }
 
+fn reachable_assignment_ticket_keys(
+    report: &crate::fleet::FleetReport,
+    assignments: &[(String, Vec<String>)],
+) -> BTreeSet<String> {
+    use crate::fleet::classify::ClassKind;
+
+    let reachable_lanes: BTreeSet<String> = report
+        .rows
+        .iter()
+        .filter(|row| !matches!(row.class, ClassKind::Dead | ClassKind::Unreachable))
+        .map(|row| row.lane.to_lowercase())
+        .collect();
+    assignments
+        .iter()
+        .filter(|(lane, _)| reachable_lanes.contains(&lane.to_lowercase()))
+        .flat_map(|(_, tickets)| tickets.iter().map(|ticket| ticket.to_lowercase()))
+        .collect()
+}
+
 #[implements("FR-041-AC-11")]
 fn is_unfinished_assignment(issue: &crate::Issue) -> bool {
     !matches!(
@@ -266,6 +285,15 @@ fn allocate_idle_lane_shares(
         let count = project_lanes.get_mut(&receiver).expect("receiver exists");
         *count = count.saturating_add(1);
     }
+}
+
+fn host_has_current_registry_lease(
+    relay: &crate::fleet::report::RelaySnapshot,
+    host: &str,
+) -> bool {
+    relay.lists.iter().any(|list| {
+        list.machine.to_string().eq_ignore_ascii_case(host) && !list.expired(relay.now_ms)
+    })
 }
 
 #[implements("FR-041-AC-1")]
@@ -680,7 +708,7 @@ pub fn evaluate(input: SaturationInput) -> SaturationReport {
                 ready_share: ready_share.clone(),
                 queued_behind_first: queued_behind_first.clone(),
                 bootstrap_ticket_pool: bootstrap_ticket_pool.clone(),
-                registry_current: !source.stale_host && source.active_lanes > 0,
+                registry_current: !source.stale_host,
                 target_ready: Evidence::unavailable(
                     "fleet.capacity",
                     "no_current_reachable_lanes",
@@ -776,7 +804,7 @@ pub fn evaluate(input: SaturationInput) -> SaturationReport {
             ready_share: ready_share.clone(),
             queued_behind_first: queued_behind_first.clone(),
             bootstrap_ticket_pool: bootstrap_ticket_pool.clone(),
-            registry_current: !source.stale_host && source.active_lanes > 0,
+            registry_current: !source.stale_host,
             target_ready,
             ready_buffer: ready_share,
             ready_buffer_deficit,
@@ -977,6 +1005,20 @@ pub fn read_live(
         }) as Arc<dyn SeriesSource>
     });
     let (relay_snapshot, receipts) = live::read_relay(config.host_timeout);
+    let lease_current: HashMap<String, bool> = relay_snapshot
+        .as_ref()
+        .ok()
+        .map(|relay| {
+            config
+                .hosts
+                .iter()
+                .map(|host| {
+                    let current = host_has_current_registry_lease(relay, host);
+                    (host.to_lowercase(), current)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let sources = Sources {
         relay: relay_snapshot,
         series,
@@ -1056,7 +1098,25 @@ pub fn read_live(
         .filter(|row| !matches!(row.class, ClassKind::Dead | ClassKind::Unreachable))
         .map(|row| row.lane.to_lowercase())
         .collect();
-    let mut reachable_assigned = BTreeSet::new();
+    let assignment_keys = assignments
+        .iter()
+        .map(|list| {
+            (
+                list.lane.to_lowercase(),
+                list.tickets
+                    .iter()
+                    .map(|ticket| {
+                        if ticket.id.trim().is_empty() {
+                            ticket.reference.trim().to_lowercase()
+                        } else {
+                            ticket.id.trim().to_lowercase()
+                        }
+                    })
+                    .collect(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let reachable_assigned = reachable_assignment_ticket_keys(&report, &assignment_keys);
     let mut supplied_lanes = BTreeSet::new();
     let mut queued_behind_first = BTreeSet::new();
     let mut lane_project: BTreeMap<String, String> = BTreeMap::new();
@@ -1071,7 +1131,6 @@ pub fn read_live(
             } else {
                 ticket.id.trim().to_lowercase()
             };
-            reachable_assigned.insert(key.clone());
             let issue = issue_map.get(&key);
             if issue.is_some_and(|issue| is_unfinished_assignment(issue)) {
                 supplied_lanes.insert(lane.clone());
@@ -1184,13 +1243,15 @@ pub fn read_live(
             })
             .cloned()
             .collect();
-        let stale_host = report.defects.iter().any(|defect| {
-            defect.kind == crate::fleet::DefectKind::StaleHostRegistry
-                && defect
-                    .host
-                    .as_deref()
-                    .is_some_and(|defect_host| defect_host.eq_ignore_ascii_case(&host_key))
-        }) || lanes.is_empty();
+        let current_lease = lease_current.get(&host_key).copied().unwrap_or(false);
+        let stale_host = !current_lease
+            || report.defects.iter().any(|defect| {
+                defect.kind == crate::fleet::DefectKind::StaleHostRegistry
+                    && defect
+                        .host
+                        .as_deref()
+                        .is_some_and(|defect_host| defect_host.eq_ignore_ascii_case(&host_key))
+            });
         let sustainable_slots = if stale_host {
             Evidence::available(
                 0,
@@ -1384,7 +1445,7 @@ mod tests {
                 supplied_lanes: 0,
                 unsupplied_lanes: 0,
                 assignment_evidence_available: true,
-                stale_host: false,
+                stale_host: true,
             }],
             project_ready: Some(BTreeMap::new()),
             queued_behind_first: Some(0),
@@ -1792,7 +1853,7 @@ mod tests {
 
     #[trace("FR-041-AC-2")]
     #[test]
-    fn zero_lane_start_uses_shared_bootstrap_pool_and_stale_hosts_remain_ineligible() {
+    fn zero_lane_start_uses_shared_bootstrap_pool_when_lease_is_current() {
         let make_host = |host: &str, stale_host| HostInput {
             host: host.to_owned(),
             sustainable_slots: Evidence::available(2, "config", 1.0),
@@ -1832,8 +1893,17 @@ mod tests {
             assert_eq!(host.bootstrap_ticket_pool.value, Some(3));
         }
         assert!(!report.hosts[1].registry_current);
-        assert!(!report.hosts[2].registry_current);
-        assert!(!report.hosts[3].registry_current);
+        assert!(report.hosts[2].registry_current);
+        assert!(report.hosts[3].registry_current);
+    }
+
+    #[trace("FR-041-AC-2")]
+    #[test]
+    fn a_never_registered_host_has_no_current_registry_lease() {
+        assert!(!host_has_current_registry_lease(
+            &crate::fleet::report::RelaySnapshot::default(),
+            "draco",
+        ));
     }
 
     #[test]
@@ -2030,6 +2100,62 @@ mod tests {
         assert!(!fr001_ready_candidate(&closed_issue, true, true, false));
     }
 
+    #[trace("FR-041-AC-8")]
+    #[test]
+    fn unreachable_lane_assignment_does_not_remove_a_ticket_from_ready_buffer() {
+        let issue = ready_issue("Backlog", crate::WorkflowStateType::Unstarted);
+        assert!(fr001_ready_candidate(&issue, true, true, false));
+        assert!(!fr001_ready_candidate(&issue, true, true, true));
+    }
+
+    #[trace("FR-041-AC-8")]
+    #[test]
+    fn ready_buffer_assembly_uses_only_assignments_on_reachable_report_lanes() {
+        let report = crate::fleet::FleetReport {
+            schema_version: 1,
+            complete: true,
+            run_ms: 1_000,
+            rows: vec![crate::fleet::report::LaneRow {
+                lane: "draco:ws:ready".to_owned(),
+                host: "draco".to_owned(),
+                class: crate::fleet::classify::ClassKind::Working,
+                reason: None,
+                state_age_secs: None,
+                last_event_ms: None,
+                evidence: Vec::new(),
+                compile_seconds: None,
+                focus: None,
+                thresholds_defaulted: false,
+                schema_version: 1,
+            }],
+            hosts: Vec::new(),
+            defects: Vec::new(),
+            host_busy: BTreeMap::new(),
+            relay_unavailable: false,
+        };
+        let assignments = vec![
+            ("draco:ws:ready".to_owned(), vec!["qsl-1".to_owned()]),
+            ("terra:ws:unreachable".to_owned(), vec!["qsl-2".to_owned()]),
+        ];
+        let assigned = reachable_assignment_ticket_keys(&report, &assignments);
+        let reachable_issue = ready_issue("Backlog", crate::WorkflowStateType::Unstarted);
+        let mut unreachable_issue = reachable_issue.clone();
+        unreachable_issue.identifier = "QSL-2".to_owned();
+
+        assert!(!fr001_ready_candidate(
+            &reachable_issue,
+            true,
+            true,
+            assigned.contains("qsl-1")
+        ));
+        assert!(fr001_ready_candidate(
+            &unreachable_issue,
+            true,
+            true,
+            assigned.contains("qsl-2")
+        ));
+    }
+
     #[trace("FR-041-AC-6")]
     #[test]
     fn idle_unassigned_lanes_contribute_to_project_shares() {
@@ -2103,7 +2229,6 @@ mod tests {
         assert!(report.complete);
     }
 
-    #[trace("FR-041-AC-5")]
     #[test]
     fn missing_host_duty_keeps_known_host_deficit_with_partial_basis() {
         let host = |name: &str, duty: Evidence<f64>| HostInput {

@@ -1294,8 +1294,18 @@ fn run_fleet_capacity_drain(
     at_ms: i64,
 ) -> Result<ix_board::fleet::ledger::CapacityStatus, Error> {
     let (config, path) = fleet_capacity_config()?;
-    ix_board::fleet::ledger::capacity::mark_draining(&path, &config, host, lane, reason, at_ms)
-        .map_err(|error| Error::Fleet(ix_board::fleet::FleetError::Ledger(error.to_string())))?;
+    let settings_value = ix_board::settings_value()?;
+    let tick_settings = ix_board::fleet::tick::TickSettings::from_toml(settings_value.as_ref())?;
+    ix_board::fleet::ledger::capacity::mark_draining(
+        &path,
+        &config,
+        host,
+        lane,
+        reason,
+        at_ms,
+        tick_settings.drain_cap,
+    )
+    .map_err(|error| Error::Fleet(ix_board::fleet::FleetError::Ledger(error.to_string())))?;
     ix_board::fleet::ledger::capacity::status(&path)
         .map_err(|error| Error::Fleet(ix_board::fleet::FleetError::Ledger(error.to_string())))
 }

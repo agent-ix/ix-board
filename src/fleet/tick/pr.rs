@@ -663,13 +663,28 @@ fn read_lane_prs(
                 }
             }
         }
-        Err(error) => result.unavailable.push(PrUnavailable {
-            lane: None,
-            ticket: None,
-            pr: None,
-            source_basis: "github_repository_title_branch_scan".to_owned(),
-            reason: error,
-        }),
+        Err(error) if error == "github_repository_scope_unconfigured" => {
+            result.unavailable.push(PrUnavailable {
+                lane: None,
+                ticket: None,
+                pr: None,
+                source_basis: "github_repository_title_branch_scan".to_owned(),
+                reason: error,
+            });
+        }
+        Err(error) => {
+            for ticket in &tickets {
+                for lane in ticket_lanes.get(ticket).into_iter().flatten() {
+                    result.unavailable.push(PrUnavailable {
+                        lane: Some(lane.clone()),
+                        ticket: Some(ticket.clone()),
+                        pr: None,
+                        source_basis: "github_repository_title_branch_scan".to_owned(),
+                        reason: error.clone(),
+                    });
+                }
+            }
+        }
     }
     Ok(result)
 }
@@ -678,6 +693,7 @@ fn read_lane_prs(
 pub(super) fn read_live(
     timeout: Duration,
     config: &crate::fleet::FleetConfig,
+    current_lanes: &[(String, String)],
 ) -> Result<PrRead, String> {
     let mut source_unavailable = Vec::new();
     let assignments = match read_current_assignments(timeout) {
@@ -726,15 +742,18 @@ pub(super) fn read_live(
         }),
     }
     let mut available_from_ms = None;
-    match read_work_events(
-        i64::try_from(config.push_interval.as_millis())
-            .unwrap_or(i64::MAX)
-            .saturating_mul(2),
-    ) {
+    let current_lanes = current_lanes
+        .iter()
+        .map(|(_, lane)| lane.to_lowercase())
+        .collect::<std::collections::BTreeSet<_>>();
+    match read_work_events(i64::try_from(config.saturation_window.as_millis()).unwrap_or(i64::MAX))
+    {
         Ok((events, available_from)) => {
             available_from_ms = Some(available_from);
             for (lane, ticket) in events {
-                assignment_map.entry(ticket).or_default().push(lane);
+                if current_lanes.contains(&lane.to_lowercase()) {
+                    assignment_map.entry(ticket).or_default().push(lane);
+                }
             }
         }
         Err(error) => source_unavailable.push(PrUnavailable {
@@ -799,6 +818,22 @@ mod tests {
         }
     }
 
+    struct RepositoryScanUnavailable;
+
+    impl PullRequestFacts for RepositoryScanUnavailable {
+        fn issues(&mut self, _: &[String]) -> Result<Vec<Issue>, String> {
+            Ok(Vec::new())
+        }
+
+        fn activity(&self, _: &str) -> Result<PullRequestActivity, String> {
+            unreachable!("there are no PRs without issue data")
+        }
+
+        fn search_open_pull_requests(&self, _: &[String]) -> Result<Vec<(String, String)>, String> {
+            Err("GitHub pull request scan failed".to_owned())
+        }
+    }
+
     #[trace("FR-041-AC-25")]
     #[test]
     fn missing_lane_ticket_mapping_remains_unavailable() {
@@ -807,6 +842,19 @@ mod tests {
         assert_eq!(result.unavailable.len(), 1);
         assert!(result.unavailable[0].lane.is_none());
         assert!(result.unavailable[0].pr.is_none());
+    }
+
+    #[trace("FR-041-AC-25")]
+    #[test]
+    fn repository_scope_failure_is_attached_to_each_mapped_lane() {
+        let assignments =
+            BTreeMap::from([("QSL-1".to_owned(), vec!["draco:QSL:builder".to_owned()])]);
+        let read = read_lane_prs(&assignments, &mut RepositoryScanUnavailable).unwrap();
+        assert!(read.unavailable.iter().any(|unavailable| {
+            unavailable.lane.as_deref() == Some("draco:QSL:builder")
+                && unavailable.pr.is_none()
+                && unavailable.source_basis == "github_repository_title_branch_scan"
+        }));
     }
 
     #[trace("FR-041-AC-25")]
@@ -1068,5 +1116,42 @@ mod tests {
             ]
         );
         assert_eq!(cursors, vec![None, Some("cursor-1".to_owned())]);
+    }
+
+    #[trace("FR-041-AC-25")]
+    #[test]
+    fn work_event_lookback_keeps_mapping_inside_the_saturation_window() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let page_for = |at_ms| {
+            serde_json::json!({
+                "available_from_ms": at_ms - 1,
+                "has_more": false,
+                "next_cursor": null,
+                "truncated": false,
+                "events": [{
+                    "at_ms": at_ms,
+                    "binding": {"address":"draco:QSL:arch"},
+                    "change": {"agent": {
+                        "ticket":"QSL-2128", "name":"coder", "status":"running"
+                    }}
+                }]
+            })
+        };
+        let within_window = now_ms - 10 * 60 * 1000;
+        let (recent, _) = collect_work_events(24 * 60 * 60 * 1000, |_, _| {
+            serde_json::from_value(page_for(within_window)).map_err(|error| error.to_string())
+        })
+        .unwrap();
+        assert_eq!(recent.len(), 1);
+
+        let outside_window = now_ms - 25 * 60 * 60 * 1000;
+        let (old, _) = collect_work_events(24 * 60 * 60 * 1000, |_, _| {
+            serde_json::from_value(page_for(outside_window)).map_err(|error| error.to_string())
+        })
+        .unwrap();
+        assert!(old.is_empty());
     }
 }

@@ -10,7 +10,10 @@ use crate::fleet::ledger::query as query_ledger;
 use ix_trace_rs::trace;
 use rusqlite::Connection;
 use std::collections::BTreeMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const START: i64 = 1_000_000;
 
@@ -137,6 +140,24 @@ impl MeasurementSource for BrokenSource {
     }
 }
 
+struct UnavailableSlotsSource;
+
+impl MeasurementSource for UnavailableSlotsSource {
+    fn measure(&self, request: &WindowRequest) -> Result<WindowMeasurements, CapacityError> {
+        let mut measurement = sample(request);
+        measurement.build_slots_busy =
+            Observation::unavailable("ix_build_slots_busy", "series_missing", None);
+        measurement.build_slots_sustainable =
+            Observation::unavailable("ix_build_slots_configured", "series_missing", None);
+        measurement.slots_busy_equals_sustainable = Observation::unavailable(
+            "ix-board.derived:build_slots_busy==build_slots_sustainable",
+            "slot_values_unavailable",
+            None,
+        );
+        Ok(measurement)
+    }
+}
+
 #[test]
 #[trace("FR-041-AC-11")]
 fn run_window_and_level_round_trip_with_each_field_basis() {
@@ -232,6 +253,54 @@ fn run_window_and_level_round_trip_with_each_field_basis() {
     assert_eq!(
         json["steps"][0]["source_basis"]["memory_headroom_min"]["availability"],
         "available"
+    );
+}
+
+#[trace("FR-041-AC-12", "FR-041-AC-13")]
+#[test]
+fn unavailable_slots_do_not_invalidate_a_demand_covered_window_or_allow_slot_end() {
+    let (_dir, path) = path();
+    let config = capacity_config();
+    let run_id = start(&path, &config, "draco", "first", START).unwrap();
+    let rampup_end = START + i64::try_from(config.capacity_rampup.as_millis()).unwrap();
+    open_step(&path, &config, run_id, 2, None, START, rampup_end).unwrap();
+    {
+        let ledger = Ledger::open(&path, &config).unwrap();
+        for tick in 1..=12 {
+            let at = rampup_end + i64::from(tick) * 300_000;
+            ledger
+                .connection
+                .execute(
+                    "INSERT INTO saturation_sample(host,at,deficit,source_basis,coverage,ready_buffer,active_lanes,supplied_lanes,unsupplied_lanes,ready_share,registry_current)
+                     VALUES('draco',?1,0,'test',1.0,2,2,0,2,2,1)",
+                    [at],
+                )
+                .unwrap();
+        }
+    }
+    measure_open_step(
+        &path,
+        &config,
+        run_id,
+        rampup_end + 3_600_000,
+        &UnavailableSlotsSource,
+    )
+    .unwrap();
+    let history = status(&path).unwrap();
+    assert_eq!(history.steps[0].valid, Some(true));
+    assert_eq!(history.steps[0].build_slots_busy, None);
+    let error = end(
+        &path,
+        &config,
+        "draco",
+        "build_slots_saturated",
+        rampup_end + 3_601_000,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("busy slots to equal sustainable slots"),
+        "{error}"
     );
 }
 
@@ -751,12 +820,14 @@ fn version_six_ledger_refreshes_output_share_provenance_columns() {
              DROP VIEW unrecorded_hosts_with_demand;
              DROP VIEW unrecorded_hosts_without_discovery_run;
              DROP VIEW unrecorded_hosts_ready_for_discovery;
+             DROP VIEW drains_over_cap_without_escalation;
              ALTER TABLE host_output_sample DROP COLUMN sample_interval_ms;
              ALTER TABLE saturation_sample DROP COLUMN source_basis;
              ALTER TABLE saturation_sample DROP COLUMN unavailable_reason;
              ALTER TABLE saturation_sample DROP COLUMN coverage;
              ALTER TABLE saturation_sample DROP COLUMN queued_behind_first;
-             ALTER TABLE saturation_sample DROP COLUMN bootstrap_ticket_pool",
+             ALTER TABLE saturation_sample DROP COLUMN bootstrap_ticket_pool;
+             ALTER TABLE capacity_event DROP COLUMN drain_cap_ms",
         )
         .unwrap();
     drop(Ledger::open(&path, &config).unwrap());
@@ -771,6 +842,14 @@ fn version_six_ledger_refreshes_output_share_provenance_columns() {
     assert!(columns.iter().any(|column| column == "source_basis"));
     assert!(columns.iter().any(|column| column == "unavailable_reason"));
     assert!(columns.iter().any(|column| column == "sample_interval_ms"));
+    let event_columns = connection
+        .prepare("PRAGMA table_info(capacity_event)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(event_columns.iter().any(|column| column == "drain_cap_ms"));
     let saturation_columns = connection
         .prepare("PRAGMA table_info(saturation_sample)")
         .unwrap()
@@ -961,6 +1040,7 @@ fn throttled_export_requires_twelve_covered_admission_samples() {
     assert!(!exposition.contains("ix_fleet_capacity_throttled_at_level{host=\"draco\"}"));
 }
 
+#[trace("FR-041-AC-10")]
 #[test]
 fn incomplete_observation_is_null_with_its_source_and_reason() {
     let mut missing: Observation<f64> = Observation::unavailable(
@@ -975,6 +1055,7 @@ fn incomplete_observation_is_null_with_its_source_and_reason() {
     assert_eq!(basis.reason.as_deref(), Some("coverage_below_90_percent"));
 }
 
+#[trace("FR-039-AC-18")]
 #[test]
 fn a_failed_measurement_keeps_the_open_hold_for_retry() {
     let (_dir, path) = path();
@@ -995,6 +1076,7 @@ fn a_failed_measurement_keeps_the_open_hold_for_retry() {
     assert!(status(&path).unwrap().steps.is_empty());
 }
 
+#[trace("FR-041-AC-20")]
 #[test]
 fn capacity_events_keep_verified_evidence() {
     let (_dir, path) = path();
@@ -1037,7 +1119,6 @@ fn capacity_events_keep_verified_evidence() {
 }
 
 #[test]
-#[trace("FR-039-AC-19")]
 fn version_three_ledger_migrates_additively_to_resumable_windows() {
     let (_dir, path) = path();
     let config = capacity_config();
@@ -1097,9 +1178,256 @@ fn marking_a_lane_draining_requires_live_watcher_evidence() {
         "draco:workspace:a",
         "memory_below_reserve",
         START,
+        Duration::from_secs(4 * 60 * 60),
     )
     .unwrap_err();
     assert!(error.to_string().contains("live lane-state evidence"));
     let status = status(&path).unwrap();
     assert!(status.events.is_empty());
+}
+
+struct TimestampedLaneState(f64);
+
+impl crate::fleet::live::PromQuery for TimestampedLaneState {
+    fn query(&self, _: &str) -> Result<String, crate::fleet::SourceError> {
+        unreachable!("lane-state freshness uses a timestamped query")
+    }
+
+    fn query_at(&self, expression: &str, _: i64) -> Result<String, crate::fleet::SourceError> {
+        assert!(expression.starts_with("max(timestamp(ix_fleet_lane_state_ratio{"));
+        Ok(serde_json::json!({
+            "data": {"result": [{"value": ["1700000060", self.0.to_string()]}]}
+        })
+        .to_string())
+    }
+}
+
+#[trace("FR-041-AC-14")]
+#[test]
+fn drain_freshness_uses_the_sample_timestamp_not_the_query_timestamp() {
+    let at_ms = 1_700_000_060_000;
+    let current = TimestampedLaneState(1_700_000_000.0);
+    let stale = TimestampedLaneState(1_699_999_999.0);
+    assert!(live_lane_current(
+        &current,
+        "draco",
+        "draco:workspace:a",
+        at_ms,
+        Duration::from_secs(30),
+    ));
+    assert!(!live_lane_current(
+        &stale,
+        "draco",
+        "draco:workspace:a",
+        at_ms,
+        Duration::from_secs(30),
+    ));
+}
+
+#[trace("FR-041-AC-14", "FR-041-AC-20")]
+#[test]
+fn live_drain_records_missing_evidence_idempotently_and_knee_has_no_ceiling() {
+    let (_dir, path) = path();
+    let now_ms = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let sample_ts = now_ms / 1000;
+    let server = thread::spawn(move || {
+        for _ in 0..18 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            loop {
+                let size = stream.read(&mut chunk).unwrap();
+                if size == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..size]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8(request).unwrap();
+            let body = if request.contains("timestamp") {
+                serde_json::json!({"status":"success","data":{"result":[{
+                    "value":[sample_ts.to_string(), sample_ts.to_string()]
+                }]}})
+            } else {
+                serde_json::json!({"status":"success","data":{"result":[]}})
+            }
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            )
+            .unwrap();
+        }
+    });
+    let mut config = capacity_config();
+    config.prometheus_url = Some(format!("http://{address}"));
+    config.host_timeout = Duration::from_secs(2);
+    mark_draining(
+        &path,
+        &config,
+        "draco",
+        "draco:workspace:a",
+        "memory_below_reserve",
+        now_ms,
+        Duration::from_secs(4 * 60 * 60),
+    )
+    .unwrap();
+    mark_draining(
+        &path,
+        &config,
+        "draco",
+        "draco:workspace:a",
+        "memory_below_reserve",
+        now_ms + 1,
+        Duration::from_secs(4 * 60 * 60),
+    )
+    .unwrap();
+    mark_draining(
+        &path,
+        &config,
+        "draco",
+        "draco:workspace:b",
+        "knee_step_back",
+        now_ms + 2,
+        Duration::from_secs(4 * 60 * 60),
+    )
+    .unwrap();
+    server.join().unwrap();
+
+    let events = status(&path).unwrap().events;
+    assert_eq!(events.len(), 4);
+    assert!(events.iter().all(|event| event.evidence_kind.is_none()));
+    let drain_caps = Connection::open(&path)
+        .unwrap()
+        .prepare("SELECT DISTINCT drain_cap_ms FROM capacity_event")
+        .unwrap()
+        .query_map([], |row| row.get::<_, i64>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(drain_caps, vec![14_400_000]);
+    let overload_drain = events
+        .iter()
+        .filter(|event| event.reason.as_deref() == Some("memory_below_reserve"))
+        .collect::<Vec<_>>();
+    assert_eq!(overload_drain.len(), 2);
+    assert!(
+        overload_drain
+            .iter()
+            .all(|event| event.ceiling_until == Some(now_ms + 21_600_000))
+    );
+    let knee_drain = events
+        .iter()
+        .filter(|event| event.reason.as_deref() == Some("knee_step_back"))
+        .collect::<Vec<_>>();
+    assert_eq!(knee_drain.len(), 2);
+    assert!(knee_drain.iter().all(|event| event.ceiling_until.is_none()));
+    let violations =
+        query_ledger(&path, "lane_reductions_without_throttle_evidence", None).unwrap();
+    assert_eq!(violations.rows.len(), 4);
+}
+
+#[trace("FR-041-AC-19")]
+#[test]
+fn lane_removal_view_requires_a_drain_for_each_removal() {
+    let (_dir, path) = path();
+    Ledger::open(&path, &capacity_config()).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO capacity_event(host,lane,kind,at) VALUES
+               ('draco','draco:workspace:a','draining_mark',100),
+               ('draco','draco:workspace:a','drain_done',150),
+               ('draco','draco:workspace:a','lane_removed',200),
+               ('draco','draco:workspace:b','draining_mark',100),
+               ('draco','draco:workspace:b','lane_removed',150),
+               ('draco','draco:workspace:c','draining_mark',100),
+               ('draco','draco:workspace:c','drain_done',150),
+               ('draco','draco:workspace:c','lane_removed',200),
+               ('draco','draco:workspace:c','lane_added',250),
+               ('draco','draco:workspace:c','lane_removed',300),
+               ('draco','draco:workspace:d','lane_removed',150);",
+        )
+        .unwrap();
+    let view = query_ledger(&path, "lane_removals_before_drain", None).unwrap();
+    let lanes = view
+        .rows
+        .iter()
+        .filter_map(|row| row.get("lane").and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lanes,
+        vec![
+            "draco:workspace:b",
+            "draco:workspace:c",
+            "draco:workspace:d"
+        ]
+    );
+}
+
+#[trace("FR-041-AC-15")]
+#[test]
+fn drain_over_cap_uses_the_recorded_drain_cap_not_the_cool_off() {
+    let (_dir, path) = path();
+    Ledger::open(&path, &capacity_config()).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO run(kind,relay_ms) VALUES('status',?1)",
+            [START + 5_000],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO capacity_event(host,lane,kind,at,ceiling_until,drain_cap_ms)
+             VALUES('draco','draco:workspace:a','draining_mark',?1,NULL,4000)",
+            [START],
+        )
+        .unwrap();
+    let view = query_ledger(&path, "drains_over_cap_without_escalation", None).unwrap();
+    assert_eq!(view.rows.len(), 1);
+}
+
+#[trace("FR-041-AC-14")]
+#[test]
+fn cool_off_view_lists_only_additions_that_exceed_the_recorded_level() {
+    let (_dir, path) = path();
+    Ledger::open(&path, &capacity_config()).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO run(kind,relay_ms,tick_interval_s) VALUES('status',1000000,300);
+             INSERT INTO capacity_level(host,level,recorded_at,reason)
+               VALUES('draco',2,40000,'step_bound');
+             INSERT INTO capacity_event(host,lane,kind,at,ceiling_until)
+               VALUES('draco','draco:workspace:a','step_down',50000,900000);
+             INSERT INTO capacity_event(host,lane,kind,at)
+               VALUES('draco','draco:workspace:c','lane_added',100000),
+                     ('draco','draco:workspace:d','lane_added',400000);
+             INSERT INTO lane_tick(run_seq,lane,host,class,observed_ms,evidence) VALUES
+               (1,'draco:workspace:a','draco','IDLE',200000,'{}'),
+               (1,'draco:workspace:b','draco','IDLE',200000,'{}'),
+               (1,'draco:workspace:c','draco','IDLE',200000,'{}'),
+               (1,'draco:workspace:a','draco','IDLE',600000,'{}'),
+               (1,'draco:workspace:b','draco','IDLE',600000,'{}');",
+        )
+        .unwrap();
+    let view = query_ledger(&path, "raises_during_cool_off", None).unwrap();
+    let lanes = view
+        .rows
+        .iter()
+        .filter_map(|row| row.get("lane").and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>();
+    assert_eq!(lanes, vec!["draco:workspace:c"]);
 }

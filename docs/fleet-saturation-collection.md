@@ -19,10 +19,11 @@ launchctl bootstrap "gui/$(id -u)" \
   "$HOME/Library/LaunchAgents/com.agentix.ix-board-saturation-collector.plist"
 ```
 
-The plist resolves `ix-board` through a standard Homebrew or system `PATH` and
-logs to `/tmp`. Ensure `ix-board`, `agent-msg` and `linear` are available in
-that `PATH` for the logged-in account, which also needs its ix-relay and Linear
-credentials. To inspect the job, use
+The plist prepends `$HOME/.local/bin` and `$HOME/.cargo/bin` to the supplied
+Homebrew or system `PATH` before starting `ix-board`; it logs to `/tmp`. Install
+`ix-board` and `agent-msg` in those directories or a standard `PATH` directory.
+The logged-in account also needs its ix-relay and Linear credentials available
+to the LaunchAgent. To inspect the job, use
 `launchctl print gui/$(id -u)/com.agentix.ix-board-saturation-collector`.
 To unload it, use
 `launchctl bootout gui/$(id -u)/com.agentix.ix-board-saturation-collector`.

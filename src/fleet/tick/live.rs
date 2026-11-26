@@ -81,7 +81,7 @@ impl TickSources for LiveSources {
 
     #[implements("FR-038-AC-5")]
     fn lane_prs(&self) -> Result<super::LanePrRead, Unread> {
-        let read = super::pr::read_live(self.timeout, &self.config)
+        let read = super::pr::read_live(self.timeout, &self.config, &self.lanes)
             .map_err(|error| Unread::Failed(SourceError(error)))?;
         Ok(super::LanePrRead {
             items: read.items,
