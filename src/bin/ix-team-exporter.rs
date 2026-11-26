@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 use clap::Parser;
 use ix_board::team_metrics::{Collector, Config, Error, now_ms};
+use ix_trace_rs::implements;
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
@@ -110,6 +111,7 @@ fn metrics_text(collector: &Collector, config: &Config, now: i64) -> Result<Stri
     Ok(text)
 }
 
+#[implements("FR-033-AC-12")]
 fn tracker_worker_configs(config: &Config) -> [Config; 1] {
     [config.clone()]
 }
@@ -238,6 +240,7 @@ mod tests {
         }
     }
 
+    #[trace("FR-033-AC-12")]
     #[test]
     fn tracker_worker_keeps_all_scopes_behind_one_shared_gate() {
         let directory = tempfile::tempdir().unwrap();
