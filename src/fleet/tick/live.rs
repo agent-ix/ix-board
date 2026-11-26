@@ -274,7 +274,6 @@ impl TickSources for LiveSources {
         Ok(completed)
     }
 
-    #[implements("FR-041-AC-21")]
     fn host_output_samples(&self, at_ms: i64) -> Vec<super::HostOutputSample> {
         use crate::fleet::capacity::{LiveMeasurementSource, MeasurementSource, WindowRequest};
         let prometheus = self

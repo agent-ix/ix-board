@@ -231,6 +231,7 @@ fn fr001_ready_candidate(
         && !reachable_assignment
 }
 
+#[implements("FR-041-AC-8")]
 fn reachable_assignment_ticket_keys(
     report: &crate::fleet::FleetReport,
     assignments: &[(String, Vec<String>)],
@@ -287,6 +288,7 @@ fn allocate_idle_lane_shares(
     }
 }
 
+#[implements("FR-041-AC-2")]
 fn host_has_current_registry_lease(
     relay: &crate::fleet::report::RelaySnapshot,
     host: &str,

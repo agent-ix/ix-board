@@ -468,6 +468,7 @@ fn requested_count(action: &Action) -> Option<i64> {
 
 #[implements("FR-041-AC-19")]
 #[implements("FR-041-AC-23")]
+#[implements("FR-041-AC-22")]
 fn record_lane_capacity_events(
     tx: &Transaction<'_>,
     report: &FleetReport,

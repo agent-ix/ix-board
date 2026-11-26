@@ -208,6 +208,7 @@ fn apply_v2(tx: &rusqlite::Transaction<'_>, fail_at: Option<usize>) -> Result<()
     Ok(())
 }
 
+#[implements("FR-039-AC-18")]
 fn apply_v3(tx: &rusqlite::Transaction<'_>, fail_at: Option<usize>) -> Result<(), LedgerError> {
     for (index, statement) in schema::V3.iter().enumerate() {
         if fail_at == Some(index) {
