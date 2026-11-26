@@ -5190,16 +5190,58 @@ fn render_chunk(chunk: &ProjectChunk) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, FocusCommand, Output, ProgramRoadmap, ProgramScopeCommand,
+        Cli, Command, FocusCommand, HostCommand, Output, ProgramRoadmap, ProgramScopeCommand,
         encode_output_json, format_issue_ref, format_snapshot_time_at, output_outcome,
-        render_chain, render_closed, render_focus_status, render_orphans, render_reconcile,
-        render_roadmap,
+        render_chain, render_closed, render_focus_status, render_human, render_orphans,
+        render_reconcile, render_roadmap,
     };
     use clap::Parser;
     use ix_board::program_review::ScopeCheckReport;
     use ix_board::{FocusStatus, IssueBatch, IssueId, IssueReference};
     use ix_cli_kit::exit::Outcome;
     use ix_trace_rs::trace;
+
+    #[test]
+    #[trace("FR-050-AC-1")]
+    fn host_check_cli_requires_no_arguments() {
+        let cli = Cli::try_parse_from(["ix-board", "host", "check"]).expect("parse host check");
+        assert!(matches!(
+            cli.command,
+            Command::Host {
+                command: HostCommand::Check
+            }
+        ));
+        assert!(Cli::try_parse_from(["ix-board", "host", "check", "--host", "terra"]).is_err());
+    }
+
+    #[test]
+    #[trace("FR-050-AC-1", "FR-050-AC-2")]
+    fn host_check_text_contains_safe_statuses_without_credential_material() {
+        let report = ix_board::host_check::HostCheckReport {
+            host: "terra".to_owned(),
+            auth: vec![
+                ix_board::host_check::AuthCheck {
+                    service: "gh".to_owned(),
+                    state: ix_board::host_check::AuthState::Ready,
+                    source: None,
+                },
+                ix_board::host_check::AuthCheck {
+                    service: "linear".to_owned(),
+                    state: ix_board::host_check::AuthState::Unauthorized,
+                    source: Some("credential_store".to_owned()),
+                },
+            ],
+            metrics: None,
+            admission: ix_board::host_hygiene::Eligibility::Unknown,
+            dev_processes: Vec::new(),
+            process_table_complete: true,
+            exit_code: 1,
+        };
+        let text = render_human(&Output::HostCheck(report));
+        assert!(text.contains("auth gh=Ready"));
+        assert!(text.contains("auth linear=Unauthorized"));
+        assert!(!text.contains("LINEAR_API_KEY"));
+    }
 
     #[trace("FR-047-AC-7")]
     #[trace("FR-047-AC-9")]
