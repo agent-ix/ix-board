@@ -263,6 +263,12 @@ fn apply_v6(tx: &rusqlite::Transaction<'_>) -> Result<(), LedgerError> {
 
 #[implements("FR-041-AC-11")]
 fn refresh_v6_host_output_view(tx: &rusqlite::Transaction<'_>) -> Result<(), LedgerError> {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS capacity_overload_state(
+           host TEXT NOT NULL, cause TEXT NOT NULL, active INTEGER NOT NULL,
+           updated_at INTEGER NOT NULL, source_basis TEXT NOT NULL,
+           PRIMARY KEY(host,cause))",
+    )?;
     let sample_interval_column: i64 = tx.query_row(
         "SELECT COUNT(*) FROM pragma_table_info('host_output_sample')
          WHERE name='sample_interval_ms'",
@@ -340,22 +346,32 @@ fn refresh_v6_host_output_view(tx: &rusqlite::Transaction<'_>) -> Result<(), Led
             tx.execute_batch(statement)?;
         }
     }
-    let columns: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info('host_output_share_of_recorded_level')
-         WHERE name IN ('source_basis','unavailable_reason')",
+    let output_window_column: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('capacity_step_lane_output') WHERE name='window_end'",
         [],
         |row| row.get(0),
     )?;
-    if columns == 2 {
-        refresh_v6_demand_views(tx)?;
-        return Ok(());
+    if output_window_column == 0 {
+        tx.execute_batch("ALTER TABLE capacity_step_lane_output ADD COLUMN window_end INTEGER")?;
     }
-    tx.execute_batch("DROP VIEW IF EXISTS host_output_share_of_recorded_level")?;
-    let view = schema::CAPACITY_VIEWS
-        .iter()
-        .find(|statement| statement.starts_with("CREATE VIEW host_output_share_of_recorded_level"))
-        .ok_or_else(|| LedgerError::Capacity("host output share view is not defined".to_owned()))?;
-    tx.execute_batch(view)?;
+    let window_min_column: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('capacity_step') WHERE name='window_min_ms'",
+        [],
+        |row| row.get(0),
+    )?;
+    if window_min_column == 0 {
+        tx.execute_batch(
+            "ALTER TABLE capacity_step ADD COLUMN window_min_ms INTEGER NOT NULL DEFAULT 3600000",
+        )?;
+    }
+    tx.execute_batch(
+        "UPDATE capacity_step_lane_output SET window_end=(
+           SELECT s.window_end FROM capacity_step s WHERE s.run_id=capacity_step_lane_output.run_id
+             AND s.step_no=capacity_step_lane_output.step_no LIMIT 1)
+         WHERE window_end IS NULL AND (SELECT COUNT(*) FROM capacity_step s
+           WHERE s.run_id=capacity_step_lane_output.run_id
+             AND s.step_no=capacity_step_lane_output.step_no)=1",
+    )?;
     refresh_v6_demand_views(tx)?;
     Ok(())
 }
@@ -394,14 +410,15 @@ fn refresh_v6_demand_views(tx: &rusqlite::Transaction<'_>) -> Result<(), LedgerE
                knee_signal INTEGER, knee_reason TEXT CHECK(knee_reason IS NULL OR
                  knee_reason IN ('output_gain','throttle')),
                source_basis TEXT NOT NULL DEFAULT '{}', build_slots_busy INTEGER,
-               build_slots_sustainable INTEGER, measurement_values TEXT NOT NULL DEFAULT '{}');
+               build_slots_sustainable INTEGER, measurement_values TEXT NOT NULL DEFAULT '{}',
+               window_min_ms INTEGER NOT NULL DEFAULT 3600000);
              INSERT INTO capacity_step(
                run_id,step_no,repeat_of,host,lanes,window_start,window_end,rampup_end,valid,
                inconclusive_reason,deficit_coverage,deficit_zero_throughout,host_output_per_hour,
                tickets_closed,prs_merged,commits_pushed,output_basis,queue_wait_p90_s,
                throttled_share,memory_headroom_min,thermal_headroom_min,
                slots_busy_equals_sustainable,knee_signal,knee_reason,source_basis,
-               build_slots_busy,build_slots_sustainable,measurement_values)
+               build_slots_busy,build_slots_sustainable,measurement_values,window_min_ms)
              SELECT run_id,step_no,repeat_of,host,lanes,window_start,window_end,rampup_end,valid,
                CASE inconclusive_reason WHEN 'deficit_nonzero' THEN 'demand_short'
                  ELSE inconclusive_reason END,
@@ -409,7 +426,7 @@ fn refresh_v6_demand_views(tx: &rusqlite::Transaction<'_>) -> Result<(), LedgerE
                prs_merged,commits_pushed,output_basis,queue_wait_p90_s,throttled_share,
                memory_headroom_min,thermal_headroom_min,slots_busy_equals_sustainable,
                knee_signal,knee_reason,source_basis,build_slots_busy,build_slots_sustainable,
-               measurement_values FROM capacity_step_before_demand_coverage;
+               measurement_values,window_min_ms FROM capacity_step_before_demand_coverage;
              DROP TABLE capacity_step_before_demand_coverage;",
         )?;
     } else {
@@ -862,7 +879,7 @@ pub fn query(path: &Path, view: &str, since: Option<Duration>) -> Result<LedgerR
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     let found = user_version(&connection)?;
-    if found != schema::VERSION {
+    if found > schema::VERSION {
         return Err(LedgerError::UnsupportedVersion {
             path: path.to_owned(),
             found,
@@ -905,8 +922,7 @@ pub fn query(path: &Path, view: &str, since: Option<Duration>) -> Result<LedgerR
                 rusqlite::types::ValueRef::Text(t) => {
                     let text = String::from_utf8_lossy(t).into_owned();
                     if name == "source_basis" {
-                        serde_json::from_str(&text)
-                            .unwrap_or_else(|_| serde_json::Value::String(text))
+                        serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text))
                     } else {
                         serde_json::Value::String(text)
                     }

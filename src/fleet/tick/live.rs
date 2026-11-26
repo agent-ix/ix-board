@@ -222,24 +222,34 @@ impl TickSources for LiveSources {
                     .iter()
                     .map(|lane| (host.host.to_lowercase(), lane.to_lowercase()))
             })
-            .filter(|(host, lane)| {
-                self.lanes
-                    .iter()
-                    .any(|current| current == &(host.clone(), lane.clone()))
-            })
             .collect::<Vec<_>>();
         if open_drains.is_empty() {
             return Ok(Vec::new());
         }
+        let mut completed = Vec::new();
+        let mut current_drains = Vec::new();
+        for (host, lane) in open_drains {
+            if !self
+                .lanes
+                .iter()
+                .any(|current| current == &(host.clone(), lane.clone()))
+            {
+                completed.push(super::DrainDoneSample {
+                    host,
+                    lane,
+                    source_basis: "relay_lane_assignment_disappeared".to_owned(),
+                    lane_lost: true,
+                });
+                continue;
+            }
+            current_drains.push((host, lane));
+        }
         let Some(url) = self.config.prometheus_url.as_deref() else {
-            return Err(Unread::Failed(SourceError(
-                "prometheus_url_unconfigured_for_drain_evidence".to_owned(),
-            )));
+            return Ok(completed);
         };
         let query = live::PromHttp::new(url, self.timeout)
             .map_err(|error| Unread::Failed(SourceError(error.to_string())))?;
-        let mut completed = Vec::new();
-        for (host, lane) in open_drains {
+        for (host, lane) in current_drains {
             let evidence = crate::fleet::saturation::live_drain_done(
                 &query,
                 &host,
@@ -255,14 +265,10 @@ impl TickSources for LiveSources {
                         "ix_fleet_lane_state_ratio;increase(ix_fleet_lane_compile_seconds_total[{}s])",
                         self.settings.drain_build_window.as_secs()
                     ),
+                    lane_lost: false,
                 }),
                 Some(false) => {}
-                None => {
-                    return Err(Unread::Failed(SourceError(format!(
-                        "drain evidence unavailable for {host}/{lane}: {}",
-                        evidence.reason.unwrap_or_else(|| "unknown".to_owned())
-                    ))));
-                }
+                None => {}
             }
         }
         Ok(completed)
@@ -356,14 +362,11 @@ impl TickSources for LiveSources {
             let Ok(measurement) = source.measure(&request) else {
                 continue;
             };
-            if measurement
-                .memory_headroom_min
-                .value
-                .is_some_and(|headroom| headroom < 0.0)
-            {
+            if let Some(headroom) = measurement.memory_headroom_min.value {
                 events.push(super::OverloadEventSample {
                     host: host.to_lowercase(),
                     cause: "memory_below_reserve".to_owned(),
+                    active: headroom < 0.0,
                     source_basis: format!(
                         "{};fleet.capacity_limits.{}.memory_reserve_bytes",
                         measurement.memory_headroom_min.source,
@@ -371,14 +374,11 @@ impl TickSources for LiveSources {
                     ),
                 });
             }
-            if measurement
-                .thermal_headroom_min
-                .value
-                .is_some_and(|headroom| headroom < 0.0)
-            {
+            if let Some(headroom) = measurement.thermal_headroom_min.value {
                 events.push(super::OverloadEventSample {
                     host: host.to_lowercase(),
-                    cause: "thermal_abort".to_owned(),
+                    cause: "thermal_limit_breach".to_owned(),
+                    active: headroom < 0.0,
                     source_basis: format!(
                         "{};fleet.capacity_limits.{}.thermal_limit_celsius",
                         measurement.thermal_headroom_min.source,

@@ -165,6 +165,8 @@ pub struct DrainDoneSample {
     pub lane: String,
     /// Auditable source basis.
     pub source_basis: String,
+    /// The lane disappeared before drain completion could be observed.
+    pub lane_lost: bool,
 }
 
 /// Per-host output observed over the trailing hour, with nullable values retained.
@@ -191,8 +193,10 @@ pub struct HostOutputSample {
 pub struct OverloadEventSample {
     /// Host name.
     pub host: String,
-    /// `memory_below_reserve` or `thermal_abort`.
+    /// `memory_below_reserve`, `thermal_limit_breach`, or a build abort.
     pub cause: String,
+    /// Whether the source currently shows this limit breach.
+    pub active: bool,
     /// Source metric and configured limit basis.
     pub source_basis: String,
 }

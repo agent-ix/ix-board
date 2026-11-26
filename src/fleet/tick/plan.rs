@@ -750,10 +750,11 @@ pub fn plan(input: &PlanInput<'_>) -> Plan {
             ActionKind::EscalateStalePr => {
                 input.facts.prs.is_none()
                     || input.facts.pr_unavailable.iter().any(|unavailable| {
-                        unavailable
-                            .lane
-                            .as_deref()
-                            .is_none_or(|lane| lane.eq_ignore_ascii_case(&open.subject))
+                        unavailable.pr.is_none()
+                            && unavailable
+                                .lane
+                                .as_deref()
+                                .is_none_or(|lane| lane.eq_ignore_ascii_case(&open.subject))
                     })
             }
             _ => false,
@@ -782,8 +783,54 @@ pub fn plan(input: &PlanInput<'_>) -> Plan {
 mod tests {
     use super::*;
     use crate::fleet::FleetReport;
-    use crate::fleet::tick::NeedReadyTickets;
+    use crate::fleet::tick::{LanePrUnavailable, NeedReadyTickets};
     use ix_trace_rs::trace;
+
+    #[test]
+    fn unattributed_pr_does_not_keep_a_lane_stale_pr_action_open() {
+        let report = FleetReport {
+            schema_version: 1,
+            complete: true,
+            run_ms: 2_000,
+            rows: Vec::new(),
+            hosts: Vec::new(),
+            defects: Vec::new(),
+            host_busy: BTreeMap::new(),
+            relay_unavailable: false,
+        };
+        let settings = TickSettings::default();
+        let facts = TickFacts {
+            prs: Some(Vec::new()),
+            pr_unavailable: vec![LanePrUnavailable {
+                lane: None,
+                ticket: Some("QSL-1".to_owned()),
+                pr: Some("https://example.invalid/pr/1".to_owned()),
+                source_basis: "linear.pull_request_attachment".to_owned(),
+                reason: "ticket-to-lane mapping unavailable".to_owned(),
+            }],
+            ..TickFacts::default()
+        };
+        let open = [OpenAction {
+            id: 1,
+            kind: ActionKind::EscalateStalePr,
+            subject: "draco:ws:lane".to_owned(),
+            started_at: 1_000,
+            due_by: 2_000,
+            rung: None,
+            parent: None,
+        }];
+        let result = plan(&PlanInput {
+            report: &report,
+            first_seen: &[],
+            settings: &settings,
+            interval_ms: 300_000,
+            facts: &facts,
+            capacity: &Capacity::default(),
+            orders: &StandingOrders::Missing,
+            open: &open,
+        });
+        assert_eq!(result.resolved, open);
+    }
 
     #[test]
     fn positive_ready_buffer_deficit_routes_to_its_project_planner() {

@@ -216,10 +216,20 @@ impl Ledger {
         for event in &facts.drain_done {
             tx.execute(
                 "INSERT INTO capacity_event(host,lane,kind,reason,evidence_kind,at,source_basis)
-                 VALUES(?1,?2,'drain_done','current_non_working_no_build',NULL,?3,?4)",
+                 VALUES(?1,?2,?3,?4,NULL,?5,?6)",
                 params![
                     event.host.to_lowercase(),
                     event.lane.to_lowercase(),
+                    if event.lane_lost {
+                        "lane_lost"
+                    } else {
+                        "drain_done"
+                    },
+                    if event.lane_lost {
+                        "assignment_disappeared"
+                    } else {
+                        "current_non_working_no_build"
+                    },
                     run_ms,
                     event.source_basis
                 ],
@@ -244,16 +254,27 @@ impl Ledger {
             )?;
         }
         for event in &facts.overload_events {
+            let host = event.host.to_lowercase();
+            let previous_active = tx
+                .query_row(
+                    "SELECT active FROM capacity_overload_state WHERE lower(host)=lower(?1) AND cause=?2",
+                    params![host, event.cause],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .is_some_and(|active| active != 0);
+            if event.active && !previous_active {
+                tx.execute(
+                    "INSERT INTO capacity_event(host,kind,reason,evidence_kind,at,source_basis)
+                     VALUES(?1,'overload_event',?2,?2,?3,?4)",
+                    params![host, event.cause, run_ms, event.source_basis],
+                )?;
+            }
             tx.execute(
-                "INSERT INTO capacity_event(host,kind,reason,evidence_kind,at,source_basis)
-                 VALUES(?1,'overload_event',?2,?3,?4,?5)",
-                params![
-                    event.host.to_lowercase(),
-                    event.cause,
-                    event.cause,
-                    run_ms,
-                    event.source_basis,
-                ],
+                "INSERT INTO capacity_overload_state(host,cause,active,updated_at,source_basis)
+                 VALUES(?1,?2,?3,?4,?5) ON CONFLICT(host,cause) DO UPDATE SET
+                 active=excluded.active,updated_at=excluded.updated_at,source_basis=excluded.source_basis",
+                params![host, event.cause, i64::from(event.active), run_ms, event.source_basis],
             )?;
         }
         for sample in &facts.capacity_throttle_samples {
@@ -650,6 +671,62 @@ mod tests {
     use crate::fleet::{ClassKind, FleetConfig, FleetReport};
     use ix_trace_rs::trace;
 
+    #[test]
+    fn overload_events_record_only_breach_transitions() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ledger.sqlite3");
+        let mut ledger = Ledger::open(&path, &FleetConfig::default()).unwrap();
+        let report = |run_ms| FleetReport {
+            schema_version: 1,
+            complete: true,
+            run_ms,
+            rows: Vec::new(),
+            hosts: Vec::new(),
+            defects: Vec::new(),
+            host_busy: BTreeMap::new(),
+            relay_unavailable: false,
+        };
+        let settings = TickSettings::default();
+        let orders = StandingOrders::Missing;
+        let focus = BTreeMap::new();
+        let event = |active| crate::fleet::tick::OverloadEventSample {
+            host: "host-a".to_owned(),
+            cause: "thermal_limit_breach".to_owned(),
+            active,
+            source_basis: "temperature_and_configured_limit".to_owned(),
+        };
+        for (at, active) in [
+            (10_000, true),
+            (20_000, true),
+            (30_000, false),
+            (40_000, true),
+        ] {
+            let facts = TickFacts {
+                overload_events: vec![event(active)],
+                ..TickFacts::default()
+            };
+            ledger
+                .commit_tick(&TickCommit {
+                    report: &report(at),
+                    settings: &settings,
+                    facts: &facts,
+                    orders: &orders,
+                    session: None,
+                    focus: &focus,
+                })
+                .unwrap();
+        }
+        let connection = Connection::open(&path).unwrap();
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM capacity_event WHERE kind='overload_event'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
     #[trace("FR-038-AC-24")]
     #[test]
     fn need_ready_ticket_action_persists_requested_count_and_resolution_times() {
@@ -770,6 +847,7 @@ mod tests {
                 host: "draco".to_owned(),
                 lane: "draco:workspace:build".to_owned(),
                 source_basis: "watcher_state+compile_increase_300s".to_owned(),
+                lane_lost: false,
             }],
             host_output_samples: vec![crate::fleet::tick::HostOutputSample {
                 host: "draco".to_owned(),

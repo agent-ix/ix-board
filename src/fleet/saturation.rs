@@ -7,7 +7,7 @@ use crate::fleet::live::PromQuery;
 use ix_trace_rs::implements;
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 /// A source value with its availability and basis, retained in the JSON contract.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -69,7 +69,7 @@ pub struct HostInput {
     pub supplied_lanes: u32,
     /// Reachable lanes without an unfinished assigned ticket.
     pub unsupplied_lanes: u32,
-    /// Whether relay assignments and work-event history were read completely.
+    /// Whether the relay assignment lists were read completely.
     pub assignment_evidence_available: bool,
     /// Whether the host's registry lease is stale.
     pub stale_host: bool,
@@ -459,13 +459,18 @@ pub fn live_drain_done(
         escape_label(host),
         escape_label(lane)
     );
-    let freshness = query_sum(query, &format!("max(time() - timestamp({selector}))"));
+    let freshness = query_sum(query, &format!("min(time() - timestamp({selector}))"));
     let non_working_selector = format!(
         "ix_fleet_lane_state_ratio{{host=\"{}\",lane=\"{}\",state!=\"working\"}}",
         escape_label(host),
         escape_label(lane)
     );
-    let non_working = query_sum(query, &format!("sum({non_working_selector})"));
+    let newest_non_working = format!(
+        "({non_working_selector}) and on(host,lane,state) \
+         (timestamp({non_working_selector}) == on(host,lane) group_left \
+         max by(host,lane)(timestamp({selector})))"
+    );
+    let non_working = query_sum(query, &format!("sum({newest_non_working})"));
     let compile_selector = format!(
         "ix_fleet_lane_compile_seconds_total{{host=\"{}\",lane=\"{}\",job=\"ix-relay-watcher\"}}",
         escape_label(host),
@@ -541,6 +546,51 @@ fn allocate_ready_shares(hosts: &[HostInput], ready: u32) -> BTreeMap<String, u3
     shares
 }
 
+fn allocate_ready_by_targets(targets: &[(String, u32)], ready: u32) -> BTreeMap<String, u32> {
+    let total = targets
+        .iter()
+        .map(|(_, target)| u64::from(*target))
+        .sum::<u64>();
+    let allocatable = u64::from(ready).min(total);
+    if total == 0 || allocatable == 0 {
+        return targets
+            .iter()
+            .map(|(host, _)| (host.to_lowercase(), 0))
+            .collect();
+    }
+    let mut allocated = BTreeMap::new();
+    let mut remainders = Vec::new();
+    let mut assigned = 0_u64;
+    for (host, target) in targets {
+        let numerator = allocatable * u64::from(*target);
+        let share = numerator / total;
+        let remainder = numerator % total;
+        allocated.insert(
+            host.to_lowercase(),
+            u32::try_from(share).unwrap_or(u32::MAX),
+        );
+        assigned += share;
+        remainders.push((remainder, host.to_lowercase(), *target));
+    }
+    remainders.sort_by(|(left_rem, left_host, _), (right_rem, right_host, _)| {
+        right_rem
+            .cmp(left_rem)
+            .then_with(|| left_host.cmp(right_host))
+    });
+    let mut remaining = allocatable.saturating_sub(assigned);
+    for (_, host, target) in remainders {
+        if remaining == 0 {
+            break;
+        }
+        let share = allocated.entry(host).or_default();
+        if *share < target {
+            *share += 1;
+            remaining -= 1;
+        }
+    }
+    allocated
+}
+
 #[implements("FR-041-AC-11")]
 fn bootstrap_ticket_pool(hosts: &[HostInput], ready: u32, queued_behind_first: u32) -> u32 {
     let total_unsupplied = hosts
@@ -550,116 +600,6 @@ fn bootstrap_ticket_pool(hosts: &[HostInput], ready: u32, queued_behind_first: u
     ready
         .saturating_sub(total_unsupplied)
         .saturating_add(queued_behind_first)
-}
-
-#[derive(serde::Deserialize)]
-struct WorkEventsPage {
-    version: u32,
-    available_from_ms: i64,
-    has_more: bool,
-    next_cursor: Option<String>,
-    truncated: bool,
-    events: Vec<WorkEvent>,
-}
-
-#[derive(serde::Deserialize)]
-struct WorkEvent {
-    id: String,
-    binding: WorkBinding,
-    change: WorkChange,
-}
-
-#[derive(serde::Deserialize)]
-struct WorkBinding {
-    address: String,
-}
-
-#[derive(serde::Deserialize)]
-struct WorkChange {
-    agent: Option<WorkAgent>,
-}
-
-#[derive(serde::Deserialize)]
-struct WorkAgent {
-    agent_id: Option<String>,
-    name: String,
-    ticket: String,
-    status: String,
-}
-
-#[implements("FR-041-AC-11")]
-fn read_running_work_assignments(
-    timeout: std::time::Duration,
-) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
-    const PAGE_SIZE: usize = 400;
-    const MAX_PAGES: usize = 100;
-    let executable = std::env::var_os("IX_BOARD_AGENT_MSG").unwrap_or_else(|| "agent-msg".into());
-    let executable = executable.to_string_lossy();
-    let mut cursor: Option<String> = None;
-    let mut available_from_ms = None;
-    let mut latest = BTreeMap::<(String, String), (String, String)>::new();
-    for _ in 0..MAX_PAGES {
-        let limit = PAGE_SIZE.to_string();
-        let mut args = vec!["work", "events", "--limit", limit.as_str()];
-        if let Some(after) = cursor.as_deref() {
-            args.extend(["--after", after]);
-        }
-        let bytes = crate::team_metrics::read_history(&executable, &args, timeout)
-            .map_err(|error| format!("read agent-msg work events: {error}"))?;
-        let page: WorkEventsPage = serde_json::from_slice(&bytes)
-            .map_err(|error| format!("decode agent-msg work events: {error}"))?;
-        if page.version != 1 || page.events.len() > PAGE_SIZE || page.truncated {
-            return Err("agent-msg work-event history is incomplete".to_owned());
-        }
-        match available_from_ms {
-            Some(boundary) if boundary != page.available_from_ms => {
-                return Err(
-                    "agent-msg work-event coverage boundary changed during pagination".to_owned(),
-                );
-            }
-            None => available_from_ms = Some(page.available_from_ms),
-            _ => {}
-        }
-        for event in page.events {
-            let Some(agent) = event.change.agent else {
-                continue;
-            };
-            let lane = event.binding.address.trim().to_lowercase();
-            let ticket = agent
-                .ticket
-                .trim()
-                .rsplit('/')
-                .next()
-                .unwrap_or_default()
-                .to_lowercase();
-            let identity = agent
-                .agent_id
-                .filter(|id| !id.trim().is_empty())
-                .unwrap_or_else(|| agent.name.clone());
-            if lane.is_empty() || ticket.is_empty() || identity.trim().is_empty() {
-                continue;
-            }
-            latest.insert((lane, identity), (ticket, agent.status.to_lowercase()));
-            let _ = event.id;
-        }
-        if !page.has_more {
-            let mut running = BTreeMap::<String, BTreeSet<String>>::new();
-            for ((lane, _), (ticket, status)) in latest {
-                if status == "running" {
-                    running.entry(lane).or_default().insert(ticket);
-                }
-            }
-            return Ok(running);
-        }
-        let next_cursor = page
-            .next_cursor
-            .ok_or_else(|| "agent-msg work events has_more without next_cursor".to_owned())?;
-        if cursor.as_deref() == Some(next_cursor.as_str()) {
-            return Err("agent-msg work-event cursor did not advance".to_owned());
-        }
-        cursor = Some(next_cursor);
-    }
-    Err("agent-msg work-event history exceeded page limit".to_owned())
 }
 
 /// Computes supply, mean duty, target, buffer, and planner shares with no external reads.
@@ -717,10 +657,7 @@ pub fn evaluate(input: SaturationInput) -> SaturationReport {
     for source in input.hosts {
         if source.active_lanes == 0 {
             let ready_share = if !source.assignment_evidence_available {
-                unavailable(
-                    "relay.assignments+agent-msg.work.events",
-                    "assignment_evidence_unavailable",
-                )
+                unavailable("relay.assignments", "assignment_evidence_unavailable")
             } else {
                 Evidence::available(0, "no_unsupplied_lanes", 1.0)
             };
@@ -742,7 +679,7 @@ pub fn evaluate(input: SaturationInput) -> SaturationReport {
                 ready_share: ready_share.clone(),
                 queued_behind_first: queued_behind_first.clone(),
                 bootstrap_ticket_pool: bootstrap_ticket_pool.clone(),
-                registry_current: !source.stale_host,
+                registry_current: !source.stale_host && source.active_lanes > 0,
                 target_ready: Evidence::unavailable(
                     "fleet.capacity",
                     "no_current_reachable_lanes",
@@ -800,10 +737,7 @@ pub fn evaluate(input: SaturationInput) -> SaturationReport {
             |target| Evidence::available(target, "fleet.queue_depth", 1.0),
         );
         let ready_share = if !source.assignment_evidence_available {
-            unavailable(
-                "relay.assignments+agent-msg.work.events",
-                "assignment_evidence_unavailable",
-            )
+            unavailable("relay.assignments", "assignment_evidence_unavailable")
         } else {
             ready_shares.as_ref().map_or_else(
                 || unavailable("linear.ready_queue.share", "project_buffer_pending"),
@@ -841,7 +775,7 @@ pub fn evaluate(input: SaturationInput) -> SaturationReport {
             ready_share: ready_share.clone(),
             queued_behind_first: queued_behind_first.clone(),
             bootstrap_ticket_pool: bootstrap_ticket_pool.clone(),
-            registry_current: !source.stale_host,
+            registry_current: !source.stale_host && source.active_lanes > 0,
             target_ready,
             ready_buffer: ready_share,
             ready_buffer_deficit,
@@ -856,12 +790,23 @@ pub fn evaluate(input: SaturationInput) -> SaturationReport {
         .zip(total_ready)
         .map(|(target, ready)| target.saturating_sub(ready));
     if let Some(ready) = total_ready {
+        let targets = hosts
+            .iter()
+            .filter_map(|host| {
+                host.target_ready
+                    .value
+                    .map(|target| (host.host.clone(), target))
+            })
+            .collect::<Vec<_>>();
+        let allocations = allocate_ready_by_targets(&targets, ready);
         for host in &mut hosts {
             if let Some(target) = host.target_ready.value {
-                let allocated = ready
-                    .saturating_mul(target)
-                    .checked_div(known_target_total)
+                let allocated = allocations
+                    .get(&host.host.to_lowercase())
+                    .copied()
                     .unwrap_or_default();
+                host.ready_buffer =
+                    Evidence::available(allocated, "linear.ready_queue.target_share", 1.0);
                 host.ready_buffer_deficit =
                     Evidence::available(target.saturating_sub(allocated), "fleet.capacity", 1.0);
             }
@@ -1052,9 +997,7 @@ pub fn read_live(
     let assignments = relay
         .assignments()
         .map_err(|error| crate::fleet::FleetError::Tick(error.to_string()))?;
-    let running_assignments = read_running_work_assignments(config.host_timeout);
-    let assignment_evidence_available = running_assignments.is_ok();
-    let running_assignments = running_assignments.unwrap_or_default();
+    let assignment_evidence_available = true;
 
     let source = LinearGraphQlSource::from_env()
         .map_err(|error| crate::fleet::FleetError::Tick(error.to_string()))?;
@@ -1122,12 +1065,11 @@ pub fn read_live(
             continue;
         }
         for (position, ticket) in list.tickets.into_iter().enumerate() {
-            let key = ticket
-                .reference
-                .rsplit('/')
-                .next()
-                .unwrap_or(&ticket.reference)
-                .to_lowercase();
+            let key = if ticket.id.trim().is_empty() {
+                ticket.reference.trim().to_lowercase()
+            } else {
+                ticket.id.trim().to_lowercase()
+            };
             reachable_assigned.insert(key.clone());
             let issue = issue_map.get(&key);
             if issue.is_some_and(|issue| is_unfinished_assignment(issue)) {
@@ -1146,31 +1088,6 @@ pub fn read_live(
             }
         }
     }
-    for (lane, tickets) in running_assignments {
-        if !reachable_lanes.contains(&lane) {
-            continue;
-        }
-        for key in tickets {
-            let Some(issue) = issue_map.get(&key) else {
-                continue;
-            };
-            if !is_unfinished_assignment(issue) {
-                continue;
-            }
-            supplied_lanes.insert(lane.clone());
-            reachable_assigned.insert(key.clone());
-            if let Some(project) = issue
-                .project_id
-                .as_ref()
-                .and_then(|project| project_keys.get(&project.0))
-            {
-                lane_project
-                    .entry(lane.clone())
-                    .or_insert_with(|| project.clone());
-            }
-        }
-    }
-
     let mut project_ready: BTreeMap<String, u32> = project_keys
         .values()
         .cloned()
@@ -1272,7 +1189,7 @@ pub fn read_live(
                     .host
                     .as_deref()
                     .is_some_and(|defect_host| defect_host.eq_ignore_ascii_case(&host_key))
-        });
+        }) || lanes.is_empty();
         let sustainable_slots = if stale_host {
             Evidence::available(
                 0,
@@ -1443,6 +1360,38 @@ mod tests {
     use super::*;
     use crate::fleet::SourceError;
     use ix_trace_rs::trace;
+
+    #[test]
+    fn configured_host_with_no_reachable_lanes_is_not_registry_current() {
+        let report = evaluate(SaturationInput {
+            observed_at_ms: 1_000,
+            window_secs: 3_600,
+            queue_depth: 1,
+            hosts: vec![HostInput {
+                host: "draco".to_owned(),
+                sustainable_slots: Evidence::available(2, "config", 1.0),
+                lane_capacity: Evidence::unavailable(
+                    "config",
+                    "lane_capacity_not_configured",
+                    None,
+                ),
+                build_slots_busy: Evidence::unavailable("broker", "series_missing", None),
+                build_slots_configured: Evidence::unavailable("broker", "series_missing", None),
+                duty: Evidence::unavailable("watcher", "no_current_lanes", None),
+                active_lanes: 0,
+                supplied_lanes: 0,
+                unsupplied_lanes: 0,
+                assignment_evidence_available: true,
+                stale_host: false,
+            }],
+            project_ready: Some(BTreeMap::new()),
+            queued_behind_first: Some(0),
+            planners: BTreeMap::new(),
+            project_lanes: BTreeMap::new(),
+        });
+        assert!(!report.hosts[0].registry_current);
+    }
+
     use std::sync::Mutex;
 
     fn ready_issue(state: &str, state_type: crate::WorkflowStateType) -> crate::Issue {
@@ -1485,8 +1434,6 @@ mod tests {
                 360.0
             } else if expression.contains("count_over_time(ix_fleet_lane_compile_seconds_total") {
                 self.compiler_samples
-            } else if expression.contains("state!=\"idle\"") {
-                108.0
             } else {
                 108.0
             };
@@ -1506,11 +1453,9 @@ mod tests {
             let is_short_lane = expression.contains("lane=\"draco:workspace:short\"");
             let value = if expression.contains("increase(ix_fleet_lane_compile_seconds_total") {
                 if is_short_lane { 0.0 } else { 324.0 }
-            } else if expression.contains("count_over_time(ix_fleet_lane_compile_seconds_total") {
-                if is_short_lane { 80.0 } else { 108.0 }
-            } else if expression.contains("state!=\"idle\"") {
-                if is_short_lane { 80.0 } else { 108.0 }
-            } else if expression.contains("count_over_time((max by (host,lane)") {
+            } else if expression.contains("count_over_time(ix_fleet_lane_compile_seconds_total")
+                || expression.contains("count_over_time((max by (host,lane)")
+            {
                 if is_short_lane { 80.0 } else { 108.0 }
             } else {
                 return Err(SourceError(format!("unexpected query: {expression}")));
@@ -1885,8 +1830,8 @@ mod tests {
             assert_eq!(host.bootstrap_ticket_pool.value, Some(3));
         }
         assert!(!report.hosts[1].registry_current);
-        assert!(report.hosts[2].registry_current);
-        assert!(report.hosts[3].registry_current);
+        assert!(!report.hosts[2].registry_current);
+        assert!(!report.hosts[3].registry_current);
     }
 
     #[test]
@@ -1943,6 +1888,58 @@ mod tests {
         assert_eq!(shares.get("draco"), Some(&1));
         assert_eq!(shares.get("terra"), Some(&0));
         assert_eq!(shares.values().sum::<u32>(), 1);
+    }
+
+    #[test]
+    fn per_host_ready_buffers_and_deficits_sum_to_the_global_values() {
+        let hosts = ["draco", "terra", "titan"]
+            .into_iter()
+            .map(|host| HostInput {
+                host: host.to_owned(),
+                sustainable_slots: Evidence::available(1, "config", 1.0),
+                lane_capacity: Evidence::unavailable(
+                    "config",
+                    "lane_capacity_not_configured",
+                    None,
+                ),
+                build_slots_busy: Evidence::unavailable("broker", "series_missing", None),
+                build_slots_configured: Evidence::unavailable("broker", "series_missing", None),
+                duty: Evidence::available(0.25, "watcher", 1.0),
+                active_lanes: 1,
+                supplied_lanes: 0,
+                unsupplied_lanes: 1,
+                assignment_evidence_available: true,
+                stale_host: false,
+            })
+            .collect();
+        let report = evaluate(SaturationInput {
+            observed_at_ms: 1_000,
+            window_secs: 3_600,
+            queue_depth: 1,
+            hosts,
+            project_ready: Some(BTreeMap::from([("QSL".to_owned(), 2)])),
+            queued_behind_first: Some(0),
+            planners: BTreeMap::new(),
+            project_lanes: BTreeMap::from([("QSL".to_owned(), 3)]),
+        });
+        assert_eq!(report.ready_buffer.value, Some(2));
+        assert_eq!(report.ready_buffer_deficit.value, Some(10));
+        assert_eq!(
+            report
+                .hosts
+                .iter()
+                .map(|host| host.ready_buffer.value.unwrap())
+                .sum::<u32>(),
+            2
+        );
+        assert_eq!(
+            report
+                .hosts
+                .iter()
+                .map(|host| host.ready_buffer_deficit.value.unwrap())
+                .sum::<u32>(),
+            10
+        );
     }
 
     #[trace("FR-041-AC-11")]

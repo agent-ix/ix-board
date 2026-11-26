@@ -13,6 +13,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::time::Duration;
 
 type CapacityLevelEvidence = (
     i64,
@@ -433,6 +434,7 @@ pub fn mark_draining(
     let host = host.trim().to_lowercase();
     if host.is_empty()
         || lane.trim().is_empty()
+        || !lane.trim().to_lowercase().starts_with(&format!("{host}:"))
         || !matches!(
             reason,
             "memory_below_reserve" | "thermal_abort" | "throttle" | "knee_step_back"
@@ -450,16 +452,57 @@ pub fn mark_draining(
         .prometheus_url
         .as_deref()
         .and_then(|url| crate::fleet::live::PromHttp::new(url, config.host_timeout).ok());
+    let query = prometheus
+        .as_ref()
+        .ok_or_else(|| LedgerError::Capacity("drain needs live lane-state evidence".to_owned()))?;
+    if !live_lane_current(query, &host, lane, at_ms, config.push_interval) {
+        return Err(LedgerError::Capacity(
+            "drain lane is not present in current watcher state".to_owned(),
+        ));
+    }
     let live = crate::fleet::capacity::LiveMeasurementSource {
         config,
         prometheus: prometheus
             .as_ref()
             .map(|query| query as &dyn crate::fleet::live::PromQuery),
     };
-    let evidence = live.derived_evidence_kind(&host);
-    let ceiling_until = at_ms.saturating_add(6 * 60 * 60 * 1000);
+    let evidence = live
+        .derived_evidence_kind(&host)
+        .or_else(|| {
+            if reason == "knee_step_back" {
+                status(path).ok().and_then(|status| {
+                    status
+                        .steps
+                        .iter()
+                        .any(|step| {
+                            step.host.eq_ignore_ascii_case(&host)
+                                && step.valid == Some(true)
+                                && step.knee_signal == Some(true)
+                        })
+                        .then_some("knee")
+                })
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            LedgerError::Capacity("drain requires current source-backed evidence".to_owned())
+        })?;
+    let ceiling_until =
+        (reason != "knee_step_back").then_some(at_ms.saturating_add(6 * 60 * 60 * 1000));
     let mut ledger = Ledger::open(path, config)?;
     let tx = ledger.connection.transaction()?;
+    let active_mark: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM capacity_event d WHERE lower(d.host)=lower(?1)
+          AND lower(d.lane)=lower(?2) AND d.kind='draining_mark' AND NOT EXISTS (
+            SELECT 1 FROM capacity_event f WHERE lower(f.lane)=lower(d.lane)
+              AND f.kind IN ('drain_done','lane_removed','lane_lost') AND f.at>=d.at))",
+        params![host, lane],
+        |row| row.get(0),
+    )?;
+    if active_mark {
+        return Ok(());
+    }
     for kind in ["draining_mark", "step_down"] {
         tx.execute(
             "INSERT INTO capacity_event(host,lane,kind,reason,evidence_kind,at,ceiling_until,
@@ -472,12 +515,43 @@ pub fn mark_draining(
                 evidence,
                 at_ms,
                 ceiling_until,
-                serde_json::json!({"source":"fleet.capacity.drain","evidence":"live measurement series"}).to_string()
+                serde_json::json!({"source":"fleet.capacity.drain","evidence_kind":evidence})
+                    .to_string()
             ],
         )?;
     }
     tx.commit()?;
     Ok(())
+}
+
+fn live_lane_current(
+    query: &dyn crate::fleet::live::PromQuery,
+    host: &str,
+    lane: &str,
+    at_ms: i64,
+    push_interval: Duration,
+) -> bool {
+    let expression = format!(
+        "max(ix_fleet_lane_state_ratio{{host=\"{}\",lane=\"{}\",job=\"ix-relay-watcher\"}})",
+        host.replace('"', "\\\""),
+        lane.replace('"', "\\\"")
+    );
+    let Ok(body) = query.query_at(&expression, at_ms) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return false;
+    };
+    let Some(samples) = value["data"]["result"].as_array() else {
+        return false;
+    };
+    let max_age = push_interval.as_millis().saturating_mul(2) as f64 / 1000.0;
+    samples.iter().any(|sample| {
+        sample["value"][0].as_f64().is_some_and(|timestamp| {
+            let age = at_ms as f64 / 1000.0 - timestamp;
+            (0.0..=max_age).contains(&age)
+        })
+    })
 }
 
 /// Persists one saturation run's per-host deficits.
@@ -952,7 +1026,21 @@ fn read_connection(path: &Path) -> Result<Option<Connection>, LedgerError> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     let found = user_version(&connection)?;
-    if found != VERSION {
+    if found > VERSION {
+        return Err(LedgerError::UnsupportedVersion {
+            path: path.to_owned(),
+            found,
+        });
+    }
+    if found < VERSION {
+        let capacity_schema: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='capacity_run')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !capacity_schema {
+            return Ok(None);
+        }
         return Err(LedgerError::UnsupportedVersion {
             path: path.to_owned(),
             found,
@@ -1199,11 +1287,16 @@ pub fn status(path: &Path) -> Result<CapacityStatus, LedgerError> {
                     && event.kind == "draining_mark"
                     && !events.iter().any(|later| {
                         later.lane == event.lane
-                            && matches!(later.kind.as_str(), "drain_done" | "lane_removed")
+                            && matches!(
+                                later.kind.as_str(),
+                                "drain_done" | "lane_removed" | "lane_lost"
+                            )
                             && later.at >= event.at
                     })
             })
             .filter_map(|event| event.lane.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect();
         host_rows.push(CapacityHost {
             host,
@@ -1223,32 +1316,38 @@ pub fn status(path: &Path) -> Result<CapacityStatus, LedgerError> {
     for step in &mut steps {
         let mut statement = connection.prepare(
             "SELECT lane, tickets_closed, prs_merged, commits_pushed, source_basis
-             FROM capacity_step_lane_output WHERE run_id=?1 AND step_no=?2 ORDER BY lane",
+             FROM capacity_step_lane_output WHERE run_id=?1 AND step_no=?2
+               AND (window_end=?3 OR (window_end IS NULL AND
+                 (SELECT COUNT(*) FROM capacity_step s WHERE s.run_id=?1 AND s.step_no=?2)=1))
+             ORDER BY lane",
         )?;
         step.lane_output = statement
-            .query_map(params![step.run_id, i64::from(step.step_no)], |row| {
-                let source_json: String = row.get(4)?;
-                let source_basis = serde_json::from_str(&source_json).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        4,
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                })?;
-                Ok(LaneOutputMeasurement {
-                    lane: row.get(0)?,
-                    tickets_closed: row
-                        .get::<_, Option<i64>>(1)?
-                        .and_then(|n| u64::try_from(n).ok()),
-                    prs_merged: row
-                        .get::<_, Option<i64>>(2)?
-                        .and_then(|n| u64::try_from(n).ok()),
-                    commits_pushed: row
-                        .get::<_, Option<i64>>(3)?
-                        .and_then(|n| u64::try_from(n).ok()),
-                    source_basis,
-                })
-            })?
+            .query_map(
+                params![step.run_id, i64::from(step.step_no), step.window_end],
+                |row| {
+                    let source_json: String = row.get(4)?;
+                    let source_basis = serde_json::from_str(&source_json).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            4,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                    Ok(LaneOutputMeasurement {
+                        lane: row.get(0)?,
+                        tickets_closed: row
+                            .get::<_, Option<i64>>(1)?
+                            .and_then(|n| u64::try_from(n).ok()),
+                        prs_merged: row
+                            .get::<_, Option<i64>>(2)?
+                            .and_then(|n| u64::try_from(n).ok()),
+                        commits_pushed: row
+                            .get::<_, Option<i64>>(3)?
+                            .and_then(|n| u64::try_from(n).ok()),
+                        source_basis,
+                    })
+                },
+            )?
             .collect::<Result<Vec<_>, _>>()?;
     }
     Ok(CapacityStatus {
@@ -1366,10 +1465,32 @@ fn metrics_at(path: &Path, now_ms: i64) -> Result<String, LedgerError> {
     text.push_str("# TYPE ix_fleet_host_output_share_of_recorded_level_timestamp_seconds gauge\n");
     let trailing_hour = now_ms.saturating_sub(3_600_000);
     let connection = if path.exists() {
-        Some(Connection::open_with_flags(
+        let connection = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?)
+        )?;
+        let found = user_version(&connection)?;
+        let capacity_schema: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='capacity_run')",
+            [],
+            |row| row.get(0),
+        )?;
+        if found > VERSION {
+            return Err(LedgerError::UnsupportedVersion {
+                path: path.to_owned(),
+                found,
+            });
+        }
+        if !capacity_schema {
+            None
+        } else if found == VERSION {
+            Some(connection)
+        } else {
+            return Err(LedgerError::UnsupportedVersion {
+                path: path.to_owned(),
+                found,
+            });
+        }
     } else {
         None
     };
@@ -1447,7 +1568,11 @@ fn metrics_at(path: &Path, now_ms: i64) -> Result<String, LedgerError> {
                 ));
             }
         }
-        for cause in ["memory_below_reserve", "thermal_abort"] {
+        for cause in [
+            "memory_below_reserve",
+            "thermal_limit_breach",
+            "thermal_abort",
+        ] {
             let count = status
                 .events
                 .iter()
@@ -1457,9 +1582,11 @@ fn metrics_at(path: &Path, now_ms: i64) -> Result<String, LedgerError> {
                         && event.reason.as_deref() == Some(cause)
                 })
                 .count();
-            text.push_str(&format!(
-                "ix_fleet_capacity_overload_events_total{{host=\"{escaped}\",cause=\"{cause}\"}} {count}\n"
-            ));
+            if count > 0 {
+                text.push_str(&format!(
+                    "ix_fleet_capacity_overload_events_total{{host=\"{escaped}\",cause=\"{cause}\"}} {count}\n"
+                ));
+            }
         }
     }
     if let Some(connection) = connection.as_ref() {
@@ -1502,13 +1629,14 @@ fn metrics_at(path: &Path, now_ms: i64) -> Result<String, LedgerError> {
                 "ix_fleet_ready_buffer_deficit_timestamp_seconds{{host=\"{escaped}\"}} {}\n",
                 prometheus_seconds(*at)
             ));
-            if *at <= now_ms && now_ms.saturating_sub(*at) <= 600_000 {
-                if let Some(deficit) = deficit {
-                    text.push_str(&format!(
-                        "ix_fleet_ready_buffer_deficit{{host=\"{escaped}\"}} {deficit}\n"
-                    ));
-                    continue;
-                }
+            if *at <= now_ms
+                && now_ms.saturating_sub(*at) <= 600_000
+                && let Some(deficit) = deficit
+            {
+                text.push_str(&format!(
+                    "ix_fleet_ready_buffer_deficit{{host=\"{escaped}\"}} {deficit}\n"
+                ));
+                continue;
             }
             let unavailable = if *at > now_ms {
                 "sample_future"
@@ -1931,9 +2059,10 @@ fn record_window_inner(
            inconclusive_reason,deficit_coverage,deficit_zero_throughout,host_output_per_hour,
            tickets_closed,prs_merged,commits_pushed,output_basis,queue_wait_p90_s,throttled_share,
            memory_headroom_min,thermal_headroom_min,slots_busy_equals_sustainable,knee_signal,
-           knee_reason,source_basis,build_slots_busy,build_slots_sustainable,measurement_values)
+           knee_reason,source_basis,build_slots_busy,build_slots_sustainable,measurement_values,
+           window_min_ms)
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,
-                ?22,?23,?24,?25,?26,?27,?28)",
+                ?22,?23,?24,?25,?26,?27,?28,?29)",
         params![
             run_id,
             step_no,
@@ -1963,6 +2092,7 @@ fn record_window_inner(
             build_slots_busy,
             build_slots_sustainable,
             measurement_values,
+            i64::try_from(config.capacity_window_min.as_millis()).unwrap_or(i64::MAX),
         ],
     )?;
     for lane in &measurement.lane_output {
@@ -1997,8 +2127,8 @@ fn record_window_inner(
             })?;
         tx.execute(
             "INSERT INTO capacity_step_lane_output(
-               run_id,step_no,lane,tickets_closed,prs_merged,commits_pushed,source_basis)
-             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+               run_id,step_no,lane,tickets_closed,prs_merged,commits_pushed,source_basis,window_end)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
             params![
                 run_id,
                 step_no,
@@ -2006,7 +2136,8 @@ fn record_window_inner(
                 tickets,
                 prs,
                 commits,
-                lane_sources
+                lane_sources,
+                measurement.window_end_ms
             ],
         )?;
     }

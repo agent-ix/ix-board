@@ -14,12 +14,16 @@ use std::time::Duration;
 trait PullRequestFacts {
     fn issues(&mut self, tickets: &[String]) -> Result<Vec<crate::Issue>, String>;
     fn activity(&self, url: &str) -> Result<PullRequestActivity, String>;
+    fn search_open_pull_requests(
+        &self,
+        _tickets: &[String],
+    ) -> Result<Vec<(String, String)>, String> {
+        Ok(Vec::new())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PullRequestActivity {
-    title: String,
-    branch: String,
     last_activity_ms: i64,
 }
 
@@ -50,6 +54,8 @@ struct WorkEventsPage {
 
 #[derive(Clone, Debug, serde::Deserialize)]
 struct WorkEvent {
+    #[serde(default)]
+    at_ms: i64,
     binding: WorkEventBinding,
     change: WorkEventChange,
 }
@@ -66,11 +72,20 @@ struct WorkEventChange {
 
 #[derive(Clone, Debug, serde::Deserialize)]
 struct WorkEventAgent {
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    name: String,
     ticket: String,
+    #[serde(default)]
+    status: String,
 }
 
 struct LivePullRequestFacts {
     timeout: Duration,
+    repositories: Vec<String>,
+    github_token: Option<String>,
+    api_root: String,
 }
 
 impl PullRequestFacts for LivePullRequestFacts {
@@ -95,6 +110,69 @@ impl PullRequestFacts for LivePullRequestFacts {
             .map_err(|error| error.to_string())?;
         github_activity(&client, &api_url, token.as_deref().ok())
     }
+
+    fn search_open_pull_requests(
+        &self,
+        tickets: &[String],
+    ) -> Result<Vec<(String, String)>, String> {
+        if self.repositories.is_empty() {
+            return Err("github_repository_scope_unconfigured".to_owned());
+        }
+        if self.github_token.is_none() {
+            return Err("github_token_unconfigured".to_owned());
+        }
+        let client = reqwest::blocking::Client::builder()
+            .timeout(self.timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| error.to_string())?;
+        let mut matches = BTreeMap::<(String, String), ()>::new();
+        for repository in &self.repositories {
+            let (owner, name) = repository
+                .split_once('/')
+                .ok_or_else(|| "invalid github_repositories entry".to_owned())?;
+            let mut complete = false;
+            for page in 1..=100 {
+                let url = format!(
+                    "{}/repos/{owner}/{name}/pulls?state=open&per_page=100&page={page}",
+                    self.api_root.trim_end_matches('/')
+                );
+                let pull_requests: Vec<serde_json::Value> =
+                    github_get(&client, &url, self.github_token.as_deref())?;
+                for pull_request in &pull_requests {
+                    let title = pull_request
+                        .get("title")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    let branch = pull_request
+                        .pointer("/head/ref")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    let Some(url) = pull_request
+                        .get("html_url")
+                        .and_then(serde_json::Value::as_str)
+                    else {
+                        return Err("GitHub pull request omitted html_url".to_owned());
+                    };
+                    for ticket in tickets {
+                        if contains_ticket(title, ticket) || contains_ticket(branch, ticket) {
+                            matches.insert((ticket_key(ticket), url.to_owned()), ());
+                        }
+                    }
+                }
+                if pull_requests.len() < 100 {
+                    complete = true;
+                    break;
+                }
+            }
+            if !complete {
+                return Err(format!(
+                    "open pull request scan exceeded bound for {repository}"
+                ));
+            }
+        }
+        Ok(matches.into_keys().collect())
+    }
 }
 
 #[implements("FR-041-AC-25")]
@@ -104,16 +182,6 @@ fn github_activity(
     token: Option<&str>,
 ) -> Result<PullRequestActivity, String> {
     let facts: serde_json::Value = github_get(client, api_url, token)?;
-    let title = facts
-        .get("title")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "GitHub pull request response omitted title".to_owned())?
-        .to_owned();
-    let branch = facts
-        .pointer("/head/ref")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "GitHub pull request response omitted head.ref".to_owned())?
-        .to_owned();
     let head_sha = facts
         .pointer("/head/sha")
         .and_then(serde_json::Value::as_str)
@@ -162,8 +230,6 @@ fn github_activity(
         }
     }
     Ok(PullRequestActivity {
-        title,
-        branch,
         last_activity_ms: review_ms.map_or(commit_ms, |time| time.max(commit_ms)),
     })
 }
@@ -241,7 +307,7 @@ fn github_api_url_at(url: &str, api_root: &str) -> Result<String, String> {
 #[implements("FR-041-AC-25")]
 fn contains_ticket(text: &str, identifier: &str) -> bool {
     let upper = text.to_ascii_uppercase();
-    let identifier = identifier.to_ascii_uppercase();
+    let identifier = ticket_key(identifier);
     upper.match_indices(&identifier).any(|(start, matched)| {
         let end = start + matched.len();
         let before_ok = upper[..start]
@@ -326,22 +392,29 @@ fn agent_msg_events_page(
 }
 
 #[implements("FR-041-AC-25")]
-fn read_work_events() -> Result<(Vec<(String, String)>, i64), String> {
+fn read_work_events(freshness_ms: i64) -> Result<(Vec<(String, String)>, i64), String> {
     let executable = std::env::var_os("IX_BOARD_AGENT_MSG")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("agent-msg"));
-    collect_work_events(|limit, cursor| agent_msg_events_page(&executable, limit, cursor))
+    collect_work_events(freshness_ms, |limit, cursor| {
+        agent_msg_events_page(&executable, limit, cursor)
+    })
 }
 
 #[implements("FR-041-AC-25")]
 fn collect_work_events(
+    freshness_ms: i64,
     mut read_page: impl FnMut(usize, Option<&str>) -> Result<WorkEventsPage, String>,
 ) -> Result<(Vec<(String, String)>, i64), String> {
     const PAGE_SIZE: usize = 200;
     const MAX_PAGES: usize = 100;
     let mut cursor = None;
     let mut first_available = None;
-    let mut mapping = Vec::new();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "system clock predates Unix epoch".to_owned())?
+        .as_millis() as i64;
+    let mut latest = BTreeMap::<(String, String), (i64, String, String)>::new();
     for _ in 0..MAX_PAGES {
         let page = read_page(PAGE_SIZE, cursor.as_deref())?;
         match first_available {
@@ -355,11 +428,33 @@ fn collect_work_events(
         }
         for event in page.events {
             if let Some(agent) = event.change.agent {
-                if !event.binding.address.trim().is_empty() && !agent.ticket.trim().is_empty() {
-                    mapping.push((
-                        event.binding.address.to_lowercase(),
+                let lane = event.binding.address.trim().to_lowercase();
+                let identity = agent
+                    .agent_id
+                    .filter(|id| !id.trim().is_empty())
+                    .unwrap_or_else(|| {
+                        if agent.name.trim().is_empty() {
+                            agent.ticket.clone()
+                        } else {
+                            agent.name.clone()
+                        }
+                    });
+                if !lane.is_empty()
+                    && !agent.ticket.trim().is_empty()
+                    && !identity.trim().is_empty()
+                {
+                    let key = (lane, identity);
+                    let candidate = (
+                        event.at_ms,
                         ticket_key(&agent.ticket),
-                    ));
+                        agent.status.to_lowercase(),
+                    );
+                    if latest
+                        .get(&key)
+                        .is_none_or(|current| candidate.0 >= current.0)
+                    {
+                        latest.insert(key, candidate);
+                    }
                 }
             }
         }
@@ -367,6 +462,15 @@ fn collect_work_events(
             return Err("agent-msg work events reports truncated coverage".to_owned());
         }
         if !page.has_more {
+            let mapping = latest
+                .into_iter()
+                .filter_map(|((lane, _), (at_ms, ticket, status))| {
+                    (status == "running"
+                        && at_ms <= now_ms
+                        && now_ms.saturating_sub(at_ms) <= freshness_ms)
+                        .then_some((lane, ticket))
+                })
+                .collect();
             return first_available
                 .map(|boundary| (mapping, boundary))
                 .ok_or_else(|| "agent-msg work events returned no page".to_owned());
@@ -509,16 +613,8 @@ fn read_lane_prs(
                     continue;
                 }
             };
-            if !contains_ticket(&activity.title, &issue.identifier)
-                && !contains_ticket(&activity.branch, &issue.identifier)
-            {
-                result.unavailable.push(PrUnavailable {
-                    lane: None, ticket: Some(issue.identifier.clone()), pr: Some(pull_request.url.clone()),
-                    source_basis: "github_pull_request_title_and_branch".to_owned(),
-                    reason: "title and branch do not identify the assigned ticket; item left unattributed".to_owned(),
-                });
-                continue;
-            }
+            // A Linear attachment is the authoritative ticket-to-PR edge. Title and branch
+            // text are not required to repeat the ticket identifier.
             for lane in lanes {
                 result.items.push(LanePr {
                     lane: lane.clone(),
@@ -527,6 +623,51 @@ fn read_lane_prs(
                 });
             }
         }
+    }
+    match facts.search_open_pull_requests(&tickets) {
+        Ok(pull_requests) => {
+            for (ticket, pr) in pull_requests {
+                let key = ticket_key(&ticket);
+                let Some(lanes) = ticket_lanes.get(&key) else {
+                    continue;
+                };
+                match facts.activity(&pr) {
+                    Ok(activity) => {
+                        for lane in lanes {
+                            if !result
+                                .items
+                                .iter()
+                                .any(|item| item.lane.eq_ignore_ascii_case(lane) && item.pr == pr)
+                            {
+                                result.items.push(LanePr {
+                                    lane: lane.clone(),
+                                    pr: pr.clone(),
+                                    last_activity_ms: activity.last_activity_ms,
+                                });
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        for lane in lanes {
+                            result.unavailable.push(PrUnavailable {
+                                lane: Some(lane.clone()),
+                                ticket: Some(ticket.clone()),
+                                pr: Some(pr.clone()),
+                                source_basis: "github_title_branch_ticket_search".to_owned(),
+                                reason: error.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Err(error) => result.unavailable.push(PrUnavailable {
+            lane: None,
+            ticket: None,
+            pr: None,
+            source_basis: "github_repository_title_branch_scan".to_owned(),
+            reason: error,
+        }),
     }
     Ok(result)
 }
@@ -583,7 +724,11 @@ pub(super) fn read_live(
         }),
     }
     let mut available_from_ms = None;
-    match read_work_events() {
+    match read_work_events(
+        i64::try_from(config.push_interval.as_millis())
+            .unwrap_or(i64::MAX)
+            .saturating_mul(2),
+    ) {
         Ok((events, available_from)) => {
             available_from_ms = Some(available_from);
             for (lane, ticket) in events {
@@ -598,7 +743,17 @@ pub(super) fn read_live(
             reason: error,
         }),
     }
-    let mut read = read_lane_prs(&assignment_map, &mut LivePullRequestFacts { timeout })?;
+    let mut read = read_lane_prs(
+        &assignment_map,
+        &mut LivePullRequestFacts {
+            timeout,
+            repositories: config.github_repositories.clone(),
+            github_token: std::env::var("GITHUB_TOKEN")
+                .or_else(|_| std::env::var("GH_TOKEN"))
+                .ok(),
+            api_root: "https://api.github.com".to_owned(),
+        },
+    )?;
     read.unavailable.extend(source_unavailable);
     read.available_from_ms = available_from_ms;
     Ok(read)
@@ -637,11 +792,77 @@ mod tests {
                 return Err("mock GitHub item unavailable".to_owned());
             }
             Ok(PullRequestActivity {
-                title: "SWM-252: test".to_owned(),
-                branch: "swm-252".to_owned(),
                 last_activity_ms: 12_345,
             })
         }
+    }
+
+    #[test]
+    fn missing_lane_ticket_mapping_remains_unavailable() {
+        let result = read_lane_prs(&BTreeMap::new(), &mut Facts(Vec::new())).unwrap();
+        assert!(result.items.is_empty());
+        assert_eq!(result.unavailable.len(), 1);
+        assert!(result.unavailable[0].lane.is_none());
+        assert!(result.unavailable[0].pr.is_none());
+    }
+
+    #[test]
+    fn production_repository_scan_matches_ticket_in_pull_request_branch() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            loop {
+                let size = stream.read(&mut chunk).unwrap();
+                if size == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..size]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let response = serde_json::json!([{
+                "html_url": "https://github.com/agent-ix/ix-board/pull/102",
+                "title": "feature without ticket in title",
+                "head": {"ref": "feature/SWM-252-capacity"}
+            }])
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            )
+            .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let facts = LivePullRequestFacts {
+            timeout: Duration::from_secs(2),
+            repositories: vec!["agent-ix/ix-board".to_owned()],
+            github_token: Some("test-token".to_owned()),
+            api_root: format!("http://{address}"),
+        };
+        let matches = facts
+            .search_open_pull_requests(&["SWM-252".to_owned()])
+            .unwrap();
+        assert_eq!(
+            matches,
+            vec![(
+                "SWM-252".to_owned(),
+                "https://github.com/agent-ix/ix-board/pull/102".to_owned()
+            )]
+        );
+        let request = server.join().unwrap();
+        assert!(request.starts_with("GET /repos/agent-ix/ix-board/pulls?state=open"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("user-agent: ix-board")
+        );
+        assert!(request.contains("authorization: Bearer test-token"));
     }
 
     #[trace("FR-041-AC-25")]
@@ -754,7 +975,7 @@ mod tests {
                 } else if path.contains("/reviews?") {
                     r#"[{"submitted_at":"2026-11-25T11:00:00Z"}]"#
                 } else {
-                    r#"{"title":"SWM-252: add capacity history","head":{"ref":"swm-252-capacity-history","sha":"abc123"},"updated_at":"2099-01-01T00:00:00Z"}"#
+                    r#"{"head":{"sha":"abc123"},"updated_at":"2099-01-01T00:00:00Z"}"#
                 };
                 write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
                 requests.push(path);
@@ -768,8 +989,6 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(activity.title, "SWM-252: add capacity history");
-        assert_eq!(activity.branch, "swm-252-capacity-history");
         assert_eq!(
             activity.last_activity_ms,
             chrono::DateTime::parse_from_rfc3339("2026-11-25T12:00:00Z")
@@ -789,7 +1008,7 @@ mod tests {
 
     #[trace("FR-041-AC-25")]
     #[test]
-    fn github_urls_are_converted_to_api_urls_and_ticket_ids_are_matched_as_tokens() {
+    fn github_urls_are_converted_to_api_urls() {
         assert_eq!(
             github_api_url_at(
                 "https://github.com/agent-ix/ix-board/pull/102",
@@ -797,9 +1016,6 @@ mod tests {
             ),
             Ok("https://api.example.test/repos/agent-ix/ix-board/pulls/102".to_owned()),
         );
-        assert!(contains_ticket("fix SWM-252 race", "SWM-252"));
-        assert!(contains_ticket("SWM-252-capacity-history", "SWM-252"));
-        assert!(!contains_ticket("SWM-2520: unrelated", "SWM-252"));
     }
 
     #[trace("FR-041-AC-25")]
@@ -831,7 +1047,7 @@ mod tests {
             }),
         ];
         let mut index = 0;
-        let (mapping, boundary) = collect_work_events(|limit, cursor| {
+        let (mapping, boundary) = collect_work_events(i64::MAX, |limit, cursor| {
             assert_eq!(limit, 200);
             cursors.push(cursor.map(str::to_owned));
             let page = pages[index].clone();

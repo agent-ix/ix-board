@@ -167,6 +167,83 @@ fn duration(window: &WindowRequest) -> Result<String, CapacityError> {
     Ok(format!("{seconds}s"))
 }
 
+fn output_rate(
+    request: &WindowRequest,
+    tickets_closed: &Observation<u64>,
+    prs_merged: &Observation<u64>,
+    commits_pushed: &Observation<u64>,
+) -> (Observation<f64>, Observation<String>) {
+    let hours = (request.end_ms - request.start_ms) as f64 / 3_600_000.0;
+    match tickets_closed
+        .value
+        .zip(prs_merged.value)
+        .map(|(tickets, prs)| tickets.saturating_add(prs))
+    {
+        Some(output) if output >= 5 => (
+            Observation::available(
+                output as f64 / hours,
+                "linear.tickets_plus_merged_prs",
+                request.end_ms,
+            ),
+            Observation::available(
+                "tickets_prs".to_owned(),
+                "ix-board.FR-041.output_basis",
+                request.end_ms,
+            ),
+        ),
+        Some(_) => commits_pushed.value.map_or_else(
+            || {
+                (
+                    unavailable(
+                        "capacity_output",
+                        commits_pushed
+                            .reason
+                            .clone()
+                            .unwrap_or_else(|| "output_sources_unavailable".to_owned()),
+                    ),
+                    unavailable(
+                        "capacity_output",
+                        "tickets_prs_below_threshold_and_commits_unavailable",
+                    ),
+                )
+            },
+            |commits| {
+                (
+                    Observation::available(
+                        commits as f64 / hours,
+                        "github.pull_request_commits",
+                        request.end_ms,
+                    ),
+                    Observation::available(
+                        "commits".to_owned(),
+                        "ix-board.FR-041.output_basis",
+                        request.end_ms,
+                    ),
+                )
+            },
+        ),
+        None => {
+            let reason = tickets_closed
+                .reason
+                .as_deref()
+                .or(prs_merged.reason.as_deref())
+                .unwrap_or("tickets_prs_total_unavailable");
+            (
+                unavailable("capacity_output", reason),
+                unavailable("capacity_output", "tickets_prs_total_unavailable"),
+            )
+        }
+    }
+}
+
+fn coverage_query(expression: &str, span: &str, sample_interval_secs: u64) -> String {
+    format!(
+        "avg_over_time((max(present_over_time(({expression})[{}s])))[{span}:{}s])",
+        sample_interval_secs.max(1),
+        sample_interval_secs.max(1)
+    )
+}
+
 #[implements("FR-041-AC-10")]
 fn validate_evaluation_time(end_ms: i64) -> Result<(), CapacityError> {
     let now_ms = i64::try_from(
@@ -367,17 +444,36 @@ fn github_token() -> Option<String> {
         })
 }
 
-#[implements("FR-041-AC-10")]
-fn linear_output(
-    request: &WindowRequest,
-    config: &FleetConfig,
-) -> (
+#[derive(Default)]
+struct LaneOutputCounts {
+    tickets: u64,
+    pull_requests: u64,
+    commits: u64,
+    tickets_complete: bool,
+    pull_requests_complete: bool,
+    commits_complete: bool,
+}
+
+impl LaneOutputCounts {
+    fn complete() -> Self {
+        Self {
+            tickets_complete: true,
+            pull_requests_complete: true,
+            commits_complete: true,
+            ..Self::default()
+        }
+    }
+}
+
+type LinearOutput = (
     Observation<u64>,
     Observation<u64>,
     Observation<u64>,
     Vec<LaneOutputMeasurement>,
     BTreeMap<String, String>,
-) {
+);
+
+fn linear_output(request: &WindowRequest, config: &FleetConfig) -> LinearOutput {
     let timeout = config.host_timeout;
     let fail = |source: &str, reason: String| unavailable(source, reason);
     let source = match LinearGraphQlSource::from_env() {
@@ -464,25 +560,34 @@ fn linear_output(
     let mut unattributed_pull_requests = 0_u64;
     let mut unattributed_commit_lists = 0_u64;
     let mut incomplete_attachment_lists = 0_u64;
-    let mut lane_counts: BTreeMap<String, (u64, u64, u64)> = BTreeMap::new();
+    let mut lane_counts: BTreeMap<String, LaneOutputCounts> = BTreeMap::new();
     for (lane, ticket) in assignments {
-        let counts = lane_counts.entry(lane.clone()).or_default();
+        let counts = lane_counts
+            .entry(lane.clone())
+            .or_insert_with(LaneOutputCounts::complete);
         {
             let key = ticket.rsplit('/').next().unwrap_or(&ticket).to_lowercase();
             let Some(issue) = issue_map.get(&key) else {
                 unattributed_tickets = unattributed_tickets.saturating_add(1);
+                counts.tickets_complete = false;
+                counts.pull_requests_complete = false;
+                counts.commits_complete = false;
                 continue;
             };
             if closed_at(issue.completed_at.as_deref()) {
-                counts.0 = counts.0.saturating_add(1);
+                counts.tickets = counts.tickets.saturating_add(1);
             }
             if !issue.attachments_complete {
                 incomplete_attachment_lists = incomplete_attachment_lists.saturating_add(1);
+                counts.pull_requests_complete = false;
+                counts.commits_complete = false;
             }
             for pr in &issue.pull_requests {
                 let (Some(client), Some(token)) = (&github_client, &github_token) else {
                     unattributed_pull_requests = unattributed_pull_requests.saturating_add(1);
                     unattributed_commit_lists = unattributed_commit_lists.saturating_add(1);
+                    counts.pull_requests_complete = false;
+                    counts.commits_complete = false;
                     continue;
                 };
                 match github_pull_request_details(client, token, &pr.url) {
@@ -490,19 +595,22 @@ fn linear_output(
                     // title and branch omit the ticket identifier.
                     Ok((_title, _branch, merged_at)) => {
                         if merged_at.is_some_and(|merged| (start..=end).contains(&merged)) {
-                            counts.1 = counts.1.saturating_add(1);
+                            counts.pull_requests = counts.pull_requests.saturating_add(1);
                         }
                     }
                     Err(_) => {
                         unattributed_pull_requests = unattributed_pull_requests.saturating_add(1);
                         unattributed_commit_lists = unattributed_commit_lists.saturating_add(1);
+                        counts.pull_requests_complete = false;
+                        counts.commits_complete = false;
                         continue;
                     }
                 }
                 match github_commit_count(client, token, &pr.url, start, end) {
-                    Ok(commits) => counts.2 = counts.2.saturating_add(commits),
+                    Ok(commits) => counts.commits = counts.commits.saturating_add(commits),
                     Err(_) => {
                         unattributed_commit_lists = unattributed_commit_lists.saturating_add(1);
+                        counts.commits_complete = false;
                     }
                 }
             }
@@ -518,44 +626,83 @@ fn linear_output(
             BTreeMap::new(),
         );
     }
-    let completed = lane_counts.values().map(|counts| counts.0).sum();
-    let merged = lane_counts.values().map(|counts| counts.1).sum();
-    let commits: u64 = lane_counts.values().map(|counts| counts.2).sum();
-    let prs_observation = Observation::available(
-        merged,
-        "linear.pull_request_attachment+github.pull_request.merged_at",
-        request.end_ms,
-    );
-    let commits_observation = Observation::available(
-        commits,
-        "linear.pull_request_attachment+github.pull_request_commits",
-        request.end_ms,
-    );
+    let completed = lane_counts.values().map(|counts| counts.tickets).sum();
+    let merged = lane_counts
+        .values()
+        .map(|counts| counts.pull_requests)
+        .sum();
+    let commits: u64 = lane_counts.values().map(|counts| counts.commits).sum();
+    let tickets_complete =
+        unattributed_tickets == 0 && lane_counts.values().all(|counts| counts.tickets_complete);
+    let prs_complete = unattributed_pull_requests == 0
+        && incomplete_attachment_lists == 0
+        && lane_counts
+            .values()
+            .all(|counts| counts.pull_requests_complete);
+    let commits_complete = unattributed_commit_lists == 0
+        && incomplete_attachment_lists == 0
+        && lane_counts.values().all(|counts| counts.commits_complete);
+    let tickets_observation = if tickets_complete {
+        Observation::available(completed, "linear.issue.completed_at", request.end_ms)
+    } else {
+        unavailable("linear.issue.completed_at", "ticket_output_incomplete")
+    };
+    let prs_observation = if prs_complete {
+        Observation::available(
+            merged,
+            "linear.pull_request_attachment+github.pull_request.merged_at",
+            request.end_ms,
+        )
+    } else {
+        unavailable(
+            "linear.pull_request_attachment+github.pull_request.merged_at",
+            "pull_request_output_incomplete",
+        )
+    };
+    let commits_observation = if commits_complete {
+        Observation::available(
+            commits,
+            "linear.pull_request_attachment+github.pull_request_commits",
+            request.end_ms,
+        )
+    } else {
+        unavailable(
+            "linear.pull_request_attachment+github.pull_request_commits",
+            "commit_output_incomplete",
+        )
+    };
     let lane_output = lane_counts
         .into_iter()
-        .map(|(lane, (tickets, prs, commits))| LaneOutputMeasurement {
+        .map(|(lane, counts)| LaneOutputMeasurement {
             lane,
-            tickets_closed: Observation::available(
-                tickets,
-                "linear.issue.completed_at",
-                request.end_ms,
-            ),
-            prs_merged: Observation::available(
-                prs,
-                "linear.pull_request.merged_at",
-                request.end_ms,
-            ),
-            commits_pushed: if commits_observation.value.is_some() {
-                Observation::available(commits, "github.pull_request_commits", request.end_ms)
+            tickets_closed: if counts.tickets_complete {
+                Observation::available(counts.tickets, "linear.issue.completed_at", request.end_ms)
+            } else {
+                unavailable("linear.issue.completed_at", "ticket_output_incomplete")
+            },
+            prs_merged: if counts.pull_requests_complete {
+                Observation::available(
+                    counts.pull_requests,
+                    "github.pull_request.merged_at",
+                    request.end_ms,
+                )
             } else {
                 unavailable(
-                    "github.pull_request_commits",
-                    commits_observation.reason.clone().unwrap_or_default(),
+                    "github.pull_request.merged_at",
+                    "pull_request_output_incomplete",
                 )
+            },
+            commits_pushed: if counts.commits_complete {
+                Observation::available(
+                    counts.commits,
+                    "github.pull_request_commits",
+                    request.end_ms,
+                )
+            } else {
+                unavailable("github.pull_request_commits", "commit_output_incomplete")
             },
         })
         .collect();
-    let at = request.end_ms;
     let attribution_basis = BTreeMap::from([
         (
             "output_attribution_basis".to_owned(),
@@ -580,7 +727,7 @@ fn linear_output(
         ),
     ]);
     (
-        Observation::available(completed, "linear.issue.completed_at", at),
+        tickets_observation,
         prs_observation,
         commits_observation,
         lane_output,
@@ -652,7 +799,7 @@ fn lane_ticket_history(
                     AssignmentStatus::Running | AssignmentStatus::Done
                 )
             {
-                let ticket = agent.ticket.to_lowercase();
+                let ticket = normalized_ticket_key(&agent.ticket);
                 let host_prefix = format!("{}:", request.host.to_lowercase());
                 let address = event.binding.address.trim().to_lowercase();
                 if !address.is_empty() && address.starts_with(&host_prefix) {
@@ -682,20 +829,45 @@ fn lane_ticket_history(
             "agent-msg work-event history is unavailable or exceeded page limit".to_owned(),
         );
     }
-    let mut matched = assignments
-        .into_iter()
-        .filter(|(_, ticket)| {
-            work_tickets.contains(&ticket.rsplit('/').next().unwrap_or(ticket).to_lowercase())
-        })
-        .collect::<Vec<_>>();
-    matched.extend(event_assignments);
-    matched.extend(active_before_window);
-    matched.sort();
-    matched.dedup();
+    let mut matched = BTreeSet::new();
+    for (lane, ticket) in assignments {
+        for ticket in normalized_ticket_keys(&ticket) {
+            if work_tickets.contains(&ticket) {
+                matched.insert((lane.to_lowercase(), ticket));
+            }
+        }
+    }
+    matched.extend(
+        event_assignments
+            .into_iter()
+            .map(|(lane, ticket)| (lane.to_lowercase(), normalized_ticket_key(&ticket))),
+    );
+    matched.extend(
+        active_before_window
+            .into_iter()
+            .map(|(lane, ticket)| (lane.to_lowercase(), normalized_ticket_key(&ticket))),
+    );
     if matched.is_empty() {
         return Err("no assignment ticket maps to a work event in the output window".to_owned());
     }
-    Ok(matched)
+    Ok(matched.into_iter().collect())
+}
+
+fn normalized_ticket_key(ticket: &str) -> String {
+    ticket
+        .trim()
+        .rsplit('/')
+        .next()
+        .unwrap_or(ticket)
+        .trim()
+        .to_lowercase()
+}
+
+fn normalized_ticket_keys(ticket: &str) -> impl Iterator<Item = String> + '_ {
+    ticket
+        .split([',', ';'])
+        .map(normalized_ticket_key)
+        .filter(|ticket| !ticket.is_empty())
 }
 
 impl MeasurementSource for LiveMeasurementSource<'_> {
@@ -719,17 +891,13 @@ impl MeasurementSource for LiveMeasurementSource<'_> {
             "build_slots_not_configured",
             at,
         );
-        let window_seconds = (request.end_ms - request.start_ms) / 1000;
         let source = |metric: &str, operation: &str| {
             let selector = format!("{metric}{{host=\"{label}\"}}");
             let expression = format!("{operation}({selector}[{span}])");
-            let coverage = format!(
-                "sum(count_over_time({selector}[{span}])) * {} / {window_seconds}",
-                self.config.push_interval.as_secs()
-            );
+            let coverage = coverage_query(&selector, &span, self.config.push_interval.as_secs());
             (expression, coverage)
         };
-        let (busy_query, busy_coverage) = source("ix_build_slots_busy", "max_over_time");
+        let (busy_query, busy_coverage) = source("ix_build_slots_busy", "min_over_time");
         let busy = source_observation(
             self.prometheus,
             &host,
@@ -742,10 +910,8 @@ impl MeasurementSource for LiveMeasurementSource<'_> {
         let queue_wait_query = format!(
             "histogram_quantile(0.9, sum by (le) (increase(ix_build_queue_wait_seconds_bucket{{host=\"{label}\"}}[{span}])))"
         );
-        let queue_wait_coverage = format!(
-            "sum(count_over_time({queue_selector}[{span}])) * {} / {window_seconds}",
-            self.config.push_interval.as_secs()
-        );
+        let queue_wait_coverage =
+            coverage_query(&queue_selector, &span, self.config.push_interval.as_secs());
         let queue_wait = source_observation(
             self.prometheus,
             &host,
@@ -757,10 +923,10 @@ impl MeasurementSource for LiveMeasurementSource<'_> {
         let admission_selector =
             format!("ix_build_admission_blocked_seconds_total{{host=\"{label}\"}}");
         let admission_query = format!("sum(increase({admission_selector}[{span}]))");
-        let admission_coverage = format!(
-            "count_over_time((sum by (host) ({admission_selector}))[{span}:{}]) * {} / {window_seconds}",
+        let admission_coverage = coverage_query(
+            &format!("sum by (host) ({admission_selector})"),
+            &span,
             self.config.push_interval.as_secs(),
-            self.config.push_interval.as_secs()
         );
         let admission = source_observation(
             self.prometheus,
@@ -785,10 +951,8 @@ impl MeasurementSource for LiveMeasurementSource<'_> {
             ),
         };
         let memory_selector = format!("node_memory_MemAvailable_bytes{{instance=\"{label}\"}}");
-        let memory_coverage = format!(
-            "sum(count_over_time({memory_selector}[{span}])) * {} / {window_seconds}",
-            self.config.push_interval.as_secs()
-        );
+        let memory_coverage =
+            coverage_query(&memory_selector, &span, self.config.push_interval.as_secs());
         let memory = source_observation(
             self.prometheus,
             &host,
@@ -807,10 +971,12 @@ impl MeasurementSource for LiveMeasurementSource<'_> {
                     "min_over_time((ix_fleet_host_memory_total_bytes{{host=\"{label}\"}} - ix_fleet_host_memory_used_bytes{{host=\"{label}\"}})[{span}:{}])",
                     self.config.push_interval.as_secs()
                 ),
-                format!(
-                    "count_over_time((ix_fleet_host_memory_total_bytes{{host=\"{label}\"}} - ix_fleet_host_memory_used_bytes{{host=\"{label}\"}})[{span}:{}]) * {} / {window_seconds}",
+                coverage_query(
+                    &format!(
+                        "ix_fleet_host_memory_total_bytes{{host=\"{label}\"}} - ix_fleet_host_memory_used_bytes{{host=\"{label}\"}}"
+                    ),
+                    &span,
                     self.config.push_interval.as_secs(),
-                    self.config.push_interval.as_secs()
                 ),
                 "relay_watcher.ix_fleet_host_memory_total_bytes-ix_fleet_host_memory_used_bytes",
                 at,
@@ -832,19 +998,11 @@ impl MeasurementSource for LiveMeasurementSource<'_> {
             ),
             _ => format!("node_thermal_temperature_celsius{{instance=\"{label}\"}}"),
         };
-        let temperature_coverage = if host == "luna" {
-            format!(
-                "count_over_time((max(node_thermal_zone_temp{{instance=\"{label}\",type=\"x86_pkg_temp\"}}))[{span}:{}]) * {} / {window_seconds}",
-                self.config.push_interval.as_secs(),
-                self.config.push_interval.as_secs()
-            )
-        } else {
-            format!(
-                "count_over_time((max({temperature_selector}))[{span}:{}]) * {} / {window_seconds}",
-                self.config.push_interval.as_secs(),
-                self.config.push_interval.as_secs()
-            )
-        };
+        let temperature_coverage = coverage_query(
+            &temperature_selector,
+            &span,
+            self.config.push_interval.as_secs(),
+        );
         let temperature = source_observation(
             self.prometheus,
             &host,
@@ -869,57 +1027,8 @@ impl MeasurementSource for LiveMeasurementSource<'_> {
             .map(|(limit, current)| limit - current);
         let (tickets_closed, prs_merged, commits_pushed, lane_output, output_attribution_basis) =
             linear_output(request, self.config);
-        let total_output = tickets_closed
-            .value
-            .zip(prs_merged.value)
-            .map(|(tickets, prs)| tickets.saturating_add(prs));
-        let (host_output_per_hour, output_basis) = match total_output {
-            Some(output) if output >= 5 => {
-                let hours = (request.end_ms - request.start_ms) as f64 / 3_600_000.0;
-                (
-                    Observation::available(
-                        output as f64 / hours,
-                        "linear.tickets_plus_merged_prs",
-                        at,
-                    ),
-                    Observation::available(
-                        "tickets_prs".to_owned(),
-                        "ix-board.FR-041.output_basis",
-                        at,
-                    ),
-                )
-            }
-            _ => match commits_pushed.value {
-                Some(commits) => {
-                    let hours = (request.end_ms - request.start_ms) as f64 / 3_600_000.0;
-                    (
-                        Observation::available(
-                            commits as f64 / hours,
-                            "github.pull_request_commits",
-                            at,
-                        ),
-                        Observation::available(
-                            "commits".to_owned(),
-                            "ix-board.FR-041.output_basis",
-                            at,
-                        ),
-                    )
-                }
-                None => (
-                    unavailable(
-                        "capacity_output",
-                        commits_pushed
-                            .reason
-                            .clone()
-                            .unwrap_or_else(|| "output_sources_unavailable".to_owned()),
-                    ),
-                    unavailable(
-                        "capacity_output",
-                        "tickets_prs_below_threshold_and_commits_unavailable",
-                    ),
-                ),
-            },
-        };
+        let (host_output_per_hour, output_basis) =
+            output_rate(request, &tickets_closed, &prs_merged, &commits_pushed);
         let slot_equal = match (busy.value, sustainable.value) {
             (Some(busy), Some(sustainable)) => Observation::available(
                 busy == f64::from(sustainable),
@@ -1030,6 +1139,43 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn output_ticket_keys_are_case_insensitive_and_split_aggregated_rows() {
+        assert_eq!(
+            normalized_ticket_keys("https://linear.app/team/issue/SWM-1, qsl-2")
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["qsl-2".to_owned(), "swm-1".to_owned()]),
+        );
+    }
+
+    #[test]
+    fn unavailable_ticket_totals_do_not_fall_back_to_commits() {
+        let request = WindowRequest {
+            host: "example-host".to_owned(),
+            lanes: 1,
+            start_ms: 1_000,
+            end_ms: 3_601_000,
+            rampup_end_ms: 1_000,
+        };
+        let tickets = Observation::unavailable(
+            "linear.issue.completed_at",
+            "ticket_output_incomplete",
+            None,
+        );
+        let prs = Observation::available(0, "linear.pull_request_attachment", request.end_ms);
+        let commits = Observation::available(8, "github.pull_request_commits", request.end_ms);
+        let (output, basis) = output_rate(&request, &tickets, &prs, &commits);
+        assert!(output.value.is_none());
+        assert!(basis.value.is_none());
+        assert_eq!(output.reason.as_deref(), Some("ticket_output_incomplete"));
+
+        let tickets = Observation::available(2, "linear.issue.completed_at", request.end_ms);
+        let prs = Observation::available(1, "linear.pull_request_attachment", request.end_ms);
+        let (output, basis) = output_rate(&request, &tickets, &prs, &commits);
+        assert_eq!(output.value, Some(8.0));
+        assert_eq!(basis.value.as_deref(), Some("commits"));
+    }
+
+    #[test]
     #[trace("FR-041-AC-10")]
     fn capacity_window_rejects_a_future_prometheus_evaluation_time() {
         assert!(validate_evaluation_time(i64::MAX).is_err());
@@ -1041,6 +1187,8 @@ mod tests {
         fn query(&self, expression: &str) -> Result<String, SourceError> {
             let value = if expression.contains("count_over_time") {
                 108.0
+            } else if expression.contains("present_over_time") {
+                1.0
             } else if expression.contains("ix_build_slots_busy") {
                 2.0
             } else if expression.contains("ix_build_queue_wait_seconds") {

@@ -27,6 +27,9 @@ Commands:
   orphans        List unprojected open and completed tickets in the scope's project teams
   help           Print this message or the help of the given subcommand(s)
 
+Commands:
+  collect  Append one live sample per configured host without sending relay messages
+
 Options:
       --json                         Emit machine-readable JSON on stdout instead of human-readable text
       --diagnostics-format <FORMAT>  Diagnostic stream format on stderr [default: human]
@@ -569,12 +572,16 @@ Options:
 
 Configure `[fleet].saturation_projects` with the Linear projects counted toward the
 ready buffer, `[fleet.capacity_limits.<host>].build_slots` with the interim sustainable
-build-slot supply, and `[fleet_tick.planners]` with the owning planner session for each
-project. `server-capacity.max_agents` supplies lane capacity only. Duty uses the relay
+build-slot supply, optional `[fleet.capacity_limits.<host>].lane_capacity` limits, and
+`[fleet_tick.planners]` with the owning planner session for each project. Add
+`[fleet].github_repositories` with `owner/repository` entries to enable title/branch
+matching for unattached open PRs. Duty uses the relay
 watcher compiler counter and lane-presence samples over the configured window; incomplete
 coverage is unavailable with a reason. A positive project deficit emits a `need_ready_tickets`
 tick action and stores `project`, `requested_count`, `emitted_at` and `resolved_at` in the
-action ledger row.
+action ledger row. The read-only command does not collect history; install the included
+300-second LaunchAgent on the collector host to run `fleet saturation collect` independently
+of panel reads.
 
 ## ix-board fleet capacity
 
@@ -589,11 +596,13 @@ Commands:
   step    Record a held lane count and its ramp-up boundary
   window  Measure and persist the open hold from live Prometheus, Linear and GitHub sources
   end     Close a discovery run and record a supported level
-  drain   Mark a lane draining and lower the six-hour lane ceiling
+  drain   Mark a lane draining and apply the supported step-down cool-off
   remove  Record an orchestrator-directed lane removal
 ```
 
-Every timestamp argument is relay-clock milliseconds. `step` records the hold and ramp-up
+Every timestamp argument is relay-clock milliseconds. `step` requires `--lanes`,
+`--lane-added-at-ms` and `--rampup-end-ms`; `--repeat-of` repeats an invalid hold at its
+original step number. `step` records the hold and ramp-up
 boundary; the orchestrator remains responsible for adding and removing lanes. Library callers
 provide a `MeasurementSource` to `measure_open_step`, which receives the persisted host, lane
 count and post-ramp-up window and returns each field with value, source, availability, coverage,
@@ -607,6 +616,8 @@ and emits `ix_fleet_capacity_recorded_level` (only when a level exists),
 `ix_fleet_capacity_recorded_level_timestamp_seconds`, one-hot
 `ix_fleet_capacity_discovery_state{host,state}`, `ix_fleet_capacity_draining_lanes` and the
 capacity throttle and overload series.
+GitHub reads use `GITHUB_TOKEN` or `GH_TOKEN` from the command's process environment; without one,
+dependent output and stale-PR evidence remain unavailable.
 
 ## ix-board drift
 

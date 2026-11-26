@@ -72,6 +72,9 @@ in the ledger, defined here or in the requirement named with it, so an
 evaluator reads stored facts and computes nothing itself. The ledger holds
 these records so that one store joins them to lane intervals, actions and ticks
 under one retention rule; the relay holds transport records of bounded age only.
+Capacity discovery history and its saturation/throttle evidence are exempt from
+age pruning: role-spec evaluations and the current sustainable level depend on
+the complete capacity history.
 
 ### Schema version 3: capacity measurement provenance
 
@@ -94,10 +97,11 @@ through the injected capacity measurement source. A successful measurement
 and its lane-attributed output commit before the open hold is removed. The
 migration from version 3 is additive and preserves prior rows.
 
-### Schema version 6: planner ready-buffer action facts
+### Schema version 6: capacity history and planner ready-buffer action facts
 
-Version 6 adds nullable `project` and `requested_count` columns to `action`.
-The migration is additive and preserves historical action rows. A `need_ready_tickets`
+Version 6 completes the capacity-history schema in [FR-041](./FR-041-fleet-saturation.md)
+and adds nullable `project` and `requested_count` columns to `action`. The migration
+is additive and preserves historical action rows. A `need_ready_tickets`
 row uses these columns while retaining its first `emitted_at` and the condition-clear
 `resolved_at` timestamps; other action kinds leave them empty.
 
@@ -117,7 +121,7 @@ row uses these columns while retaining its first `emitted_at` and the condition-
 | `cycle_missed` | `session_addr`, `last_ended_at`, `expected_by`, `detected_at` | `fleet tick` (below). **Deferred to SWM-255**: not written yet |
 | `defect` (existing, columns fixed) | `defect_id`, `source`, `host`, `lane`, `kind`, `first_seen_at`, `closed_at`, `routed_ticket`, `routed_at`; `first_seen_at` is relay time and is empty for a defect first seen in a run without relay time, whose host clock is kept in `first_seen_host_ms` | `fleet status` and `fleet tick` |
 | `dialog_answer` | see [FR-044](./FR-044-fleet-cycle-and-dialog-answer-log.md) | `fleet answer-log record` |
-| `capacity_run`, `capacity_window`, `capacity_step`, `capacity_step_lane_output`, `capacity_level`, `capacity_event`, `host_output_sample` | see [FR-041](./FR-041-fleet-saturation.md) | `fleet capacity` and `fleet tick` |
+| `capacity_run`, `capacity_window`, `capacity_step`, `capacity_step_lane_output`, `capacity_level`, `capacity_event`, `host_output_sample`, `saturation_sample`, `capacity_throttle_sample`, `capacity_overload_state` | see [FR-041](./FR-041-fleet-saturation.md) | `fleet capacity`, `fleet saturation collect` and `fleet tick` |
 
 - **Gap rows.** A `plan_coverage_gap` row is opened by the first tick whose report
   contains the gap and closed by the first later tick whose report does not. A
@@ -215,7 +219,7 @@ in [FR-041](./FR-041-fleet-saturation.md); `answer_dialog_latency_max` and
 | FR-039-AC-5 | A ledger path inside a git work tree is refused, and the default path is outside any work tree. | Test |
 | FR-039-AC-6 | The `executed_at` of a `push_next_ticket` equals the first transition of the target lane into WORKING with focus on the pushed ticket, and WORKING on another ticket gives none; that of an `answer_dialog` equals the first transition out of BLOCKED after an emitted answer, and an `escalate_block` fallback gives none; that of an `act_on_undetermined` equals the first transition to a determined class; a lane already in the expected state at emission has none until a later transition; an action aimed at a lead or project has none and resolves when its condition clears; a `resend_order` has no `executed_at` until SWM-255 adds the `Acted` receipt join. | Test |
 | FR-039-AC-7 | `fleet ledger query` returns idle minutes per lane per day and actions with time-to-action in text and JSON without writing. | Test |
-| FR-039-AC-8 | An unsupported schema version is refused with no change, retention prunes only rows older than the configured age, and replaced assignments, defects and ground-truth samples are stored with their timestamps. | Test |
+| FR-039-AC-8 | An unsupported schema version is refused with no change, retention prunes only eligible rows older than the configured age while preserving open intervals and capacity history, and replaced assignments, defects and ground-truth samples are stored with their timestamps. | Test |
 | FR-039-AC-9 | Opening a version 1 ledger migrates it to the current version in one transaction under the writer lock with every earlier row unchanged; a crash injected mid-migration leaves the version 1 ledger intact and openable; a ledger of a later version is refused without a change. | Test |
 | FR-039-AC-17 | Opening a version 2 ledger migrates it to version 3 under the writer lock, preserves every existing row, and adds provenance columns; a crash injected during migration leaves the version 2 ledger intact; new capacity steps expose one source-basis entry per measurement field in JSON. | Test |
 | FR-039-AC-18 | Opening a version 3 ledger migrates it to version 4 under the writer lock, preserves previous rows and creates the resumable capacity-window table; a start, hold, measurement-source response, end and status read preserve per-field and per-lane source basis, while failed measurement leaves the open window intact. | Test |

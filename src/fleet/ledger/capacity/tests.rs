@@ -20,6 +20,34 @@ fn path() -> (tempfile::TempDir, std::path::PathBuf) {
     (dir, path)
 }
 
+#[test]
+fn schema_two_ledger_supports_read_only_queries_without_capacity_tables() {
+    let (_dir, path) = path();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA user_version=2;
+             CREATE TABLE run(sequence INTEGER PRIMARY KEY, relay_ms INTEGER NOT NULL);
+             CREATE VIEW idle_minutes AS SELECT 1 AS at_ms, 0 AS minutes;",
+        )
+        .unwrap();
+    drop(connection);
+
+    assert_eq!(
+        query_ledger(&path, "idle_minutes", None)
+            .unwrap()
+            .rows
+            .len(),
+        1
+    );
+    assert!(status(&path).unwrap().hosts.is_empty());
+    assert!(
+        metrics_at(&path, START)
+            .unwrap()
+            .contains("# TYPE ix_fleet_capacity_recorded_level gauge")
+    );
+}
+
 fn value<T>(value: T, source: &str, at_ms: i64) -> Observation<T> {
     Observation::available(value, source, at_ms)
 }
@@ -1058,10 +1086,10 @@ fn version_three_ledger_migrates_additively_to_resumable_windows() {
 
 #[trace("FR-041-AC-14")]
 #[test]
-fn marking_a_lane_draining_writes_step_down_ceiling_atomically() {
+fn marking_a_lane_draining_requires_live_watcher_evidence() {
     let (_dir, path) = path();
     let config = capacity_config();
-    mark_draining(
+    let error = mark_draining(
         &path,
         &config,
         "draco",
@@ -1069,14 +1097,8 @@ fn marking_a_lane_draining_writes_step_down_ceiling_atomically() {
         "memory_below_reserve",
         START,
     )
-    .unwrap();
+    .unwrap_err();
+    assert!(error.to_string().contains("live lane-state evidence"));
     let status = status(&path).unwrap();
-    assert_eq!(status.events.len(), 2);
-    assert_eq!(status.events[0].kind, "step_down");
-    assert_eq!(status.events[1].kind, "draining_mark");
-    assert_eq!(status.events[0].ceiling_until, Some(START + 21_600_000));
-    assert_eq!(
-        status.events[1].reason.as_deref(),
-        Some("memory_below_reserve")
-    );
+    assert!(status.events.is_empty());
 }

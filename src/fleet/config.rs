@@ -21,7 +21,7 @@ const RELAY_OWNED: [&str; 6] = [
 ];
 /// Default orchestrator cycle, ten minutes (FR-039).
 const DEFAULT_CYCLE_SECS: u64 = 600;
-const KNOWN: [&str; 23] = [
+const KNOWN: [&str; 24] = [
     "team_keys",
     "focus_window_secs",
     "ledger_path",
@@ -45,6 +45,7 @@ const KNOWN: [&str; 23] = [
     "min_duty_observation_secs",
     "saturation_queue_depth",
     "saturation_projects",
+    "github_repositories",
 ];
 
 /// Explicit per-host capacity limits. Values are never inferred from telemetry.
@@ -119,6 +120,8 @@ pub struct FleetConfig {
     pub saturation_queue_depth: u32,
     /// Linear projects whose ready tickets feed fleet buffer demand.
     pub saturation_projects: Vec<String>,
+    /// GitHub repositories scanned for ticket identifiers in open PR titles and branches.
+    pub github_repositories: Vec<String>,
 }
 
 impl Default for FleetConfig {
@@ -147,6 +150,7 @@ impl Default for FleetConfig {
             min_duty_observation: Duration::from_secs(60 * 60),
             saturation_queue_depth: 2,
             saturation_projects: Vec::new(),
+            github_repositories: Vec::new(),
         }
     }
 }
@@ -245,6 +249,30 @@ impl FleetConfig {
                 &mut config.min_duty_observation,
             )?;
             config.saturation_projects = strings(table, "saturation_projects")?;
+            config.github_repositories = strings(table, "github_repositories")?;
+            let mut unique_repositories = config.github_repositories.clone();
+            unique_repositories.sort();
+            unique_repositories.dedup();
+            if config.github_repositories.len() > 20
+                || unique_repositories.len() != config.github_repositories.len()
+                || config.github_repositories.iter().any(|repository| {
+                    let mut parts = repository.split('/');
+                    let owner = parts.next().unwrap_or_default();
+                    let name = parts.next().unwrap_or_default();
+                    parts.next().is_some()
+                        || owner.is_empty()
+                        || name.is_empty()
+                        || !owner.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                        || !name
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+                })
+            {
+                return Err(FleetError::Config(
+                    "github_repositories must contain at most 20 unique owner/repository names"
+                        .to_owned(),
+                ));
+            }
             if let Some(value) = table.get("saturation_queue_depth") {
                 config.saturation_queue_depth = value
                     .as_integer()
