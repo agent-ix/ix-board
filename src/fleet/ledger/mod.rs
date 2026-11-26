@@ -634,7 +634,9 @@ impl Ledger {
             params![program, team, job_id, finished_at_ms, outcome, detail],
         )?;
         if changed == 0 {
-            return Err(LedgerError::Capacity("cadence run was not started".to_owned()));
+            return Err(LedgerError::Capacity(
+                "cadence run was not started".to_owned(),
+            ));
         }
         Ok(())
     }

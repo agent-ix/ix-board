@@ -19,7 +19,8 @@ immediately. A job is due when its interval has elapsed since its last
 completed run, and overdue when at least one additional interval has elapsed.
 The command exits 0 when no job is due, 1 when at least one job is due, and 2
 when at least one job is overdue. `--alert` SHALL emit an alert when the
-configured cadence checker job itself is overdue.
+configured cadence checker job itself is overdue. That job is the manifest
+entry whose id is `cadence-checker`.
 
 `ix-board cadence run <job>` SHALL run exactly the argv sequence declared by
 the matching manifest job, without a shell, and SHALL persist the start time,

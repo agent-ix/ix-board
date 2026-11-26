@@ -147,7 +147,14 @@ impl DueReport {
         let mut lines = self
             .jobs
             .iter()
-            .map(|job| format!("{} {} owner={}", job.id, state_name(job.state), job.owner_role))
+            .map(|job| {
+                format!(
+                    "{} {} owner={}",
+                    job.id,
+                    state_name(job.state),
+                    job.owner_role
+                )
+            })
             .collect::<Vec<_>>();
         if self.alert {
             lines.push("alert cadence checker is overdue".to_owned());
@@ -263,9 +270,9 @@ pub fn due(
         })
         .collect::<Result<Vec<_>, CadenceError>>()?;
     jobs.sort_by(|left, right| left.id.cmp(&right.id));
-    let checker_overdue = jobs.iter().any(|job| {
-        job.id == CHECKER_JOB_ID && job.state == DueState::Overdue
-    });
+    let checker_overdue = jobs
+        .iter()
+        .any(|job| job.id == CHECKER_JOB_ID && job.state == DueState::Overdue);
     Ok(DueReport {
         program: program.to_owned(),
         team: team.to_owned(),
@@ -349,8 +356,39 @@ pub fn run_job(
 }
 
 fn execute(job: &Job) -> Result<std::process::ExitStatus, std::io::Error> {
+    if job.kind == JobKind::RetroSnapshot {
+        validate_retro_snapshot_config(job)?;
+    }
     let executable = std::env::current_exe()?;
     Command::new(executable).args(&job.command).status()
+}
+
+fn validate_retro_snapshot_config(job: &Job) -> Result<(), std::io::Error> {
+    let config_path = job
+        .command
+        .windows(2)
+        .find(|pair| pair[0] == "--config")
+        .map(|pair| PathBuf::from(&pair[1]))
+        .ok_or_else(|| std::io::Error::other("retro snapshot job requires --config <file>"))?;
+    let config = crate::retro::RetroConfig::load(&config_path)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    if config.team != job.team {
+        return Err(std::io::Error::other(format!(
+            "retro config team {:?} does not match cadence team {:?}",
+            config.team, job.team
+        )));
+    }
+    if config.herdr_teams.is_empty() {
+        return Err(std::io::Error::other(
+            "retro snapshot config must name at least one herdr_teams entry",
+        ));
+    }
+    if config.gate_log.is_none() {
+        return Err(std::io::Error::other(
+            "retro snapshot config must set gate_log",
+        ));
+    }
+    Ok(())
 }
 
 fn unix_time_ms() -> i64 {
@@ -429,8 +467,14 @@ mod tests {
             detail: None,
         };
         assert_eq!(classify_due(1800, Some(&recent), 1_801_000), DueState::Due);
-        assert_eq!(classify_due(1800, Some(&recent), 3_601_000), DueState::Overdue);
-        assert_eq!(classify_due(1800, Some(&recent), 1_800_999), DueState::NotDue);
+        assert_eq!(
+            classify_due(1800, Some(&recent), 3_601_000),
+            DueState::Overdue
+        );
+        assert_eq!(
+            classify_due(1800, Some(&recent), 1_800_999),
+            DueState::NotDue
+        );
     }
 
     #[test]
@@ -453,11 +497,47 @@ mod tests {
             .cadence_start(&checker.program, &checker.team, &checker.id, 0)
             .unwrap();
         ledger
-            .cadence_finish(&checker.program, &checker.team, &checker.id, 1000, true, None)
+            .cadence_finish(
+                &checker.program,
+                &checker.team,
+                &checker.id,
+                1000,
+                true,
+                None,
+            )
             .unwrap();
         let overdue = due(&manifest, &ledger, "QSL", "qsl", 3_601_000, true).unwrap();
         assert_eq!(overdue.exit_code(), 2);
         assert!(overdue.alert);
+    }
+
+    #[test]
+    #[trace("FR-048-AC-2")]
+    fn ledger_reopen_preserves_outcome_and_running_job_ages_to_overdue() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ledger.sqlite3");
+        {
+            let mut ledger = Ledger::open(&path, &FleetConfig::default()).unwrap();
+            ledger.cadence_start("QSL", "qsl", "retro", 0).unwrap();
+            ledger
+                .cadence_finish("QSL", "qsl", "retro", 1000, false, Some("exit 4"))
+                .unwrap();
+        }
+        let mut ledger = Ledger::open(&path, &FleetConfig::default()).unwrap();
+        let last = ledger
+            .cadence_last_run("QSL", "qsl", "retro")
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.finished_at_ms, Some(1000));
+        assert_eq!(last.outcome, "failed");
+        assert_eq!(last.detail.as_deref(), Some("exit 4"));
+
+        ledger.cadence_start("QSL", "qsl", "stopped", 0).unwrap();
+        let manifest = Manifest {
+            jobs: vec![job("stopped")],
+        };
+        let report = due(&manifest, &ledger, "QSL", "qsl", 3_600_000, false).unwrap();
+        assert_eq!(report.jobs[0].state, DueState::Overdue);
     }
 
     #[test]

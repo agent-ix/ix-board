@@ -247,13 +247,11 @@ pub const V9: &[&str] = &[
 ];
 
 /// Version 10 adds the last-run cadence record for each program/team/job tuple.
-pub const V10: &[&str] = &[
-    "CREATE TABLE cadence_job_run(
+pub const V10: &[&str] = &["CREATE TABLE IF NOT EXISTS cadence_job_run(
        program TEXT NOT NULL, team TEXT NOT NULL, job_id TEXT NOT NULL,
        started_at_ms INTEGER NOT NULL, finished_at_ms INTEGER,
        outcome TEXT NOT NULL CHECK(outcome IN ('running','succeeded','failed')),
-       detail TEXT, PRIMARY KEY(program, team, job_id))",
-];
+       detail TEXT, PRIMARY KEY(program, team, job_id))"];
 
 /// Views replaced when installing the version 7 definitions.
 pub const V7_DROP_VIEWS: &[&str] = &[

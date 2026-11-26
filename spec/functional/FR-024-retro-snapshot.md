@@ -107,7 +107,7 @@ existing id (see [FR-025](./FR-025-retro-store.md)).
 |----|----------|--------------|
 | FR-024-AC-1 | Given fixture Linear, GitHub and herdr records, the command appends exactly one record containing every catalog id, with the fixture's expected value or unavailable status for each. | Test |
 | FR-024-AC-2 | `path_remaining` equals the open transitive blockers of the gate tickets and excludes issues that block no gate; it is `unavailable` when the blocker expansion is truncated. `path_closed` counts only completions inside the window. | Test |
-| FR-024-AC-3 | `net_closed_minus_new` is negative for a fixture window with more new issues than completions, counts a completed path issue once, and `intake_new` counts only issues created inside the window. | Test |
+| FR-024-AC-3 | `net_closed_minus_new` is negative for a fixture window with more new issues than completions, counts a completed path issue once, is unavailable when blocker expansion is partial, and `intake_new` counts only issues created inside the window. | Test |
 | FR-024-AC-4 | `prs_merged_per_hour` equals merged count divided by window hours, and `pr_cycle_median_hours` and `pr_cycle_p90_hours` match the nearest-rank values for a fixture with an even count and an outlier. | Test |
 | FR-024-AC-5 | `prs_open`, `prs_idle`, `prs_oversize` and `prs_ready_unmerged` match the fixture for pull requests that straddle each threshold, a draft, and an approved and an unapproved pull request. | Test |
 | FR-024-AC-6 | `fix_rounds_max` and `fix_rounds_total` count only pull requests that are open or were merged inside the window, and are computed from marker first lines only: a comment containing the marker text in its body but not on its first line, and a human comment, change neither value; a disposition marker whose `repo=` and `id=` match no `reviewer` marker of a counted pull request is ignored. | Test |
@@ -126,7 +126,7 @@ existing id (see [FR-025](./FR-025-retro-store.md)).
 | FR-024-AC-14 | `--json` output exposes every metric with id, value, unit, direction, status, source, query and its FR-024 catalog family as `class`; it includes the FR-029 department class as `department_class` when defined. These class fields are output-only and are never written to the append-only store. Text output prints one line per metric. | Test |
 | FR-024-AC-19 | `ix-board::retro::decode_saved_report` accepts the record payload of `retro snapshot --json` containing these class fields; older pinned readers that reject unknown metric fields reject this output. This acceptance covers the record payload only, excluding stale-cache freshness keys added by the CLI wrapper. | Test |
 | FR-024-AC-20 | The fixed catalog includes only the eight added ids in this change, preserves every prior id and formula, and reports each added metric as unavailable when its source is not configured or complete. | Test |
-| FR-024-AC-21 | For complete fixtures, pull-request/block counts, commit counts, review-file-only commit counts, reviewer rounds, unnamed waits above 20 minutes, host load per core, and saturation overlapping lane idle match hand-written expected values; exactly 20 minutes is not over the unnamed-wait threshold. | Test |
+| FR-024-AC-21 | When the corresponding structured source has not been configured or does not provide complete coverage, each added metric is unavailable with a source-specific reason; the existing metric formulas remain unchanged. | Test |
 
 ## Dependencies
 

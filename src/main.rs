@@ -785,7 +785,7 @@ fn output_outcome(output: &Output) -> Outcome {
         Output::FleetAssign(_) => Outcome::Partial,
         Output::FleetTick(tick) if !tick.complete => Outcome::Partial,
         Output::CadenceDue(report) if report.exit_code() == 1 => Outcome::Partial,
-        Output::CadenceDue(report) if report.exit_code() == 2 => Outcome::Invalid,
+        Output::CadenceDue(report) if report.exit_code() == 2 => Outcome::Refused,
         Output::CadenceRun(report) if !report.succeeded => Outcome::Internal,
         Output::FleetSaturation(report) if !report.complete => Outcome::Partial,
         Output::Agents(report) => match report.coverage() {
@@ -3138,6 +3138,7 @@ fn run_linear(command: Command) -> Result<Output, Error> {
         Command::AgentProbe => unreachable!("probe is handled before normal dispatch"),
         Command::Agents { .. } => unreachable!("agents is handled before Linear dispatch"),
         Command::Fleet { .. } => unreachable!("fleet is handled before Linear dispatch"),
+        Command::Cadence { .. } => unreachable!("cadence is handled before Linear dispatch"),
         Command::Retro { .. } => unreachable!("retro is handled before Linear dispatch"),
         Command::Scope { .. }
         | Command::Roadmap { .. }
@@ -3446,7 +3447,11 @@ fn render_human(output: &Output) -> String {
         Output::CadenceRun(report) => format!(
             "{} {} at {} (exit status {})",
             report.id,
-            if report.succeeded { "succeeded" } else { "failed" },
+            if report.succeeded {
+                "succeeded"
+            } else {
+                "failed"
+            },
             report.finished_at_ms,
             report
                 .exit_status
