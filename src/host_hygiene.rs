@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 /// Process paths and command evidence needed to decide whether a target is in use.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -130,6 +130,10 @@ pub struct HygieneConfig {
     pub idle_minutes: Option<u64>,
     /// Default free-space floor in GiB for hosts without an override.
     pub default_free_floor_gb: Option<u64>,
+    /// Maximum filesystem entries examined while deriving target idle age.
+    pub mtime_scan_entries: Option<usize>,
+    /// Maximum duration in milliseconds spent deriving target idle age.
+    pub mtime_scan_duration_ms: Option<u64>,
     /// Policy values keyed by Herdr host label.
     #[serde(default)]
     pub hosts: BTreeMap<String, HostPolicyConfig>,
@@ -141,6 +145,8 @@ impl Default for HygieneConfig {
             worktree_root: None,
             idle_minutes: Some(60),
             default_free_floor_gb: Some(100),
+            mtime_scan_entries: Some(100_000),
+            mtime_scan_duration_ms: Some(2_000),
             hosts: BTreeMap::from([(
                 "terra".to_owned(),
                 HostPolicyConfig {
@@ -167,6 +173,8 @@ impl HygieneConfig {
             worktree_root: overrides.worktree_root,
             idle_minutes: overrides.idle_minutes.or(Some(60)),
             default_free_floor_gb: overrides.default_free_floor_gb.or(Some(100)),
+            mtime_scan_entries: overrides.mtime_scan_entries.or(Some(100_000)),
+            mtime_scan_duration_ms: overrides.mtime_scan_duration_ms.or(Some(2_000)),
             hosts: Self::default().hosts,
         };
         for (host, policy) in overrides.hosts {
@@ -204,6 +212,9 @@ impl HygieneConfig {
         config.hosts = normalized;
         if config.default_free_floor_gb == Some(0) {
             return Err("hygiene.default_free_floor_gb must be positive".to_owned());
+        }
+        if config.mtime_scan_entries == Some(0) || config.mtime_scan_duration_ms == Some(0) {
+            return Err("hygiene mtime scan limits must be positive".to_owned());
         }
         Ok(config)
     }
@@ -558,11 +569,28 @@ pub fn free_disk_bytes(path: &Path) -> io::Result<u64> {
 
 /// Finds the newest modification time anywhere below a target directory.
 #[implements("FR-048-AC-5")]
-pub fn newest_mtime_under(path: &Path) -> io::Result<SystemTime> {
+pub fn newest_mtime_under(
+    path: &Path,
+    max_entries: usize,
+    max_duration: Duration,
+) -> io::Result<SystemTime> {
+    let started = Instant::now();
+    let limit_error = || io::Error::new(io::ErrorKind::TimedOut, "mtime scan limit exceeded");
+    if max_entries == 0 || max_duration.is_zero() {
+        return Err(limit_error());
+    }
     let mut newest = std::fs::symlink_metadata(path)?.modified()?;
     let mut pending = vec![path.to_owned()];
+    let mut entries_seen = 0_usize;
     while let Some(directory) = pending.pop() {
         for entry in std::fs::read_dir(directory)? {
+            if started.elapsed() >= max_duration {
+                return Err(limit_error());
+            }
+            entries_seen = entries_seen.saturating_add(1);
+            if entries_seen > max_entries {
+                return Err(limit_error());
+            }
             let entry = entry?;
             let metadata = std::fs::symlink_metadata(entry.path())?;
             newest = newest.max(metadata.modified()?);
@@ -570,6 +598,9 @@ pub fn newest_mtime_under(path: &Path) -> io::Result<SystemTime> {
                 pending.push(entry.path());
             }
         }
+    }
+    if started.elapsed() > max_duration {
+        return Err(limit_error());
     }
     Ok(newest)
 }
@@ -620,7 +651,9 @@ pub fn target_use_in_worktree(target: &Path, worktree: &Path, table: &ProcessTab
             path_starts_with_any(cwd, &worktree_paths)
                 || path_starts_with_any(&canonical_or_original(cwd), &worktree_paths)
         }) || bytes_reference_any(&process.cmdline, &target_paths)
+            || bytes_reference_any(&process.cmdline, &worktree_paths)
             || bytes_reference_any(&process.environ, &target_paths)
+            || bytes_reference_any(&process.environ, &worktree_paths)
             || process.fds.iter().any(|path| {
                 path_starts_with_any(path, &target_paths)
                     || path_starts_with_any(&canonical_or_original(path), &target_paths)
@@ -698,6 +731,29 @@ pub fn apply_clean_decision(decision: &CleanDecision, apply: bool) -> io::Result
         result.reason = "removed".to_owned();
     }
     Ok(result)
+}
+
+/// Rechecks a planned eligible target with fresh age and process evidence before deletion.
+#[implements("FR-048-AC-5", "FR-048-AC-6")]
+pub fn recheck_clean_decision(
+    planned: &CleanDecision,
+    worktree: &Path,
+    now: SystemTime,
+    newest_modified: SystemTime,
+    policy: &HostPolicy,
+    processes: &ProcessTable,
+) -> CleanDecision {
+    if !planned.eligible {
+        return planned.clone();
+    }
+    clean_decision(
+        &planned.target,
+        worktree,
+        now,
+        newest_modified,
+        policy,
+        processes,
+    )
 }
 
 /// Parses the Prometheus text exposition emitted by locked-build and node-exporter.
@@ -877,6 +933,8 @@ mod tests {
         let defaults = HygieneConfig::from_settings(None).expect("default policy");
         assert_eq!(defaults.idle_minutes, Some(60));
         assert_eq!(defaults.default_free_floor_gb, Some(100));
+        assert_eq!(defaults.mtime_scan_entries, Some(100_000));
+        assert_eq!(defaults.mtime_scan_duration_ms, Some(2_000));
         assert_eq!(defaults.hosts["terra"].free_floor_gb, Some(150));
 
         let settings = toml::from_str::<toml::Value>(
@@ -884,6 +942,8 @@ mod tests {
             [hygiene]
             worktree_root = "/srv/dev/worktrees"
             idle_minutes = 90
+            mtime_scan_entries = 500
+            mtime_scan_duration_ms = 150
 
             [hygiene.hosts.terra]
             max_load1 = 32.0
@@ -902,6 +962,8 @@ mod tests {
             Some(Path::new("/srv/dev/worktrees"))
         );
         assert_eq!(config.idle_minutes, Some(90));
+        assert_eq!(config.mtime_scan_entries, Some(500));
+        assert_eq!(config.mtime_scan_duration_ms, Some(150));
         assert_eq!(config.hosts["terra"].free_floor_gb, Some(150));
         assert_eq!(config.hosts["luna"].free_floor_gb, Some(100));
         assert_eq!(
@@ -964,6 +1026,37 @@ mod tests {
             target_use(target, &ProcessTable::default()),
             UseState::Unknown
         );
+    }
+
+    #[test]
+    #[trace("FR-048-AC-2")]
+    fn command_or_environment_reference_to_worktree_protects_target_with_other_cwd() {
+        let target = Path::new("/work/wt/target");
+        let worktree = target.parent().unwrap();
+        for process in [
+            ProcessEvidence {
+                cwd: Some(PathBuf::from("/tmp")),
+                cmdline: b"cargo\0--manifest-path=/work/wt/Cargo.toml".to_vec(),
+                ..Default::default()
+            },
+            ProcessEvidence {
+                cwd: Some(PathBuf::from("/tmp")),
+                environ: b"PROJECT_ROOT=/work/wt".to_vec(),
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                target_use_in_worktree(
+                    target,
+                    worktree,
+                    &ProcessTable {
+                        processes: vec![process],
+                        complete: true,
+                    }
+                ),
+                UseState::InUse
+            );
+        }
     }
 
     #[test]
@@ -1103,7 +1196,8 @@ mod tests {
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(recent_artifact_mtime))
             .unwrap();
-        let newest = newest_mtime_under(&target).expect("recursive newest mtime");
+        let newest = newest_mtime_under(&target, 100, Duration::from_secs(1))
+            .expect("recursive newest mtime");
         assert_eq!(newest, recent_artifact_mtime);
         let decision = clean_decision(
             &target,
@@ -1120,6 +1214,80 @@ mod tests {
             },
         );
         assert_eq!(decision.reason, "too_recent");
+    }
+
+    #[test]
+    #[trace("FR-048-AC-5", "FR-048-AC-6")]
+    fn bounded_mtime_scan_fails_closed_and_fresh_apply_age_skips_removal() {
+        let sandbox = tempfile::tempdir().expect("sandbox");
+        let target = sandbox.path().join("target");
+        std::fs::create_dir_all(&target).expect("target");
+        std::fs::write(target.join("one"), "1").expect("first entry");
+        std::fs::write(target.join("two"), "2").expect("second entry");
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000_000);
+        let policy = HostPolicy {
+            free_floor_bytes: 1,
+            idle_age_secs: 3_600,
+        };
+        let no_processes = ProcessTable {
+            processes: Vec::new(),
+            complete: true,
+        };
+
+        let entry_limit = newest_mtime_under(&target, 1, Duration::from_secs(1))
+            .expect_err("entry limit makes age unknown");
+        assert_eq!(entry_limit.kind(), io::ErrorKind::TimedOut);
+        let time_limit = newest_mtime_under(&target, 100, Duration::from_nanos(1))
+            .expect_err("expired time budget makes age unknown");
+        assert_eq!(time_limit.kind(), io::ErrorKind::TimedOut);
+        let fail_closed = clean_decision(&target, sandbox.path(), now, now, &policy, &no_processes);
+        assert!(
+            !fail_closed.eligible,
+            "unknown age must never permit deletion"
+        );
+        assert_eq!(fail_closed.reason, "too_recent");
+
+        let nested = target.join("debug");
+        std::fs::create_dir(&nested).expect("nested build output");
+        let artifact = nested.join("artifact");
+        std::fs::write(&artifact, "build").expect("artifact");
+        let old = now - Duration::from_secs(7_200);
+        for path in [&target, &nested, &artifact] {
+            std::fs::File::open(path)
+                .expect("open path")
+                .set_times(std::fs::FileTimes::new().set_modified(old))
+                .expect("set old mtime");
+        }
+        let planned_mtime =
+            newest_mtime_under(&target, 100, Duration::from_secs(1)).expect("plan age");
+        let planned = clean_decision(
+            &target,
+            sandbox.path(),
+            now,
+            planned_mtime,
+            &policy,
+            &no_processes,
+        );
+        assert!(planned.eligible, "old build output is initially eligible");
+
+        let completed_build_mtime = now - Duration::from_secs(30);
+        std::fs::File::open(&artifact)
+            .expect("open artifact")
+            .set_times(std::fs::FileTimes::new().set_modified(completed_build_mtime))
+            .expect("record build completion");
+        let current_mtime =
+            newest_mtime_under(&target, 100, Duration::from_secs(1)).expect("apply age");
+        let rechecked = recheck_clean_decision(
+            &planned,
+            sandbox.path(),
+            now,
+            current_mtime,
+            &policy,
+            &no_processes,
+        );
+        assert!(!rechecked.eligible, "a build finished after planning");
+        assert_eq!(rechecked.reason, "too_recent");
+        assert!(target.exists(), "fresh target remains available");
     }
 
     #[test]

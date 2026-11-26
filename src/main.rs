@@ -3434,9 +3434,9 @@ fn run_hygiene(
     use ix_board::host_hygiene::{
         CleanDecision, HostPolicy, HygieneConfig, HygieneReport, apply_clean_decision,
         canonicalize_worktree_root, clean_decision, free_disk_bytes, newest_mtime_under,
-        system_process_table,
+        recheck_clean_decision, system_process_table,
     };
-    use std::time::SystemTime;
+    use std::time::{Duration, SystemTime};
 
     if cfg!(target_os = "windows") {
         return Ok(HygieneReport {
@@ -3490,6 +3490,8 @@ fn run_hygiene(
         .ok_or_else(|| Error::ProgramReview {
             message: "idle age overflows seconds".to_owned(),
         })?;
+    let mtime_scan_entries = config.mtime_scan_entries.unwrap_or(100_000);
+    let mtime_scan_duration = Duration::from_millis(config.mtime_scan_duration_ms.unwrap_or(2_000));
     let free_bytes = free_disk_bytes(&root).ok();
     let processes = system_process_table().unwrap_or_default();
     let prunable_worktrees = find_prunable_worktrees(&root);
@@ -3551,15 +3553,19 @@ fn run_hygiene(
         if !target.starts_with(&worktree) {
             continue;
         }
-        let modified = newest_mtime_under(&target).unwrap_or_else(|_| SystemTime::now());
+        let modified = newest_mtime_under(&target, mtime_scan_entries, mtime_scan_duration)
+            .unwrap_or_else(|_| SystemTime::now());
         let mut decision = clean_decision(&target, &worktree, now, modified, &policy, &processes);
         if apply && decision.eligible {
             let latest = system_process_table().unwrap_or_default();
-            decision = clean_decision(
-                &target,
+            let newest_modified =
+                newest_mtime_under(&target, mtime_scan_entries, mtime_scan_duration)
+                    .unwrap_or_else(|_| SystemTime::now());
+            decision = recheck_clean_decision(
+                &decision,
                 &worktree,
                 SystemTime::now(),
-                modified,
+                newest_modified,
                 &policy,
                 &latest,
             );
