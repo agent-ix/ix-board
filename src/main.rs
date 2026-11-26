@@ -692,7 +692,6 @@ enum Output {
     },
     Hygiene(ix_board::host_hygiene::HygieneReport),
     HostCheck(ix_board::host_check::HostCheckReport),
-    HostCheck(ix_board::host_check::HostCheckReport),
     BuildStatus(
         Vec<(
             ix_board::host_hygiene::BuildHostMetrics,
@@ -1023,7 +1022,7 @@ fn run(command: Command) -> Result<Output, Error> {
         },
         Command::Host {
             command: HostCommand::Check,
-        } => run_host_check().map(Output::HostCheck),
+        } => Ok(Output::HostCheck(run_host_check())),
         Command::Build {
             command:
                 BuildCommand::Status {
@@ -3369,7 +3368,7 @@ fn run_linear(command: Command) -> Result<Output, Error> {
         Command::Auth { .. } => unreachable!("auth commands are handled before Linear dispatch"),
         Command::AgentProbe => unreachable!("probe is handled before normal dispatch"),
         Command::Agents { .. } => unreachable!("agents is handled before Linear dispatch"),
-        Command::Hygiene { .. } | Command::Build { .. } => {
+        Command::Hygiene { .. } | Command::Host { .. } | Command::Build { .. } => {
             unreachable!("build-host commands are handled before Linear dispatch")
         }
         Command::Fleet { .. } => unreachable!("fleet is handled before Linear dispatch"),
@@ -3848,7 +3847,7 @@ fn run_host_check() -> ix_board::host_check::HostCheckReport {
     let linear_state = match linear_source.as_deref() {
         Some("keyring_locked") => AuthState::KeyringLocked,
         Some("unavailable") => AuthState::Unavailable,
-        Some(source) => match ix_board::LinearGraphQlSource::from_env()
+        Some(_source) => match ix_board::LinearGraphQlSource::from_env()
             .and_then(|linear| linear.auth_status())
         {
             Ok(200..=299) => AuthState::Ready,
@@ -3969,6 +3968,7 @@ fn find_prunable_worktrees(
     root: &std::path::Path,
     mounts: &[ix_board::host_hygiene::MountEntry],
 ) -> Vec<PathBuf> {
+    use ix_board::host_hygiene::{MountSafety, mount_safety};
     let mut found = std::collections::BTreeSet::new();
     let Ok(entries) = std::fs::read_dir(root) else {
         return Vec::new();
