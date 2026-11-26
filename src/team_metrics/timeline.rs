@@ -3,6 +3,7 @@
 use super::wire::AssignmentStatus;
 use super::{Assignment, Binding, Change, Config, Error, Event, Selectors};
 use crate::retro::Record;
+use ix_trace_rs::implements;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -17,6 +18,8 @@ pub struct State {
     pub(crate) history_at_ms: i64,
     pub(crate) history_ok: bool,
     pub(crate) history_gaps: u64,
+    #[serde(default)]
+    pub(crate) linear_requests_last_refresh: u64,
     pub(crate) journal_from_ms: i64,
     pub(crate) scopes: BTreeMap<String, ScopeState>,
 }
@@ -34,28 +37,66 @@ pub struct ScopeState {
     pub(crate) tracker_at_ms: i64,
     pub(crate) tracker_ok: bool,
     pub(crate) record: Option<Record>,
+    #[serde(default)]
+    pub(crate) record_reason: Option<String>,
+    #[serde(default)]
+    pub(crate) pr_stats_reason: Option<String>,
+    #[serde(default)]
+    pub(crate) review_stats_reason: Option<String>,
+    #[serde(default)]
+    pub(crate) closures_daily_reason: Option<String>,
+    #[serde(default)]
+    pub(crate) merged_prs_daily_reason: Option<String>,
     pub(crate) pr_stats: Option<super::pr_stats::PrStats>,
     pub(crate) review_stats: Option<super::reviews::ReviewStats>,
+    #[serde(default)]
+    pub(crate) closures_daily: Option<Vec<usize>>,
+    #[serde(default)]
+    pub(crate) merged_prs_daily: Option<Vec<usize>>,
+    #[serde(default)]
+    pub(crate) closures_daily_coverage: f64,
+    #[serde(default)]
+    pub(crate) merged_prs_daily_coverage: f64,
     pub(crate) pr_success_at_ms: i64,
     pub(crate) review_success_at_ms: i64,
     #[serde(default)]
     pub(crate) github_observed_at_ms: i64,
+    #[serde(default)]
+    pub(crate) github_repo_coverage: f64,
     pub(crate) assignments: BTreeMap<String, Active>,
     pub(crate) pauses: BTreeMap<String, bool>,
     pub(crate) reported_scope: BTreeMap<String, String>,
     pub(crate) totals: BTreeMap<String, f64>,
     pub(crate) samples: BTreeMap<String, Sample>,
     pub(crate) stages: BTreeMap<String, Vec<(i64, f64)>>,
+    #[serde(default)]
+    pub(crate) linear_stage_ages: Vec<LinearStageAge>,
+    #[serde(default)]
+    pub(crate) effort_range: Option<EffortRange>,
+    #[serde(default)]
+    pub(crate) effort_range_reason: Option<String>,
     pub(crate) lifecycle_at_ms: i64,
     pub(crate) lifecycle_ok: bool,
     pub(crate) lifecycle_success_at_ms: i64,
     pub(crate) population_observed: bool,
+    #[serde(default)]
+    pub(crate) execution_population_expected: usize,
+    #[serde(default)]
+    pub(crate) execution_population_observed: usize,
+    #[serde(default)]
+    pub(crate) execution_observed_count: usize,
+    #[serde(default)]
+    pub(crate) execution_working_count: usize,
+    #[serde(default)]
+    pub(crate) execution_observed_at_ms: i64,
     pub(crate) unattributed_executing_agents: usize,
     pub(crate) covered_seconds: f64,
     pub(crate) effort_points: Vec<(i64, f64, f64)>,
     pub(crate) build_execution_seconds_24h: Option<f64>,
     pub(crate) ready_issues: Option<usize>,
     pub(crate) blocked_issues: Option<usize>,
+    #[serde(default)]
+    pub(crate) wip_active: Option<usize>,
     pub(crate) coverage_started_ms: Option<i64>,
     pub(crate) last_error: Option<String>,
 }
@@ -65,6 +106,21 @@ pub(crate) struct Member {
     pub ticket: String,
     pub state: crate::WorkflowStateType,
     pub leaf: bool,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LinearStageAge {
+    pub stage: String,
+    pub oldest_seconds: f64,
+    pub coverage: f64,
+    #[serde(default)]
+    pub available: bool,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EffortRange {
+    pub working_lane_seconds: f64,
+    pub coverage: f64,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -116,7 +172,31 @@ fn state_label(status: AssignmentStatus) -> &'static str {
 fn add(totals: &mut BTreeMap<String, f64>, key: &str, value: f64) {
     *totals.entry(key.into()).or_default() += value;
 }
-fn scope_matches(selected: &Selectors, reported: &relay_work_wire::ReportedScope) -> bool {
+#[implements("FR-033-AC-16")]
+pub(super) fn scope_matches(
+    selected: &Selectors,
+    reported: &relay_work_wire::ReportedScope,
+) -> bool {
+    if selected.team.is_some()
+        && selected.initiatives.is_empty()
+        && selected.projects.is_empty()
+        && selected.tickets.is_empty()
+    {
+        // A team-only selection accepts a narrower ticket slice only when its
+        // issue keys prove the selected team. Project and initiative labels alone
+        // do not carry reliable team identity in the relay wire format.
+        let Some(team) = selected.team.as_deref() else {
+            return false;
+        };
+        if reported.tickets.is_empty() {
+            return false;
+        }
+        let prefix = format!("{}-", team.to_ascii_uppercase());
+        return reported
+            .tickets
+            .iter()
+            .all(|ticket| ticket.to_ascii_uppercase().starts_with(&prefix));
+    }
     let same = |a: &[String], b: &[String]| {
         a.iter().collect::<BTreeSet<_>>() == b.iter().collect::<BTreeSet<_>>()
     };

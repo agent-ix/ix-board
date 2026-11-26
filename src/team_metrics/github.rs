@@ -16,17 +16,22 @@ use std::time::{Duration, Instant};
 pub(super) const TTL_MS: i64 = 900_000;
 const HOUR_MS: i64 = 3_600_000;
 pub(super) const MAX_BODY: usize = 1024 * 1024;
-const MAX_REQUESTS: i64 = 40;
+// Leave ten percent of GitHub's documented 5,000-point user/hour primary
+// GraphQL allowance for other clients; each attempt reserves 25 points.
+const MAX_REQUESTS: i64 = 180;
 // Fixed selections expose at most 50 PR nodes and two one-item timeline
 // connections per PR (or 25 flat linked PR aliases). Reserve 25 points even
 // though GitHub's documented connection calculation yields a few points.
 const RESERVED_COST: i64 = 25;
-const MAX_COST: i64 = 1000;
-const MAX_PAGES: usize = 4;
+const MAX_COST: i64 = 4500;
+const MAX_PAGES: usize = 10;
+const MAX_RECENT_PAGES: usize = 30;
 const MAX_OLD: usize = 50;
 const MAX_REPOS: usize = 32;
+const DAILY_PR_WINDOW_SECONDS: f64 = 7.0 * 86_400.0;
 pub(super) const MAX_QUERY: usize = 16 * 1024;
 const CACHE_BYTES: i64 = 4 * 1024 * 1024;
+const PR_FIELDS: &str = "nodes { number createdAt mergedAt closedAt updatedAt isDraft state additions deletions reviewDecision timelineItems(first: 1, itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT]) { totalCount } reopenEvents: timelineItems(first: 1, itemTypes: [REOPENED_EVENT]) { totalCount } } pageInfo { hasNextPage endCursor }";
 
 #[derive(serde::Serialize)]
 pub(super) struct Request {
@@ -276,11 +281,13 @@ impl<T: Transport> Guard<T> {
                     .filter(|r| r.data.rate.remaining < 25);
                 let limited = response.status == 429
                     || response.status == 403
+                    || response.headers.contains_key("retry-after")
                     || response
                         .headers
                         .get("x-ratelimit-remaining")
                         .is_some_and(|v| v == "0")
-                    || graph_limit.is_some();
+                    || graph_limit.is_some()
+                    || response_body_reports_rate_limit(&response.body);
                 if limited {
                     let graph_reset = graph_limit.and_then(|r| chrono::DateTime::parse_from_rfc3339(&r.data.rate.reset_at).ok()).map(|d| d.timestamp_millis()).unwrap_or(0);
                     let until = backoff(&response, received).max(graph_reset);
@@ -314,18 +321,46 @@ impl<T: Transport> Guard<T> {
             }
             Err(reason) => Err(reason),
         };
-        if result.is_err() {
-            // Malformed payloads, transport timeouts and GraphQL errors also suppress
-            // retry storms. A longer server cooldown always wins.
-            tx.execute(
-                "UPDATE github_gate SET cooldown=max(cooldown,?1) WHERE id=1",
-                [received.saturating_add(HOUR_MS)],
-            )
-            .map_err(|e| e.to_string())?;
-        }
+        // Ordinary repository errors stay local to their caller. Only explicit
+        // server rate-limit responses above set the shared cooldown.
         tx.commit().map_err(|e| e.to_string())?;
         result
     }
+}
+#[implements("FR-033-AC-12")]
+fn response_body_reports_rate_limit(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let mut messages = value
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .into_iter()
+        .chain(
+            value
+                .get("errors")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|error| error.get("message").and_then(serde_json::Value::as_str)),
+        );
+    messages.any(|message| message.to_ascii_lowercase().contains("rate limit"))
+        || value
+            .get("errors")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|errors| {
+                errors.iter().any(|error| {
+                    [
+                        error.get("type").and_then(serde_json::Value::as_str),
+                        error
+                            .pointer("/extensions/code")
+                            .and_then(serde_json::Value::as_str),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .any(|code| matches!(code, "RATE_LIMITED" | "RATE_LIMIT_EXCEEDED"))
+                })
+            })
 }
 fn backoff(response: &Response, now: i64) -> i64 {
     let reset = response
@@ -453,23 +488,27 @@ type InfoRows = Result<BTreeMap<u64, PullRequestInfo>, String>;
 pub(super) struct SelectedGithub<T = Http> {
     guard: Result<Guard<T>, String>,
     allowed: BTreeSet<(String, u64)>,
+    priority: BTreeSet<(String, u64)>,
     complete: bool,
     now: i64,
     oldest_at: Cell<i64>,
-    start: Instant,
+    start: Cell<Option<Instant>>,
     lists: RefCell<BTreeMap<String, PrRows>>,
     infos: RefCell<BTreeMap<String, InfoRows>>,
 }
 impl SelectedGithub {
-    pub(super) fn new(
+    #[implements("FR-033-AC-18")]
+    pub(super) fn new_with_priority(
         config: &Config,
         allowed: BTreeSet<(String, u64)>,
+        priority: BTreeSet<(String, u64)>,
         complete: bool,
         now: i64,
     ) -> Self {
         Self::with_guard(
             Http::local().and_then(|transport| Guard::open(config, transport)),
             allowed,
+            priority,
             complete,
             now,
         )
@@ -479,16 +518,18 @@ impl<T: Transport> SelectedGithub<T> {
     fn with_guard(
         guard: Result<Guard<T>, String>,
         allowed: BTreeSet<(String, u64)>,
+        priority: BTreeSet<(String, u64)>,
         complete: bool,
         now: i64,
     ) -> Self {
         Self {
             guard,
             allowed,
+            priority,
             complete,
             now,
             oldest_at: Cell::new(0),
-            start: Instant::now(),
+            start: Cell::new(None),
             lists: RefCell::new(BTreeMap::new()),
             infos: RefCell::new(BTreeMap::new()),
         }
@@ -524,7 +565,12 @@ impl<T: Transport> SelectedGithub<T> {
         request: &Request,
         validate: impl Fn(&str, i64) -> Result<(), String>,
     ) -> Result<Cached, String> {
-        if self.start.elapsed() >= Duration::from_secs(45) {
+        let start = self.start.get().unwrap_or_else(|| {
+            let started = Instant::now();
+            self.start.set(Some(started));
+            started
+        });
+        if start.elapsed() >= Duration::from_secs(120) {
             return Err("GitHub collection time budget exhausted".into());
         }
         if self.allowed.len() > 10_000 {
@@ -542,50 +588,98 @@ impl<T: Transport> SelectedGithub<T> {
         });
         Ok(cached)
     }
-    fn list(&self, repo: &str, states: &str, since: Option<f64>) -> PrRows {
-        let query = crate::retro::live::PULL_REQUEST_QUERY
-            .replace("__STATES__", states)
-            .replacen(
-                "  repository(",
-                "  rateLimit { cost remaining resetAt }\n  repository(",
-                1,
-            );
-        let mut cursor = None;
-        let mut seen = BTreeSet::new();
-        let mut prs = Vec::new();
-        let mut previous_update = f64::INFINITY;
-        for _ in 0..MAX_PAGES {
-            let request = graph_request(&query, repo, cursor.as_deref())?;
-            let body = self.read(&request, |body, at| {
-                validate_page(body, repo, since, states, at)
-            })?;
-            let page =
-                crate::retro::live::pull_request_page(&graph_body(&body.body)?, repo, since)?;
-            if page.items.len() > 50 || page.items.iter().any(|p| !seen.insert(p.number)) {
-                return Err("GitHub duplicate/oversize PR page".into());
+    #[implements("FR-033-AC-13")]
+    fn list_recent_population(&self, repo: &str, since: f64) -> PrRows {
+        let mut open_after: Option<String> = None;
+        let mut closed_after: Option<String> = None;
+        let mut open_more = true;
+        let mut closed_more = true;
+        let mut rows = Vec::<PullRequest>::new();
+        let mut open_cursors = BTreeSet::new();
+        let mut closed_cursors = BTreeSet::new();
+        let mut open_last_updated = f64::INFINITY;
+        let mut closed_last_updated = f64::INFINITY;
+        for page_index in 0..MAX_RECENT_PAGES {
+            if page_index == MAX_PAGES && open_more {
+                return Err("GitHub open PR page budget exhausted; incomplete population".into());
             }
-            for pr in &page.items {
-                if pr.updated_at > previous_update {
-                    return Err("GitHub pagination order is inconsistent".into());
+            if !open_more && !closed_more {
+                let mut seen = BTreeSet::new();
+                rows.retain(|pr| seen.insert(pr.number));
+                return Ok(rows);
+            }
+            let mut fields = Vec::new();
+            let mut variables = BTreeMap::new();
+            if open_more {
+                fields.push(format!(
+                    "open: pullRequests(first: 50, states: [OPEN], after: $openAfter, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{ {PR_FIELDS} }}"
+                ));
+                variables.insert(
+                    "openAfter".to_owned(),
+                    open_after.clone().unwrap_or_default(),
+                );
+            }
+            if closed_more {
+                fields.push(format!(
+                    "recent: pullRequests(first: 50, states: [MERGED, CLOSED], after: $recentAfter, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{ {PR_FIELDS} }}"
+                ));
+                variables.insert(
+                    "recentAfter".to_owned(),
+                    closed_after.clone().unwrap_or_default(),
+                );
+            }
+            let declarations = variables
+                .keys()
+                .map(|name| format!("${name}: String"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "query($owner: String!, $name: String!, {declarations}) {{ rateLimit {{ cost remaining resetAt }} repository(owner: $owner, name: $name) {{ {} }} }}",
+                fields.join("\n")
+            );
+            let mut request = graph_request(&query, repo, None)?;
+            for (name, value) in variables {
+                if !value.is_empty() {
+                    request.variables.insert(name, value);
                 }
-                previous_update = pr.updated_at;
             }
-            prs.extend(
-                page.items
-                    .into_iter()
-                    .filter(|p| since.is_none_or(|s| p.updated_at >= s)),
-            );
-            if !page.has_next {
-                return Ok(prs);
+            let body = self.read(&request, |body, at| {
+                validate_population_page(body, repo, since, open_more, closed_more, at)
+            })?;
+            if open_more {
+                let page = population_page(&body.body, "open", repo, None)?;
+                validate_population_cursor(
+                    &page,
+                    open_after.as_deref(),
+                    &mut open_cursors,
+                    &mut open_last_updated,
+                )?;
+                rows.extend(page.items);
+                open_after = page.cursor;
+                open_more = page.has_next;
             }
-            let next = page.cursor.ok_or("GitHub next cursor absent")?;
-            if cursor.as_ref() == Some(&next) {
-                return Err("GitHub pagination did not advance".into());
+            if closed_more {
+                let page = population_page(&body.body, "recent", repo, Some(since))?;
+                validate_population_cursor(
+                    &page,
+                    closed_after.as_deref(),
+                    &mut closed_cursors,
+                    &mut closed_last_updated,
+                )?;
+                rows.extend(page.items);
+                closed_after = page.cursor;
+                closed_more = page.has_next;
             }
-            cursor = Some(next);
         }
-        Err("GitHub repository page budget exhausted; incomplete population".into())
+        let mut seen = BTreeSet::new();
+        rows.retain(|pr| seen.insert(pr.number));
+        if open_more || closed_more {
+            Err("GitHub recent PR page budget exhausted; incomplete population".into())
+        } else {
+            Ok(rows)
+        }
     }
+    #[implements("FR-033-AC-18")]
     fn repository_prs(&self, repo: &str) -> PrRows {
         if let Some(rows) = self.lists.borrow().get(repo) {
             return rows.clone();
@@ -593,18 +687,13 @@ impl<T: Transport> SelectedGithub<T> {
         if self.lists.borrow().len() >= MAX_REPOS {
             return Err("GitHub repository population exceeds collection bound".into());
         }
-        let result = (|| {
-            let mut rows = self.list(repo, "[OPEN]", None)?;
-            rows.extend(self.list(
-                repo,
-                "[MERGED, CLOSED]",
-                Some(self.now as f64 / 1000.0 - 86_400.0),
-            )?);
-            Ok(rows)
-        })();
+        self.start.set(Some(Instant::now()));
+        let result =
+            self.list_recent_population(repo, self.now as f64 / 1000.0 - DAILY_PR_WINDOW_SECONDS);
         self.lists.borrow_mut().insert(repo.into(), result.clone());
         result
     }
+    #[implements("FR-033-AC-18")]
     fn repository_infos(&self, repo: &str) -> InfoRows {
         if let Some(rows) = self.infos.borrow().get(repo) {
             return rows.clone();
@@ -612,6 +701,7 @@ impl<T: Transport> SelectedGithub<T> {
         if self.infos.borrow().len() >= MAX_REPOS {
             return Err("GitHub linked repository population exceeds collection bound".into());
         }
+        self.start.set(Some(Instant::now()));
         let result = (|| {
             let mut rows = BTreeMap::new();
             // A failed full population never certifies an empty listing. Linked detail
@@ -627,13 +717,25 @@ impl<T: Transport> SelectedGithub<T> {
                     );
                 }
             }
-            let numbers: Vec<_> = self
-                .allowed
+            let candidates: Vec<u64> = self
+                .priority
                 .iter()
-                .filter(|(r, n)| r == repo && !rows.contains_key(n))
-                .take(MAX_OLD)
+                .filter(|(r, n)| {
+                    r == repo && self.allowed.contains(&(r.clone(), *n)) && !rows.contains_key(n)
+                })
+                .chain(
+                    self.allowed
+                        .iter()
+                        .filter(|(r, n)| r == repo && !rows.contains_key(n)),
+                )
                 .map(|(_, n)| *n)
                 .collect();
+            let mut seen = BTreeSet::new();
+            let mut numbers = candidates
+                .into_iter()
+                .filter(|number| seen.insert(*number))
+                .collect::<Vec<_>>();
+            numbers.truncate(MAX_OLD);
             for chunk in numbers.chunks(25) {
                 let fields = chunk
                     .iter()
@@ -654,6 +756,32 @@ impl<T: Transport> SelectedGithub<T> {
         self.infos.borrow_mut().insert(repo.into(), result.clone());
         result
     }
+}
+
+#[implements("FR-033-AC-13")]
+fn validate_population_cursor(
+    page: &crate::retro::sources::Page<PullRequest>,
+    previous_cursor: Option<&str>,
+    cursors: &mut BTreeSet<String>,
+    last_updated: &mut f64,
+) -> Result<(), String> {
+    if page.has_next {
+        let cursor = page
+            .cursor
+            .as_deref()
+            .filter(|cursor| Some(*cursor) != previous_cursor)
+            .ok_or_else(|| "GitHub population page omitted or stalled its cursor".to_owned())?;
+        if !cursors.insert(cursor.to_owned()) {
+            return Err("GitHub population page repeated a cursor".into());
+        }
+    }
+    for pr in &page.items {
+        if pr.updated_at > *last_updated {
+            return Err("GitHub population pages are not newest-first".into());
+        }
+        *last_updated = pr.updated_at;
+    }
+    Ok(())
 }
 fn validate_page(
     body: &str,
@@ -703,6 +831,49 @@ fn validate_page(
         .any(|pair| pair[0].updated_at < pair[1].updated_at)
     {
         return Err("GitHub PR page is not ordered by native update time".into());
+    }
+    Ok(())
+}
+fn population_connection(body: &str, alias: &str) -> Result<String, String> {
+    let response: serde_json::Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    let data = response.get("data").ok_or("GitHub response data missing")?;
+    let connection = data
+        .get("repository")
+        .and_then(|r| r.get(alias))
+        .ok_or("GitHub batched PR connection missing")?;
+    Ok(serde_json::json!({
+        "data": {
+            "rateLimit": data.get("rateLimit").ok_or("GitHub quota evidence missing")?,
+            "repository": {"pullRequests": connection}
+        }
+    })
+    .to_string())
+}
+fn population_page(
+    body: &str,
+    alias: &str,
+    repo: &str,
+    since: Option<f64>,
+) -> Result<crate::retro::sources::Page<PullRequest>, String> {
+    let wrapper = population_connection(body, alias)?;
+    crate::retro::live::pull_request_page(&graph_body(&wrapper)?, repo, since)
+}
+fn validate_population_page(
+    body: &str,
+    repo: &str,
+    since: f64,
+    open: bool,
+    recent: bool,
+    at: i64,
+) -> Result<(), String> {
+    for (enabled, alias, cutoff, states) in [
+        (open, "open", None, "[OPEN]"),
+        (recent, "recent", Some(since), "[MERGED, CLOSED]"),
+    ] {
+        if enabled {
+            let wrapper = population_connection(body, alias)?;
+            validate_page(&wrapper, repo, cutoff, states, at)?;
+        }
     }
     Ok(())
 }
@@ -926,7 +1097,7 @@ mod tests {
         if let Ok(g) = &guard {
             g.transport.clock.set(at);
         }
-        SelectedGithub::with_guard(guard, allowed, complete, at)
+        SelectedGithub::with_guard(guard, allowed, BTreeSet::new(), complete, at)
     }
     fn config(path: &std::path::Path) -> Config {
         serde_json::from_value(serde_json::json!({
@@ -947,8 +1118,21 @@ mod tests {
             assert!(!request.conditional);
             let query = &request.query;
             assert!(query.len() < MAX_QUERY);
-            let repository = if query.contains("pullRequests(") {
-                serde_json::json!({"pullRequests":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}})
+            let connection =
+                serde_json::json!({"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}});
+            let repository = if query.contains("open: pullRequests")
+                || query.contains("recent: pullRequests")
+            {
+                let mut aliases = serde_json::Map::new();
+                if query.contains("open: pullRequests") {
+                    aliases.insert("open".into(), connection.clone());
+                }
+                if query.contains("recent: pullRequests") {
+                    aliases.insert("recent".into(), connection);
+                }
+                serde_json::Value::Object(aliases)
+            } else if query.contains("pullRequests(") {
+                serde_json::json!({"pullRequests":connection})
             } else {
                 let mut fields = serde_json::Map::new();
                 for number in query.split("pullRequest(number: ").skip(1) {
@@ -974,7 +1158,7 @@ mod tests {
             .map_err(|e| e.to_string())
     }
 
-    #[trace("FR-033-AC-12", "FR-033-AC-13")]
+    #[trace("FR-033-AC-12", "FR-033-AC-13", "FR-033-AC-18")]
     #[test]
     fn thousands_of_old_links_have_constant_batched_cost_across_scopes_cycles_and_restart() {
         let dir = tempfile::tempdir().unwrap();
@@ -1009,8 +1193,8 @@ mod tests {
             );
             assert_eq!(
                 transport.count(),
-                if offset < TTL_MS { 8 } else { 16 },
-                "cold=8, warm/restart=0, expired unchanged=8 sends for two repositories"
+                if offset < TTL_MS { 6 } else { 12 },
+                "cold=6, warm/restart=0, expired unchanged=6 sends for two repositories"
             );
         }
     }
@@ -1022,7 +1206,7 @@ mod tests {
         let cfg = config(dir.path());
         let fake = Fake::new(|_, _| Ok(response("{}".into())));
         let guard = open(&cfg, fake.clone()).unwrap();
-        for n in 0..40 {
+        for n in 0..usize::try_from(MAX_REQUESTS).unwrap() {
             guard
                 .request_at(&request(n, false), 1000, valid_json)
                 .unwrap();
@@ -1031,16 +1215,20 @@ mod tests {
         let guard = open(&cfg, fake.clone()).unwrap();
         assert!(
             guard
-                .request_at(&request(41, false), 1001, valid_json)
+                .request_at(
+                    &request(usize::try_from(MAX_REQUESTS).unwrap() + 1, false),
+                    1001,
+                    valid_json,
+                )
                 .is_err()
         );
-        assert_eq!(fake.count(), 40);
+        assert_eq!(fake.count(), usize::try_from(MAX_REQUESTS).unwrap());
         let cost: i64 = guard
             .db
             .borrow()
             .query_row("SELECT sum(cost) FROM github_sends", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(cost, 1000);
+        assert_eq!(cost, MAX_COST);
     }
 
     #[trace("FR-033-AC-12")]
@@ -1144,7 +1332,7 @@ mod tests {
     #[trace("FR-033-AC-12", "FR-033-AC-13")]
     #[test]
     fn server_cooldowns_and_errors_remain_unavailable_after_restart() {
-        for status in [403, 429, 200] {
+        for status in [403, 429, 500, 200] {
             let dir = tempfile::tempdir().unwrap();
             let cfg = config(dir.path());
             let fake = Fake::new(move |_, _| {
@@ -1185,10 +1373,14 @@ mod tests {
     #[trace("FR-033-AC-13")]
     #[test]
     fn malformed_partial_null_and_cost_excess_never_certify_evidence() {
-        for body in [
-            "{}",
-            "{\"errors\":[{\"type\":\"RATE_LIMITED\"}]}",
-            "{\"data\":{\"repository\":null,\"rateLimit\":{\"cost\":26,\"remaining\":1,\"resetAt\":\"2030-01-01T00:00:00Z\"}}}",
+        for (body, expected_sends) in [
+            ("{}", 2),
+            ("{\"errors\":[{\"type\":\"RATE_LIMITED\"}]}", 1),
+            ("{\"message\":\"API rate limit exceeded\"}", 1),
+            (
+                "{\"data\":{\"repository\":null,\"rateLimit\":{\"cost\":26,\"remaining\":1,\"resetAt\":\"2030-01-01T00:00:00Z\"}}}",
+                1,
+            ),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let cfg = config(dir.path());
@@ -1202,7 +1394,7 @@ mod tests {
             );
             assert!(source.pull_requests("agent-ix/one", 0.0).is_err());
             assert!(source.pull_request("agent-ix/one", 1).is_err());
-            assert_eq!(fake.count(), 1);
+            assert_eq!(fake.count(), expected_sends);
         }
         let null = serde_json::json!({"data":{"rateLimit":{"cost":1,"remaining":100,"resetAt":"2030-01-01T00:00:00Z"},"repository":{"p1":null}}}).to_string();
         assert!(parse_infos(&null, &[1], 1000).unwrap().is_empty());
@@ -1215,14 +1407,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = config(dir.path());
         let fake = Fake::new(|request, _| {
-            let n = request
-                .variables
-                .get("after")
-                .map(String::as_str)
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0)
-                + 1;
-            Ok(response(serde_json::json!({"data":{"rateLimit":{"cost":1,"remaining":100,"resetAt":"2030-01-01T00:00:00Z"},"repository":{"pullRequests":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":n.to_string()}}}}}).to_string()))
+            let next = |key: &str| {
+                request
+                    .variables
+                    .get(key)
+                    .map(String::as_str)
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0)
+                    + 1
+            };
+            let connection = |n: u64| serde_json::json!({"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":n.to_string()}});
+            let mut repository = serde_json::Map::new();
+            if request.query.contains("open: pullRequests") {
+                repository.insert("open".into(), connection(next("openAfter")));
+            }
+            if request.query.contains("recent: pullRequests") {
+                repository.insert("recent".into(), connection(next("recentAfter")));
+            }
+            Ok(response(serde_json::json!({"data":{"rateLimit":{"cost":1,"remaining":100,"resetAt":"2030-01-01T00:00:00Z"},"repository":repository}}).to_string()))
         });
         let source = source(open(&cfg, fake.clone()), BTreeSet::new(), true, 1000);
         assert!(source.pull_requests("agent-ix/one", 0.0).is_err());
@@ -1364,7 +1566,7 @@ mod tests {
                 .request_at(&request(0, true), 1001, valid_json)
                 .is_err()
         );
-        assert_eq!(fake.count(), 1);
+        assert_eq!(fake.count(), 2);
         let response = Response {
             status: 429,
             headers: [(
@@ -1379,7 +1581,6 @@ mod tests {
     fn graph_body_validator(body: &str, _at: i64) -> Result<(), String> {
         graph_body(body).map(|_| ())
     }
-
     #[trace("FR-033-AC-13")]
     #[test]
     fn graph_body_preserves_node_connections_and_rejects_graph_errors() {
@@ -1403,38 +1604,136 @@ mod tests {
         );
     }
 
-    #[trace("FR-033-AC-12", "FR-033-AC-13")]
+    #[trace("FR-033-AC-13", "FR-033-AC-18")]
+    #[test]
+    fn population_cursor_rejects_missing_stalled_duplicate_and_out_of_order_pages() {
+        let row = |number, updated_at| PullRequest {
+            closed_at: None,
+            reopen_events: None,
+            repo: "owner/repo".into(),
+            number,
+            open: true,
+            draft: false,
+            created_at: 0.0,
+            merged_at: None,
+            updated_at,
+            additions: 0,
+            deletions: 0,
+            review_decision: None,
+            force_pushes: None,
+        };
+        let mut cursors = BTreeSet::new();
+        let mut last_updated = f64::INFINITY;
+        let missing = crate::retro::sources::Page {
+            items: vec![row(1, 10.0)],
+            has_next: true,
+            cursor: None,
+        };
+        assert!(
+            validate_population_cursor(&missing, None, &mut cursors, &mut last_updated).is_err()
+        );
+        let first = crate::retro::sources::Page {
+            items: vec![row(1, 10.0)],
+            has_next: true,
+            cursor: Some("cursor-a".into()),
+        };
+        validate_population_cursor(&first, None, &mut cursors, &mut last_updated).unwrap();
+        assert!(
+            validate_population_cursor(&first, Some("cursor-a"), &mut cursors, &mut last_updated)
+                .is_err()
+        );
+        let duplicate = crate::retro::sources::Page {
+            items: vec![row(1, 9.0)],
+            has_next: false,
+            cursor: None,
+        };
+        assert!(
+            validate_population_cursor(
+                &duplicate,
+                Some("cursor-a"),
+                &mut cursors,
+                &mut last_updated
+            )
+            .is_ok()
+        );
+        let out_of_order = crate::retro::sources::Page {
+            items: vec![row(2, 11.0)],
+            has_next: false,
+            cursor: None,
+        };
+        assert!(
+            validate_population_cursor(
+                &out_of_order,
+                Some("cursor-a"),
+                &mut cursors,
+                &mut last_updated
+            )
+            .is_err()
+        );
+    }
+
+    #[trace("FR-033-AC-12", "FR-033-AC-13", "FR-033-AC-18")]
     #[test]
     fn native_open_and_merged_rows_resolve_callbacks_without_detail_requests() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = config(dir.path());
         let fake = Fake::new(|request, _| {
             let query = &request.query;
-            let open = query.contains("states: [OPEN]");
+            if query.contains("pullRequest(number:") {
+                let mut fields = serde_json::Map::new();
+                for number in query.split("pullRequest(number: ").skip(1) {
+                    let n: u64 = number.split(')').next().unwrap().parse().unwrap();
+                    let merged = n == 2;
+                    fields.insert(
+                        format!("p{n}"),
+                        serde_json::json!({
+                                "state":if merged {"MERGED"} else {"OPEN"},
+                                "createdAt":"2026-11-20T00:00:00Z",
+                                "updatedAt":"2026-11-22T00:00:00Z",
+                        "mergedAt":if merged {Some("2026-11-22T00:00:00Z")} else {None::<&str>},
+                        "closedAt":if merged {Some("2026-11-22T00:00:00Z")} else {None::<&str>}
+                            }),
+                    );
+                }
+                return Ok(response(serde_json::json!({"data":{"rateLimit":{"cost":3,"remaining":100,"resetAt":"2030-01-01T00:00:00Z"},"repository":fields}}).to_string()));
+            }
             let node = serde_json::json!({
-                "number":if open {1} else {2},"state":if open {"OPEN"} else {"MERGED"},
+                "number":1,"state":"OPEN",
                 "createdAt":"2026-11-20T00:00:00Z","updatedAt":"2026-11-22T00:00:00Z",
-                "mergedAt":if open {None} else {Some("2026-11-22T00:00:00Z")},
-                "closedAt":if open {None} else {Some("2026-11-22T00:00:00Z")},
+                "mergedAt":None::<&str>,"closedAt":None::<&str>,
                 "isDraft":false,"additions":7,"deletions":3,"reviewDecision":"APPROVED",
                 "timelineItems":{"totalCount":0},"reopenEvents":{"totalCount":0}
             });
-            Ok(response(serde_json::json!({"data":{"rateLimit":{"cost":3,"remaining":100,"resetAt":"2030-01-01T00:00:00Z"},"repository":{"pullRequests":{"nodes":[node],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}).to_string()))
+            let merged = serde_json::json!({
+                "number":2,"state":"MERGED","createdAt":"2026-11-20T00:00:00Z",
+                "updatedAt":"2026-11-22T00:00:00Z","mergedAt":"2026-11-22T00:00:00Z",
+                "closedAt":"2026-11-22T00:00:00Z","isDraft":false,"additions":7,
+                "deletions":3,"reviewDecision":"APPROVED","timelineItems":{"totalCount":0},
+                "reopenEvents":{"totalCount":0}
+            });
+            let connection = |node| serde_json::json!({"nodes":[node],"pageInfo":{"hasNextPage":false,"endCursor":null}});
+            let repository =
+                serde_json::json!({"open":connection(node),"recent":connection(merged)});
+            assert!(query.contains("open: pullRequests(first: 50, states: [OPEN]"));
+            assert!(query.contains("recent: pullRequests(first: 50, states: [MERGED, CLOSED]"));
+            Ok(response(serde_json::json!({"data":{"rateLimit":{"cost":3,"remaining":100,"resetAt":"2030-01-01T00:00:00Z"},"repository":repository}}).to_string()))
         });
-        let at = chrono::DateTime::parse_from_rfc3339("2026-11-22T01:00:00Z")
+        let at = chrono::DateTime::parse_from_rfc3339("2026-11-26T01:00:00Z")
             .unwrap()
             .timestamp_millis();
         let allowed = [("agent-ix/one".into(), 1), ("agent-ix/one".into(), 2)].into();
         let source = source(open(&cfg, fake.clone()), allowed, true, at);
+        assert!(source.start.get().is_none());
         let rows = source
-            .pull_requests("agent-ix/one", at as f64 / 1000.0 - 86_400.0)
+            .pull_requests("agent-ix/one", at as f64 / 1000.0 - DAILY_PR_WINDOW_SECONDS)
             .unwrap();
+        assert!(source.start.get().is_some());
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].additions + rows[0].deletions, 10);
         assert!(rows[0].open);
         assert!(!source.pull_request("agent-ix/one", 1).unwrap().merged);
         assert!(source.pull_request("agent-ix/one", 2).unwrap().merged);
-        assert_eq!(fake.count(), 2);
+        assert_eq!(fake.count(), 1);
         assert_eq!(source.observed_at(), at);
         source
             .guard
@@ -1448,9 +1747,61 @@ mod tests {
         assert!(source.pull_request("agent-ix/one", 1).is_err());
         assert_eq!(
             fake.count(),
-            2,
+            1,
             "a shared cooldown overrides prior per-cycle memoization"
         );
+    }
+
+    #[trace("FR-033-AC-13", "FR-033-AC-18")]
+    #[test]
+    fn repository_population_includes_merges_from_the_full_seven_day_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-26T04:00:00Z")
+            .unwrap()
+            .timestamp() as f64;
+        let within = crate::drift::format_timestamp(now - 4.0 * 86_400.0);
+        let outside = crate::drift::format_timestamp(now - 8.0 * 86_400.0);
+        let fake = Fake::new(move |request, _| {
+            assert!(request.query.contains("recent: pullRequests"));
+            let connection = |nodes| serde_json::json!({"nodes":nodes,"pageInfo":{"hasNextPage":false,"endCursor":null}});
+            let node = |number, merged_at: &str| {
+                serde_json::json!({
+                    "number":number,
+                    "state":"MERGED",
+                    "createdAt":merged_at,
+                    "updatedAt":merged_at,
+                    "mergedAt":merged_at,
+                    "closedAt":merged_at,
+                    "isDraft":false,
+                    "additions":4,
+                    "deletions":2,
+                    "reviewDecision":null,
+                    "timelineItems":{"totalCount":0},
+                    "reopenEvents":{"totalCount":0}
+                })
+            };
+            let repository = serde_json::json!({
+                "open":connection(Vec::<serde_json::Value>::new()),
+                "recent":connection(vec![node(4, &within), node(8, &outside)])
+            });
+            Ok(response(serde_json::json!({
+                "data":{"rateLimit":{"cost":3,"remaining":100,"resetAt":"2030-01-01T00:00:00Z"},"repository":repository}
+            }).to_string()))
+        });
+        let at = (now * 1000.0) as i64;
+        let source = source(
+            open(&cfg, fake),
+            BTreeSet::from([("owner/repo".into(), 4), ("owner/repo".into(), 8)]),
+            true,
+            at,
+        );
+        let rows = source
+            .pull_requests("owner/repo", now - DAILY_PR_WINDOW_SECONDS)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].number, 4);
+        assert_eq!(rows[0].merged_at, Some(now - 4.0 * 86_400.0));
     }
 
     #[trace("FR-033-AC-12", "FR-033-AC-13")]
@@ -1479,18 +1830,18 @@ mod tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        assert_eq!(charges, vec![1_000_000, 1_020_000]);
+        assert_eq!(charges, vec![1_000_000]);
         assert_eq!(source.observed_at(), 1_020_000);
-        assert_eq!(fake.count(), 2);
+        assert_eq!(fake.count(), 1);
         drop(source);
         let guard = open(&cfg, fake.clone()).unwrap();
         assert!(
             guard
-                .request_at(&request(8, false), 1_030_000, valid_json)
+                .request_at(&request(8, false), 1_010_000, valid_json)
                 .is_err(),
             "a restarted worker with a clock older than the prior receipt must fail closed"
         );
-        assert_eq!(fake.count(), 2);
+        assert_eq!(fake.count(), 1);
     }
 
     #[trace("FR-033-AC-12")]
@@ -1500,11 +1851,11 @@ mod tests {
         let cfg = config(dir.path());
         let fake = Fake::new(|_, _| Ok(response("{}".into())));
         let guard = open(&cfg, fake.clone()).unwrap();
-        for n in 0..40 {
+        for n in 0..MAX_REQUESTS {
             guard
                 .request_at(
-                    &request(n, false),
-                    1000 + i64::try_from(n).unwrap() * 1000,
+                    &request(usize::try_from(n).unwrap(), false),
+                    1000 + n * 1000,
                     valid_json,
                 )
                 .unwrap();
@@ -1512,19 +1863,31 @@ mod tests {
         drop(guard);
         let guard = open(&cfg, fake.clone()).unwrap();
         guard
-            .request_at(&request(40, false), HOUR_MS + 2000, valid_json)
+            .request_at(
+                &request(usize::try_from(MAX_REQUESTS).unwrap(), false),
+                HOUR_MS + 2000,
+                valid_json,
+            )
             .unwrap();
         guard
-            .request_at(&request(41, false), HOUR_MS + 2000, valid_json)
+            .request_at(
+                &request(usize::try_from(MAX_REQUESTS).unwrap() + 1, false),
+                HOUR_MS + 2000,
+                valid_json,
+            )
             .unwrap();
         assert!(
             guard
-                .request_at(&request(42, false), HOUR_MS + 2000, valid_json)
+                .request_at(
+                    &request(usize::try_from(MAX_REQUESTS).unwrap() + 2, false),
+                    HOUR_MS + 2000,
+                    valid_json
+                )
                 .is_err()
         );
         assert_eq!(
             fake.count(),
-            42,
+            usize::try_from(MAX_REQUESTS).unwrap() + 2,
             "only the first two charges have aged out of the rolling hour"
         );
 
@@ -1641,9 +2004,13 @@ mod tests {
         );
         fake.namespace = "first".into();
         let guard = open(&cfg, fake.clone()).unwrap();
-        for n in 0..40 {
+        for n in 0..MAX_REQUESTS {
             guard
-                .request_at(&request(n, false), 1000, valid_json)
+                .request_at(
+                    &request(usize::try_from(n).unwrap(), false),
+                    1000,
+                    valid_json,
+                )
                 .unwrap();
         }
         drop(guard);
@@ -1656,7 +2023,7 @@ mod tests {
         );
         assert_eq!(
             fake.count(),
-            40,
+            usize::try_from(MAX_REQUESTS).unwrap(),
             "account switches cannot reset shared request accounting"
         );
     }
@@ -1666,7 +2033,7 @@ mod tests {
     fn the_fortieth_actual_http_attempt_cannot_hide_an_extra_redirect_send() {
         use super::super::github_http::tests::{Fixture, reply};
         let server = Fixture::start(|n, _| {
-            if n == 40 {
+            if n == usize::try_from(MAX_REQUESTS).unwrap() {
                 reply(302, "Location: /again\r\n", "{}")
             } else {
                 reply(200, "", "{}")
@@ -1677,20 +2044,34 @@ mod tests {
         let http = Http::fixture(&server.endpoint, "offline-credential").unwrap();
         let clock = Arc::new(TestClock(std::sync::atomic::AtomicI64::new(1000)));
         let guard = Guard::with_clock(&cfg, http, clock).unwrap();
-        for n in 0..39 {
+        for n in 0..usize::try_from(MAX_REQUESTS - 1).unwrap() {
             guard.request(&request(n, false), valid_json).unwrap();
         }
-        assert!(guard.request(&request(39, false), valid_json).is_err());
-        assert!(guard.request(&request(40, false), valid_json).is_err());
+        assert!(
+            guard
+                .request(
+                    &request(usize::try_from(MAX_REQUESTS - 1).unwrap(), false),
+                    valid_json
+                )
+                .is_err()
+        );
+        assert!(
+            guard
+                .request(
+                    &request(usize::try_from(MAX_REQUESTS).unwrap(), false),
+                    valid_json
+                )
+                .is_err()
+        );
         let ledger: i64 = guard
             .db
             .borrow()
             .query_row("SELECT count(*) FROM github_sends", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(ledger, 40);
+        assert_eq!(ledger, MAX_REQUESTS);
         assert_eq!(
             server.finish().len(),
-            40,
+            usize::try_from(MAX_REQUESTS).unwrap(),
             "wire requests, including redirects, must match admitted debits"
         );
     }
@@ -1811,7 +2192,7 @@ mod tests {
         assert_eq!(fake.count(), 41);
     }
 
-    #[trace("FR-033-AC-12", "FR-033-AC-13")]
+    #[trace("FR-033-AC-12", "FR-033-AC-13", "FR-033-AC-18")]
     #[test]
     fn actual_http_body_nests_variables_for_listing_historical_and_paginated_queries() {
         use super::super::github_http::tests::{Fixture, reply};
@@ -1833,11 +2214,11 @@ mod tests {
             assert!(query.contains("$owner"));
             assert!(query.contains("$name"));
             let repository = if query.contains("pullRequests(") {
-                let (nodes, has_next, cursor) = if query.contains("states: [OPEN]") {
-                    let number = if variables.get("after").is_none() {
+                let (nodes, has_next, cursor) = if query.contains("open: pullRequests") {
+                    let number = if variables.get("openAfter").is_none() {
                         1
                     } else {
-                        assert_eq!(variables.get("after").unwrap(), "opaque-page-two");
+                        assert_eq!(variables.get("openAfter").unwrap(), "opaque-page-two");
                         2
                     };
                     let node = serde_json::json!({"number":number,"state":"OPEN","createdAt":"1970-01-01T00:00:00Z","updatedAt":"1970-01-01T00:00:00Z","mergedAt":null,"closedAt":null,"isDraft":false,"additions":3,"deletions":2,"reviewDecision":null,"timelineItems":{"totalCount":0},"reopenEvents":{"totalCount":0}});
@@ -1851,15 +2232,20 @@ mod tests {
                         },
                     )
                 } else {
-                    assert_eq!(variables.len(), 2);
-                    assert!(query.contains("states: [MERGED, CLOSED]"));
                     (Vec::new(), false, None)
                 };
-                serde_json::json!({"pullRequests":{"nodes":nodes,"pageInfo":{"hasNextPage":has_next,"endCursor":cursor}}})
+                let open = serde_json::json!({"nodes":nodes,"pageInfo":{"hasNextPage":has_next,"endCursor":cursor}});
+                let recent = serde_json::json!({"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}});
+                serde_json::json!({"open":open,"recent":recent})
             } else {
                 assert_eq!(variables.len(), 2);
-                assert!(query.contains("p3: pullRequest(number: 3)"));
-                serde_json::json!({"p3":{"state":"MERGED","createdAt":"1970-01-01T00:00:00Z","updatedAt":"1970-01-01T00:00:00Z","mergedAt":"1970-01-01T00:00:00Z","closedAt":"1970-01-01T00:00:00Z"}})
+                let mut fields = serde_json::Map::new();
+                for number in 3..=100 {
+                    if query.contains(&format!("p{number}: pullRequest(number: {number})")) {
+                        fields.insert(format!("p{number}"), serde_json::json!({"state":"MERGED","createdAt":"1970-01-01T00:00:00Z","updatedAt":"1970-01-01T00:00:00Z","mergedAt":"1970-01-01T00:00:00Z","closedAt":"1970-01-01T00:00:00Z"}));
+                    }
+                }
+                serde_json::Value::Object(fields)
             };
             let response = serde_json::json!({"data":{"rateLimit":{"cost":3,"remaining":100,"resetAt":"2030-01-01T00:00:00Z"},"repository":repository}}).to_string();
             reply(200, "", &response)
@@ -1869,32 +2255,37 @@ mod tests {
         let http = Http::fixture(&server.endpoint, "offline-credential").unwrap();
         let clock = Arc::new(TestClock(std::sync::atomic::AtomicI64::new(1000)));
         let guard = Guard::with_clock(&cfg, http, clock).unwrap();
-        let allowed = (1..=3).map(|n| ("agent-ix/one".into(), n)).collect();
-        let source = SelectedGithub::with_guard(Ok(guard), allowed, true, 1000);
+        let allowed = (1..=51).map(|n| ("agent-ix/one".into(), n)).collect();
+        let priority = BTreeSet::from([("agent-ix/one".into(), 51)]);
+        let source = SelectedGithub::with_guard(Ok(guard), allowed, priority, true, 1000);
         let prs = source.pull_requests("agent-ix/one", 0.0).unwrap();
         assert_eq!(
             prs.iter().map(|pr| pr.number).collect::<Vec<_>>(),
             vec![1, 2]
         );
-        assert!(source.pull_request("agent-ix/one", 3).unwrap().merged);
+        assert!(source.pull_request("agent-ix/one", 51).unwrap().merged);
         assert!(!source.pull_request("agent-ix/one", 1).unwrap().merged);
         let seen = server.finish();
         assert_eq!(
             seen.len(),
             4,
-            "two open pages, one recent page and one historical batch"
+            "two population pages and two bounded historical batches"
+        );
+        assert!(
+            seen.iter()
+                .any(|request| request.contains("p51: pullRequest(number: 51)"))
         );
         let pagination: Vec<_> = seen
             .iter()
             .map(|request| {
                 let payload: serde_json::Value =
                     serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
-                payload["variables"].get("after").cloned()
+                payload["variables"].get("openAfter").cloned()
             })
             .collect();
         assert_eq!(
             pagination,
-            vec![None, Some(serde_json::json!("opaque-page-two")), None, None]
+            vec![None, Some(serde_json::json!("opaque-page-two")), None, None,]
         );
     }
 

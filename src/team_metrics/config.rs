@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Agent-IX
 use super::Error;
 use crate::{ScopeSelection, TeamKey};
+use ix_trace_rs::implements;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
@@ -53,6 +54,9 @@ pub struct Config {
     /// The configured `fleet tick` interval; a tick older than twice this is not served.
     #[serde(default = "tick_interval")]
     pub fleet_tick_interval_seconds: u64,
+    /// Prometheus base URL; if omitted, `IX_PROMETHEUS_URL` must be set.
+    #[serde(default)]
+    pub prometheus_url: Option<String>,
     /// At most four explicitly monitored scopes within the initial 1,000-series budget.
     pub scopes: Vec<ScopeConfig>,
 }
@@ -96,8 +100,10 @@ pub struct ScopeConfig {
     /// Current authoritative selectors; selector revisions are stored outside labels.
     pub selectors: Selectors,
     /// Canonical server:workspace:tab identities authorized to report this scope.
+    #[serde(default)]
     pub leads: Vec<String>,
     /// Herdr workspaces to query; assigned leads still restrict attribution.
+    #[serde(default)]
     pub herdr_teams: Vec<String>,
     /// Existing retro configuration, including gates, policies and source parameters.
     pub retro_config: PathBuf,
@@ -118,6 +124,7 @@ impl Config {
         Ok(config)
     }
     /// Rejects unbounded state, unsafe label values and ambiguous monitored identities.
+    #[implements("FR-033-AC-16")]
     pub fn validate(&self) -> Result<(), Error> {
         if self.version != 1 || self.scopes.len() > 4 || self.scopes.is_empty() {
             return Err(Error::Invalid(
@@ -135,6 +142,13 @@ impl Config {
                 "invalid retention, storage budget or polling interval",
             ));
         }
+        if self.prometheus_url.as_ref().is_some_and(|url| {
+            url.len() > 2048
+                || !(url.starts_with("http://") || url.starts_with("https://"))
+                || url.chars().any(char::is_whitespace)
+        }) {
+            return Err(Error::Invalid("invalid Prometheus base URL"));
+        }
         let mut keys = BTreeSet::new();
         for scope in &self.scopes {
             for id in [&scope.team_id, &scope.scope_id] {
@@ -149,13 +163,20 @@ impl Config {
                     ));
                 }
             }
-            if !keys.insert(scope.key())
-                || scope.leads.is_empty()
-                || scope.leads.len() > 32
-                || scope.herdr_teams.len() > 16
-            {
+            if scope.selectors.team.as_ref().is_some_and(|team| {
+                team.is_empty()
+                    || team.len() > 64
+                    || !team
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+            }) {
                 return Err(Error::Invalid(
-                    "duplicate scope or missing/unbounded leads/workspaces",
+                    "Linear team key has unsafe label characters",
+                ));
+            }
+            if !keys.insert(scope.key()) || scope.leads.len() > 32 || scope.herdr_teams.len() > 16 {
+                return Err(Error::Invalid(
+                    "duplicate scope or unbounded leads/workspaces",
                 ));
             }
             if scope

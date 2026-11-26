@@ -118,6 +118,20 @@ query IssueHistory($id: String!, $first: Int!, $after: String) {
   }
 }"#;
 
+const ISSUE_HISTORIES_QUERY: &str = r#"
+query IssueHistories($ids: [ID!]!, $issueFirst: Int!, $historyFirst: Int!) {
+  issues(first: $issueFirst, filter: { id: { in: $ids } }) {
+    nodes {
+      id
+      history(first: $historyFirst) {
+        nodes { id createdAt fromState { name type } toState { name type } }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}"#;
+
 const MARKER_COMMENTS_QUERY: &str = r#"
 query MarkerComments($first: Int!, $after: String, $prefix: String!, $needle: String!) {
   comments(
@@ -126,6 +140,32 @@ query MarkerComments($first: Int!, $after: String, $prefix: String!, $needle: St
     filter: { and: [{ body: { startsWith: $prefix } }, { body: { contains: $needle } }] }
   ) {
     nodes { id createdAt body }
+    pageInfo { hasNextPage endCursor }
+  }
+}"#;
+
+const MARKER_COMMENT_PAGE_QUERY: &str = r#"
+query MarkerCommentPage($first: Int!, $after: String, $prefix: String!, $needle: String!, $since: DateTimeOrDuration!) {
+  comments(
+    first: $first
+    after: $after
+    orderBy: updatedAt
+    filter: { and: [{ body: { startsWith: $prefix } }, { body: { contains: $needle } }, { updatedAt: { gte: $since } }] }
+  ) {
+    nodes { id createdAt updatedAt body }
+    pageInfo { hasNextPage endCursor }
+  }
+}"#;
+
+const MARKER_COMMENT_BACKFILL_QUERY: &str = r#"
+query MarkerCommentBackfill($first: Int!, $after: String, $prefix: String!, $needle: String!) {
+  comments(
+    first: $first
+    after: $after
+    orderBy: updatedAt
+    filter: { and: [{ body: { startsWith: $prefix } }, { body: { contains: $needle } }] }
+  ) {
+    nodes { id createdAt updatedAt body }
     pageInfo { hasNextPage endCursor }
   }
 }"#;
@@ -170,6 +210,8 @@ query TicketIdentity($identifier: String!) {
 }"#;
 
 const HISTORY_PAGE_SIZE: i32 = 100;
+const HISTORY_BATCH_SIZE: usize = 25;
+const HISTORY_BATCH_EVENT_SIZE: i32 = 50;
 
 const PROJECT_STATUSES_QUERY: &str = r#"
 query ProjectStatuses($first: Int!, $after: String) {
@@ -367,6 +409,12 @@ pub(crate) fn request_count() -> u64 {
 }
 
 impl LinearGraphQlSource {
+    pub(crate) fn request_count(&self) -> u64 {
+        self.metrics
+            .requests
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub(crate) fn metrics_start(&self) -> (u64, u64, u64, u64, std::time::Instant) {
         use std::sync::atomic::Ordering;
         (
@@ -948,6 +996,7 @@ impl LinearGraphQlSource {
 
     /// Reads one issue's complete state history for the retro commands; a history that stops
     /// before its last page is an error.
+    #[implements("FR-033-AC-16")]
     pub fn fetch_state_changes(
         &self,
         issue_id: &str,
@@ -973,6 +1022,71 @@ impl LinearGraphQlSource {
                 cursor: history.page_info.end_cursor,
             })
         })?;
+        Self::state_changes_from_events(events)
+    }
+
+    /// Reads histories for bounded issue batches and falls back to complete pagination when a
+    /// batch result reports more than the first 50 events.
+    #[implements("FR-033-AC-18")]
+    pub fn fetch_state_changes_batch(
+        &self,
+        issue_ids: &[String],
+    ) -> Vec<Result<Vec<crate::retro::sources::StateChange>, String>> {
+        let mut results = Vec::with_capacity(issue_ids.len());
+        for ids in issue_ids.chunks(HISTORY_BATCH_SIZE) {
+            let Ok(issue_first) = i32::try_from(ids.len()) else {
+                results.extend(
+                    ids.iter().map(|_| {
+                        Err("Linear issue history batch exceeded the page limit".to_owned())
+                    }),
+                );
+                continue;
+            };
+            let batch = self.request::<IssueHistoriesData, _>(
+                ISSUE_HISTORIES_QUERY,
+                IssueHistoriesVariables {
+                    ids: ids.to_vec(),
+                    issue_first,
+                    history_first: HISTORY_BATCH_EVENT_SIZE,
+                },
+            );
+            let mut histories = match batch {
+                Ok(data) if !data.issues.page_info.has_next_page => data
+                    .issues
+                    .nodes
+                    .into_iter()
+                    .map(|issue| (issue._id, issue.history))
+                    .collect::<BTreeMap<_, _>>(),
+                Ok(_) => {
+                    results.extend(ids.iter().map(|_| {
+                        Err("Linear batched issue history page was incomplete".to_owned())
+                    }));
+                    continue;
+                }
+                Err(error) => {
+                    results.extend(ids.iter().map(|_| Err(error.to_string())));
+                    continue;
+                }
+            };
+            for issue_id in ids {
+                let Some(history) = histories.remove(issue_id) else {
+                    results.push(Err(format!("issue {issue_id} not found")));
+                    continue;
+                };
+                if history.page_info.has_next_page {
+                    results.push(self.fetch_state_changes(issue_id));
+                } else {
+                    results.push(Self::state_changes_from_events(history.nodes));
+                }
+            }
+        }
+        results
+    }
+
+    #[implements("FR-033-AC-18")]
+    fn state_changes_from_events(
+        events: Vec<RawIssueHistoryEvent>,
+    ) -> Result<Vec<crate::retro::sources::StateChange>, String> {
         events
             .into_iter()
             .filter(|event| event.from_state.is_some() || event.to_state.is_some())
@@ -982,7 +1096,8 @@ impl LinearGraphQlSource {
                 Ok(crate::retro::sources::StateChange {
                     at,
                     from: event.from_state.map(|state| state.status_type),
-                    to: event.to_state.map(|state| state.status_type),
+                    to: event.to_state.as_ref().map(|state| state.status_type),
+                    to_name: event.to_state.map(|state| state.name),
                 })
             })
             .collect()
@@ -1209,6 +1324,38 @@ impl LinearGraphQlSource {
                 has_next: data.comments.page_info.has_next_page,
                 cursor: data.comments.page_info.end_cursor,
             })
+        })
+    }
+
+    /// Reads one stable page of marker comments by native update time for resumable sync.
+    #[implements("FR-033-AC-17")]
+    pub fn fetch_marker_comment_page(
+        &self,
+        prefix: &str,
+        needle: &str,
+        updated_since: Option<f64>,
+        after: Option<&str>,
+    ) -> Result<crate::retro::sources::Page<MarkerComment>, String> {
+        let data: CommentData = self
+            .request(
+                if updated_since.is_some() {
+                    MARKER_COMMENT_PAGE_QUERY
+                } else {
+                    MARKER_COMMENT_BACKFILL_QUERY
+                },
+                MarkerVariables {
+                    first: ISSUE_PAGE_SIZE,
+                    after: after.map(str::to_owned),
+                    prefix: prefix.to_owned(),
+                    needle: needle.to_owned(),
+                    since: updated_since.map(crate::drift::format_timestamp),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(crate::retro::sources::Page {
+            items: data.comments.nodes,
+            has_next: data.comments.page_info.has_next_page,
+            cursor: data.comments.page_info.end_cursor,
         })
     }
 
@@ -2211,6 +2358,14 @@ struct IssueHistoryVariables {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IssueHistoriesVariables {
+    ids: Vec<String>,
+    issue_first: i32,
+    history_first: i32,
+}
+
+#[derive(Serialize)]
 struct ProjectIdVariables {
     id: String,
 }
@@ -2478,7 +2633,7 @@ struct CommentData {
 }
 
 /// Native tracker comment retained for attributed review evidence.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MarkerComment {
     /// Native comment ID, absent in older selected projections.
@@ -2487,6 +2642,9 @@ pub struct MarkerComment {
     /// Source creation time, never inferred from prose.
     #[serde(default, rename = "createdAt")]
     pub created_at: Option<String>,
+    /// Source update time used to incrementally refresh marker evidence.
+    #[serde(default, rename = "updatedAt")]
+    pub updated_at: Option<String>,
     /// Structured marker/data payload, kept outside metric labels.
     pub body: String,
 }
@@ -2578,6 +2736,12 @@ struct RawIssueRelations {
 #[serde(deny_unknown_fields)]
 struct IssueHistoryData {
     issue: Option<RawIssueHistory>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IssueHistoriesData {
+    issues: Connection<RawIssueHistory>,
 }
 
 #[derive(Deserialize)]
@@ -2965,6 +3129,59 @@ mod tests {
                 .map(|body| (200, Vec::new(), body))
                 .collect(),
         )
+    }
+
+    #[trace("FR-033-AC-18")]
+    #[test]
+    fn batched_issue_histories_fall_back_to_pagination_when_a_history_has_more() {
+        let event = |id: &str, at: &str| {
+            serde_json::json!({
+                "id": id,
+                "createdAt": at,
+                "fromState": {"name":"Backlog","type":"backlog"},
+                "toState": {"name":"In Progress","type":"started"}
+            })
+        };
+        let first_page = serde_json::json!({
+            "data":{"issues":{
+                "nodes":[
+                    {"id":"issue-1","history":{"nodes":[event("one-a", "2026-11-20T00:00:00Z")],"pageInfo":{"hasNextPage":true,"endCursor":"history-cursor"}}},
+                    {"id":"issue-2","history":{"nodes":[event("two-a", "2026-11-21T00:00:00Z")],"pageInfo":{"hasNextPage":false,"endCursor":null}}}
+                ],
+                "pageInfo":{"hasNextPage":false,"endCursor":null}
+            }}
+        });
+        let full_history = serde_json::json!({
+            "data":{"issue":{
+                "id":"issue-1",
+                "history":{"nodes":[
+                    event("one-a", "2026-11-20T00:00:00Z"),
+                    event("one-b", "2026-11-22T00:00:00Z")
+                ],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+            }}
+        });
+        let (endpoint, server) = mock_linear(vec![first_page, full_history]);
+        let source =
+            LinearGraphQlSource::with_endpoint("test-key", endpoint).expect("fixture source");
+        let issue_ids = vec!["issue-1".to_owned(), "issue-2".to_owned()];
+        let histories = source.fetch_state_changes_batch(&issue_ids);
+        let requests = server.join().expect("mock server");
+
+        assert_eq!(histories.len(), 2);
+        assert_eq!(histories[0].as_ref().unwrap().len(), 2);
+        assert_eq!(histories[1].as_ref().unwrap().len(), 1);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0]["variables"]["ids"],
+            serde_json::json!(issue_ids)
+        );
+        assert_eq!(requests[0]["variables"]["historyFirst"], 50);
+        assert!(
+            requests[1]["query"]
+                .as_str()
+                .unwrap()
+                .contains("query IssueHistory")
+        );
     }
 
     #[test]

@@ -2,12 +2,12 @@
 // Copyright (C) 2026 Agent-IX
 use super::*;
 use super::{
-    timeline::{ExecutionSample, Member},
+    timeline::{Active, ExecutionSample, Member},
     wire::AssignmentStatus,
 };
 use crate::WorkflowStateType;
 use ix_trace_rs::trace;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 fn config(path: &std::path::Path) -> Config {
     Config {
         version: 1,
@@ -19,6 +19,7 @@ fn config(path: &std::path::Path) -> Config {
         tracker_interval_seconds: 300,
         fleet_ledger: None,
         fleet_tick_interval_seconds: 300,
+        prometheus_url: None,
         scopes: vec![ScopeConfig {
             team_id: "factory".into(),
             scope_id: "completion".into(),
@@ -31,6 +32,152 @@ fn config(path: &std::path::Path) -> Config {
             retro_config: path.join("retro.json"),
         }],
     }
+}
+
+#[trace("FR-033-AC-16")]
+#[test]
+fn config_rejects_unsafe_linear_team_keys_and_allows_missing_team_label() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(dir.path());
+    cfg.scopes[0].selectors.team = Some("QSL,other".into());
+    assert!(cfg.validate().is_err());
+    cfg.scopes[0].selectors.team = None;
+    cfg.scopes[0].selectors.projects.push("project-id".into());
+    assert!(cfg.validate().is_ok());
+    let text = render(&cfg, &state(&cfg), 0, 1_000).unwrap();
+    assert!(text.contains("team_key=\"\""));
+}
+
+#[trace("FR-033-AC-15", "FR-033-AC-17")]
+#[test]
+fn review_metric_values_and_partial_coverage_are_rendered_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(dir.path());
+    let mut state = state(&config);
+    let scope = state.scopes.get_mut("factory:completion").unwrap();
+    scope.tracker_ok = true;
+    scope.tracker_at_ms = 1_000_000;
+    scope.github_observed_at_ms = 1_000_000;
+    scope.pr_success_at_ms = 1_000_000;
+    scope.review_success_at_ms = 1_000_000;
+    scope.github_repo_coverage = 0.5;
+    scope.pr_stats = Some(super::pr_stats::PrStats {
+        values: BTreeMap::new(),
+    });
+    scope.review_stats = Some(super::reviews::ReviewStats {
+        values: BTreeMap::from([
+            ("pr_changes_requested_share".into(), 0.5),
+            ("pr_changes_requested_coverage".into(), 0.5),
+            ("new_pr_first_review_median_seconds_24h".into(), 120.0),
+            ("new_pr_first_review_coverage_24h".into(), 0.25),
+            ("review_findings_confirmed_high_24h".into(), 2.0),
+            ("review_marker_backfill_coverage".into(), 0.5),
+        ]),
+    });
+    let text = render(&config, &state, 0, 1_000_000).unwrap();
+    assert!(text.contains("ix_team_pr_changes_requested_share{") && text.contains("} 0.5"));
+    assert!(
+        text.contains("ix_team_new_pr_first_review_median_seconds_24h{") && text.contains("} 120")
+    );
+    assert!(text.contains("metric=\"review_marker_backfill\"} 0.5"));
+    assert!(text.contains("metric=\"review_findings_confirmed_high_24h\"} 0.5"));
+}
+
+#[trace("FR-033-AC-17")]
+#[test]
+fn stale_review_evidence_omits_values_and_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(dir.path());
+    let mut state = state(&config);
+    let scope = state.scopes.get_mut("factory:completion").unwrap();
+    scope.tracker_ok = true;
+    scope.tracker_at_ms = 1_000_000;
+    scope.review_success_at_ms = 100_000;
+    scope.review_stats = Some(super::reviews::ReviewStats {
+        values: BTreeMap::from([
+            ("pr_changes_requested_share".into(), 0.5),
+            ("pr_changes_requested_coverage".into(), 1.0),
+            ("review_marker_backfill_coverage".into(), 1.0),
+        ]),
+    });
+    let text = render(&config, &state, 0, 1_000_000).unwrap();
+    assert!(!text.contains("ix_team_pr_changes_requested_share{"));
+    assert!(!text.contains("metric=\"review_marker_backfill\"}"));
+    assert!(!text.contains("ix_team_metric_coverage{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\",metric=\"pr_changes_requested_share\"}"));
+    assert!(text.contains("metric=\"pr_changes_requested_share\"} 0"));
+}
+
+#[trace("FR-033-AC-17")]
+#[test]
+fn empty_open_review_population_reports_why_changes_share_is_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(dir.path());
+    let mut state = state(&config);
+    let scope = state.scopes.get_mut("factory:completion").unwrap();
+    scope.tracker_ok = true;
+    scope.tracker_at_ms = 1_000_000;
+    scope.github_observed_at_ms = 1_000_000;
+    scope.pr_success_at_ms = 1_000_000;
+    scope.review_success_at_ms = 1_000_000;
+    scope.github_repo_coverage = 1.0;
+    scope.review_stats = Some(super::reviews::ReviewStats {
+        values: BTreeMap::from([
+            ("pr_changes_requested_coverage".into(), 0.0),
+            ("review_marker_backfill_coverage".into(), 0.0),
+        ]),
+    });
+    let text = render(&config, &state, 0, 1_000_000).unwrap();
+    assert!(text.contains("metric=\"pr_changes_requested_share\"} 0"));
+    assert!(text.contains(
+        "metric=\"pr_changes_requested_share\",reason=\"no open non-draft PR has a retained valid Linear review record\"} 1"
+    ));
+}
+
+#[trace("FR-033-AC-17")]
+#[test]
+fn review_findings_are_unavailable_when_marker_backfill_has_no_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(dir.path());
+    let mut state = state(&config);
+    let scope = state.scopes.get_mut("factory:completion").unwrap();
+    scope.tracker_ok = true;
+    scope.tracker_at_ms = 1_000_000;
+    scope.review_success_at_ms = 1_000_000;
+    scope.review_stats = Some(super::reviews::ReviewStats {
+        values: BTreeMap::from([
+            ("review_recorded_prs_24h".into(), 0.0),
+            ("review_marker_backfill_coverage".into(), 0.0),
+            ("review_findings_confirmed_high_24h".into(), 0.0),
+        ]),
+    });
+
+    let text = render(&config, &state, 0, 1_000_000).unwrap();
+    assert!(!text.contains("ix_team_review_findings_confirmed_high_24h{"));
+    assert!(text.contains(
+        "ix_team_metric_available{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\",metric=\"review_findings_confirmed_high_24h\"} 0"
+    ));
+}
+
+#[trace("FR-033-AC-16")]
+#[test]
+fn empty_stage_history_population_does_not_publish_a_zero_age() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(dir.path());
+    let mut state = state(&config);
+    state.history_ok = true;
+    state.history_at_ms = 100_000;
+    let scope = state.scopes.get_mut("factory:completion").unwrap();
+    scope.tracker_ok = true;
+    scope.tracker_at_ms = 100_000;
+    scope.linear_stage_ages = vec![super::timeline::LinearStageAge {
+        stage: "in_progress".into(),
+        oldest_seconds: 0.0,
+        coverage: 0.0,
+        available: false,
+    }];
+    let text = render(&config, &state, 0, 100_000).unwrap();
+    assert!(!text.contains("ix_team_stage_oldest_age_seconds{"));
+    assert!(text.contains("metric=\"stage_oldest_age_seconds\",stage=\"in_progress\"} 0"));
 }
 fn binding() -> Binding {
     Binding {
@@ -304,7 +451,7 @@ fn export_omits_unknown_values_and_uses_only_bounded_labels() {
     let state = state(&config);
     let text = render(&config, &state, 1234, 1000).unwrap();
     assert!(text.contains(
-        "ix_team_source_available{team_id=\"factory\",scope_id=\"completion\",source=\"tracker\"} 0"
+        "ix_team_source_available{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\",source=\"tracker\"} 0"
     ));
     assert!(!text.contains("ix_team_path_closed_24h{"));
     assert!(!text.contains("ix_team_scope_members{"));
@@ -363,6 +510,373 @@ fn unsupported_journal_and_unknown_config_fields_are_refused() {
     );
     assert!(serde_json::from_str::<Selectors>(r#"{"team":"QSL","typo":true}"#).is_err());
     assert!(config.validate().is_ok());
+}
+
+#[trace("FR-033-AC-16")]
+#[test]
+fn team_scope_does_not_require_relay_identity_or_release_project() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config(dir.path());
+    let scope = &mut config.scopes[0];
+    scope.leads.clear();
+    scope.herdr_teams.clear();
+    assert!(config.validate().is_ok());
+    let selectors: Selectors = serde_json::from_str(r#"{"team":"QSL"}"#).unwrap();
+    assert_eq!(selectors.team.as_deref(), Some("QSL"));
+}
+
+#[trace("FR-033-AC-16")]
+#[test]
+fn partial_lane_coverage_publishes_execution_value_and_exposes_ratio() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(dir.path());
+    let mut state = state(&config);
+    let scope = state.scopes.get_mut("factory:completion").unwrap();
+    scope.execution_population_expected = 2;
+    scope.execution_population_observed = 1;
+    scope.execution_observed_count = 1;
+    scope.execution_working_count = 1;
+    scope.execution_observed_at_ms = 1_000;
+    let text = render(&config, &state, 0, 1_000).unwrap();
+    assert!(text.contains(
+        "ix_team_metric_coverage{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\",metric=\"executing_agents\"} 0.5"
+    ));
+    assert!(text.contains(
+        "ix_team_executing_agents{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\"} 1"
+    ));
+}
+
+#[trace("FR-033-AC-16")]
+#[test]
+fn team_lane_classification_uses_latest_state_and_exact_workspace() {
+    use super::collect::{PrometheusLeadStatus, PrometheusSample};
+    let status = PrometheusLeadStatus {
+        lane_status: vec![
+            PrometheusSample {
+                labels: BTreeMap::from([
+                    ("lane".into(), "draco:QSL:arch".into()),
+                    ("state".into(), "blocked".into()),
+                ]),
+                timestamp_seconds: 100.0,
+                value: 1.0,
+            },
+            PrometheusSample {
+                labels: BTreeMap::from([
+                    ("lane".into(), "draco:QSL:arch".into()),
+                    ("state".into(), "working".into()),
+                ]),
+                timestamp_seconds: 110.0,
+                value: 1.0,
+            },
+            PrometheusSample {
+                labels: BTreeMap::from([
+                    ("lane".into(), "draco:QSLX:arch".into()),
+                    ("state".into(), "working".into()),
+                ]),
+                timestamp_seconds: 110.0,
+                value: 1.0,
+            },
+        ],
+    };
+    assert_eq!(
+        super::collect::classify_team_lanes(&status, "QSL", 110_000),
+        (1, 1, 1)
+    );
+}
+
+#[trace("FR-033-AC-16")]
+#[test]
+fn prometheus_lane_join_keeps_gauge_value_and_source_timestamp() {
+    let values = serde_json::json!({
+        "status": "success",
+        "data": {"result": [{"metric": {"__name__": "ix_fleet_lane_state_ratio", "lane": "draco:QSL:arch", "state": "working"}, "value": [200, "1"]}]}
+    })
+    .to_string();
+    let timestamps = serde_json::json!({
+        "status": "success",
+        "data": {"result": [{"metric": {"lane": "draco:QSL:arch", "state": "working"}, "value": [200, "190"]}]}
+    })
+    .to_string();
+    let joined = super::collect::join_prometheus_samples(&values, &timestamps).unwrap();
+    assert_eq!(joined[0].timestamp_seconds, 190.0);
+    assert_eq!(joined[0].value, 1.0);
+}
+
+#[trace("FR-033-AC-16")]
+#[test]
+fn pane_status_uses_the_original_scrape_timestamp_from_timestamp_query_value() {
+    let values = serde_json::json!({
+        "status": "success",
+        "data": {"result": [{"metric": {"machine": "host-a", "pane": "2", "status": "working", "workspace_label": "QSL", "tab_label": "code"}, "value": [2000, "1"]}]}
+    })
+    .to_string();
+    let timestamps = serde_json::json!({
+        "status": "success",
+        "data": {"result": [{"metric": {"__name__": "timestamp", "machine": "host-a", "pane": "2", "status": "working"}, "value": [2000, "1811"]}]}
+    })
+    .to_string();
+
+    let joined = super::collect::join_pane_status_timestamps(&values, &timestamps).unwrap();
+    assert_eq!(joined[0].timestamp_seconds, 1811.0);
+    assert_eq!(joined[0].value, 1.0);
+}
+
+#[trace("FR-033-AC-16")]
+#[test]
+fn conflicting_fresh_lane_states_are_not_classified() {
+    use super::collect::{PrometheusLeadStatus, PrometheusSample};
+    let status = PrometheusLeadStatus {
+        lane_status: ["working", "blocked"]
+            .into_iter()
+            .map(|state| PrometheusSample {
+                labels: BTreeMap::from([
+                    ("lane".into(), "draco:QSL:arch".into()),
+                    ("state".into(), state.into()),
+                ]),
+                timestamp_seconds: 110.0,
+                value: 1.0,
+            })
+            .collect(),
+    };
+    assert_eq!(
+        super::collect::classify_team_lanes(&status, "QSL", 110_000),
+        (1, 0, 0)
+    );
+}
+
+#[trace("FR-033-AC-16")]
+#[test]
+fn live_pane_without_a_status_is_uncovered_while_idle_is_observed() {
+    use super::collect::{PrometheusLeadStatus, PrometheusSample};
+    let status = PrometheusLeadStatus {
+        lane_status: [
+            PrometheusSample {
+                labels: BTreeMap::from([
+                    ("lane".into(), "terra:QSL:w1:p1".into()),
+                    ("state".into(), "__missing__".into()),
+                ]),
+                timestamp_seconds: 100.0,
+                value: 1.0,
+            },
+            PrometheusSample {
+                labels: BTreeMap::from([
+                    ("lane".into(), "titan:QSL:w2:p2".into()),
+                    ("state".into(), "idle".into()),
+                ]),
+                timestamp_seconds: 100.0,
+                value: 1.0,
+            },
+        ]
+        .into(),
+    };
+    assert_eq!(
+        super::collect::classify_team_lanes(&status, "QSL", 100_000),
+        (2, 1, 0)
+    );
+}
+
+#[trace("FR-033-AC-16")]
+#[test]
+fn pane_status_accepts_small_source_clock_skew_and_rejects_future_data() {
+    use super::collect::{PrometheusLeadStatus, PrometheusSample};
+    let sample = |seconds| PrometheusSample {
+        labels: BTreeMap::from([
+            ("lane".into(), "draco:QSL:w1:p1".into()),
+            ("state".into(), "working".into()),
+        ]),
+        timestamp_seconds: seconds,
+        value: 1.0,
+    };
+    let slight_skew = PrometheusLeadStatus {
+        lane_status: vec![sample(100.036)],
+    };
+    assert_eq!(
+        super::collect::classify_team_lanes(&slight_skew, "QSL", 100_000),
+        (1, 1, 1)
+    );
+    let future = PrometheusLeadStatus {
+        lane_status: vec![sample(106.0)],
+    };
+    assert_eq!(
+        super::collect::classify_team_lanes(&future, "QSL", 100_000),
+        (1, 0, 0)
+    );
+}
+
+#[trace("FR-033-AC-15")]
+#[test]
+fn retained_lane_range_integrates_working_time_and_host_coverage() {
+    let timestamps = serde_json::json!({
+        "status":"success",
+        "data":{"resultType":"matrix","result":[
+            {"metric":{"host":"draco","lane":"draco:QSL:arch","state":"working"},"values":[[900, "900"],[960,"960"]]},
+            {"metric":{"host":"luna","lane":"luna:QSL:code","state":"blocked"},"values":[[960,"960"],[1020,"1020"]]}
+        ]}
+    }).to_string();
+    let values = serde_json::json!({
+        "status":"success",
+        "data":{"resultType":"matrix","result":[
+            {"metric":{"host":"draco","lane":"draco:QSL:arch","state":"working"},"values":[[900, "1"],[960,"1"]]},
+            {"metric":{"host":"luna","lane":"luna:QSL:code","state":"blocked"},"values":[[960,"1"],[1020,"1"]]}
+        ]}
+    }).to_string();
+    let expected_hosts =
+        BTreeSet::from(["draco".to_owned(), "luna".to_owned(), "terra".to_owned()]);
+    let range =
+        super::collect::parse_effort_range(&timestamps, &values, &expected_hosts, 900.0, 1080.0)
+            .unwrap();
+    assert_eq!(range.working_lane_seconds, 120.0);
+    assert!((range.coverage - (4.0 / 9.0)).abs() < f64::EPSILON);
+}
+
+#[trace("FR-033-AC-15")]
+#[test]
+fn effort_coverage_includes_hosts_found_only_in_retained_range_samples() {
+    let timestamps = serde_json::json!({
+        "status":"success",
+        "data":{"resultType":"matrix","result":[
+            {"metric":{"host":"draco","lane":"draco:QSL:arch","state":"working"},"values":[[900,"900"],[960,"960"]]},
+            {"metric":{"host":"luna","lane":"luna:QSL:code","state":"blocked"},"values":[[960,"960"],[1020,"1020"]]}
+        ]}
+    }).to_string();
+    let values = serde_json::json!({
+        "status":"success",
+        "data":{"resultType":"matrix","result":[
+            {"metric":{"host":"draco","lane":"draco:QSL:arch","state":"working"},"values":[[900,"1"],[960,"1"]]},
+            {"metric":{"host":"luna","lane":"luna:QSL:code","state":"blocked"},"values":[[960,"1"],[1020,"1"]]}
+        ]}
+    }).to_string();
+    let expected_hosts = BTreeSet::from(["draco".to_owned()]);
+    let range =
+        super::collect::parse_effort_range(&timestamps, &values, &expected_hosts, 900.0, 1080.0)
+            .unwrap();
+    assert!((range.coverage - (2.0 / 3.0)).abs() < f64::EPSILON);
+}
+
+#[trace("FR-033-AC-15")]
+#[test]
+fn stale_effort_state_series_do_not_conflict_with_fresh_state_after_change() {
+    let timestamps = serde_json::json!({
+        "status":"success",
+        "data":{"resultType":"matrix","result":[
+            {"metric":{"host":"draco","lane":"draco:QSL:arch","state":"blocked"},"values":[[900,"800"],[960,"800"]]},
+            {"metric":{"host":"draco","lane":"draco:QSL:arch","state":"working"},"values":[[900,"900"],[960,"960"]]}
+        ]}
+    }).to_string();
+    let values = serde_json::json!({
+        "status":"success",
+        "data":{"resultType":"matrix","result":[
+            {"metric":{"host":"draco","lane":"draco:QSL:arch","state":"blocked"},"values":[[900,"1"],[960,"1"]]},
+            {"metric":{"host":"draco","lane":"draco:QSL:arch","state":"working"},"values":[[900,"1"],[960,"1"]]}
+        ]}
+    }).to_string();
+    let range = super::collect::parse_effort_range(
+        &timestamps,
+        &values,
+        &BTreeSet::from(["draco".to_owned()]),
+        900.0,
+        1080.0,
+    )
+    .unwrap();
+    assert_eq!(range.working_lane_seconds, 120.0);
+    assert!((range.coverage - (2.0 / 3.0)).abs() < f64::EPSILON);
+}
+
+#[trace("FR-033-AC-18")]
+#[test]
+fn daily_velocity_emits_seven_days_with_day_labels_and_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(dir.path());
+    let mut state = state(&config);
+    let scope = state.scopes.get_mut("factory:completion").unwrap();
+    scope.tracker_ok = true;
+    scope.tracker_at_ms = 1_000;
+    scope.github_observed_at_ms = 1_000;
+    scope.closures_daily = Some(vec![0, 1, 2, 3, 4, 5, 6]);
+    scope.merged_prs_daily = Some(vec![6, 5, 4, 3, 2, 1, 0]);
+    scope.closures_daily_coverage = 0.5;
+    scope.merged_prs_daily_coverage = 0.75;
+    scope.github_repo_coverage = 0.75;
+    let text = render(&config, &state, 0, 1_000).unwrap();
+    assert!(text.contains(
+        "ix_team_closures_day{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\",days_ago=\"0\"} 0"
+    ));
+    assert!(text.contains(
+        "ix_team_merged_prs_day{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\",days_ago=\"6\"} 0"
+    ));
+    assert!(text.contains(
+        "ix_team_metric_coverage{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\",metric=\"closures_day_0\"} 0.5"
+    ));
+    assert!(text.contains(
+        "ix_team_metric_coverage{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\",metric=\"merged_prs_day_0\"} 0.75"
+    ));
+    assert!(text.contains(
+        "ix_team_metric_coverage{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\",metric=\"closures_day_6\"} 0.5"
+    ));
+}
+
+#[trace("FR-033-AC-16")]
+#[test]
+fn effort_uses_retained_lane_range_with_partial_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(dir.path());
+    let mut state = state(&config);
+    let now = 86_100_000;
+    let scope = state.scopes.get_mut("factory:completion").unwrap();
+    scope.tracker_ok = true;
+    scope.tracker_at_ms = now;
+    scope.github_observed_at_ms = 0;
+    scope.effort_range = Some(super::timeline::EffortRange {
+        working_lane_seconds: 1200.0,
+        coverage: 0.6,
+    });
+    let metric = |id: &str, value| crate::retro::Metric {
+        id: id.into(),
+        status: crate::retro::Status::Ok,
+        value: Some(value),
+        unit: "issues".into(),
+        direction: crate::retro::Direction::Up,
+        source: "linear+github".into(),
+        query: "test fixture".into(),
+        reason: None,
+    };
+    scope.record = Some(crate::retro::Record {
+        schema_version: 1,
+        kind: crate::retro::RecordKind::Snapshot,
+        taken_at: "1970-01-02T00:00:00Z".into(),
+        team: "factory".into(),
+        window: "24h".into(),
+        metrics: BTreeMap::from([
+            ("path_closed".into(), metric("path_closed", 2.0)),
+            (
+                "path_closed_unverified".into(),
+                metric("path_closed_unverified", 0.0),
+            ),
+        ]),
+        department: None,
+    });
+    let text = render(&config, &state, 0, now).unwrap();
+    assert!(text.contains(
+        "ix_team_effort_per_verified_path_closure_seconds_24h{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\"} 600"
+    ));
+    assert!(text.contains("metric=\"effort_per_verified_path_closure_seconds_24h\"} 0.6"));
+    assert!(text.contains(
+        "ix_team_path_closed_unverified_24h{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\"} 0"
+    ));
+    state
+        .scopes
+        .get_mut("factory:completion")
+        .unwrap()
+        .effort_range = Some(super::timeline::EffortRange {
+        working_lane_seconds: 1200.0,
+        coverage: 0.49,
+    });
+    let below_threshold = render(&config, &state, 0, now).unwrap();
+    assert!(!below_threshold.contains("ix_team_effort_per_verified_path_closure_seconds_24h{"));
+    assert!(
+        below_threshold
+            .contains("reason=\"fresh host feed coverage is below the 50% meaningful threshold\"")
+    );
 }
 
 /// Provenance: SWM-181; scalar throughput snapshots retain gauge semantics.
@@ -499,8 +1013,97 @@ fn failed_lifecycle_keeps_last_success_and_omits_current_ages() {
     state.observe(&config, &[], 31000, false);
     let text = render(&config, &state, 1000, 31000).unwrap();
     assert!(text.contains("source=\"lifecycle\"} 1\n")); // last successful timestamp is one Unix second.
-    assert!(!text.contains("ix_team_stage_oldest_age_seconds{"));
+    assert!(!text.contains("ix_team_stage_oldest_age_seconds{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\",stage=\"coding\"}"));
+    assert!(!text.contains(
+        "ix_team_executing_agents{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\"}"
+    ));
+    assert!(text.contains("metric=\"executing_agents\"} 0"));
     assert!(!text.contains("ix_team_unattributed_executing_agents{"));
+}
+
+#[trace("FR-033-AC-15")]
+#[test]
+fn linear_stage_age_ignores_reported_assignment_duration() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(dir.path());
+    let mut state = state(&config);
+    state.history_ok = true;
+    state.history_at_ms = 100_000;
+    let scope = state.scopes.get_mut("factory:completion").unwrap();
+    scope.tracker_ok = true;
+    scope.tracker_at_ms = 100_000;
+    scope.lifecycle_ok = true;
+    scope.lifecycle_success_at_ms = 100_000;
+    scope.population_observed = true;
+    let mut known = assignment("coder", AssignmentStatus::Running);
+    known.agent_id = "known".into();
+    let mut unknown = assignment("coding", AssignmentStatus::Running);
+    unknown.agent_id = "unknown".into();
+    scope.assignments.insert(
+        "known".into(),
+        Active {
+            binding: binding(),
+            assignment: known,
+            started_ms: 90_000,
+            start_known: true,
+            accounted_ms: 100_000,
+        },
+    );
+    scope.assignments.insert(
+        "unknown".into(),
+        Active {
+            binding: binding(),
+            assignment: unknown,
+            started_ms: 0,
+            start_known: false,
+            accounted_ms: 100_000,
+        },
+    );
+    let text = render(&config, &state, 0, 100_000).unwrap();
+    assert!(!text.contains("ix_team_stage_oldest_age_seconds"));
+    assert!(!text.contains("stage_oldest_age_seconds"));
+}
+
+/// Trace: FR-033-AC-15, FR-033-AC-16
+#[trace("FR-033-AC-15", "FR-033-AC-16")]
+#[test]
+fn team_series_have_linear_team_labels_and_explicit_empty_population_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(dir.path());
+    let mut state = state(&config);
+    state.history_ok = true;
+    state.history_at_ms = 100_000;
+    let scope = state.scopes.get_mut("factory:completion").unwrap();
+    scope.tracker_ok = true;
+    scope.tracker_at_ms = 100_000;
+    scope.lifecycle_ok = true;
+    scope.lifecycle_success_at_ms = 100_000;
+    scope.population_observed = true;
+    scope.execution_population_expected = 1;
+    scope.execution_population_observed = 1;
+    scope.execution_observed_count = 1;
+    scope.execution_observed_at_ms = 100_000;
+    scope.wip_active = Some(3);
+    let text = render(&config, &state, 0, 100_000).unwrap();
+    assert!(text.contains(
+        "ix_team_wip_active{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\"} 3"
+    ));
+
+    assert!(text.contains("team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\""));
+    assert!(text.contains(
+        "ix_team_executing_agents{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\"} 0"
+    ));
+    assert!(!text.contains("ix_team_stage_oldest_age_seconds"));
+    for metric in [
+        "effort_per_verified_path_closure_seconds_24h",
+        "new_pr_first_review_median_seconds_24h",
+        "pr_changes_requested_share",
+    ] {
+        assert!(
+            text.contains(&format!("metric=\"{metric}\"}} 0")),
+            "expected explicit no-data status for {metric}"
+        );
+    }
 }
 
 /// Provenance: SWM-181; snapshots establish only current assignment facts.
@@ -536,6 +1139,14 @@ fn bootstrap_never_invents_historical_stage_starts() {
         )
         .unwrap();
     assert!(!state.scopes["factory:completion"].assignments["draco:parent:42:child"].start_known);
+    state.history_ok = true;
+    state.history_at_ms = 5000;
+    let scope = state.scopes.get_mut("factory:completion").unwrap();
+    scope.tracker_ok = true;
+    scope.tracker_at_ms = 5000;
+    let text = render(&config, &state, 0, 5000).unwrap();
+    assert!(!text.contains("ix_team_stage_oldest_age_seconds{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\",stage=\"coding\"}"));
+    assert!(!text.contains("stage_oldest_age_seconds"));
 }
 
 /// Provenance: SWM-181; Unicode-heavy events stay within the actual byte ceiling.
@@ -613,7 +1224,8 @@ fn completed_stages_do_not_leak_into_a_disjoint_scope_with_the_same_lead() {
 #[test]
 fn a_lead_working_a_different_reported_scope_has_unknown_parent_attribution() {
     let dir = tempfile::tempdir().unwrap();
-    let config = config(dir.path());
+    let mut config = config(dir.path());
+    config.scopes[0].selectors.initiatives = vec!["selected-initiative".into()];
     let mut state = state(&config);
     let different = relay_work_wire::ReportedScope {
         initiatives: vec![],
@@ -652,6 +1264,55 @@ fn a_lead_working_a_different_reported_scope_has_unknown_parent_attribution() {
     );
 }
 
+#[trace("FR-033-AC-16")]
+#[test]
+fn team_only_scope_accepts_narrower_reported_work_slices() {
+    let selected = Selectors {
+        team: Some("QSL".into()),
+        ..Default::default()
+    };
+    let reported = relay_work_wire::ReportedScope {
+        initiatives: vec!["changed-initiative".into()],
+        projects: vec!["changed-project".into()],
+        tickets: vec!["QSL-42".into()],
+        reported_at_ms: 1000,
+    };
+    assert!(super::timeline::scope_matches(&selected, &reported));
+}
+
+#[trace("FR-033-AC-16")]
+#[test]
+fn team_only_scope_rejects_unattributed_or_other_team_ticket_slices() {
+    let selected = Selectors {
+        team: Some("QSL".into()),
+        ..Default::default()
+    };
+    let unrelated_ticket = relay_work_wire::ReportedScope {
+        initiatives: vec![],
+        projects: vec![],
+        tickets: vec!["SWM-42".into()],
+        reported_at_ms: 1000,
+    };
+    let project_only = relay_work_wire::ReportedScope {
+        initiatives: vec!["unknown-initiative".into()],
+        projects: vec!["unknown-project".into()],
+        tickets: vec![],
+        reported_at_ms: 1000,
+    };
+    let empty = relay_work_wire::ReportedScope {
+        initiatives: vec![],
+        projects: vec![],
+        tickets: vec![],
+        reported_at_ms: 1000,
+    };
+    assert!(!super::timeline::scope_matches(
+        &selected,
+        &unrelated_ticket
+    ));
+    assert!(!super::timeline::scope_matches(&selected, &project_only));
+    assert!(!super::timeline::scope_matches(&selected, &empty));
+}
+
 #[trace("FR-033-AC-5", "FR-033-AC-13")]
 #[test]
 fn cached_github_values_expire_independently_of_fresh_tracker_polls() {
@@ -672,7 +1333,7 @@ fn cached_github_values_expire_independently_of_fresh_tracker_polls() {
     assert!(expired.contains("source=\"tracker\"} 1\n"));
     assert!(expired.contains("source=\"github_prs\"} 0\n"));
     assert!(!expired.contains("ix_team_prs_closed_unmerged_24h{"));
-    assert!(expired.contains("ix_team_source_last_success_timestamp_seconds{team_id=\"factory\",scope_id=\"completion\",source=\"github_prs\"} 100\n"));
+    assert!(expired.contains("ix_team_source_last_success_timestamp_seconds{team_id=\"factory\",team_key=\"QSL\",scope_id=\"completion\",source=\"github_prs\"} 100\n"));
 }
 
 #[trace("FR-033-AC-1", "FR-033-AC-3")]

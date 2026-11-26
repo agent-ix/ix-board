@@ -197,6 +197,9 @@ impl LiveLinear {
 }
 
 impl LinearSource for LiveLinear {
+    fn request_count(&self) -> Option<u64> {
+        Some(self.source.request_count())
+    }
     fn cache_freshness(&self) -> Option<crate::CacheFreshness> {
         self.service()
             .ok()
@@ -279,8 +282,9 @@ impl LinearSource for LiveLinear {
         self.source.fetch_state_changes(issue_id)
     }
 
+    #[implements("FR-033-AC-18")]
     fn state_histories(&self, issue_ids: &[String]) -> Vec<Result<Vec<StateChange>, String>> {
-        parallel_map(issue_ids, |id| self.source.fetch_state_changes(id))
+        self.source.fetch_state_changes_batch(issue_ids)
     }
 
     fn marker_lines(&self, prefix: &str, needle: &str) -> Result<Vec<String>, String> {

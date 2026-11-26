@@ -5,6 +5,7 @@ use crate::{
     MarkerComment,
     retro::metrics::{first_line, marker_fields},
 };
+use ix_trace_rs::implements;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -14,6 +15,7 @@ pub(crate) struct ReviewStats {
     pub values: BTreeMap<String, f64>,
 }
 pub(crate) const NAMES: &[&str] = &[
+    "pr_changes_requested_share",
     "review_recorded_prs_24h",
     "review_classifiable_prs_24h",
     "review_classification_share",
@@ -28,25 +30,32 @@ pub(crate) const NAMES: &[&str] = &[
     "new_pr_first_review_median_seconds_24h",
     "new_pr_first_review_p90_seconds_24h",
     "new_pr_first_review_count_24h",
+    "review_records_skipped_24h",
 ];
 
 // These are projections of the externally owned dev-team marker payload. Extra
 // finding metadata (excerpts, paths, scope and model text) is deliberately ignored.
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct ReviewData {
     clean: bool,
     findings: Vec<Finding>,
+    #[serde(default)]
+    mergeable: Option<bool>,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct Finding {
     fnd: String,
     severity: String,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct DispositionData {
+    #[serde(default)]
+    mergeable: Option<bool>,
     dispositions: Vec<Disposition>,
+    #[serde(default)]
+    new_findings: Vec<Finding>,
 }
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct Disposition {
     fnd: String,
     outcome: String,
@@ -57,6 +66,27 @@ struct Review {
     at: f64,
     clean: bool,
     findings: BTreeMap<String, String>,
+}
+type ReviewArtifactKey = (String, String, String, String);
+type ReviewFindingKey = (String, String, String, String, String);
+type LatestFindingKey = (String, String, String, String, String);
+
+pub(super) fn compact_marker_body(body: &str) -> String {
+    let first = first_line(body);
+    let Some((kind, _)) = marker_fields(first) else {
+        return first.to_owned();
+    };
+    let yaml = match kind {
+        "reviewer" => yaml::<ReviewData>(body)
+            .and_then(|data| serde_yaml::to_string(&data).map_err(|e| e.to_string())),
+        "reviewer-dispositions" => yaml::<DispositionData>(body)
+            .and_then(|data| serde_yaml::to_string(&data).map_err(|e| e.to_string())),
+        _ => return first.to_owned(),
+    };
+    match yaml {
+        Ok(yaml) => format!("{first}\n```yaml\n{yaml}```"),
+        Err(_) => first.to_owned(),
+    }
 }
 
 fn yaml<T: serde::de::DeserializeOwned>(body: &str) -> Result<T, String> {
@@ -102,108 +132,233 @@ fn yaml<T: serde::de::DeserializeOwned>(body: &str) -> Result<T, String> {
 
 /// Measures only PRs with explicit review records created in the selected day.
 /// Unresolved findings are pending; dispositions distinguish confirmed from rejected.
+#[implements("FR-033-AC-10", "FR-033-AC-17")]
 pub(crate) fn calculate(
     comments: &[MarkerComment],
     allowed: &BTreeSet<String>,
     created: &BTreeMap<String, f64>,
+    open_prs: &BTreeSet<String>,
     now: f64,
 ) -> Result<ReviewStats, String> {
-    let mut reviews: BTreeMap<(String, String), Review> = BTreeMap::new();
-    let mut outcomes: BTreeMap<(String, String, String), (u64, f64, Disposition)> = BTreeMap::new();
+    let mut reviews: BTreeMap<ReviewArtifactKey, Review> = BTreeMap::new();
+    let mut outcomes: BTreeMap<ReviewFindingKey, (u64, f64, Disposition)> = BTreeMap::new();
+    let mut verdicts = Vec::<(String, f64, bool)>::new();
+    let mut artifact_findings = BTreeMap::<ReviewArtifactKey, BTreeMap<String, String>>::new();
     let mut seen = BTreeSet::new();
+    let mut semantic_seen = BTreeSet::new();
+    let mut skipped = 0usize;
     // Resolve attributed review artifacts before their dispositions, regardless
     // of source ordering. Unrelated artifacts cannot invalidate this scope.
     let mut ordered: Vec<_> = comments.iter().collect();
-    ordered.sort_by_key(|c| {
-        marker_fields(first_line(&c.body)).is_none_or(|(kind, _)| kind != "reviewer")
+    ordered.sort_by(|left, right| {
+        let left_kind =
+            marker_fields(first_line(&left.body)).is_none_or(|(kind, _)| kind != "reviewer");
+        let right_kind =
+            marker_fields(first_line(&right.body)).is_none_or(|(kind, _)| kind != "reviewer");
+        let left_at = left
+            .created_at
+            .as_deref()
+            .and_then(|at| crate::drift::timestamp_epoch(at).ok())
+            .unwrap_or_default();
+        let right_at = right
+            .created_at
+            .as_deref()
+            .and_then(|at| crate::drift::timestamp_epoch(at).ok())
+            .unwrap_or_default();
+        left_kind
+            .cmp(&right_kind)
+            .then_with(|| left_at.total_cmp(&right_at))
+            .then_with(|| {
+                left.id
+                    .as_deref()
+                    .unwrap_or_default()
+                    .cmp(right.id.as_deref().unwrap_or_default())
+            })
     });
     for comment in ordered {
-        let id = comment
-            .id
-            .as_ref()
-            .ok_or("review comment has no native identity")?;
+        let Some(id) = comment.id.as_ref() else {
+            skipped += 1;
+            continue;
+        };
         if !seen.insert(id) {
+            skipped += 1;
             continue;
         }
-        let at = crate::drift::timestamp_epoch(
-            comment
-                .created_at
-                .as_deref()
-                .ok_or("review comment has no source timestamp")?,
-        )
-        .map_err(|e| e.to_string())?;
-        if at <= now - 86400.0 || at > now {
+        let Some(created_at) = comment.created_at.as_deref() else {
+            skipped += 1;
+            continue;
+        };
+        let Ok(at) = crate::drift::timestamp_epoch(created_at) else {
+            skipped += 1;
+            continue;
+        };
+        if at > now {
             continue;
         }
         let Some((kind, fields)) = marker_fields(first_line(&comment.body)) else {
-            return Err("unsupported review marker".into());
+            skipped += 1;
+            continue;
         };
-        let repo = *fields
-            .get("repo")
-            .ok_or("review marker has no repository")?;
-        let artifact = *fields
-            .get("id")
-            .ok_or("review marker has no artifact identity")?;
+        let (Some(repo), Some(artifact)) = (fields.get("repo"), fields.get("id")) else {
+            skipped += 1;
+            continue;
+        };
+        if let Some(run) = fields.get("run")
+            && !semantic_seen.insert((
+                kind.to_owned(),
+                (*repo).to_owned(),
+                fields
+                    .get("method")
+                    .copied()
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                (*artifact).to_owned(),
+                format!("{run}:{}", fields.get("round").copied().unwrap_or("0")),
+            ))
+        {
+            skipped += 1;
+            continue;
+        }
         if kind == "reviewer" {
-            let pr = *fields
-                .get("pr")
-                .ok_or("review marker has no PR attribution")?;
+            let Some(pr) = fields.get("pr") else {
+                skipped += 1;
+                continue;
+            };
             let full = if pr.starts_with(&format!("{repo}#")) {
-                pr.to_owned()
+                (*pr).to_owned()
             } else {
-                let short = repo.rsplit('/').next().ok_or("repository identity")?;
-                let number = pr
-                    .strip_prefix(&format!("{short}#"))
-                    .ok_or("PR/repository attribution mismatch")?;
+                let Some(short) = repo.rsplit('/').next() else {
+                    skipped += 1;
+                    continue;
+                };
+                let Some(number) = pr.strip_prefix(&format!("{short}#")) else {
+                    skipped += 1;
+                    continue;
+                };
                 format!("{repo}#{number}")
             };
             if !allowed.contains(&full) {
                 continue;
             }
-            let data: ReviewData = yaml(&comment.body)?;
+            let Ok(data) = yaml::<ReviewData>(&comment.body) else {
+                skipped += 1;
+                continue;
+            };
             if data.clean != data.findings.is_empty() {
-                return Err("review clean flag contradicts findings".into());
+                skipped += 1;
+                continue;
             }
             let mut findings = BTreeMap::new();
+            let mut valid = true;
             for finding in data.findings {
                 if !matches!(finding.severity.as_str(), "high" | "medium" | "low")
                     || findings.insert(finding.fnd, finding.severity).is_some()
                 {
-                    return Err("duplicate finding or unsupported severity".into());
+                    valid = false;
+                    break;
                 }
             }
-            if reviews
-                .insert(
-                    (repo.into(), artifact.into()),
-                    Review {
-                        pr: full,
-                        at,
-                        clean: data.clean,
-                        findings,
-                    },
-                )
-                .is_some()
-            {
-                return Err("duplicate review artifact identity".into());
-            }
-        } else if kind == "reviewer-dispositions" {
-            if !reviews.contains_key(&(repo.into(), artifact.into())) {
+            let key = (
+                repo.to_string(),
+                fields
+                    .get("method")
+                    .copied()
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                artifact.to_string(),
+                full.clone(),
+            );
+            if !valid {
+                skipped += 1;
                 continue;
             }
-            let round = fields
-                .get("round")
-                .ok_or("disposition round missing")?
-                .parse::<u64>()
-                .map_err(|_| "disposition round invalid")?;
-            let data: DispositionData = yaml(&comment.body)?;
-            for d in data.dispositions {
-                if !matches!(
+            artifact_findings.insert(key.clone(), findings.clone());
+            let review = Review {
+                pr: full.clone(),
+                at,
+                clean: data.clean,
+                findings,
+            };
+            if reviews.get(&key).is_none_or(|old| at > old.at) {
+                reviews.insert(key, review);
+            }
+            let marker_mergeable = fields
+                .get("mergeable")
+                .and_then(|value| match *value {
+                    "yes" | "true" => Some(true),
+                    "no" | "false" => Some(false),
+                    _ => None,
+                })
+                .or(data.mergeable);
+            if let Some(mergeable) = marker_mergeable {
+                verdicts.push((full, at, mergeable));
+            }
+        } else if kind == "reviewer-dispositions" {
+            let Some((artifact_key, review)) = reviews
+                .iter()
+                .filter(|((review_repo, method, review_id, _), review)| {
+                    review_repo.as_str() == *repo
+                        && review_id.as_str() == *artifact
+                        && fields
+                            .get("method")
+                            .is_none_or(|value| *value == method.as_str())
+                        && review.at <= at
+                })
+                .max_by(|left, right| left.1.at.total_cmp(&right.1.at))
+            else {
+                continue;
+            };
+            let artifact_key = artifact_key.clone();
+            let pr = review.pr.clone();
+            let Some(round) = fields.get("round").and_then(|r| r.parse::<u64>().ok()) else {
+                skipped += 1;
+                continue;
+            };
+            let Ok(data) = yaml::<DispositionData>(&comment.body) else {
+                skipped += 1;
+                continue;
+            };
+            if data.dispositions.iter().any(|d| {
+                !matches!(
                     d.outcome.as_str(),
                     "fixed" | "rejected" | "deferred" | "accepted-no-change" | "still-open"
-                ) {
-                    return Err("unsupported finding disposition".into());
+                )
+            }) {
+                skipped += 1;
+                continue;
+            }
+            let marker_mergeable = fields
+                .get("mergeable")
+                .and_then(|value| match *value {
+                    "yes" | "true" => Some(true),
+                    "no" | "false" => Some(false),
+                    _ => None,
+                })
+                .or(data.mergeable);
+            if let Some(mergeable) = marker_mergeable {
+                verdicts.push((pr, at, mergeable));
+            }
+            let finding_states = artifact_findings.entry(artifact_key.clone()).or_default();
+            for finding in data.new_findings {
+                if matches!(finding.severity.as_str(), "high" | "medium" | "low") {
+                    finding_states
+                        .entry(finding.fnd)
+                        .or_insert(finding.severity);
+                } else {
+                    skipped += 1;
                 }
-                let key = (repo.into(), artifact.into(), d.fnd.clone());
+            }
+            for d in data.dispositions {
+                let key = (
+                    artifact_key.0.clone(),
+                    artifact_key.1.clone(),
+                    artifact_key.2.clone(),
+                    artifact_key.3.clone(),
+                    d.fnd.clone(),
+                );
+                finding_states
+                    .entry(d.fnd.clone())
+                    .or_insert_with(|| "unknown".into());
                 if outcomes
                     .get(&key)
                     .is_none_or(|old| (round, at) > (old.0, old.1))
@@ -213,6 +368,11 @@ pub(crate) fn calculate(
             }
         }
     }
+    verdicts.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let latest: BTreeMap<String, bool> = verdicts
+        .into_iter()
+        .map(|(pr, _, mergeable)| (pr, mergeable))
+        .collect();
     let mut prs: BTreeMap<String, (bool, bool, bool, f64)> = BTreeMap::new();
     let mut confirmed: BTreeMap<String, usize> = BTreeMap::from([
         ("high".into(), 0),
@@ -220,22 +380,42 @@ pub(crate) fn calculate(
         ("low".into(), 0),
         ("unknown".into(), 0),
     ]);
+    let mut latest_reviews: BTreeMap<String, &Review> = BTreeMap::new();
     let (mut pending, mut rejected) = (0usize, 0usize);
-    for ((repo, id), review) in &reviews {
+    for ((repo, method, id, _pr), review) in &reviews {
+        if latest_reviews
+            .get(&review.pr)
+            .is_none_or(|old| review.at > old.at)
+        {
+            latest_reviews.insert(review.pr.clone(), review);
+        }
+        if review.at <= now - 86400.0 {
+            continue;
+        }
         let row = prs
             .entry(review.pr.clone())
             .or_insert((false, false, true, review.at));
         row.0 |= !review.clean;
         row.3 = row.3.min(review.at);
         let mut findings = review.findings.clone();
-        for key in outcomes.keys().filter(|(r, a, _)| r == repo && a == id) {
+        for (fnd, severity) in artifact_findings
+            .get(&(repo.clone(), method.clone(), id.clone(), review.pr.clone()))
+            .into_iter()
+            .flat_map(|findings| findings.iter())
+        {
             findings
-                .entry(key.2.clone())
-                .or_insert_with(|| "unknown".into());
+                .entry(fnd.clone())
+                .or_insert_with(|| severity.clone());
         }
         row.0 |= !findings.is_empty();
         for (fnd, severity) in findings {
-            match outcomes.get(&(repo.clone(), id.clone(), fnd)) {
+            match outcomes.get(&(
+                repo.clone(),
+                method.clone(),
+                id.clone(),
+                review.pr.clone(),
+                fnd,
+            )) {
                 Some((_, _, d)) if d.outcome == "rejected" => rejected += 1,
                 Some(_) => {
                     row.1 = true;
@@ -248,7 +428,50 @@ pub(crate) fn calculate(
             }
         }
     }
+    let mut latest_finding_state = BTreeMap::<LatestFindingKey, (u64, f64, bool)>::new();
+    for ((repo, method, artifact, pr), findings) in &artifact_findings {
+        let Some(review) =
+            reviews.get(&(repo.clone(), method.clone(), artifact.clone(), pr.clone()))
+        else {
+            continue;
+        };
+        for fnd in findings.keys() {
+            let disposition = outcomes.get(&(
+                repo.clone(),
+                method.clone(),
+                artifact.clone(),
+                pr.clone(),
+                fnd.clone(),
+            ));
+            let (round, at, unresolved) = match disposition {
+                Some((round, at, disposition)) => (
+                    *round,
+                    *at,
+                    matches!(disposition.outcome.as_str(), "still-open" | "deferred"),
+                ),
+                None => (0, review.at, true),
+            };
+            let key = (
+                review.pr.clone(),
+                repo.clone(),
+                method.clone(),
+                artifact.clone(),
+                fnd.clone(),
+            );
+            if latest_finding_state
+                .get(&key)
+                .is_none_or(|old| (at, round) > (old.1, old.0))
+            {
+                latest_finding_state.insert(key, (round, at, unresolved));
+            }
+        }
+    }
+    let unresolved_prs = latest_finding_state
+        .into_iter()
+        .filter_map(|((pr, _, _, _, _), (_, _, unresolved))| unresolved.then_some(pr))
+        .collect::<BTreeSet<_>>();
     let mut values = BTreeMap::new();
+    values.insert("review_records_skipped_24h".into(), skipped as f64);
     let classified = prs.values().filter(|p| p.2).count();
     values.insert("review_recorded_prs_24h".into(), prs.len() as f64);
     values.insert("review_classifiable_prs_24h".into(), classified as f64);
@@ -270,22 +493,57 @@ pub(crate) fn calculate(
             prs.values().filter(|p| p.0).count() as f64 / prs.len() as f64,
         );
     }
+    let reviewed_open: Vec<_> = open_prs
+        .iter()
+        .filter_map(|pr| latest_reviews.get(pr).copied())
+        .collect();
+    let open_review_coverage = if open_prs.is_empty() {
+        0.0
+    } else {
+        reviewed_open.len() as f64 / open_prs.len() as f64
+    };
+    values.insert("pr_changes_requested_coverage".into(), open_review_coverage);
+    if !reviewed_open.is_empty() {
+        let requested = reviewed_open
+            .iter()
+            .filter(|review| {
+                latest.get(&review.pr) == Some(&false) || unresolved_prs.contains(&review.pr)
+            })
+            .count();
+        values.insert(
+            "pr_changes_requested_share".into(),
+            requested as f64 / reviewed_open.len() as f64,
+        );
+    }
     if classified > 0 {
         values.insert(
             "review_confirmed_finding_pr_share_24h".into(),
             prs.values().filter(|p| p.1 && p.2).count() as f64 / classified as f64,
         );
     }
-    let mut delays: Vec<_> = prs
+    let eligible_new_prs = created
+        .values()
+        .filter(|at| **at > now - 86400.0 && **at <= now)
+        .count();
+    let mut delays: Vec<_> = created
         .iter()
-        .filter_map(|(pr, row)| {
-            created
-                .get(pr)
-                .filter(|at| **at > now - 86400.0 && **at <= row.3)
-                .map(|at| row.3 - at)
+        .filter(|(_, at)| **at > now - 86400.0 && **at <= now)
+        .filter_map(|(pr, at)| {
+            prs.get(pr)
+                .filter(|row| row.3 >= *at)
+                .map(|row| row.3 - *at)
         })
         .collect();
     delays.sort_by(f64::total_cmp);
+    let first_review_coverage = if eligible_new_prs == 0 {
+        0.0
+    } else {
+        delays.len() as f64 / eligible_new_prs as f64
+    };
+    values.insert(
+        "new_pr_first_review_coverage_24h".into(),
+        first_review_coverage,
+    );
     values.insert("new_pr_first_review_count_24h".into(), delays.len() as f64);
     if !delays.is_empty() {
         for (name, fraction) in [
@@ -309,6 +567,7 @@ mod tests {
         MarkerComment {
             id: Some(id.into()),
             created_at: Some(crate::drift::format_timestamp(seconds)),
+            updated_at: Some(crate::drift::format_timestamp(seconds)),
             body: format!("{marker}\n\n```yaml\n{data}\n```\n"),
         }
     }
@@ -323,15 +582,34 @@ mod tests {
             "clean: false\nfindings:\n  - fnd: FND-1\n    severity: high\n    finding: private prose is not counted",
         )
     }
+    #[trace("FR-033-AC-17")]
+    #[test]
+    fn compact_marker_body_keeps_structured_fields_and_drops_private_prose() {
+        let body = "<!-- reviewer repo=owner/repo id=SR-1 pr=repo#1 run=a -->\nprivate review explanation\n\n```yaml\nclean: false\nmergeable: false\nfindings:\n  - fnd: FND-1\n    severity: high\n    excerpt: private source text\n```\n";
+        let compact = compact_marker_body(body);
+        assert!(compact.contains("mergeable: false"));
+        assert!(compact.contains("fnd: FND-1"));
+        assert!(!compact.contains("private review explanation"));
+        assert!(!compact.contains("private source text"));
+    }
     #[trace("FR-033-AC-10")]
     #[test]
     fn pending_findings_are_not_fabricated_as_confirmed_or_clean() {
-        let v = calculate(&[review()], &allowed(), &BTreeMap::new(), 100000.0)
-            .unwrap()
-            .values;
+        let v = calculate(
+            &[review()],
+            &allowed(),
+            &BTreeMap::new(),
+            &allowed(),
+            100000.0,
+        )
+        .unwrap()
+        .values;
         assert_eq!(v["review_recorded_prs_24h"], 1.0);
         assert_eq!(v["review_findings_pending_24h"], 1.0);
         assert_eq!(v["review_classifiable_prs_24h"], 0.0);
+        assert_eq!(v["pr_changes_requested_coverage"], 1.0);
+        assert_eq!(v["pr_changes_requested_share"], 1.0);
+        assert_eq!(v["review_records_skipped_24h"], 0.0);
         assert!(!v.contains_key("review_confirmed_finding_pr_share_24h"));
     }
     #[trace("FR-033-AC-10")]
@@ -353,6 +631,7 @@ mod tests {
             &[review(), review(), rejected, fixed],
             &allowed(),
             &BTreeMap::new(),
+            &allowed(),
             100000.0,
         )
         .unwrap()
@@ -375,6 +654,7 @@ mod tests {
             &[review(), fixed],
             &allowed(),
             &BTreeMap::from([("owner/repo#1".into(), 98000.0)]),
+            &allowed(),
             100000.0,
         )
         .unwrap()
@@ -385,18 +665,341 @@ mod tests {
     }
     #[trace("FR-033-AC-10")]
     #[test]
-    fn missing_or_contradictory_structured_evidence_is_unavailable() {
+    fn missing_or_contradictory_structured_evidence_is_skipped_and_counted() {
         let mut r = review();
         r.body =
             "<!-- reviewer repo=owner/repo id=SR-1 pr=repo#1 -->\nHigh severity defect in prose"
                 .into();
-        assert!(calculate(&[r], &allowed(), &BTreeMap::new(), 100000.0).is_err());
+        let v = calculate(&[r], &allowed(), &BTreeMap::new(), &allowed(), 100000.0)
+            .unwrap()
+            .values;
+        assert_eq!(v["review_records_skipped_24h"], 1.0);
+        assert!(!v.contains_key("new_pr_first_review_median_seconds_24h"));
         let bad = comment(
             "bad",
             99000.0,
             "<!-- reviewer repo=owner/repo id=SR-1 pr=repo#1 -->",
             "clean: true\nfindings:\n  - fnd: FND-1\n    severity: high",
         );
-        assert!(calculate(&[bad], &allowed(), &BTreeMap::new(), 100000.0).is_err());
+        let v = calculate(&[bad], &allowed(), &BTreeMap::new(), &allowed(), 100000.0)
+            .unwrap()
+            .values;
+        assert_eq!(v["review_records_skipped_24h"], 1.0);
+        assert!(!v.contains_key("new_pr_first_review_median_seconds_24h"));
+    }
+    #[trace("FR-033-AC-10")]
+    #[test]
+    fn missing_native_comment_id_and_duplicate_review_identity_are_counted_and_skipped() {
+        let mut no_id = review();
+        no_id.id = None;
+        let mut duplicate = review();
+        duplicate.id = Some("duplicate-native-id".into());
+        let mut another = duplicate.clone();
+        another.id = Some("second-native-id".into());
+        let v = calculate(
+            &[no_id, duplicate, another],
+            &allowed(),
+            &BTreeMap::new(),
+            &allowed(),
+            100000.0,
+        )
+        .unwrap()
+        .values;
+        assert_eq!(v["review_records_skipped_24h"], 2.0);
+        assert_eq!(v["review_recorded_prs_24h"], 1.0);
+        assert_eq!(v["pr_changes_requested_share"], 1.0);
+    }
+
+    #[trace("FR-033-AC-17")]
+    #[test]
+    fn changes_requested_uses_latest_mergeability_not_the_findings_share() {
+        let not_mergeable = comment(
+            "not-mergeable",
+            99000.0,
+            "<!-- reviewer repo=owner/repo id=SR-2 pr=repo#1 method=rust-review run=b -->",
+            "clean: true\nmergeable: false\nfindings: []",
+        );
+        let open_prs = BTreeSet::from(["owner/repo#1".into(), "owner/repo#2".into()]);
+        let values = calculate(
+            &[not_mergeable],
+            &allowed(),
+            &BTreeMap::new(),
+            &open_prs,
+            100000.0,
+        )
+        .unwrap()
+        .values;
+        assert_eq!(values["pr_changes_requested_share"], 1.0);
+        assert_eq!(values["pr_changes_requested_coverage"], 0.5);
+        assert_eq!(values["review_prs_with_findings_share_24h"], 0.0);
+    }
+
+    #[trace("FR-033-AC-17")]
+    #[test]
+    fn mergeable_marker_field_and_artifact_identity_are_preserved() {
+        let a = comment(
+            "a",
+            99000.0,
+            "<!-- reviewer repo=owner/repo id=SR-A pr=repo#1 run=a mergeable=no -->",
+            "clean: true\nfindings: []",
+        );
+        let b = comment(
+            "b",
+            99100.0,
+            "<!-- reviewer repo=owner/repo id=SR-B pr=repo#1 run=b -->",
+            "clean: false\nfindings:\n  - fnd: FND-1\n    severity: high",
+        );
+        let fixed_b = comment(
+            "fixed-b",
+            99200.0,
+            "<!-- reviewer-dispositions repo=owner/repo id=SR-B round=1 run=c -->",
+            "dispositions:\n  - fnd: FND-1\n    outcome: fixed",
+        );
+        let later = comment(
+            "later",
+            99300.0,
+            "<!-- reviewer repo=owner/repo id=SR-A pr=repo#1 run=d -->",
+            "clean: true\nfindings: []",
+        );
+        let values = calculate(
+            &[a, b, fixed_b, later],
+            &allowed(),
+            &BTreeMap::new(),
+            &allowed(),
+            100000.0,
+        )
+        .unwrap()
+        .values;
+        assert_eq!(values["pr_changes_requested_share"], 1.0);
+    }
+
+    #[trace("FR-033-AC-17")]
+    #[test]
+    fn disposition_added_findings_remain_unresolved() {
+        let clean = comment(
+            "clean",
+            99000.0,
+            "<!-- reviewer repo=owner/repo id=SR-3 pr=repo#1 run=a -->",
+            "clean: true\nfindings: []",
+        );
+        let disposition = comment(
+            "disposition",
+            99100.0,
+            "<!-- reviewer-dispositions repo=owner/repo id=SR-3 round=1 run=b -->",
+            "new_findings:\n  - fnd: FND-9\n    severity: medium\ndispositions:\n  - fnd: FND-9\n    outcome: still-open",
+        );
+        let values = calculate(
+            &[clean, disposition],
+            &allowed(),
+            &BTreeMap::new(),
+            &allowed(),
+            100000.0,
+        )
+        .unwrap()
+        .values;
+        assert_eq!(values["pr_changes_requested_share"], 1.0);
+        assert_eq!(values["review_findings_confirmed_medium_24h"], 1.0);
+    }
+
+    #[trace("FR-033-AC-17")]
+    #[test]
+    fn later_clean_review_does_not_hide_an_unresolved_older_finding() {
+        let older = comment(
+            "older",
+            98_000.0,
+            "<!-- reviewer repo=owner/repo id=SR-older pr=repo#1 method=rust-review run=a -->",
+            "clean: false\nfindings:\n  - fnd: FND-1\n    severity: high\nmergeable: true",
+        );
+        let newer = comment(
+            "newer",
+            99_000.0,
+            "<!-- reviewer repo=owner/repo id=SR-newer pr=repo#1 method=rust-review run=b -->",
+            "clean: true\nfindings: []\nmergeable: true",
+        );
+        let open = allowed();
+        let values = calculate(&[older, newer], &open, &BTreeMap::new(), &open, 100_000.0)
+            .unwrap()
+            .values;
+        assert_eq!(values["pr_changes_requested_share"], 1.0);
+    }
+
+    #[trace("FR-033-AC-10", "FR-033-AC-17")]
+    #[test]
+    fn same_artifact_id_in_distinct_review_methods_keeps_findings_separate() {
+        let first = comment(
+            "review-a",
+            99_000.0,
+            "<!-- reviewer repo=owner/repo id=SR-1 pr=repo#1 method=rust-review run=a -->",
+            "clean: false\nfindings:\n  - fnd: FND-1\n    severity: high",
+        );
+        let second = comment(
+            "review-b",
+            99_500.0,
+            "<!-- reviewer repo=owner/repo id=SR-1 pr=repo#1 method=code-review run=b -->",
+            "clean: true\nfindings: []",
+        );
+        let values = calculate(
+            &[first, second],
+            &allowed(),
+            &BTreeMap::from([("owner/repo#1".into(), 90_000.0)]),
+            &allowed(),
+            100_000.0,
+        )
+        .unwrap()
+        .values;
+        assert_eq!(values["pr_changes_requested_share"], 1.0);
+    }
+
+    #[trace("FR-033-AC-17")]
+    #[test]
+    fn same_artifact_id_on_distinct_prs_keeps_findings_separate() {
+        let finding = comment(
+            "review-a",
+            99_000.0,
+            "<!-- reviewer repo=owner/repo id=SR-1 pr=repo#1 method=rust-review run=a -->",
+            "clean: false\nfindings:\n  - fnd: FND-1\n    severity: high",
+        );
+        let clean = comment(
+            "review-b",
+            99_500.0,
+            "<!-- reviewer repo=owner/repo id=SR-1 pr=repo#2 method=rust-review run=b -->",
+            "clean: true\nfindings: []",
+        );
+        let open = BTreeSet::from(["owner/repo#1".into(), "owner/repo#2".into()]);
+        let values = calculate(&[finding, clean], &open, &BTreeMap::new(), &open, 100_000.0)
+            .unwrap()
+            .values;
+        assert_eq!(values["pr_changes_requested_coverage"], 1.0);
+        assert_eq!(values["pr_changes_requested_share"], 0.5);
+    }
+
+    #[trace("FR-033-AC-17")]
+    #[test]
+    fn disposition_round_is_part_of_the_semantic_deduplication_key() {
+        let review = comment(
+            "review",
+            99_000.0,
+            "<!-- reviewer repo=owner/repo id=SR-1 pr=repo#1 method=rust-review run=review -->",
+            "clean: false\nfindings:\n  - fnd: FND-1\n    severity: high",
+        );
+        let first_round = comment(
+            "round-one",
+            99_100.0,
+            "<!-- reviewer-dispositions repo=owner/repo id=SR-1 method=rust-review round=1 run=resume -->",
+            "dispositions:\n  - fnd: FND-1\n    outcome: still-open",
+        );
+        let second_round = comment(
+            "round-two",
+            99_200.0,
+            "<!-- reviewer-dispositions repo=owner/repo id=SR-1 method=rust-review round=2 run=resume -->",
+            "dispositions:\n  - fnd: FND-1\n    outcome: fixed",
+        );
+        let values = calculate(
+            &[review, first_round, second_round],
+            &allowed(),
+            &BTreeMap::new(),
+            &allowed(),
+            100_000.0,
+        )
+        .unwrap()
+        .values;
+        assert_eq!(values["pr_changes_requested_share"], 0.0);
+        assert_eq!(values["review_findings_confirmed_high_24h"], 1.0);
+    }
+
+    #[trace("FR-033-AC-17")]
+    #[test]
+    fn later_review_without_mergeability_preserves_latest_explicit_verdict() {
+        let blocked = comment(
+            "blocked",
+            99_000.0,
+            "<!-- reviewer repo=owner/repo id=SR-1 pr=repo#1 method=rust-review run=a mergeable=no -->",
+            "clean: true\nfindings: []",
+        );
+        let later = comment(
+            "later",
+            99_500.0,
+            "<!-- reviewer repo=owner/repo id=SR-2 pr=repo#1 method=rust-review run=b -->",
+            "clean: true\nfindings: []",
+        );
+        let values = calculate(
+            &[blocked, later],
+            &allowed(),
+            &BTreeMap::new(),
+            &allowed(),
+            100_000.0,
+        )
+        .unwrap()
+        .values;
+        assert_eq!(values["pr_changes_requested_share"], 1.0);
+    }
+
+    #[trace("FR-033-AC-17")]
+    #[test]
+    fn latest_disposition_mergeability_marks_the_open_pr() {
+        let review = comment(
+            "review",
+            98_000.0,
+            "<!-- reviewer repo=owner/repo id=SR-1 pr=repo#1 method=rust-review run=a -->",
+            "clean: true\nfindings: []\nmergeable: true",
+        );
+        let disposition = comment(
+            "disposition",
+            99_000.0,
+            "<!-- reviewer-dispositions repo=owner/repo id=SR-1 round=1 run=b -->",
+            "mergeable: false\ndispositions: []",
+        );
+        let open = allowed();
+        let values = calculate(
+            &[review, disposition],
+            &open,
+            &BTreeMap::new(),
+            &open,
+            100_000.0,
+        )
+        .unwrap()
+        .values;
+        assert_eq!(values["pr_changes_requested_share"], 1.0);
+    }
+
+    #[trace("FR-033-AC-17")]
+    #[test]
+    fn changes_requested_share_remains_visible_with_partial_coverage() {
+        let open: BTreeSet<_> = (1..=20)
+            .map(|number| format!("owner/repo#{number}"))
+            .collect();
+        let mut comments = Vec::new();
+        let mut created = BTreeMap::new();
+        for number in 1..=19 {
+            let mergeable = number != 1;
+            let pr = format!("owner/repo#{number}");
+            created.insert(pr, 90_000.0);
+            comments.push(comment(
+                &format!("review-{number}"),
+                99_000.0,
+                &format!("<!-- reviewer repo=owner/repo id=SR-{number} pr=repo#{number} method=rust-review run=a -->"),
+                &format!("clean: true\nfindings: []\nmergeable: {mergeable}"),
+            ));
+        }
+        let values = calculate(&comments, &open, &created, &open, 100_000.0)
+            .unwrap()
+            .values;
+        assert_eq!(values["pr_changes_requested_coverage"], 0.95);
+        assert_eq!(values["pr_changes_requested_share"], 1.0 / 19.0);
+    }
+
+    #[trace("FR-033-AC-17")]
+    #[test]
+    fn first_review_distribution_is_published_for_partial_coverage() {
+        let open = BTreeSet::from(["owner/repo#1".into(), "owner/repo#2".into()]);
+        let created = BTreeMap::from([
+            ("owner/repo#1".into(), 98_000.0),
+            ("owner/repo#2".into(), 98_000.0),
+        ]);
+        let values = calculate(&[review()], &allowed(), &created, &open, 100_000.0)
+            .unwrap()
+            .values;
+        assert_eq!(values["new_pr_first_review_coverage_24h"], 0.5);
+        assert_eq!(values["new_pr_first_review_median_seconds_24h"], 1_000.0);
     }
 }

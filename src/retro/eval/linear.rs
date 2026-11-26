@@ -1799,6 +1799,7 @@ mod tests {
         MarkerComment {
             id: Some(id.to_owned()),
             created_at: Some(crate::drift::format_timestamp(at)),
+            updated_at: None,
             body: body.to_owned(),
         }
     }

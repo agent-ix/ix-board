@@ -309,6 +309,7 @@ fn change(hours_ago: f64, from: S, to: S) -> StateChange {
         at: ago(hours_ago),
         from: Some(from),
         to: Some(to),
+        to_name: None,
     }
 }
 
@@ -2847,6 +2848,7 @@ fn change_at(at: f64, from: S, to: S) -> StateChange {
         at,
         from: Some(from),
         to: Some(to),
+        to_name: None,
     }
 }
 
@@ -3627,6 +3629,7 @@ fn configured_native_http_and_export_file_flow_through_snapshot_store_and_missin
             at: 1_800_000_000.0 - 7200.0,
             from: Some(S::Unstarted),
             to: Some(S::Started),
+            to_name: None,
         }]),
     );
     rig.histories.insert("issue-b".into(), Ok(Vec::new()));

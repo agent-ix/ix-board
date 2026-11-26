@@ -16,7 +16,6 @@ pub(crate) const NAMES: &[&str] = &[
     "pr_closed_unmerged_share_24h",
     "prs_changes_requested",
     "prs_review_required",
-    "pr_changes_requested_share",
     "prs_reopened_open",
     "pr_size_median_lines",
     "pr_size_p90_lines",
@@ -42,10 +41,6 @@ pub(crate) fn calculate(prs: &[PullRequest], now: f64) -> PrStats {
             .iter()
             .filter(|p| p.review_decision.as_deref() == Some("CHANGES_REQUESTED"))
             .count();
-        let approved = open
-            .iter()
-            .filter(|p| p.review_decision.as_deref() == Some("APPROVED"))
-            .count();
         values.insert("prs_changes_requested".into(), requested as f64);
         values.insert(
             "prs_review_required".into(),
@@ -53,12 +48,6 @@ pub(crate) fn calculate(prs: &[PullRequest], now: f64) -> PrStats {
                 .filter(|p| p.review_decision.as_deref() == Some("REVIEW_REQUIRED"))
                 .count() as f64,
         );
-        if requested + approved > 0 {
-            values.insert(
-                "pr_changes_requested_share".into(),
-                requested as f64 / (requested + approved) as f64,
-            );
-        }
     }
     if prs
         .iter()
@@ -151,7 +140,7 @@ mod tests {
         .values;
         assert_eq!(values["prs_closed_unmerged_24h"], 1.0);
         assert_eq!(values["pr_closed_unmerged_share_24h"], 0.5);
-        assert_eq!(values["pr_changes_requested_share"], 0.5);
+        assert!(!values.contains_key("pr_changes_requested_share"));
         assert_eq!(values["prs_reopened_open"], 1.0);
     }
     #[trace("FR-033-AC-9")]

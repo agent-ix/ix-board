@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 use clap::Parser;
 use ix_board::team_metrics::{Collector, Config, Error, now_ms};
+use ix_trace_rs::implements;
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
@@ -109,6 +110,12 @@ fn metrics_text(collector: &Collector, config: &Config, now: i64) -> Result<Stri
     }
     Ok(text)
 }
+
+#[implements("FR-033-AC-12")]
+fn tracker_worker_configs(config: &Config) -> [Config; 1] {
+    [config.clone()]
+}
+
 fn run() -> Result<(), Error> {
     // SystemHost's local lifecycle transport invokes the current executable.
     // Support the same bounded, read-only protocol as the ix-board CLI.
@@ -132,9 +139,7 @@ fn run() -> Result<(), Error> {
         updated: Instant::now(),
     }));
     let (sender, receiver) = mpsc::sync_channel(1);
-    for scope in &config.scopes {
-        let mut tracker_config = config.clone();
-        tracker_config.scopes = vec![scope.clone()];
+    for tracker_config in tracker_worker_configs(&config) {
         let sender = sender.clone();
         thread::spawn(move || {
             loop {
@@ -204,6 +209,56 @@ fn main() -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ix_board::team_metrics::{ScopeConfig, Selectors};
+    fn two_scope_config(path: &std::path::Path) -> Config {
+        let scope = |team_id: &str, scope_id: &str, team: &str| ScopeConfig {
+            team_id: team_id.into(),
+            scope_id: scope_id.into(),
+            selectors: Selectors {
+                team: Some(team.into()),
+                ..Default::default()
+            },
+            leads: Vec::new(),
+            herdr_teams: Vec::new(),
+            retro_config: path.join(format!("{team_id}.json")),
+        };
+        Config {
+            version: 1,
+            listen: "127.0.0.1:0".parse().unwrap(),
+            state_path: path.join("events.sqlite"),
+            max_bytes: 1024 * 1024,
+            retention_seconds: 604800,
+            activity_interval_seconds: 30,
+            tracker_interval_seconds: 300,
+            fleet_ledger: None,
+            fleet_tick_interval_seconds: 300,
+            prometheus_url: Some("http://127.0.0.1:9090".into()),
+            scopes: vec![
+                scope("fsl", "completion", "QSL"),
+                scope("swarm-tools", "department-monitoring", "SWM"),
+            ],
+        }
+    }
+
+    #[trace("FR-033-AC-12")]
+    #[test]
+    fn tracker_worker_keeps_all_scopes_behind_one_shared_gate() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = two_scope_config(directory.path());
+        let workers = tracker_worker_configs(&config);
+
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].scopes.len(), 2);
+        assert_eq!(
+            workers[0]
+                .scopes
+                .iter()
+                .map(|scope| format!("{}:{}", scope.team_id, scope.scope_id))
+                .collect::<Vec<_>>(),
+            ["fsl:completion", "swarm-tools:department-monitoring"]
+        );
+    }
+
     use ix_trace_rs::trace;
     #[trace("FR-033-AC-8")]
     #[test]
