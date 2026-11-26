@@ -240,7 +240,7 @@ pub fn load_manifest(path: &Path) -> Result<Manifest, CadenceError> {
 }
 
 /// Validates cadence job identity, interval and supported argv shape.
-#[implements("FR-049-AC-4")]
+#[implements("FR-049-AC-4", "FR-049-AC-8")]
 pub fn validate_manifest(manifest: &Manifest) -> Result<(), CadenceError> {
     if manifest
         .alert_recipient
@@ -300,6 +300,7 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), CadenceError> {
     Ok(())
 }
 
+#[implements("FR-049-AC-8")]
 fn command_matches_kind(kind: JobKind, command: &[String]) -> bool {
     match (kind, command) {
         (JobKind::RetroSnapshot, [root, sub, ..]) => root == "retro" && sub == "snapshot",
@@ -372,7 +373,7 @@ fn classify_due(interval_secs: u64, last_run: Option<&CadenceRun>, now_ms: i64) 
 #[implements("FR-049-AC-7")]
 pub fn run_job(
     manifest: &Manifest,
-    mut open_ledger: impl FnMut() -> Result<Ledger, CadenceError>,
+    open_ledger: impl FnMut() -> Result<Ledger, CadenceError>,
     job_id: &str,
     now_ms: i64,
 ) -> Result<JobRunReport, CadenceError> {
@@ -390,6 +391,7 @@ struct RunOutcome {
     exit_status: Option<i32>,
 }
 
+#[implements("FR-049-AC-8")]
 fn run_job_with_executor(
     manifest: &Manifest,
     mut open_ledger: impl FnMut() -> Result<Ledger, CadenceError>,
