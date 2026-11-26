@@ -12,6 +12,7 @@ mod drift;
 pub mod fleet;
 mod focus_activity;
 pub mod host_hygiene;
+pub mod host_check;
 mod hygiene;
 mod linear;
 pub mod linear_summary;

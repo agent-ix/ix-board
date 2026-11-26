@@ -37,6 +37,28 @@ pub struct ProcessTable {
     pub complete: bool,
 }
 
+/// One filesystem mount observed from the operating system mount table.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MountEntry {
+    /// Mount identifier or device source reported by the host.
+    pub source: String,
+    /// Mount location.
+    pub mount_point: PathBuf,
+    /// Filesystem type.
+    pub fs_type: String,
+}
+
+/// Whether a path can be scanned without crossing an unexpected mount.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MountSafety {
+    /// Path and anchor share one filesystem and the path contains no nested mount.
+    Safe,
+    /// The path is on another filesystem or contains a nested mount.
+    Boundary,
+    /// The mount table is absent, malformed or insufficient to identify the path.
+    Unknown,
+}
+
 /// Whether process evidence proves a directory is safe to clean.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UseState {
@@ -93,8 +115,12 @@ pub struct BuildHostMetrics {
     pub disk_available_bytes: Option<u64>,
     /// Number of queued build requests.
     pub queue_depth: u64,
+    /// Whether the exposition contained a queue depth sample for this host.
+    pub queue_depth_available: bool,
     /// Running locked-build lease count.
     pub running_leases: u64,
+    /// Whether the exposition contained a running lease sample for this host.
+    pub running_leases_available: bool,
     /// Running lease counts by owner lane address.
     pub leases_by_lane: BTreeMap<String, u64>,
 }
@@ -259,18 +285,20 @@ pub struct HygieneReport {
     pub orphan_build_processes: Vec<u32>,
     /// Whether process inspection was complete.
     pub process_table_complete: bool,
+    /// Whether the mount table could be read and interpreted.
+    pub mount_table_complete: bool,
     /// Unsupported host OS/platform condition.
     pub unsupported: bool,
 }
 
 impl HygieneReport {
     /// Stable command status: 0 clean, 1 findings, 2 missing evidence, 3 unsupported platform.
-    #[implements("FR-048-AC-1", "FR-048-AC-3")]
+    #[implements("FR-048-AC-1", "FR-048-AC-3", "FR-048-AC-10")]
     pub fn exit_code(&self) -> u8 {
         if self.unsupported {
             return 3;
         }
-        if self.free_bytes.is_none() || !self.process_table_complete {
+        if self.free_bytes.is_none() || !self.process_table_complete || !self.mount_table_complete {
             return 2;
         }
         if self
@@ -309,6 +337,116 @@ pub fn system_process_table() -> io::Result<ProcessTable> {
             processes: Vec::new(),
             complete: false,
         })
+    }
+}
+
+/// Reads the platform mount table into a portable source/mountpoint/type form.
+#[implements("FR-048-AC-10")]
+pub fn system_mount_table() -> io::Result<Vec<MountEntry>> {
+    #[cfg(target_os = "linux")]
+    let text = std::fs::read_to_string("/proc/self/mountinfo")?;
+    #[cfg(target_os = "macos")]
+    let text = {
+        let output = Command::new("mount").arg("-p").output()?;
+        if !output.status.success() {
+            return Err(io::Error::other("mount table command failed"));
+        }
+        String::from_utf8(output.stdout)
+            .map_err(|_| io::Error::other("mount table is not UTF-8"))?
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    return Err(io::Error::other("mount table unsupported"));
+    parse_mount_table(&text)
+}
+
+/// Parses Linux mountinfo or BSD `mount -p` rows.
+#[implements("FR-048-AC-10")]
+pub fn parse_mount_table(text: &str) -> io::Result<Vec<MountEntry>> {
+    let mut entries = Vec::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let fields = if let Some((before, after)) = line.split_once(" - ") {
+            let left = before.split_whitespace().collect::<Vec<_>>();
+            let right = after.split_whitespace().collect::<Vec<_>>();
+            if left.len() < 5 || right.len() < 2 {
+                continue;
+            }
+            (left[0].to_owned(), unescape_mount_field(left[4]), right[0].to_owned())
+        } else {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            if fields.len() < 3 {
+                continue;
+            }
+            (unescape_mount_field(fields[0]), unescape_mount_field(fields[1]), fields[2].to_owned())
+        };
+        entries.push(MountEntry {
+            source: fields.0,
+            mount_point: PathBuf::from(fields.1),
+            fs_type: fields.2,
+        });
+    }
+    if entries.is_empty() {
+        return Err(io::Error::other("mount table contains no usable entries"));
+    }
+    entries.sort_by(|left, right| left.mount_point.cmp(&right.mount_point));
+    Ok(entries)
+}
+
+fn unescape_mount_field(field: &str) -> String {
+    field
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+
+/// Checks a candidate path against an injected or system mount table.
+#[implements("FR-048-AC-10")]
+pub fn mount_safety(path: &Path, anchor: &Path, mounts: &[MountEntry]) -> MountSafety {
+    let path = canonical_or_original(path);
+    let anchor = canonical_or_original(anchor);
+    let Some(path_mount) = mount_for(&path, mounts) else {
+        return MountSafety::Unknown;
+    };
+    let Some(anchor_mount) = mount_for(&anchor, mounts) else {
+        return MountSafety::Unknown;
+    };
+    if path_mount.source != anchor_mount.source || path_mount.fs_type != anchor_mount.fs_type {
+        return MountSafety::Boundary;
+    }
+    if mounts.iter().any(|entry| {
+        entry.mount_point != path && entry.mount_point.starts_with(&path)
+    }) {
+        return MountSafety::Boundary;
+    }
+    MountSafety::Safe
+}
+
+fn mount_for<'a>(path: &Path, mounts: &'a [MountEntry]) -> Option<&'a MountEntry> {
+    mounts
+        .iter()
+        .filter(|entry| path.starts_with(&entry.mount_point))
+        .max_by_key(|entry| entry.mount_point.components().count())
+}
+
+/// Reports whether a mount table has an entry covering a path.
+#[implements("FR-048-AC-10")]
+pub fn mount_table_covers(path: &Path, mounts: &[MountEntry]) -> bool {
+    mount_for(&canonical_or_original(path), mounts).is_some()
+}
+
+/// Reports whether two paths resolve to the same source and filesystem type.
+#[implements("FR-048-AC-10")]
+pub fn mount_filesystem_matches(left: &Path, right: &Path, mounts: &[MountEntry]) -> MountSafety {
+    let Some(left_mount) = mount_for(&canonical_or_original(left), mounts) else {
+        return MountSafety::Unknown;
+    };
+    let Some(right_mount) = mount_for(&canonical_or_original(right), mounts) else {
+        return MountSafety::Unknown;
+    };
+    if left_mount.source == right_mount.source && left_mount.fs_type == right_mount.fs_type {
+        MountSafety::Safe
+    } else {
+        MountSafety::Boundary
     }
 }
 
@@ -757,7 +895,7 @@ pub fn recheck_clean_decision(
 }
 
 /// Parses the Prometheus text exposition emitted by locked-build and node-exporter.
-#[implements("FR-048-AC-7")]
+#[implements("FR-048-AC-7", "FR-050-AC-3")]
 pub fn parse_build_metrics(text: &str) -> BTreeMap<String, BuildHostMetrics> {
     let mut result = BTreeMap::<String, BuildHostMetrics>::new();
     let mut cpus = BTreeMap::<String, std::collections::BTreeSet<String>>::new();
@@ -808,11 +946,13 @@ pub fn parse_build_metrics(text: &str) -> BTreeMap<String, BuildHostMetrics> {
                 row.disk_available_bytes = value_u64(value)
             }
             "ix_build_queue_depth" => {
+                row.queue_depth_available = true;
                 row.queue_depth = row
                     .queue_depth
                     .saturating_add(value_u64(value).unwrap_or(0))
             }
             "ix_build_lane_running" => {
+                row.running_leases_available = true;
                 let count = value_u64(value).unwrap_or(0);
                 row.running_leases = row.running_leases.saturating_add(count);
                 if count > 0
@@ -880,12 +1020,21 @@ fn label<'a>(labels: &'a str, wanted: &str) -> Option<&'a str> {
 }
 
 /// Evaluates host telemetry against a configured heavy-gate policy.
-#[implements("FR-048-AC-8")]
+#[implements("FR-048-AC-8", "FR-050-AC-3")]
 pub fn eligibility(metrics: &BuildHostMetrics, policy: BuildPolicy) -> Eligibility {
     let (Some(load1), Some(cores)) = (metrics.load1, metrics.cores) else {
         return Eligibility::Unknown;
     };
     if !load1.is_finite() || !cores.is_finite() || cores <= 0.0 {
+        return Eligibility::Unknown;
+    }
+    if metrics.memory_total_bytes.is_none()
+        || metrics.memory_available_bytes.is_none()
+        || metrics.swap_total_bytes.is_none()
+        || metrics.swap_free_bytes.is_none()
+        || !metrics.queue_depth_available
+        || !metrics.running_leases_available
+    {
         return Eligibility::Unknown;
     }
     if load1 >= policy.max_load1 || metrics.running_leases >= policy.heavy_gate_slots {
@@ -1416,7 +1565,9 @@ mod tests {
         assert_eq!(row.swap_free_bytes, Some(10));
         assert_eq!(row.disk_available_bytes, Some(700));
         assert_eq!(row.queue_depth, 5);
+        assert!(row.queue_depth_available);
         assert_eq!(row.running_leases, 1);
+        assert!(row.running_leases_available);
         assert_eq!(row.leases_by_lane["luna:team:coder"], 1);
         assert!(!row.leases_by_lane.contains_key("luna:team:idle"));
         assert_eq!(row.load1, Some(7.6));
@@ -1424,7 +1575,7 @@ mod tests {
     }
 
     #[test]
-    #[trace("FR-048-AC-8")]
+    #[trace("FR-048-AC-8", "FR-050-AC-3")]
     fn luna_policy_rejects_load_eight_and_any_existing_heavy_gate() {
         let policy = BuildPolicy {
             max_load1: 8.0,
@@ -1433,14 +1584,73 @@ mod tests {
         let mut metrics = BuildHostMetrics {
             load1: Some(7.9),
             cores: Some(8.0),
+            memory_total_bytes: Some(1000),
+            memory_available_bytes: Some(500),
+            swap_total_bytes: Some(100),
+            swap_free_bytes: Some(100),
+            queue_depth_available: true,
+            running_leases_available: true,
             ..Default::default()
         };
         assert_eq!(eligibility(&metrics, policy), Eligibility::Eligible);
         metrics.load1 = Some(8.0);
         assert_eq!(eligibility(&metrics, policy), Eligibility::Ineligible);
+        metrics.memory_available_bytes = None;
+        assert_eq!(eligibility(&metrics, policy), Eligibility::Unknown);
+        metrics.memory_available_bytes = Some(500);
         metrics.load1 = Some(7.9);
         metrics.running_leases = 1;
         assert_eq!(eligibility(&metrics, policy), Eligibility::Ineligible);
+    }
+
+    #[test]
+    #[trace("FR-048-AC-10")]
+    fn injected_mount_table_blocks_other_filesystems_and_nested_mounts() {
+        let mounts = parse_mount_table(
+            "36 25 8:1 / /home rw - ext4 /dev/root rw\n37 36 8:2 / /home/p/dev/worktrees/wt/target/cache rw - ext4 /dev/cache rw\n38 36 8:3 / /mnt/other rw - ext4 /dev/other rw\n",
+        )
+        .expect("mount table parses");
+        assert_eq!(
+            mount_safety(
+                Path::new("/home/p/dev/worktrees/other"),
+                Path::new("/home/p/dev/worktrees"),
+                &mounts
+            ),
+            MountSafety::Safe
+        );
+        assert_eq!(
+            mount_safety(
+                Path::new("/mnt/other"),
+                Path::new("/home/p/dev/worktrees"),
+                &mounts
+            ),
+            MountSafety::Boundary
+        );
+        assert_eq!(
+            mount_safety(
+                Path::new("/home/p/dev/worktrees/wt/target"),
+                Path::new("/home/p/dev/worktrees"),
+                &mounts
+            ),
+            MountSafety::Boundary
+        );
+        assert_eq!(
+            mount_safety(
+                Path::new("/unknown"),
+                Path::new("/home/p/dev/worktrees"),
+                &mounts
+            ),
+            MountSafety::Unknown
+        );
+        assert!(parse_mount_table("garbage").is_err());
+    }
+
+    #[test]
+    #[trace("FR-048-AC-10")]
+    fn mount_table_parser_unescapes_spaces_in_mountpoints() {
+        let mounts = parse_mount_table("36 25 8:1 / /home/p/dev\\040space rw - ext4 /dev/root rw\n")
+            .expect("mount table parses");
+        assert_eq!(mounts[0].mount_point, Path::new("/home/p/dev space"));
     }
 
     #[test]
@@ -1454,6 +1664,7 @@ mod tests {
             prunable_worktrees: Vec::new(),
             orphan_build_processes: Vec::new(),
             process_table_complete: true,
+            mount_table_complete: true,
             unsupported: false,
         };
         assert_eq!(report(Some(99)).exit_code(), 1);

@@ -121,6 +121,11 @@ enum Command {
         #[command(subcommand)]
         command: HygieneCommand,
     },
+    /// Check local host authentication and build capacity.
+    Host {
+        #[command(subcommand)]
+        command: HostCommand,
+    },
     /// Compare build-host capacity telemetry.
     Build {
         #[command(subcommand)]
@@ -209,6 +214,12 @@ enum HygieneCommand {
         #[arg(long)]
         apply: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum HostCommand {
+    /// Run the local host check without arguments.
+    Check,
 }
 
 #[derive(clap::Args, Debug)]
@@ -680,6 +691,8 @@ enum Output {
         recorded_level: Option<u32>,
     },
     Hygiene(ix_board::host_hygiene::HygieneReport),
+    HostCheck(ix_board::host_check::HostCheckReport),
+    HostCheck(ix_board::host_check::HostCheckReport),
     BuildStatus(
         Vec<(
             ix_board::host_hygiene::BuildHostMetrics,
@@ -783,6 +796,7 @@ fn main() -> std::process::ExitCode {
                     emit_result(&text);
                     match &output {
                         Output::Hygiene(report) => std::process::ExitCode::from(report.exit_code()),
+                        Output::HostCheck(report) => std::process::ExitCode::from(report.exit_code),
                         _ => std::process::ExitCode::from(output_outcome(&output)),
                     }
                 }
@@ -1007,6 +1021,9 @@ fn run(command: Command) -> Result<Output, Error> {
             HygieneCommand::Check(args) => run_hygiene(&args, false).map(Output::Hygiene),
             HygieneCommand::Clean { args, apply } => run_hygiene(&args, apply).map(Output::Hygiene),
         },
+        Command::Host {
+            command: HostCommand::Check,
+        } => run_host_check().map(Output::HostCheck),
         Command::Build {
             command:
                 BuildCommand::Status {
@@ -3566,15 +3583,17 @@ fn run_drift(
     Ok(Output::Drift(evaluate_drift_file(&config, &evidence)?))
 }
 
-#[implements("FR-048-AC-1", "FR-048-AC-4", "FR-048-AC-5")]
+#[implements("FR-048-AC-1", "FR-048-AC-4", "FR-048-AC-5", "FR-048-AC-10")]
 fn run_hygiene(
     args: &HygieneArgs,
     apply: bool,
 ) -> Result<ix_board::host_hygiene::HygieneReport, Error> {
     use ix_board::host_hygiene::{
-        CleanDecision, HostPolicy, HygieneConfig, HygieneReport, apply_clean_decision,
+        CleanDecision, HostPolicy, HygieneConfig, HygieneReport, MountSafety, apply_clean_decision,
         canonicalize_worktree_root, clean_decision, free_disk_bytes, newest_mtime_under,
-        recheck_clean_decision, system_process_table,
+        mount_filesystem_matches, mount_safety, mount_table_covers, recheck_clean_decision,
+        system_mount_table,
+        system_process_table,
     };
     use std::time::{Duration, SystemTime};
 
@@ -3587,6 +3606,7 @@ fn run_hygiene(
             prunable_worktrees: Vec::new(),
             orphan_build_processes: Vec::new(),
             process_table_complete: false,
+            mount_table_complete: false,
             unsupported: true,
         });
     }
@@ -3634,7 +3654,21 @@ fn run_hygiene(
     let mtime_scan_duration = Duration::from_millis(config.mtime_scan_duration_ms.unwrap_or(2_000));
     let free_bytes = free_disk_bytes(&root).ok();
     let processes = system_process_table().unwrap_or_default();
-    let prunable_worktrees = find_prunable_worktrees(&root);
+    let mounts = system_mount_table().ok();
+    let mount_table_complete = mounts.is_some();
+    let root_mount_safety = if mounts
+        .as_ref()
+        .is_some_and(|mounts| mount_table_covers(&root, mounts))
+    {
+        MountSafety::Safe
+    } else {
+        MountSafety::Unknown
+    };
+    let prunable_worktrees = if root_mount_safety == MountSafety::Safe {
+        find_prunable_worktrees(&root, mounts.as_deref().unwrap_or_default())
+    } else {
+        Vec::new()
+    };
     let orphan_build_processes = processes
         .processes
         .iter()
@@ -3680,6 +3714,12 @@ fn run_hygiene(
         if !worktree.join(".git").exists() {
             continue;
         }
+        if root_mount_safety != MountSafety::Safe
+            || mount_filesystem_matches(&worktree, &root, mounts.as_deref().unwrap_or_default())
+                != MountSafety::Safe
+        {
+            continue;
+        }
         let target_path = worktree.join("target");
         let Ok(metadata) = std::fs::symlink_metadata(&target_path) else {
             continue;
@@ -3691,6 +3731,21 @@ fn run_hygiene(
             continue;
         };
         if !target.starts_with(&worktree) {
+            continue;
+        }
+        let safety = mount_safety(&target, &root, mounts.as_deref().unwrap_or_default());
+        if safety != MountSafety::Safe {
+            targets.push(CleanDecision {
+                target,
+                age_secs: 0,
+                eligible: false,
+                reason: match safety {
+                    MountSafety::Boundary => "mount_boundary",
+                    MountSafety::Unknown => "mount_evidence_unknown",
+                    MountSafety::Safe => unreachable!(),
+                }
+                .to_owned(),
+            });
             continue;
         }
         let modified = newest_mtime_under(&target, mtime_scan_entries, mtime_scan_duration)
@@ -3728,12 +3783,186 @@ fn run_hygiene(
         prunable_worktrees,
         orphan_build_processes,
         process_table_complete: processes.complete,
+        mount_table_complete,
         unsupported: false,
     })
 }
 
-#[implements("FR-048-AC-4")]
-fn find_prunable_worktrees(root: &std::path::Path) -> Vec<PathBuf> {
+#[implements("FR-050-AC-1", "FR-050-AC-2", "FR-050-AC-3", "FR-050-AC-4")]
+fn run_host_check() -> ix_board::host_check::HostCheckReport {
+    use ix_board::host_check::{
+        AuthCheck, AuthState, dev_process_findings, find_executable, host_exit_code,
+    };
+    use ix_board::host_hygiene::{
+        Eligibility, HygieneConfig, eligibility, normalize_host_label, parse_build_metrics,
+        system_process_table,
+    };
+    use std::process::Command;
+
+    let settings = ix_board::settings_value().ok().flatten();
+    let hygiene = HygieneConfig::from_settings(settings.as_ref()).ok();
+    let host = resolve_host_label(hygiene.as_ref());
+    let host_name = host.clone().unwrap_or_else(|| "unknown".to_owned());
+    let path = std::env::var_os("PATH").unwrap_or_default();
+
+    let gh_path = find_executable(&path, "gh");
+    let (gh_state, gh_source) = match gh_path {
+        None => (AuthState::PathMissing, None),
+        Some(executable) => {
+            let result = Command::new(executable)
+                .args(["auth", "status", "--hostname", "github.com"])
+                .stdin(std::process::Stdio::null())
+                .output();
+            match result {
+                Ok(output) if output.status.success() => (AuthState::Ready, None),
+                Ok(output) => {
+                    let text = format!(
+                        "{} {}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    )
+                    .to_lowercase();
+                    let state = if text.contains("401") {
+                        AuthState::Unauthorized
+                    } else if text.contains("not logged in") || text.contains("no active account") {
+                        AuthState::Missing
+                    } else {
+                        AuthState::Unavailable
+                    };
+                    (state, None)
+                }
+                Err(_) => (AuthState::Unavailable, None),
+            }
+        }
+    };
+    let gh = AuthCheck {
+        service: "gh".to_owned(),
+        state: gh_state,
+        source: gh_source,
+    };
+
+    let linear_source = match ix_board::LinearGraphQlSource::credential_source() {
+        Ok(source) => source,
+        Err(Error::Credential(_)) => Some("keyring_locked".to_owned()),
+        Err(_) => Some("unavailable".to_owned()),
+    };
+    let linear_state = match linear_source.as_deref() {
+        Some("keyring_locked") => AuthState::KeyringLocked,
+        Some("unavailable") => AuthState::Unavailable,
+        Some(source) => match ix_board::LinearGraphQlSource::from_env()
+            .and_then(|linear| linear.auth_status())
+        {
+            Ok(200..=299) => AuthState::Ready,
+            Ok(401) => AuthState::Unauthorized,
+            Ok(_) => AuthState::Unavailable,
+            Err(Error::Credential(_)) => AuthState::KeyringLocked,
+            Err(Error::MissingApiKey) => AuthState::Missing,
+            Err(Error::Http(error)) if error.status() == Some(reqwest::StatusCode::UNAUTHORIZED) => {
+                AuthState::Unauthorized
+            }
+            Err(_) => AuthState::Unavailable,
+        },
+        None => {
+            if find_executable(&path, "linear").is_none()
+                && std::env::var_os("LINEAR_API_KEY").is_none()
+            {
+                AuthState::PathMissing
+            } else {
+                AuthState::Missing
+            }
+        }
+    };
+    let linear = AuthCheck {
+        service: "linear".to_owned(),
+        state: linear_state,
+        source: linear_source.filter(|source| !matches!(source.as_str(), "keyring_locked" | "unavailable")),
+    };
+    let auth = vec![gh, linear];
+
+    let mut metrics = None;
+    let mut admission = Eligibility::Unknown;
+    if let (Some(host), Some(config)) = (host.as_deref(), hygiene.as_ref())
+        && let Some(policy) = config.build_policy(host)
+        && let Ok(fleet_config) = ix_board::fleet::FleetConfig::from_toml(
+            settings.as_ref(),
+            std::env::var("IX_PROMETHEUS_URL").ok(),
+        )
+        && let Some(url) = fleet_config.prometheus_url.as_deref()
+        && let Ok(text) = fetch_metrics_text(url)
+    {
+        let rows = parse_build_metrics(&text);
+        if let Some(row) = rows.get(&normalize_host_label(host)) {
+            admission = eligibility(row, policy);
+            metrics = Some(row.clone());
+        }
+    }
+
+    let process_table = system_process_table().unwrap_or_default();
+    let dev_root = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join("dev"))
+        .unwrap_or_else(|| PathBuf::from("/dev-root-unavailable"));
+    let dev_processes = dev_process_findings(&dev_root, &process_table);
+    let exit_code = host_exit_code(
+        &auth,
+        metrics.as_ref(),
+        admission,
+        &dev_processes,
+        process_table.complete,
+    );
+    ix_board::host_check::HostCheckReport {
+        host: host_name,
+        auth,
+        metrics,
+        admission,
+        dev_processes,
+        process_table_complete: process_table.complete,
+        exit_code,
+    }
+}
+
+#[implements("FR-050-AC-1")]
+fn resolve_host_label(config: Option<&ix_board::host_hygiene::HygieneConfig>) -> Option<String> {
+    let configured = config.map(|config| &config.hosts);
+    let candidates = [
+        std::env::var("IX_BOARD_HOST").ok(),
+        std::env::var("HERDR_SERVER").ok(),
+        std::process::Command::new("agent-msg")
+            .args(["whoami", "--json"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| {
+                let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+                value
+                    .get("server")
+                    .or_else(|| value.get("host"))
+                    .or_else(|| value.get("address"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(|value| value.split(':').next().unwrap_or(value).to_owned())
+            }),
+        std::env::var("HOSTNAME")
+            .ok()
+            .map(|name| name.split('.').next().unwrap_or(&name).to_owned()),
+    ];
+    candidates.into_iter().flatten().find_map(|candidate| {
+        let normalized = candidate.trim().to_lowercase();
+        if normalized.is_empty() {
+            return None;
+        }
+        configured
+            .and_then(|hosts| hosts.keys().find(|host| host.eq_ignore_ascii_case(&normalized)))
+            .cloned()
+            .or_else(|| configured.is_none().then_some(normalized))
+    })
+}
+
+#[implements("FR-048-AC-4", "FR-048-AC-10")]
+fn find_prunable_worktrees(
+    root: &std::path::Path,
+    mounts: &[ix_board::host_hygiene::MountEntry],
+) -> Vec<PathBuf> {
     let mut found = std::collections::BTreeSet::new();
     let Ok(entries) = std::fs::read_dir(root) else {
         return Vec::new();
@@ -3756,7 +3985,9 @@ fn find_prunable_worktrees(root: &std::path::Path) -> Vec<PathBuf> {
         let mut current = None;
         for line in String::from_utf8_lossy(&output.stdout).lines() {
             if let Some(path) = line.strip_prefix("worktree ") {
-                current = Some(PathBuf::from(path));
+                let path = PathBuf::from(path);
+                current = (mount_safety(&path, root, mounts) == MountSafety::Safe)
+                    .then_some(path);
             } else if line.starts_with("prunable")
                 && let Some(path) = current.as_ref().filter(|path| path.starts_with(root))
             {
@@ -3970,6 +4201,32 @@ fn render_human(output: &Output) -> String {
             })
             .collect::<Vec<_>>()
             .join("\n"),
+        Output::HostCheck(report) => {
+            let mut lines = vec![format!("{} host check exit={}", report.host, report.exit_code)];
+            lines.extend(report.auth.iter().map(|check| {
+                format!("auth {}={:?} source={}", check.service, check.state, check.source.as_deref().unwrap_or("unknown"))
+            }));
+            if let Some(metrics) = &report.metrics {
+                lines.push(format!(
+                    "build load/core={:?} memory={:?}/{:?} swap={:?}/{:?} queue={} leases={} admission={:?}",
+                    metrics.load1.zip(metrics.cores).filter(|(_, cores)| *cores > 0.0).map(|(load, cores)| load / cores),
+                    metrics.memory_available_bytes,
+                    metrics.memory_total_bytes,
+                    metrics.swap_free_bytes,
+                    metrics.swap_total_bytes,
+                    metrics.queue_depth,
+                    metrics.running_leases,
+                    report.admission,
+                ));
+            } else {
+                lines.push(format!("build telemetry unavailable admission={:?}", report.admission));
+            }
+            lines.push(format!("process_evidence_complete={}", report.process_table_complete));
+            lines.extend(report.dev_processes.iter().map(|finding| {
+                format!("dev_process pid={} executable={} cwd={}", finding.pid, finding.executable, finding.cwd.display())
+            }));
+            lines.join("\n")
+        }
         Output::FleetAssign(report) => ix_board::fleet::assign::render_text(report),
         Output::FleetLedger(rows) => rows.render_text(),
         Output::FleetDefectRoute {

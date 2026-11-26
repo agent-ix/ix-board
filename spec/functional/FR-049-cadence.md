@@ -31,7 +31,9 @@ succeeds or fails. A snapshot job MAY declare `after_success`.
 When declared, `after_success` SHALL be a `retro delta --config <file> --notify`
 argv and SHALL run only after the snapshot exits successfully. A failed
 follow-up SHALL make the cadence run fail. Supported
-job kinds are `retro_snapshot`, `fleet_tick` and `hygiene`. Jobs are configured
+job kinds are `retro_snapshot`, `fleet_tick`, `hygiene` and `host_check`. A
+`host_check` job SHALL use exactly the argv `["host", "check"]` and run on the
+machine where cadence is invoked. Jobs are configured
 by program and team and declare a stable job id, positive interval, kind, argv
 sequence and owner role. The cadence loader SHALL reject an invalid or
 ambiguous manifest entry before execution. Cadence does not install or run a
@@ -59,6 +61,7 @@ manifest is shared configuration and is not stored in the fleet ledger.
 | FR-049-AC-5 | `--alert` emits an alert only when the configured cadence checker job is overdue. | Test |
 | FR-049-AC-6 | Cadence uses the existing fleet ledger and does not create a scheduler or write state into a repository. | Test |
 | FR-049-AC-7 | A valid snapshot job runs its configured notifying delta only after snapshot success; snapshot failure skips the delta, and a delta failure is recorded as a failed cadence run. Cadence tests cover both failure transitions. Delta tests use hand-written retro records and an injected sender; no test sends a real notification. | Test |
+| FR-049-AC-8 | A host-check job accepts only `host check`, runs that argv as a child without shell expansion, and records its success or failure in the cadence ledger. | Test |
 
 ## Dependencies
 

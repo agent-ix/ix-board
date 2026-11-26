@@ -17,6 +17,7 @@ Commands:
   issues         Read multiple exact Linear issues in one cached workspace request
   agents         Say whether each agent in a team's herdr workspaces is working right now
   hygiene        Inspect or clean build-host worktree output
+  host           Check local host authentication and build capacity
   build          Compare build-host capacity telemetry
   fleet          Fleet lane commands
   drift          Render a deterministic drift report from versioned structured evidence
@@ -542,6 +543,21 @@ Without `--policy`, the command uses configured `[hygiene.hosts.<host>]` entries
 both `max_load1` and `heavy_gate_slots`. Pass one `--policy` for each host to override the
 configured host list. For luna's current rule use `luna:8:1` (raw load must be below 8 and no
 heavy gate may already be running).
+
+## ix-board host check
+
+```text
+ix-board host check
+```
+
+Checks local GitHub and Linear authentication, locked-build load, memory, swap,
+queue and running lease telemetry, admission eligibility, and quire/quoin/rg
+process working directories under `~/dev`. It prints statuses and metrics
+without credential values. Exit status is 0 when all required checks pass and
+1 when any check fails or evidence is unknown. Configure the current host with
+`IX_BOARD_HOST` when Herdr server identity cannot be resolved. Configure
+`IX_PROMETHEUS_URL` (or `[fleet].prometheus_url`) and a complete
+`[hygiene.hosts.<host>]` policy for capacity status.
 
 ## ix-board fleet status
 

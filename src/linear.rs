@@ -490,6 +490,21 @@ impl LinearGraphQlSource {
         )
     }
 
+    /// Sends a minimal authenticated request and returns only the HTTP status.
+    ///
+    /// # Errors
+    /// Returns a transport error without including the credential or response body.
+    #[implements("FR-050-AC-2")]
+    pub fn auth_status(&self) -> Result<u16, Error> {
+        let response = self
+            .client
+            .post(&self.endpoint)
+            .header(reqwest::header::AUTHORIZATION, self.api_key.expose_secret())
+            .json(&serde_json::json!({"query":"query HostCheck { viewer { id } }"}))
+            .send()?;
+        Ok(response.status().as_u16())
+    }
+
     /// Builds a source with a controlled credential provider and HTTP endpoint.
     ///
     /// `environment_override` is a snapshot of `LINEAR_API_KEY`; `None` means
