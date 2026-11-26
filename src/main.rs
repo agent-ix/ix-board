@@ -3789,7 +3789,7 @@ fn run_hygiene(
 #[implements("FR-050-AC-1", "FR-050-AC-2", "FR-050-AC-3", "FR-050-AC-4")]
 fn run_host_check() -> ix_board::host_check::HostCheckReport {
     use ix_board::host_check::{
-        AuthCheck, AuthState, dev_process_findings, find_executable, host_exit_code,
+        AuthCheck, AuthState, auth_state, dev_process_findings, find_executable, host_exit_code,
     };
     use ix_board::host_hygiene::{
         Eligibility, HygieneConfig, eligibility, normalize_host_label, parse_build_metrics,
@@ -3804,15 +3804,17 @@ fn run_host_check() -> ix_board::host_check::HostCheckReport {
     let path = std::env::var_os("PATH").unwrap_or_default();
 
     let gh_path = find_executable(&path, "gh");
-    let (gh_state, gh_source) = match gh_path {
-        None => (AuthState::PathMissing, None),
+    let gh_state = match gh_path {
+        None => auth_state(false, false, false, None, false),
         Some(executable) => {
             let result = Command::new(executable)
                 .args(["auth", "status", "--hostname", "github.com"])
                 .stdin(std::process::Stdio::null())
                 .output();
             match result {
-                Ok(output) if output.status.success() => (AuthState::Ready, None),
+                Ok(output) if output.status.success() => {
+                    auth_state(true, false, true, Some(200), true)
+                }
                 Ok(output) => {
                     let text = format!(
                         "{} {}",
@@ -3820,57 +3822,61 @@ fn run_host_check() -> ix_board::host_check::HostCheckReport {
                         String::from_utf8_lossy(&output.stderr)
                     )
                     .to_lowercase();
-                    let state = if text.contains("401") {
-                        AuthState::Unauthorized
-                    } else if text.contains("not logged in") || text.contains("no active account") {
-                        AuthState::Missing
-                    } else {
-                        AuthState::Unavailable
-                    };
-                    (state, None)
+                    let unauthorized = text.contains("401");
+                    let missing =
+                        text.contains("not logged in") || text.contains("no active account");
+                    auth_state(!missing, false, true, unauthorized.then_some(401), false)
                 }
-                Err(_) => (AuthState::Unavailable, None),
+                Err(_) => AuthState::Unavailable,
             }
         }
     };
     let gh = AuthCheck {
         service: "gh".to_owned(),
         state: gh_state,
-        source: gh_source,
+        source: None,
     };
 
     let linear_source = match ix_board::LinearGraphQlSource::credential_source() {
         Ok(source) => source,
-        Err(Error::Credential(_)) => Some("keyring_locked".to_owned()),
+        Err(Error::Credential(ix_cli_kit::secrets::SecretError::Locked)) => {
+            Some("keyring_locked".to_owned())
+        }
         Err(_) => Some("unavailable".to_owned()),
     };
     let linear_state = match linear_source.as_deref() {
-        Some("keyring_locked") => AuthState::KeyringLocked,
-        Some("unavailable") => AuthState::Unavailable,
-        Some(_source) => match ix_board::LinearGraphQlSource::from_env()
+        Some("keyring_locked") => auth_state(true, true, true, None, false),
+        Some("unavailable") => auth_state(true, false, true, None, false),
+        Some(_) => match ix_board::LinearGraphQlSource::from_env()
             .and_then(|linear| linear.auth_status())
         {
-            Ok(200..=299) => AuthState::Ready,
-            Ok(401) => AuthState::Unauthorized,
-            Ok(_) => AuthState::Unavailable,
-            Err(Error::Credential(_)) => AuthState::KeyringLocked,
-            Err(Error::MissingApiKey) => AuthState::Missing,
+            Ok(status) => auth_state(
+                true,
+                false,
+                true,
+                Some(status),
+                (200..300).contains(&status),
+            ),
+            Err(Error::Credential(ix_cli_kit::secrets::SecretError::Locked)) => {
+                auth_state(true, true, true, None, false)
+            }
+            Err(Error::Credential(_)) | Err(Error::MissingApiKey) => {
+                auth_state(false, false, true, None, false)
+            }
             Err(Error::Http(error))
                 if error.status() == Some(reqwest::StatusCode::UNAUTHORIZED) =>
             {
-                AuthState::Unauthorized
+                auth_state(true, false, true, Some(401), false)
             }
-            Err(_) => AuthState::Unavailable,
+            Err(_) => auth_state(true, false, true, None, false),
         },
-        None => {
-            if find_executable(&path, "linear").is_none()
-                && std::env::var_os("LINEAR_API_KEY").is_none()
-            {
-                AuthState::PathMissing
-            } else {
-                AuthState::Missing
-            }
-        }
+        None => auth_state(
+            false,
+            false,
+            find_executable(&path, "linear").is_some(),
+            None,
+            false,
+        ),
     };
     let linear = AuthCheck {
         service: "linear".to_owned(),
@@ -4070,6 +4076,7 @@ fn run_build_status(
         .collect())
 }
 
+#[implements("FR-050-AC-1")]
 fn render_human(output: &Output) -> String {
     match output {
         Output::Cached { result, freshness } => format!(

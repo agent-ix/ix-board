@@ -576,7 +576,7 @@ fn linux_process_table(proc_root: &Path) -> io::Result<ProcessTable> {
 #[implements("FR-048-AC-3")]
 fn macos_process_table() -> io::Result<ProcessTable> {
     let output = Command::new("lsof")
-        .args(["-nP", "-Fpn", "-d", "cwd,txt,mem,0-"])
+        .args(["-nP", "-Ffpn", "-d", "cwd,txt,mem,0-"])
         .output()?;
     if !output.status.success() {
         return Ok(ProcessTable {
@@ -667,6 +667,7 @@ fn parse_macos_process_output(
         })
         .collect::<BTreeMap<_, _>>();
     let mut current: Option<ProcessEvidence> = None;
+    let mut current_descriptor: Option<String> = None;
     for line in String::from_utf8_lossy(lsof_output).lines() {
         if let Some(pid) = line
             .strip_prefix('p')
@@ -679,10 +680,17 @@ fn parse_macos_process_output(
                 pid,
                 ..Default::default()
             });
+            current_descriptor = None;
+        } else if let Some(descriptor) = line.strip_prefix('f') {
+            current_descriptor = Some(descriptor.to_owned());
         } else if let Some(path) = line.strip_prefix('n').map(PathBuf::from)
             && let Some(process) = current.as_mut()
         {
-            process.fds.push(path);
+            if current_descriptor.as_deref() == Some("cwd") {
+                process.cwd = Some(path);
+            } else {
+                process.fds.push(path);
+            }
         }
     }
     if let Some(process) = current {
@@ -917,6 +925,7 @@ pub fn recheck_clean_decision(
 pub fn parse_build_metrics(text: &str) -> BTreeMap<String, BuildHostMetrics> {
     let mut result = BTreeMap::<String, BuildHostMetrics>::new();
     let mut cpus = BTreeMap::<String, std::collections::BTreeSet<String>>::new();
+    let mut busy_leases = BTreeMap::<String, u64>::new();
     for line in text.lines().filter(|line| !line.starts_with('#')) {
         let mut fields = line.split_whitespace();
         let Some(sample) = fields.next() else {
@@ -980,6 +989,10 @@ pub fn parse_build_metrics(text: &str) -> BTreeMap<String, BuildHostMetrics> {
                     .queue_depth
                     .saturating_add(value_u64(value).unwrap_or(0))
             }
+            "ix_build_slots_busy" => {
+                row.running_leases_available = true;
+                busy_leases.insert(host, value_u64(value).unwrap_or(0));
+            }
             "ix_build_lane_running" => {
                 row.running_leases_available = true;
                 let count = value_u64(value).unwrap_or(0);
@@ -997,6 +1010,11 @@ pub fn parse_build_metrics(text: &str) -> BTreeMap<String, BuildHostMetrics> {
     for (host, values) in cpus {
         if let Some(row) = result.get_mut(&host) {
             row.cores = u32::try_from(values.len()).ok().map(f64::from);
+        }
+    }
+    for (host, count) in busy_leases {
+        if let Some(row) = result.get_mut(&host) {
+            row.running_leases = count;
         }
     }
     result
@@ -1096,14 +1114,14 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    #[trace("FR-048-AC-3")]
+    #[trace("FR-048-AC-3", "FR-050-AC-4")]
     fn macos_process_output_retains_build_commands_and_pane_environment() {
         let environments = BTreeMap::from([
             (123, b"HERDR_PANE_ID=tab-123\0".to_vec()),
             (124, b"OTHER=value\0".to_vec()),
         ]);
         let table = parse_macos_process_output(
-            b"p123\nn/worktrees/active/target/debug\np124\nn/worktrees/old/target/debug\n",
+            b"p123\nfcwd\nn/Users/peter/dev/worktrees/active\nftxt\nn/usr/bin/cargo\np124\nfcwd\nn/Users/peter/other\nf0\nn/dev/null\n",
             b"123 cargo\n124 cargo\n",
             &environments,
             true,
@@ -1111,6 +1129,10 @@ mod tests {
         assert!(table.complete);
         assert_eq!(table.processes.len(), 2);
         assert_eq!(table.processes[0].cmdline, b"cargo");
+        assert_eq!(
+            table.processes[0].cwd.as_deref(),
+            Some(Path::new("/Users/peter/dev/worktrees/active"))
+        );
         assert_eq!(table.processes[0].environ, b"HERDR_PANE_ID=tab-123\0");
         assert_eq!(table.processes[1].cmdline, b"cargo");
         assert!(
@@ -1598,6 +1620,7 @@ mod tests {
             "node_filesystem_avail_bytes{host=\"luna\",mountpoint=\"/\",fstype=\"ext4\"} 700\n",
             "ix_build_queue_depth{host=\"luna\",priority=\"must-fix\"} 2\n",
             "ix_build_queue_depth{host=\"luna\",priority=\"periodic\"} 3\n",
+            "ix_build_slots_busy{host=\"luna\"} 1\n",
             "ix_build_lane_running{host=\"luna\",lane=\"luna:team:coder\"} 1\n",
             "ix_build_lane_running{host=\"luna\",lane=\"luna:team:idle\"} 0\n",
             "node_load1{host=\"LUNA\"} 7.6 1700000000\n",
@@ -1653,6 +1676,39 @@ mod tests {
             Eligibility::Eligible
         );
         assert_eq!(eligibility_at(&metrics, policy, 1121), Eligibility::Unknown);
+    }
+
+    #[test]
+    #[trace("FR-048-AC-7", "FR-048-AC-8", "FR-050-AC-3")]
+    fn empty_locked_build_lease_gauge_is_known_zero() {
+        let rows = parse_build_metrics(concat!(
+            "node_load1{host=\"luna\"} 1\n",
+            "node_cpu_seconds_total{host=\"luna\",cpu=\"0\",mode=\"idle\"} 1\n",
+            "node_memory_MemTotal_bytes{host=\"luna\"} 1000\n",
+            "node_memory_MemAvailable_bytes{host=\"luna\"} 800\n",
+            "node_memory_SwapTotal_bytes{host=\"luna\"} 0\n",
+            "node_memory_SwapFree_bytes{host=\"luna\"} 0\n",
+            "ix_build_queue_depth{host=\"luna\",class=\"must-fix\"} 0\n",
+            "ix_build_queue_depth{host=\"luna\",class=\"point\"} 0\n",
+            "ix_build_queue_depth{host=\"luna\",class=\"block\"} 0\n",
+            "ix_build_queue_depth{host=\"luna\",class=\"periodic\"} 0\n",
+            "ix_build_slots_busy{host=\"luna\"} 0\n",
+        ));
+        let metrics = &rows["luna"];
+        assert!(metrics.queue_depth_available);
+        assert_eq!(metrics.queue_depth, 0);
+        assert!(metrics.running_leases_available);
+        assert_eq!(metrics.running_leases, 0);
+        assert_eq!(
+            eligibility(
+                metrics,
+                BuildPolicy {
+                    max_load1: 8.0,
+                    heavy_gate_slots: 1,
+                },
+            ),
+            Eligibility::Eligible
+        );
     }
 
     #[test]
