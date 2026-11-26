@@ -37,6 +37,10 @@ use locked-build lease evidence instead of identifying a shell wrapper by its na
   is eligible only if it is older than configured idle age, belongs to a worktree, is not in use by
   any process, and is not under a source, `.git`, `dev_bak`, or `dev_archive` path. Apply removes
   only eligible target directories. The decision logic accepts an injected process table.
+- **Mount safety.** Hygiene reads the host mount table before scanning or cleaning. Worktrees and
+  targets on a different filesystem from the configured worktree root are excluded, and a target
+  containing a nested mount point is reported as ineligible and is never counted or removed across
+  that boundary. An unreadable mount table makes the affected result unknown and prevents cleanup.
 - **Build status.** The all-host table reports one-minute load per core, memory and swap use,
   `ix_build_queue_depth`, active `ix_build_lane_running` leases and an eligibility verdict from
   explicit per-host policy. A host with missing or stale evidence is ineligible. A heavy gate is
@@ -60,6 +64,7 @@ use locked-build lease evidence instead of identifying a shell wrapper by its na
 | FR-048-AC-7 | Build status parses Prometheus text exposition and reports per-host load per core, memory, swap, queue depth and running leases in one deterministic table. | Test |
 | FR-048-AC-8 | Eligibility uses the host policy and missing or stale telemetry is ineligible; luna is eligible for one heavy gate only when no heavy gate is running and system load is below 8. | Test |
 | FR-048-AC-9 | Agent activity recognizes locked-build ownership from lease evidence and does not infer it from `locked-build.sh` command text. | Test |
+| FR-048-AC-10 | An injected mount table proves hygiene ignores worktrees on an unexpected filesystem and refuses to scan or clean a target containing a nested mount point; unreadable mount evidence prevents cleanup. | Test |
 
 ## Traceability
 
