@@ -161,11 +161,11 @@ impl HygieneReport {
 pub fn system_process_table() -> io::Result<ProcessTable> {
     #[cfg(target_os = "linux")]
     {
-        return linux_process_table(Path::new("/proc"));
+        linux_process_table(Path::new("/proc"))
     }
     #[cfg(target_os = "macos")]
     {
-        return macos_process_table();
+        macos_process_table()
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -275,10 +275,10 @@ fn macos_process_table() -> io::Result<ProcessTable> {
                 pid,
                 ..Default::default()
             });
-        } else if let Some(path) = line.strip_prefix('n').map(PathBuf::from) {
-            if let Some(process) = current.as_mut() {
-                process.fds.push(path);
-            }
+        } else if let Some(path) = line.strip_prefix('n').map(PathBuf::from)
+            && let Some(process) = current.as_mut()
+        {
+            process.fds.push(path);
         }
     }
     if let Some(process) = current {
