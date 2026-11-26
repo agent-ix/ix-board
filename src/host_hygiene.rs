@@ -447,6 +447,7 @@ fn macos_process_table() -> io::Result<ProcessTable> {
 }
 
 #[cfg(target_os = "macos")]
+#[implements("FR-048-AC-3")]
 fn is_build_command(command: &[u8]) -> bool {
     command
         .split(|byte| byte.is_ascii_whitespace())
