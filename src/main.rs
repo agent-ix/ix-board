@@ -4820,8 +4820,9 @@ mod tests {
     /// Trace: FR-021-AC-3, FR-023-AC-1
     #[test]
     fn program_review_commands_accept_the_scope_file_option() {
-        let scope = Cli::try_parse_from(["ix-board", "scope", "check", "--scope", "sample-team.toml"])
-            .expect("parse scope check");
+        let scope =
+            Cli::try_parse_from(["ix-board", "scope", "check", "--scope", "sample-team.toml"])
+                .expect("parse scope check");
         assert!(
             matches!(scope.command, Command::Scope { command: ProgramScopeCommand::Check { scope } } if scope.to_str() == Some("sample-team.toml"))
         );
@@ -4856,8 +4857,8 @@ mod tests {
             Cli::try_parse_from(["ix-board", "reconcile", "SWM", "--stale-days", "0"]).is_err()
         );
 
-        let chain =
-            Cli::try_parse_from(["ix-board", "chain", "TEST-42"]).expect("parse single issue chain");
+        let chain = Cli::try_parse_from(["ix-board", "chain", "TEST-42"])
+            .expect("parse single issue chain");
         assert!(
             matches!(chain.command, Command::Chain { issue: Some(issue), scope: None } if issue == "TEST-42")
         );

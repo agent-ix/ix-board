@@ -221,9 +221,9 @@ pub(super) fn session_turn_has_transcript_id(path: &std::path::Path) -> Result<b
                 path.display()
             )
         })?;
-    if !(3..=8).contains(&version) {
+    if !(3..=9).contains(&version) {
         return Err(format!(
-            "{}: unsupported ledger schema version {version}; retro evaluator supports 3 through 8",
+            "{}: unsupported ledger schema version {version}; retro evaluator supports 3 through 9",
             path.display()
         ));
     }
@@ -283,9 +283,9 @@ fn read_rows(
                 path.display()
             )
         })?;
-    if !(3..=8).contains(&version) {
+    if !(3..=9).contains(&version) {
         return Err(format!(
-            "{}: unsupported ledger schema version {version}; retro evaluator supports 3 through 8",
+            "{}: unsupported ledger schema version {version}; retro evaluator supports 3 through 9",
             path.display()
         ));
     }
@@ -973,7 +973,7 @@ mod tests {
             },
         )
         .expect_err("future schema must fail closed");
-        assert!(error.contains("supports 3 through 8"));
+        assert!(error.contains("supports 3 through 9"));
     }
 
     #[test]
