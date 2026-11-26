@@ -280,11 +280,13 @@ impl<T: Transport> Guard<T> {
                     .filter(|r| r.data.rate.remaining < 25);
                 let limited = response.status == 429
                     || response.status == 403
+                    || response.headers.contains_key("retry-after")
                     || response
                         .headers
                         .get("x-ratelimit-remaining")
                         .is_some_and(|v| v == "0")
-                    || graph_limit.is_some();
+                    || graph_limit.is_some()
+                    || response_body_reports_rate_limit(&response.body);
                 if limited {
                     let graph_reset = graph_limit.and_then(|r| chrono::DateTime::parse_from_rfc3339(&r.data.rate.reset_at).ok()).map(|d| d.timestamp_millis()).unwrap_or(0);
                     let until = backoff(&response, received).max(graph_reset);
@@ -323,6 +325,40 @@ impl<T: Transport> Guard<T> {
         tx.commit().map_err(|e| e.to_string())?;
         result
     }
+}
+fn response_body_reports_rate_limit(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let mut messages = value
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .into_iter()
+        .chain(
+            value
+                .get("errors")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|error| error.get("message").and_then(serde_json::Value::as_str)),
+        );
+    messages.any(|message| message.to_ascii_lowercase().contains("rate limit"))
+        || value
+            .get("errors")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|errors| {
+                errors.iter().any(|error| {
+                    [
+                        error.get("type").and_then(serde_json::Value::as_str),
+                        error
+                            .pointer("/extensions/code")
+                            .and_then(serde_json::Value::as_str),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .any(|code| matches!(code, "RATE_LIMITED" | "RATE_LIMIT_EXCEEDED"))
+                })
+            })
 }
 fn backoff(response: &Response, now: i64) -> i64 {
     let reset = response
@@ -454,7 +490,7 @@ pub(super) struct SelectedGithub<T = Http> {
     complete: bool,
     now: i64,
     oldest_at: Cell<i64>,
-    start: Instant,
+    start: Cell<Option<Instant>>,
     lists: RefCell<BTreeMap<String, PrRows>>,
     infos: RefCell<BTreeMap<String, InfoRows>>,
 }
@@ -491,7 +527,7 @@ impl<T: Transport> SelectedGithub<T> {
             complete,
             now,
             oldest_at: Cell::new(0),
-            start: Instant::now(),
+            start: Cell::new(None),
             lists: RefCell::new(BTreeMap::new()),
             infos: RefCell::new(BTreeMap::new()),
         }
@@ -527,7 +563,12 @@ impl<T: Transport> SelectedGithub<T> {
         request: &Request,
         validate: impl Fn(&str, i64) -> Result<(), String>,
     ) -> Result<Cached, String> {
-        if self.start.elapsed() >= Duration::from_secs(45) {
+        let start = self.start.get().unwrap_or_else(|| {
+            let started = Instant::now();
+            self.start.set(Some(started));
+            started
+        });
+        if start.elapsed() >= Duration::from_secs(45) {
             return Err("GitHub collection time budget exhausted".into());
         }
         if self.allowed.len() > 10_000 {
@@ -552,6 +593,12 @@ impl<T: Transport> SelectedGithub<T> {
         let mut open_more = true;
         let mut closed_more = true;
         let mut rows = Vec::new();
+        let mut open_numbers = BTreeSet::new();
+        let mut closed_numbers = BTreeSet::new();
+        let mut open_cursors = BTreeSet::new();
+        let mut closed_cursors = BTreeSet::new();
+        let mut open_last_updated = f64::INFINITY;
+        let mut closed_last_updated = f64::INFINITY;
         for _ in 0..MAX_PAGES {
             if !open_more && !closed_more {
                 return Ok(rows);
@@ -596,12 +643,26 @@ impl<T: Transport> SelectedGithub<T> {
             })?;
             if open_more {
                 let page = population_page(&body.body, "open", repo, None)?;
+                validate_population_cursor(
+                    &page,
+                    open_after.as_deref(),
+                    &mut open_cursors,
+                    &mut open_numbers,
+                    &mut open_last_updated,
+                )?;
                 rows.extend(page.items);
                 open_after = page.cursor;
                 open_more = page.has_next;
             }
             if closed_more {
                 let page = population_page(&body.body, "recent", repo, Some(since))?;
+                validate_population_cursor(
+                    &page,
+                    closed_after.as_deref(),
+                    &mut closed_cursors,
+                    &mut closed_numbers,
+                    &mut closed_last_updated,
+                )?;
                 rows.extend(page.items);
                 closed_after = page.cursor;
                 closed_more = page.has_next;
@@ -621,6 +682,7 @@ impl<T: Transport> SelectedGithub<T> {
         if self.lists.borrow().len() >= MAX_REPOS {
             return Err("GitHub repository population exceeds collection bound".into());
         }
+        self.start.set(Some(Instant::now()));
         let result =
             self.list_recent_population(repo, self.now as f64 / 1000.0 - DAILY_PR_WINDOW_SECONDS);
         self.lists.borrow_mut().insert(repo.into(), result.clone());
@@ -634,6 +696,7 @@ impl<T: Transport> SelectedGithub<T> {
         if self.infos.borrow().len() >= MAX_REPOS {
             return Err("GitHub linked repository population exceeds collection bound".into());
         }
+        self.start.set(Some(Instant::now()));
         let result = (|| {
             let mut rows = BTreeMap::new();
             // A failed full population never certifies an empty listing. Linked detail
@@ -688,6 +751,35 @@ impl<T: Transport> SelectedGithub<T> {
         self.infos.borrow_mut().insert(repo.into(), result.clone());
         result
     }
+}
+
+fn validate_population_cursor(
+    page: &crate::retro::sources::Page<PullRequest>,
+    previous_cursor: Option<&str>,
+    cursors: &mut BTreeSet<String>,
+    numbers: &mut BTreeSet<u64>,
+    last_updated: &mut f64,
+) -> Result<(), String> {
+    if page.has_next {
+        let cursor = page
+            .cursor
+            .as_deref()
+            .filter(|cursor| Some(*cursor) != previous_cursor)
+            .ok_or_else(|| "GitHub population page omitted or stalled its cursor".to_owned())?;
+        if !cursors.insert(cursor.to_owned()) {
+            return Err("GitHub population page repeated a cursor".into());
+        }
+    }
+    for pr in &page.items {
+        if !numbers.insert(pr.number) {
+            return Err("GitHub population page repeated a pull request".into());
+        }
+        if pr.updated_at > *last_updated {
+            return Err("GitHub population pages are not newest-first".into());
+        }
+        *last_updated = pr.updated_at;
+    }
+    Ok(())
 }
 fn validate_page(
     body: &str,
@@ -1238,7 +1330,7 @@ mod tests {
     #[trace("FR-033-AC-12", "FR-033-AC-13")]
     #[test]
     fn server_cooldowns_and_errors_remain_unavailable_after_restart() {
-        for status in [403, 429, 200] {
+        for status in [403, 429, 500, 200] {
             let dir = tempfile::tempdir().unwrap();
             let cfg = config(dir.path());
             let fake = Fake::new(move |_, _| {
@@ -1281,7 +1373,8 @@ mod tests {
     fn malformed_partial_null_and_cost_excess_never_certify_evidence() {
         for (body, expected_sends) in [
             ("{}", 2),
-            ("{\"errors\":[{\"type\":\"RATE_LIMITED\"}]}", 2),
+            ("{\"errors\":[{\"type\":\"RATE_LIMITED\"}]}", 1),
+            ("{\"message\":\"API rate limit exceeded\"}", 1),
             (
                 "{\"data\":{\"repository\":null,\"rateLimit\":{\"cost\":26,\"remaining\":1,\"resetAt\":\"2030-01-01T00:00:00Z\"}}}",
                 1,
@@ -1486,7 +1579,6 @@ mod tests {
     fn graph_body_validator(body: &str, _at: i64) -> Result<(), String> {
         graph_body(body).map(|_| ())
     }
-
     #[trace("FR-033-AC-13")]
     #[test]
     fn graph_body_preserves_node_connections_and_rejects_graph_errors() {
@@ -1507,6 +1599,91 @@ mod tests {
         assert_eq!(
             graph_body(errors).unwrap_err(),
             "GitHub GraphQL returned errors"
+        );
+    }
+
+    #[trace("FR-033-AC-13", "FR-033-AC-18")]
+    #[test]
+    fn population_cursor_rejects_missing_stalled_duplicate_and_out_of_order_pages() {
+        let row = |number, updated_at| PullRequest {
+            closed_at: None,
+            reopen_events: None,
+            repo: "owner/repo".into(),
+            number,
+            open: true,
+            draft: false,
+            created_at: 0.0,
+            merged_at: None,
+            updated_at,
+            additions: 0,
+            deletions: 0,
+            review_decision: None,
+            force_pushes: None,
+        };
+        let mut cursors = BTreeSet::new();
+        let mut numbers = BTreeSet::new();
+        let mut last_updated = f64::INFINITY;
+        let missing = crate::retro::sources::Page {
+            items: vec![row(1, 10.0)],
+            has_next: true,
+            cursor: None,
+        };
+        assert!(
+            validate_population_cursor(
+                &missing,
+                None,
+                &mut cursors,
+                &mut numbers,
+                &mut last_updated
+            )
+            .is_err()
+        );
+        let first = crate::retro::sources::Page {
+            items: vec![row(1, 10.0)],
+            has_next: true,
+            cursor: Some("cursor-a".into()),
+        };
+        validate_population_cursor(&first, None, &mut cursors, &mut numbers, &mut last_updated)
+            .unwrap();
+        assert!(
+            validate_population_cursor(
+                &first,
+                Some("cursor-a"),
+                &mut cursors,
+                &mut numbers,
+                &mut last_updated
+            )
+            .is_err()
+        );
+        let duplicate = crate::retro::sources::Page {
+            items: vec![row(1, 9.0)],
+            has_next: false,
+            cursor: None,
+        };
+        assert!(
+            validate_population_cursor(
+                &duplicate,
+                Some("cursor-a"),
+                &mut cursors,
+                &mut numbers,
+                &mut last_updated
+            )
+            .is_err()
+        );
+        let out_of_order = crate::retro::sources::Page {
+            items: vec![row(2, 11.0)],
+            has_next: false,
+            cursor: None,
+        };
+        assert!(
+            validate_population_cursor(
+                &out_of_order,
+                Some("cursor-a"),
+                &mut cursors,
+                &mut numbers,
+                &mut last_updated
+            )
+            .is_err()
         );
     }
 
@@ -1561,9 +1738,11 @@ mod tests {
             .timestamp_millis();
         let allowed = [("agent-ix/one".into(), 1), ("agent-ix/one".into(), 2)].into();
         let source = source(open(&cfg, fake.clone()), allowed, true, at);
+        assert!(source.start.get().is_none());
         let rows = source
             .pull_requests("agent-ix/one", at as f64 / 1000.0 - DAILY_PR_WINDOW_SECONDS)
             .unwrap();
+        assert!(source.start.get().is_some());
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].additions + rows[0].deletions, 10);
         assert!(rows[0].open);

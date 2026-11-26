@@ -171,7 +171,10 @@ fn state_label(status: AssignmentStatus) -> &'static str {
 fn add(totals: &mut BTreeMap<String, f64>, key: &str, value: f64) {
     *totals.entry(key.into()).or_default() += value;
 }
-fn scope_matches(selected: &Selectors, reported: &relay_work_wire::ReportedScope) -> bool {
+pub(super) fn scope_matches(
+    selected: &Selectors,
+    reported: &relay_work_wire::ReportedScope,
+) -> bool {
     if selected.team.is_some()
         && selected.initiatives.is_empty()
         && selected.projects.is_empty()

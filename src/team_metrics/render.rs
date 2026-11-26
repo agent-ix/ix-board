@@ -557,21 +557,51 @@ pub fn render(
                     .unwrap_or("Linear review records are unavailable"),
             ),
         ] {
+            let is_review_metric_set = std::ptr::eq(names, super::reviews::NAMES);
+            if is_review_metric_set
+                && tracker_fresh
+                && values.is_some()
+                && let Some(review_values) = values
+            {
+                let coverage_ratio = review_values
+                    .get("review_marker_backfill_coverage")
+                    .copied()
+                    .unwrap_or(0.0);
+                coverage(&mut out, &labels, "review_marker_backfill", coverage_ratio)?;
+            }
             for name in names {
                 let value = values.filter(|_| tracker_fresh).and_then(|v| v.get(*name));
-                if *name == "pr_changes_requested_share" {
+                if is_review_metric_set
+                    && tracker_fresh
+                    && values.is_some()
+                    && *name == "pr_changes_requested_share"
+                {
                     let ratio = values
                         .and_then(|v| v.get("pr_changes_requested_coverage"))
                         .copied()
                         .unwrap_or(0.0)
                         .min(s.github_repo_coverage);
                     coverage(&mut out, &labels, name, ratio)?;
-                } else if *name == "new_pr_first_review_median_seconds_24h" {
+                } else if is_review_metric_set
+                    && tracker_fresh
+                    && values.is_some()
+                    && *name == "new_pr_first_review_median_seconds_24h"
+                {
                     let ratio = values
                         .and_then(|v| v.get("new_pr_first_review_coverage_24h"))
                         .copied()
                         .unwrap_or(0.0)
                         .min(s.github_repo_coverage);
+                    coverage(&mut out, &labels, name, ratio)?;
+                } else if is_review_metric_set
+                    && tracker_fresh
+                    && values.is_some()
+                    && name.starts_with("review_findings_")
+                {
+                    let ratio = values
+                        .and_then(|v| v.get("review_marker_backfill_coverage"))
+                        .copied()
+                        .unwrap_or(0.0);
                     coverage(&mut out, &labels, name, ratio)?;
                 }
                 let value = value.filter(|_| {

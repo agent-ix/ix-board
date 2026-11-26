@@ -54,6 +54,9 @@ pub struct Config {
     /// The configured `fleet tick` interval; a tick older than twice this is not served.
     #[serde(default = "tick_interval")]
     pub fleet_tick_interval_seconds: u64,
+    /// Prometheus base URL; if omitted, `IX_PROMETHEUS_URL` must be set.
+    #[serde(default)]
+    pub prometheus_url: Option<String>,
     /// At most four explicitly monitored scopes within the initial 1,000-series budget.
     pub scopes: Vec<ScopeConfig>,
 }
@@ -138,6 +141,13 @@ impl Config {
             return Err(Error::Invalid(
                 "invalid retention, storage budget or polling interval",
             ));
+        }
+        if self.prometheus_url.as_ref().is_some_and(|url| {
+            url.len() > 2048
+                || !(url.starts_with("http://") || url.starts_with("https://"))
+                || url.chars().any(char::is_whitespace)
+        }) {
+            return Err(Error::Invalid("invalid Prometheus base URL"));
         }
         let mut keys = BTreeSet::new();
         for scope in &self.scopes {
