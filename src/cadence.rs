@@ -65,7 +65,7 @@ pub struct Job {
     pub kind: JobKind,
     /// Arguments passed to this ix-board executable, without shell expansion.
     pub command: Vec<String>,
-    /// Optional `retro delta --notify` command run only after this command succeeds.
+    /// Optional configured `retro delta --notify` command run only after success.
     #[serde(default)]
     pub after_success: Option<Vec<String>>,
     /// Role responsible for this job.
@@ -87,7 +87,7 @@ pub enum JobKind {
 }
 
 /// Cadence manifest containing program/team job entries.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     /// Single relay address notified when `cadence due --alert` finds the checker needs attention.
@@ -239,8 +239,77 @@ pub fn load_manifest(path: &Path) -> Result<Manifest, CadenceError> {
     Ok(manifest)
 }
 
+/// Creates the default team retro job once, without replacing an existing manifest.
+#[implements("FR-049-AC-4")]
+pub fn generate_default_manifest(
+    path: &Path,
+    program: &str,
+    team: &str,
+) -> Result<Manifest, CadenceError> {
+    let manifest = Manifest {
+        alert_recipient: None,
+        jobs: vec![Job {
+            program: program.to_owned(),
+            team: team.to_owned(),
+            id: format!("retro-{}", team.to_ascii_lowercase()),
+            interval_secs: 30 * 60,
+            kind: JobKind::RetroSnapshot,
+            command: vec![
+                "retro".into(),
+                "snapshot".into(),
+                "--team".into(),
+                team.to_owned(),
+            ],
+            after_success: Some(vec![
+                "retro".into(),
+                "delta".into(),
+                "--team".into(),
+                team.to_owned(),
+                "--notify".into(),
+            ]),
+            owner_role: "minder".into(),
+        }],
+    };
+    validate_manifest(&manifest)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    if let Some(parent) = parent {
+        std::fs::create_dir_all(parent).map_err(|source| CadenceError::Read {
+            path: parent.to_owned(),
+            source,
+        })?;
+    }
+    let bytes = serde_json::to_vec_pretty(&manifest)
+        .map_err(|error| CadenceError::Manifest(error.to_string()))?;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => {
+            use std::io::Write;
+            file.write_all(&bytes)
+                .map_err(|source| CadenceError::Read {
+                    path: path.to_owned(),
+                    source,
+                })?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(source) => {
+            return Err(CadenceError::Read {
+                path: path.to_owned(),
+                source,
+            });
+        }
+    }
+    load_manifest(path)
+}
+
 /// Validates cadence job identity, interval and supported argv shape.
-#[implements("FR-049-AC-4", "FR-049-AC-8")]
+#[implements("FR-049-AC-4")]
+#[implements("FR-049-AC-7")]
+#[implements("FR-049-AC-9")]
 pub fn validate_manifest(manifest: &Manifest) -> Result<(), CadenceError> {
     if manifest
         .alert_recipient
@@ -282,17 +351,20 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), CadenceError> {
             )));
         }
         let valid_delta = job.after_success.as_deref().is_some_and(|command| {
-            command.len() >= 2
-                && command[0] == "retro"
-                && command[1] == "delta"
-                && command
-                    .windows(2)
-                    .any(|pair| pair[0] == "--config" && !pair[1].is_empty())
-                && command.iter().any(|arg| arg == "--notify")
+            matches!(
+                command,
+                [root, sub, scope, value, notify]
+                    if root == "retro"
+                        && sub == "delta"
+                        && (scope == "--config" || scope == "--team")
+                        && !value.is_empty()
+                        && !value.starts_with("--")
+                        && notify == "--notify"
+            )
         });
         if job.after_success.is_some() && (job.kind != JobKind::RetroSnapshot || !valid_delta) {
             return Err(CadenceError::Manifest(format!(
-                "job {} after_success must be a retro delta command",
+                "job {} after_success must be a retro delta --notify command with --config or --team",
                 job.id
             )));
         }
@@ -300,7 +372,7 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), CadenceError> {
     Ok(())
 }
 
-#[implements("FR-049-AC-8")]
+#[implements("FR-049-AC-9")]
 fn command_matches_kind(kind: JobKind, command: &[String]) -> bool {
     match (kind, command) {
         (JobKind::RetroSnapshot, [root, sub, ..]) => root == "retro" && sub == "snapshot",
@@ -371,18 +443,14 @@ fn classify_due(interval_secs: u64, last_run: Option<&CadenceRun>, now_ms: i64) 
 /// Runs one uniquely identified job and records its process outcome.
 #[implements("FR-049-AC-3")]
 #[implements("FR-049-AC-7")]
+#[implements("FR-049-AC-9")]
 pub fn run_job(
     manifest: &Manifest,
     open_ledger: impl FnMut() -> Result<Ledger, CadenceError>,
     job_id: &str,
     now_ms: i64,
 ) -> Result<JobRunReport, CadenceError> {
-    run_job_with_executor(manifest, open_ledger, job_id, now_ms, |job| {
-        execute(job).map(|status| RunOutcome {
-            succeeded: status.success(),
-            exit_status: status.code(),
-        })
-    })
+    run_job_with_manifest_path(manifest, None, open_ledger, job_id, now_ms)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -391,8 +459,37 @@ struct RunOutcome {
     exit_status: Option<i32>,
 }
 
-#[implements("FR-049-AC-8")]
+#[implements("FR-049-AC-9")]
+#[cfg(test)]
 fn run_job_with_executor(
+    manifest: &Manifest,
+    mut open_ledger: impl FnMut() -> Result<Ledger, CadenceError>,
+    job_id: &str,
+    now_ms: i64,
+    execute_job: impl FnOnce(&Job) -> Result<RunOutcome, std::io::Error>,
+) -> Result<JobRunReport, CadenceError> {
+    run_job_with_manifest_path_and_executor(manifest, &mut open_ledger, job_id, now_ms, execute_job)
+}
+
+/// Runs one job while binding its follow-up delta to the manifest that selected the job.
+#[implements("FR-049-AC-7", "FR-049-AC-9")]
+pub fn run_job_with_manifest_path(
+    manifest: &Manifest,
+    manifest_path: Option<&Path>,
+    open_ledger: impl FnMut() -> Result<Ledger, CadenceError>,
+    job_id: &str,
+    now_ms: i64,
+) -> Result<JobRunReport, CadenceError> {
+    run_job_with_manifest_path_and_executor(manifest, open_ledger, job_id, now_ms, |job| {
+        execute(job, manifest_path).map(|status| RunOutcome {
+            succeeded: status.success(),
+            exit_status: status.code(),
+        })
+    })
+}
+
+#[implements("FR-049-AC-7", "FR-049-AC-9")]
+fn run_job_with_manifest_path_and_executor(
     manifest: &Manifest,
     mut open_ledger: impl FnMut() -> Result<Ledger, CadenceError>,
     job_id: &str,
@@ -448,13 +545,24 @@ fn run_job_with_executor(
     }
 }
 
-fn execute(job: &Job) -> Result<std::process::ExitStatus, std::io::Error> {
+#[implements("FR-049-AC-7")]
+fn execute(
+    job: &Job,
+    manifest_path: Option<&Path>,
+) -> Result<std::process::ExitStatus, std::io::Error> {
     let executable = std::env::current_exe()?;
     let status = Command::new(&executable).args(&job.command).status()?;
     if status.success()
         && let Some(after_success) = &job.after_success
     {
-        return Command::new(executable).args(after_success).status();
+        let mut command = Command::new(executable);
+        command.args(after_success);
+        if after_success.iter().any(|arg| arg == "--notify")
+            && let Some(manifest_path) = manifest_path
+        {
+            command.arg("--manifest").arg(manifest_path);
+        }
+        return command.status();
     }
     Ok(status)
 }
@@ -702,7 +810,7 @@ mod tests {
     }
 
     #[test]
-    #[trace("FR-049-AC-8", "FR-050-AC-5")]
+    #[trace("FR-049-AC-9", "FR-050-AC-5")]
     fn host_check_cadence_job_records_its_injected_child_outcome() {
         let directory = tempfile::tempdir().unwrap();
         let ledger_path = directory.path().join("ledger.sqlite3");
@@ -743,5 +851,39 @@ mod tests {
             .unwrap();
         assert_eq!(last.outcome, "failed");
         assert_eq!(last.detail.as_deref(), Some("1"));
+    }
+
+    #[test]
+    #[trace("FR-049-AC-4", "FR-049-AC-7")]
+    fn manifest_rejects_malformed_delta_argv_before_snapshot_execution() {
+        let malformed = [
+            vec!["retro", "delta", "--team", "--notify"],
+            vec![
+                "retro",
+                "delta",
+                "--team",
+                "qsl",
+                "--config",
+                "retro.json",
+                "--notify",
+            ],
+            vec![
+                "retro",
+                "delta",
+                "--team",
+                "qsl",
+                "--manifest",
+                "other.json",
+                "--notify",
+            ],
+        ];
+        for command in malformed {
+            let mut manifest = Manifest {
+                alert_recipient: None,
+                jobs: vec![job("retro")],
+            };
+            manifest.jobs[0].after_success = Some(command.into_iter().map(str::to_owned).collect());
+            assert!(validate_manifest(&manifest).is_err());
+        }
     }
 }

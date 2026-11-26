@@ -26,7 +26,6 @@
     "repo": "agent-ix/filament-spec-language",
     "branch": "main"
   },
-  "gate_log": "/Users/peter/.local/state/team-retro/QSL/gate.jsonl",
-  "review_round_limit": 2,
-  "minder_address": "terra:QSL:minder"
+  "gate_log": null,
+  "review_round_limit": 2
 }

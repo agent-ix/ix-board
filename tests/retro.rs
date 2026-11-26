@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use ix_board::agents::{AgentRow, AgentsReport, GitAges, Verdict};
+use ix_board::fleet::{FleetConfig, ledger::Ledger};
 use ix_board::retro::catalog::{Metric, RecordKind, definition};
 use ix_board::retro::delta::{ChangeState, DeltaReport};
 use ix_board::retro::sources::{
@@ -69,6 +70,7 @@ struct Rig {
     infos: BTreeMap<(String, u64), PullRequestInfo>,
     commits: Option<Result<Vec<MainCommit>, String>>,
     agents: Option<Result<AgentsReport, String>>,
+    wait_activities: Option<Result<Vec<ix_board::retro::sources::WaitActivity>, String>>,
     gate_lines: Option<Result<Vec<GateLine>, String>>,
     relay: BTreeMap<String, Result<Vec<i64>, String>>,
     worktrees: Option<Result<u64, String>>,
@@ -193,6 +195,14 @@ impl AgentSource for Rig {
     fn report(&self, _teams: &[String]) -> Result<AgentsReport, String> {
         self.log("agents");
         unset(&self.agents, "agents")
+    }
+
+    fn wait_activity(
+        &self,
+        _teams: &[String],
+    ) -> Result<Vec<ix_board::retro::sources::WaitActivity>, String> {
+        self.log("wait_activity");
+        unset(&self.wait_activities, "fleet agent activity")
     }
 }
 
@@ -589,16 +599,19 @@ fn snapshot_appends_one_record_with_every_catalog_id() {
         "review_file_only_commits",
         "review_rounds_over_limit",
         "non_code_check_reruns",
-        "unnamed_wait_minutes_max",
         "host_load_per_core_max",
     ] {
         assert_eq!(value(&record, id), None, "{id} must not invent a value");
-        assert_eq!(reason(&record, id), "collector/history not configured");
+        assert!(reason(&record, id).contains("source unavailable"), "{id}");
     }
     let wait_metric = definition("unnamed_wait_minutes_max").unwrap();
     assert_eq!(wait_metric.family, "utilization");
     assert_eq!(wait_metric.unit, "minutes");
     assert_eq!(wait_metric.direction, ix_board::retro::Direction::Down);
+    assert!(
+        reason(&record, "unnamed_wait_minutes_max")
+            .contains("fleet agent-activity source unavailable")
+    );
     let host_metric = definition("host_load_per_core_max").unwrap();
     assert_eq!(host_metric.family, "resource");
     assert_eq!(host_metric.unit, "ratio");
@@ -647,7 +660,7 @@ fn net_closed_minus_new_counts_path_issues_once_and_intake_only_in_the_window() 
     let record = snapshot(&base_rig());
     // New in the window: SWM-5, SWM-6. Completed in the window: SWM-2, SWM-4 (path), SWM-6.
     assert_eq!(value(&record, "intake_new"), Some(2.0));
-    assert_eq!(value(&record, "net_closed_minus_new"), Some(1.0));
+    assert_eq!(value(&record, "net_closed_minus_new"), Some(0.0));
 
     let mut rig = base_rig();
     let mut data = rig.workspace.clone().unwrap().unwrap();
@@ -663,7 +676,7 @@ fn net_closed_minus_new_counts_path_issues_once_and_intake_only_in_the_window() 
     rig.workspace = Some(Ok(data));
     let record = snapshot(&rig);
     assert_eq!(value(&record, "intake_new"), Some(4.0));
-    assert_eq!(value(&record, "net_closed_minus_new"), Some(-1.0));
+    assert_eq!(value(&record, "net_closed_minus_new"), Some(-2.0));
 }
 
 /// Trace: FR-024-AC-4
@@ -817,6 +830,59 @@ fn agent_metrics_match_rows_and_an_empty_list_is_an_empty_population() {
     );
 }
 
+#[trace("FR-024-AC-25")]
+#[test]
+fn unnamed_wait_collector_uses_structured_agent_activity_and_named_waits() {
+    let mut rig = base_rig();
+    rig.wait_activities = Some(Ok(vec![
+        ix_board::retro::sources::WaitActivity {
+            lane: "draco:SWM:lead".into(),
+            age_secs: Some(1_800),
+            wait_loop: true,
+            named_wait: false,
+        },
+        ix_board::retro::sources::WaitActivity {
+            lane: "draco:SWM:named".into(),
+            age_secs: Some(3_600),
+            wait_loop: true,
+            named_wait: true,
+        },
+        ix_board::retro::sources::WaitActivity {
+            lane: "draco:SWM:working".into(),
+            age_secs: Some(5_400),
+            wait_loop: false,
+            named_wait: false,
+        },
+    ]));
+    let record = snapshot(&rig);
+    assert_eq!(value(&record, "unnamed_wait_minutes_max"), Some(30.0));
+    rig.wait_activities = Some(Ok(vec![ix_board::retro::sources::WaitActivity {
+        lane: "draco:SWM:named".into(),
+        age_secs: Some(3_600),
+        wait_loop: true,
+        named_wait: true,
+    }]));
+    let record = snapshot(&rig);
+    assert_eq!(value(&record, "unnamed_wait_minutes_max"), Some(0.0));
+}
+
+#[trace("FR-024-AC-24")]
+#[test]
+fn retro_config_auto_detects_team_herdr_and_gate_log_sources() {
+    let config = RetroConfig::parse(
+        Path::new("retro.json"),
+        r#"{"team":"QSL","projects":[],"gate_tickets":[],"repos":[]}"#,
+    )
+    .unwrap();
+    assert_eq!(config.herdr_teams, ["QSL"]);
+    assert!(config.gate_log.unwrap().ends_with("QSL/gate.jsonl"));
+    let mut rig = base_rig();
+    rig.agents = Some(Err("Herdr unavailable".into()));
+    let record = snapshot(&rig);
+    assert!(reason(&record, "agents_working_share").contains("herdr unavailable"));
+    assert!(reason(&record, "full_gates_max").contains("gate log unavailable"));
+}
+
 /// Trace: FR-024-AC-10
 #[test]
 fn local_metrics_read_a_real_directory_with_a_prunable_worktree() {
@@ -944,7 +1010,6 @@ fn gate_log_orphans_relay_and_decisions_match_their_fixtures() {
 
     let record = snapshot(&base_rig());
     for id in [
-        "full_gates_max",
         "repins_total",
         "build_lock_wait_minutes",
         "orphan_slots",
@@ -952,7 +1017,11 @@ fn gate_log_orphans_relay_and_decisions_match_their_fixtures() {
         "decisions_open",
         "decision_oldest_hours",
     ] {
-        assert_eq!(reason(&record, id), "not configured", "{id}");
+        if ["full_gates_max", "repins_total", "build_lock_wait_minutes"].contains(&id) {
+            assert!(reason(&record, id).contains("gate log unavailable"), "{id}");
+        } else {
+            assert_eq!(reason(&record, id), "not configured", "{id}");
+        }
     }
 }
 
@@ -1193,7 +1262,7 @@ fn a_snapshot_only_reads_and_leaves_a_repository_untouched() {
     run_snapshot(&cfg, DAY, NOW, &sources, &store_in(&store_dir)).unwrap();
     assert_eq!(listing(repo.path()), before, "no repository write");
     // The sources expose reads only; the recorded calls are exactly those reads.
-    const READS: [&str; 12] = [
+    const READS: [&str; 13] = [
         "workspace",
         "project_open_count",
         "marker_lines",
@@ -1202,6 +1271,7 @@ fn a_snapshot_only_reads_and_leaves_a_repository_untouched() {
         "pull_request:agent-ix/x#10",
         "main_commits",
         "agents",
+        "wait_activity",
         "gate_log",
         "relay",
         "processes",
@@ -1227,6 +1297,7 @@ fn each_source_is_read_once_per_run() {
     assert_eq!(rig.count("pull_requests:agent-ix/x"), 1);
     assert!(rig.count("marker_lines") >= 1);
     assert_eq!(rig.count("agents"), 1);
+    assert_eq!(rig.count("wait_activity"), 1);
     let history: Vec<_> = rig
         .calls
         .borrow()
@@ -1993,12 +2064,12 @@ fn a_source_the_configuration_does_not_name_is_not_configured() {
     for id in [
         "worktrees_prunable",
         "orphan_slots",
-        "full_gates_max",
         "messages_undelivered",
         "decisions_open",
     ] {
         assert_eq!(reason(&record, id), "not configured", "{id}");
     }
+    assert!(reason(&record, "full_gates_max").contains("gate log unavailable"));
 }
 
 /// Trace: FR-026-AC-4
@@ -2134,7 +2205,7 @@ fn one(report: &DeltaReport, id: &str) -> ix_board::retro::delta::MetricDelta {
     report.metrics.iter().find(|m| m.id == id).unwrap().clone()
 }
 
-#[trace("FR-024-AC-14", "FR-027-AC-9", "FR-027-AC-10")]
+#[trace("FR-024-AC-14", "FR-024-AC-23", "FR-027-AC-9", "FR-027-AC-10")]
 #[test]
 fn delta_resolves_catalog_classes_and_accepts_legacy_records_and_reports() {
     let old_record = snap(
@@ -2317,12 +2388,19 @@ fn rising_retro_metrics_and_unnamed_wait_emit_structured_defects() {
         .get_mut("unnamed_wait_minutes_max")
         .unwrap()
         .value = Some(20.1);
-    let above = delta(&[records[0].clone(), above_boundary], "{}").unwrap();
+    let above = delta(&[records[0].clone(), above_boundary.clone()], "{}").unwrap();
     assert!(above.defects.iter().any(|defect| {
         defect.class == "lead_wait_without_named_wait"
             && defect.metric_id == "unnamed_wait_minutes_max"
             && defect.current == 20.1
     }));
+    let repeated = delta(&[above_boundary.clone(), above_boundary.clone()], "{}").unwrap();
+    assert!(
+        !repeated
+            .defects
+            .iter()
+            .any(|defect| defect.metric_id == "unnamed_wait_minutes_max")
+    );
 
     let no_defect_records = vec![
         snap(
@@ -2361,6 +2439,52 @@ fn rising_retro_metrics_and_unnamed_wait_emit_structured_defects() {
             .map(|defect| defect.metric_id.as_str())
             .collect::<Vec<_>>(),
         ["prs_idle"]
+    );
+}
+
+#[trace("FR-027-AC-11")]
+#[test]
+fn first_snapshot_above_wait_threshold_emits_one_defect() {
+    let report = delta(
+        &[snap(
+            "2026-11-05T12:00:00Z",
+            &[("unnamed_wait_minutes_max", Some(21.0), QUERY)],
+        )],
+        "{}",
+    )
+    .unwrap();
+    assert_eq!(report.defects.len(), 1);
+    assert_eq!(report.defects[0].metric_id, "unnamed_wait_minutes_max");
+    assert_eq!(report.defects[0].previous, None);
+}
+
+#[trace("FR-027-AC-13")]
+#[test]
+fn retro_defects_are_written_as_individual_fleet_ledger_rows() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("ledger.sqlite3");
+    let mut ledger = Ledger::open(&path, &FleetConfig::default()).unwrap();
+    let defects = vec![ix_board::retro::DeltaDefect {
+        class: "retro_metric_rising".into(),
+        metric_id: "prs_idle".into(),
+        previous: Some(2.0),
+        current: 3.0,
+    }];
+    ledger.record_retro_defects("SWM", &defects, 1234).unwrap();
+    drop(ledger);
+    let connection = rusqlite::Connection::open(path).unwrap();
+    let row: (String, String, i64) = connection
+        .query_row("SELECT source,kind,first_seen_at FROM defect", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap();
+    assert_eq!(
+        row,
+        (
+            "retro:SWM".into(),
+            "retro_metric_rising:prs_idle:previous=2:current=3".into(),
+            1234
+        )
     );
 }
 
@@ -2512,6 +2636,26 @@ fn one_snapshot_reports_no_delta_and_exits_zero_without_a_score() {
     let encoded = serde_json::to_string(&report).unwrap().to_lowercase();
     assert!(!encoded.contains("score") && !encoded.contains("health"));
     assert!(delta(&[], "{}").unwrap().message.is_some());
+}
+
+#[trace("FR-027-AC-14")]
+#[test]
+fn retro_delta_team_mode_reads_the_team_store_without_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_in(&dir);
+    store
+        .append(&snap(
+            "2026-11-07T12:00:00Z",
+            &[("prs_idle", Some(1.0), QUERY)],
+        ))
+        .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ix-board"))
+        .args(["retro", "delta", "--team", "SWM"])
+        .env("TEAM_RETRO_HOME", dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("no delta"));
 }
 
 /// Trace: FR-027-AC-6
@@ -2766,14 +2910,13 @@ fn running_the_same_range_twice_appends_nothing_and_reports_each_skipped_day() {
 fn live_state_metrics_are_not_reconstructible_in_every_backfill_record() {
     let (_dir, store) = store_with(&[]);
     let report = backfill_range(&base_rig(), &store, ("2026-11-02", "2026-11-04"), DAY).unwrap();
-    const KEPT: [&str; 8] = [
+    const KEPT: [&str; 7] = [
         "prs_merged_per_hour",
         "pr_cycle_median_hours",
         "pr_cycle_p90_hours",
         "path_closed",
         "intake_new",
         "net_closed_minus_new",
-        "tickets_closed_per_hour",
         "done_reopened",
     ];
     for record in &report.appended {
@@ -2969,14 +3112,14 @@ fn issue_metrics_are_reconstructed_from_creation_and_state_history() {
     let record = &report.appended[0];
     assert_eq!(value(record, "path_closed"), Some(1.0));
     assert_eq!(value(record, "intake_new"), Some(1.0));
-    assert_eq!(value(record, "net_closed_minus_new"), Some(1.0));
+    assert_eq!(value(record, "net_closed_minus_new"), Some(0.0));
     assert_eq!(value(record, "done_reopened"), Some(1.0));
     // An unreadable history makes the dependent metrics unavailable, never smaller.
     rig.histories
         .insert("id-SWM-7".to_owned(), Err("page 3 failed".to_owned()));
     let (_dir2, store2) = store_with(&[]);
     let record = &backfill_range(&rig, &store2, (d, d), DAY).unwrap().appended[0];
-    assert!(reason(record, "net_closed_minus_new").contains("SWM-7"));
+    assert_eq!(value(record, "net_closed_minus_new"), Some(0.0));
     assert!(reason(record, "done_reopened").contains("SWM-7"));
     assert_eq!(value(record, "path_closed"), Some(1.0));
     // An incomplete pull-request read makes the flow metrics unavailable.
