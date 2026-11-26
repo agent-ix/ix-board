@@ -106,7 +106,7 @@ fn marker_channel_rotation(channel_count: usize, cursor: usize) -> Option<(usize
 }
 
 #[cfg(test)]
-#[ix_trace_rs::trace("FR-033-AC-17")]
+#[trace("FR-033-AC-17")]
 #[test]
 fn marker_channel_rotation_visits_every_channel_before_repeating() {
     let mut cursor = 0;
