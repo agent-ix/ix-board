@@ -804,12 +804,7 @@ fn build_row(
 }
 
 fn is_work_command(process: &PaneProcess) -> bool {
-    let runs_gate_wrapper = process
-        .args
-        .split_whitespace()
-        .take(2)
-        .any(|word| word.rsplit('/').next() == Some("locked-build.sh"));
-    WORK_COMMANDS.contains(&process.comm.as_str()) || runs_gate_wrapper
+    WORK_COMMANDS.contains(&process.comm.as_str())
 }
 
 fn last_chars(text: &str, count: usize) -> String {
@@ -930,6 +925,7 @@ pub fn render_text(report: &AgentsReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ix_trace_rs::trace;
 
     #[test]
     fn duration_accepts_units_and_refuses_the_rest() {
@@ -950,5 +946,14 @@ mod tests {
             "Is this ok? I checked it myself.\nPR opened."
         ));
         assert!(!asks_for_input("All gates are green and the PR is open."));
+    }
+
+    #[test]
+    #[trace("FR-048-AC-9")]
+    fn locked_build_wrapper_name_does_not_establish_running_work() {
+        let wrapper = PaneProcess { comm: "bash".into(), args: "locked-build.sh".into() };
+        let leased_command = PaneProcess { comm: "cargo".into(), args: "cargo test".into() };
+        assert!(!is_work_command(&wrapper));
+        assert!(is_work_command(&leased_command));
     }
 }

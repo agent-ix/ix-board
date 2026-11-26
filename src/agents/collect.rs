@@ -1108,15 +1108,11 @@ fn collect_processes(probe: &mut Probe, budget: &mut Budget) {
                 if list.len() < 128 {
                     list.push(PaneProcess {
                         comm: String::from_utf8_lossy(&comm).trim().into(),
-                        args: if String::from_utf8_lossy(&args)
+                        args: String::from_utf8_lossy(&args)
                             .split('\0')
-                            .take(2)
-                            .any(|word| word.rsplit('/').next() == Some("locked-build.sh"))
-                        {
-                            "locked-build.sh".into()
-                        } else {
-                            String::new()
-                        },
+                            .next()
+                            .unwrap_or_default()
+                            .to_owned(),
                     });
                 } else {
                     probe.process_availability.missing("pane_process_limit");

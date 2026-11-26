@@ -9,6 +9,7 @@ pub mod cache_status;
 pub mod chain;
 mod drift;
 pub mod fleet;
+pub mod host_hygiene;
 mod focus_activity;
 mod hygiene;
 mod linear;
