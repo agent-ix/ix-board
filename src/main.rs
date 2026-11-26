@@ -3353,6 +3353,7 @@ fn run_drift(
     Ok(Output::Drift(evaluate_drift_file(&config, &evidence)?))
 }
 
+#[implements("FR-048-AC-1", "FR-048-AC-4", "FR-048-AC-5")]
 fn run_hygiene(
     args: &HygieneArgs,
     apply: bool,
@@ -3369,8 +3370,15 @@ fn run_hygiene(
             free_bytes: None,
             free_floor_bytes: args.free_floor_gb.saturating_mul(1024 * 1024 * 1024),
             targets: Vec::new(),
+            prunable_worktrees: Vec::new(),
+            orphan_build_processes: Vec::new(),
             process_table_complete: false,
             unsupported: true,
+        });
+    }
+    if args.root.file_name().is_none_or(|name| name != "worktrees") {
+        return Err(Error::ProgramReview {
+            message: "hygiene root must be a worktrees directory".to_owned(),
         });
     }
     let floor = args
@@ -3387,6 +3395,30 @@ fn run_hygiene(
         })?;
     let free_bytes = free_disk_bytes(&args.root).ok();
     let processes = system_process_table().unwrap_or_default();
+    let prunable_worktrees = find_prunable_worktrees(&args.root);
+    let orphan_build_processes = processes
+        .processes
+        .iter()
+        .filter(|process| {
+            process
+                .cwd
+                .as_deref()
+                .is_some_and(|cwd| cwd.starts_with(&args.root))
+                && process.cmdline.split(|byte| *byte == 0).any(|word| {
+                    matches!(
+                        PathBuf::from(String::from_utf8_lossy(word).as_ref())
+                            .file_name()
+                            .and_then(|name| name.to_str()),
+                        Some("cargo" | "rustc")
+                    )
+                })
+                && !process
+                    .environ
+                    .windows(b"HERDR_PANE_ID=".len())
+                    .any(|window| window == b"HERDR_PANE_ID=")
+        })
+        .map(|process| process.pid)
+        .collect::<Vec<_>>();
     let now = SystemTime::now();
     let policy = HostPolicy {
         free_floor_bytes: floor,
@@ -3427,9 +3459,46 @@ fn run_hygiene(
         free_bytes,
         free_floor_bytes: floor,
         targets,
+        prunable_worktrees,
+        orphan_build_processes,
         process_table_complete: processes.complete,
         unsupported: false,
     })
+}
+
+#[implements("FR-048-AC-4")]
+fn find_prunable_worktrees(root: &std::path::Path) -> Vec<PathBuf> {
+    let mut found = std::collections::BTreeSet::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    for entry in entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+    {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(entry.path())
+            .args(["worktree", "list", "--porcelain"])
+            .output();
+        let Ok(output) = output else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let mut current = None;
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if let Some(path) = line.strip_prefix("worktree ") {
+                current = Some(PathBuf::from(path));
+            } else if line.starts_with("prunable")
+                && let Some(path) = current.as_ref().filter(|path| path.starts_with(root))
+            {
+                found.insert(path.clone());
+            }
+        }
+    }
+    found.into_iter().collect()
 }
 
 fn run_build_status(
@@ -3598,6 +3667,18 @@ fn render_human(output: &Output) -> String {
                 .map(|target| format!("\n{} {}", target.reason, target.target.display()))
                 .collect::<Vec<_>>()
                 .join("")
+                + &report
+                    .prunable_worktrees
+                    .iter()
+                    .map(|path| format!("\nprunable {}", path.display()))
+                    .collect::<Vec<_>>()
+                    .join("")
+                + &report
+                    .orphan_build_processes
+                    .iter()
+                    .map(|pid| format!("\norphan_build_process {pid}"))
+                    .collect::<Vec<_>>()
+                    .join("")
         }
         Output::BuildStatus(rows) => rows
             .iter()

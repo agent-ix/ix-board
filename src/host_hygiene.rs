@@ -91,6 +91,8 @@ pub struct BuildHostMetrics {
     pub queue_depth: u64,
     /// Running locked-build lease count.
     pub running_leases: u64,
+    /// Running lease counts by owner lane address.
+    pub leases_by_lane: BTreeMap<String, u64>,
 }
 
 /// A host's eligibility threshold for running a heavy gate.
@@ -125,6 +127,10 @@ pub struct HygieneReport {
     pub free_floor_bytes: u64,
     /// Target directories examined.
     pub targets: Vec<CleanDecision>,
+    /// Worktree paths that `git worktree list` marks prunable.
+    pub prunable_worktrees: Vec<PathBuf>,
+    /// Build processes under the worktree root without a Herdr pane association.
+    pub orphan_build_processes: Vec<u32>,
     /// Whether process inspection was complete.
     pub process_table_complete: bool,
     /// Unsupported host OS/platform condition.
@@ -149,6 +155,8 @@ impl HygieneReport {
                     "eligible" | "process_evidence_incomplete"
                 )
             })
+            || !self.prunable_worktrees.is_empty()
+            || !self.orphan_build_processes.is_empty()
         {
             1
         } else {
@@ -199,20 +207,35 @@ fn linux_process_table(proc_root: &Path) -> io::Result<ProcessTable> {
             continue;
         };
         let process_dir = entry.path();
-        let read_optional = |name: &str| match fs::read(process_dir.join(name)) {
+        let mut read_optional = |name: &str| match fs::read(process_dir.join(name)) {
             Ok(value) => Some(value),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(_) => None,
+            Err(_) => {
+                table.complete = false;
+                None
+            }
         };
-        let cwd = fs::read_link(process_dir.join("cwd")).ok();
+        let cwd = match fs::read_link(process_dir.join("cwd")) {
+            Ok(path) => Some(path),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(_) => {
+                table.complete = false;
+                None
+            }
+        };
         let cmdline = read_optional("cmdline").unwrap_or_default();
         let environ = read_optional("environ").unwrap_or_default();
         let mut fds = Vec::new();
         match fs::read_dir(process_dir.join("fd")) {
             Ok(entries) => {
-                for fd in entries.flatten() {
-                    if let Ok(path) = fs::read_link(fd.path()) {
-                        fds.push(path);
+                for fd in entries {
+                    match fd {
+                        Ok(fd) => match fs::read_link(fd.path()) {
+                            Ok(path) => fds.push(path),
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                            Err(_) => table.complete = false,
+                        },
+                        Err(_) => table.complete = false,
                     }
                 }
             }
@@ -427,9 +450,12 @@ pub fn parse_build_metrics(text: &str) -> BTreeMap<String, BuildHostMetrics> {
                     .saturating_add(value_u64(value).unwrap_or(0))
             }
             "ix_build_lane_running" => {
-                row.running_leases = row
-                    .running_leases
-                    .saturating_add(value_u64(value).unwrap_or(0))
+                let count = value_u64(value).unwrap_or(0);
+                row.running_leases = row.running_leases.saturating_add(count);
+                if let Some(lane) = label(labels, "lane") {
+                    let entry = row.leases_by_lane.entry(lane.to_owned()).or_default();
+                    *entry = entry.saturating_add(count);
+                }
             }
             _ => {}
         }
@@ -570,6 +596,37 @@ mod tests {
     }
 
     #[test]
+    #[trace("FR-048-AC-5", "FR-048-AC-6")]
+    fn cleanup_plan_accepts_a_real_worktree_target_without_touching_source() {
+        let root = tempfile::tempdir().expect("temp worktree root");
+        let worktree = root.path().join("swm-1");
+        let target = worktree.join("target");
+        std::fs::create_dir_all(&target).expect("target dir");
+        std::fs::write(worktree.join(".git"), "gitdir: ../.git/worktrees/swm-1\n")
+            .expect("worktree metadata");
+        std::fs::write(worktree.join("src.rs"), "source").expect("source file");
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(10_000);
+        let old = now - std::time::Duration::from_secs(3601);
+        let decision = clean_decision(
+            &target,
+            &worktree,
+            now,
+            old,
+            &HostPolicy {
+                free_floor_bytes: 100,
+                idle_age_secs: 3600,
+            },
+            &ProcessTable {
+                processes: Vec::new(),
+                complete: true,
+            },
+        );
+        assert!(decision.eligible);
+        assert!(worktree.join("src.rs").exists());
+        assert!(worktree.join(".git").exists());
+    }
+
+    #[test]
     #[trace("FR-048-AC-7")]
     fn locked_build_metrics_aggregate_priorities_and_owner_leases() {
         let rows = parse_build_metrics(concat!(
@@ -591,6 +648,7 @@ mod tests {
         assert_eq!(row.swap_free_bytes, Some(10));
         assert_eq!(row.queue_depth, 5);
         assert_eq!(row.running_leases, 1);
+        assert_eq!(row.leases_by_lane["luna:team:coder"], 1);
     }
 
     #[test]
@@ -621,6 +679,8 @@ mod tests {
             free_bytes,
             free_floor_bytes: 100,
             targets: Vec::new(),
+            prunable_worktrees: Vec::new(),
+            orphan_build_processes: Vec::new(),
             process_table_complete: true,
             unsupported: false,
         };
