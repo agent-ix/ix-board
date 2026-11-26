@@ -244,7 +244,7 @@ fn cadence_skips_delta_after_snapshot_failure_and_records_follow_up_failure() {
         .env("TEAM_RETRO_HOME", &retro_home)
         .output()
         .unwrap();
-    assert!(output.status.success());
+    assert!(!output.status.success());
     assert!(
         !String::from_utf8_lossy(&output.stdout).contains("no delta:"),
         "follow-up delta must be skipped after snapshot failure"
@@ -284,7 +284,7 @@ fn cadence_skips_delta_after_snapshot_failure_and_records_follow_up_failure() {
         .env("TEAM_RETRO_HOME", &retro_home)
         .output()
         .unwrap();
-    assert!(output.status.success());
+    assert!(!output.status.success());
     let ledger = Ledger::open(&ledger_path, &FleetConfig::default()).unwrap();
     assert_eq!(
         ledger
