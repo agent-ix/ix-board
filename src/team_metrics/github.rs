@@ -27,6 +27,7 @@ const MAX_COST: i64 = 4500;
 const MAX_PAGES: usize = 10;
 const MAX_OLD: usize = 50;
 const MAX_REPOS: usize = 32;
+const DAILY_PR_WINDOW_SECONDS: f64 = 7.0 * 86_400.0;
 pub(super) const MAX_QUERY: usize = 16 * 1024;
 const CACHE_BYTES: i64 = 4 * 1024 * 1024;
 const PR_FIELDS: &str = "nodes { number createdAt mergedAt closedAt updatedAt isDraft state additions deletions reviewDecision timelineItems(first: 1, itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT]) { totalCount } reopenEvents: timelineItems(first: 1, itemTypes: [REOPENED_EVENT]) { totalCount } } pageInfo { hasNextPage endCursor }";
@@ -619,7 +620,8 @@ impl<T: Transport> SelectedGithub<T> {
         if self.lists.borrow().len() >= MAX_REPOS {
             return Err("GitHub repository population exceeds collection bound".into());
         }
-        let result = self.list_recent_population(repo, self.now as f64 / 1000.0 - 86_400.0);
+        let result =
+            self.list_recent_population(repo, self.now as f64 / 1000.0 - DAILY_PR_WINDOW_SECONDS);
         self.lists.borrow_mut().insert(repo.into(), result.clone());
         result
     }
@@ -1507,7 +1509,7 @@ mod tests {
         );
     }
 
-    #[trace("FR-033-AC-12", "FR-033-AC-13")]
+    #[trace("FR-033-AC-12", "FR-033-AC-13", "FR-033-AC-18")]
     #[test]
     fn native_open_and_merged_rows_resolve_callbacks_without_detail_requests() {
         let dir = tempfile::tempdir().unwrap();
@@ -1553,13 +1555,13 @@ mod tests {
             assert!(query.contains("recent: pullRequests(first: 50, states: [MERGED, CLOSED]"));
             Ok(response(serde_json::json!({"data":{"rateLimit":{"cost":3,"remaining":100,"resetAt":"2030-01-01T00:00:00Z"},"repository":repository}}).to_string()))
         });
-        let at = chrono::DateTime::parse_from_rfc3339("2026-11-22T01:00:00Z")
+        let at = chrono::DateTime::parse_from_rfc3339("2026-11-26T01:00:00Z")
             .unwrap()
             .timestamp_millis();
         let allowed = [("agent-ix/one".into(), 1), ("agent-ix/one".into(), 2)].into();
         let source = source(open(&cfg, fake.clone()), allowed, true, at);
         let rows = source
-            .pull_requests("agent-ix/one", at as f64 / 1000.0 - 86_400.0)
+            .pull_requests("agent-ix/one", at as f64 / 1000.0 - DAILY_PR_WINDOW_SECONDS)
             .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].additions + rows[0].deletions, 10);

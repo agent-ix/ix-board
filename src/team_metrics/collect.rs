@@ -751,13 +751,11 @@ impl Collector {
                         .as_ref()
                         .filter(|_| github.observed_at() > 0)
                         .map(|prs| super::pr_stats::calculate(prs, now as f64 / 1000.0));
+                    let daily_candidates = daily_closure_candidates(&selected, now as f64 / 1000.0);
                     let (closures_daily, mut closures_daily_reason, closures_daily_coverage) =
-                        match daily_verified_linear_closures(
+                        match daily_linear_closures(
                             source.as_ref(),
-                            &closure_candidates,
-                            &github,
-                            &cfg.repos,
-                            &successful_repo_names,
+                            &daily_candidates,
                             &verified_closure_history_path()?,
                             now as f64 / 1000.0,
                         ) {
@@ -1195,12 +1193,9 @@ fn verified_closure_history_path() -> Result<PathBuf, String> {
 }
 
 #[implements("FR-033-AC-18")]
-fn daily_verified_linear_closures(
+fn daily_linear_closures(
     source: &dyn LinearSource,
     issues: &[Issue],
-    github: &dyn GithubSource,
-    repos: &[String],
-    successful_repos: &BTreeSet<String>,
     cache_path: &std::path::Path,
     now: f64,
 ) -> Result<DailyClosureResult, String> {
@@ -1266,92 +1261,23 @@ fn daily_verified_linear_closures(
     file.write_all(&bytes).map_err(|error| error.to_string())?;
     file.sync_all().map_err(|error| error.to_string())?;
     std::fs::rename(temporary, cache_path).map_err(|error| error.to_string())?;
-    let configured: BTreeSet<_> = repos.iter().map(String::as_str).collect();
-    let mut refs = BTreeSet::new();
     let mut covered_issues = Vec::new();
     let mut completed_histories = Vec::new();
     for (issue, history) in issues.iter().zip(histories) {
         let Some(history) = history else {
             continue;
         };
-        if !issue.attachments_complete {
-            history_errors.push(format!(
-                "{}: Linear PR attachments incomplete",
-                issue.identifier
-            ));
-            continue;
-        }
-        refs.extend(
-            issue
-                .attachment_urls
-                .iter()
-                .filter_map(|url| retro::metrics::pull_request_ref(url))
-                .filter(|(repo, _)| configured.contains(repo.as_str())),
-        );
         covered_issues.push(issue.clone());
         completed_histories.push(history);
     }
-    let mut merged_by_repo = BTreeMap::<String, BTreeSet<u64>>::new();
-    let mut failed_repos = BTreeSet::new();
-    let mut github_errors = Vec::new();
-    for (repo, number) in refs {
-        if !successful_repos.contains(&repo) {
-            failed_repos.insert(repo.clone());
-            continue;
-        }
-        match github.pull_request(&repo, number) {
-            Ok(info) if info.merged => {
-                merged_by_repo.entry(repo).or_default().insert(number);
-            }
-            Ok(_) => {}
-            Err(error) => {
-                failed_repos.insert(repo.clone());
-                github_errors.push(format!("{repo}#{number}: {error}"));
-            }
-        }
-    }
-    let complete_repos = successful_repos
-        .iter()
-        .filter(|repo| !failed_repos.contains(*repo))
-        .collect::<BTreeSet<_>>();
-    let repo_coverage = if configured.is_empty() {
-        0.0
-    } else {
-        complete_repos.len() as f64 / configured.len() as f64
-    };
     let history_coverage = if issues.is_empty() {
         1.0
     } else {
         covered_issues.len() as f64 / issues.len() as f64
     };
-    let coverage = repo_coverage.min(history_coverage).clamp(0.0, 1.0);
-    let effective_repos = complete_repos
-        .iter()
-        .map(|repo| repo.as_str())
-        .collect::<BTreeSet<_>>();
-    let merged = merged_by_repo
-        .into_iter()
-        .filter(|(repo, _)| effective_repos.contains(repo.as_str()))
-        .flat_map(|(repo, numbers)| {
-            numbers
-                .into_iter()
-                .map(move |number| (repo.clone(), number))
-        })
-        .collect::<BTreeSet<_>>();
-    let values = verified_daily_closure_counts(
-        &covered_issues,
-        &completed_histories,
-        &merged,
-        &effective_repos,
-        now,
-    )?;
-    let reason = (!history_errors.is_empty() || !github_errors.is_empty()).then(|| {
-        history_errors
-            .into_iter()
-            .chain(github_errors)
-            .collect::<Vec<_>>()
-            .join("; ")
-    });
+    let coverage = history_coverage.clamp(0.0, 1.0);
+    let values = daily_linear_closure_counts(&covered_issues, &completed_histories, now)?;
+    let reason = (!history_errors.is_empty()).then(|| history_errors.join("; "));
     Ok(DailyClosureResult {
         values,
         coverage,
@@ -1364,6 +1290,22 @@ fn daily_verified_linear_closures(
 struct ClosureHistoryCache {
     updated_at: Option<String>,
     history: Vec<retro::sources::StateChange>,
+}
+
+#[implements("FR-033-AC-18")]
+fn daily_closure_candidates(issues: &[Issue], now: f64) -> Vec<Issue> {
+    let since = now - 7.0 * 86_400.0;
+    issues
+        .iter()
+        .filter(|issue| {
+            issue
+                .updated_at
+                .as_deref()
+                .and_then(|updated| crate::drift::timestamp_epoch(updated).ok())
+                .is_none_or(|updated| updated >= since)
+        })
+        .cloned()
+        .collect()
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -1383,36 +1325,20 @@ struct StageHistoryCache {
 }
 
 #[implements("FR-033-AC-18")]
-fn verified_daily_closure_counts(
+fn daily_linear_closure_counts(
     issues: &[Issue],
     histories: &[Vec<retro::sources::StateChange>],
-    merged_prs: &BTreeSet<(String, u64)>,
-    repos: &BTreeSet<&str>,
     now: f64,
 ) -> Result<Vec<usize>, String> {
     if histories.len() != issues.len() {
-        return Err("Linear returned a different number of path histories than requested".into());
+        return Err(
+            "Linear returned a different number of selected-issue histories than requested".into(),
+        );
     }
     let day_now = (now / 86400.0).floor() as i64;
     let mut counts = vec![0usize; 7];
     let mut seen = BTreeSet::new();
     for (issue, history) in issues.iter().zip(histories) {
-        if !issue.attachments_complete {
-            return Err(format!(
-                "Linear PR attachments incomplete for {}",
-                issue.identifier
-            ));
-        }
-        let refs: BTreeSet<_> = issue
-            .attachment_urls
-            .iter()
-            .filter_map(|url| retro::metrics::pull_request_ref(url))
-            .filter(|(repo, _)| repos.contains(repo.as_str()))
-            .collect();
-        let verified = refs.iter().any(|reference| merged_prs.contains(reference));
-        if !verified {
-            continue;
-        }
         for change in history {
             if change.to != Some(WorkflowStateType::Completed)
                 || change.from == Some(WorkflowStateType::Completed)
@@ -1982,6 +1908,7 @@ mod tests {
 
     struct ClosureTestLinear {
         history: Vec<retro::sources::StateChange>,
+        fail_issue_id: Option<&'static str>,
     }
 
     impl retro::sources::LinearSource for ClosureTestLinear {
@@ -1995,8 +1922,11 @@ mod tests {
 
         fn state_history(
             &self,
-            _issue_id: &str,
+            issue_id: &str,
         ) -> Result<Vec<retro::sources::StateChange>, String> {
+            if self.fail_issue_id == Some(issue_id) {
+                return Err("history unavailable".into());
+            }
             Ok(self.history.clone())
         }
 
@@ -2009,41 +1939,6 @@ mod tests {
             _label: &str,
         ) -> Result<Vec<retro::sources::LabeledIssue>, String> {
             Err("not used".into())
-        }
-    }
-
-    struct ClosureTestGithub;
-
-    impl retro::sources::GithubSource for ClosureTestGithub {
-        fn pull_requests(
-            &self,
-            _repo: &str,
-            _since: f64,
-        ) -> Result<Vec<retro::sources::PullRequest>, String> {
-            Ok(Vec::new())
-        }
-
-        fn pull_request(
-            &self,
-            repo: &str,
-            _number: u64,
-        ) -> Result<retro::sources::PullRequestInfo, String> {
-            if repo == "owner/bad" {
-                return Err("repository unavailable".into());
-            }
-            Ok(retro::sources::PullRequestInfo {
-                merged: true,
-                updated_at: 100_000.0,
-            })
-        }
-
-        fn main_commits(
-            &self,
-            _repo: &str,
-            _branch: &str,
-            _since: f64,
-        ) -> Result<Vec<retro::sources::MainCommit>, String> {
-            Ok(Vec::new())
         }
     }
 
@@ -2078,7 +1973,40 @@ mod tests {
 
     #[trace("FR-033-AC-18")]
     #[test]
-    fn daily_closures_keep_successful_repositories_when_one_verification_fails() {
+    fn daily_closure_history_reads_only_issues_updated_in_window() {
+        let issue = |id: &str, updated_at: Option<&str>| {
+            serde_json::from_value::<Issue>(serde_json::json!({
+                "id":id,"identifier":format!("QSL-{id}"),"title":"example","description":null,
+                "state":"Started","state_name":"In Progress","state_type":"started",
+                "parent_id":null,"team_key":"QSL","assignee_id":null,"assignee_name":null,
+                "project_id":null,"project_milestone_id":null,"priority":0,"sort_order":0,
+                "blocked_by":[],"created_at":"2026-11-01T00:00:00Z","updated_at":updated_at,
+                "attachment_urls":[],"attachments_complete":true,"started_at":null,
+                "completed_at":null,"pull_requests":[]
+            }))
+            .unwrap()
+        };
+        let now = crate::drift::timestamp_epoch("2026-11-26T02:10:00Z").unwrap();
+        let candidates = daily_closure_candidates(
+            &[
+                issue("recent", Some("2026-11-25T00:00:00Z")),
+                issue("old", Some("2026-11-18T00:00:00Z")),
+                issue("unknown", None),
+            ],
+            now,
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|issue| issue.identifier.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["QSL-recent", "QSL-unknown"])
+        );
+    }
+
+    #[trace("FR-033-AC-18")]
+    #[test]
+    fn daily_closures_keep_read_histories_when_one_selected_issue_history_fails() {
         let directory = tempfile::tempdir().unwrap();
         let issue = |id: &str, identifier: &str, repo: &str, number: u64| {
             serde_json::from_value::<Issue>(serde_json::json!({
@@ -2119,20 +2047,23 @@ mod tests {
                 to: Some(WorkflowStateType::Completed),
                 to_name: Some("Done".into()),
             }],
+            fail_issue_id: Some("bad"),
         };
-        let result = daily_verified_linear_closures(
+        let result = daily_linear_closures(
             &linear,
             &issues,
-            &ClosureTestGithub,
-            &["owner/good".into(), "owner/bad".into()],
-            &BTreeSet::from(["owner/good".into(), "owner/bad".into()]),
             &directory.path().join("closure-history.json"),
             100_000.0,
         )
         .unwrap();
         assert_eq!(result.values[0], 1);
         assert_eq!(result.coverage, 0.5);
-        assert!(result.reason.unwrap().contains("owner/bad#2"));
+        assert!(
+            result
+                .reason
+                .unwrap()
+                .contains("QSL-2: history unavailable")
+        );
     }
 
     #[trace("FR-033-AC-16")]
@@ -2230,7 +2161,7 @@ mod tests {
     }
     #[trace("FR-033-AC-18")]
     #[test]
-    fn daily_closures_count_only_merged_pr_verified_path_events() {
+    fn daily_closures_count_every_selected_completed_state_transition() {
         use crate::retro::sources::StateChange;
         let issue = |id: &str, number: Option<u64>| {
             let attachment_urls = number.map_or_else(Vec::new, |number| {
@@ -2255,16 +2186,8 @@ mod tests {
         };
         let issues = vec![issue("1", Some(1)), issue("2", None), issue("3", Some(2))];
         let histories = vec![vec![event.clone()], vec![event.clone()], vec![event]];
-        let merged = BTreeSet::from([("agent-ix/repo".into(), 1)]);
-        let counts = verified_daily_closure_counts(
-            &issues,
-            &histories,
-            &merged,
-            &BTreeSet::from(["agent-ix/repo"]),
-            200_000.0,
-        )
-        .unwrap();
-        assert_eq!(counts, vec![1, 0, 0, 0, 0, 0, 0]);
+        let counts = daily_linear_closure_counts(&issues, &histories, 200_000.0).unwrap();
+        assert_eq!(counts, vec![3, 0, 0, 0, 0, 0, 0]);
     }
     #[trace("FR-033-AC-15")]
     #[test]

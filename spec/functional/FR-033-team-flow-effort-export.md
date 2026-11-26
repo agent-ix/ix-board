@@ -66,8 +66,10 @@ minority of the trailing window cannot represent the team's observed effort;
 the coverage gauge remains present with the unavailable reason. At or above 50%,
 the value uses only covered host-time and is published with its coverage gauge.
 If the window has no verified closure, the value is absent with an explicit
-reason. The exporter reports verified closure counts for the previous three UTC
-days and identifies the gate selector used. First-review median requires a
+reason. Daily closure counts report every Linear transition into a completed
+state for issues in the selected team scope, independent of PR attachment or
+gate-path verification. They cover the previous seven UTC calendar days and
+include observed-over-expected history coverage. First-review median requires a
 successful PR population and at least one covered new PR; its coverage gauge is
 published alongside the median even for a partial population. Changes-requested
 share comes from the Linear reviewer marker population,
@@ -143,7 +145,7 @@ was read successfully for the entire cohort.
 | FR-033-AC-15 | All scope metrics include `team_key` from the configured Linear selector. Execution counts use fresh classified Prometheus lane status even if unrelated git/process evidence is partial; multiple active state labels at the same latest timestamp make that lane uncovered instead of choosing arbitrarily. Effort uses retained Prometheus lane history and verified path closures; expected hosts come from the current QSL lane inventory, including hosts with no samples in the trailing range. Missing/stale history publishes availability and coverage without fabricating zero. Linear reviewer markers supply changes-requested share; malformed or duplicate records are skipped and counted. | Test |
 | FR-033-AC-16 | WIP counts open selected-team issues whose Linear workflow state type is `started`; the gauge is `ix_team_wip_active`. Ready and blocked counts use the selected team issue population. Team lanes are read from current Prometheus status without relay identity. The latest state per exact-team lane classifies `working` as executing and all other fresh states as not executing. Coverage reports observed over expected lanes. Stage age uses open team issues' current Linear state entry times and emits labels only for measured workflow states of type `started`, in lowercase snake case. | Test |
 | FR-033-AC-17 | The changes-requested share uses latest Linear review/disposition records for open, non-draft PRs, with numerator not-mergeable or unresolved-finding records and denominator PRs with valid review records; coverage is reviewed PRs over open non-draft PRs. Unresolved findings survive later clean reviews until a terminal disposition closes them. Marker backfill persists page cursors across refreshes and source failures; subsequent reads filter on native comment update time after a persisted watermark. Per-refresh pages are bounded so steady-state Linear request use remains below 150 requests per hour at the configured tracker cadence. The share and first-review median are published over any nonempty covered population, including partial coverage; draft PRs are excluded from first-review coverage. | Test |
-| FR-033-AC-18 | The exporter emits seven daily gauges for merged PRs and verified Linear path closures, with the same bounded team labels and `days_ago` 0..6. Partial configured-source failures lower each daily series coverage while preserving values computed from covered repositories and histories; zero is emitted only when the covered source has no matching events. | Test |
+| FR-033-AC-18 | The exporter emits seven daily gauges for merged PRs and Linear issues in the selected scope that transition into a completed state, with the same bounded team labels and `days_ago` 0..6. Configured GitHub repositories are queried over the full seven-day window so every merged day is represented. Partial source failures lower each daily series coverage while preserving values computed from covered repositories and issue histories; zero is emitted only when a covered source has no matching events. | Test |
 
 ## Dependencies
 
