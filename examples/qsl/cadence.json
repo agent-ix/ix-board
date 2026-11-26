@@ -1,0 +1,25 @@
+{
+  "jobs": [
+    {
+      "program": "QSL",
+      "team": "qsl",
+      "id": "retro-qsl",
+      "interval_secs": 1800,
+      "kind": "retro_snapshot",
+      "command": [
+        "retro",
+        "snapshot",
+        "--config",
+        "/Users/peter/.local/state/team-retro/QSL/config.json"
+      ],
+      "after_success": [
+        "retro",
+        "delta",
+        "--config",
+        "/Users/peter/.local/state/team-retro/QSL/config.json",
+        "--notify"
+      ],
+      "owner_role": "minder"
+    }
+  ]
+}

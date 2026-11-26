@@ -733,13 +733,15 @@ ix-board retro delta [OPTIONS] --config <CONFIG>
 Options:
       --config <CONFIG>              JSON retro configuration file
       --json                         Emit machine-readable JSON on stdout instead of human-readable text
+      --notify                       Send stored delta defects to the configured minder
       --diagnostics-format <FORMAT>  Diagnostic stream format on stderr [default: human]
       --color <WHEN>                 Colorize human diagnostics on stderr: auto (TTY only), always, or never [default: auto]
   -h, --help                         Print help
 ```
 
 With fewer than two snapshots the command reports that no delta exists and exits zero. A
-`baseline_taken_at` that matches no record stops it with an error naming the value.
+`baseline_taken_at` that matches no record stops it with an error naming the value. Defects
+are included in JSON and text output; they are sent only when `--notify` is supplied.
 
 ## ix-board retro backfill
 

@@ -3742,6 +3742,48 @@ mod tests {
     }
 
     #[test]
+    #[trace("FR-047-AC-9")]
+    fn retro_adapter_reads_hand_written_additive_churn_metrics() {
+        let record: super::super::Record = serde_json::from_str(
+            r#"{"schema_version":1,"kind":"snapshot","taken_at":"2026-11-14T22:13:20Z","team":"QSL","window":"24h","metrics":{"prs_per_ticket_max":{"id":"prs_per_ticket_max","status":"ok","value":3,"unit":"pull_requests","direction":"down","source":"linear+github","query":"attached pull requests per ticket","class":"rework"},"commits_per_pr_max":{"id":"commits_per_pr_max","status":"ok","value":7,"unit":"commits","direction":"down","source":"github","query":"commits on pull request","class":"rework"}}}"#,
+        )
+        .unwrap();
+        let spec = RoleSpec {
+            role: "coder".into(),
+            metrics: Vec::new(),
+            rules: ["prs_per_ticket_max", "commits_per_pr_max"]
+                .into_iter()
+                .map(|metric_id| EvaluationRule {
+                    id: format!("R-{metric_id}"),
+                    rule: "rule".into(),
+                    evidence_source: "ix-board-metric".into(),
+                    trigger: format!("retro.{metric_id}"),
+                    method: "deterministic".into(),
+                    query_or_rubric: format!("retro.{metric_id}"),
+                    comparator: "=".into(),
+                    target: 0.0,
+                    unit: "count".into(),
+                })
+                .collect(),
+        };
+        let live = retro_record_adapters(std::slice::from_ref(&spec), Ok(&record));
+        assert_eq!(
+            live["retro.prs_per_ticket_max"],
+            QueryValue::Value {
+                value: 3.0,
+                evidence_refs: vec!["retro:prs_per_ticket_max:2026-11-14T22:13:20Z".into()],
+            }
+        );
+        assert_eq!(
+            live["retro.commits_per_pr_max"],
+            QueryValue::Value {
+                value: 7.0,
+                evidence_refs: vec!["retro:commits_per_pr_max:2026-11-14T22:13:20Z".into()],
+            }
+        );
+    }
+
+    #[test]
     #[trace("FR-047-AC-1")]
     fn missing_department_configuration_has_the_accumulation_reason() {
         let record: super::super::Record = serde_json::from_str(

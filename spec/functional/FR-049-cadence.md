@@ -26,18 +26,22 @@ id is `cadence-checker`.
 `ix-board cadence run <job>` SHALL run exactly the argv sequence declared by
 the matching manifest job, without a shell, and SHALL persist the start time,
 completion time and outcome in the existing fleet ledger whether the command
-succeeds or fails. Supported job kinds are `retro_snapshot`, `fleet_tick` and
-`hygiene`. Jobs are configured by program and team and declare a stable job id,
-positive interval, kind, argv sequence and owner role. The cadence loader SHALL
-reject an invalid or ambiguous manifest entry before execution. Cadence does not install or
-run a host scheduler.
+succeeds or fails. A snapshot job may declare `after_success`, which SHALL be a
+`retro delta --config <file> --notify` argv and SHALL run only after the snapshot
+exits successfully. A failed follow-up makes the cadence run fail. Supported
+job kinds are `retro_snapshot`, `fleet_tick` and `hygiene`. Jobs are configured
+by program and team and declare a stable job id, positive interval, kind, argv
+sequence and owner role. The cadence loader SHALL reject an invalid or
+ambiguous manifest entry before execution. Cadence does not install or run a
+host scheduler.
 
 ## Configuration
 
 The cadence manifest is JSON, selected by `IX_BOARD_CADENCE_MANIFEST` or the
 default `cadence.json` in ix-board's user configuration directory. Its job
 entries use `program`, `team`, `id`, `interval_secs`, `kind`, `command`, and
-`owner_role`. The optional top-level `alert_recipient` is one complete
+`owner_role`. A snapshot job may also name an `after_success` argv for its
+stored delta notification. The optional top-level `alert_recipient` is one complete
 `server:workspace:tab` relay address; `--alert` requires it when an alert is
 sent. `command` is an argv array; shell expansion is not performed. The
 manifest is shared configuration and is not stored in the fleet ledger.
@@ -52,6 +56,7 @@ manifest is shared configuration and is not stored in the fleet ledger.
 | FR-049-AC-4 | Program/team selection, unknown jobs, duplicate jobs, invalid intervals and malformed manifest fields are handled deterministically before running a job. | Test |
 | FR-049-AC-5 | `--alert` emits an alert only when the configured cadence checker job is overdue. | Test |
 | FR-049-AC-6 | Cadence uses the existing fleet ledger and does not create a scheduler or write state into a repository. | Test |
+| FR-049-AC-7 | A valid snapshot job runs its configured notifying delta only after snapshot success; snapshot failure skips the delta, and a delta failure is recorded as a failed cadence run. Tests use hand-written retro records and a fake relay sender. | Test |
 
 ## Dependencies
 

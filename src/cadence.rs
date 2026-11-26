@@ -65,6 +65,9 @@ pub struct Job {
     pub kind: JobKind,
     /// Arguments passed to this ix-board executable, without shell expansion.
     pub command: Vec<String>,
+    /// Optional `retro delta --notify` command run only after this command succeeds.
+    #[serde(default)]
+    pub after_success: Option<Vec<String>>,
     /// Role responsible for this job.
     pub owner_role: String,
 }
@@ -276,6 +279,21 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), CadenceError> {
                 job.id, job.kind
             )));
         }
+        let valid_delta = job.after_success.as_deref().is_some_and(|command| {
+            command.len() >= 2
+                && command[0] == "retro"
+                && command[1] == "delta"
+                && command
+                    .windows(2)
+                    .any(|pair| pair[0] == "--config" && !pair[1].is_empty())
+                && command.iter().any(|arg| arg == "--notify")
+        });
+        if job.after_success.is_some() && (job.kind != JobKind::RetroSnapshot || !valid_delta) {
+            return Err(CadenceError::Manifest(format!(
+                "job {} after_success must be a retro delta command",
+                job.id
+            )));
+        }
     }
     Ok(())
 }
@@ -355,6 +373,7 @@ fn classify_due(interval_secs: u64, last_run: Option<&CadenceRun>, now_ms: i64) 
 
 /// Runs one uniquely identified job and records its process outcome.
 #[implements("FR-049-AC-3")]
+#[implements("FR-049-AC-7")]
 pub fn run_job(
     manifest: &Manifest,
     mut open_ledger: impl FnMut() -> Result<Ledger, CadenceError>,
@@ -413,7 +432,13 @@ pub fn run_job(
 
 fn execute(job: &Job) -> Result<std::process::ExitStatus, std::io::Error> {
     let executable = std::env::current_exe()?;
-    Command::new(executable).args(&job.command).status()
+    let status = Command::new(&executable).args(&job.command).status()?;
+    if status.success()
+        && let Some(after_success) = &job.after_success
+    {
+        return Command::new(executable).args(after_success).status();
+    }
+    Ok(status)
 }
 
 fn unix_time_ms() -> i64 {
@@ -481,6 +506,7 @@ mod tests {
                 "/tmp/retro.json".to_owned(),
             ],
             owner_role: "minder".to_owned(),
+            after_success: None,
         }
     }
 

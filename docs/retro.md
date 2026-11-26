@@ -68,7 +68,11 @@ The ids are `path_remaining`, `path_closed`, `intake_new`, `net_closed_minus_new
 `in_progress_stale`, `source_count_disagreement`, `agents_working_share`,
 `agents_idle_minutes_max`, `worktrees_prunable`, `disk_bytes`, `orphan_slots`, `full_gates_max`,
 `repins_total`, `build_lock_wait_minutes`, `messages_undelivered`, `decisions_open` and
-`decision_oldest_hours`. The definitions are in the FR-024 requirement.
+`decision_oldest_hours`, `prs_per_ticket_max`, `commits_per_pr_max`,
+`review_file_only_commits`, `review_rounds_over_limit`, `non_code_check_reruns`,
+`unnamed_wait_minutes_max` and `host_load_per_core_max`. The definitions are in
+the FR-024 requirement. Additive metrics remain unavailable until their
+complete structured source collectors are present.
 
 Boundaries: a pull request is idle at or beyond `pr_idle_hours`; oversize and orphan age are
 strictly above their limits. `fix_rounds_*` count only pull requests that are open or were merged
@@ -107,6 +111,24 @@ when the queries differ it is `query_changed` with both queries shown. `regressi
 metric with direction `up` or `down` when the change moved against the direction in each of the
 latest two consecutive comparisons between snapshots (so it needs three snapshots with comparable
 queries); `neutral` metrics never regress. There is no combined score.
+
+Delta also emits a `defects` array. Increases in `prs_idle`, `fix_rounds_max` and
+`agents_idle_minutes_max` become `retro_metric_rising` defects; an
+`unnamed_wait_minutes_max` above 20 becomes `lead_wait_without_named_wait`.
+Use `--notify` to send these stored findings to the configured `minder_address`.
+Without that flag, delta sends nothing.
+
+## QSL cadence example
+
+The QSL examples under `examples/qsl/` connect the 30-minute cadence runner to
+retro snapshots and stored delta notifications for the verified
+`terra:QSL:minder` address. The snapshot configuration includes the QSL Herdr
+workspace and gate log, so `agents_working_share`, `agents_idle_minutes_max`,
+`full_gates_max` and `build_lock_wait_minutes` are available when their source
+records are complete. Install the manifest at `~/.config/ix-board/cadence.json`
+and the supplied LaunchAgent under `~/Library/LaunchAgents/`, then load it with
+`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agentix.ix-board-retro-qsl.plist`.
+The examples use local QSL paths from this machine and need path updates elsewhere.
 
 ## Backfill
 

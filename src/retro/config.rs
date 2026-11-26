@@ -129,6 +129,12 @@ pub struct RetroConfig {
     /// Optional UTC time naming the baseline record.
     #[serde(default)]
     pub baseline_taken_at: Option<String>,
+    /// Optional verified relay address for explicit retro delta defect delivery.
+    #[serde(default)]
+    pub minder_address: Option<String>,
+    /// Optional reviewer-round policy limit for additive churn metrics.
+    #[serde(default)]
+    pub review_round_limit: Option<u64>,
 }
 
 impl RetroConfig {

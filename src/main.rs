@@ -430,6 +430,9 @@ enum RetroCommand {
         /// JSON retro configuration file.
         #[arg(long)]
         config: PathBuf,
+        /// Send stored delta defects to the configured minder address.
+        #[arg(long)]
+        notify: bool,
     },
     /// Append one record per UTC day from Linear and GitHub history.
     Backfill {
@@ -1130,8 +1133,8 @@ fn run(command: Command) -> Result<Output, Error> {
             command: RetroCommand::Snapshot { config, window },
         } => run_retro_snapshot(&config, &window),
         Command::Retro {
-            command: RetroCommand::Delta { config },
-        } => run_retro_delta(&config).map(Output::RetroDelta),
+            command: RetroCommand::Delta { config, notify },
+        } => run_retro_delta(&config, notify).map(Output::RetroDelta),
         Command::Retro {
             command:
                 RetroCommand::Backfill {
@@ -1894,10 +1897,37 @@ fn run_retro_snapshot(config_path: &std::path::Path, window: &str) -> Result<Out
     ))
 }
 
-fn run_retro_delta(config_path: &std::path::Path) -> Result<retro::DeltaReport, Error> {
+#[implements("FR-027-AC-12")]
+fn run_retro_delta(
+    config_path: &std::path::Path,
+    notify: bool,
+) -> Result<retro::DeltaReport, Error> {
     let config = retro::RetroConfig::load(config_path).map_err(retro::RetroError::from)?;
     let store = retro::Store::from_env(&config.team).map_err(retro::RetroError::from)?;
-    Ok(retro::run_delta(&config, &store)?)
+    let report = retro::run_delta(&config, &store)?;
+    if notify {
+        retro::notify_defects(
+            &report,
+            config.minder_address.as_deref(),
+            |recipient, message| {
+                let output = std::process::Command::new("agent-msg")
+                    .args(["send", recipient, message])
+                    .output()
+                    .map_err(|error| format!("could not run agent-msg: {error}"))?;
+                if output.status.success() {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "agent-msg send {recipient} exited {}: {}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ))
+                }
+            },
+        )
+        .map_err(|message| Error::Retro(retro::RetroError::Evaluation(message)))?;
+    }
+    Ok(report)
 }
 
 fn run_retro_backfill(
