@@ -492,20 +492,50 @@ fn with_lock_budget<T>(
 }
 
 #[cfg(unix)]
-pub(crate) fn restrict_permissions(path: &Path) -> Result<(), Error> {
-    use std::{
-        fs::OpenOptions,
-        os::unix::fs::{OpenOptionsExt, PermissionsExt},
-    };
+fn restrict_permissions_with(
+    file: &std::fs::File,
+    chmod: impl FnOnce(&std::fs::File, std::fs::Permissions) -> std::io::Result<()>,
+) -> Result<(), Error> {
+    use std::os::unix::fs::PermissionsExt;
 
-    let file = OpenOptions::new()
+    if file
+        .metadata()
+        .map_err(Error::CachePermissions)?
+        .permissions()
+        .mode()
+        & 0o777
+        == 0o600
+    {
+        return Ok(());
+    }
+    let desired = std::fs::Permissions::from_mode(0o600);
+    match chmod(file, desired) {
+        Ok(()) => Ok(()),
+        Err(chmod_error) => {
+            let mode_is_restricted = file
+                .metadata()
+                .map(|metadata| metadata.permissions().mode() & 0o777 == 0o600)
+                .unwrap_or(false);
+            if mode_is_restricted {
+                Ok(())
+            } else {
+                Err(Error::CachePermissions(chmod_error))
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn restrict_permissions(path: &Path) -> Result<(), Error> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
         .open(path)
         .map_err(Error::CachePermissions)?;
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .map_err(Error::CachePermissions)
+    restrict_permissions_with(&file, |file, permissions| file.set_permissions(permissions))
 }
 
 #[cfg(not(unix))]
@@ -517,6 +547,67 @@ pub(crate) fn restrict_permissions(_path: &Path) -> Result<(), Error> {
 mod tests {
     use super::*;
     use crate::{FocusBaseline, FocusBaselineIssue, IssueId, WorkflowStateType};
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_permissions_skip_denied_chmod_when_already_restricted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("cache dir");
+        let path = directory.path().join("permissions.sqlite3");
+        std::fs::write(&path, b"").expect("cache file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("restrict mode");
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open cache");
+        let chmod_called = std::cell::Cell::new(false);
+
+        restrict_permissions_with(&file, |_, _| {
+            chmod_called.set(true);
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        })
+        .expect("already restricted cache is accepted");
+
+        assert!(
+            !chmod_called.get(),
+            "chmod must not be attempted for mode 0600"
+        );
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_permissions_ignore_denial_only_if_mode_became_restricted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("cache dir");
+        let path = directory.path().join("permissions.sqlite3");
+        std::fs::write(&path, b"").expect("cache file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("set permissive mode");
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open cache");
+
+        let error = restrict_permissions_with(&file, |file, _| {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        });
+        assert!(error.is_ok(), "a concurrent mode fix makes denial harmless");
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("restore permissive mode");
+        let error = restrict_permissions_with(&file, |_, _| {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        });
+        assert!(
+            matches!(error, Err(Error::CachePermissions(error)) if error.kind() == std::io::ErrorKind::PermissionDenied)
+        );
+    }
 
     /// Trace: FR-013-AC-7
     #[test]

@@ -9,6 +9,7 @@ use super::lifecycle::{
     AgentId, Availability, Lifecycle, WorkerObservation, WorkerRole, WorkerState,
 };
 use super::probe::{GitTimes, PaneProcess, Probe, ProbeRequest, SessionFiles, run};
+use ix_trace_rs::implements;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -475,6 +476,7 @@ fn read_transcript(
 }
 
 /// Collects one bounded request against an explicit home, without changing files.
+#[implements("FR-018-AC-30")]
 pub fn collect_probe(home: &Path, request: &ProbeRequest) -> Result<Probe, AgentsError> {
     request.validate()?;
     let start = epoch_now();
@@ -1108,15 +1110,11 @@ fn collect_processes(probe: &mut Probe, budget: &mut Budget) {
                 if list.len() < 128 {
                     list.push(PaneProcess {
                         comm: String::from_utf8_lossy(&comm).trim().into(),
-                        args: if String::from_utf8_lossy(&args)
+                        args: String::from_utf8_lossy(&args)
                             .split('\0')
-                            .take(2)
-                            .any(|word| word.rsplit('/').next() == Some("locked-build.sh"))
-                        {
-                            "locked-build.sh".into()
-                        } else {
-                            String::new()
-                        },
+                            .next()
+                            .unwrap_or_default()
+                            .to_owned(),
                     });
                 } else {
                     probe.process_availability.missing("pane_process_limit");
