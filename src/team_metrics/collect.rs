@@ -7,7 +7,7 @@ use super::{Config, Error, Event, History, Journal, ScopeState, State};
 use crate::fleet::live::{PromHttp, PromQuery};
 use crate::retro::sources::{AgentSource, GithubSource, LinearSource};
 use crate::{Issue, WorkflowStateType, WorkspaceSnapshot, retro};
-use ix_trace_rs::implements;
+use ix_trace_rs::{implements, trace};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
