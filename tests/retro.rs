@@ -554,7 +554,7 @@ fn git_init(dir: &Path) {
 
 // ---- FR-024 ----------------------------------------------------------------------------
 
-#[trace("FR-024-AC-1", "FR-024-AC-14")]
+#[trace("FR-024-AC-1", "FR-024-AC-14", "FR-024-AC-20", "FR-024-AC-22")]
 #[test]
 fn snapshot_appends_one_record_with_every_catalog_id() {
     let rig = base_rig();
@@ -2262,6 +2262,7 @@ fn a_metric_moving_against_its_direction_twice_in_a_row_is_regressing() {
 }
 
 #[trace("FR-027-AC-11")]
+#[trace("FR-024-AC-21")]
 #[test]
 fn rising_retro_metrics_and_unnamed_wait_emit_structured_defects() {
     let records = vec![
@@ -2338,6 +2339,16 @@ fn delta_notification_is_opt_in_and_uses_the_configured_minder() {
         .is_err()
     );
     assert_eq!(sent_without_route, 0);
+
+    let mut sent_to_invalid_route = 0;
+    assert!(
+        ix_board::retro::notify_defects(&report, Some("QSL:minder"), |_, _| {
+            sent_to_invalid_route += 1;
+            Ok(())
+        })
+        .is_err()
+    );
+    assert_eq!(sent_to_invalid_route, 0);
 }
 
 /// Trace: FR-027-AC-3

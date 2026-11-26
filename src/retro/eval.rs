@@ -1065,6 +1065,7 @@ pub fn retro_adapters(
 /// Adapts an in-memory, read-only retro collection without appending it to the store.
 #[implements("FR-047-AC-1")]
 #[implements("FR-047-AC-9")]
+#[implements("FR-024-AC-20")]
 pub fn retro_record_adapters(
     specs: &[RoleSpec],
     record: Result<&super::Record, &str>,
@@ -3743,6 +3744,7 @@ mod tests {
 
     #[test]
     #[trace("FR-047-AC-9")]
+    #[trace("FR-024-AC-20")]
     fn retro_adapter_reads_hand_written_additive_churn_metrics() {
         let record: super::super::Record = serde_json::from_str(
             r#"{"schema_version":1,"kind":"snapshot","taken_at":"2026-11-14T22:13:20Z","team":"QSL","window":"24h","metrics":{"prs_per_ticket_max":{"id":"prs_per_ticket_max","status":"ok","value":3,"unit":"pull_requests","direction":"down","source":"linear+github","query":"attached pull requests per ticket","class":"rework"},"commits_per_pr_max":{"id":"commits_per_pr_max","status":"ok","value":7,"unit":"commits","direction":"down","source":"github","query":"commits on pull request","class":"rework"}}}"#,

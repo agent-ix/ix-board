@@ -227,6 +227,7 @@ pub(crate) fn compare_records(
 }
 
 #[implements("FR-027-AC-11")]
+#[implements("FR-024-AC-21")]
 fn delta_defects(metrics: &[MetricDelta]) -> Vec<DeltaDefect> {
     let mut defects = Vec::new();
     for metric in metrics.iter().filter(|metric| {
