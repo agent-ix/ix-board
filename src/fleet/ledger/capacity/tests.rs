@@ -73,6 +73,40 @@ fn capacity_config() -> FleetConfig {
     config
 }
 
+#[trace("FR-041-AC-17")]
+#[test]
+fn unrecorded_hosts_with_demand_excludes_uncovered_and_recorded_hosts() {
+    let (_dir, path) = path();
+    let ledger = Ledger::open(&path, &FleetConfig::default()).unwrap();
+    ledger
+        .connection
+        .execute_batch(
+            "INSERT INTO saturation_sample(
+                 host,at,deficit,ready_buffer,active_lanes,supplied_lanes,
+                 unsupplied_lanes,ready_share,registry_current,bootstrap_ticket_pool
+             ) VALUES
+               ('demanding',100,2,2,2,0,2,2,1,0),
+               ('no-demand',100,0,0,2,0,2,0,1,0),
+               ('recorded',100,3,2,2,0,2,2,1,0);
+             INSERT INTO capacity_level(host,level,recorded_at)
+               VALUES('recorded',1,50);",
+        )
+        .unwrap();
+
+    let observed = ledger
+        .connection
+        .prepare("SELECT host,deficit FROM unrecorded_hosts_with_demand ORDER BY host")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert_eq!(observed, vec![("demanding".to_owned(), 2)]);
+}
+
 fn sample(request: &WindowRequest) -> WindowMeasurements {
     let at = request.end_ms;
     let output_basis = value("tickets_prs".to_owned(), "ix-board.capacity", at);
@@ -849,19 +883,28 @@ fn duplicate_and_clumped_saturation_samples_do_not_inflate_window_coverage() {
 
 #[test]
 #[trace("FR-041-AC-11")]
-fn version_six_ledger_refreshes_output_share_provenance_columns() {
+fn version_six_view_refresh_restores_output_share_provenance_columns() {
     let (_dir, path) = path();
     let config = capacity_config();
-    drop(Ledger::open(&path, &config).unwrap());
+    let mut connection = Connection::open(&path).unwrap();
+    connection.execute_batch(super::super::schema::V1).unwrap();
+    let tx = connection.transaction().unwrap();
+    super::super::apply_v2(&tx, None).unwrap();
+    super::super::apply_v3(&tx, None).unwrap();
+    super::super::apply_v4(&tx).unwrap();
+    super::super::apply_v5(&tx).unwrap();
+    super::super::apply_v6(&tx).unwrap();
+    tx.commit().unwrap();
+    drop(connection);
     Connection::open(&path)
         .unwrap()
         .execute_batch(
-            "DROP VIEW host_output_share_of_recorded_level;
-             DROP VIEW unrecorded_hosts_with_demand;
-             DROP VIEW unrecorded_hosts_without_discovery_run;
-             DROP VIEW unrecorded_hosts_ready_for_discovery;
-             DROP VIEW drains_over_cap_without_escalation;
-             DROP VIEW raises_during_cool_off;
+            "DROP VIEW IF EXISTS host_output_share_of_recorded_level;
+             DROP VIEW IF EXISTS unrecorded_hosts_with_demand;
+             DROP VIEW IF EXISTS unrecorded_hosts_without_discovery_run;
+             DROP VIEW IF EXISTS unrecorded_hosts_ready_for_discovery;
+             DROP VIEW IF EXISTS drains_over_cap_without_escalation;
+             DROP VIEW IF EXISTS raises_during_cool_off;
              ALTER TABLE host_output_sample DROP COLUMN sample_interval_ms;
              ALTER TABLE saturation_sample DROP COLUMN source_basis;
              ALTER TABLE saturation_sample DROP COLUMN unavailable_reason;
@@ -872,8 +915,8 @@ fn version_six_ledger_refreshes_output_share_provenance_columns() {
              ALTER TABLE capacity_event DROP COLUMN ceiling_lanes",
         )
         .unwrap();
-    assert!(status(&path).unwrap().events.is_empty());
     drop(Ledger::open(&path, &config).unwrap());
+    assert!(status(&path).unwrap().events.is_empty());
     let connection = Connection::open(&path).unwrap();
     let columns = connection
         .prepare("PRAGMA table_info(host_output_share_of_recorded_level)")
@@ -1169,20 +1212,35 @@ fn version_three_ledger_migrates_additively_to_resumable_windows() {
     drop(Ledger::open(&path, &config).unwrap());
     {
         let connection = Connection::open(&path).unwrap();
-        for statement in crate::fleet::ledger::schema::CAPACITY_VIEWS {
-            let view = statement.split_whitespace().nth(2).unwrap();
+        for view in crate::fleet::ledger::schema::QUERYABLE {
+            if *view == "cycle_missed" {
+                continue;
+            }
             connection
                 .execute_batch(&format!("DROP VIEW {view}"))
                 .unwrap();
         }
         connection
             .execute_batch(
-                "ALTER TABLE capacity_step DROP COLUMN build_slots_busy;
+                "ALTER TABLE action_send DROP COLUMN sender_role;
+             DROP INDEX action_send_receipt_unique;
+             ALTER TABLE assignment_history DROP COLUMN sender_role;
+             ALTER TABLE assignment_history DROP COLUMN sender_addr;
+             ALTER TABLE cycle_missed DROP COLUMN at_ms;
+             ALTER TABLE session_turn DROP COLUMN transcript_id;
+             DROP TABLE lane_lead;
+             DROP TABLE failed_probe_tick;
+             DROP TABLE relay_order;
+             DROP TABLE relay_order_snapshot;
+             DROP TABLE host_build_pause_interval;
+             ALTER TABLE capacity_step DROP COLUMN build_slots_busy;
              ALTER TABLE capacity_step DROP COLUMN build_slots_sustainable;
              ALTER TABLE capacity_step DROP COLUMN measurement_values;
              ALTER TABLE action DROP COLUMN project;
              ALTER TABLE action DROP COLUMN requested_count;
              DROP TABLE capacity_throttle_sample;
+             DROP TABLE session_turn_stream_state;
+             DROP TABLE session_turn_session_role;
              ALTER TABLE capacity_event DROP COLUMN source_basis;
              ALTER TABLE host_output_sample DROP COLUMN source_basis;
              CREATE UNIQUE INDEX capacity_step_run_step ON capacity_step(run_id,step_no);

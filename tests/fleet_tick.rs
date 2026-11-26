@@ -97,7 +97,7 @@ struct Rig {
     settings: TickSettings,
     orders: StandingOrders,
     facts: TickFacts,
-    focus: BTreeMap<String, String>,
+    focus: BTreeMap<String, ix_board::fleet::focus::Focus>,
 }
 
 impl Rig {
@@ -994,7 +994,12 @@ fn executed_at_needs_positive_evidence_for_each_kind() {
     // for any WORKING lane.
     rig.assign(LANE, &["SWM-1"]);
     rig.tick(&report(T0 + 9000, vec![idle(LANE)], vec![]));
-    rig.focus.insert(LANE.to_owned(), "SWM-9".to_owned());
+    rig.focus.insert(
+        LANE.to_owned(),
+        ix_board::fleet::focus::Focus::Ticket {
+            ticket: "SWM-9".to_owned(),
+        },
+    );
     rig.tick(&report(T0 + 10_000, vec![working(LANE)], vec![]));
     assert_eq!(
         executed_of(&rig, ActionKind::PushNextTicket),
@@ -1002,7 +1007,12 @@ fn executed_at_needs_positive_evidence_for_each_kind() {
         "working on another ticket is not execution"
     );
     rig.tick(&report(T0 + 10_500, vec![idle(LANE)], vec![]));
-    rig.focus.insert(LANE.to_owned(), "swm-1".to_owned());
+    rig.focus.insert(
+        LANE.to_owned(),
+        ix_board::fleet::focus::Focus::Ticket {
+            ticket: "swm-1".to_owned(),
+        },
+    );
     rig.tick(&report(T0 + 11_000, vec![working(LANE)], vec![]));
     assert_eq!(
         executed_of(&rig, ActionKind::PushNextTicket)[1],
@@ -1470,8 +1480,8 @@ fn a_tick_completes_pending_assignments_and_reads_focus_through_the_shared_commi
         .unwrap()
         .execute(
             "INSERT INTO assignment_history(lane, ticket, assigned_at, order_id, expect_ticket,
-               sent_at, deadline_at, result) VALUES(?1, 'SWM-1', 1, 'o-1', 'SWM-1', 1, 2, 'pending')",
-            [LANE],
+               sent_at, deadline_at, result) VALUES(?1, 'SWM-1', ?2, 'o-1', 'SWM-1', ?2, ?3, 'pending')",
+            rusqlite::params![LANE, T0 + 1_000, T0 + 2_000],
         )
         .unwrap();
     let mut bus = FakeBus {

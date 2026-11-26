@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Agent-IX
 
 use super::*;
+use crate::fleet::assign::{AssignReport, AssignResult};
 use crate::fleet::report::{DefectKind, HostSummary, LaneRow};
 use ix_trace_rs::trace;
 
@@ -99,6 +100,27 @@ fn working_idle_idle_working_gives_ten_idle_minutes() {
     assert_eq!(idle[0]["minutes_with_ready_work"], 0.0);
 }
 
+#[trace("FR-039-AC-15")]
+#[test]
+fn time_to_action_uses_the_start_of_the_nonworking_episode() {
+    let (_dir, path) = path();
+    let mut ledger = open(&path);
+    for (at, class) in [
+        (0, ClassKind::Working),
+        (5, ClassKind::Idle),
+        (10, ClassKind::Idle),
+        (15, ClassKind::Working),
+    ] {
+        ledger.record_status(&report(at, &[("a", class)])).unwrap();
+    }
+    drop(ledger);
+    let p90 = rows(&path, "time_to_action_p90");
+    assert_eq!(p90.len(), 1);
+    assert_eq!(p90[0]["p90_minutes"], 10.0);
+    assert_eq!(p90[0]["sample_count"], 1);
+    assert_eq!(p90[0]["unbounded_count"], 0);
+}
+
 #[trace("FR-039-AC-2")]
 #[test]
 fn a_span_longer_than_twice_the_tick_interval_yields_no_minutes() {
@@ -166,17 +188,32 @@ fn version_five_ledger_adds_planner_action_columns_without_losing_rows() {
         .unwrap();
     drop(ledger);
     let connection = Connection::open(&path).unwrap();
-    for statement in schema::CAPACITY_VIEWS {
-        let view = statement.split_whitespace().nth(2).unwrap();
+    for view in schema::QUERYABLE {
+        if *view == "cycle_missed" {
+            continue;
+        }
         connection
             .execute_batch(&format!("DROP VIEW {view}"))
             .unwrap();
     }
     connection
         .execute_batch(
-            "ALTER TABLE action DROP COLUMN project;
+            "ALTER TABLE action_send DROP COLUMN sender_role;
+             DROP INDEX action_send_receipt_unique;
+             ALTER TABLE assignment_history DROP COLUMN sender_role;
+             ALTER TABLE assignment_history DROP COLUMN sender_addr;
+             ALTER TABLE cycle_missed DROP COLUMN at_ms;
+             ALTER TABLE session_turn DROP COLUMN transcript_id;
+             DROP TABLE lane_lead;
+             DROP TABLE failed_probe_tick;
+             DROP TABLE relay_order;
+             DROP TABLE relay_order_snapshot;
+             DROP TABLE host_build_pause_interval;
+             ALTER TABLE action DROP COLUMN project;
              ALTER TABLE action DROP COLUMN requested_count;
              DROP TABLE capacity_throttle_sample;
+             DROP TABLE session_turn_stream_state;
+             DROP TABLE session_turn_session_role;
              ALTER TABLE capacity_event DROP COLUMN source_basis;
              ALTER TABLE host_output_sample DROP COLUMN source_basis;
              PRAGMA user_version=5;",
@@ -324,17 +361,17 @@ fn an_unsupported_schema_version_is_refused_without_a_change() {
     drop(open(&path));
     Connection::open(&path)
         .unwrap()
-        .pragma_update(None, "user_version", 9)
+        .pragma_update(None, "user_version", 10)
         .unwrap();
     let before = std::fs::read(&path).unwrap();
     let error = Ledger::open(&path, &FleetConfig::default()).err().unwrap();
     assert!(matches!(
         error,
-        LedgerError::UnsupportedVersion { found: 9, .. }
+        LedgerError::UnsupportedVersion { found: 10, .. }
     ));
     assert!(matches!(
         query(&path, "defect_rows", None),
-        Err(LedgerError::UnsupportedVersion { found: 9, .. })
+        Err(LedgerError::UnsupportedVersion { found: 10, .. })
     ));
     assert_eq!(std::fs::read(&path).unwrap(), before);
 }
@@ -418,8 +455,8 @@ fn seed_v2_capacity_rows(path: &Path) {
 fn a_crash_mid_migration_leaves_the_version_one_ledger_intact_and_openable() {
     let (_dir, path) = path();
     seed_v1(&path);
-    let total = schema::V2.len() + schema::views().len();
-    for fail_at in [0, 20, total - 1] {
+    let v2_steps = schema::V2.len();
+    for fail_at in [0, v2_steps / 2, v2_steps - 1] {
         let error = Ledger::open_with(&path, &FleetConfig::default(), Some((fail_at, usize::MAX)))
             .err()
             .unwrap();
@@ -532,7 +569,12 @@ fn migration_is_one_transaction_and_a_later_version_is_refused() {
         "session_turn",
         "cycle_event",
         "cycle_missed",
+        "lane_lead",
+        "failed_probe_tick",
         "dialog_answer",
+        "relay_order_snapshot",
+        "relay_order",
+        "host_build_pause_interval",
         "capacity_run",
         "capacity_step",
         "capacity_step_lane_output",
@@ -559,7 +601,7 @@ fn migration_is_one_transaction_and_a_later_version_is_refused() {
         .unwrap();
     assert!(matches!(
         Ledger::open(&path, &FleetConfig::default()),
-        Err(LedgerError::UnsupportedVersion { found: 7, .. })
+        Err(LedgerError::UnsupportedVersion { found, .. }) if found == VERSION + 1
     ));
 }
 
@@ -604,6 +646,316 @@ fn idle_with_ready_work_views_equal_the_hand_computed_values() {
     assert_eq!(a["minutes_with_ready_work"], 35.0);
     let b = idle.iter().find(|r| r["lane"] == "b").unwrap();
     assert_eq!(b["minutes_with_ready_work"], 0.0);
+}
+
+#[trace("FR-039-AC-15")]
+#[test]
+fn role_metric_views_return_hand_computed_values() {
+    let (_dir, path) = path();
+    let mut ledger = open(&path);
+    for (at, a, b) in [
+        (0, ClassKind::Idle, ClassKind::Blocked),
+        (5, ClassKind::Idle, ClassKind::Blocked),
+        (10, ClassKind::Working, ClassKind::Working),
+        (15, ClassKind::Idle, ClassKind::Working),
+    ] {
+        ledger
+            .record_status(&report(at, &[("a", a), ("b", b)]))
+            .unwrap();
+    }
+    ledger
+        .connection
+        .execute_batch(
+            "UPDATE lane_tick SET ready_work_available = 1, remaining_assigned = 1
+               WHERE lane = 'a' AND class = 'IDLE';
+             INSERT INTO tick(started_at,committed_at) VALUES(0,600000);
+             INSERT INTO action(tick_id,kind,lane,emitted_at,executed_at,target_role,target_addr)
+               VALUES(1,'answer_dialog','b',0,300000,'lane','b');
+             INSERT INTO action(tick_id,kind,lane,emitted_at,target_role,target_addr)
+               VALUES(1,'answer_dialog','a',0,'lane','a');
+             INSERT INTO action(tick_id,kind,project,emitted_at,requested_count,target_role,target_addr)
+               VALUES(1,'need_ready_tickets','project-one',0,2,'planner','planner:one');
+             INSERT INTO action(tick_id,kind,project,emitted_at,requested_count,target_role,target_addr)
+               VALUES(1,'need_ready_tickets','project-two',0,3,'planner','planner:two');
+             INSERT INTO action_send(action_id,sent_at,sender_addr,recipient_addr,receipt_id)
+               VALUES(3,1,'minder','planner:two','receipt-1');
+             INSERT INTO defect(source,host,kind,first_seen_at)
+               VALUES('probe:relay','mac','unreadable_source',0);
+             INSERT INTO assignment_history(lane,ticket,assigned_at,order_id,sent_at,deadline_at,
+               result,result_at,confirm_latency_s)
+               VALUES('a','TEST-1',0,'order-a',0,600000,'confirmed',600000,300);
+             INSERT INTO assignment_history(lane,ticket,assigned_at,order_id,sent_at,deadline_at,
+               result,result_at,confirm_latency_s)
+               VALUES('b','TEST-2',0,'order-b',0,600000,'timed_out',900000,NULL);
+             INSERT INTO drift_finding(lane,rule,opened_at,closed_at)
+               VALUES('a','not_assigned',660000,780000);
+             INSERT INTO drift_finding(lane,rule,opened_at,closed_at)
+               VALUES('a','not_in_plan',720000,780000);",
+        )
+        .unwrap();
+    drop(ledger);
+
+    let idle_capacity = rows(&path, "idle_capacity_minutes_with_ready_work");
+    assert_eq!(idle_capacity[0]["slot_minutes"], 10.0);
+    assert_eq!(idle_capacity[0]["available"], 1);
+    let time_to_action = rows(&path, "time_to_action_p90");
+    assert!(time_to_action[0]["p90_minutes"].is_null());
+    assert_eq!(time_to_action[0]["unbounded_count"], 1);
+    assert_eq!(rows(&path, "missed_idle_minutes")[0]["minutes"], 10.0);
+    let detection = rows(&path, "detection_to_action_p90");
+    assert!(detection[0]["p90_minutes"].is_null());
+    assert_eq!(detection[0]["unbounded_count"], 1);
+    let assignment = rows(&path, "assignment_confirm_latency_p90");
+    assert!(assignment[0]["p90_minutes"].is_null());
+    assert_eq!(assignment[0]["unbounded_count"], 1);
+    assert_eq!(
+        rows(&path, "drift_lane_minutes_share")[0]["share_percent"],
+        20.0
+    );
+    assert_eq!(rows(&path, "blocked_lane_minutes")[0]["minutes"], 10.0);
+    let pause = rows(&path, "idle_lane_minutes_during_build_pause");
+    assert!(pause[0]["minutes"].is_null());
+    assert_eq!(pause[0]["available"], 0);
+    assert_eq!(pause[0]["unavailable_reason"], "no pause producer");
+    assert_eq!(rows(&path, "need_ready_tickets_actions").len(), 2);
+    let due = rows(&path, "need_ready_tickets_due");
+    assert_eq!(due[0]["project"], "project-one");
+    assert_eq!(due[0]["requested_count"], 2);
+    assert_eq!(due[0]["emitted_at"], 0);
+    assert!(due[0]["resolved_at"].is_null());
+    assert_eq!(due[0]["at_ms"], 86_400_000);
+    let project_lane: Option<String> = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT lane FROM action WHERE kind='need_ready_tickets' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(project_lane, None);
+    assert_eq!(
+        rows(&path, "need_ready_tickets_without_planner_order").len(),
+        2
+    );
+    assert_eq!(rows(&path, "probe_failure_without_routed_defect").len(), 1);
+}
+
+#[trace("FR-039-AC-15")]
+#[test]
+fn capacity_views_report_unavailable_when_ready_or_assignment_sources_are_missing() {
+    let (_dir, path) = path();
+    let mut ledger = open(&path);
+    for at in [0, 5, 10] {
+        ledger
+            .record_status(&report(
+                at,
+                &[
+                    ("idle", ClassKind::Idle),
+                    ("unreachable", ClassKind::Unreachable),
+                ],
+            ))
+            .unwrap();
+    }
+    drop(ledger);
+    let idle = rows(&path, "idle_capacity_minutes_with_ready_work");
+    assert_eq!(idle.len(), 1);
+    assert_eq!(idle[0]["available"], 0);
+    assert!(idle[0]["slot_minutes"].is_null());
+    assert_eq!(
+        idle[0]["unavailable_reason"],
+        "ready work source unavailable"
+    );
+    let missed = rows(&path, "missed_idle_minutes");
+    assert_eq!(missed.len(), 1);
+    assert_eq!(missed[0]["available"], 0);
+    assert!(missed[0]["minutes"].is_null());
+    assert_eq!(
+        missed[0]["unavailable_reason"],
+        "assignment source unavailable"
+    );
+    assert!(
+        rows(&path, "idle_minutes")
+            .iter()
+            .all(|row| row["lane"] != "unreachable")
+    );
+}
+
+#[trace("FR-039-AC-15")]
+#[test]
+fn assignment_writer_records_order_focus_but_all_orders_view_stays_unavailable() {
+    let (_dir, path) = path();
+    let mut ledger = open(&path);
+    let report = AssignReport {
+        sender_role: "orchestrator".into(),
+        sender_addr: "test-server:test-workspace:test-lead".into(),
+        lane: "test-server:test-workspace:test-coder".into(),
+        tickets: vec!["SWM-1".into()],
+        order_id: Some("order-1".into()),
+        expect_ticket: "SWM-1".into(),
+        started_at_ms: 1_000,
+        sent_at_ms: Some(1_000),
+        deadline_at_ms: Some(301_000),
+        result: AssignResult::Confirmed,
+        result_at_ms: Some(2_000),
+        confirm_latency_s: Some(1),
+        focus_at_deadline: Some("SWM-1".into()),
+        list_version: Some(2),
+        previous_tickets: Vec::new(),
+        list_write_error: None,
+        defects: Vec::new(),
+    };
+    ledger.upsert_assignment(None, &report).unwrap();
+    let saved: (String, i64) = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT order_id,sent_at FROM order_focus_at_deadline WHERE order_id='order-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(saved, ("order-1".to_owned(), 1_000));
+    let due = rows(&path, "lane_orders_due");
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0]["available"], 0);
+    assert_eq!(
+        due[0]["unavailable_reason"],
+        "relay all-orders source has not been read"
+    );
+}
+
+#[trace("FR-039-AC-20")]
+#[test]
+fn probe_defect_route_records_ticket_and_relay_time_once() {
+    let (_dir, path) = path();
+    let mut ledger = open(&path);
+    let mut report = report(1, &[]);
+    report.defects.push(defect("probe:relay", 1));
+    ledger.record_status(&report).unwrap();
+    ledger.record_defect_route(1, "SWM-900", 60_000).unwrap();
+    assert!(ledger.record_defect_route(999, "SWM-900", 60_000).is_err());
+    let defect = rows(&path, "defect_rows");
+    assert_eq!(defect[0]["routed_ticket"], "SWM-900");
+    assert_eq!(defect[0]["routed_at"], 60_000);
+    assert!(ledger.record_defect_route(1, "SWM-901", 60_001).is_err());
+    ledger
+        .connection
+        .execute(
+            "INSERT INTO defect(source,kind,first_seen_at,closed_at)
+             VALUES('probe:relay','unreadable_source',10,20)",
+            [],
+        )
+        .unwrap();
+    assert!(ledger.record_defect_route(2, "SWM-902", 60_001).is_err());
+    ledger
+        .connection
+        .execute(
+            "INSERT INTO defect(source,kind,first_seen_at) VALUES('relay','unreadable_source',10)",
+            [],
+        )
+        .unwrap();
+    assert!(ledger.record_defect_route(3, "SWM-903", 60_001).is_err());
+    assert_eq!(rows(&path, "failed_probe_ticks").len(), 1);
+    assert!(rows(&path, "probe_failure_without_routed_defect").is_empty());
+}
+
+#[trace("FR-039-AC-9")]
+#[test]
+fn version_two_ledgers_migrate_to_role_metric_views_without_losing_rows() {
+    let (_dir, path) = path();
+    let mut connection = Connection::open(&path).unwrap();
+    let tx = connection.transaction().unwrap();
+    tx.execute_batch(schema::V1).unwrap();
+    apply_v2(&tx, None).unwrap();
+    tx.execute_batch(
+        "INSERT INTO action(kind,emitted_at) VALUES('preserved',7);
+         INSERT INTO order_focus_at_deadline(order_id,sender_role,sender_addr,lane,expect_ticket,
+           deadline_at,focus_ticket,outcome) VALUES
+           ('old-order','minder','minder:one','lane:one','SWM-7',1000,'SWM-7','confirmed');",
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    drop(open(&path));
+    assert_eq!(count(&path, "PRAGMA user_version"), VERSION);
+    assert_eq!(count(&path, "SELECT emitted_at FROM action"), 7);
+    assert_eq!(
+        count(
+            &path,
+            "SELECT COUNT(*) FROM order_focus_at_deadline WHERE order_id='old-order'"
+        ),
+        1
+    );
+    for view in schema::QUERYABLE {
+        query(&path, view, None).unwrap();
+    }
+}
+
+#[trace("FR-039-AC-15")]
+#[test]
+fn session_turn_rows_are_readable_with_relay_time_filtering() {
+    let (_dir, path) = path();
+    let ledger = open(&path);
+    ledger
+        .connection
+        .execute(
+            "INSERT INTO session_turn(session_addr,session_role,started_at,transcript_id)
+             VALUES('test-server:test-workspace:test-minder','minder',1200,'session-1200')",
+            [],
+        )
+        .unwrap();
+    drop(ledger);
+
+    let rows = query(&path, "session_turn_rows", Some(Duration::from_millis(1))).unwrap();
+    assert_eq!(rows.rows.len(), 1);
+    assert_eq!(
+        rows.rows[0]["session_addr"],
+        "test-server:test-workspace:test-minder"
+    );
+    assert_eq!(rows.rows[0]["session_role"], "minder");
+    assert_eq!(rows.rows[0]["started_at"], 1200);
+    assert_eq!(rows.rows[0]["transcript_id"], "session-1200");
+    assert_eq!(rows.rows[0]["at_ms"], 1200);
+}
+
+#[trace("FR-039-AC-14")]
+#[test]
+fn version_seven_migration_adds_nullable_transcript_id_without_rewriting_turns() {
+    let (_dir, path) = path();
+    let ledger = open(&path);
+    ledger
+        .connection
+        .execute(
+            "INSERT INTO session_turn(session_addr,session_role,started_at)
+             VALUES('test-server:test-workspace:test-minder','minder',1200)",
+            [],
+        )
+        .unwrap();
+    drop(ledger);
+
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "DROP VIEW session_turn_stream_coverage;
+             DROP VIEW session_turn_rows;
+             DROP TABLE session_turn_stream_state;
+             DROP TABLE session_turn_session_role;
+             ALTER TABLE session_turn DROP COLUMN transcript_id;
+             CREATE VIEW session_turn_rows AS
+               SELECT session_addr,session_role,started_at,started_at AS at_ms FROM session_turn;
+             PRAGMA user_version=7;",
+        )
+        .unwrap();
+
+    drop(open(&path));
+    assert_eq!(count(&path, "PRAGMA user_version"), 9);
+    let rows = query(&path, "session_turn_rows", Some(Duration::from_millis(1))).unwrap();
+    assert_eq!(rows.rows.len(), 1);
+    assert_eq!(
+        rows.rows[0]["session_addr"],
+        "test-server:test-workspace:test-minder"
+    );
+    assert_eq!(rows.rows[0]["started_at"], 1200);
+    assert!(rows.rows[0]["transcript_id"].is_null());
 }
 
 #[test]
@@ -753,7 +1105,7 @@ fn retention_never_prunes_open_rows() {
         ("plan_coverage_gap", "closed_at IS NULL", 1),
         ("action", "resolved_at IS NULL", 1),
         ("cycle_event", "ended_at IS NULL", 1),
-        ("capacity_level", "superseded_at IS NULL", 2),
+        ("capacity_level", "superseded_at IS NULL", 1),
     ] {
         assert_eq!(
             count(&path, &format!("SELECT COUNT(*) FROM {table}")),

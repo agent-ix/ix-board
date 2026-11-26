@@ -11,6 +11,7 @@ use super::config::{
 };
 use super::live::series;
 use super::{FleetConfig, SourceError};
+use ix_trace_rs::implements;
 use relay_core::fleet::{HostLaneList, fleet_registry};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -38,20 +39,81 @@ pub struct RegInfo {
 pub struct RawEvent {
     /// Lane address.
     pub addr: String,
+    /// Harness session identifier copied from the relay event's `session` field.
+    /// This is the transcript identifier when present; it is never inferred from `addr`.
+    pub transcript_id: Option<String>,
+    /// Configured role copied from the relay event's `role` field on `session_start` events.
+    pub session_role: Option<String>,
     /// Event.
     pub event: HookEvent,
 }
 
 /// Parses a stored relay activity event (`addr`, `server_ms`, `kind`); `None` when unreadable.
+#[implements("FR-039-AC-14")]
 pub fn parse_event(json: &str) -> Option<RawEvent> {
     let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let kind = HookKind::parse(value.get("kind")?.as_str()?)?;
     Some(RawEvent {
         addr: value.get("addr")?.as_str()?.to_owned(),
+        transcript_id: value
+            .get("session")
+            .and_then(serde_json::Value::as_str)
+            .filter(|session| !session.trim().is_empty())
+            .map(str::to_owned),
+        session_role: (kind == HookKind::SessionStart)
+            .then(|| value.get("role").and_then(serde_json::Value::as_str))
+            .flatten()
+            .filter(|role| !role.trim().is_empty())
+            .map(str::to_owned),
         event: HookEvent {
             server_ms: value.get("server_ms")?.as_i64()?,
-            kind: HookKind::parse(value.get("kind")?.as_str()?)?,
+            kind,
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use ix_trace_rs::trace;
+
+    use super::*;
+
+    #[trace("FR-039-AC-14")]
+    #[test]
+    fn parse_event_copies_only_the_authoritative_session_field_as_transcript_id() {
+        let event = parse_event(
+            r#"{"addr":"test-server:test-workspace:test-minder","server_ms":42,"kind":"prompt","session":"opaque-session-id"}"#,
+        )
+        .expect("well-formed relay prompt event");
+
+        assert_eq!(event.transcript_id.as_deref(), Some("opaque-session-id"));
+        assert_eq!(event.session_role, None);
+        assert_eq!(event.addr, "test-server:test-workspace:test-minder");
+        assert_eq!(event.event.kind, HookKind::Prompt);
+    }
+
+    #[trace("FR-039-AC-14")]
+    #[test]
+    fn parse_event_copies_configured_role_from_session_start_only() {
+        let event = parse_event(
+            r#"{"addr":"test-server:test-workspace:test-coder","server_ms":41,"kind":"session_start","session":"opaque-session-id","role":"coder"}"#,
+        )
+        .expect("well-formed relay session-start event");
+
+        assert_eq!(event.session_role.as_deref(), Some("coder"));
+        assert_eq!(event.transcript_id.as_deref(), Some("opaque-session-id"));
+    }
+
+    #[trace("FR-039-AC-14")]
+    #[test]
+    fn parse_event_does_not_infer_transcript_id_from_address() {
+        let event = parse_event(
+            r#"{"addr":"test-server:test-workspace:test-minder","server_ms":42,"kind":"prompt"}"#,
+        )
+        .expect("well-formed relay prompt event without a session field");
+
+        assert_eq!(event.transcript_id, None);
+    }
 }
 
 /// Everything read from the relay in one pass.
@@ -73,6 +135,8 @@ pub struct RelaySnapshot {
     pub registration_defects: Vec<String>,
     /// The activity stream is absent or empty.
     pub activity_absent: bool,
+    /// The bounded relay activity read reached its event cap, so history may be incomplete.
+    pub activity_stream_capped: bool,
     /// No host lane list exists.
     pub lane_registry_absent: bool,
 }
@@ -325,6 +389,21 @@ pub struct FleetReport {
 }
 
 impl FleetReport {
+    /// Records a source defect without misclassifying it as a ledger write failure.
+    pub fn add_unreadable_source(&mut self, source: &str, reason: String) {
+        self.defects.push(Defect {
+            kind: DefectKind::UnreadableSource,
+            source: source.to_owned(),
+            host: None,
+            lane: None,
+            reason,
+            observed_ms: self.run_ms,
+            first_seen_ms: None,
+        });
+        self.defects.sort();
+        self.complete = false;
+    }
+
     /// Adds the `ledger_unwritable` defect for a run whose ledger write failed.
     pub fn add_ledger_defect(&mut self, reason: String) {
         self.defects.push(Defect {

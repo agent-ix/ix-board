@@ -210,6 +210,11 @@ enum FleetCommand {
         #[command(subcommand)]
         command: LedgerCommand,
     },
+    /// Record the beginning or end of an orchestrator loop cycle.
+    Cycle {
+        #[command(subcommand)]
+        command: CycleCommand,
+    },
     /// Read capacity discovery runs, measurements and sustainable levels.
     Capacity {
         #[command(subcommand)]
@@ -224,6 +229,25 @@ enum SaturationCommand {
 }
 
 #[derive(Subcommand, Debug)]
+enum CycleCommand {
+    /// Start a cycle for one relay session.
+    Start {
+        /// Session address that owns the cycle.
+        #[arg(long)]
+        session: String,
+        /// Configured cycle interval, for example 10m.
+        #[arg(long, value_parser = parse_duration)]
+        interval: Option<u64>,
+    },
+    /// End the newest open cycle for one relay session.
+    End {
+        /// Session address that owns the cycle.
+        #[arg(long)]
+        session: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum LedgerCommand {
     /// Print the rows of one ledger view without writing.
     Query {
@@ -232,6 +256,13 @@ enum LedgerCommand {
         /// Only rows within this window before the newest run (for example 90s, 20m, 4h).
         #[arg(long, value_parser = parse_duration)]
         since: Option<u64>,
+    },
+    /// Record the Linear ticket that owns an open probe defect.
+    RouteDefect {
+        /// Ledger defect id.
+        defect_id: i64,
+        /// Ticket identifier that was filed for the defect.
+        ticket: String,
     },
 }
 
@@ -516,6 +547,12 @@ enum Output {
     Agents(AgentsReport),
     Fleet(ix_board::fleet::FleetReport),
     FleetLedger(ix_board::fleet::ledger::LedgerRows),
+    FleetDefectRoute {
+        defect_id: i64,
+        ticket: String,
+        routed_at_ms: i64,
+    },
+    FleetCycle(FleetCycleReport),
     FleetAssign(ix_board::fleet::assign::AssignReport),
     FleetTick(ix_board::fleet::tick::TickOutput),
     FleetSaturation(ix_board::fleet::saturation::SaturationReport),
@@ -544,6 +581,16 @@ enum Output {
     Reconcile(ReconcileReport),
     Chain(ChainReport),
     Orphans(OrphansReport),
+}
+
+#[derive(Serialize)]
+struct FleetCycleReport {
+    operation: String,
+    session_addr: String,
+    started_at_ms: Option<i64>,
+    ended_at_ms: Option<i64>,
+    interval_s: Option<i64>,
+    cycle_id: Option<i64>,
 }
 
 fn parse_project_status(value: &str) -> Result<ProjectRunStatus, String> {
@@ -636,7 +683,8 @@ fn main() -> std::process::ExitCode {
             }
             std::process::ExitCode::from(match error {
                 Error::Assign(ref assign) if assign.operational() => Outcome::Internal,
-                Error::Fleet(ix_board::fleet::FleetError::Tick(_)) => Outcome::Internal,
+                Error::Fleet(ix_board::fleet::FleetError::Tick(_))
+                | Error::Fleet(ix_board::fleet::FleetError::Relay(_)) => Outcome::Internal,
                 Error::InvalidTeam
                 | Error::InvalidQuery
                 | Error::ProjectNotFound { .. }
@@ -829,6 +877,26 @@ fn run(command: Command) -> Result<Output, Error> {
                     command: LedgerCommand::Query { view, since },
                 },
         } => run_fleet_ledger_query(&view, since).map(Output::FleetLedger),
+        Command::Fleet {
+            command:
+                FleetCommand::Ledger {
+                    command: LedgerCommand::RouteDefect { defect_id, ticket },
+                },
+        } => run_fleet_ledger_route_defect(defect_id, &ticket).map(|routed_at_ms| {
+            Output::FleetDefectRoute {
+                defect_id,
+                ticket,
+                routed_at_ms,
+            }
+        }),
+        Command::Fleet {
+            command: FleetCommand::Cycle { command },
+        } => match command {
+            CycleCommand::Start { session, interval } => {
+                run_fleet_cycle_start(&session, interval).map(Output::FleetCycle)
+            }
+            CycleCommand::End { session } => run_fleet_cycle_end(&session).map(Output::FleetCycle),
+        },
         Command::Fleet {
             command:
                 FleetCommand::Capacity {
@@ -1058,6 +1126,7 @@ fn count_roadmap_from_cache(
     }
 }
 
+#[implements("FR-039-AC-14")]
 fn run_fleet_status() -> Result<ix_board::fleet::FleetReport, Error> {
     use ix_board::fleet::live;
     let settings = ix_board::settings_value()?;
@@ -1074,6 +1143,11 @@ fn run_fleet_status() -> Result<ix_board::fleet::FleetReport, Error> {
             Err(error) => std::sync::Arc::new(live::UnavailablePrometheus(error.to_string())),
         });
     let (relay, receipts) = live::read_relay(config.host_timeout);
+    let role_observations = relay
+        .as_ref()
+        .ok()
+        .map(|snapshot| snapshot.events.clone())
+        .unwrap_or_default();
     let sources = ix_board::fleet::Sources {
         relay,
         series,
@@ -1086,14 +1160,33 @@ fn run_fleet_status() -> Result<ix_board::fleet::FleetReport, Error> {
             i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
         });
     let mut report = ix_board::fleet::build_report(&config, &sources, local_now_ms);
-    record_run(&config, &mut report);
+    let tick_settings = match ix_board::fleet::tick::TickSettings::from_toml(settings.as_ref()) {
+        Ok(settings) => settings,
+        Err(error) => {
+            report.add_unreadable_source("config:fleet_tick", error.to_string());
+            ix_board::fleet::tick::TickSettings::default()
+        }
+    };
+    record_run(&config, &tick_settings, &role_observations, &mut report);
     Ok(report)
 }
 
 /// Commits the run, completing the `assignment_history` rows a killed `fleet assign` left pending, or
 /// confirmed before their deadline, in the same pass (FR-035 behavior 10). A relay that cannot be
 /// reached is already a defect of the report, and the run is recorded without the completion.
-fn record_run(config: &ix_board::fleet::FleetConfig, report: &mut ix_board::fleet::FleetReport) {
+#[implements("FR-039-AC-14")]
+fn record_run(
+    config: &ix_board::fleet::FleetConfig,
+    tick_settings: &ix_board::fleet::tick::TickSettings,
+    role_observations: &[ix_board::fleet::RawEvent],
+    report: &mut ix_board::fleet::FleetReport,
+) {
+    ix_board::fleet::live::record_session_turn_page(
+        config,
+        tick_settings,
+        role_observations,
+        report,
+    );
     let relay = relay_core::config::load_core(relay_core::config::CoreFlags::default())
         .ok()
         .and_then(|settings| {
@@ -1103,7 +1196,12 @@ fn record_run(config: &ix_board::fleet::FleetConfig, report: &mut ix_board::flee
         });
     match relay {
         Some(mut relay) => {
-            ix_board::fleet::ledger::record_status_completing(config, report, &mut relay);
+            ix_board::fleet::ledger::record_status_completing(
+                config,
+                tick_settings,
+                report,
+                &mut relay,
+            );
         }
         None => ix_board::fleet::ledger::record_status(config, report),
     }
@@ -1122,6 +1220,89 @@ fn run_fleet_ledger_query(
     let path = ledger::resolve_path(&config).map_err(|e| FleetError::Ledger(e.to_string()))?;
     ledger::query(&path, view, since.map(std::time::Duration::from_secs))
         .map_err(|e| Error::Fleet(FleetError::Ledger(e.to_string())))
+}
+
+#[implements("FR-039-AC-20")]
+fn run_fleet_ledger_route_defect(defect_id: i64, ticket: &str) -> Result<i64, Error> {
+    use ix_board::fleet::{FleetError, ledger};
+    let settings = ix_board::settings_value()?;
+    let config = ix_board::fleet::FleetConfig::from_toml(
+        settings.as_ref(),
+        std::env::var("IX_PROMETHEUS_URL").ok(),
+    )?;
+    let (relay, _receipts) = ix_board::fleet::live::read_relay(config.host_timeout);
+    let relay = relay.map_err(|error| Error::Fleet(FleetError::Relay(error.to_string())))?;
+    let path = ledger::resolve_path(&config).map_err(|e| FleetError::Ledger(e.to_string()))?;
+    let mut store = ledger::Ledger::open(&path, &config)
+        .map_err(|e| Error::Fleet(FleetError::Ledger(e.to_string())))?;
+    store
+        .record_defect_route(defect_id, ticket, relay.now_ms)
+        .map_err(|e| Error::Fleet(FleetError::Ledger(e.to_string())))?;
+    Ok(relay.now_ms)
+}
+
+#[implements("FR-044-AC-1")]
+fn run_fleet_cycle_start(
+    session_addr: &str,
+    interval_s: Option<u64>,
+) -> Result<FleetCycleReport, Error> {
+    use ix_board::fleet::{FleetError, ledger};
+    let settings = ix_board::settings_value()?;
+    let config = ix_board::fleet::FleetConfig::from_toml(
+        settings.as_ref(),
+        std::env::var("IX_PROMETHEUS_URL").ok(),
+    )?;
+    let (relay, _receipts) = ix_board::fleet::live::read_relay(config.host_timeout);
+    let relay = relay.map_err(|error| Error::Fleet(FleetError::Relay(error.to_string())))?;
+    let path = ledger::resolve_path(&config).map_err(|e| FleetError::Ledger(e.to_string()))?;
+    let mut store = ledger::Ledger::open(&path, &config)
+        .map_err(|e| Error::Fleet(FleetError::Ledger(e.to_string())))?;
+    let interval_s = interval_s
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| {
+            Error::Fleet(FleetError::Config(
+                "cycle interval overflows i64".to_owned(),
+            ))
+        })?
+        .unwrap_or_else(|| i64::try_from(config.cycle_interval.as_secs()).unwrap_or(i64::MAX));
+    let cycle_id = store
+        .cycle_start(session_addr, relay.now_ms, interval_s)
+        .map_err(|e| Error::Fleet(FleetError::Ledger(e)))?;
+    Ok(FleetCycleReport {
+        operation: "start".to_owned(),
+        session_addr: session_addr.to_owned(),
+        started_at_ms: Some(relay.now_ms),
+        ended_at_ms: None,
+        interval_s: Some(interval_s),
+        cycle_id: Some(cycle_id),
+    })
+}
+
+#[implements("FR-044-AC-1")]
+fn run_fleet_cycle_end(session_addr: &str) -> Result<FleetCycleReport, Error> {
+    use ix_board::fleet::{FleetError, ledger};
+    let settings = ix_board::settings_value()?;
+    let config = ix_board::fleet::FleetConfig::from_toml(
+        settings.as_ref(),
+        std::env::var("IX_PROMETHEUS_URL").ok(),
+    )?;
+    let (relay, _receipts) = ix_board::fleet::live::read_relay(config.host_timeout);
+    let relay = relay.map_err(|error| Error::Fleet(FleetError::Relay(error.to_string())))?;
+    let path = ledger::resolve_path(&config).map_err(|e| FleetError::Ledger(e.to_string()))?;
+    let mut store = ledger::Ledger::open(&path, &config)
+        .map_err(|e| Error::Fleet(FleetError::Ledger(e.to_string())))?;
+    store
+        .cycle_end(session_addr, relay.now_ms)
+        .map_err(|e| Error::Fleet(FleetError::Ledger(e)))?;
+    Ok(FleetCycleReport {
+        operation: "end".to_owned(),
+        session_addr: session_addr.to_owned(),
+        started_at_ms: None,
+        ended_at_ms: Some(relay.now_ms),
+        interval_s: None,
+        cycle_id: None,
+    })
 }
 
 #[implements("FR-041-AC-17")]
@@ -1843,6 +2024,22 @@ fn render_human(output: &Output) -> String {
         Output::Fleet(report) => ix_board::fleet::render_text(report),
         Output::FleetAssign(report) => ix_board::fleet::assign::render_text(report),
         Output::FleetLedger(rows) => rows.render_text(),
+        Output::FleetDefectRoute {
+            defect_id,
+            ticket,
+            routed_at_ms,
+        } => {
+            format!("routed defect {defect_id} to {ticket} at relay-ms {routed_at_ms}")
+        }
+        Output::FleetCycle(report) => format!(
+            "{} cycle for {} at relay-ms {}",
+            report.operation,
+            report.session_addr,
+            report
+                .ended_at_ms
+                .or(report.started_at_ms)
+                .unwrap_or_default()
+        ),
         Output::FleetTick(tick) => tick.render_text(),
         Output::FleetSaturation(report) => serde_json::to_string_pretty(report)
             .unwrap_or_else(|error| format!("could not render fleet saturation JSON: {error}")),
@@ -3429,7 +3626,9 @@ mod fleet_assign_output {
 
     fn report(result: AssignResult) -> AssignReport {
         AssignReport {
-            lane: "terra:SWM:one".into(),
+            sender_role: "orchestrator".into(),
+            sender_addr: "test-server:test-workspace:test-lead".into(),
+            lane: "test-server:test-workspace:test-lane".into(),
             tickets: vec!["SWM-211".into()],
             order_id: Some("order-1".into()),
             expect_ticket: "SWM-211".into(),

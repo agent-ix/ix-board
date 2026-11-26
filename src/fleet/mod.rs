@@ -45,6 +45,9 @@ pub enum FleetError {
     /// The ledger could not be read.
     #[error("fleet ledger: {0}")]
     Ledger(String),
+    /// The live relay could not be read.
+    #[error("fleet relay: {0}")]
+    Relay(String),
     /// The tick could not evaluate the fleet and committed nothing.
     #[error("fleet tick could not evaluate: {0}")]
     Tick(String),

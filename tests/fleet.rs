@@ -34,6 +34,8 @@ fn ev(kind: HookKind, secs_ago: u64) -> HookEvent {
 fn raw(addr: &str, kind: HookKind, secs_ago: u64) -> RawEvent {
     RawEvent {
         addr: addr.to_owned(),
+        transcript_id: None,
+        session_role: None,
         event: ev(kind, secs_ago),
     }
 }

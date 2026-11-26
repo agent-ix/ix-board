@@ -969,17 +969,41 @@ fn a_command_killed_after_the_send_leaves_pending_and_the_next_run_completes_it(
     assert!(rows[0].order_id.is_some() && rows[0].result_at.is_none());
 
     // Before the deadline a run leaves the row alone.
-    assert_eq!(complete_pending(&ledger.config, &mut relay).unwrap(), 0);
+    assert_eq!(
+        complete_pending(
+            &ledger.config,
+            &ix_board::fleet::tick::TickSettings::default(),
+            &mut relay,
+        )
+        .unwrap(),
+        0
+    );
     assert_eq!(ledger.rows()[0].result, "pending");
 
     wait_past(&mut relay, rows[0].deadline_at.unwrap());
-    assert_eq!(complete_pending(&ledger.config, &mut relay).unwrap(), 1);
+    assert_eq!(
+        complete_pending(
+            &ledger.config,
+            &ix_board::fleet::tick::TickSettings::default(),
+            &mut relay,
+        )
+        .unwrap(),
+        1
+    );
     let rows = ledger.rows();
     let row = &rows[0];
     assert_eq!(row.result, "confirmed");
     assert!(row.confirm_latency_s.is_some());
     assert_eq!(row.focus_at_deadline.as_deref(), Some("SWM-211"));
-    assert_eq!(complete_pending(&ledger.config, &mut relay).unwrap(), 0);
+    assert_eq!(
+        complete_pending(
+            &ledger.config,
+            &ix_board::fleet::tick::TickSettings::default(),
+            &mut relay,
+        )
+        .unwrap(),
+        0
+    );
 }
 
 #[trace("FR-035-AC-11")]
@@ -1016,7 +1040,15 @@ fn an_early_confirmation_gets_its_focus_at_the_deadline_from_the_next_run() {
         "/w/z",
     );
     wait_past(&mut relay, report.deadline_at_ms.unwrap());
-    assert_eq!(complete_pending(&ledger.config, &mut relay).unwrap(), 1);
+    assert_eq!(
+        complete_pending(
+            &ledger.config,
+            &ix_board::fleet::tick::TickSettings::default(),
+            &mut relay,
+        )
+        .unwrap(),
+        1
+    );
     let rows = ledger.rows();
     assert_eq!(rows[0].result, "confirmed");
     assert!(
@@ -1276,7 +1308,12 @@ fn a_status_run_commits_the_completed_row_with_its_run() {
     let deadline = leave_pending(port, &mut relay, &target, &ledger);
     wait_past(&mut relay, deadline);
     let mut report = status_report();
-    record_status_completing(&ledger.config, &mut report, &mut relay);
+    record_status_completing(
+        &ledger.config,
+        &ix_board::fleet::tick::TickSettings::default(),
+        &mut report,
+        &mut relay,
+    );
     let rows = ledger.rows();
     assert_eq!(rows[0].result, "confirmed");
     assert_eq!(rows[0].focus_at_deadline.as_deref(), Some("SWM-211"));
@@ -1303,7 +1340,12 @@ fn a_failed_completion_is_a_defect_committed_with_the_run() {
     bus.armed = true;
     bus.fail_reads = 100;
     let mut report = status_report();
-    record_status_completing(&ledger.config, &mut report, &mut bus);
+    record_status_completing(
+        &ledger.config,
+        &ix_board::fleet::tick::TickSettings::default(),
+        &mut report,
+        &mut bus,
+    );
     assert!(!report.complete);
     assert_eq!(ledger.rows()[0].result, "pending");
     assert_eq!(count(&ledger, "SELECT COUNT(*) FROM run"), 1);

@@ -458,6 +458,11 @@ pub fn run(file: Option<&toml::Value>, session: Option<&str>) -> Result<TickOutp
         }
     });
     let (relay, receipts) = live::read_relay(config.host_timeout);
+    let role_observations = relay
+        .as_ref()
+        .ok()
+        .map(|snapshot| snapshot.events.clone())
+        .unwrap_or_default();
     let sources = Sources {
         relay,
         series: series.clone(),
@@ -472,6 +477,7 @@ pub fn run(file: Option<&toml::Value>, session: Option<&str>) -> Result<TickOutp
             .map_or_else(|| "no lane could be read".to_owned(), |d| d.reason.clone());
         return Err(FleetError::Tick(why));
     }
+    live::record_session_turn_page(&config, &settings, &role_observations, &mut report);
     let facts = TickFacts::read(
         &live_sources(&report, config.host_timeout, &config, &settings),
         report.run_ms,
@@ -500,40 +506,36 @@ pub fn run(file: Option<&toml::Value>, session: Option<&str>) -> Result<TickOutp
     )
 }
 
-/// The FR-037 focus ticket of each WORKING lane that has an open `push_next_ticket` condition, read
-/// from the lane's hook events. A lane whose events cannot be read has no focus, so no
-/// `executed_at`.
-fn pushed_lane_focus(
+/// The FR-037 focus state of each lane, read in one relay stream pass. Missing or unreadable
+/// activity is kept unavailable and never treated as a successful push.
+fn lane_focus_states(
     config: &FleetConfig,
     report: &crate::fleet::FleetReport,
-    ledger: &Ledger,
     facts: &TickFacts,
     bus: &mut impl crate::fleet::assign::AssignBus,
-) -> Result<BTreeMap<String, String>, FleetError> {
-    let open = ledger
-        .open_push_lanes()
-        .map_err(|e| FleetError::Ledger(e.to_string()))?;
+) -> Result<BTreeMap<String, crate::fleet::focus::Focus>, String> {
+    let lanes = report
+        .rows
+        .iter()
+        .map(|row| row.lane.clone())
+        .collect::<Vec<_>>();
+    let activity = bus.lane_events_for(&lanes)?;
     let window_ms = i64::try_from(config.focus_window.as_millis()).unwrap_or(i64::MAX);
     let mut focus = BTreeMap::new();
     for row in &report.rows {
         let key = row.lane.to_lowercase();
-        if row.class != crate::fleet::ClassKind::Working || !open.contains(&key) {
-            continue;
-        }
         let tickets: Vec<String> = facts
             .assignments
             .as_ref()
             .and_then(|a| a.get(&key))
             .cloned()
             .unwrap_or_default();
-        let Ok(events) = bus.lane_events(&row.lane) else {
+        let Some(events) = activity.get(&key) else {
             continue;
         };
         let keys = crate::fleet::assign::focus_keys(&config.team_keys, &tickets);
-        let derived = crate::fleet::focus::derive(&events, report.run_ms, window_ms, None, &keys);
-        if let Some(ticket) = derived.ticket() {
-            focus.insert(key, ticket.to_owned());
-        }
+        let derived = crate::fleet::focus::derive(events, report.run_ms, window_ms, None, &keys);
+        focus.insert(key, derived);
     }
     Ok(focus)
 }
@@ -556,16 +558,23 @@ pub struct TickInputs<'a> {
 /// # Errors
 ///
 /// A ledger failure; no tick is committed then.
+#[implements("FR-039-AC-12")]
 pub fn commit_completing(
     config: &FleetConfig,
     report: &mut crate::fleet::FleetReport,
     inputs: &TickInputs<'_>,
     bus: &mut impl crate::fleet::assign::AssignBus,
 ) -> Result<TickOutput, FleetError> {
-    ledger::complete_assignments(config, report, bus);
+    ledger::complete_assignments(config, inputs.settings, report, bus);
+    let focus = match lane_focus_states(config, report, inputs.facts, bus) {
+        Ok(focus) => focus,
+        Err(error) => {
+            report.add_unreadable_source("relay:activity", error);
+            BTreeMap::new()
+        }
+    };
     let path = ledger::resolve_path(config).map_err(|e| FleetError::Ledger(e.to_string()))?;
     let mut ledger = Ledger::open(&path, config).map_err(|e| FleetError::Ledger(e.to_string()))?;
-    let focus = pushed_lane_focus(config, report, &ledger, inputs.facts, bus)?;
     ledger
         .commit_tick(&TickCommit {
             report,

@@ -6,10 +6,13 @@
 
 use super::SourceError;
 use super::classify::WeakSource;
+use super::ledger::{Ledger, resolve_path};
 use super::report::{
     ExpiredOrder, HostSeries, OrderReceipts, ProbeReading, ReceiptRead, RegInfo, RelayConfig,
     RelaySnapshot, SeriesSource, UnresolvedOrder, WeakSignals, parse_event,
 };
+use super::tick::TickSettings;
+use super::{FleetConfig, FleetReport};
 use ix_trace_rs::implements;
 use relay_core::config::{CoreFlags, load_core};
 use relay_core::receipts::{
@@ -18,6 +21,132 @@ use relay_core::receipts::{
 };
 use relay_core::{ACTIVITY_MAX_EVENTS, Address, Relay};
 use std::time::Duration;
+
+/// Maximum number of relay activity stream entries consumed by one session-turn ledger pass.
+pub const SESSION_TURN_PAGE_SIZE: usize = 500;
+
+/// One Redis stream entry returned for incremental session-turn ingestion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionTurnStreamEntry {
+    /// Monotonic Redis stream ID (`milliseconds-sequence`).
+    pub id: String,
+    /// Relay-authored activity event JSON.
+    pub event_json: Option<String>,
+}
+
+/// A bounded page of stream entries and the oldest currently retained entry ID.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SessionTurnStreamPage {
+    /// Entries after the durable cursor, in ascending Redis stream order.
+    pub entries: Vec<SessionTurnStreamEntry>,
+    /// Oldest event currently present in the capped stream, when any.
+    pub oldest_available_id: Option<String>,
+}
+
+#[implements("FR-039-AC-14")]
+/// Reads one bounded page after `cursor` from the relay activity stream.
+///
+/// The public relay API exposes a newest-N snapshot, not stream IDs or cursor pagination. This
+/// reader uses Redis' stable XRANGE stream API and the prefix resolved by relay-core so the ledger
+/// can persist a loss-detectable position without requesting the capped snapshot repeatedly.
+///
+/// # Errors
+/// Returns a source error for relay configuration, Redis connection, or command failures.
+pub fn read_session_turn_page(
+    cursor: Option<(i64, i64)>,
+    timeout: Duration,
+) -> Result<SessionTurnStreamPage, SourceError> {
+    use redis::streams::StreamRangeReply;
+
+    let settings = relay_core::config::load_core(CoreFlags::default())
+        .map_err(|error| SourceError(format!("relay configuration: {error}")))?;
+    let client = redis::Client::open(settings.url.value.as_str())
+        .map_err(|error| SourceError(format!("relay activity client: {error}")))?;
+    let mut connection = client
+        .get_connection_with_timeout(timeout)
+        .map_err(|error| SourceError(format!("relay activity connect: {error}")))?;
+    let key = format!("{}activity", settings.prefix.value);
+    let oldest: StreamRangeReply = redis::cmd("XRANGE")
+        .arg(&key)
+        .arg("-")
+        .arg("+")
+        .arg("COUNT")
+        .arg(1)
+        .query(&mut connection)
+        .map_err(|error| SourceError(format!("relay activity oldest entry: {error}")))?;
+    let oldest_available_id = oldest.ids.first().map(|entry| entry.id.clone());
+    let start = cursor.map_or_else(
+        || "-".to_owned(),
+        |(milliseconds, sequence)| format!("({milliseconds}-{sequence}"),
+    );
+    let page: StreamRangeReply = redis::cmd("XRANGE")
+        .arg(&key)
+        .arg(start)
+        .arg("+")
+        .arg("COUNT")
+        .arg(SESSION_TURN_PAGE_SIZE)
+        .query(&mut connection)
+        .map_err(|error| SourceError(format!("relay activity page: {error}")))?;
+    let entries = page
+        .ids
+        .into_iter()
+        .map(|entry| {
+            let event_json = entry.get::<String>("event");
+            SessionTurnStreamEntry {
+                id: entry.id,
+                event_json,
+            }
+        })
+        .collect();
+    Ok(SessionTurnStreamPage {
+        entries,
+        oldest_available_id,
+    })
+}
+
+/// Reads and commits one bounded relay activity page to the session-turn ledger.
+///
+/// The stream position and prompt rows share one SQLite transaction, so a crash cannot advance
+/// the cursor past rows that were not committed. Historical coverage begins at the oldest event
+/// available when this cursor is first installed and is exposed by
+/// `session_turn_stream_coverage`.
+pub fn record_session_turn_page(
+    config: &FleetConfig,
+    settings: &TickSettings,
+    role_observations: &[super::RawEvent],
+    report: &mut FleetReport,
+) {
+    let result = (|| -> Result<(), String> {
+        let path = resolve_path(config).map_err(|error| error.to_string())?;
+        let mut ledger = Ledger::open(&path, config).map_err(|error| error.to_string())?;
+        let cursor = ledger.session_turn_stream_cursor()?;
+        let page = read_session_turn_page(cursor, config.host_timeout).map_err(|error| error.0)?;
+        let entries = page
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.id.clone(),
+                    entry
+                        .event_json
+                        .as_deref()
+                        .and_then(super::report::parse_event),
+                )
+            })
+            .collect::<Vec<_>>();
+        ledger.record_session_turn_page(
+            settings,
+            &entries,
+            role_observations,
+            page.oldest_available_id.as_deref(),
+            report.run_ms,
+        )?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        report.add_unreadable_source("relay:session_turn", error);
+    }
+}
 
 /// Reads the relay snapshot and the order receipts over one bounded connection. The URL and key
 /// prefix resolve like every ix-relay binary (`IX_RELAY_URL`, then `~/.ix/relay/config.toml`).
@@ -86,10 +215,11 @@ fn read_snapshot(relay: &mut Relay, timeout: Duration) -> Result<RelaySnapshot, 
         registration_defects,
         ..RelaySnapshot::default()
     };
-    snapshot.activity_absent = relay
+    let activity_len = relay
         .activity_len()
-        .map_err(|e| fail("activity length", e))?
-        == 0;
+        .map_err(|e| fail("activity length", e))?;
+    snapshot.activity_absent = activity_len == 0;
+    snapshot.activity_stream_capped = activity_len >= ACTIVITY_MAX_EVENTS;
     let stream = relay
         .activity_events(ACTIVITY_MAX_EVENTS)
         .map_err(|e| fail("activity stream", e))?;
@@ -413,6 +543,7 @@ const RECEIPT_MAX_PAGES: usize = RECEIPT_EVENT_CAP / RECEIPT_PAGE_CAP + 1;
 /// # Errors
 ///
 /// The page could not be read or continued, or the history needs more pages than it can hold.
+#[implements("FR-039-AC-12")]
 pub fn collect_receipts(
     mut fetch: impl FnMut(Option<String>) -> Result<ReceiptExport, SourceError>,
 ) -> Result<(Vec<ReceiptEvent>, Vec<String>), SourceError> {
@@ -430,7 +561,7 @@ pub fn collect_receipts(
                         "relay receipts incomplete: {reason:?}"
                     )));
                 }
-                ReceiptCoverageReason::BeforeInstrumentation => continue,
+                ReceiptCoverageReason::BeforeInstrumentation => "before_instrumentation",
                 ReceiptCoverageReason::RecordingGap => "recording_gap",
                 ReceiptCoverageReason::ObservationPending => "observation_pending",
                 ReceiptCoverageReason::Retention => "retention",

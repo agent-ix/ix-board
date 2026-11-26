@@ -73,13 +73,15 @@ fn status_writes_the_ledger_and_query_reads_the_defect_without_writing() {
     assert_eq!(out.status.code(), Some(0));
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(value["view"], "defect_rows");
-    assert_eq!(value["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(value["rows"].as_array().unwrap().len(), 2, "rows: {value}");
     assert_eq!(value["rows"][0]["source"], "relay");
     assert!(value["rows"][0]["first_seen_at"].is_null());
     assert_eq!(
         value["rows"][0]["first_seen_host_ms"].as_i64().unwrap(),
         seen
     );
+    assert_eq!(value["rows"][1]["source"], "relay:session_turn");
+    assert!(value["rows"][1]["first_seen_at"].is_null());
     assert_eq!(std::fs::read(&ledger).unwrap(), before);
     let none = dir.path().join("none.sqlite3");
     std::fs::write(none.with_extension("toml"), "").unwrap();

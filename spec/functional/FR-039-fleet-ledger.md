@@ -111,10 +111,10 @@ row uses these columns while retaining its first `emitted_at` and the condition-
 | `plan_coverage_gap` | gap id, `kind` (`unowned_ready`, `short_queue`, `stale_assignment`), subject (ticket or lane), detail, `opened_tick`, `opened_at`, `closed_tick`, `closed_at` | `fleet tick` ([FR-036](./FR-036-fleet-plan-coverage.md)) |
 | `lane_tick` | run sequence, `source` (`status` or `tick`), tick id (empty for a `status` row), lane, host, class, reason, `remaining_assigned`, `ready_work_available`, `observed_ms` (relay time of the run), evidence | `fleet tick` and `fleet status`; a `status` row leaves `remaining_assigned` and `ready_work_available` empty |
 | `drift_finding` | finding id, lane, rule, focus, `opened_tick`, `opened_at`, `closed_at`, evidence times | `fleet tick` ([FR-037](./FR-037-fleet-focus-and-drift.md)) |
-| `assignment_history` (extended) | adds `order_id`, `expect_ticket`, `sent_at`, `deadline_at`, `result` (`pending`, `confirmed`, `acted_not_focused`, `ack_expired`, `timed_out`), `result_at`, `confirm_latency_s` (empty for an unconfirmed result), `focus_at_deadline` | `fleet assign` ([FR-035](./FR-035-fleet-assign.md)) |
-| `order_focus_at_deadline` | `order_id`, `sender_role` (`orchestrator`, `minder`), `sender_addr`, lane, `expect_ticket`, `deadline_at`, `focus_ticket`, `focus_state`, `outcome` (`confirmed`, `acted_not_focused`, `ack_expired`, `timed_out`), `followup_at` | `fleet tick` and `fleet status`. **Deferred to SWM-255**: not written yet |
-| `action` (extended) | adds `severity`, `due_by`, `target_role` (`lane`, `lead`, `orchestrator`, `planner`, `host`), `target_addr`, `condition_started_at`, `parent_action_id`, `rung` (0 to 3), `project`, `requested_count` | `fleet tick` ([FR-038](./FR-038-fleet-tick.md)); `project` and `requested_count` are set for `need_ready_tickets` ([FR-041](./FR-041-fleet-saturation.md)) |
-| `action_send` | `action_id`, `sent_at`, `sender_addr`, `recipient_addr`, receipt id | `fleet tick` and `fleet status`, from relay receipts. **Deferred to SWM-255**: not written yet |
+| `assignment_history` (extended) | adds `order_id`, `expect_ticket`, `sent_at`, `deadline_at`, `result` (`pending`, `confirmed`, `acted_not_focused`, `ack_expired`, `timed_out`), `result_at`, `confirm_latency_s` (empty for an unconfirmed result), `focus_at_deadline`, `sender_role`, `sender_addr` | `fleet assign` ([FR-035](./FR-035-fleet-assign.md)) |
+| `order_focus_at_deadline` | `order_id`, `sender_role` (`orchestrator`, `minder`, `other`), `sender_addr`, lane, `expect_ticket`, `deadline_at`, `focus_ticket`, `focus_state`, `outcome` (`confirmed`, `acted_not_focused`, `ack_expired`, `timed_out`), `followup_at` | `fleet assign`, plus `fleet tick` and `fleet status` for externally sent orders exposed by the relay expired-order index |
+| `action` (extended) | adds `severity`, `due_by`, `target_role` (`lane`, `lead`, `orchestrator`, `planner`, `host`), `target_addr`, `condition_started_at`, `parent_action_id`, `rung` (0 to 3), `project` and `requested_count` | `fleet tick` ([FR-038](./FR-038-fleet-tick.md)); SWM-217 writes `need_ready_tickets` rows with project/count |
+| `action_send` | `action_id`, `sent_at`, `sender_addr`, `recipient_addr`, unique receipt id | `fleet tick` and `fleet status`, matched from queued relay receipts by the configured minder sender and recipient; one receipt satisfies at most one action, oldest action first |
 | `tick` (extended) | adds `session_addr` and `session_role` | `fleet tick` |
 | `session_turn` | `session_addr`, `session_role`, `started_at` | `fleet tick` and `fleet status`, from hook `prompt` events of the configured minder and orchestrator addresses. **Deferred to SWM-255**: not written yet |
 | `cycle_event` | `cycle_id`, `session_addr`, `started_at`, `ended_at`, `ended_reason` (`ended`, `superseded`), `interval_s` | `fleet cycle` ([FR-044](./FR-044-fleet-cycle-and-dialog-answer-log.md)) |
@@ -122,6 +122,48 @@ row uses these columns while retaining its first `emitted_at` and the condition-
 | `defect` (existing, columns fixed) | `defect_id`, `source`, `host`, `lane`, `kind`, `first_seen_at`, `closed_at`, `routed_ticket`, `routed_at`; `first_seen_at` is relay time and is empty for a defect first seen in a run without relay time, whose host clock is kept in `first_seen_host_ms` | `fleet status` and `fleet tick` |
 | `dialog_answer` | see [FR-044](./FR-044-fleet-cycle-and-dialog-answer-log.md) | `fleet answer-log record` |
 | `capacity_run`, `capacity_window`, `capacity_step`, `capacity_step_lane_output`, `capacity_level`, `capacity_event`, `host_output_sample`, `saturation_sample`, `capacity_throttle_sample`, `capacity_overload_state` | see [FR-041](./FR-041-fleet-saturation.md) | `fleet capacity`, `fleet saturation collect` and `fleet tick` |
+
+### Schema version 7: role-spec metric producers
+
+The additive version 7 migration adds relay order snapshots and sender/session
+attribution needed by role metrics, and creates `host_build_pause_interval`
+for a future pause producer. Planner requests already use the version 6
+`action.project` and `action.requested_count` columns; these remain nullable,
+and `need_ready_tickets` rows leave `action.lane` NULL. Emission and resolution
+times remain relay milliseconds. No build-pause producer exists yet, so an
+evaluator reports that metric as not applicable with reason `no pause producer`,
+never as zero. The migration recreates views transactionally and preserves all
+version 6 rows. Each query below is read-only and available through
+`fleet ledger query <name>`.
+
+| View | Rows and measure |
+|------|------------------|
+| `idle_capacity_minutes_with_ready_work` | One row per UTC day; `slot_minutes` sums valid IDLE lane spans with ready work across hosts |
+| `time_to_action_p90` | One row per UTC day; `p90_minutes` is nearest-rank p90 from the beginning of a non-WORKING episode to its next WORKING transition; the view includes all due episodes and returns NULL with a non-zero `unbounded_count` if any episode has no observed transition |
+| `assignment_confirm_latency_p90` | One row per UTC day; nearest-rank p90 of sent assignment confirmation latencies after deadline; includes unconfirmed assignments as unbounded and returns NULL with a non-zero `unbounded_count` if any are present |
+| `drift_lane_minutes_share` | One row per UTC day; `share_percent` is lane-minutes with an open `not_assigned`, `not_in_plan` or `priority_inversion` finding over valid WORKING lane-minutes |
+| `missed_idle_minutes` | One row per lane, host and UTC day; `minutes` sums valid IDLE spans with `remaining_assigned > 0` |
+| `detection_to_action_p90` | One row per UTC day; nearest-rank p90 of all lane-targeted actions; an action without `executed_at` is unbounded and makes the p90 NULL with a non-zero `unbounded_count` |
+| `blocked_lane_minutes` | One row per lane, host and UTC day; `minutes` sums valid BLOCKED spans |
+| `idle_lane_minutes_during_build_pause` | Unavailable until a build-pause producer exists; returns NULL `minutes`, `available=0`, and `unavailable_reason='no pause producer'` |
+| `need_ready_tickets_actions` | `need_ready_tickets` action rows with tick, `action.project`, requested count, target role/address and emission time; `action.lane` is NULL for these rows |
+| `need_ready_tickets_due` | Planner requests with project and requested count, keyed at `emitted_at + 24h` |
+| `need_ready_tickets_without_planner_order` | `need_ready_tickets` actions with no recorded send to the target planner |
+| `relay_order_snapshot` | One all-orders read attempt, with relay observation time, requested enqueue-time window, source complete-coverage boundary, availability, reason and skipped row count |
+| `relay_order` | Verbatim order fields from every page in a complete relay snapshot, including `deadline_at`, `enqueued_at`, `acted_at`, `expired`, and stored `state` |
+| `lane_orders_due` | Orders whose source `deadline_at` is at or before the complete snapshot observation time and that have no later order to the same lane enqueued before their deadline; uses source `enqueued_at` to determine order sequence and emits `available=0` with the latest source reason when the read is incomplete |
+| `lane_orders_not_taken_up` | Due orders where Relay reports `expired=1` and no `acted_at`; the same later-order rule applies, and incomplete snapshots emit the same unavailable sentinel |
+| `failed_probe_ticks` | Failed probe defects with host, source, first-seen time and matching tick when present |
+| `probe_failure_without_routed_defect` | Failed probe defect rows with no routed ticket |
+| `session_turn_rows` | Prompt turns attributed to configured sessions, readable by address and role with `started_at` and relay-time `at_ms` |
+
+`fleet ledger route-defect <defect-id> <ticket> --at-ms <relay-ms>` writes a
+one-time ticket relation for an open `probe:%` defect. The caller supplies the
+relay timestamp; an absent, already-routed or non-probe defect is refused.
+
+Duration views exclude spans longer than twice the tick interval, matching the
+ledger gap rule. Percentiles use nearest-rank `ceil(0.9 * n)` independently per
+UTC day. `--since` filters each view by its UTC day or event `at_ms`.
 
 - **Gap rows.** A `plan_coverage_gap` row is opened by the first tick whose report
   contains the gap and closed by the first later tick whose report does not. A
@@ -148,15 +190,19 @@ row uses these columns while retaining its first `emitted_at` and the condition-
   eligible for (the lane's configured teams and projects; a lane with none
   configured is eligible for all).
 - **Run rows.** `lane_tick` rows are written by every committed `fleet status` and `fleet tick` run with the run's `source`. The views read `lane_tick_rows`, which keeps one row per lane per `observed_ms`, a `tick` row winning over a `status` row of the same relay time, so a status run and a tick at the same time never count twice. A `status` row leaves `ready_work_available` empty, so it never counts as ready work. Retention prunes an interval-like row (a gap, finding, action, cycle or capacity level) by the time it closed, so a row that is still open is never pruned.
-- **Order focus at the deadline.** For every relay order carrying
-  `--expect-ticket`, whoever sent it, the first committed run after its deadline
-  passes records one `order_focus_at_deadline` row. `focus_ticket` is the lane's
+- **Order focus at the deadline.** `fleet assign` records its order and outcome
+  directly. For externally sent orders, the first `fleet tick` or `fleet status`
+  after an unacted order expires records the relay's `expired_orders` entry,
+  including its source deadline; the sender role is resolved from
+  `[fleet_tick].orchestrator` and `[fleet_tick].minder`, otherwise `other`.
+  The expiry API exposes only unacted orders and reports truncation, skipped
+  rows, and its indexing start. The command emits a ledger defect when that
+  coverage is incomplete; it does not infer an ack deadline for acted external
+  orders because receipt events do not carry one. `focus_ticket` is the lane's
   derived focus ([FR-037](./FR-037-fleet-focus-and-drift.md)) computed with the
-  focus window ending at `deadline_at`, not at the run time. `outcome` is
-  `confirmed` when it equals `expect_ticket`; otherwise it is derived from the
-  receipts as in [FR-035](./FR-035-fleet-assign.md). `followup_at` is the relay
-  time of the first later order or message from the same sender session to the
-  lane or its lead, and stays empty until one exists.
+  focus window ending at `deadline_at`, not at the run time. `followup_at` is
+  the relay time of the first later order or message from the same sender session
+  to the lane or its lead, and stays empty until one exists.
 - **Action sends.** `action_send` rows join an action to the relay receipt of the
   message that carried it, matched by sender address (the configured session
   address of the executing role), recipient address and time after `emitted_at`,
@@ -227,10 +273,11 @@ in [FR-041](./FR-041-fleet-saturation.md); `answer_dialog_latency_max` and
 | FR-039-AC-10 | A gap present in tick 1 and absent in tick 3 gives one `plan_coverage_gap` row with `opened_tick` 1 and `closed_tick` 3; an `unavailable` list in tick 2 neither closes nor reopens it; `open_cycles` equals `max(1, ceil((close_or_now - open - grace) / cycle_interval))` on the evaluation clock: with a 10 minute cycle and grace of 15 minutes (10 minutes plus a 5 minute tick) a gap closed at 4, 24 and 25 minutes counts 1 each (the later ones are an orchestrator that acted in its next cycle), one closed at 26 minutes counts 2, one closed at 36 minutes counts 3, and one still open counts by elapsed time while no `cycle_event` row is written. | Test |
 | FR-039-AC-16 | With the orchestrator session writing no `cycle_event.ended_at` for more than twice `interval_s`, `fleet tick` writes one `cycle_missed` row for the span and not a second on the next tick; a session that ends cycles on time writes none. | Test |
 | FR-039-AC-11 | `lane_tick` holds one row per lane per committed `fleet status` or `fleet tick` run with its `source`, class and `ready_work_available` (true exactly when the lane has a remaining ticket or an unowned ready ticket in one of the lane's eligible teams or projects exists, written by `fleet tick`; empty on a `status` row); a status row and a tick row at the same relay time count once in the views, the tick row winning; `idle_lane_with_ready_work_ticks` and `idle_lane_episode_with_ready_work_max` equal the hand-computed values on a fixture. | Test |
-| FR-039-AC-12 | An order with `--expect-ticket` sent by the minder and one sent by `fleet assign` each get one `order_focus_at_deadline` row in the first run after the deadline, with the focus computed over the window ending at `deadline_at` (a focus change after the deadline does not alter it) and outcomes `confirmed`, `acted_not_focused`, `ack_expired` and `timed_out` matching their receipts. | Test |
+| FR-039-AC-12 | A `fleet assign` order and each externally sent unacted order available from the relay expiry index get one `order_focus_at_deadline` row with sender attribution, source deadline, focus computed over the window ending at `deadline_at`, and outcome matching receipts; truncated, skipped or uninitialized expiry-index coverage is surfaced as a ledger defect, and no ack deadline is fabricated for acted external orders. The ledger also snapshots the all-orders API only when every page is complete, preserves `state` and `expired`, and returns explicit unavailability for `complete=false`, any `skipped` row, missing operator confirmation, or an invalid cursor/page contract. The request starts at the later of the confirmed complete-coverage boundary and the eight-day retention floor; `oldest_available_at` remains the relay's complete boundary (not the requested-window clamp), and an earlier partial page never produces a partial view. | Test |
 | FR-039-AC-13 | A relay send from the configured minder address to an action's target after `emitted_at` produces one `action_send` row, a repeated run does not add a second, and a send before `emitted_at`, from another sender or to another recipient produces none, and one receipt never satisfies two open actions to the same recipient (the older action takes it). | Test |
 | FR-039-AC-14 | A tick run with `--session` records that address and its configured role; without it the relay-resolved caller address is recorded; an unconfigured address records role `other`; a minder `session_turn` with no tick within one interval appears in `minder_turns_without_committed_tick`. | Test |
-| FR-039-AC-15 | Every view in the role-spec view table exists in a fresh ledger under the name `<name>`, is readable through `fleet ledger query`, and returns the hand-computed value on a fixture covering escalation rungs (sent, late and suppressed), unconfirmed assignments with and without a follow-up, and unexecuted actions, and `defect_rows`, `add_lane_action_open_cycles_max` and an unconfirmed assignment (empty latency, not the deadline length) resolve. | Test |
+| FR-039-AC-15 | Every view in the role-spec view tables exists in a fresh ledger under the name `<name>`, is readable through `fleet ledger query`, and returns the hand-computed value on its fixture; the v6-to-v7 migration preserves rows and installs all v7 views. | Test |
+| FR-039-AC-20 | Routing an open probe defect to a ticket stores `routed_ticket` and a relay-millisecond `routed_at`; a duplicate, absent, already-routed, closed or non-probe defect is refused, and the defect leaves `probe_failure_without_routed_defect`. | Test |
 
 ## Dependencies
 
