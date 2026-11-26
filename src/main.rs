@@ -3140,6 +3140,9 @@ fn run_linear(command: Command) -> Result<Output, Error> {
         Command::Auth { .. } => unreachable!("auth commands are handled before Linear dispatch"),
         Command::AgentProbe => unreachable!("probe is handled before normal dispatch"),
         Command::Agents { .. } => unreachable!("agents is handled before Linear dispatch"),
+        Command::Hygiene { .. } | Command::Build { .. } => {
+            unreachable!("build-host commands are handled before Linear dispatch")
+        }
         Command::Fleet { .. } => unreachable!("fleet is handled before Linear dispatch"),
         Command::Retro { .. } => unreachable!("retro is handled before Linear dispatch"),
         Command::Scope { .. }

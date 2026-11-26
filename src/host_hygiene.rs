@@ -103,7 +103,7 @@ pub struct BuildPolicy {
 }
 
 /// Result of evaluating one host for a heavy gate.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Eligibility {
     /// Current telemetry satisfies policy.
     Eligible,
