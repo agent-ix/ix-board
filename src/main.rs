@@ -2037,19 +2037,19 @@ fn run_retro_eval(
                 || metric.query == "github.ticket_start_to_pr_open_median_hours"
         })
     });
-    let transcript_id_column_present = needs_transcript
-        .then(|| {
-            retro_eval_stage_bounded("session_turn.transcript_id_schema", &run_scope, || {
-                fleet_ledger_path
-                    .as_deref()
-                    .ok_or_else(|| {
-                        "fleet ledger path is unavailable for transcript identity".to_owned()
-                    })
-                    .and_then(retro::eval::session_turn_has_transcript_id)
-            })
-            .unwrap_or_else(Err)
+    let transcript_id_column_present = if needs_transcript {
+        retro_eval_stage_bounded("session_turn.transcript_id_schema", &run_scope, || {
+            fleet_ledger_path
+                .as_deref()
+                .ok_or_else(|| {
+                    "fleet ledger path is unavailable for transcript identity".to_owned()
+                })
+                .and_then(retro::eval::session_turn_has_transcript_id)
         })
-        .unwrap_or(Ok(false));
+        .unwrap_or_else(Err)
+    } else {
+        Ok(false)
+    };
     let transcript_inventory = if needs_transcript {
         retro_eval_stage_bounded("current.transcripts", &run_scope, || {
             let home = std::env::var_os("HOME")
@@ -2091,9 +2091,11 @@ fn run_retro_eval(
                 &window,
                 &settings,
                 &run_scope,
-                &transcript_inventory,
-                &transcript_id_column_present,
-                previous_window.start_ms,
+                &TranscriptDispatchContext {
+                    inventory: &transcript_inventory,
+                    transcript_id_column_present: &transcript_id_column_present,
+                    coverage_start_ms: previous_window.start_ms,
+                },
             )
         })
         .unwrap_or_else(|reason| {
@@ -2335,6 +2337,19 @@ fn is_lane_order_query(query: &str) -> bool {
     )
 }
 
+type SessionQueryValues = std::collections::BTreeMap<String, retro::eval::QueryValue>;
+type SessionAdapterValues = std::collections::BTreeMap<(String, String), SessionQueryValues>;
+type TranscriptAdapterValues = (
+    std::collections::BTreeMap<String, retro::eval::QueryValue>,
+    SessionAdapterValues,
+);
+
+struct TranscriptDispatchContext<'a> {
+    inventory: &'a Result<retro::eval::transcript::TranscriptInventory, String>,
+    transcript_id_column_present: &'a Result<bool, String>,
+    coverage_start_ms: i64,
+}
+
 #[implements("FR-047-AC-1")]
 fn collect_session_lane_order_adapters(
     specs: &[retro::eval::RoleSpec],
@@ -2345,13 +2360,7 @@ fn collect_session_lane_order_adapters(
     team: &str,
     team_workspaces: &[String],
     session_rows: &[serde_json::Map<String, serde_json::Value>],
-) -> Result<
-    std::collections::BTreeMap<
-        (String, String),
-        std::collections::BTreeMap<String, retro::eval::QueryValue>,
-    >,
-    String,
-> {
+) -> Result<SessionAdapterValues, String> {
     let mut result = std::collections::BTreeMap::new();
     let mut identities = std::collections::BTreeSet::new();
     for row in session_rows {
@@ -2410,13 +2419,7 @@ fn transcript_adapter_sets(
     window: &retro::eval::EvalWindow,
     context: &retro::eval::transcript::AdapterContext,
     transcript_id_column_present: &Result<bool, String>,
-) -> (
-    std::collections::BTreeMap<String, retro::eval::QueryValue>,
-    std::collections::BTreeMap<
-        (String, String),
-        std::collections::BTreeMap<String, retro::eval::QueryValue>,
-    >,
-) {
+) -> TranscriptAdapterValues {
     use retro::eval::QueryValue;
     let mut role_values = std::collections::BTreeMap::new();
     let mut session_values = std::collections::BTreeMap::new();
@@ -2588,9 +2591,7 @@ fn collect_role_github_linear_adapters(
     window: &retro::eval::EvalWindow,
     settings: &retro::eval::EvalSettings,
     run_scope: &retro::eval::EvalRunScope,
-    transcript_inventory: &Result<retro::eval::transcript::TranscriptInventory, String>,
-    transcript_id_column_present: &Result<bool, String>,
-    transcript_coverage_start_ms: i64,
+    transcript: &TranscriptDispatchContext<'_>,
 ) -> std::collections::BTreeMap<String, retro::eval::QueryValue> {
     let has_role_github_queries = specs.iter().any(|spec| {
         spec.rules.iter().any(|rule| {
@@ -2698,9 +2699,9 @@ fn collect_role_github_linear_adapters(
                         }
                         apply_transcript_dispatch_joins(
                             &mut evidence,
-                            transcript_inventory,
-                            transcript_id_column_present,
-                            transcript_coverage_start_ms,
+                            transcript.inventory,
+                            transcript.transcript_id_column_present,
+                            transcript.coverage_start_ms,
                             window,
                             settings.review_age_limit_hours,
                         );
@@ -2721,9 +2722,9 @@ fn collect_role_github_linear_adapters(
                 && reason.contains("reviewer and lead dispatch evidence is incomplete")
             {
                 *reason = transcript_dispatch_unavailable_reason(
-                    transcript_id_column_present,
-                    transcript_inventory,
-                    transcript_coverage_start_ms,
+                    transcript.transcript_id_column_present,
+                    transcript.inventory,
+                    transcript.coverage_start_ms,
                 );
                 evidence_refs.clear();
             }
@@ -4442,7 +4443,7 @@ mod tests {
             &window,
             "TEST",
             &["TEST".to_owned()],
-            &[session_row.clone()],
+            std::slice::from_ref(&session_row),
         )
         .expect("collect scoped lane-order adapter");
         let session_key = ("coder".to_owned(), "test:workspace:coder".to_owned());

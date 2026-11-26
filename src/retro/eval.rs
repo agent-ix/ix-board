@@ -2033,13 +2033,13 @@ pub fn linear_class_a_adapters_with_github(
         }
     }
 
-    if needed.contains("linear.outside_diff_findings_without_failure") {
-        if let Err(reason) = github_evidence {
-            results.insert(
-                "linear.outside_diff_findings_without_failure".to_owned(),
-                unavailable(reason.to_owned()),
-            );
-        }
+    if needed.contains("linear.outside_diff_findings_without_failure")
+        && let Err(reason) = github_evidence
+    {
+        results.insert(
+            "linear.outside_diff_findings_without_failure".to_owned(),
+            unavailable(reason.to_owned()),
+        );
     }
     results
 }

@@ -843,7 +843,13 @@ mod tests {
             ("available", Value::from(1)),
         ])];
         assert!(
-            scope_lane_order_rows(&[spec.clone()], "lane_orders_due", rows.clone(), None).is_err()
+            scope_lane_order_rows(
+                std::slice::from_ref(&spec),
+                "lane_orders_due",
+                rows.clone(),
+                None
+            )
+            .is_err()
         );
         let no_sessions = crate::retro::eval::LaneOrderScope {
             team_id: Some("factory-panel".to_owned()),
@@ -851,7 +857,7 @@ mod tests {
         };
         assert!(
             scope_lane_order_rows(
-                &[spec.clone()],
+                std::slice::from_ref(&spec),
                 "lane_orders_due",
                 rows.clone(),
                 Some(&no_sessions)

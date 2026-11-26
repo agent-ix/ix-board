@@ -1255,18 +1255,17 @@ pub(super) fn reviewer_class_a_metrics(
             }
             was_clean = clean;
         }
-        if was_clean {
-            if let (Some(first_review), Some(last_review), Some(clean_start)) =
+        if was_clean
+            && let (Some(first_review), Some(last_review), Some(clean_start)) =
                 (first_reviewer_at, last_reviewer_at, clean_start)
-            {
-                let clean_at = last_review.max(clean_start);
-                if clean_at >= start && clean_at < end {
-                    review_to_clean.push((
-                        clean_at - first_review,
-                        pr,
-                        clean_evidence.into_iter().collect(),
-                    ));
-                }
+        {
+            let clean_at = last_review.max(clean_start);
+            if clean_at >= start && clean_at < end {
+                review_to_clean.push((
+                    clean_at - first_review,
+                    pr,
+                    clean_evidence.into_iter().collect(),
+                ));
             }
         }
     }
@@ -1383,7 +1382,7 @@ fn median(mut values: Vec<f64>) -> Option<f64> {
     }
     values.sort_by(f64::total_cmp);
     let middle = values.len() / 2;
-    Some(if values.len() % 2 == 0 {
+    Some(if values.len().is_multiple_of(2) {
         (values[middle - 1] + values[middle]) / 2.0
     } else {
         values[middle]
