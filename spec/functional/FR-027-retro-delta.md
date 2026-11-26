@@ -42,6 +42,14 @@ differ, it SHALL report `query_changed` and show both queries. A metric with
 direction `neutral` SHALL show changes and never `regressing`. The command SHALL
 print no single combined health score.
 
+The delta report SHALL also expose a `defects` array. A latest two-record increase
+in `prs_idle`, `fix_rounds_max` or `agents_idle_minutes_max` emits one
+`retro_metric_rising` defect with the metric ID and both observed values. A
+`lead_wait_without_named_wait` defect is emitted when the latest
+`unnamed_wait_minutes_max` value is strictly greater than 20. Defect generation
+reads only stored records; delivery is a separate explicit command option and
+uses the configured `minder_address` (`server:workspace:tab`).
+
 ## Acceptance Criteria
 
 | ID | Criteria | Verification |
@@ -56,6 +64,8 @@ print no single combined health score.
 | FR-027-AC-8 | A `baseline_taken_at` matching no record stops the command with an error naming the value. | Test |
 | FR-027-AC-9 | `ix-board retro delta` output includes each metric's FR-024 catalog family as `class` and the FR-029 department class as `department_class` where defined, resolving both from catalogs. | Test |
 | FR-027-AC-10 | `ix-board::retro::decode_saved_report` decodes delta JSON written before the `class` and `department_class` output fields existed. | Test |
+| FR-027-AC-11 | Hand-written records that show each watched metric rising produce one structured defect with exact metric and values; flat, falling, unavailable, or query-changed metrics produce none. The unnamed-wait defect is emitted only above 20 minutes. | Test |
+| FR-027-AC-12 | Without `--notify`, delta makes no notification call; with `--notify`, each defect is sent once to the configured three-part minder address, and missing or invalid routing configuration returns an error without sending. | Test |
 
 ## Dependencies
 
