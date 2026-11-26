@@ -3458,7 +3458,7 @@ fn run_hygiene(
         .or(config.worktree_root)
         .unwrap_or_else(default_worktree_root);
     let host_policy = config.hosts.get(&args.host.to_lowercase());
-    let floor_gb = args.free_floor_gb.or_else(|| host_policy.and_then(|policy| policy.free_floor_gb))
+    let floor_gb = args.free_floor_gb.or_else(|| host_policy.and_then(|policy| policy.free_floor_gb)).or(config.default_free_floor_gb)
         .ok_or_else(|| Error::ProgramReview {
             message: format!("no free-space floor configured for host {:?}; set hygiene.hosts.{}.free_floor_gb or pass --free-floor-gb", args.host, args.host),
         })?;
@@ -3631,17 +3631,12 @@ fn run_build_status(
         config
             .hosts
             .keys()
-            .map(|host| {
+            .filter_map(|host| {
                 config
                     .build_policy(host)
                     .map(|policy| (host.clone(), policy))
-                    .ok_or_else(|| Error::ProgramReview {
-                        message: format!(
-                            "host {host:?} needs both max_load1 and heavy_gate_slots for build status"
-                        ),
-                    })
             })
-            .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?
+            .collect::<std::collections::BTreeMap<_, _>>()
     } else {
         policies
         .iter()

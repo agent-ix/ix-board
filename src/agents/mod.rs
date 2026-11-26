@@ -704,6 +704,7 @@ fn canonical_lane_address(server: &str, workspace: &str, tab: &str) -> Option<St
     )
 }
 
+#[implements("FR-018-AC-30")]
 fn build_row(
     host: &dyn Host,
     agent: &HerdrAgent,

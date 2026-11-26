@@ -497,8 +497,10 @@ ix-board hygiene check --host <HOST> [--free-floor-gb <GIB>] [--root <WORKTREES>
 Reports free disk space, target directories and their ages, prunable worktrees, and build
 processes without a Herdr pane association. The worktree root must be named `worktrees`. Values
 may be set in the ix-board settings file under `[hygiene]`; command-line values override the
-configured ones. Each host needs `hygiene.hosts.<host>.free_floor_gb`, and cleanup needs
-`hygiene.idle_minutes`. There are no implicit floor or age defaults. Exit status is 0 when clear,
+configured ones. The default policy floor is 100 GiB, with 150 GiB for terra; the default idle age
+is 60 minutes. Set `hygiene.default_free_floor_gb`, a host-specific
+`hygiene.hosts.<host>.free_floor_gb`, or `hygiene.idle_minutes` to change those policy fields.
+Exit status is 0 when clear,
 1 when findings exist, 2 when required evidence is unavailable, and 3 on unsupported Windows.
 
 ## ix-board hygiene clean
@@ -514,6 +516,7 @@ worktrees when complete process evidence proves they are unused. Example policy:
 [hygiene]
 worktree_root = "/srv/dev/worktrees"
 idle_minutes = 90
+default_free_floor_gb = 100
 
 [hygiene.hosts.terra]
 free_floor_gb = 150

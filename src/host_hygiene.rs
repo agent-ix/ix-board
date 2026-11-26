@@ -121,16 +121,35 @@ pub struct HostPolicyConfig {
 }
 
 /// The `[hygiene]` policy table from ix-board settings.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HygieneConfig {
     /// Worktree directory on this host.
     pub worktree_root: Option<PathBuf>,
     /// Minimum target-directory idle age in minutes.
     pub idle_minutes: Option<u64>,
+    /// Default free-space floor in GiB for hosts without an override.
+    pub default_free_floor_gb: Option<u64>,
     /// Policy values keyed by Herdr host label.
     #[serde(default)]
     pub hosts: BTreeMap<String, HostPolicyConfig>,
+}
+
+impl Default for HygieneConfig {
+    fn default() -> Self {
+        Self {
+            worktree_root: None,
+            idle_minutes: Some(60),
+            default_free_floor_gb: Some(100),
+            hosts: BTreeMap::from([(
+                "terra".to_owned(),
+                HostPolicyConfig {
+                    free_floor_gb: Some(150),
+                    ..Default::default()
+                },
+            )]),
+        }
+    }
 }
 
 impl HygieneConfig {
@@ -140,10 +159,28 @@ impl HygieneConfig {
         let Some(value) = settings.and_then(|settings| settings.get("hygiene")) else {
             return Ok(Self::default());
         };
-        let mut config: Self = value
+        let overrides: Self = value
             .clone()
             .try_into()
             .map_err(|error| format!("invalid [hygiene] settings: {error}"))?;
+        let mut config = Self {
+            worktree_root: overrides.worktree_root,
+            idle_minutes: overrides.idle_minutes.or(Some(60)),
+            default_free_floor_gb: overrides.default_free_floor_gb.or(Some(100)),
+            hosts: Self::default().hosts,
+        };
+        for (host, policy) in overrides.hosts {
+            let key = host.to_lowercase();
+            let merged = config
+                .hosts
+                .remove(&key)
+                .map_or(policy.clone(), |defaults| HostPolicyConfig {
+                    free_floor_gb: policy.free_floor_gb.or(defaults.free_floor_gb),
+                    max_load1: policy.max_load1.or(defaults.max_load1),
+                    heavy_gate_slots: policy.heavy_gate_slots.or(defaults.heavy_gate_slots),
+                });
+            config.hosts.insert(host, merged);
+        }
         if config.idle_minutes.is_some_and(|minutes| minutes == 0) {
             return Err("hygiene.idle_minutes must be positive".to_owned());
         }
@@ -165,10 +202,14 @@ impl HygieneConfig {
             }
         }
         config.hosts = normalized;
+        if config.default_free_floor_gb == Some(0) {
+            return Err("hygiene.default_free_floor_gb must be positive".to_owned());
+        }
         Ok(config)
     }
 
     /// Resolves a complete heavy-gate policy for one configured host.
+    #[implements("FR-048-AC-8")]
     pub fn build_policy(&self, host: &str) -> Option<BuildPolicy> {
         let policy = self.hosts.get(&host.to_lowercase())?;
         Some(BuildPolicy {
@@ -380,6 +421,19 @@ fn macos_process_table() -> io::Result<ProcessTable> {
         processes: Vec::new(),
         complete: true,
     };
+    let process_names = Command::new("ps").args(["-axo", "pid=,comm="]).output()?;
+    if !process_names.status.success() {
+        table.complete = false;
+    }
+    let mut commands = BTreeMap::new();
+    for line in String::from_utf8_lossy(&process_names.stdout).lines() {
+        let Some((pid, command)) = line.trim().split_once(char::is_whitespace) else {
+            continue;
+        };
+        if let Ok(pid) = pid.trim().parse::<u32>() {
+            commands.insert(pid, command.trim().as_bytes().to_vec());
+        }
+    }
     let mut current: Option<ProcessEvidence> = None;
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         if let Some(pid) = line
@@ -401,6 +455,31 @@ fn macos_process_table() -> io::Result<ProcessTable> {
     }
     if let Some(process) = current {
         table.processes.push(process);
+    }
+    for process in &mut table.processes {
+        process.cmdline = commands.remove(&process.pid).unwrap_or_default();
+        if process.cmdline.is_empty() {
+            table.complete = false;
+            continue;
+        }
+        let executable = process
+            .cmdline
+            .split(|byte| byte.is_ascii_whitespace())
+            .next()
+            .and_then(|command| std::str::from_utf8(command).ok())
+            .and_then(|command| Path::new(command).file_name())
+            .and_then(|name| name.to_str());
+        if matches!(executable, Some("cargo" | "rustc")) {
+            match Command::new("ps")
+                .args(["eww", "-p", &process.pid.to_string(), "-o", "command="])
+                .output()
+            {
+                Ok(output) if output.status.success() && output.stdout.len() <= 1_048_576 => {
+                    process.environ = output.stdout;
+                }
+                _ => table.complete = false,
+            }
+        }
     }
     Ok(table)
 }
@@ -618,6 +697,11 @@ mod tests {
     #[test]
     #[trace("FR-048-AC-1", "FR-048-AC-8")]
     fn host_hygiene_policy_reads_expected_values_from_settings() {
+        let defaults = HygieneConfig::from_settings(None).expect("default policy");
+        assert_eq!(defaults.idle_minutes, Some(60));
+        assert_eq!(defaults.default_free_floor_gb, Some(100));
+        assert_eq!(defaults.hosts["terra"].free_floor_gb, Some(150));
+
         let settings = toml::from_str::<toml::Value>(
             r#"
             [hygiene]
@@ -625,7 +709,6 @@ mod tests {
             idle_minutes = 90
 
             [hygiene.hosts.terra]
-            free_floor_gb = 150
             max_load1 = 32.0
             heavy_gate_slots = 2
 
