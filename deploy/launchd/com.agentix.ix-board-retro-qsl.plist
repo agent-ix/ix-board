@@ -16,7 +16,7 @@
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <string>/Users/peter/.cargo/bin:/Users/peter/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     <key>TEAM_RETRO_HOME</key>
     <string>/Users/peter/.local/state/team-retro</string>
   </dict>

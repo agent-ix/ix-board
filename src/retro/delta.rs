@@ -278,14 +278,15 @@ fn delta_defects(metrics: &[MetricDelta]) -> Vec<DeltaDefect> {
 #[implements("FR-027-AC-12")]
 pub fn notify_defects(
     report: &DeltaReport,
+    enabled: bool,
     recipient: Option<&str>,
     mut notify: impl FnMut(&str, &str) -> Result<(), String>,
 ) -> Result<(), String> {
-    if report.defects.is_empty() {
+    if !enabled || report.defects.is_empty() {
         return Ok(());
     }
     let recipient = recipient
-        .filter(|address| valid_relay_address(address))
+        .filter(|address| crate::relay_address::is_valid(address))
         .ok_or_else(|| "retro config must set minder_address as server:workspace:tab".to_owned())?;
     for defect in &report.defects {
         let message = format!(
@@ -301,12 +302,6 @@ pub fn notify_defects(
         notify(recipient, &message)?;
     }
     Ok(())
-}
-
-fn valid_relay_address(address: &str) -> bool {
-    let mut parts = address.split(':');
-    (0..3).all(|_| parts.next().is_some_and(|part| !part.trim().is_empty()))
-        && parts.next().is_none()
 }
 
 /// The instant a stored or configured UTC time names, with its fractional seconds.

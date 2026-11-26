@@ -184,7 +184,7 @@ pub fn notify_if_alert(
 ) -> Result<(), CadenceError> {
     if report.alert {
         let recipient = recipient
-            .filter(|address| valid_relay_address(address))
+            .filter(|address| crate::relay_address::is_valid(address))
             .ok_or_else(|| {
                 CadenceError::Notification(
                     "manifest must configure one alert_recipient as server:workspace:tab"
@@ -243,7 +243,7 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), CadenceError> {
     if manifest
         .alert_recipient
         .as_deref()
-        .is_some_and(|address| !valid_relay_address(address))
+        .is_some_and(|address| !crate::relay_address::is_valid(address))
     {
         return Err(CadenceError::Manifest(
             "alert_recipient must be one server:workspace:tab address".to_owned(),
@@ -296,13 +296,6 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), CadenceError> {
         }
     }
     Ok(())
-}
-
-fn valid_relay_address(address: &str) -> bool {
-    let mut segments = address.split(':');
-    let has_three_nonempty =
-        (0..3).all(|_| segments.next().is_some_and(|part| !part.trim().is_empty()));
-    has_three_nonempty && segments.next().is_none()
 }
 
 fn command_matches_kind(kind: JobKind, command: &[String]) -> bool {

@@ -21,15 +21,6 @@ use crate::{Issue, IssueId, WorkflowStateType, WorkspaceSnapshot};
 
 const NOT_CONFIGURED: &str = "not configured";
 const EMPTY: &str = "empty population";
-const ADDITIVE_METRICS: [&str; 7] = [
-    "prs_per_ticket_max",
-    "commits_per_pr_max",
-    "review_file_only_commits",
-    "review_rounds_over_limit",
-    "non_code_check_reruns",
-    "unnamed_wait_minutes_max",
-    "host_load_per_core_max",
-];
 
 /// A computed value, or the reason it is unavailable.
 type Outcome = Result<f64, String>;
@@ -213,11 +204,6 @@ fn collect_inner(
     if out.wants("messages_undelivered") {
         relay(&mut out, sources);
     }
-    // These ids are additive catalog entries whose source collectors are optional. They remain
-    // explicit unavailable values until their complete structured source pass is configured.
-    for id in ADDITIVE_METRICS {
-        out.put(id, Err("collector/history not configured".to_owned()));
-    }
     if let Some(requested) = requested {
         for id in requested {
             if out.metrics.contains_key(id) {
@@ -235,11 +221,9 @@ fn collect_inner(
         }
     } else {
         for entry in CATALOG {
-            debug_assert!(
-                out.metrics.contains_key(entry.id),
-                "{} not computed",
-                entry.id
-            );
+            if !out.metrics.contains_key(entry.id) {
+                out.put(entry.id, Err("collector/history not configured".to_owned()));
+            }
         }
     }
     out.metrics

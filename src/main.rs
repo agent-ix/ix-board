@@ -1905,28 +1905,27 @@ fn run_retro_delta(
     let config = retro::RetroConfig::load(config_path).map_err(retro::RetroError::from)?;
     let store = retro::Store::from_env(&config.team).map_err(retro::RetroError::from)?;
     let report = retro::run_delta(&config, &store)?;
-    if notify {
-        retro::notify_defects(
-            &report,
-            config.minder_address.as_deref(),
-            |recipient, message| {
-                let output = std::process::Command::new("agent-msg")
-                    .args(["send", recipient, message])
-                    .output()
-                    .map_err(|error| format!("could not run agent-msg: {error}"))?;
-                if output.status.success() {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "agent-msg send {recipient} exited {}: {}",
-                        output.status,
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    ))
-                }
-            },
-        )
-        .map_err(|message| Error::Retro(retro::RetroError::Evaluation(message)))?;
-    }
+    retro::notify_defects(
+        &report,
+        notify,
+        config.minder_address.as_deref(),
+        |recipient, message| {
+            let output = std::process::Command::new("agent-msg")
+                .args(["send", recipient, message])
+                .output()
+                .map_err(|error| format!("could not run agent-msg: {error}"))?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "agent-msg send {recipient} exited {}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ))
+            }
+        },
+    )
+    .map_err(|message| Error::Retro(retro::RetroError::Evaluation(message)))?;
     Ok(report)
 }
 
