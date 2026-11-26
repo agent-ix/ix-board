@@ -613,6 +613,7 @@ impl<T: Transport> SelectedGithub<T> {
             Ok(rows)
         }
     }
+    #[implements("FR-033-AC-18")]
     fn repository_prs(&self, repo: &str) -> PrRows {
         if let Some(rows) = self.lists.borrow().get(repo) {
             return rows.clone();
