@@ -221,9 +221,9 @@ pub(super) fn session_turn_has_transcript_id(path: &std::path::Path) -> Result<b
                 path.display()
             )
         })?;
-    if !(3..=9).contains(&version) {
+    if !(3..=10).contains(&version) {
         return Err(format!(
-            "{}: unsupported ledger schema version {version}; retro evaluator supports 3 through 9",
+            "{}: unsupported ledger schema version {version}; retro evaluator supports 3 through 10",
             path.display()
         ));
     }
@@ -283,9 +283,9 @@ fn read_rows(
                 path.display()
             )
         })?;
-    if !(3..=9).contains(&version) {
+    if !(3..=10).contains(&version) {
         return Err(format!(
-            "{}: unsupported ledger schema version {version}; retro evaluator supports 3 through 9",
+            "{}: unsupported ledger schema version {version}; retro evaluator supports 3 through 10",
             path.display()
         ));
     }
@@ -954,13 +954,13 @@ mod tests {
     }
 
     #[test]
-    #[trace("FR-047-AC-6")]
+    #[trace("FR-047-AC-6", "FR-047-AC-10")]
     fn read_only_window_reader_rejects_unknown_future_schema_versions() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("ledger.sqlite3");
         let connection = rusqlite::Connection::open(&path).expect("create ledger fixture");
         connection
-            .pragma_update(None, "user_version", 10)
+            .pragma_update(None, "user_version", 11)
             .expect("set future version");
         drop(connection);
         let error = read_view_rows(
@@ -973,7 +973,7 @@ mod tests {
             },
         )
         .expect_err("future schema must fail closed");
-        assert!(error.contains("supports 3 through 9"));
+        assert!(error.contains("supports 3 through 10"));
     }
 
     #[test]

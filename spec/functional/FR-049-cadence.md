@@ -28,8 +28,9 @@ the matching manifest job, without a shell, and SHALL persist the start time,
 completion time and outcome in the existing fleet ledger whether the command
 succeeds or fails. A snapshot job MAY declare `after_success`.
 
-When declared, `after_success` SHALL be a `retro delta --config <file> --notify`
-argv and SHALL run only after the snapshot exits successfully. A failed
+When declared, `after_success` SHALL be exactly a `retro delta --config <file> --notify`
+or `retro delta --team <team> --notify` argv; cadence SHALL run it with the
+selected manifest path and only after the snapshot exits successfully. A failed
 follow-up SHALL make the cadence run fail. Supported
 job kinds are `retro_snapshot`, `fleet_tick` and `hygiene`. Jobs are configured
 by program and team and declare a stable job id, positive interval, kind, argv
@@ -59,6 +60,7 @@ manifest is shared configuration and is not stored in the fleet ledger.
 | FR-049-AC-5 | `--alert` emits an alert only when the configured cadence checker job is overdue. | Test |
 | FR-049-AC-6 | Cadence uses the existing fleet ledger and does not create a scheduler or write state into a repository. | Test |
 | FR-049-AC-7 | A valid snapshot job runs its configured notifying delta only after snapshot success; snapshot failure skips the delta, and a delta failure is recorded as a failed cadence run. Cadence tests cover both failure transitions. Delta tests use hand-written retro records and an injected sender; no test sends a real notification. | Test |
+| FR-049-AC-8 | First `cadence due` without an explicit or environment manifest creates a default 30-minute retro snapshot job for the requested program/team, followed by `retro delta --team <team> --notify`; reruns are byte-for-byte no-ops and existing manifests are never replaced. | Test |
 
 ## Dependencies
 

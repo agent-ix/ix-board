@@ -81,7 +81,7 @@ pub struct MetricDelta {
     pub regressing: bool,
 }
 
-/// One actionable regression for the configured minder.
+/// One actionable retro finding routed through the cadence alert recipient.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeltaDefect {
@@ -136,6 +136,7 @@ pub fn run_delta(config: &RetroConfig, store: &Store) -> Result<DeltaReport, Ret
 
 /// Applies the store's existing comparison selection to already validated, time-ordered records.
 #[implements("FR-027-AC-11")]
+#[implements("FR-027-AC-13")]
 pub(crate) fn compare_records(
     team: &str,
     baseline_taken_at: Option<&str>,
@@ -158,6 +159,19 @@ pub(crate) fn compare_records(
         .filter(|record| record.kind == RecordKind::Snapshot)
         .collect::<Vec<_>>();
     let [.., previous, latest] = snapshots.as_slice() else {
+        let defects = snapshots
+            .last()
+            .and_then(|record| record.metrics.get("unnamed_wait_minutes_max"))
+            .filter(|metric| metric.status == Status::Ok)
+            .and_then(|metric| metric.value.filter(|value| *value > 20.0))
+            .map(|current| DeltaDefect {
+                class: "lead_wait_without_named_wait".to_owned(),
+                metric_id: "unnamed_wait_minutes_max".to_owned(),
+                previous: None,
+                current,
+            })
+            .into_iter()
+            .collect();
         return Ok(DeltaReport {
             department: None,
             team: team.into(),
@@ -170,7 +184,7 @@ pub(crate) fn compare_records(
             baseline: baseline.map(|record| record.taken_at.clone()),
             baseline_kind: baseline.map(|record| record.kind),
             metrics: Vec::new(),
-            defects: Vec::new(),
+            defects,
         });
     };
     let baseline = baseline.unwrap_or(latest);
@@ -206,7 +220,7 @@ pub(crate) fn compare_records(
             }
         })
         .collect::<Vec<_>>();
-    let defects = delta_defects(&metrics);
+    let defects = delta_defects(&metrics, Some(previous));
     Ok(DeltaReport {
         department: latest.department.as_ref().map(|report| {
             super::department::delta(
@@ -227,7 +241,7 @@ pub(crate) fn compare_records(
 }
 
 #[implements("FR-027-AC-11")]
-fn delta_defects(metrics: &[MetricDelta]) -> Vec<DeltaDefect> {
+fn delta_defects(metrics: &[MetricDelta], previous_record: Option<&Record>) -> Vec<DeltaDefect> {
     let mut defects = Vec::new();
     for metric in metrics.iter().filter(|metric| {
         matches!(
@@ -243,10 +257,10 @@ fn delta_defects(metrics: &[MetricDelta]) -> Vec<DeltaDefect> {
                 .is_some_and(|change| change > 0.0)
             && let (Some(current), Some(previous)) = (
                 metric.value,
-                metric
-                    .value
-                    .zip(metric.since_previous.change)
-                    .map(|(v, d)| v - d),
+                previous_record
+                    .and_then(|record| record.metrics.get(&metric.id))
+                    .filter(|stored| stored.status == Status::Ok)
+                    .and_then(|stored| stored.value),
             )
         {
             defects.push(DeltaDefect {
@@ -262,11 +276,16 @@ fn delta_defects(metrics: &[MetricDelta]) -> Vec<DeltaDefect> {
         .find(|metric| metric.id == "unnamed_wait_minutes_max")
         && metric.status == Status::Ok
         && let Some(current) = metric.value.filter(|value| *value > 20.0)
+        && let previous = previous_record
+            .and_then(|record| record.metrics.get("unnamed_wait_minutes_max"))
+            .filter(|stored| stored.status == Status::Ok)
+            .and_then(|stored| stored.value)
+        && (previous.is_none_or(|value| value <= 20.0) || current > previous.unwrap_or(0.0))
     {
         defects.push(DeltaDefect {
             class: "lead_wait_without_named_wait".to_owned(),
             metric_id: metric.id.clone(),
-            previous: None,
+            previous,
             current,
         });
     }
@@ -286,7 +305,9 @@ pub fn notify_defects(
     }
     let recipient = recipient
         .filter(|address| crate::relay_address::is_valid(address))
-        .ok_or_else(|| "retro config must set minder_address as server:workspace:tab".to_owned())?;
+        .ok_or_else(|| {
+            "cadence manifest must set alert_recipient as server:workspace:tab".to_owned()
+        })?;
     for defect in &report.defects {
         let message = format!(
             "ix-board retro defect {}: {} = {}{}",

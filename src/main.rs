@@ -419,8 +419,11 @@ enum RetroCommand {
     /// Append one record of the metric catalog to the team's retro store.
     Snapshot {
         /// JSON retro configuration file.
-        #[arg(long)]
-        config: PathBuf,
+        #[arg(long, required_unless_present = "team", conflicts_with = "team")]
+        config: Option<PathBuf>,
+        /// Team using automatically discovered Herdr and gate log sources.
+        #[arg(long, required_unless_present = "config")]
+        team: Option<String>,
         /// Trailing window for window metrics: seconds, minutes, hours or days (90s, 20m, 4h, 2d).
         #[arg(long, default_value = retro::DEFAULT_WINDOW)]
         window: String,
@@ -428,11 +431,17 @@ enum RetroCommand {
     /// Compare the latest snapshot with the previous one and the baseline, reading only the store.
     Delta {
         /// JSON retro configuration file.
-        #[arg(long)]
-        config: PathBuf,
-        /// Send stored delta defects to the configured minder address.
+        #[arg(long, required_unless_present = "team", conflicts_with = "team")]
+        config: Option<PathBuf>,
+        /// Team using automatically discovered Herdr and gate log sources.
+        #[arg(long, required_unless_present = "config")]
+        team: Option<String>,
+        /// Send stored delta defects to the cadence manifest alert_recipient.
         #[arg(long)]
         notify: bool,
+        /// Cadence manifest carrying the single alert_recipient.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
     },
     /// Append one record per UTC day from Linear and GitHub history.
     Backfill {
@@ -1130,11 +1139,28 @@ fn run(command: Command) -> Result<Output, Error> {
                 },
         } => run_fleet_capacity_remove(&host, &lane, at_ms).map(Output::FleetCapacity),
         Command::Retro {
-            command: RetroCommand::Snapshot { config, window },
-        } => run_retro_snapshot(&config, &window),
+            command:
+                RetroCommand::Snapshot {
+                    config,
+                    team,
+                    window,
+                },
+        } => run_retro_snapshot(config.as_deref(), team.as_deref(), &window),
         Command::Retro {
-            command: RetroCommand::Delta { config, notify },
-        } => run_retro_delta(&config, notify).map(Output::RetroDelta),
+            command:
+                RetroCommand::Delta {
+                    config,
+                    team,
+                    notify,
+                    manifest,
+                },
+        } => run_retro_delta(
+            config.as_deref(),
+            team.as_deref(),
+            notify,
+            manifest.as_deref(),
+        )
+        .map(Output::RetroDelta),
         Command::Retro {
             command:
                 RetroCommand::Backfill {
@@ -1868,8 +1894,17 @@ fn fetch_metrics_text(url: &str) -> Result<String, Error> {
     })
 }
 
-fn run_retro_snapshot(config_path: &std::path::Path, window: &str) -> Result<Output, Error> {
-    let config = retro::RetroConfig::load(config_path).map_err(retro::RetroError::from)?;
+#[implements("FR-024-AC-24")]
+fn run_retro_snapshot(
+    config_path: Option<&std::path::Path>,
+    team: Option<&str>,
+    window: &str,
+) -> Result<Output, Error> {
+    let config = match (config_path, team) {
+        (Some(path), None) => retro::RetroConfig::load(path).map_err(retro::RetroError::from)?,
+        (None, Some(team)) => retro::RetroConfig::for_team(team.to_owned()),
+        _ => unreachable!("clap requires exactly one of --config and --team"),
+    };
     let window_secs = retro::parse_window(window).map_err(retro::RetroError::from)?;
     let store = retro::Store::from_env(&config.team).map_err(retro::RetroError::from)?;
     // A refused store path must cost no reads, so check it before any source is started.
@@ -1898,35 +1933,61 @@ fn run_retro_snapshot(config_path: &std::path::Path, window: &str) -> Result<Out
 }
 
 #[implements("FR-027-AC-12")]
+#[implements("FR-027-AC-13")]
+#[implements("FR-027-AC-14")]
 fn run_retro_delta(
-    config_path: &std::path::Path,
+    config_path: Option<&std::path::Path>,
+    team: Option<&str>,
     notify: bool,
+    cadence_manifest: Option<&std::path::Path>,
 ) -> Result<retro::DeltaReport, Error> {
-    let config = retro::RetroConfig::load(config_path).map_err(retro::RetroError::from)?;
+    let config = match (config_path, team) {
+        (Some(path), None) => retro::RetroConfig::load(path).map_err(retro::RetroError::from)?,
+        (None, Some(team)) => retro::RetroConfig::for_team(team.to_owned()),
+        _ => unreachable!("clap requires exactly one of --config and --team"),
+    };
     let store = retro::Store::from_env(&config.team).map_err(retro::RetroError::from)?;
     let report = retro::run_delta(&config, &store)?;
-    retro::notify_defects(
-        &report,
-        notify,
-        config.minder_address.as_deref(),
-        |recipient, message| {
-            let output = std::process::Command::new("agent-msg")
-                .args(["send", recipient, message])
-                .output()
-                .map_err(|error| format!("could not run agent-msg: {error}"))?;
-            if output.status.success() {
-                Ok(())
-            } else {
-                Err(format!(
-                    "agent-msg send {recipient} exited {}: {}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ))
-            }
-        },
-    )
-    .map_err(|message| Error::Retro(retro::RetroError::Evaluation(message)))?;
+    if !report.defects.is_empty() {
+        let settings = ix_board::settings_value()?;
+        let mut ledger = ix_board::cadence::open_ledger(settings.as_ref())
+            .map_err(|error| Error::Cadence(error.to_string()))?;
+        ledger
+            .record_retro_defects(&config.team, &report.defects, cadence_now_ms())
+            .map_err(|error| Error::Cadence(error.to_string()))?;
+    }
+    if notify && !report.defects.is_empty() {
+        let path = ix_board::cadence::manifest_path(cadence_manifest)
+            .map_err(|error| Error::Cadence(error.to_string()))?;
+        let manifest = ix_board::cadence::load_manifest(&path)
+            .map_err(|error| Error::Cadence(error.to_string()))?;
+        retro::notify_defects(
+            &report,
+            true,
+            manifest.alert_recipient.as_deref(),
+            send_relay_message,
+        )
+        .map_err(|message| Error::Retro(retro::RetroError::Evaluation(message)))?;
+    }
     Ok(report)
+}
+
+#[implements("FR-049-AC-5")]
+#[implements("FR-027-AC-12")]
+fn send_relay_message(recipient: &str, message: &str) -> Result<(), String> {
+    let output = std::process::Command::new("agent-msg")
+        .args(["send", recipient, message])
+        .output()
+        .map_err(|error| format!("could not run agent-msg: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "agent-msg send {recipient} exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
 }
 
 fn run_retro_backfill(
@@ -3273,6 +3334,7 @@ fn run_auth(command: AuthCommand) -> Result<Output, Error> {
 
 #[implements("FR-049-AC-3")]
 #[implements("FR-049-AC-5")]
+#[implements("FR-049-AC-8")]
 fn run_cadence(command: CadenceCommand) -> Result<Output, Error> {
     let manifest_override = match &command {
         CadenceCommand::Due { manifest, .. } | CadenceCommand::Run { manifest, .. } => {
@@ -3281,8 +3343,17 @@ fn run_cadence(command: CadenceCommand) -> Result<Output, Error> {
     };
     let path = ix_board::cadence::manifest_path(manifest_override)
         .map_err(|error| Error::Cadence(error.to_string()))?;
-    let manifest = ix_board::cadence::load_manifest(&path)
-        .map_err(|error| Error::Cadence(error.to_string()))?;
+    let manifest = match &command {
+        CadenceCommand::Due { program, team, .. }
+            if manifest_override.is_none()
+                && std::env::var_os("IX_BOARD_CADENCE_MANIFEST").is_none()
+                && !path.exists() =>
+        {
+            ix_board::cadence::generate_default_manifest(&path, program, team)
+        }
+        _ => ix_board::cadence::load_manifest(&path),
+    }
+    .map_err(|error| Error::Cadence(error.to_string()))?;
     let settings = ix_board::settings_value()?;
     match command {
         CadenceCommand::Due {
@@ -3305,27 +3376,15 @@ fn run_cadence(command: CadenceCommand) -> Result<Output, Error> {
             ix_board::cadence::notify_if_alert(
                 &report,
                 manifest.alert_recipient.as_deref(),
-                |recipient, message| {
-                    let output = std::process::Command::new("agent-msg")
-                        .args(["send", recipient, message])
-                        .output()
-                        .map_err(|error| format!("could not run agent-msg: {error}"))?;
-                    if !output.status.success() {
-                        return Err(format!(
-                            "agent-msg send {recipient} exited {}: {}",
-                            output.status,
-                            String::from_utf8_lossy(&output.stderr).trim()
-                        ));
-                    }
-                    Ok(())
-                },
+                send_relay_message,
             )
             .map_err(|error| Error::Cadence(error.to_string()))?;
             Ok(Output::CadenceDue(report))
         }
         CadenceCommand::Run { job, .. } => {
-            let report = ix_board::cadence::run_job(
+            let report = ix_board::cadence::run_job_with_manifest_path(
                 &manifest,
+                Some(&path),
                 || ix_board::cadence::open_ledger(settings.as_ref()),
                 &job,
                 cadence_now_ms(),

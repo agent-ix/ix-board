@@ -14,6 +14,8 @@ relationships:
 read the structured Linear, GitHub and herdr sources named in the retro
 configuration, compute the metric catalog below for the configured team, and
 append one record to the store defined by [FR-025](./FR-025-retro-store.md).
+`ix-board retro snapshot --team <team>` SHALL use the team as the Herdr workspace
+label and auto-detect the gate log under `$TEAM_RETRO_HOME/<team>/gate.jsonl`.
 `--window` takes seconds, minutes, hours or days (`90s`, `20m`, `4h`, `2d`) and
 defaults to `24h`. The command SHALL measure window metrics over the trailing window
 ending at the snapshot time, and state metrics at the snapshot time. The command SHALL NOT mutate Linear, GitHub or any repository. The
@@ -34,18 +36,17 @@ word never has to serve as Linear key, workspace label and directory.
 | `projects` | Linear project names whose issues count toward progress metrics. |
 | `gate_tickets` | Issue ids whose transitive blockers define the path. |
 | `repos` | `owner/name` repositories whose pull requests belong to the team. |
-| `herdr_teams` | Herdr workspace labels read for utilization metrics. |
+| `herdr_teams` | Herdr workspace labels read for utilization metrics (defaults to `[team]`). |
 | `thresholds` | `pr_idle_hours`, `pr_oversize_lines`, `in_progress_stale_hours`. Each is optional and has no default; a metric whose threshold is absent is `unavailable` with reason `not configured`. |
 | `main_check` | Optional repository and branch; the check-runs of every commit on that branch inside the window define main status. |
 | `local_paths` | Optional directories read for prunable worktrees and disk bytes. |
 | `slot_process` | Optional process-name substring identifying build-slot wrappers. |
 | `orphan_slot_hours` | Optional age in hours after which a wrapper whose parent has exited counts as an orphan. A sibling top-level field of `slot_process`; `orphan_slots` needs both. |
-| `gate_log` | Optional path to the JSONL gate log that the team gate script emits (Linear SWM-145) whose lines carry `pr`, `kind` (`gate` or `repin`), `requested_lock_at`, `acquired_lock_at`, `started_at` and `finished_at`. |
+| `gate_log` | Path to the JSONL gate log that the team gate script emits (defaults to `$TEAM_RETRO_HOME/<team>/gate.jsonl`); lines carry `pr`, `kind` (`gate` or `repin`), `requested_lock_at`, `acquired_lock_at`, `started_at` and `finished_at`. |
 | `relay_leads` | Optional relay addresses (`server:workspace:tab`) read for undelivered messages. |
 | `message_stale_minutes` | Optional age in minutes after which a pending message counts as undelivered. A sibling top-level field of `relay_leads`; `messages_undelivered` needs both. |
 | `decision_label` | Optional Linear label name marking issues that wait on an owner decision. |
 | `review_round_limit` | Optional maximum reviewer round count used by `review_rounds_over_limit`; without it, only that metric is unavailable. |
-| `minder_address` | Optional verified `server:workspace:tab` relay destination for explicit `retro delta --notify` defect delivery. |
 | `baseline_taken_at` | Optional UTC time naming the baseline record ([FR-027](./FR-027-retro-delta.md)). |
 
 ### Metric catalog
@@ -61,7 +62,7 @@ with reason `empty population`.
 | progress | `path_remaining` | Open issues that transitively block a gate ticket, from the blocker-chain expansion of [FR-022](./FR-022-blocker-chain.md); `unavailable` when that expansion is truncated or partial. |
 | progress | `path_closed` | Path issues whose state history shows a move to completed inside the window. Path issues are all transitive blockers of the gate tickets, open or completed. |
 | progress | `intake_new` | Issues created inside the window in the configured projects. |
-| progress | `net_closed_minus_new` | Issues in the union of the configured projects and the path that moved to completed inside the window, each counted once, minus `intake_new`. |
+| progress | `net_closed_minus_new` | Path issues that moved to completed inside the window, minus `intake_new`. |
 | progress | `tickets_closed_per_hour` | Issues in the configured projects and gate path that moved to completed in the window and have at least one attached merged pull request, counted once, divided by window hours; unavailable when Linear history, issue attachments, or GitHub merge state is incomplete. |
 | progress | `gates_remaining` | Gate tickets that are not completed. |
 | progress | `path_closed_unverified` | Path issues completed inside the window with no merged pull request attached, per [FR-021](./FR-021-project-reconciliation.md): each pull request URL attached to the issue is checked for a merge on GitHub; `unavailable` when an attachment list was not fully read or GitHub cannot be read. |
@@ -88,7 +89,7 @@ with reason `empty population`.
 | rework | `commits_per_pr_max`, `review_file_only_commits` | Largest commit count on an open or merged-in-window pull request, and total commits whose complete changed-file list contains only `reviews/` paths, from complete GitHub commit and file pages. |
 | rework | `review_rounds_over_limit` | Number of open or merged-in-window pull requests whose highest matching reviewer-disposition `round=` exceeds `review_round_limit`; unavailable when the limit or marker population is not configured or complete. |
 | rework | `non_code_check_reruns` | Check runs repeated after a pull-request head move where every intervening commit changes only documentation, tests, or review records; source is complete GitHub head, commit-file and check-run history. |
-| utilization | `unnamed_wait_minutes_max` | Largest time a configured lane was classified `LOOP(wait_loop)` without a structured named wait, from complete lane status observations; unavailable when lane status or wait-name evidence is incomplete. |
+| utilization | `unnamed_wait_minutes_max` | Greatest age of a team lane's last relay activity while complete fleet status classifies it `LOOP(wait_loop)`; a `wait_loop` classification carries no structured wait name. Unavailable when relay or fleet status evidence is incomplete. |
 | resource | `host_load_per_core_max` | Maximum one-minute host load divided by logical core count for configured build hosts, from complete scheduler host observations. |
 
 The command reads the state history of an issue only when the issue was updated inside the window (or, for `in_progress_stale`, inside `in_progress_stale_hours`), because an issue cannot change state without being updated. That holds only for a current update time, so the issue snapshot must be proven current first: a cached snapshot is used only when a fresh read of the issues updated since then shows the same update time for each, and is refetched otherwise. Independent histories are read concurrently, and a partial read is never reported as a smaller count.
@@ -102,7 +103,7 @@ existing id (see [FR-025](./FR-025-retro-store.md)).
 |----|----------|--------------|
 | FR-024-AC-1 | Given fixture Linear, GitHub and herdr records, the command appends exactly one record containing every catalog id, with the fixture's expected value or unavailable status for each. | Test |
 | FR-024-AC-2 | `path_remaining` equals the open transitive blockers of the gate tickets and excludes issues that block no gate; it is `unavailable` when the blocker expansion is truncated. `path_closed` counts only completions inside the window. | Test |
-| FR-024-AC-3 | `net_closed_minus_new` is negative for a fixture window with more new issues than completions, counts a completed path issue once, and `intake_new` counts only issues created inside the window. | Test |
+| FR-024-AC-3 | `net_closed_minus_new` subtracts `intake_new` from path issues completed inside the window, counts each completed path issue once, and `intake_new` counts only issues created inside the window. | Test |
 | FR-024-AC-4 | `prs_merged_per_hour` equals merged count divided by window hours, and `pr_cycle_median_hours` and `pr_cycle_p90_hours` match the nearest-rank values for a fixture with an even count and an outlier. | Test |
 | FR-024-AC-5 | `prs_open`, `prs_idle`, `prs_oversize` and `prs_ready_unmerged` match the fixture for pull requests that straddle each threshold, a draft, and an approved and an unapproved pull request. | Test |
 | FR-024-AC-6 | `fix_rounds_max` and `fix_rounds_total` count only pull requests that are open or were merged inside the window, and are computed from marker first lines only: a comment containing the marker text in its body but not on its first line, and a human comment, change neither value; a disposition marker whose `repo=` and `id=` match no `reviewer` marker of a counted pull request is ignored. | Test |
@@ -117,12 +118,14 @@ existing id (see [FR-025](./FR-025-retro-store.md)).
 | FR-024-AC-18 | A missing threshold makes only the metrics that use it `unavailable` with reason `not configured`, and `slot_process` without `orphan_slot_hours`, or `relay_leads` without `message_stale_minutes`, (and the reverse) makes its metric `unavailable` with reason `not configured`. | Test |
 | FR-024-AC-19 | `tickets_closed_per_hour` counts the unique configured project/path issues completed inside the half-open event window that have an attached merged pull request, divides by window hours, and is unavailable when state history, issue attachments or GitHub merge state is incomplete. | Test |
 | FR-024-AC-20 | The additive churn metric IDs are present in each snapshot; until their complete structured collectors are configured, they are unavailable with no invented values. The role evaluator passes hand-written stored values through the corresponding `retro.<metric_id>` adapters. | Test |
-| FR-024-AC-21 | `unnamed_wait_minutes_max` is catalogued as a utilization metric measured in minutes with a lower-is-better direction, and is unavailable until a complete structured wait collector is configured. | Test |
+| FR-024-AC-21 | `unnamed_wait_minutes_max` is catalogued as a utilization metric measured in minutes with a lower-is-better direction. | Test |
 | FR-024-AC-22 | `host_load_per_core_max` is present in the catalog and is unavailable without a complete host collector; no value is invented. | Test |
 | FR-024-AC-12 | The command makes no Linear mutation, no GitHub write and no repository write; test source doubles that record writes see none. | Test |
 | FR-024-AC-13 | Each source is read with one paginated pass per run, and a source read that does not reach its last page makes dependent metrics unavailable ([FR-026](./FR-026-retro-unavailable-not-zero.md)). | Test |
 | FR-024-AC-14 | `--json` output exposes every metric with id, value, unit, direction, status, source, query and its FR-024 catalog family as `class`; it includes the FR-029 department class as `department_class` when defined. These class fields are output-only and are never written to the append-only store. Text output prints one line per metric. | Test |
-| FR-024-AC-19 | `ix-board::retro::decode_saved_report` accepts the record payload of `retro snapshot --json` containing these class fields; older pinned readers that reject unknown metric fields reject this output. This acceptance covers the record payload only, excluding stale-cache freshness keys added by the CLI wrapper. | Test |
+| FR-024-AC-23 | `ix-board::retro::decode_saved_report` accepts the record payload of `retro snapshot --json` containing these class fields; older pinned readers that reject unknown metric fields reject this output. This acceptance covers the record payload only, excluding stale-cache freshness keys added by the CLI wrapper. | Test |
+| FR-024-AC-24 | `retro snapshot --team T` uses Herdr label `T`, discovers `$TEAM_RETRO_HOME/T/gate.jsonl`, and unavailable metrics name the missing Herdr or gate_log source. | Test |
+| FR-024-AC-25 | `unnamed_wait_minutes_max` reports the greatest age of last relay activity for team lanes classified `LOOP(wait_loop)` by complete fleet status, and is unavailable when relay or fleet status evidence is incomplete. | Test |
 
 ## Dependencies
 

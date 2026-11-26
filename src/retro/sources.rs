@@ -225,6 +225,24 @@ pub trait GithubSource {
 pub trait AgentSource {
     /// The FR-018 report for the workspace labels.
     fn report(&self, teams: &[String]) -> Result<AgentsReport, String>;
+
+    /// Current fleet activity rows used to measure unnamed wait loops.
+    fn wait_activity(&self, _teams: &[String]) -> Result<Vec<WaitActivity>, String> {
+        Err("fleet agent-activity source is unavailable".to_owned())
+    }
+}
+
+/// One complete fleet activity observation for a team lane.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WaitActivity {
+    /// Relay lane address.
+    pub lane: String,
+    /// Age of the last agent activity, in seconds.
+    pub age_secs: Option<u64>,
+    /// Whether the lane is classified as `LOOP(wait_loop)`.
+    pub wait_loop: bool,
+    /// Whether structured activity supplied a name for the wait.
+    pub named_wait: bool,
 }
 
 /// One line of the gate log.

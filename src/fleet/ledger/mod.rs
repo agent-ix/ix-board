@@ -807,6 +807,34 @@ impl Ledger {
         Ok(())
     }
 
+    /// Records each retro finding as an independently queryable defect row.
+    #[implements("FR-027-AC-13")]
+    pub fn record_retro_defects(
+        &mut self,
+        team: &str,
+        defects: &[crate::retro::DeltaDefect],
+        at_ms: i64,
+    ) -> Result<(), LedgerError> {
+        let tx = self.connection.transaction()?;
+        for defect in defects {
+            let kind = format!(
+                "{}:{}:previous={}:current={}",
+                defect.class,
+                defect.metric_id,
+                defect
+                    .previous
+                    .map_or_else(|| "none".to_owned(), |v| v.to_string()),
+                defect.current
+            );
+            tx.execute(
+                "INSERT INTO defect(source,host,lane,kind,first_seen_at) VALUES(?1,NULL,NULL,?2,?3)",
+                params![format!("retro:{team}"), kind, at_ms],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Appends one `fleet status` run: the run record, one `lane_tick` row per lane, the
     /// per-host figures and the defect rows, then prunes by retention. Returns each report
     /// defect's first-seen time in relay milliseconds, in report order; a defect first seen in a

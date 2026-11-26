@@ -10,7 +10,7 @@ relationships:
 
 ## Description
 
-`ix-board retro delta --config <file> [--json]` SHALL read the store of the
+`ix-board retro delta --config <file> [--json]` or `ix-board retro delta --team <team> [--json]` SHALL read the store of the
 configured team and, for each metric of the latest record, report the value, the
 change since the previous record, and the change since the baseline. The latest
 and previous records SHALL be the two records of kind `snapshot` with the
@@ -46,9 +46,11 @@ The delta report SHALL also expose a `defects` array. A latest two-record increa
 in `prs_idle`, `fix_rounds_max` or `agents_idle_minutes_max` emits one
 `retro_metric_rising` defect with the metric ID and both observed values. A
 `lead_wait_without_named_wait` defect is emitted when the latest
-`unnamed_wait_minutes_max` value is strictly greater than 20. Defect generation
-reads only stored records; delivery is a separate explicit command option and
-uses the configured `minder_address` (`server:workspace:tab`).
+`unnamed_wait_minutes_max` value is strictly greater than 20 and rises from the
+previous value or crosses 20 for the first time; with one snapshot, a value over
+20 is a first crossing. Defect generation reads stored records and records each
+finding in the fleet ledger. `--notify` sends findings to the cadence manifest's
+single `alert_recipient` (`server:workspace:tab`).
 
 ## Acceptance Criteria
 
@@ -64,8 +66,10 @@ uses the configured `minder_address` (`server:workspace:tab`).
 | FR-027-AC-8 | A `baseline_taken_at` matching no record stops the command with an error naming the value. | Test |
 | FR-027-AC-9 | `ix-board retro delta` output includes each metric's FR-024 catalog family as `class` and the FR-029 department class as `department_class` where defined, resolving both from catalogs. | Test |
 | FR-027-AC-10 | `ix-board::retro::decode_saved_report` decodes delta JSON written before the `class` and `department_class` output fields existed. | Test |
-| FR-027-AC-11 | Hand-written records that show each watched metric rising produce one structured defect with exact metric and values; flat, falling, unavailable, or query-changed metrics produce none. The unnamed-wait defect is emitted only above 20 minutes. | Test |
-| FR-027-AC-12 | Without `--notify`, delta makes no notification call; with `--notify`, each defect is sent once to the configured three-part minder address, and missing or invalid routing configuration returns an error without sending. | Test |
+| FR-027-AC-11 | Hand-written records that show each watched metric rising produce one structured defect with the metric's stored prior value and current value; flat, falling, unavailable, or query-changed metrics produce none. Unnamed wait emits only above 20 and only on a rise or first crossing, including the first snapshot. | Test |
+| FR-027-AC-12 | Without `--notify`, delta makes no notification call; with `--notify`, each defect is sent once to the cadence manifest's `alert_recipient`, and missing or invalid routing configuration returns an error without sending. | Test |
+| FR-027-AC-13 | Each emitted defect is appended as an individual fleet ledger defect row with team, class, metric id, previous and current values. | Test |
+| FR-027-AC-14 | `retro delta --team T` reads team T's store without a retro config file; `--notify` reads its recipient from the selected cadence manifest. | Test |
 
 ## Dependencies
 
