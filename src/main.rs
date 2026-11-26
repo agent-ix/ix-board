@@ -3382,20 +3382,9 @@ fn run_cadence(command: CadenceCommand) -> Result<Output, Error> {
             Ok(Output::CadenceDue(report))
         }
         CadenceCommand::Run { job, .. } => {
-            let mut execution_manifest = manifest.clone();
-            if let Some(job) = execution_manifest
-                .jobs
-                .iter_mut()
-                .find(|candidate| candidate.id == job)
-                && let Some(after_success) = &mut job.after_success
-                && after_success.iter().any(|arg| arg == "--notify")
-                && !after_success.iter().any(|arg| arg == "--manifest")
-            {
-                after_success.push("--manifest".to_owned());
-                after_success.push(path.to_string_lossy().into_owned());
-            }
-            let report = ix_board::cadence::run_job(
-                &execution_manifest,
+            let report = ix_board::cadence::run_job_with_manifest_path(
+                &manifest,
+                Some(&path),
                 || ix_board::cadence::open_ledger(settings.as_ref()),
                 &job,
                 cadence_now_ms(),

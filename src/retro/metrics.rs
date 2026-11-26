@@ -413,7 +413,7 @@ impl Out<'_> {
             "review_file_only_commits" => ("github", format!("commits whose complete file list contains only reviews/ paths; {window}")),
             "review_rounds_over_limit" => ("linear+github", format!("pull requests whose highest matching reviewer round exceeds review_round_limit={}; {window}", threshold(self.config.review_round_limit))),
             "non_code_check_reruns" => ("github", format!("check runs repeated after a head move whose intervening complete commit files are non-code; {window}")),
-            "unnamed_wait_minutes_max" => ("Herdr and structured lane status", format!("largest duration of LOOP(wait_loop) without a named wait; defect over 20 minutes; {window}")),
+            "unnamed_wait_minutes_max" => ("relay activity and Prometheus fleet lane status", format!("largest age of last relay activity for a team lane classified LOOP(wait_loop); defect over 20 minutes; {window}")),
             "host_load_per_core_max" => (
                 "scheduler host observations",
                 "maximum one-minute load divided by logical cores".to_owned(),
@@ -1361,23 +1361,18 @@ fn stability(out: &mut Out<'_>, sources: &Sources<'_>) {
 #[implements("FR-047-AC-1")]
 #[implements("FR-024-AC-25")]
 fn utilization(out: &mut Out<'_>, sources: &Sources<'_>) {
-    if out.config.herdr_teams.is_empty() {
+    if out.wants_any(&["agents_working_share", "agents_idle_minutes_max"])
+        && out.config.herdr_teams.is_empty()
+    {
         let reason = "herdr source missing: no workspace labels are configured".to_owned();
-        for id in [
-            "agents_working_share",
-            "agents_idle_minutes_max",
-            "unnamed_wait_minutes_max",
-        ] {
-            out.unavailable(id, reason.clone());
-        }
-    } else {
+        out.unavailable("agents_working_share", reason.clone());
+        out.unavailable("agents_idle_minutes_max", reason);
+    } else if out.wants_any(&["agents_working_share", "agents_idle_minutes_max"]) {
         match sources.agents.report(&out.config.herdr_teams) {
             Err(error) => {
                 let reason = format!("herdr unavailable: {error}");
                 out.unavailable("agents_working_share", reason.clone());
-                for id in ["agents_idle_minutes_max", "unnamed_wait_minutes_max"] {
-                    out.unavailable(id, reason.clone());
-                }
+                out.unavailable("agents_idle_minutes_max", reason);
             }
             Ok(report)
                 if !report.errors.is_empty()
@@ -1405,9 +1400,7 @@ fn utilization(out: &mut Out<'_>, sources: &Sources<'_>) {
                 );
                 let reason = format!("herdr unavailable: {}", reasons.join("; "));
                 out.unavailable("agents_working_share", reason.clone());
-                for id in ["agents_idle_minutes_max", "unnamed_wait_minutes_max"] {
-                    out.unavailable(id, reason.clone());
-                }
+                out.unavailable("agents_idle_minutes_max", reason);
             }
             Ok(report) => {
                 let total = report.agents.len();
@@ -1447,46 +1440,27 @@ fn utilization(out: &mut Out<'_>, sources: &Sources<'_>) {
                         (_, Some(secs)) => Ok(secs as f64 / 60.0),
                     },
                 );
-                let wait = if report.schema_version != crate::agents::AGENTS_SCHEMA_VERSION
-                    || !report.missing_teams.is_empty()
-                    || report.agents.iter().any(|row| row.partial)
-                {
-                    Err("herdr activity source incomplete for wait-loop evidence".to_owned())
-                } else {
-                    report
-                        .agents
-                        .iter()
-                        .filter(|row| is_unnamed_wait(row))
-                        .map(|row| {
-                            row.recent_activity_at
-                                .map(|at| row.host_now.saturating_sub(at) as f64 / 60.0)
-                                .ok_or_else(|| {
-                                    format!(
-                                        "herdr activity source lacks last activity for {}",
-                                        row.title
-                                    )
-                                })
-                        })
-                        .collect::<Result<Vec<_>, _>>()
-                        .map(|waits| waits.into_iter().reduce(f64::max).unwrap_or(0.0))
-                };
-                out.put("unnamed_wait_minutes_max", wait);
             }
         }
     }
-}
-
-#[implements("FR-024-AC-25")]
-fn is_unnamed_wait(row: &crate::agents::AgentRow) -> bool {
-    let status = row.herdr_status.trim();
-    let wait_loop =
-        status.eq_ignore_ascii_case("LOOP(wait_loop)") || status.eq_ignore_ascii_case("wait_loop");
-    let named = row.notes.iter().any(|note| {
-        note.strip_prefix("named_wait:")
-            .or_else(|| note.strip_prefix("wait_name:"))
-            .is_some_and(|name| !name.trim().is_empty())
-    });
-    wait_loop && !named
+    if out.wants("unnamed_wait_minutes_max") {
+        let teams = [out.config.team.clone()];
+        let wait = sources.agents.wait_activity(&teams).and_then(|rows| {
+            rows.into_iter()
+                .filter(|row| row.wait_loop && !row.named_wait)
+                .map(|row| {
+                    row.age_secs.map(|age| age as f64 / 60.0).ok_or_else(|| {
+                        format!("fleet agent-activity source lacks age for {}", row.lane)
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(|waits| waits.into_iter().reduce(f64::max).unwrap_or(0.0))
+        });
+        out.put(
+            "unnamed_wait_minutes_max",
+            wait.map_err(|error| format!("fleet agent-activity source unavailable: {error}")),
+        );
+    }
 }
 
 fn relay(out: &mut Out<'_>, sources: &Sources<'_>) {

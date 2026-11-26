@@ -348,14 +348,16 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), CadenceError> {
             )));
         }
         let valid_delta = job.after_success.as_deref().is_some_and(|command| {
-            let configured_scope = command
-                .windows(2)
-                .any(|pair| (pair[0] == "--config" || pair[0] == "--team") && !pair[1].is_empty());
-            command.len() >= 2
-                && command[0] == "retro"
-                && command[1] == "delta"
-                && configured_scope
-                && command.iter().any(|arg| arg == "--notify")
+            matches!(
+                command,
+                [root, sub, scope, value, notify]
+                    if root == "retro"
+                        && sub == "delta"
+                        && (scope == "--config" || scope == "--team")
+                        && !value.is_empty()
+                        && !value.starts_with("--")
+                        && notify == "--notify"
+            )
         });
         if job.after_success.is_some() && (job.kind != JobKind::RetroSnapshot || !valid_delta) {
             return Err(CadenceError::Manifest(format!(
@@ -442,6 +444,18 @@ pub fn run_job(
     job_id: &str,
     now_ms: i64,
 ) -> Result<JobRunReport, CadenceError> {
+    run_job_with_manifest_path(manifest, None, &mut open_ledger, job_id, now_ms)
+}
+
+/// Runs one job while binding its follow-up delta to the manifest that selected the job.
+#[implements("FR-049-AC-7")]
+pub fn run_job_with_manifest_path(
+    manifest: &Manifest,
+    manifest_path: Option<&Path>,
+    mut open_ledger: impl FnMut() -> Result<Ledger, CadenceError>,
+    job_id: &str,
+    now_ms: i64,
+) -> Result<JobRunReport, CadenceError> {
     validate_manifest(manifest)?;
     let mut matching = manifest.jobs.iter().filter(|job| job.id == job_id);
     let Some(job) = matching.next() else {
@@ -453,7 +467,7 @@ pub fn run_job(
     let mut ledger = open_ledger()?;
     ledger.cadence_start(&job.program, &job.team, &job.id, now_ms)?;
     drop(ledger);
-    let result = execute(job);
+    let result = execute(job, manifest_path);
     let finished_at_ms = unix_time_ms();
     match result {
         Ok(status) => {
@@ -492,13 +506,24 @@ pub fn run_job(
     }
 }
 
-fn execute(job: &Job) -> Result<std::process::ExitStatus, std::io::Error> {
+#[implements("FR-049-AC-7")]
+fn execute(
+    job: &Job,
+    manifest_path: Option<&Path>,
+) -> Result<std::process::ExitStatus, std::io::Error> {
     let executable = std::env::current_exe()?;
     let status = Command::new(&executable).args(&job.command).status()?;
     if status.success()
         && let Some(after_success) = &job.after_success
     {
-        return Command::new(executable).args(after_success).status();
+        let mut command = Command::new(executable);
+        command.args(after_success);
+        if after_success.iter().any(|arg| arg == "--notify")
+            && let Some(manifest_path) = manifest_path
+        {
+            command.arg("--manifest").arg(manifest_path);
+        }
+        return command.status();
     }
     Ok(status)
 }
@@ -742,5 +767,39 @@ mod tests {
         manifest.jobs[0].interval_secs = 1800;
         manifest.alert_recipient = Some("all".to_owned());
         assert!(validate_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    #[trace("FR-049-AC-4", "FR-049-AC-7")]
+    fn manifest_rejects_malformed_delta_argv_before_snapshot_execution() {
+        let malformed = [
+            vec!["retro", "delta", "--team", "--notify"],
+            vec![
+                "retro",
+                "delta",
+                "--team",
+                "qsl",
+                "--config",
+                "retro.json",
+                "--notify",
+            ],
+            vec![
+                "retro",
+                "delta",
+                "--team",
+                "qsl",
+                "--manifest",
+                "other.json",
+                "--notify",
+            ],
+        ];
+        for command in malformed {
+            let mut manifest = Manifest {
+                alert_recipient: None,
+                jobs: vec![job("retro")],
+            };
+            manifest.jobs[0].after_success = Some(command.into_iter().map(str::to_owned).collect());
+            assert!(validate_manifest(&manifest).is_err());
+        }
     }
 }

@@ -70,6 +70,7 @@ struct Rig {
     infos: BTreeMap<(String, u64), PullRequestInfo>,
     commits: Option<Result<Vec<MainCommit>, String>>,
     agents: Option<Result<AgentsReport, String>>,
+    wait_activities: Option<Result<Vec<ix_board::retro::sources::WaitActivity>, String>>,
     gate_lines: Option<Result<Vec<GateLine>, String>>,
     relay: BTreeMap<String, Result<Vec<i64>, String>>,
     worktrees: Option<Result<u64, String>>,
@@ -194,6 +195,14 @@ impl AgentSource for Rig {
     fn report(&self, _teams: &[String]) -> Result<AgentsReport, String> {
         self.log("agents");
         unset(&self.agents, "agents")
+    }
+
+    fn wait_activity(
+        &self,
+        _teams: &[String],
+    ) -> Result<Vec<ix_board::retro::sources::WaitActivity>, String> {
+        self.log("wait_activity");
+        unset(&self.wait_activities, "fleet agent activity")
     }
 }
 
@@ -599,7 +608,10 @@ fn snapshot_appends_one_record_with_every_catalog_id() {
     assert_eq!(wait_metric.family, "utilization");
     assert_eq!(wait_metric.unit, "minutes");
     assert_eq!(wait_metric.direction, ix_board::retro::Direction::Down);
-    assert_eq!(value(&record, "unnamed_wait_minutes_max"), Some(0.0));
+    assert!(
+        reason(&record, "unnamed_wait_minutes_max")
+            .contains("fleet agent-activity source unavailable")
+    );
     let host_metric = definition("host_load_per_core_max").unwrap();
     assert_eq!(host_metric.family, "resource");
     assert_eq!(host_metric.unit, "ratio");
@@ -822,19 +834,34 @@ fn agent_metrics_match_rows_and_an_empty_list_is_an_empty_population() {
 #[test]
 fn unnamed_wait_collector_uses_structured_agent_activity_and_named_waits() {
     let mut rig = base_rig();
-    {
-        let lead = &mut rig.agents.as_mut().unwrap().as_mut().unwrap().agents[0];
-        lead.title = "lead".into();
-        lead.herdr_status = "LOOP(wait_loop)".into();
-        lead.recent_activity_at = Some(1_000);
-        lead.host_now = 2_800;
-    }
+    rig.wait_activities = Some(Ok(vec![
+        ix_board::retro::sources::WaitActivity {
+            lane: "draco:SWM:lead".into(),
+            age_secs: Some(1_800),
+            wait_loop: true,
+            named_wait: false,
+        },
+        ix_board::retro::sources::WaitActivity {
+            lane: "draco:SWM:named".into(),
+            age_secs: Some(3_600),
+            wait_loop: true,
+            named_wait: true,
+        },
+        ix_board::retro::sources::WaitActivity {
+            lane: "draco:SWM:working".into(),
+            age_secs: Some(5_400),
+            wait_loop: false,
+            named_wait: false,
+        },
+    ]));
     let record = snapshot(&rig);
     assert_eq!(value(&record, "unnamed_wait_minutes_max"), Some(30.0));
-
-    rig.agents.as_mut().unwrap().as_mut().unwrap().agents[0]
-        .notes
-        .push("named_wait: waiting for review".into());
+    rig.wait_activities = Some(Ok(vec![ix_board::retro::sources::WaitActivity {
+        lane: "draco:SWM:named".into(),
+        age_secs: Some(3_600),
+        wait_loop: true,
+        named_wait: true,
+    }]));
     let record = snapshot(&rig);
     assert_eq!(value(&record, "unnamed_wait_minutes_max"), Some(0.0));
 }
@@ -1235,7 +1262,7 @@ fn a_snapshot_only_reads_and_leaves_a_repository_untouched() {
     run_snapshot(&cfg, DAY, NOW, &sources, &store_in(&store_dir)).unwrap();
     assert_eq!(listing(repo.path()), before, "no repository write");
     // The sources expose reads only; the recorded calls are exactly those reads.
-    const READS: [&str; 12] = [
+    const READS: [&str; 13] = [
         "workspace",
         "project_open_count",
         "marker_lines",
@@ -1244,6 +1271,7 @@ fn a_snapshot_only_reads_and_leaves_a_repository_untouched() {
         "pull_request:agent-ix/x#10",
         "main_commits",
         "agents",
+        "wait_activity",
         "gate_log",
         "relay",
         "processes",
@@ -1269,6 +1297,7 @@ fn each_source_is_read_once_per_run() {
     assert_eq!(rig.count("pull_requests:agent-ix/x"), 1);
     assert!(rig.count("marker_lines") >= 1);
     assert_eq!(rig.count("agents"), 1);
+    assert_eq!(rig.count("wait_activity"), 1);
     let history: Vec<_> = rig
         .calls
         .borrow()

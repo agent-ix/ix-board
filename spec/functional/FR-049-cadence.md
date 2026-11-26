@@ -28,8 +28,9 @@ the matching manifest job, without a shell, and SHALL persist the start time,
 completion time and outcome in the existing fleet ledger whether the command
 succeeds or fails. A snapshot job MAY declare `after_success`.
 
-When declared, `after_success` SHALL be a `retro delta --config <file> --notify`
-or `retro delta --team <team> --notify` argv and SHALL run only after the snapshot exits successfully. A failed
+When declared, `after_success` SHALL be exactly a `retro delta --config <file> --notify`
+or `retro delta --team <team> --notify` argv; cadence SHALL run it with the
+selected manifest path and only after the snapshot exits successfully. A failed
 follow-up SHALL make the cadence run fail. Supported
 job kinds are `retro_snapshot`, `fleet_tick` and `hygiene`. Jobs are configured
 by program and team and declare a stable job id, positive interval, kind, argv

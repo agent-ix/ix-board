@@ -212,6 +212,8 @@ fn cadence_runs_stored_delta_after_snapshot_without_sending_when_no_defect_exist
     )
     .unwrap();
     let config_path = retro_config.to_string_lossy().into_owned();
+    let unrelated_manifest = directory.path().join("unrelated-cadence.json");
+    std::fs::write(&unrelated_manifest, "not the selected cadence manifest").unwrap();
     let manifest_value = json!({
         "jobs": [{
             "program": "QSL",
@@ -230,7 +232,7 @@ fn cadence_runs_stored_delta_after_snapshot_without_sending_when_no_defect_exist
         .arg(&manifest_path)
         .env("IX_BOARD_LEDGER_PATH", &ledger_path)
         .env("TEAM_RETRO_HOME", &retro_home)
-        .env("IX_BOARD_CADENCE_MANIFEST", &manifest_path)
+        .env("IX_BOARD_CADENCE_MANIFEST", &unrelated_manifest)
         .output()
         .unwrap();
     assert!(

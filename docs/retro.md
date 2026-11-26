@@ -17,7 +17,7 @@ ix-board retro delta    --config retro.json          # after each snapshot
 
 Use the same `--window` for every snapshot and any backfill; records taken with different windows or thresholds compare as `query_changed`. A snapshot measured 15 to 60 seconds against a live workspace; most of the upper end is the 25-second wait on Herdr when a machine is unreachable.
 
-`ix-board retro snapshot` reads Linear, GitHub, Herdr and a few local sources, computes a fixed
+`ix-board retro snapshot` reads Linear, GitHub, Herdr, relay and Prometheus fleet status, and a few local sources, computes a fixed
 catalog of metrics for one team, and appends one record to that team's store. It never writes to
 Linear, GitHub or any repository.
 

@@ -18,7 +18,7 @@ use serde::Deserialize;
 use super::sources::{
     AGENTS_IDLE_AFTER_SECS, AgentSource, CheckState, GateLine, GateLogSource, GithubSource,
     LabeledIssue, LinearSource, LocalSource, MainCommit, Page, ProcessRow, PullRequest,
-    PullRequestInfo, RelaySource, StateChange, read_all_pages,
+    PullRequestInfo, RelaySource, StateChange, WaitActivity, read_all_pages,
 };
 use crate::agents::{AgentsReport, build_report, system_hosts};
 use crate::{LinearGraphQlSource, ReadService, WorkspaceSnapshot};
@@ -815,6 +815,69 @@ impl AgentSource for LiveAgents {
                 AGENTS_DEADLINE.as_secs()
             )
         })?
+    }
+
+    #[implements("FR-024-AC-25")]
+    fn wait_activity(&self, teams: &[String]) -> Result<Vec<WaitActivity>, String> {
+        let settings = crate::settings_value().map_err(|error| error.to_string())?;
+        let config = crate::fleet::FleetConfig::from_toml(
+            settings.as_ref(),
+            std::env::var("IX_PROMETHEUS_URL").ok(),
+        )
+        .map_err(|error| error.to_string())?;
+        let series: Option<std::sync::Arc<dyn crate::fleet::SeriesSource>> =
+            config.prometheus_url.as_ref().map(|url| {
+                match crate::fleet::live::PromHttp::new(url, config.host_timeout) {
+                    Ok(query) => {
+                        std::sync::Arc::new(crate::fleet::live::PrometheusSeries { query })
+                            as std::sync::Arc<dyn crate::fleet::SeriesSource>
+                    }
+                    Err(error) => std::sync::Arc::new(crate::fleet::live::UnavailablePrometheus(
+                        error.to_string(),
+                    )),
+                }
+            });
+        let (relay, receipts) = crate::fleet::live::read_relay(config.host_timeout);
+        let sources = crate::fleet::Sources {
+            relay,
+            series,
+            receipts: &receipts,
+            weak: &crate::fleet::live::NoWeakSignals,
+        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+            });
+        let report = crate::fleet::build_report(&config, &sources, now_ms);
+        if !report.complete {
+            return Err(format!(
+                "fleet report is incomplete: {}",
+                report
+                    .defects
+                    .iter()
+                    .map(|defect| format!("{}: {}", defect.source, defect.reason))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
+        }
+        Ok(report
+            .rows
+            .into_iter()
+            .filter(|row| {
+                let workspace = row.lane.split(':').nth(1).unwrap_or_default();
+                teams
+                    .iter()
+                    .any(|team| team.eq_ignore_ascii_case(workspace))
+            })
+            .map(|row| WaitActivity {
+                lane: row.lane,
+                age_secs: row.state_age_secs,
+                wait_loop: row.class == crate::fleet::ClassKind::Loop
+                    && row.reason.as_deref() == Some("wait_loop"),
+                named_wait: false,
+            })
+            .collect())
     }
 }
 
