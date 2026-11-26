@@ -212,14 +212,14 @@ struct HygieneArgs {
     #[arg(long)]
     host: String,
     /// Worktree root on this host.
-    #[arg(long, default_value_os_t = default_worktree_root())]
-    root: PathBuf,
+    #[arg(long)]
+    root: Option<PathBuf>,
     /// Configured minimum free space in GiB.
     #[arg(long)]
-    free_floor_gb: u64,
+    free_floor_gb: Option<u64>,
     /// Configured minimum target age in minutes.
-    #[arg(long, default_value_t = 60)]
-    idle_minutes: u64,
+    #[arg(long)]
+    idle_minutes: Option<u64>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -230,7 +230,7 @@ enum BuildCommand {
         #[arg(long)]
         metrics_url: String,
         /// Host policy in `host:max_load1:max_running_leases` form (repeatable).
-        #[arg(long = "policy", required = true)]
+        #[arg(long = "policy")]
         policies: Vec<String>,
     },
 }
@@ -3432,8 +3432,8 @@ fn run_hygiene(
     apply: bool,
 ) -> Result<ix_board::host_hygiene::HygieneReport, Error> {
     use ix_board::host_hygiene::{
-        CleanDecision, HostPolicy, HygieneReport, apply_clean_decision, clean_decision,
-        free_disk_bytes, system_process_table,
+        CleanDecision, HostPolicy, HygieneConfig, HygieneReport, apply_clean_decision,
+        clean_decision, free_disk_bytes, system_process_table,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -3441,7 +3441,7 @@ fn run_hygiene(
         return Ok(HygieneReport {
             host: args.host.clone(),
             free_bytes: None,
-            free_floor_bytes: args.free_floor_gb.saturating_mul(1024 * 1024 * 1024),
+            free_floor_bytes: 0,
             targets: Vec::new(),
             prunable_worktrees: Vec::new(),
             orphan_build_processes: Vec::new(),
@@ -3449,26 +3449,45 @@ fn run_hygiene(
             unsupported: true,
         });
     }
-    if args.root.file_name().is_none_or(|name| name != "worktrees") {
+    let settings = ix_board::settings_value()?;
+    let config = HygieneConfig::from_settings(settings.as_ref())
+        .map_err(|message| Error::ProgramReview { message })?;
+    let root = args
+        .root
+        .clone()
+        .or(config.worktree_root)
+        .unwrap_or_else(default_worktree_root);
+    let host_policy = config.hosts.get(&args.host.to_lowercase());
+    let floor_gb = args.free_floor_gb.or_else(|| host_policy.and_then(|policy| policy.free_floor_gb))
+        .ok_or_else(|| Error::ProgramReview {
+            message: format!("no free-space floor configured for host {:?}; set hygiene.hosts.{}.free_floor_gb or pass --free-floor-gb", args.host, args.host),
+        })?;
+    let idle_minutes =
+        args.idle_minutes
+            .or(config.idle_minutes)
+            .ok_or_else(|| Error::ProgramReview {
+                message:
+                    "no target idle age configured; set hygiene.idle_minutes or pass --idle-minutes"
+                        .to_owned(),
+            })?;
+    if root.file_name().is_none_or(|name| name != "worktrees") {
         return Err(Error::ProgramReview {
             message: "hygiene root must be a worktrees directory".to_owned(),
         });
     }
-    let floor = args
-        .free_floor_gb
+    let floor = floor_gb
         .checked_mul(1024 * 1024 * 1024)
         .ok_or_else(|| Error::ProgramReview {
             message: "free-space floor overflows bytes".to_owned(),
         })?;
-    let age = args
-        .idle_minutes
+    let age = idle_minutes
         .checked_mul(60)
         .ok_or_else(|| Error::ProgramReview {
             message: "idle age overflows seconds".to_owned(),
         })?;
-    let free_bytes = free_disk_bytes(&args.root).ok();
+    let free_bytes = free_disk_bytes(&root).ok();
     let processes = system_process_table().unwrap_or_default();
-    let prunable_worktrees = find_prunable_worktrees(&args.root);
+    let prunable_worktrees = find_prunable_worktrees(&root);
     let orphan_build_processes = processes
         .processes
         .iter()
@@ -3476,7 +3495,7 @@ fn run_hygiene(
             process
                 .cwd
                 .as_deref()
-                .is_some_and(|cwd| cwd.starts_with(&args.root))
+                .is_some_and(|cwd| cwd.starts_with(&root))
                 && process.cmdline.split(|byte| *byte == 0).any(|word| {
                     matches!(
                         PathBuf::from(String::from_utf8_lossy(word).as_ref())
@@ -3497,7 +3516,7 @@ fn run_hygiene(
         free_floor_bytes: floor,
         idle_age_secs: age,
     };
-    let entries = std::fs::read_dir(&args.root).map_err(|error| Error::ProgramReview {
+    let entries = std::fs::read_dir(&root).map_err(|error| Error::ProgramReview {
         message: format!("cannot read worktree root: {error}"),
     })?;
     let mut targets = Vec::new();
@@ -3597,9 +3616,34 @@ fn run_build_status(
     )>,
     Error,
 > {
-    use ix_board::host_hygiene::{BuildPolicy, Eligibility, parse_build_metrics};
+    use ix_board::host_hygiene::{BuildPolicy, Eligibility, HygieneConfig, parse_build_metrics};
     let response = fetch_metrics_text(metrics_url)?;
-    let configured = policies
+    let configured = if policies.is_empty() {
+        let settings = ix_board::settings_value()?;
+        let config = HygieneConfig::from_settings(settings.as_ref())
+            .map_err(|message| Error::ProgramReview { message })?;
+        if config.hosts.is_empty() {
+            return Err(Error::ProgramReview {
+                message: "no hosts configured in [hygiene.hosts] and no --policy supplied"
+                    .to_owned(),
+            });
+        }
+        config
+            .hosts
+            .keys()
+            .map(|host| {
+                config
+                    .build_policy(host)
+                    .map(|policy| (host.clone(), policy))
+                    .ok_or_else(|| Error::ProgramReview {
+                        message: format!(
+                            "host {host:?} needs both max_load1 and heavy_gate_slots for build status"
+                        ),
+                    })
+            })
+            .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?
+    } else {
+        policies
         .iter()
         .map(|policy| {
             let fields = policy.split(':').collect::<Vec<_>>();
@@ -3632,7 +3676,13 @@ fn run_build_status(
                 },
             ))
         })
-        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
+        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?
+    };
+    if configured.is_empty() {
+        return Err(Error::ProgramReview {
+            message: "no complete build policy configured; set max_load1 and heavy_gate_slots for each host".to_owned(),
+        });
+    }
     let metrics = parse_build_metrics(&response);
     Ok(configured
         .into_iter()

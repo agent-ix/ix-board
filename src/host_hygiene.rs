@@ -108,6 +108,76 @@ pub struct BuildPolicy {
     pub heavy_gate_slots: u64,
 }
 
+/// Per-host policy values used by hygiene and build admission commands.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostPolicyConfig {
+    /// Free-space floor in GiB.
+    pub free_floor_gb: Option<u64>,
+    /// Maximum raw one-minute load average for a heavy gate.
+    pub max_load1: Option<f64>,
+    /// Maximum simultaneous heavy gates including the proposed gate.
+    pub heavy_gate_slots: Option<u64>,
+}
+
+/// The `[hygiene]` policy table from ix-board settings.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneConfig {
+    /// Worktree directory on this host.
+    pub worktree_root: Option<PathBuf>,
+    /// Minimum target-directory idle age in minutes.
+    pub idle_minutes: Option<u64>,
+    /// Policy values keyed by Herdr host label.
+    #[serde(default)]
+    pub hosts: BTreeMap<String, HostPolicyConfig>,
+}
+
+impl HygieneConfig {
+    /// Parses and validates the `[hygiene]` settings table.
+    #[implements("FR-048-AC-1", "FR-048-AC-8")]
+    pub fn from_settings(settings: Option<&toml::Value>) -> Result<Self, String> {
+        let Some(value) = settings.and_then(|settings| settings.get("hygiene")) else {
+            return Ok(Self::default());
+        };
+        let mut config: Self = value
+            .clone()
+            .try_into()
+            .map_err(|error| format!("invalid [hygiene] settings: {error}"))?;
+        if config.idle_minutes.is_some_and(|minutes| minutes == 0) {
+            return Err("hygiene.idle_minutes must be positive".to_owned());
+        }
+        let mut normalized = BTreeMap::new();
+        for (host, policy) in config.hosts {
+            if host.trim().is_empty() {
+                return Err("hygiene host labels must not be empty".to_owned());
+            }
+            if policy.free_floor_gb.is_some_and(|value| value == 0)
+                || policy.heavy_gate_slots.is_some_and(|value| value == 0)
+                || policy
+                    .max_load1
+                    .is_some_and(|value| !value.is_finite() || value <= 0.0)
+            {
+                return Err(format!("invalid hygiene policy for host {host:?}"));
+            }
+            if normalized.insert(host.to_lowercase(), policy).is_some() {
+                return Err("hygiene host labels must be unique ignoring case".to_owned());
+            }
+        }
+        config.hosts = normalized;
+        Ok(config)
+    }
+
+    /// Resolves a complete heavy-gate policy for one configured host.
+    pub fn build_policy(&self, host: &str) -> Option<BuildPolicy> {
+        let policy = self.hosts.get(&host.to_lowercase())?;
+        Some(BuildPolicy {
+            max_load1: policy.max_load1?,
+            heavy_gate_slots: policy.heavy_gate_slots?,
+        })
+    }
+}
+
 /// Result of evaluating one host for a heavy gate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Eligibility {
@@ -544,6 +614,44 @@ pub fn eligibility(metrics: &BuildHostMetrics, policy: BuildPolicy) -> Eligibili
 mod tests {
     use super::*;
     use ix_trace_rs::trace;
+
+    #[test]
+    #[trace("FR-048-AC-1", "FR-048-AC-8")]
+    fn host_hygiene_policy_reads_expected_values_from_settings() {
+        let settings = toml::from_str::<toml::Value>(
+            r#"
+            [hygiene]
+            worktree_root = "/srv/dev/worktrees"
+            idle_minutes = 90
+
+            [hygiene.hosts.terra]
+            free_floor_gb = 150
+            max_load1 = 32.0
+            heavy_gate_slots = 2
+
+            [hygiene.hosts.luna]
+            free_floor_gb = 100
+            max_load1 = 8.0
+            heavy_gate_slots = 1
+            "#,
+        )
+        .expect("valid settings");
+        let config = HygieneConfig::from_settings(Some(&settings)).expect("valid hygiene config");
+        assert_eq!(
+            config.worktree_root.as_deref(),
+            Some(Path::new("/srv/dev/worktrees"))
+        );
+        assert_eq!(config.idle_minutes, Some(90));
+        assert_eq!(config.hosts["terra"].free_floor_gb, Some(150));
+        assert_eq!(config.hosts["luna"].free_floor_gb, Some(100));
+        assert_eq!(
+            config.build_policy("LUNA"),
+            Some(BuildPolicy {
+                max_load1: 8.0,
+                heavy_gate_slots: 1,
+            })
+        );
+    }
 
     #[test]
     #[trace("FR-048-AC-2")]

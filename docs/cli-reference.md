@@ -491,34 +491,54 @@ code. When no row could be read it exits with the internal-error code.
 ## ix-board hygiene check
 
 ```text
-ix-board hygiene check --host <HOST> --free-floor-gb <GIB> [--root <WORKTREES>] [--idle-minutes <MINUTES>]
+ix-board hygiene check --host <HOST> [--free-floor-gb <GIB>] [--root <WORKTREES>] [--idle-minutes <MINUTES>]
 ```
 
 Reports free disk space, target directories and their ages, prunable worktrees, and build
-processes without a Herdr pane association. The worktree root must be named `worktrees`.
-The free-space floor and idle age are explicit policy values. Exit status is 0 when clear,
+processes without a Herdr pane association. The worktree root must be named `worktrees`. Values
+may be set in the ix-board settings file under `[hygiene]`; command-line values override the
+configured ones. Each host needs `hygiene.hosts.<host>.free_floor_gb`, and cleanup needs
+`hygiene.idle_minutes`. There are no implicit floor or age defaults. Exit status is 0 when clear,
 1 when findings exist, 2 when required evidence is unavailable, and 3 on unsupported Windows.
 
 ## ix-board hygiene clean
 
 ```text
-ix-board hygiene clean --host <HOST> --free-floor-gb <GIB> [--root <WORKTREES>] [--idle-minutes <MINUTES>] [--apply]
+ix-board hygiene clean --host <HOST> [--free-floor-gb <GIB>] [--root <WORKTREES>] [--idle-minutes <MINUTES>] [--apply]
 ```
 
 Dry-run by default. `--apply` removes only old `target/` directories under discovered Git
-worktrees when complete process evidence proves they are unused.
+worktrees when complete process evidence proves they are unused. Example policy:
+
+```toml
+[hygiene]
+worktree_root = "/srv/dev/worktrees"
+idle_minutes = 90
+
+[hygiene.hosts.terra]
+free_floor_gb = 150
+max_load1 = 32.0
+heavy_gate_slots = 2
+
+[hygiene.hosts.luna]
+free_floor_gb = 100
+max_load1 = 8.0
+heavy_gate_slots = 1
+```
 
 ## ix-board build status
 
 ```text
-ix-board build status --metrics-url <URL> --policy <HOST:MAX_LOAD1:HEAVY_GATE_SLOTS>...
+ix-board build status --metrics-url <URL> [--policy <HOST:MAX_LOAD1:HEAVY_GATE_SLOTS>...]
 ```
 
 Reads Prometheus text exposition from the configured endpoint and reports per-host one-minute
 load per core, root filesystem free space, memory, swap, queued requests, running locked-build
 leases and policy eligibility.
-Pass one `--policy` for each host. For luna's current rule use `luna:8:1` (raw load must be
-below 8 and no heavy gate may already be running).
+Without `--policy`, the command uses configured `[hygiene.hosts.<host>]` entries that provide
+both `max_load1` and `heavy_gate_slots`. Pass one `--policy` for each host to override the
+configured host list. For luna's current rule use `luna:8:1` (raw load must be below 8 and no
+heavy gate may already be running).
 
 ## ix-board fleet status
 
