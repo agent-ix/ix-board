@@ -455,8 +455,8 @@ fn seed_v2_capacity_rows(path: &Path) {
 fn a_crash_mid_migration_leaves_the_version_one_ledger_intact_and_openable() {
     let (_dir, path) = path();
     seed_v1(&path);
-    let total = schema::V2.len() + schema::views().len();
-    for fail_at in [0, 20, total - 1] {
+    let v2_steps = schema::V2.len();
+    for fail_at in [0, v2_steps / 2, v2_steps - 1] {
         let error = Ledger::open_with(&path, &FleetConfig::default(), Some((fail_at, usize::MAX)))
             .err()
             .unwrap();

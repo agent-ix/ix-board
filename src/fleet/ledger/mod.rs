@@ -632,8 +632,8 @@ impl Ledger {
             }
             6 => {
                 let tx = connection.transaction()?;
-                refresh_v6_host_output_view(&tx)?;
                 apply_v7(&tx)?;
+                refresh_v6_host_output_view(&tx)?;
                 apply_v8(&tx)?;
                 apply_v9(&tx)?;
                 tx.commit()?;
