@@ -2347,6 +2347,7 @@ fn rising_retro_metrics_and_unnamed_wait_emit_structured_defects() {
     assert!(delta(&no_defect_records, "{}").unwrap().defects.is_empty());
 
     let mut changed_query = no_defect_records[1].clone();
+    changed_query.metrics.get_mut("prs_idle").unwrap().value = Some(5.0);
     changed_query
         .metrics
         .get_mut("fix_rounds_max")
