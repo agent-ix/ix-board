@@ -81,6 +81,7 @@ pub fn collect_selected(
 #[implements("FR-024-AC-19")]
 #[implements("FR-024-AC-1")]
 #[implements("FR-024-AC-20")]
+#[implements("FR-024-AC-21")]
 #[implements("FR-024-AC-22")]
 fn collect_inner(
     config: &RetroConfig,
