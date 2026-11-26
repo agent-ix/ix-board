@@ -157,7 +157,7 @@ impl DueReport {
             })
             .collect::<Vec<_>>();
         if self.alert {
-            lines.push("alert cadence checker is overdue".to_owned());
+            lines.push("alert cadence checker is missing or due".to_owned());
         }
         lines.join("\n")
     }
@@ -270,14 +270,15 @@ pub fn due(
         })
         .collect::<Result<Vec<_>, CadenceError>>()?;
     jobs.sort_by(|left, right| left.id.cmp(&right.id));
-    let checker_overdue = jobs
+    let checker_missing_or_due = jobs
         .iter()
-        .any(|job| job.id == CHECKER_JOB_ID && job.state == DueState::Overdue);
+        .find(|job| job.id == CHECKER_JOB_ID)
+        .is_none_or(|job| job.state != DueState::NotDue);
     Ok(DueReport {
         program: program.to_owned(),
         team: team.to_owned(),
         jobs,
-        alert: alert && checker_overdue,
+        alert: alert && checker_missing_or_due,
     })
 }
 
@@ -493,7 +494,7 @@ mod tests {
         assert_eq!(absent.exit_code(), 0);
         let first = due(&manifest, &ledger, "QSL", "qsl", 0, true).unwrap();
         assert_eq!(first.exit_code(), 1);
-        assert!(!first.alert);
+        assert!(first.alert);
 
         ledger
             .cadence_start(&checker.program, &checker.team, &checker.id, 0)

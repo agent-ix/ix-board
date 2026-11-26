@@ -51,7 +51,35 @@ fn due_command(manifest: &Path, ledger: &Path) -> std::process::Output {
 }
 
 #[test]
-#[trace("FR-048-AC-3")]
+#[trace("FR-048-AC-5")]
+fn cadence_due_cli_alerts_when_checker_is_missing() {
+    let directory = tempfile::tempdir().unwrap();
+    let manifest_path = directory.path().join("cadence.json");
+    let ledger_path = directory.path().join("ledger.sqlite3");
+    manifest(&manifest_path, 3600);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ix-board"))
+        .args([
+            "cadence",
+            "due",
+            "--program",
+            "QSL",
+            "--team",
+            "qsl",
+            "--alert",
+            "--manifest",
+        ])
+        .arg(&manifest_path)
+        .env("IX_BOARD_LEDGER_PATH", &ledger_path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("alert cadence checker is missing or due")
+    );
+}
+
+#[test]
+#[trace("FR-048-AC-3", "FR-048-AC-6")]
 fn cadence_run_releases_ledger_for_fleet_tick_and_concurrent_due() {
     let directory = tempfile::tempdir().unwrap();
     let manifest_path = directory.path().join("cadence.json");
@@ -129,6 +157,46 @@ fn cadence_hygiene_job_runs_the_focus_hygiene_argv() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("Usage: ix-board focus hygiene"));
+    let ledger = Ledger::open(&ledger_path, &FleetConfig::default()).unwrap();
+    let result = ledger
+        .cadence_last_run("QSL", "qsl", "hygiene")
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.outcome, "succeeded");
+}
+
+#[test]
+#[trace("FR-048-AC-3")]
+fn cadence_run_records_a_child_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let manifest_path = directory.path().join("cadence.json");
+    let ledger_path = directory.path().join("ledger.sqlite3");
+    let value = json!({
+        "jobs": [{
+            "program": "QSL",
+            "team": "qsl",
+            "id": "hygiene-fail",
+            "interval_secs": 3600,
+            "kind": "hygiene",
+            "command": ["focus", "hygiene", "--not-a-real-option"],
+            "owner_role": "minder"
+        }]
+    });
+    std::fs::write(&manifest_path, serde_json::to_vec(&value).unwrap()).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ix-board"))
+        .args(["cadence", "run", "hygiene-fail", "--manifest"])
+        .arg(&manifest_path)
+        .env("IX_BOARD_LEDGER_PATH", &ledger_path)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let ledger = Ledger::open(&ledger_path, &FleetConfig::default()).unwrap();
+    let result = ledger
+        .cadence_last_run("QSL", "qsl", "hygiene-fail")
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.outcome, "failed");
+    assert!(result.finished_at_ms.is_some());
 }
 
 #[test]
