@@ -379,7 +379,10 @@ impl Out<'_> {
             "review_rounds_over_limit" => ("linear+github", format!("pull requests whose highest matching reviewer round exceeds review_round_limit={}; {window}", threshold(self.config.review_round_limit))),
             "non_code_check_reruns" => ("github", format!("check runs repeated after a head move whose intervening complete commit files are non-code; {window}")),
             "unnamed_wait_minutes_max" => ("Herdr and structured lane status", format!("largest duration of LOOP(wait_loop) without a named wait; defect over 20 minutes; {window}")),
-            "host_load_per_core_max" => ("scheduler host observations", format!("maximum one-minute load divided by logical cores")),
+            "host_load_per_core_max" => (
+                "scheduler host observations",
+                "maximum one-minute load divided by logical cores".to_owned(),
+            ),
             _ => ("unknown", String::new()),
         };
         (source, rule)
