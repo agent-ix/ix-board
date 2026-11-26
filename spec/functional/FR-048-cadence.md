@@ -18,9 +18,10 @@ overdue, or not due. A job without a successful or failed run record is due
 immediately. A job is due when its interval has elapsed since its last
 completed run, and overdue when at least one additional interval has elapsed.
 The command exits 0 when no job is due, 1 when at least one job is due, and 2
-when at least one job is overdue. `--alert` SHALL emit an alert when the
-configured cadence checker job itself is overdue. That job is the manifest
-entry whose id is `cadence-checker`.
+when at least one job is overdue. `--alert` SHALL send a relay notification to
+the single `alert_recipient` address in the manifest when the configured
+cadence checker is missing or due/overdue. That job is the manifest entry whose
+id is `cadence-checker`.
 
 `ix-board cadence run <job>` SHALL run exactly the argv sequence declared by
 the matching manifest job, without a shell, and SHALL persist the start time,
@@ -36,8 +37,10 @@ run a host scheduler.
 The cadence manifest is JSON, selected by `IX_BOARD_CADENCE_MANIFEST` or the
 default `cadence.json` in ix-board's user configuration directory. Its job
 entries use `program`, `team`, `id`, `interval_secs`, `kind`, `command`, and
-`owner_role`. `command` is an argv array; shell expansion is not performed.
-The manifest is shared configuration and is not stored in the fleet ledger.
+`owner_role`. The optional top-level `alert_recipient` is one complete
+`server:workspace:tab` relay address; `--alert` requires it when an alert is
+sent. `command` is an argv array; shell expansion is not performed. The
+manifest is shared configuration and is not stored in the fleet ledger.
 
 ## Acceptance Criteria
 

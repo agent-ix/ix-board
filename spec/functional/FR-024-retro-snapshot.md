@@ -82,19 +82,6 @@ with reason `empty population`.
 | resource | `build_lock_wait_minutes` | Sum of `acquired_lock_at` minus `requested_lock_at` over `gate_log` lines finished inside the window. |
 | utilization | `messages_undelivered` | Messages pending longer than `message_stale_minutes` in the ix-relay bus queues of the addresses in `relay_leads`, read without dequeuing. Queues are keyed by the registered session name, so each address is resolved read-only through the bus registry by machine, workspace and tab, and the messages of every matching registration count; an address with no registration makes the metric `unavailable`. The bus URL and prefix come from `IX_RELAY_URL` and `IX_RELAY_PREFIX`, then `~/.ix/relay/config.toml`, then the relay defaults. |
 | scope | `decisions_open`, `decision_oldest_hours` | Open issues carrying `decision_label`, and the age in hours of the oldest. |
-| flow | `prs_per_block_max` | Largest number of pull requests linked to one configured parent ticket/block, from structured issue attachments and GitHub pull-request links. |
-| flow | `commits_per_pr_max` | Largest commit count among pull requests created, updated or merged inside the window, from GitHub commit lists. |
-| rework | `review_file_commits_total` | Commits in the window whose changed files are all under `reviews/`, from GitHub commit file lists. |
-| rework | `review_rounds_max` | Largest reviewer round marker for a pull request in the window, from the first-line `reviewer` and `reviewer-dispositions` markers. |
-| utilization | `lane_idle_minutes_max` | Largest time a configured lane remained in `LOOP(wait_loop)` without a named wait, from structured agent activity records. |
-| utilization | `lane_unnamed_wait_over_20m` | Lanes whose `LOOP(wait_loop)` interval exceeded 20 minutes without a named wait, from structured agent activity records. |
-| resource | `host_load_per_core_max` | Highest configured host load-per-core sample in the window, from structured host samples. |
-| resource | `host_saturated_minutes` | Minutes with host saturation overlapping a lane idle interval, from structured host samples. |
-
-These are additive catalog ids. Their absence from a source, incomplete source
-coverage, or unconfigured source SHALL produce `unavailable`, never zero.
-`lane_unnamed_wait_over_20m` is the defect-class count and has a fixed
-20-minute threshold.
 
 The command reads the state history of an issue only when the issue was updated inside the window (or, for `in_progress_stale`, inside `in_progress_stale_hours`), because an issue cannot change state without being updated. That holds only for a current update time, so the issue snapshot must be proven current first: a cached snapshot is used only when a fresh read of the issues updated since then shows the same update time for each, and is refetched otherwise. Independent histories are read concurrently, and a partial read is never reported as a smaller count.
 
@@ -125,8 +112,6 @@ existing id (see [FR-025](./FR-025-retro-store.md)).
 | FR-024-AC-13 | Each source is read with one paginated pass per run, and a source read that does not reach its last page makes dependent metrics unavailable ([FR-026](./FR-026-retro-unavailable-not-zero.md)). | Test |
 | FR-024-AC-14 | `--json` output exposes every metric with id, value, unit, direction, status, source, query and its FR-024 catalog family as `class`; it includes the FR-029 department class as `department_class` when defined. These class fields are output-only and are never written to the append-only store. Text output prints one line per metric. | Test |
 | FR-024-AC-19 | `ix-board::retro::decode_saved_report` accepts the record payload of `retro snapshot --json` containing these class fields; older pinned readers that reject unknown metric fields reject this output. This acceptance covers the record payload only, excluding stale-cache freshness keys added by the CLI wrapper. | Test |
-| FR-024-AC-20 | The fixed catalog includes only the eight added ids in this change, preserves every prior id and formula, and reports each added metric as unavailable when its source is not configured or complete. | Test |
-| FR-024-AC-21 | When the corresponding structured source has not been configured or does not provide complete coverage, each added metric is unavailable with a source-specific reason; the existing metric formulas remain unchanged. | Test |
 
 ## Dependencies
 

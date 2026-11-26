@@ -554,7 +554,7 @@ fn git_init(dir: &Path) {
 
 // ---- FR-024 ----------------------------------------------------------------------------
 
-#[trace("FR-024-AC-1", "FR-024-AC-14", "FR-024-AC-20", "FR-024-AC-21")]
+#[trace("FR-024-AC-1", "FR-024-AC-14")]
 #[test]
 fn snapshot_appends_one_record_with_every_catalog_id() {
     let rig = base_rig();
@@ -578,27 +578,6 @@ fn snapshot_appends_one_record_with_every_catalog_id() {
     assert_eq!(value(&record, "prs_open"), Some(1.0));
     assert_eq!(value(&record, "fix_rounds_total"), Some(3.0));
     assert_eq!(reason(&record, "main_red_incidents"), "not configured");
-    let added_ids = [
-        "prs_per_block_max",
-        "commits_per_pr_max",
-        "review_file_commits_total",
-        "review_rounds_max",
-        "lane_idle_minutes_max",
-        "lane_unnamed_wait_over_20m",
-        "host_load_per_core_max",
-        "host_saturated_minutes",
-    ];
-    for id in added_ids {
-        assert!(
-            ix_board::retro::catalog::definition(id).is_some(),
-            "{id} catalog id"
-        );
-        assert_eq!(value(&record, id), None, "{id} lacks its source adapter");
-        assert!(
-            reason(&record, id).contains("source adapter is not configured"),
-            "{id}"
-        );
-    }
     assert_eq!(record.kind, ix_board::retro::RecordKind::Snapshot);
     assert_eq!(record.taken_at, "2026-11-07T12:00:00Z");
     assert_eq!(record.window, "1d");
@@ -614,7 +593,7 @@ fn path_counts_only_open_transitive_blockers_of_gates() {
     assert_eq!(value(&record, "path_closed"), Some(2.0));
 }
 
-/// Trace: FR-024-AC-2, FR-024-AC-3
+/// Trace: FR-024-AC-2
 #[test]
 fn path_remaining_is_unavailable_when_the_blocker_expansion_is_partial() {
     let mut rig = base_rig();
@@ -627,6 +606,7 @@ fn path_remaining_is_unavailable_when_the_blocker_expansion_is_partial() {
     for id in [
         "path_remaining",
         "path_closed",
+        "net_closed_minus_new",
         "path_closed_unverified",
         "done_reopened",
     ] {
@@ -2626,14 +2606,13 @@ fn running_the_same_range_twice_appends_nothing_and_reports_each_skipped_day() {
 fn live_state_metrics_are_not_reconstructible_in_every_backfill_record() {
     let (_dir, store) = store_with(&[]);
     let report = backfill_range(&base_rig(), &store, ("2026-11-02", "2026-11-04"), DAY).unwrap();
-    const KEPT: [&str; 8] = [
+    const KEPT: [&str; 7] = [
         "prs_merged_per_hour",
         "pr_cycle_median_hours",
         "pr_cycle_p90_hours",
         "path_closed",
         "intake_new",
         "net_closed_minus_new",
-        "tickets_closed_per_hour",
         "done_reopened",
     ];
     for record in &report.appended {

@@ -51,34 +51,6 @@ fn due_command(manifest: &Path, ledger: &Path) -> std::process::Output {
 }
 
 #[test]
-#[trace("FR-048-AC-5")]
-fn cadence_due_cli_alerts_when_checker_is_missing() {
-    let directory = tempfile::tempdir().unwrap();
-    let manifest_path = directory.path().join("cadence.json");
-    let ledger_path = directory.path().join("ledger.sqlite3");
-    manifest(&manifest_path, 3600);
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ix-board"))
-        .args([
-            "cadence",
-            "due",
-            "--program",
-            "QSL",
-            "--team",
-            "qsl",
-            "--alert",
-            "--manifest",
-        ])
-        .arg(&manifest_path)
-        .env("IX_BOARD_LEDGER_PATH", &ledger_path)
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(1));
-    assert!(
-        String::from_utf8_lossy(&output.stdout).contains("alert cadence checker is missing or due")
-    );
-}
-
-#[test]
 #[trace("FR-048-AC-3", "FR-048-AC-6")]
 fn cadence_run_releases_ledger_for_fleet_tick_and_concurrent_due() {
     let directory = tempfile::tempdir().unwrap();

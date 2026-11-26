@@ -198,18 +198,6 @@ fn collect_inner(
     if out.wants_any(&["full_gates_max", "repins_total", "build_lock_wait_minutes"]) {
         gate_log(&mut out, sources);
     }
-    if out.wants_any(&[
-        "prs_per_block_max",
-        "commits_per_pr_max",
-        "review_file_commits_total",
-        "review_rounds_max",
-        "lane_idle_minutes_max",
-        "lane_unnamed_wait_over_20m",
-        "host_load_per_core_max",
-        "host_saturated_minutes",
-    ]) {
-        unconfigured_additions(&mut out);
-    }
     if out.wants("messages_undelivered") {
         relay(&mut out, sources);
     }
@@ -369,14 +357,6 @@ impl Out<'_> {
             "messages_undelivered" => ("ix-relay", format!("messages pending longer than message_stale_minutes={} in the queues of relay_leads", threshold(self.config.message_stale_minutes))),
             "decisions_open" => ("linear", format!("open issues carrying decision_label={:?}", self.config.decision_label.clone().unwrap_or_default())),
             "decision_oldest_hours" => ("linear", format!("age in hours of the oldest open issue carrying decision_label={:?}", self.config.decision_label.clone().unwrap_or_default())),
-            "prs_per_block_max" => ("linear+github", "largest number of pull requests linked to one parent ticket or block; source adapter not configured".to_owned()),
-            "commits_per_pr_max" => ("github", format!("largest commits-per-pull-request count in {window}; commit-list source adapter not configured")),
-            "review_file_commits_total" => ("github", format!("commits whose changed files are exclusively under reviews/ in {window}; commit-file source adapter not configured")),
-            "review_rounds_max" => ("linear", format!("maximum reviewer round marker per pull request in {window}; review-round source adapter not configured")),
-            "lane_idle_minutes_max" => ("herdr", "largest LOOP(wait_loop) idle interval from structured activity; source adapter not configured".to_owned()),
-            "lane_unnamed_wait_over_20m" => ("herdr", "count of lanes in LOOP(wait_loop) longer than 20 minutes without a named wait; source adapter not configured".to_owned()),
-            "host_load_per_core_max" => ("host metrics", format!("maximum load per core in {window}; structured host sample adapter not configured")),
-            "host_saturated_minutes" => ("host metrics+herdr", format!("minutes of host saturation overlapping lane idle in {window}; structured host sample adapter not configured")),
             _ => ("unknown", String::new()),
         };
         (source, rule)
@@ -394,27 +374,6 @@ impl Out<'_> {
             "{rule}; check-runs of main_check={target}; window={}",
             format_window(self.frame.window_secs)
         )
-    }
-}
-
-fn unconfigured_additions(out: &mut Out<'_>) {
-    for (id, source) in [
-        ("prs_per_block_max", "Linear/GitHub parent ticket links"),
-        ("commits_per_pr_max", "GitHub commit lists"),
-        ("review_file_commits_total", "GitHub commit file lists"),
-        ("review_rounds_max", "reviewer round markers"),
-        ("lane_idle_minutes_max", "structured Herdr wait-loop events"),
-        (
-            "lane_unnamed_wait_over_20m",
-            "structured Herdr wait-loop events",
-        ),
-        ("host_load_per_core_max", "structured host samples"),
-        (
-            "host_saturated_minutes",
-            "structured host samples and Herdr wait-loop events",
-        ),
-    ] {
-        out.unavailable(id, format!("{source} source adapter is not configured"));
     }
 }
 
@@ -692,7 +651,6 @@ fn progress(
 /// the frame.
 #[implements("FR-047-AC-1")]
 #[implements("FR-024-AC-19")]
-#[implements("FR-024-AC-3")]
 fn window_progress(
     out: &mut Out<'_>,
     scope: &Scope<'_>,
@@ -749,7 +707,8 @@ fn window_progress(
     }
     if needs_net {
         let net = (|| {
-            let closed = history.changed_in_window(&wanted, frame, to_completed)?;
+            let union = wanted;
+            let closed = history.changed_in_window(&union, frame, to_completed)?;
             Ok::<_, String>(count(closed.len()) - count(created.clone().unwrap_or(Ok(0))?))
         })();
         out.put("net_closed_minus_new", net);

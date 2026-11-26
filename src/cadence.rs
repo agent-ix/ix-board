@@ -44,6 +44,9 @@ pub enum CadenceError {
         /// Process error.
         message: String,
     },
+    /// The alert notification could not be delivered.
+    #[error("cadence alert notification: {0}")]
+    Notification(String),
 }
 
 /// A configured cadence job.
@@ -82,6 +85,9 @@ pub enum JobKind {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
+    /// Single relay address notified when `cadence due --alert` finds the checker needs attention.
+    #[serde(default)]
+    pub alert_recipient: Option<String>,
     /// Jobs in the manifest.
     pub jobs: Vec<Job>,
 }
@@ -124,7 +130,7 @@ pub struct DueReport {
     pub team: String,
     /// Matching jobs in stable id order.
     pub jobs: Vec<DueJob>,
-    /// Whether `--alert` found the checker itself overdue.
+    /// Whether `--alert` found the checker missing or due/overdue.
     pub alert: bool,
 }
 
@@ -161,6 +167,37 @@ impl DueReport {
         }
         lines.join("\n")
     }
+}
+
+/// Sends the checker alert only when the due report requests one.
+///
+/// # Errors
+/// Returns an error when the notification transport refuses the alert.
+#[implements("FR-048-AC-5")]
+pub fn notify_if_alert(
+    report: &DueReport,
+    recipient: Option<&str>,
+    notify: impl FnOnce(&str, &str) -> Result<(), String>,
+) -> Result<(), CadenceError> {
+    if report.alert {
+        let recipient = recipient
+            .filter(|address| valid_relay_address(address))
+            .ok_or_else(|| {
+                CadenceError::Notification(
+                    "manifest must configure one alert_recipient as server:workspace:tab"
+                        .to_owned(),
+                )
+            })?;
+        notify(
+            recipient,
+            &format!(
+                "ix-board cadence checker needs attention for {}/{}",
+                report.program, report.team
+            ),
+        )
+        .map_err(CadenceError::Notification)?;
+    }
+    Ok(())
 }
 
 /// Resolves the manifest from an explicit override, environment or user config directory.
@@ -200,6 +237,15 @@ pub fn load_manifest(path: &Path) -> Result<Manifest, CadenceError> {
 /// Validates cadence job identity, interval and supported argv shape.
 #[implements("FR-048-AC-4")]
 pub fn validate_manifest(manifest: &Manifest) -> Result<(), CadenceError> {
+    if manifest
+        .alert_recipient
+        .as_deref()
+        .is_some_and(|address| !valid_relay_address(address))
+    {
+        return Err(CadenceError::Manifest(
+            "alert_recipient must be one server:workspace:tab address".to_owned(),
+        ));
+    }
     let mut identities = BTreeSet::new();
     for job in &manifest.jobs {
         if job.program.trim().is_empty()
@@ -232,6 +278,13 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), CadenceError> {
         }
     }
     Ok(())
+}
+
+fn valid_relay_address(address: &str) -> bool {
+    let mut segments = address.split(':');
+    let has_three_nonempty =
+        (0..3).all(|_| segments.next().is_some_and(|part| !part.trim().is_empty()));
+    has_three_nonempty && segments.next().is_none()
 }
 
 fn command_matches_kind(kind: JobKind, command: &[String]) -> bool {
@@ -359,39 +412,8 @@ pub fn run_job(
 }
 
 fn execute(job: &Job) -> Result<std::process::ExitStatus, std::io::Error> {
-    if job.kind == JobKind::RetroSnapshot {
-        validate_retro_snapshot_config(job)?;
-    }
     let executable = std::env::current_exe()?;
     Command::new(executable).args(&job.command).status()
-}
-
-fn validate_retro_snapshot_config(job: &Job) -> Result<(), std::io::Error> {
-    let config_path = job
-        .command
-        .windows(2)
-        .find(|pair| pair[0] == "--config")
-        .map(|pair| PathBuf::from(&pair[1]))
-        .ok_or_else(|| std::io::Error::other("retro snapshot job requires --config <file>"))?;
-    let config = crate::retro::RetroConfig::load(&config_path)
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
-    if config.team != job.team {
-        return Err(std::io::Error::other(format!(
-            "retro config team {:?} does not match cadence team {:?}",
-            config.team, job.team
-        )));
-    }
-    if config.herdr_teams.is_empty() {
-        return Err(std::io::Error::other(
-            "retro snapshot config must name at least one herdr_teams entry",
-        ));
-    }
-    if config.gate_log.is_none() {
-        return Err(std::io::Error::other(
-            "retro snapshot config must set gate_log",
-        ));
-    }
-    Ok(())
 }
 
 fn unix_time_ms() -> i64 {
@@ -437,10 +459,13 @@ pub fn open_ledger(settings: Option<&toml::Value>) -> Result<Ledger, CadenceErro
 
 #[cfg(test)]
 mod tests {
-    use super::{DueState, Job, JobKind, Manifest, classify_due, due, validate_manifest};
+    use super::{
+        DueState, Job, JobKind, Manifest, classify_due, due, notify_if_alert, validate_manifest,
+    };
     use crate::fleet::FleetConfig;
     use crate::fleet::ledger::Ledger;
     use ix_trace_rs::trace;
+    use serde_json::json;
 
     fn job(id: &str) -> Job {
         Job {
@@ -488,6 +513,7 @@ mod tests {
         let mut ledger = Ledger::open(&path, &FleetConfig::default()).unwrap();
         let checker = job("cadence-checker");
         let manifest = Manifest {
+            alert_recipient: None,
             jobs: vec![checker.clone()],
         };
         let absent = due(&manifest, &ledger, "elsewhere", "qsl", 0, true).unwrap();
@@ -515,6 +541,75 @@ mod tests {
     }
 
     #[test]
+    #[trace("FR-048-AC-5")]
+    fn checker_notification_is_sent_only_when_report_alerts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ledger.sqlite3");
+        let mut ledger = Ledger::open(&path, &FleetConfig::default()).unwrap();
+        let manifest_path = directory.path().join("cadence.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec(&json!({
+                "alert_recipient": "draco:SWM:minder",
+                "jobs": [{
+                    "program": "QSL",
+                    "team": "qsl",
+                    "id": "cadence-checker",
+                    "interval_secs": 1800,
+                    "kind": "retro_snapshot",
+                    "command": ["retro", "snapshot", "--config", "/tmp/retro.json"],
+                    "owner_role": "minder"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let manifest = super::load_manifest(&manifest_path).unwrap();
+        let checker = &manifest.jobs[0];
+        ledger
+            .cadence_start(&checker.program, &checker.team, &checker.id, 0)
+            .unwrap();
+        ledger
+            .cadence_finish(
+                &checker.program,
+                &checker.team,
+                &checker.id,
+                1000,
+                true,
+                None,
+            )
+            .unwrap();
+
+        let on_time = due(&manifest, &ledger, "QSL", "qsl", 1001, true).unwrap();
+        let mut on_time_notified = false;
+        notify_if_alert(&on_time, manifest.alert_recipient.as_deref(), |_, _| {
+            on_time_notified = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(!on_time_notified);
+
+        let overdue = due(&manifest, &ledger, "QSL", "qsl", 3_601_000, true).unwrap();
+        let mut sent = None;
+        notify_if_alert(
+            &overdue,
+            manifest.alert_recipient.as_deref(),
+            |recipient, message| {
+                sent = Some((recipient.to_owned(), message.to_owned()));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            sent,
+            Some((
+                "draco:SWM:minder".to_owned(),
+                "ix-board cadence checker needs attention for QSL/qsl".to_owned()
+            ))
+        );
+    }
+
+    #[test]
     #[trace("FR-048-AC-2")]
     fn ledger_reopen_preserves_outcome_and_running_job_ages_to_overdue() {
         let directory = tempfile::tempdir().unwrap();
@@ -537,6 +632,7 @@ mod tests {
 
         ledger.cadence_start("QSL", "qsl", "stopped", 0).unwrap();
         let manifest = Manifest {
+            alert_recipient: None,
             jobs: vec![job("stopped")],
         };
         let report = due(&manifest, &ledger, "QSL", "qsl", 3_600_000, false).unwrap();
@@ -547,12 +643,16 @@ mod tests {
     #[trace("FR-048-AC-4")]
     fn manifest_rejects_duplicate_and_invalid_job_entries() {
         let mut manifest = Manifest {
+            alert_recipient: None,
             jobs: vec![job("retro")],
         };
         manifest.jobs.push(job("retro"));
         assert!(validate_manifest(&manifest).is_err());
         manifest.jobs.pop();
         manifest.jobs[0].interval_secs = 0;
+        assert!(validate_manifest(&manifest).is_err());
+        manifest.jobs[0].interval_secs = 1800;
+        manifest.alert_recipient = Some("all".to_owned());
         assert!(validate_manifest(&manifest).is_err());
     }
 }

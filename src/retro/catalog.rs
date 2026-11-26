@@ -104,14 +104,6 @@ pub const CATALOG: &[MetricDef] = &[
     def("messages_undelivered", "utilization", "messages", Down),
     def("decisions_open", "scope", "issues", Down),
     def("decision_oldest_hours", "scope", "hours", Down),
-    def("prs_per_block_max", "flow", "pull_requests", Down),
-    def("commits_per_pr_max", "flow", "commits", Down),
-    def("review_file_commits_total", "rework", "commits", Down),
-    def("review_rounds_max", "rework", "rounds", Down),
-    def("lane_idle_minutes_max", "utilization", "minutes", Down),
-    def("lane_unnamed_wait_over_20m", "defect", "lanes", Down),
-    def("host_load_per_core_max", "resource", "load_per_core", Down),
-    def("host_saturated_minutes", "resource", "minutes", Down),
 ];
 
 /// Looks up a catalog entry by id.

@@ -3082,6 +3082,7 @@ fn run_auth(command: AuthCommand) -> Result<Output, Error> {
 }
 
 #[implements("FR-048-AC-3")]
+#[implements("FR-048-AC-5")]
 fn run_cadence(command: CadenceCommand) -> Result<Output, Error> {
     let manifest_override = match &command {
         CadenceCommand::Due { manifest, .. } | CadenceCommand::Run { manifest, .. } => {
@@ -3109,6 +3110,25 @@ fn run_cadence(command: CadenceCommand) -> Result<Output, Error> {
                 &team,
                 cadence_now_ms(),
                 alert,
+            )
+            .map_err(|error| Error::Cadence(error.to_string()))?;
+            ix_board::cadence::notify_if_alert(
+                &report,
+                manifest.alert_recipient.as_deref(),
+                |recipient, message| {
+                    let output = std::process::Command::new("agent-msg")
+                        .args(["send", recipient, message])
+                        .output()
+                        .map_err(|error| format!("could not run agent-msg: {error}"))?;
+                    if !output.status.success() {
+                        return Err(format!(
+                            "agent-msg send {recipient} exited {}: {}",
+                            output.status,
+                            String::from_utf8_lossy(&output.stderr).trim()
+                        ));
+                    }
+                    Ok(())
+                },
             )
             .map_err(|error| Error::Cadence(error.to_string()))?;
             Ok(Output::CadenceDue(report))
