@@ -3433,9 +3433,10 @@ fn run_hygiene(
 ) -> Result<ix_board::host_hygiene::HygieneReport, Error> {
     use ix_board::host_hygiene::{
         CleanDecision, HostPolicy, HygieneConfig, HygieneReport, apply_clean_decision,
-        clean_decision, free_disk_bytes, system_process_table,
+        canonicalize_worktree_root, clean_decision, free_disk_bytes, newest_mtime_under,
+        system_process_table,
     };
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::SystemTime;
 
     if cfg!(target_os = "windows") {
         return Ok(HygieneReport {
@@ -3452,11 +3453,15 @@ fn run_hygiene(
     let settings = ix_board::settings_value()?;
     let config = HygieneConfig::from_settings(settings.as_ref())
         .map_err(|message| Error::ProgramReview { message })?;
-    let root = args
+    let configured_root = args
         .root
         .clone()
         .or(config.worktree_root)
         .unwrap_or_else(default_worktree_root);
+    let root =
+        canonicalize_worktree_root(&configured_root).map_err(|error| Error::ProgramReview {
+            message: format!("cannot canonicalize worktree root: {error}"),
+        })?;
     let host_policy = config.hosts.get(&args.host.to_lowercase());
     let floor_gb = args.free_floor_gb.or_else(|| host_policy.and_then(|policy| policy.free_floor_gb)).or(config.default_free_floor_gb)
         .ok_or_else(|| Error::ProgramReview {
@@ -3521,21 +3526,32 @@ fn run_hygiene(
     })?;
     let mut targets = Vec::new();
     for entry in entries.flatten() {
-        let worktree = entry.path();
+        let Ok(worktree) = std::fs::canonicalize(entry.path()) else {
+            continue;
+        };
+        if !worktree.starts_with(&root) {
+            continue;
+        }
         if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             continue;
         }
         if !worktree.join(".git").exists() {
             continue;
         }
-        let target = worktree.join("target");
-        let Ok(metadata) = std::fs::symlink_metadata(&target) else {
+        let target_path = worktree.join("target");
+        let Ok(metadata) = std::fs::symlink_metadata(&target_path) else {
             continue;
         };
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
             continue;
         }
-        let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+        let Ok(target) = std::fs::canonicalize(&target_path) else {
+            continue;
+        };
+        if !target.starts_with(&worktree) {
+            continue;
+        }
+        let modified = newest_mtime_under(&target).unwrap_or_else(|_| SystemTime::now());
         let mut decision = clean_decision(&target, &worktree, now, modified, &policy, &processes);
         if apply && decision.eligible {
             let latest = system_process_table().unwrap_or_default();
@@ -3616,7 +3632,9 @@ fn run_build_status(
     )>,
     Error,
 > {
-    use ix_board::host_hygiene::{BuildPolicy, Eligibility, HygieneConfig, parse_build_metrics};
+    use ix_board::host_hygiene::{
+        Eligibility, HygieneConfig, parse_build_metrics, parse_build_policy,
+    };
     let response = fetch_metrics_text(metrics_url)?;
     let configured = if policies.is_empty() {
         let settings = ix_board::settings_value()?;
@@ -3639,39 +3657,11 @@ fn run_build_status(
             .collect::<std::collections::BTreeMap<_, _>>()
     } else {
         policies
-        .iter()
-        .map(|policy| {
-            let fields = policy.split(':').collect::<Vec<_>>();
-            if fields.len() != 3 {
-                return Err(Error::ProgramReview {
-                    message: format!(
-                        "invalid host policy {policy:?}; expected host:max_load1:max_running_leases"
-                    ),
-                });
-            }
-            let max_load1 = fields[1]
-                .parse::<f64>()
-                .ok()
-                .filter(|value| value.is_finite() && *value > 0.0)
-                .ok_or_else(|| Error::ProgramReview {
-                    message: format!("invalid max_load1 in host policy {policy:?}"),
-                })?;
-            let heavy_gate_slots = fields[2]
-                .parse::<u64>()
-                .ok()
-                .filter(|value| *value > 0)
-                .ok_or_else(|| Error::ProgramReview {
-                    message: format!("invalid lease count in host policy {policy:?}"),
-                })?;
-            Ok((
-                fields[0].to_owned(),
-                BuildPolicy {
-                    max_load1,
-                    heavy_gate_slots,
-                },
-            ))
-        })
-        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?
+            .iter()
+            .map(|policy| {
+                parse_build_policy(policy).map_err(|message| Error::ProgramReview { message })
+            })
+            .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?
     };
     if configured.is_empty() {
         return Err(Error::ProgramReview {

@@ -409,7 +409,7 @@ fn linux_process_table(proc_root: &Path) -> io::Result<ProcessTable> {
 #[implements("FR-048-AC-3")]
 fn macos_process_table() -> io::Result<ProcessTable> {
     let output = Command::new("lsof")
-        .args(["-nP", "-Fpn", "-d", "cwd,txt,0-"])
+        .args(["-nP", "-Fpn", "-d", "cwd,txt,mem,0-"])
         .output()?;
     if !output.status.success() {
         return Ok(ProcessTable {
@@ -417,7 +417,7 @@ fn macos_process_table() -> io::Result<ProcessTable> {
             complete: false,
         });
     }
-    let process_names = Command::new("ps").args(["-axo", "pid=,comm="]).output()?;
+    let process_names = Command::new("ps").args(["-axo", "pid=,args="]).output()?;
     let mut environments = BTreeMap::new();
     for line in String::from_utf8_lossy(&process_names.stdout).lines() {
         let Some((pid, command)) = line.trim().split_once(char::is_whitespace) else {
@@ -442,8 +442,27 @@ fn macos_process_table() -> io::Result<ProcessTable> {
         &output.stdout,
         &process_names.stdout,
         &environments,
-        output.status.success() && process_names.status.success(),
+        macos_process_evidence_complete(
+            current_user_is_root(),
+            output.status.success(),
+            process_names.status.success(),
+        ),
     ))
+}
+
+#[cfg(target_os = "macos")]
+#[implements("FR-048-AC-3")]
+fn current_user_is_root() -> bool {
+    Command::new("id")
+        .arg("-u")
+        .output()
+        .is_ok_and(|output| output.status.success() && output.stdout.trim_ascii() == b"0")
+}
+
+#[cfg(target_os = "macos")]
+#[implements("FR-048-AC-3")]
+fn macos_process_evidence_complete(is_root: bool, lsof_ok: bool, ps_ok: bool) -> bool {
+    is_root && lsof_ok && ps_ok
 }
 
 #[cfg(target_os = "macos")]
@@ -537,6 +556,24 @@ pub fn free_disk_bytes(path: &Path) -> io::Result<u64> {
         .ok_or_else(|| io::Error::other("df value overflow"))
 }
 
+/// Finds the newest modification time anywhere below a target directory.
+#[implements("FR-048-AC-5")]
+pub fn newest_mtime_under(path: &Path) -> io::Result<SystemTime> {
+    let mut newest = std::fs::symlink_metadata(path)?.modified()?;
+    let mut pending = vec![path.to_owned()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            let metadata = std::fs::symlink_metadata(entry.path())?;
+            newest = newest.max(metadata.modified()?);
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    Ok(newest)
+}
+
 fn path_references(bytes: &[u8], target: &Path) -> bool {
     let needle = target.as_os_str().as_encoded_bytes();
     bytes
@@ -552,15 +589,46 @@ fn path_references(bytes: &[u8], target: &Path) -> bool {
 /// Finds a process reference using cwd, command, environment, descriptors and maps.
 #[implements("FR-048-AC-2")]
 pub fn target_use(target: &Path, table: &ProcessTable) -> UseState {
+    target_use_in_worktree(target, target.parent().unwrap_or(target), table)
+}
+
+/// Canonicalizes a configured worktree root before scanning it.
+#[implements("FR-048-AC-1", "FR-048-AC-5")]
+pub fn canonicalize_worktree_root(root: &Path) -> io::Result<PathBuf> {
+    std::fs::canonicalize(root)
+}
+
+fn canonical_or_original(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned())
+}
+
+fn path_starts_with_any(path: &Path, roots: &[PathBuf]) -> bool {
+    path.starts_with(&roots[0]) || roots.get(1).is_some_and(|root| path.starts_with(root))
+}
+
+fn bytes_reference_any(bytes: &[u8], paths: &[PathBuf]) -> bool {
+    paths.iter().any(|path| path_references(bytes, path))
+}
+
+/// Finds process references to a target or any cwd within its owning worktree.
+#[implements("FR-048-AC-2")]
+pub fn target_use_in_worktree(target: &Path, worktree: &Path, table: &ProcessTable) -> UseState {
+    let target_paths = [target.to_owned(), canonical_or_original(target)];
+    let worktree_paths = [worktree.to_owned(), canonical_or_original(worktree)];
     let used = table.processes.iter().any(|process| {
-        process
-            .cwd
-            .as_deref()
-            .is_some_and(|cwd| cwd.starts_with(target))
-            || path_references(&process.cmdline, target)
-            || path_references(&process.environ, target)
-            || process.fds.iter().any(|path| path.starts_with(target))
-            || process.maps.iter().any(|path| path.starts_with(target))
+        process.cwd.as_deref().is_some_and(|cwd| {
+            path_starts_with_any(cwd, &worktree_paths)
+                || path_starts_with_any(&canonical_or_original(cwd), &worktree_paths)
+        }) || bytes_reference_any(&process.cmdline, &target_paths)
+            || bytes_reference_any(&process.environ, &target_paths)
+            || process.fds.iter().any(|path| {
+                path_starts_with_any(path, &target_paths)
+                    || path_starts_with_any(&canonical_or_original(path), &target_paths)
+            })
+            || process.maps.iter().any(|path| {
+                path_starts_with_any(path, &target_paths)
+                    || path_starts_with_any(&canonical_or_original(path), &target_paths)
+            })
     });
     if used {
         UseState::InUse
@@ -581,16 +649,25 @@ pub fn clean_decision(
     policy: &HostPolicy,
     processes: &ProcessTable,
 ) -> CleanDecision {
-    let reason = if target.file_name().is_none_or(|name| name != "target") {
+    let canonical_target = canonical_or_original(target);
+    let canonical_worktree = canonical_or_original(worktree);
+    let reason = if canonical_target
+        .file_name()
+        .is_none_or(|name| name != "target")
+    {
         "not_target_directory"
-    } else if target.components().any(|component| {
-        matches!(
-            component.as_os_str().to_str(),
-            Some("dev_bak" | "dev_archive" | ".git")
-        )
-    }) {
+    } else if target
+        .components()
+        .chain(canonical_target.components())
+        .any(|component| {
+            matches!(
+                component.as_os_str().to_str(),
+                Some("dev_bak" | "dev_archive" | ".git")
+            )
+        })
+    {
         "protected_path"
-    } else if !target.starts_with(worktree) {
+    } else if !canonical_target.starts_with(&canonical_worktree) {
         "outside_worktree"
     } else if now
         .duration_since(modified)
@@ -598,14 +675,14 @@ pub fn clean_decision(
     {
         "too_recent"
     } else {
-        match target_use(target, processes) {
+        match target_use_in_worktree(&canonical_target, &canonical_worktree, processes) {
             UseState::InUse => "process_in_use",
             UseState::Unknown => "process_evidence_incomplete",
             UseState::Unused => "eligible",
         }
     };
     CleanDecision {
-        target: target.to_owned(),
+        target: canonical_target,
         age_secs: now.duration_since(modified).map_or(0, |age| age.as_secs()),
         eligible: reason == "eligible",
         reason: reason.to_owned(),
@@ -629,10 +706,14 @@ pub fn parse_build_metrics(text: &str) -> BTreeMap<String, BuildHostMetrics> {
     let mut result = BTreeMap::<String, BuildHostMetrics>::new();
     let mut cpus = BTreeMap::<String, std::collections::BTreeSet<String>>::new();
     for line in text.lines().filter(|line| !line.starts_with('#')) {
-        let Some((sample, value)) = line.split_once(char::is_whitespace) else {
+        let mut fields = line.split_whitespace();
+        let Some(sample) = fields.next() else {
             continue;
         };
-        let Ok(value) = value.trim().parse::<f64>() else {
+        let Some(raw_value) = fields.next() else {
+            continue;
+        };
+        let Ok(value) = raw_value.parse::<f64>() else {
             continue;
         };
         let (name, labels) = if let Some((name, rest)) = sample.split_once('{') {
@@ -646,18 +727,17 @@ pub fn parse_build_metrics(text: &str) -> BTreeMap<String, BuildHostMetrics> {
         let Some(host) = label(labels, "host") else {
             continue;
         };
+        let host = normalize_host_label(host);
         let row = result
-            .entry(host.to_owned())
+            .entry(host.clone())
             .or_insert_with(|| BuildHostMetrics {
-                host: host.to_owned(),
+                host: host.clone(),
                 ..BuildHostMetrics::default()
             });
         if name == "node_cpu_seconds_total"
             && let Some(cpu) = label(labels, "cpu")
         {
-            cpus.entry(host.to_owned())
-                .or_default()
-                .insert(cpu.to_owned());
+            cpus.entry(host.clone()).or_default().insert(cpu.to_owned());
         }
         match name {
             "node_load1" => row.load1 = Some(value),
@@ -679,7 +759,9 @@ pub fn parse_build_metrics(text: &str) -> BTreeMap<String, BuildHostMetrics> {
             "ix_build_lane_running" => {
                 let count = value_u64(value).unwrap_or(0);
                 row.running_leases = row.running_leases.saturating_add(count);
-                if let Some(lane) = label(labels, "lane") {
+                if count > 0
+                    && let Some(lane) = label(labels, "lane")
+                {
                     let entry = row.leases_by_lane.entry(lane.to_owned()).or_default();
                     *entry = entry.saturating_add(count);
                 }
@@ -693,6 +775,40 @@ pub fn parse_build_metrics(text: &str) -> BTreeMap<String, BuildHostMetrics> {
         }
     }
     result
+}
+
+/// Normalizes host labels for case-insensitive policy and metrics joins.
+#[implements("FR-048-AC-8")]
+pub fn normalize_host_label(host: &str) -> String {
+    host.to_lowercase()
+}
+
+/// Parses a CLI host policy and normalizes its host key for metrics joins.
+#[implements("FR-048-AC-8")]
+pub fn parse_build_policy(value: &str) -> Result<(String, BuildPolicy), String> {
+    let fields = value.split(':').collect::<Vec<_>>();
+    if fields.len() != 3 || fields[0].trim().is_empty() {
+        return Err(format!(
+            "invalid host policy {value:?}; expected host:max_load1:heavy_gate_slots"
+        ));
+    }
+    let max_load1 = fields[1]
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .ok_or_else(|| format!("invalid max_load1 in host policy {value:?}"))?;
+    let heavy_gate_slots = fields[2]
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| format!("invalid lease count in host policy {value:?}"))?;
+    Ok((
+        normalize_host_label(fields[0].trim()),
+        BuildPolicy {
+            max_load1,
+            heavy_gate_slots,
+        },
+    ))
 }
 
 fn value_u64(value: f64) -> Option<u64> {
@@ -795,6 +911,17 @@ mod tests {
                 heavy_gate_slots: 1,
             })
         );
+        assert_eq!(normalize_host_label("LuNa"), "luna");
+        assert_eq!(
+            parse_build_policy("LuNa:8:1").expect("case-insensitive CLI policy"),
+            (
+                "luna".to_owned(),
+                BuildPolicy {
+                    max_load1: 8.0,
+                    heavy_gate_slots: 1,
+                }
+            )
+        );
     }
 
     #[test]
@@ -828,7 +955,10 @@ mod tests {
                 processes: vec![process],
                 complete: true,
             };
-            assert_eq!(target_use(target, &table), UseState::InUse);
+            assert_eq!(
+                target_use_in_worktree(target, target.parent().unwrap(), &table),
+                UseState::InUse
+            );
         }
         assert_eq!(
             target_use(target, &ProcessTable::default()),
@@ -890,6 +1020,168 @@ mod tests {
             .reason,
             "process_evidence_incomplete"
         );
+        let worktree_cwd = ProcessTable {
+            processes: vec![ProcessEvidence {
+                cwd: Some(worktree.into()),
+                ..Default::default()
+            }],
+            complete: true,
+        };
+        assert_eq!(
+            clean_decision(target, worktree, now, old, &policy, &worktree_cwd).reason,
+            "process_in_use"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[trace("FR-048-AC-5", "FR-048-AC-6")]
+    fn canonicalized_symlink_root_and_target_still_match_live_process_paths() {
+        let sandbox = tempfile::tempdir().expect("sandbox");
+        let real_root = sandbox.path().join("real/worktrees");
+        let worktree = real_root.join("swm-1");
+        let target = worktree.join("target");
+        std::fs::create_dir_all(target.join("debug")).expect("target");
+        std::fs::write(
+            worktree.join(".git"),
+            "gitdir: ../repo/.git/worktrees/swm-1\n",
+        )
+        .expect("git metadata");
+        let alias_root = sandbox.path().join("alias/worktrees");
+        std::fs::create_dir_all(alias_root.parent().unwrap()).expect("alias parent");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_root, &alias_root).expect("symlink root");
+
+        let canonical_root = canonicalize_worktree_root(&alias_root).expect("canonical root");
+        assert_eq!(canonical_root, real_root.canonicalize().unwrap());
+        let alias_worktree = alias_root.join("swm-1");
+        let alias_target = alias_worktree.join("target");
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(10_000);
+        let table = ProcessTable {
+            processes: vec![ProcessEvidence {
+                cwd: Some(target.join("debug")),
+                ..Default::default()
+            }],
+            complete: true,
+        };
+        let decision = clean_decision(
+            &alias_target,
+            &alias_worktree,
+            now,
+            now - std::time::Duration::from_secs(4000),
+            &HostPolicy {
+                free_floor_bytes: 1,
+                idle_age_secs: 60,
+            },
+            &table,
+        );
+        assert_eq!(decision.reason, "process_in_use");
+        assert_eq!(decision.target, target.canonicalize().unwrap());
+    }
+
+    #[test]
+    #[trace("FR-048-AC-5")]
+    fn newest_target_descendant_mtime_controls_idle_age() {
+        let sandbox = tempfile::tempdir().expect("sandbox");
+        let target = sandbox.path().join("target");
+        std::fs::create_dir_all(target.join("debug/deep")).expect("nested target");
+        let newest_file = target.join("debug/deep/recent-build-artifact");
+        std::fs::write(&newest_file, "built").expect("recent artifact");
+        let old_target_mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let recent_artifact_mtime = old_target_mtime + std::time::Duration::from_secs(7_200);
+        std::fs::File::open(&target)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old_target_mtime))
+            .unwrap();
+        for directory in [target.join("debug"), target.join("debug/deep")] {
+            std::fs::File::open(directory)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(old_target_mtime))
+                .unwrap();
+        }
+        std::fs::File::open(&newest_file)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(recent_artifact_mtime))
+            .unwrap();
+        let newest = newest_mtime_under(&target).expect("recursive newest mtime");
+        assert_eq!(newest, recent_artifact_mtime);
+        let decision = clean_decision(
+            &target,
+            sandbox.path(),
+            recent_artifact_mtime + std::time::Duration::from_secs(300),
+            newest,
+            &HostPolicy {
+                free_floor_bytes: 1,
+                idle_age_secs: 3_600,
+            },
+            &ProcessTable {
+                processes: Vec::new(),
+                complete: true,
+            },
+        );
+        assert_eq!(decision.reason, "too_recent");
+    }
+
+    #[test]
+    #[trace("FR-048-AC-5", "FR-048-AC-6")]
+    fn cleanup_reasons_are_stable_for_protected_outside_and_recent_paths() {
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(10_000);
+        let policy = HostPolicy {
+            free_floor_bytes: 1,
+            idle_age_secs: 60,
+        };
+        let unused = ProcessTable {
+            processes: Vec::new(),
+            complete: true,
+        };
+        assert_eq!(
+            clean_decision(
+                Path::new("/work/wt/output"),
+                Path::new("/work/wt"),
+                now,
+                now - std::time::Duration::from_secs(600),
+                &policy,
+                &unused
+            )
+            .reason,
+            "not_target_directory"
+        );
+        assert_eq!(
+            clean_decision(
+                Path::new("/work/dev_bak/wt/target"),
+                Path::new("/work/dev_bak/wt"),
+                now,
+                now - std::time::Duration::from_secs(600),
+                &policy,
+                &unused
+            )
+            .reason,
+            "protected_path"
+        );
+        assert_eq!(
+            clean_decision(
+                Path::new("/other/wt/target"),
+                Path::new("/work/wt"),
+                now,
+                now - std::time::Duration::from_secs(600),
+                &policy,
+                &unused
+            )
+            .reason,
+            "outside_worktree"
+        );
+        assert_eq!(
+            clean_decision(
+                Path::new("/work/wt/target"),
+                Path::new("/work/wt"),
+                now,
+                now,
+                &policy,
+                &unused
+            )
+            .reason,
+            "too_recent"
+        );
     }
 
     #[test]
@@ -934,7 +1226,7 @@ mod tests {
     #[trace("FR-048-AC-7")]
     fn locked_build_metrics_aggregate_priorities_and_owner_leases() {
         let rows = parse_build_metrics(concat!(
-            "node_load1{host=\"luna\"} 7.6\n",
+            "node_load1{host=\"luna\"} 6.5\n",
             "node_cpu_seconds_total{host=\"luna\",cpu=\"0\",mode=\"idle\"} 1\n",
             "node_cpu_seconds_total{host=\"luna\",cpu=\"1\",mode=\"idle\"} 1\n",
             "node_memory_MemTotal_bytes{host=\"luna\"} 1000\n",
@@ -945,8 +1237,11 @@ mod tests {
             "ix_build_queue_depth{host=\"luna\",priority=\"must-fix\"} 2\n",
             "ix_build_queue_depth{host=\"luna\",priority=\"periodic\"} 3\n",
             "ix_build_lane_running{host=\"luna\",lane=\"luna:team:coder\"} 1\n",
+            "ix_build_lane_running{host=\"luna\",lane=\"luna:team:idle\"} 0\n",
+            "node_load1{host=\"LUNA\"} 7.6 1700000000\n",
         ));
         let row = &rows["luna"];
+        assert_eq!(rows.len(), 1);
         assert_eq!(row.load1, Some(7.6));
         assert_eq!(row.cores, Some(2.0));
         assert_eq!(row.memory_available_bytes, Some(400));
@@ -955,6 +1250,9 @@ mod tests {
         assert_eq!(row.queue_depth, 5);
         assert_eq!(row.running_leases, 1);
         assert_eq!(row.leases_by_lane["luna:team:coder"], 1);
+        assert!(!row.leases_by_lane.contains_key("luna:team:idle"));
+        assert_eq!(row.load1, Some(7.6));
+        assert_eq!(row.host, "luna");
     }
 
     #[test]
@@ -993,5 +1291,74 @@ mod tests {
         assert_eq!(report(Some(99)).exit_code(), 1);
         assert_eq!(report(Some(100)).exit_code(), 0);
         assert_eq!(report(None).exit_code(), 2);
+        assert_eq!(
+            HygieneReport {
+                process_table_complete: false,
+                ..report(Some(100))
+            }
+            .exit_code(),
+            2
+        );
+        assert_eq!(
+            HygieneReport {
+                unsupported: true,
+                ..report(Some(100))
+            }
+            .exit_code(),
+            3
+        );
+        assert_eq!(
+            HygieneReport {
+                targets: vec![CleanDecision {
+                    target: "/wt/target".into(),
+                    age_secs: 0,
+                    eligible: true,
+                    reason: "eligible".into()
+                }],
+                ..report(Some(100))
+            }
+            .exit_code(),
+            1
+        );
+        assert_eq!(
+            HygieneReport {
+                prunable_worktrees: vec!["/wt/dead".into()],
+                ..report(Some(100))
+            }
+            .exit_code(),
+            1
+        );
+        assert_eq!(
+            HygieneReport {
+                orphan_build_processes: vec![42],
+                ..report(Some(100))
+            }
+            .exit_code(),
+            1
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[trace("FR-048-AC-3", "FR-048-AC-5")]
+    fn incomplete_macos_process_visibility_never_authorizes_cleanup() {
+        assert!(!macos_process_evidence_complete(false, true, true));
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(10_000);
+        let decision = clean_decision(
+            Path::new("/work/wt/target"),
+            Path::new("/work/wt"),
+            now,
+            now - std::time::Duration::from_secs(600),
+            &HostPolicy {
+                free_floor_bytes: 1,
+                idle_age_secs: 60,
+            },
+            &ProcessTable {
+                processes: Vec::new(),
+                complete: macos_process_evidence_complete(false, true, true),
+            },
+        );
+        assert_eq!(decision.reason, "process_evidence_incomplete");
+        assert!(!decision.eligible);
     }
 }

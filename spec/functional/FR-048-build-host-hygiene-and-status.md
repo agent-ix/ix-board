@@ -49,7 +49,7 @@ use locked-build lease evidence instead of identifying a shell wrapper by its na
 
 ## Acceptance Criteria
 
-| ID | Criterion | Verification |
+| ID | Criteria | Verification |
 | --- | --- | --- |
 | FR-048-AC-1 | Host policy values control the free-space result; a fixture below its configured floor yields exit status 1 and a fixture above the floor yields 0. | Test |
 | FR-048-AC-2 | Linux process evidence considers cwd, cmdline, environment, file descriptors and maps; a process reference to a target marks it in use, and incomplete evidence is unknown. | Test |
@@ -64,3 +64,8 @@ use locked-build lease evidence instead of identifying a shell wrapper by its na
 ## Traceability
 
 SWM-326, SWM-328 and SWM-334.
+
+## Dependencies
+
+- FR-043 provides the agent activity and evidence model extended by lease-aware build detection.
+- FR-041 provides shared workspace and host configuration conventions used by the host commands.

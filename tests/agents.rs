@@ -472,6 +472,7 @@ struct Machine {
     probe: Probe,
     tail: Result<String, &'static str>,
     fail: bool,
+    fail_tabs: bool,
 }
 impl Host for Machine {
     fn label(&self) -> &str {
@@ -487,6 +488,7 @@ impl Host for Machine {
         match args {
             ["workspace","list"]=>Ok(json!({"result":{"workspaces":[{"workspace_id":"w","label":"Team"}]}}).to_string()),
             ["agent","list"]=>Ok(json!({"result":{"agents":[{"pane_id":"w:p","workspace_id":"w","tab_id":"t","agent":self.harness,"agent_status":self.status,"agent_session":{"value":"root"},"cwd":"/work"}]}}).to_string()),
+            ["tab","list"] if self.fail_tabs => Err(AgentsError::Timeout { command: "tab list".into(), secs: 60 }),
             ["tab","list"]=>Ok(json!({"result":{"tabs":[{"workspace_id":"w","tab_id":"t","label":"coder"}]}}).to_string()),
             ["agent","read",_,"--lines","30"]=>self.tail.clone().map_err(|e| AgentsError::ProbeFormat(e.into())),
             _=>panic!("unexpected {args:?}")
@@ -526,7 +528,42 @@ fn machine() -> Machine {
         },
         tail: Ok("❯".into()),
         fail: false,
+        fail_tabs: false,
     }
+}
+
+#[trace("FR-018-AC-30")]
+#[test]
+fn failed_tab_list_preserves_host_agent_rows_with_error_note() {
+    let mut host = machine();
+    host.fail_tabs = true;
+    let hosts: Vec<Arc<dyn Host>> = vec![Arc::new(host)];
+    let report = build_report_with_leases(
+        &hosts,
+        &["team".into()],
+        IDLE,
+        HOST_TIMEOUT,
+        &mut |_| Ok(None),
+        &BTreeSet::from(["local:team:coder".to_owned()]),
+    );
+    assert_eq!(report.agents.len(), 1);
+    assert!(
+        !report.agents[0]
+            .processes
+            .contains(&"locked-build lease".to_owned())
+    );
+    assert!(
+        report.agents[0]
+            .notes
+            .iter()
+            .any(|note| note.contains("tab list unavailable"))
+    );
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|error| error.contains("tab list unavailable"))
+    );
 }
 fn report(machines: Vec<Machine>) -> AgentsReport {
     build_report(

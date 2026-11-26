@@ -604,15 +604,25 @@ fn gather_host(
         .and_then(|text| parse_workspaces(&text))
         .and_then(|workspaces| {
             let agents = parse_agents(&host.herdr(&["agent", "list"])?)?;
-            let tabs = parse_tabs(&host.herdr(&["tab", "list"])?)?;
-            Ok((workspaces, agents, tabs))
+            Ok((workspaces, agents))
         });
-    let (workspaces, agents, tabs) = match listed {
+    let (workspaces, agents) = match listed {
         Ok(listed) => listed,
         Err(error) => {
             result.errors.push(format!("{label}: {error}"));
             result.missing = Some(error.to_string());
             return result;
+        }
+    };
+    let (tabs, tab_error) = match host
+        .herdr(&["tab", "list"])
+        .and_then(|text| parse_tabs(&text))
+    {
+        Ok(tabs) => (tabs, None),
+        Err(error) => {
+            let message = format!("{label}: tab list unavailable: {error}");
+            result.errors.push(message.clone());
+            (Vec::new(), Some(message))
         }
     };
     let team_of: BTreeMap<&str, &HerdrWorkspace> = workspaces
@@ -681,6 +691,7 @@ fn gather_host(
             .is_some_and(|address| leases.contains(&address));
         let mut row = build_row(host, agent, &probe, idle_after, team, lease_active);
         row.notes.extend(probe_note.clone());
+        row.notes.extend(tab_error.clone());
         result.rows.push(row);
     }
     result
