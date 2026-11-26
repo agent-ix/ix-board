@@ -205,7 +205,7 @@ pub(crate) fn compare_records(
                 regressing,
             }
         })
-        .collect();
+        .collect::<Vec<_>>();
     let defects = delta_defects(&metrics);
     Ok(DeltaReport {
         department: latest.department.as_ref().map(|report| {
