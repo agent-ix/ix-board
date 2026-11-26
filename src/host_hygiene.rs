@@ -7,8 +7,8 @@ use ix_trace_rs::implements;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 use std::process::Command;
+use std::time::SystemTime;
 use std::{fs, io};
 
 /// Process paths and command evidence needed to decide whether a target is in use.
@@ -140,9 +140,14 @@ impl HygieneReport {
         if self.free_bytes.is_none() || !self.process_table_complete {
             return 2;
         }
-        if self.free_bytes.is_some_and(|free| free < self.free_floor_bytes)
+        if self
+            .free_bytes
+            .is_some_and(|free| free < self.free_floor_bytes)
             || self.targets.iter().any(|target| {
-                matches!(target.reason.as_str(), "eligible" | "process_evidence_incomplete")
+                matches!(
+                    target.reason.as_str(),
+                    "eligible" | "process_evidence_incomplete"
+                )
             })
         {
             1
@@ -164,19 +169,32 @@ pub fn system_process_table() -> io::Result<ProcessTable> {
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        Ok(ProcessTable { processes: Vec::new(), complete: false })
+        Ok(ProcessTable {
+            processes: Vec::new(),
+            complete: false,
+        })
     }
 }
 
 #[cfg(target_os = "linux")]
 fn linux_process_table(proc_root: &Path) -> io::Result<ProcessTable> {
-    let mut table = ProcessTable { processes: Vec::new(), complete: true };
+    let mut table = ProcessTable {
+        processes: Vec::new(),
+        complete: true,
+    };
     for entry in fs::read_dir(proc_root)? {
         let entry = match entry {
             Ok(entry) => entry,
-            Err(_) => { table.complete = false; continue; }
+            Err(_) => {
+                table.complete = false;
+                continue;
+            }
         };
-        let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse().ok()) else {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse().ok())
+        else {
             continue;
         };
         let process_dir = entry.path();
@@ -190,23 +208,40 @@ fn linux_process_table(proc_root: &Path) -> io::Result<ProcessTable> {
         let environ = read_optional("environ").unwrap_or_default();
         let mut fds = Vec::new();
         match fs::read_dir(process_dir.join("fd")) {
-            Ok(entries) => for fd in entries.flatten() {
-                if let Ok(path) = fs::read_link(fd.path()) { fds.push(path); }
-            },
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+            Ok(entries) => {
+                for fd in entries.flatten() {
+                    if let Ok(path) = fs::read_link(fd.path()) {
+                        fds.push(path);
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(_) => table.complete = false,
         }
         let mut maps = Vec::new();
         match fs::read_to_string(process_dir.join("maps")) {
-            Ok(text) => for line in text.lines() {
-                if let Some(path) = line.split_whitespace().nth(5).filter(|part| part.starts_with('/')) {
-                    maps.push(PathBuf::from(path));
+            Ok(text) => {
+                for line in text.lines() {
+                    if let Some(path) = line
+                        .split_whitespace()
+                        .nth(5)
+                        .filter(|part| part.starts_with('/'))
+                    {
+                        maps.push(PathBuf::from(path));
+                    }
                 }
-            },
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(_) => table.complete = false,
         }
-        table.processes.push(ProcessEvidence { pid, cwd, cmdline, environ, fds, maps });
+        table.processes.push(ProcessEvidence {
+            pid,
+            cwd,
+            cmdline,
+            environ,
+            fds,
+            maps,
+        });
     }
     Ok(table)
 }
@@ -217,19 +252,37 @@ fn macos_process_table() -> io::Result<ProcessTable> {
         .args(["-nP", "-Fpn", "-d", "cwd,txt,0-"])
         .output()?;
     if !output.status.success() {
-        return Ok(ProcessTable { processes: Vec::new(), complete: false });
+        return Ok(ProcessTable {
+            processes: Vec::new(),
+            complete: false,
+        });
     }
-    let mut table = ProcessTable { processes: Vec::new(), complete: true };
+    let mut table = ProcessTable {
+        processes: Vec::new(),
+        complete: true,
+    };
     let mut current: Option<ProcessEvidence> = None;
     for line in String::from_utf8_lossy(&output.stdout).lines() {
-        if let Some(pid) = line.strip_prefix('p').and_then(|pid| pid.parse::<u32>().ok()) {
-            if let Some(process) = current.take() { table.processes.push(process); }
-            current = Some(ProcessEvidence { pid, ..Default::default() });
+        if let Some(pid) = line
+            .strip_prefix('p')
+            .and_then(|pid| pid.parse::<u32>().ok())
+        {
+            if let Some(process) = current.take() {
+                table.processes.push(process);
+            }
+            current = Some(ProcessEvidence {
+                pid,
+                ..Default::default()
+            });
         } else if let Some(path) = line.strip_prefix('n').map(PathBuf::from) {
-            if let Some(process) = current.as_mut() { process.fds.push(path); }
+            if let Some(process) = current.as_mut() {
+                process.fds.push(path);
+            }
         }
     }
-    if let Some(process) = current { table.processes.push(process); }
+    if let Some(process) = current {
+        table.processes.push(process);
+    }
     Ok(table)
 }
 
@@ -240,11 +293,15 @@ pub fn free_disk_bytes(path: &Path) -> io::Result<u64> {
         return Err(io::Error::other("df failed"));
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    let available_kib = text.lines().nth(1)
+    let available_kib = text
+        .lines()
+        .nth(1)
         .and_then(|line| line.split_whitespace().nth(3))
         .and_then(|value| value.parse::<u64>().ok())
         .ok_or_else(|| io::Error::other("df output unavailable"))?;
-    available_kib.checked_mul(1024).ok_or_else(|| io::Error::other("df value overflow"))
+    available_kib
+        .checked_mul(1024)
+        .ok_or_else(|| io::Error::other("df value overflow"))
 }
 
 fn path_references(bytes: &[u8], target: &Path) -> bool {
@@ -258,7 +315,10 @@ fn path_references(bytes: &[u8], target: &Path) -> bool {
 #[implements("FR-048-AC-2")]
 pub fn target_use(target: &Path, table: &ProcessTable) -> UseState {
     let used = table.processes.iter().any(|process| {
-        process.cwd.as_deref().is_some_and(|cwd| cwd.starts_with(target))
+        process
+            .cwd
+            .as_deref()
+            .is_some_and(|cwd| cwd.starts_with(target))
             || path_references(&process.cmdline, target)
             || path_references(&process.environ, target)
             || process.fds.iter().any(|path| path.starts_with(target))
@@ -286,7 +346,10 @@ pub fn clean_decision(
     let reason = if target.file_name().is_none_or(|name| name != "target") {
         "not_target_directory"
     } else if target.components().any(|component| {
-        matches!(component.as_os_str().to_str(), Some("dev_bak" | "dev_archive" | ".git"))
+        matches!(
+            component.as_os_str().to_str(),
+            Some("dev_bak" | "dev_archive" | ".git")
+        )
     }) {
         "protected_path"
     } else if !target.starts_with(worktree) {
@@ -333,14 +396,18 @@ pub fn parse_build_metrics(text: &str) -> BTreeMap<String, BuildHostMetrics> {
         let Some(host) = label(labels, "host") else {
             continue;
         };
-        let row = result.entry(host.to_owned()).or_insert_with(|| BuildHostMetrics {
-            host: host.to_owned(),
-            ..BuildHostMetrics::default()
-        });
+        let row = result
+            .entry(host.to_owned())
+            .or_insert_with(|| BuildHostMetrics {
+                host: host.to_owned(),
+                ..BuildHostMetrics::default()
+            });
         if name == "node_cpu_seconds_total"
             && let Some(cpu) = label(labels, "cpu")
         {
-            cpus.entry(host.to_owned()).or_default().insert(cpu.to_owned());
+            cpus.entry(host.to_owned())
+                .or_default()
+                .insert(cpu.to_owned());
         }
         match name {
             "node_load1" => row.load1 = Some(value),
@@ -348,8 +415,16 @@ pub fn parse_build_metrics(text: &str) -> BTreeMap<String, BuildHostMetrics> {
             "node_memory_MemAvailable_bytes" => row.memory_available_bytes = value_u64(value),
             "node_memory_SwapTotal_bytes" => row.swap_total_bytes = value_u64(value),
             "node_memory_SwapFree_bytes" => row.swap_free_bytes = value_u64(value),
-            "ix_build_queue_depth" => row.queue_depth = row.queue_depth.saturating_add(value_u64(value).unwrap_or(0)),
-            "ix_build_lane_running" => row.running_leases = row.running_leases.saturating_add(value_u64(value).unwrap_or(0)),
+            "ix_build_queue_depth" => {
+                row.queue_depth = row
+                    .queue_depth
+                    .saturating_add(value_u64(value).unwrap_or(0))
+            }
+            "ix_build_lane_running" => {
+                row.running_leases = row
+                    .running_leases
+                    .saturating_add(value_u64(value).unwrap_or(0))
+            }
             _ => {}
         }
     }
@@ -399,17 +474,38 @@ mod tests {
     fn every_linux_reference_kind_marks_the_target_in_use() {
         let target = Path::new("/work/wt/target");
         let values = [
-            ProcessEvidence { cwd: Some(target.join("debug")), ..Default::default() },
-            ProcessEvidence { cmdline: b"cargo\0/work/wt/target/debug".to_vec(), ..Default::default() },
-            ProcessEvidence { environ: b"CARGO_TARGET_DIR=/work/wt/target".to_vec(), ..Default::default() },
-            ProcessEvidence { fds: vec![target.join("debug/build")], ..Default::default() },
-            ProcessEvidence { maps: vec![target.join("debug/lib.so")], ..Default::default() },
+            ProcessEvidence {
+                cwd: Some(target.join("debug")),
+                ..Default::default()
+            },
+            ProcessEvidence {
+                cmdline: b"cargo\0/work/wt/target/debug".to_vec(),
+                ..Default::default()
+            },
+            ProcessEvidence {
+                environ: b"CARGO_TARGET_DIR=/work/wt/target".to_vec(),
+                ..Default::default()
+            },
+            ProcessEvidence {
+                fds: vec![target.join("debug/build")],
+                ..Default::default()
+            },
+            ProcessEvidence {
+                maps: vec![target.join("debug/lib.so")],
+                ..Default::default()
+            },
         ];
         for process in values {
-            let table = ProcessTable { processes: vec![process], complete: true };
+            let table = ProcessTable {
+                processes: vec![process],
+                complete: true,
+            };
             assert_eq!(target_use(target, &table), UseState::InUse);
         }
-        assert_eq!(target_use(target, &ProcessTable::default()), UseState::Unknown);
+        assert_eq!(
+            target_use(target, &ProcessTable::default()),
+            UseState::Unknown
+        );
     }
 
     #[test]
@@ -418,15 +514,53 @@ mod tests {
         let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(10_000);
         let target = Path::new("/work/wt/target");
         let worktree = Path::new("/work/wt");
-        let policy = HostPolicy { free_floor_bytes: 100, idle_age_secs: 3600 };
+        let policy = HostPolicy {
+            free_floor_bytes: 100,
+            idle_age_secs: 3600,
+        };
         let old = now - std::time::Duration::from_secs(3601);
-        let decision = clean_decision(target, worktree, now, old, &policy, &ProcessTable {
-            processes: Vec::new(), complete: true,
-        });
-        assert_eq!(decision, CleanDecision { target: target.into(), eligible: true, reason: "eligible".into() });
-        let busy = ProcessTable { processes: vec![ProcessEvidence { cwd: Some(target.into()), ..Default::default() }], complete: true };
-        assert_eq!(clean_decision(target, worktree, now, old, &policy, &busy).reason, "process_in_use");
-        assert_eq!(clean_decision(target, worktree, now, old, &policy, &ProcessTable::default()).reason, "process_evidence_incomplete");
+        let decision = clean_decision(
+            target,
+            worktree,
+            now,
+            old,
+            &policy,
+            &ProcessTable {
+                processes: Vec::new(),
+                complete: true,
+            },
+        );
+        assert_eq!(
+            decision,
+            CleanDecision {
+                target: target.into(),
+                eligible: true,
+                reason: "eligible".into()
+            }
+        );
+        let busy = ProcessTable {
+            processes: vec![ProcessEvidence {
+                cwd: Some(target.into()),
+                ..Default::default()
+            }],
+            complete: true,
+        };
+        assert_eq!(
+            clean_decision(target, worktree, now, old, &policy, &busy).reason,
+            "process_in_use"
+        );
+        assert_eq!(
+            clean_decision(
+                target,
+                worktree,
+                now,
+                old,
+                &policy,
+                &ProcessTable::default()
+            )
+            .reason,
+            "process_evidence_incomplete"
+        );
     }
 
     #[test]
@@ -456,8 +590,15 @@ mod tests {
     #[test]
     #[trace("FR-048-AC-8")]
     fn luna_policy_rejects_load_eight_and_any_existing_heavy_gate() {
-        let policy = BuildPolicy { max_load1: 8.0, heavy_gate_slots: 1 };
-        let mut metrics = BuildHostMetrics { load1: Some(7.9), cores: Some(8.0), ..Default::default() };
+        let policy = BuildPolicy {
+            max_load1: 8.0,
+            heavy_gate_slots: 1,
+        };
+        let mut metrics = BuildHostMetrics {
+            load1: Some(7.9),
+            cores: Some(8.0),
+            ..Default::default()
+        };
         assert_eq!(eligibility(&metrics, policy), Eligibility::Eligible);
         metrics.load1 = Some(8.0);
         assert_eq!(eligibility(&metrics, policy), Eligibility::Ineligible);
@@ -470,8 +611,12 @@ mod tests {
     #[trace("FR-048-AC-1")]
     fn check_exit_code_compares_free_bytes_with_policy_floor() {
         let report = |free_bytes| HygieneReport {
-            host: "draco".into(), free_bytes, free_floor_bytes: 100,
-            targets: Vec::new(), process_table_complete: true, unsupported: false,
+            host: "draco".into(),
+            free_bytes,
+            free_floor_bytes: 100,
+            targets: Vec::new(),
+            process_table_complete: true,
+            unsupported: false,
         };
         assert_eq!(report(Some(99)).exit_code(), 1);
         assert_eq!(report(Some(100)).exit_code(), 0);

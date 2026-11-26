@@ -643,7 +643,12 @@ enum Output {
         recorded_level: Option<u32>,
     },
     Hygiene(ix_board::host_hygiene::HygieneReport),
-    BuildStatus(Vec<(ix_board::host_hygiene::BuildHostMetrics, ix_board::host_hygiene::Eligibility)>),
+    BuildStatus(
+        Vec<(
+            ix_board::host_hygiene::BuildHostMetrics,
+            ix_board::host_hygiene::Eligibility,
+        )>,
+    ),
     RetroDelta(retro::DeltaReport),
     RetroBackfill(retro::BackfillReport),
     RetroEval(retro::eval::EvalReport),
@@ -823,7 +828,12 @@ fn output_outcome(output: &Output) -> Outcome {
             ix_board::agents::Coverage::Failed => Outcome::Internal,
         },
         Output::BuildStatus(rows)
-            if rows.iter().any(|(_, verdict)| *verdict == ix_board::host_hygiene::Eligibility::Unknown) => Outcome::Partial,
+            if rows
+                .iter()
+                .any(|(_, verdict)| *verdict == ix_board::host_hygiene::Eligibility::Unknown) =>
+        {
+            Outcome::Partial
+        }
         Output::ProgramScopeCheck(report) if !report.is_valid() => Outcome::Partial,
         _ => Outcome::Ok,
     }
@@ -951,9 +961,13 @@ fn run(command: Command) -> Result<Output, Error> {
             HygieneCommand::Check(args) => run_hygiene(&args, false).map(Output::Hygiene),
             HygieneCommand::Clean { args, apply } => run_hygiene(&args, apply).map(Output::Hygiene),
         },
-        Command::Build { command: BuildCommand::Status { metrics_url, policies } } => {
-            run_build_status(&metrics_url, &policies).map(Output::BuildStatus)
-        }
+        Command::Build {
+            command:
+                BuildCommand::Status {
+                    metrics_url,
+                    policies,
+                },
+        } => run_build_status(&metrics_url, &policies).map(Output::BuildStatus),
         Command::Fleet {
             command: FleetCommand::Status,
         } => run_fleet_status().map(Output::Fleet),
@@ -3336,40 +3350,64 @@ fn run_drift(
     Ok(Output::Drift(evaluate_drift_file(&config, &evidence)?))
 }
 
-fn run_hygiene(args: &HygieneArgs, apply: bool) -> Result<ix_board::host_hygiene::HygieneReport, Error> {
+fn run_hygiene(
+    args: &HygieneArgs,
+    apply: bool,
+) -> Result<ix_board::host_hygiene::HygieneReport, Error> {
     use ix_board::host_hygiene::{
-        CleanDecision, HostPolicy, HygieneReport, free_disk_bytes, clean_decision,
+        CleanDecision, HostPolicy, HygieneReport, clean_decision, free_disk_bytes,
         system_process_table,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
 
     if cfg!(target_os = "windows") {
         return Ok(HygieneReport {
-            host: args.host.clone(), free_bytes: None,
+            host: args.host.clone(),
+            free_bytes: None,
             free_floor_bytes: args.free_floor_gb.saturating_mul(1024 * 1024 * 1024),
-            targets: Vec::new(), process_table_complete: false, unsupported: true,
+            targets: Vec::new(),
+            process_table_complete: false,
+            unsupported: true,
         });
     }
-    let floor = args.free_floor_gb.checked_mul(1024 * 1024 * 1024).ok_or_else(|| {
-        Error::ProgramReview { message: "free-space floor overflows bytes".to_owned() }
-    })?;
-    let age = args.idle_minutes.checked_mul(60).ok_or_else(|| {
-        Error::ProgramReview { message: "idle age overflows seconds".to_owned() }
-    })?;
+    let floor = args
+        .free_floor_gb
+        .checked_mul(1024 * 1024 * 1024)
+        .ok_or_else(|| Error::ProgramReview {
+            message: "free-space floor overflows bytes".to_owned(),
+        })?;
+    let age = args
+        .idle_minutes
+        .checked_mul(60)
+        .ok_or_else(|| Error::ProgramReview {
+            message: "idle age overflows seconds".to_owned(),
+        })?;
     let free_bytes = free_disk_bytes(&args.root).ok();
     let processes = system_process_table().unwrap_or_default();
     let now = SystemTime::now();
-    let policy = HostPolicy { free_floor_bytes: floor, idle_age_secs: age };
-    let entries = std::fs::read_dir(&args.root)
-        .map_err(|error| Error::ProgramReview { message: format!("cannot read worktree root: {error}") })?;
+    let policy = HostPolicy {
+        free_floor_bytes: floor,
+        idle_age_secs: age,
+    };
+    let entries = std::fs::read_dir(&args.root).map_err(|error| Error::ProgramReview {
+        message: format!("cannot read worktree root: {error}"),
+    })?;
     let mut targets = Vec::new();
     for entry in entries.flatten() {
         let worktree = entry.path();
-        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) { continue; }
-        if !worktree.join(".git").exists() { continue; }
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        if !worktree.join(".git").exists() {
+            continue;
+        }
         let target = worktree.join("target");
-        let Ok(metadata) = std::fs::symlink_metadata(&target) else { continue; };
-        if !metadata.is_dir() || metadata.file_type().is_symlink() { continue; }
+        let Ok(metadata) = std::fs::symlink_metadata(&target) else {
+            continue;
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
         let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
         let mut decision = clean_decision(&target, &worktree, now, modified, &policy, &processes);
         if apply && decision.eligible {
@@ -3382,15 +3420,25 @@ fn run_hygiene(args: &HygieneArgs, apply: bool) -> Result<ix_board::host_hygiene
     }
     targets.sort_by(|left: &CleanDecision, right| left.target.cmp(&right.target));
     Ok(HygieneReport {
-        host: args.host.clone(), free_bytes, free_floor_bytes: floor, targets,
-        process_table_complete: processes.complete, unsupported: false,
+        host: args.host.clone(),
+        free_bytes,
+        free_floor_bytes: floor,
+        targets,
+        process_table_complete: processes.complete,
+        unsupported: false,
     })
 }
 
 fn run_build_status(
     metrics_url: &str,
     policies: &[String],
-) -> Result<Vec<(ix_board::host_hygiene::BuildHostMetrics, ix_board::host_hygiene::Eligibility)>, Error> {
+) -> Result<
+    Vec<(
+        ix_board::host_hygiene::BuildHostMetrics,
+        ix_board::host_hygiene::Eligibility,
+    )>,
+    Error,
+> {
     use ix_board::host_hygiene::{BuildPolicy, Eligibility, parse_build_metrics};
     let response = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -3400,24 +3448,58 @@ fn run_build_status(
         .send()?
         .error_for_status()?
         .text()?;
-    let configured = policies.iter().map(|policy| {
-        let fields = policy.split(':').collect::<Vec<_>>();
-        if fields.len() != 3 {
-            return Err(Error::ProgramReview { message: format!("invalid host policy {policy:?}; expected host:max_load1:max_running_leases") });
-        }
-        let max_load1 = fields[1].parse::<f64>().ok().filter(|value| value.is_finite() && *value > 0.0)
-            .ok_or_else(|| Error::ProgramReview { message: format!("invalid max_load1 in host policy {policy:?}") })?;
-        let heavy_gate_slots = fields[2].parse::<u64>().ok().filter(|value| *value > 0)
-            .ok_or_else(|| Error::ProgramReview { message: format!("invalid lease count in host policy {policy:?}") })?;
-        Ok((fields[0].to_owned(), BuildPolicy { max_load1, heavy_gate_slots }))
-    }).collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
+    let configured = policies
+        .iter()
+        .map(|policy| {
+            let fields = policy.split(':').collect::<Vec<_>>();
+            if fields.len() != 3 {
+                return Err(Error::ProgramReview {
+                    message: format!(
+                        "invalid host policy {policy:?}; expected host:max_load1:max_running_leases"
+                    ),
+                });
+            }
+            let max_load1 = fields[1]
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .ok_or_else(|| Error::ProgramReview {
+                    message: format!("invalid max_load1 in host policy {policy:?}"),
+                })?;
+            let heavy_gate_slots = fields[2]
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| Error::ProgramReview {
+                    message: format!("invalid lease count in host policy {policy:?}"),
+                })?;
+            Ok((
+                fields[0].to_owned(),
+                BuildPolicy {
+                    max_load1,
+                    heavy_gate_slots,
+                },
+            ))
+        })
+        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
     let metrics = parse_build_metrics(&response);
-    Ok(configured.into_iter().map(|(host, policy)| {
-        let row = metrics.get(&host).cloned().unwrap_or_else(|| ix_board::host_hygiene::BuildHostMetrics { host, ..Default::default() });
-        let verdict = if row.load1.is_none() || row.cores.is_none() { Eligibility::Unknown }
-            else { ix_board::host_hygiene::eligibility(&row, policy) };
-        (row, verdict)
-    }).collect())
+    Ok(configured
+        .into_iter()
+        .map(|(host, policy)| {
+            let row = metrics.get(&host).cloned().unwrap_or_else(|| {
+                ix_board::host_hygiene::BuildHostMetrics {
+                    host,
+                    ..Default::default()
+                }
+            });
+            let verdict = if row.load1.is_none() || row.cores.is_none() {
+                Eligibility::Unknown
+            } else {
+                ix_board::host_hygiene::eligibility(&row, policy)
+            };
+            (row, verdict)
+        })
+        .collect())
 }
 
 fn render_human(output: &Output) -> String {
@@ -3496,27 +3578,45 @@ fn render_human(output: &Output) -> String {
         Output::Drift(report) => render_drift_text(report),
         Output::Agents(report) => render_text(report),
         Output::Fleet(report) => ix_board::fleet::render_text(report),
-        Output::Hygiene(report) => format!(
-            "{} hygiene: free={} floor={} targets={} process_evidence_complete={} unsupported={}",
-            report.host,
-            report.free_bytes.map_or_else(|| "unknown".to_owned(), |bytes| bytes.to_string()),
-            report.free_floor_bytes,
-            report.targets.len(),
-            report.process_table_complete,
-            report.unsupported,
-        ) + &report.targets.iter().map(|target| format!("\n{} {}", target.reason, target.target.display())).collect::<Vec<_>>().join(""),
-        Output::BuildStatus(rows) => rows.iter().map(|(row, verdict)| format!(
-            "{} load/core={:.2} memory={:?}/{:?} swap={:?}/{:?} queue={} leases={} {:?}",
-            row.host,
-            row.load1.zip(row.cores).filter(|(_, cores)| *cores > 0.0).map_or(f64::NAN, |(load, cores)| load / cores),
-            row.memory_available_bytes,
-            row.memory_total_bytes,
-            row.swap_free_bytes,
-            row.swap_total_bytes,
-            row.queue_depth,
-            row.running_leases,
-            verdict,
-        )).collect::<Vec<_>>().join("\n"),
+        Output::Hygiene(report) => {
+            format!(
+                "{} hygiene: free={} floor={} targets={} process_evidence_complete={} unsupported={}",
+                report.host,
+                report
+                    .free_bytes
+                    .map_or_else(|| "unknown".to_owned(), |bytes| bytes.to_string()),
+                report.free_floor_bytes,
+                report.targets.len(),
+                report.process_table_complete,
+                report.unsupported,
+            ) + &report
+                .targets
+                .iter()
+                .map(|target| format!("\n{} {}", target.reason, target.target.display()))
+                .collect::<Vec<_>>()
+                .join("")
+        }
+        Output::BuildStatus(rows) => rows
+            .iter()
+            .map(|(row, verdict)| {
+                format!(
+                    "{} load/core={:.2} memory={:?}/{:?} swap={:?}/{:?} queue={} leases={} {:?}",
+                    row.host,
+                    row.load1
+                        .zip(row.cores)
+                        .filter(|(_, cores)| *cores > 0.0)
+                        .map_or(f64::NAN, |(load, cores)| load / cores),
+                    row.memory_available_bytes,
+                    row.memory_total_bytes,
+                    row.swap_free_bytes,
+                    row.swap_total_bytes,
+                    row.queue_depth,
+                    row.running_leases,
+                    verdict,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
         Output::FleetAssign(report) => ix_board::fleet::assign::render_text(report),
         Output::FleetLedger(rows) => rows.render_text(),
         Output::FleetDefectRoute {

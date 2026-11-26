@@ -951,8 +951,14 @@ mod tests {
     #[test]
     #[trace("FR-048-AC-9")]
     fn locked_build_wrapper_name_does_not_establish_running_work() {
-        let wrapper = PaneProcess { comm: "bash".into(), args: "locked-build.sh".into() };
-        let leased_command = PaneProcess { comm: "cargo".into(), args: "cargo test".into() };
+        let wrapper = PaneProcess {
+            comm: "bash".into(),
+            args: "locked-build.sh".into(),
+        };
+        let leased_command = PaneProcess {
+            comm: "cargo".into(),
+            args: "cargo test".into(),
+        };
         assert!(!is_work_command(&wrapper));
         assert!(is_work_command(&leased_command));
     }
