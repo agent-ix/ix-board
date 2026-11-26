@@ -440,18 +440,14 @@ fn team_lane_classification_uses_latest_state_and_exact_workspace() {
 #[trace("FR-033-AC-16")]
 #[test]
 fn prometheus_lane_join_keeps_gauge_value_and_source_timestamp() {
-    let labels = serde_json::json!({
-        "lane": "draco:QSL:arch",
-        "state": "working"
-    });
     let values = serde_json::json!({
         "status": "success",
-        "data": {"result": [{"metric": labels.clone(), "value": [200, "1"]}]}
+        "data": {"result": [{"metric": {"__name__": "ix_fleet_lane_state_ratio", "lane": "draco:QSL:arch", "state": "working"}, "value": [200, "1"]}]}
     })
     .to_string();
     let timestamps = serde_json::json!({
         "status": "success",
-        "data": {"result": [{"metric": labels, "value": [200, "190"]}]}
+        "data": {"result": [{"metric": {"lane": "draco:QSL:arch", "state": "working"}, "value": [200, "190"]}]}
     })
     .to_string();
     let joined = super::collect::join_prometheus_samples(&values, &timestamps).unwrap();

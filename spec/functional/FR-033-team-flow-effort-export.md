@@ -47,6 +47,10 @@ their numeric series and report availability zero.
 Workers share the default coordinated Linear cache and persisted quota gate.
 Stale back-off fallback snapshots cannot certify a fresh tracker population;
 last-success timestamps retain the actual successful source-sync time.
+Snapshot-derived health gauges use the latest stored 1d retro snapshot for the
+configured team. A daily snapshot stays current for 25 hours to allow the next
+scheduled run and ordinary delay; a future or older snapshot is unavailable
+with an explicit reason.
 The exporter surface also serves the bounded fleet gauges defined by [FR-038](./FR-038-fleet-tick.md) and [FR-041](./FR-041-fleet-saturation.md) (`ix_fleet_tick_timestamp_seconds`, `ix_fleet_tick_actions{kind}`, `ix_fleet_ready_buffer_deficit`), omitting a value whose source is unavailable.
 The initial configuration permits four scopes and 1,000 output series. Individual
 evidence is retained for at most seven days within a 64 MiB SQLite file limit.
@@ -94,8 +98,10 @@ coverage is emitted only for stages with current open issues. State-entry times
 come from Linear issue history, cached by issue update time and incrementally
 backfilled across refreshes. Each refresh reads a bounded number of changed
 histories; failed or not-yet-read histories reduce coverage. The oldest age is
-published over covered issues at 50% or greater stage coverage, beside the
-coverage gauge. Below 50%, the age is withheld with an unavailable reason. No
+published over covered issues at 25% or greater stage coverage, beside the
+coverage gauge. The value is the oldest observed entry among covered issues.
+Below 25%, fewer than one in four current issues support this
+maximum-age estimate, so the age is withheld with an unavailable reason. No
 fixed stage set or synthetic stage population is emitted.
 
 `pr_changes_requested_share` uses open, non-draft PRs whose latest Linear review

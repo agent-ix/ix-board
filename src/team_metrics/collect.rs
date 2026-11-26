@@ -56,6 +56,8 @@ struct DailyClosureResult {
 const REVIEW_MARKER_PAGE_BUDGET: usize = 1;
 const REVIEW_MARKER_STORE_LIMIT: usize = 16 * 1024 * 1024;
 const STAGE_HISTORY_ISSUE_BUDGET: usize = 2;
+const MIN_STAGE_AGE_COVERAGE: f64 = 0.25;
+const RETRO_SNAPSHOT_MAX_AGE_SECONDS: f64 = 25.0 * 60.0 * 60.0;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1018,11 +1020,15 @@ pub(super) fn join_prometheus_samples(
     let values = parse_prometheus_samples(values_body)?;
     let timestamps = parse_prometheus_samples(timestamps_body)?
         .into_iter()
-        .map(|sample| (sample.labels, sample.value))
+        .map(|mut sample| {
+            sample.labels.remove("__name__");
+            (sample.labels, sample.value)
+        })
         .collect::<BTreeMap<_, _>>();
     values
         .into_iter()
         .map(|mut sample| {
+            sample.labels.remove("__name__");
             sample.timestamp_seconds = *timestamps
                 .get(&sample.labels)
                 .ok_or_else(|| "Prometheus timestamp query omitted a lane series".to_owned())?;
@@ -1631,7 +1637,7 @@ fn linear_stage_ages_from_histories(
                 stage,
                 oldest_seconds: ages.last().copied().unwrap_or_default(),
                 coverage: ages.len() as f64 / expected.max(1) as f64,
-                available: ages.len() as f64 / expected.max(1) as f64 >= 0.5,
+                available: ages.len() as f64 / expected.max(1) as f64 >= MIN_STAGE_AGE_COVERAGE,
             }
         })
         .collect()
@@ -1682,13 +1688,17 @@ fn latest_retro_record(team: &str, now_ms: i64) -> (Option<retro::Record>, Optio
         );
     };
     let age = now_ms as f64 / 1000.0 - taken_at;
-    if !(0.0..=900.0).contains(&age) {
+    if !retro_snapshot_is_fresh(age) {
         return (
             None,
             Some("latest 1d retro snapshot is stale or from the future".into()),
         );
     }
     (Some(record), None)
+}
+
+fn retro_snapshot_is_fresh(age_seconds: f64) -> bool {
+    (0.0..=RETRO_SNAPSHOT_MAX_AGE_SECONDS).contains(&age_seconds)
 }
 
 #[implements("FR-033-AC-15")]
@@ -2190,6 +2200,32 @@ mod tests {
         assert_eq!(ages[0].oldest_seconds, 3600.0);
         assert_eq!(ages[0].coverage, 0.5);
         assert!(ages[0].available);
+
+        let mut partial_workspace = workspace.clone();
+        partial_workspace
+            .issues
+            .push(issue("4", "QSL-4", "In Progress", "started", None));
+        partial_workspace
+            .issues
+            .push(issue("5", "QSL-5", "In Progress", "started", None));
+        partial_workspace
+            .issues
+            .push(issue("6", "QSL-6", "In Progress", "started", None));
+        let partial_ages = linear_stage_ages_from_histories(
+            &partial_workspace,
+            &BTreeSet::from([
+                crate::IssueId("1".into()),
+                crate::IssueId("2".into()),
+                crate::IssueId("3".into()),
+                crate::IssueId("4".into()),
+                crate::IssueId("5".into()),
+                crate::IssueId("6".into()),
+            ]),
+            &history_cache,
+            crate::drift::timestamp_epoch("2026-11-25T21:00:00Z").unwrap() as i64 * 1000,
+        );
+        assert_eq!(partial_ages[0].coverage, 0.2);
+        assert!(!partial_ages[0].available);
     }
     #[trace("FR-033-AC-18")]
     #[test]
@@ -2320,6 +2356,17 @@ mod tests {
             1_020_000
         );
     }
+    #[trace("FR-033-AC-5")]
+    #[test]
+    fn daily_retro_snapshots_stay_fresh_until_the_next_scheduled_run() {
+        assert!(retro_snapshot_is_fresh(24.0 * 60.0 * 60.0));
+        assert!(retro_snapshot_is_fresh(RETRO_SNAPSHOT_MAX_AGE_SECONDS));
+        assert!(!retro_snapshot_is_fresh(
+            RETRO_SNAPSHOT_MAX_AGE_SECONDS + 1.0
+        ));
+        assert!(!retro_snapshot_is_fresh(-1.0));
+    }
+
     #[trace("FR-033-AC-5")]
     #[test]
     fn stale_backoff_snapshots_cannot_refresh_tracker_success() {

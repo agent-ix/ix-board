@@ -463,7 +463,7 @@ pub fn render(
                         &mut out,
                         &labels,
                         &format!("stage_oldest_age_seconds_{}", stage.stage),
-                        "fewer than half of current issues have matching state-history evidence",
+                        "stage history coverage is below the 25% meaningful threshold",
                     )?;
                 }
             }
