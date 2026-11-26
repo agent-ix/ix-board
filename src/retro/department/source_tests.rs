@@ -309,16 +309,19 @@ fn native_claim_restart_and_attachment_truncation_never_use_update_time_as_claim
             at: END - 7200.0,
             from: Some(Unstarted),
             to: Some(Started),
+            to_name: None,
         },
         StateChange {
             at: END - 20.0,
             from: Some(Started),
             to: Some(Started),
+            to_name: None,
         },
         StateChange {
             at: END - 10.0,
             from: Some(Unstarted),
             to: Some(Started),
+            to_name: None,
         },
     ];
     enrich_claim_history(row, Ok(&history), Some(&at(0.0)));
@@ -340,6 +343,7 @@ fn native_claim_restart_and_attachment_truncation_never_use_update_time_as_claim
         at: END - 10.0,
         from: Some(Started),
         to: Some(Unstarted),
+        to_name: None,
     });
     enrich_claim_history(
         &mut batches[0].observations[0],
@@ -471,6 +475,7 @@ fn documented_source_input_is_read_by_the_production_file_normalizer() {
         at: END - 7200.0,
         from: Some(crate::WorkflowStateType::Unstarted),
         to: Some(crate::WorkflowStateType::Started),
+        to_name: None,
     }];
     enrich_claim_history(
         &mut batches[0].observations[0],

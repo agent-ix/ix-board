@@ -307,6 +307,44 @@ impl PromHttp {
             client,
         })
     }
+
+    /// Runs one bounded Prometheus range query and returns the response body.
+    pub fn query_range(
+        &self,
+        expr: &str,
+        start_seconds: f64,
+        end_seconds: f64,
+        step_seconds: u32,
+    ) -> Result<String, SourceError> {
+        if !start_seconds.is_finite()
+            || !end_seconds.is_finite()
+            || start_seconds >= end_seconds
+            || step_seconds == 0
+            || end_seconds - start_seconds > 86_400.0
+        {
+            return Err(SourceError("prometheus range bounds are invalid".into()));
+        }
+        let response = self
+            .client
+            .get(format!("{}/api/v1/query_range", self.base))
+            .query(&[
+                ("query", expr),
+                ("start", &start_seconds.to_string()),
+                ("end", &end_seconds.to_string()),
+                ("step", &step_seconds.to_string()),
+            ])
+            .send()
+            .map_err(|e| SourceError(format!("prometheus range: {e}")))?;
+        if !response.status().is_success() {
+            return Err(SourceError(format!(
+                "prometheus range: HTTP {}",
+                response.status()
+            )));
+        }
+        response
+            .text()
+            .map_err(|e| SourceError(format!("prometheus range: {e}")))
+    }
 }
 
 #[implements("FR-041-AC-10")]

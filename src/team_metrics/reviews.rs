@@ -375,7 +375,7 @@ pub(crate) fn calculate(
         first_review_coverage,
     );
     values.insert("new_pr_first_review_count_24h".into(), delays.len() as f64);
-    if !delays.is_empty() && first_review_coverage >= 0.95 {
+    if !delays.is_empty() {
         for (name, fraction) in [
             ("new_pr_first_review_median_seconds_24h", 0.5),
             ("new_pr_first_review_p90_seconds_24h", 0.9),
@@ -397,6 +397,7 @@ mod tests {
         MarkerComment {
             id: Some(id.into()),
             created_at: Some(crate::drift::format_timestamp(seconds)),
+            updated_at: Some(crate::drift::format_timestamp(seconds)),
             body: format!("{marker}\n\n```yaml\n{data}\n```\n"),
         }
     }
@@ -577,5 +578,19 @@ mod tests {
             .values;
         assert_eq!(values["pr_changes_requested_coverage"], 0.95);
         assert_eq!(values["pr_changes_requested_share"], 1.0 / 19.0);
+    }
+
+    #[test]
+    fn first_review_distribution_is_published_for_partial_coverage() {
+        let open = BTreeSet::from(["owner/repo#1".into(), "owner/repo#2".into()]);
+        let created = BTreeMap::from([
+            ("owner/repo#1".into(), 98_000.0),
+            ("owner/repo#2".into(), 98_000.0),
+        ]);
+        let values = calculate(&[review()], &allowed(), &created, &open, 100_000.0)
+            .unwrap()
+            .values;
+        assert_eq!(values["new_pr_first_review_coverage_24h"], 0.5);
+        assert_eq!(values["new_pr_first_review_median_seconds_24h"], 1_000.0);
     }
 }

@@ -73,10 +73,6 @@ pub struct Selectors {
     /// Ticket UUIDs or identifiers, including descendants.
     #[serde(default)]
     pub tickets: Vec<String>,
-    /// Select the unique started team project whose name contains `release`. This follows the
-    /// current release path without freezing a project ID.
-    #[serde(default)]
-    pub current_release_project: bool,
 }
 impl Selectors {
     pub(crate) fn selection(&self) -> ScopeSelection {
@@ -101,11 +97,10 @@ pub struct ScopeConfig {
     /// Current authoritative selectors; selector revisions are stored outside labels.
     pub selectors: Selectors,
     /// Canonical server:workspace:tab identities authorized to report this scope.
-    pub leads: Vec<String>,
-    /// Refresh `leads` from the relay directory's verified team workspace on each activity poll.
     #[serde(default)]
-    pub derive_leads_from_relay: bool,
+    pub leads: Vec<String>,
     /// Herdr workspaces to query; assigned leads still restrict attribution.
+    #[serde(default)]
     pub herdr_teams: Vec<String>,
     /// Existing retro configuration, including gates, policies and source parameters.
     pub retro_config: PathBuf,
@@ -169,13 +164,9 @@ impl Config {
                     "Linear team key has unsafe label characters",
                 ));
             }
-            if !keys.insert(scope.key())
-                || (scope.leads.is_empty() && !scope.derive_leads_from_relay)
-                || scope.leads.len() > 32
-                || scope.herdr_teams.len() > 16
-            {
+            if !keys.insert(scope.key()) || scope.leads.len() > 32 || scope.herdr_teams.len() > 16 {
                 return Err(Error::Invalid(
-                    "duplicate scope or missing/unbounded leads/workspaces",
+                    "duplicate scope or unbounded leads/workspaces",
                 ));
             }
             if scope
@@ -188,18 +179,6 @@ impl Config {
                 ));
             }
             let s = &scope.selectors;
-            if scope.derive_leads_from_relay && s.team.is_none() {
-                return Err(Error::Invalid(
-                    "relay lead discovery requires a Linear team selector",
-                ));
-            }
-            if s.current_release_project
-                && (!s.projects.is_empty() || !s.initiatives.is_empty() || !s.tickets.is_empty())
-            {
-                return Err(Error::Invalid(
-                    "current release project cannot be combined with fixed selectors",
-                ));
-            }
             if s.team.is_none()
                 && s.projects.is_empty()
                 && s.initiatives.is_empty()

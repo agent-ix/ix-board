@@ -17,6 +17,8 @@ pub struct State {
     pub(crate) history_at_ms: i64,
     pub(crate) history_ok: bool,
     pub(crate) history_gaps: u64,
+    #[serde(default)]
+    pub(crate) linear_requests_last_refresh: u64,
     pub(crate) journal_from_ms: i64,
     pub(crate) scopes: BTreeMap<String, ScopeState>,
 }
@@ -34,6 +36,16 @@ pub struct ScopeState {
     pub(crate) tracker_at_ms: i64,
     pub(crate) tracker_ok: bool,
     pub(crate) record: Option<Record>,
+    #[serde(default)]
+    pub(crate) record_reason: Option<String>,
+    #[serde(default)]
+    pub(crate) pr_stats_reason: Option<String>,
+    #[serde(default)]
+    pub(crate) review_stats_reason: Option<String>,
+    #[serde(default)]
+    pub(crate) closures_daily_reason: Option<String>,
+    #[serde(default)]
+    pub(crate) merged_prs_daily_reason: Option<String>,
     pub(crate) pr_stats: Option<super::pr_stats::PrStats>,
     pub(crate) review_stats: Option<super::reviews::ReviewStats>,
     #[serde(default)]
@@ -44,22 +56,28 @@ pub struct ScopeState {
     pub(crate) review_success_at_ms: i64,
     #[serde(default)]
     pub(crate) github_observed_at_ms: i64,
+    #[serde(default)]
+    pub(crate) github_repo_coverage: f64,
     pub(crate) assignments: BTreeMap<String, Active>,
     pub(crate) pauses: BTreeMap<String, bool>,
     pub(crate) reported_scope: BTreeMap<String, String>,
     pub(crate) totals: BTreeMap<String, f64>,
     pub(crate) samples: BTreeMap<String, Sample>,
     pub(crate) stages: BTreeMap<String, Vec<(i64, f64)>>,
+    #[serde(default)]
+    pub(crate) linear_stage_ages: Vec<LinearStageAge>,
+    #[serde(default)]
+    pub(crate) effort_range: Option<EffortRange>,
+    #[serde(default)]
+    pub(crate) effort_range_reason: Option<String>,
     pub(crate) lifecycle_at_ms: i64,
     pub(crate) lifecycle_ok: bool,
     pub(crate) lifecycle_success_at_ms: i64,
     pub(crate) population_observed: bool,
     #[serde(default)]
-    pub(crate) relay_leads_expected: usize,
+    pub(crate) execution_population_expected: usize,
     #[serde(default)]
-    pub(crate) relay_leads_observed: usize,
-    #[serde(default)]
-    pub(crate) relay_leads_not_running: usize,
+    pub(crate) execution_population_observed: usize,
     #[serde(default)]
     pub(crate) execution_observed_count: usize,
     #[serde(default)]
@@ -72,6 +90,8 @@ pub struct ScopeState {
     pub(crate) build_execution_seconds_24h: Option<f64>,
     pub(crate) ready_issues: Option<usize>,
     pub(crate) blocked_issues: Option<usize>,
+    #[serde(default)]
+    pub(crate) wip_active: Option<usize>,
     pub(crate) coverage_started_ms: Option<i64>,
     pub(crate) last_error: Option<String>,
 }
@@ -81,6 +101,21 @@ pub(crate) struct Member {
     pub ticket: String,
     pub state: crate::WorkflowStateType,
     pub leaf: bool,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LinearStageAge {
+    pub stage: String,
+    pub oldest_seconds: f64,
+    pub coverage: f64,
+    #[serde(default)]
+    pub available: bool,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EffortRange {
+    pub working_lane_seconds: f64,
+    pub coverage: f64,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

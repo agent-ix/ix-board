@@ -2,7 +2,6 @@
 // Copyright (C) 2026 Agent-IX
 use super::{Config, Error, State};
 use crate::retro::{Status, department::Value};
-use ix_trace_rs::implements;
 use std::{collections::BTreeSet, fmt::Write};
 
 struct Text {
@@ -34,11 +33,37 @@ fn flag(value: bool) -> f64 {
     if value { 1.0 } else { 0.0 }
 }
 
+fn label_value(value: &str) -> String {
+    value
+        .chars()
+        .take(160)
+        .flat_map(|character| match character {
+            '\\' => vec!['\\', '\\'],
+            '"' => vec!['\\', '"'],
+            '\n' => vec!['\\', 'n'],
+            '\r' => vec![],
+            character => vec![character],
+        })
+        .collect()
+}
+
 fn coverage(text: &mut Text, labels: &str, metric: &str, value: f64) -> Result<(), Error> {
     text.metric(
         "ix_team_metric_coverage",
         &format!("{labels},metric=\"{metric}\""),
         value.clamp(0.0, 1.0),
+        false,
+    )
+}
+fn unavailable(text: &mut Text, labels: &str, metric: &str, reason: &str) -> Result<(), Error> {
+    text.metric(
+        "ix_team_metric_reason_info",
+        &format!(
+            "{labels},metric=\"{}\",reason=\"{}\"",
+            label_value(metric),
+            label_value(reason)
+        ),
+        1.0,
         false,
     )
 }
@@ -88,7 +113,6 @@ const DEPARTMENT: &[(&str, &str, f64)] = &[
 
 /// Encodes a bounded allowlist in Prometheus text format. Missing data emits
 /// availability=0 and omits its numeric value, never substitutes zero.
-#[implements("FR-033-AC-16", "FR-033-AC-17", "FR-033-AC-18")]
 pub fn render(
     config: &Config,
     state: &State,
@@ -141,6 +165,12 @@ pub fn render(
         "",
         state.history_gaps as f64,
         true,
+    )?;
+    out.metric(
+        "ix_team_linear_requests_last_refresh",
+        "",
+        state.linear_requests_last_refresh as f64,
+        false,
     )?;
     out.metric(
         "ix_team_exporter_history_available_from_timestamp_seconds",
@@ -275,17 +305,14 @@ pub fn render(
         }
         let execution_observation_fresh = s.execution_observed_at_ms > 0
             && (0..=90000).contains(&now.saturating_sub(s.execution_observed_at_ms));
-        let expected_leads = if scope.derive_leads_from_relay {
-            s.relay_leads_expected
-        } else {
-            scope.leads.len()
-        };
-        let execution_coverage = if execution_observation_fresh && expected_leads > 0 {
-            (s.execution_observed_count as f64 / expected_leads as f64).min(1.0)
-        } else {
-            0.0
-        };
-        let executing_agents = (execution_observation_fresh && s.execution_observed_count > 0)
+        let execution_coverage =
+            if execution_observation_fresh && s.execution_population_expected > 0 {
+                (s.execution_population_observed as f64 / s.execution_population_expected as f64)
+                    .min(1.0)
+            } else {
+                0.0
+            };
+        let executing_agents = (execution_observation_fresh && s.execution_population_observed > 0)
             .then_some(s.execution_working_count as f64);
         coverage(&mut out, &labels, "executing_agents", execution_coverage)?;
         out.metric(
@@ -296,6 +323,13 @@ pub fn render(
         )?;
         if let Some(count) = executing_agents {
             out.metric("ix_team_executing_agents", &labels, count, false)?;
+        } else {
+            unavailable(
+                &mut out,
+                &labels,
+                "executing_agents",
+                "Prometheus lane feed is stale or unavailable",
+            )?;
         }
         let paused = !s.pauses.is_empty()
             && scope
@@ -391,61 +425,48 @@ pub fn render(
                     }
                 }
             }
-            let active = s
-                .assignments
-                .values()
-                .filter(|a| {
-                    tracker_fresh
-                        && history_fresh
-                        && super::timeline::stage(&a.assignment.role) == stage
-                        && s.members.values().any(|m| m.ticket == a.assignment.ticket)
-                })
-                .collect::<Vec<_>>();
-            let oldest = active
-                .iter()
-                .filter(|a| a.start_known)
-                .map(|a| now.saturating_sub(a.started_ms).max(0))
-                .max();
-            let age = if active.is_empty() {
-                (tracker_fresh && history_fresh && life_fresh && s.population_observed)
-                    .then_some(0.0)
-            } else {
-                oldest.map(|age| age as f64 / 1000.0)
-            };
-            let known = active.iter().filter(|a| a.start_known).count();
-            let age_coverage = if active.is_empty() {
-                if age.is_some() { 1.0 } else { 0.0 }
-            } else {
-                known as f64 / active.len() as f64
-            };
-            coverage(
-                &mut out,
-                &labels,
-                &format!("stage_oldest_age_seconds_{stage}"),
-                age_coverage,
-            )?;
-            out.metric(
-                "ix_team_metric_available",
-                &format!("{labels},metric=\"stage_oldest_age_seconds\",stage=\"{stage}\""),
-                flag(age.is_some()),
-                false,
-            )?;
-            if let Some(age) = age {
+        }
+        if tracker_fresh {
+            for stage in &s.linear_stage_ages {
+                coverage(
+                    &mut out,
+                    &labels,
+                    &format!("stage_oldest_age_seconds_{}", stage.stage),
+                    stage.coverage,
+                )?;
                 out.metric(
-                    "ix_team_stage_oldest_age_seconds",
-                    &format!("{labels},stage=\"{stage}\""),
-                    age,
+                    "ix_team_metric_available",
+                    &format!(
+                        "{labels},metric=\"stage_oldest_age_seconds\",stage=\"{}\"",
+                        stage.stage
+                    ),
+                    u8::from(stage.available) as f64,
                     false,
                 )?;
+                if stage.available {
+                    out.metric(
+                        "ix_team_stage_oldest_age_seconds",
+                        &format!("{labels},stage=\"{}\"", stage.stage),
+                        stage.oldest_seconds,
+                        false,
+                    )?;
+                } else {
+                    unavailable(
+                        &mut out,
+                        &labels,
+                        &format!("stage_oldest_age_seconds_{}", stage.stage),
+                        "fewer than half of current issues have matching state-history evidence",
+                    )?;
+                }
             }
         }
         for (id, name, factor) in LEGACY {
             let metric = s.record.as_ref().and_then(|r| r.metrics.get(*id));
             let value = metric
                 .filter(|m| {
-                    m.status == Status::Ok
-                        && tracker_fresh
-                        && (!m.source.split('+').any(|s| s == "github") || github_fresh)
+                    // Retro snapshots carry their own source completeness. Do not blank a
+                    // snapshot metric because the exporter's separate live PR poll failed.
+                    m.status == Status::Ok && tracker_fresh
                 })
                 .and_then(|m| m.value);
             out.metric(
@@ -456,6 +477,24 @@ pub fn render(
             )?;
             if let Some(value) = value {
                 out.metric(&format!("ix_team_{name}"), &labels, value * factor, false)?;
+            } else {
+                let reason = if !tracker_fresh {
+                    "fresh Linear tracker data unavailable"
+                } else if let Some(metric) = metric {
+                    metric
+                        .reason
+                        .as_deref()
+                        .unwrap_or(if metric.status == Status::Ok {
+                            "retro snapshot metric has no value"
+                        } else {
+                            "retro snapshot metric status is not ok"
+                        })
+                } else {
+                    s.record_reason
+                        .as_deref()
+                        .unwrap_or("metric is absent from the retro snapshot")
+                };
+                unavailable(&mut out, &labels, name, reason)?;
             }
         }
         for (id, name, factor) in DEPARTMENT {
@@ -464,12 +503,15 @@ pub fn render(
                 .as_ref()
                 .and_then(|r| r.department.as_ref())
                 .and_then(|d| d.measurements.get(*id));
-            let value = m
-                .filter(|m| m.status == Status::Ok && tracker_fresh)
-                .and_then(|m| match m.value.as_ref() {
-                    Some(Value::Scalar(v)) => Some(*v),
-                    _ => None,
-                });
+            let value = if *id == "wip_active" && tracker_fresh {
+                s.wip_active.map(|count| count as f64)
+            } else {
+                m.filter(|m| m.status == Status::Ok && tracker_fresh)
+                    .and_then(|m| match m.value.as_ref() {
+                        Some(Value::Scalar(v)) => Some(*v),
+                        _ => None,
+                    })
+            };
             out.metric(
                 "ix_team_metric_available",
                 &format!("{labels},metric=\"{name}\""),
@@ -478,12 +520,23 @@ pub fn render(
             )?;
             if let Some(value) = value {
                 out.metric(&format!("ix_team_{name}"), &labels, value * factor, false)?;
+            } else {
+                let reason = if !tracker_fresh {
+                    "fresh Linear tracker data unavailable"
+                } else {
+                    m.and_then(|measurement| measurement.reason.as_deref())
+                        .unwrap_or("department metric is not configured or absent")
+                };
+                unavailable(&mut out, &labels, name, reason)?;
             }
         }
-        for (names, values) in [
+        for (names, values, missing_reason) in [
             (
                 super::pr_stats::NAMES,
                 s.pr_stats.as_ref().filter(|_| pr_fresh).map(|p| &p.values),
+                s.pr_stats_reason
+                    .as_deref()
+                    .unwrap_or("GitHub PR statistics are unavailable"),
             ),
             (
                 super::reviews::NAMES,
@@ -491,6 +544,9 @@ pub fn render(
                     .as_ref()
                     .filter(|_| review_fresh)
                     .map(|p| &p.values),
+                s.review_stats_reason
+                    .as_deref()
+                    .unwrap_or("Linear review records are unavailable"),
             ),
         ] {
             for name in names {
@@ -499,13 +555,15 @@ pub fn render(
                     let ratio = values
                         .and_then(|v| v.get("pr_changes_requested_coverage"))
                         .copied()
-                        .unwrap_or(0.0);
+                        .unwrap_or(0.0)
+                        .min(s.github_repo_coverage);
                     coverage(&mut out, &labels, name, ratio)?;
                 } else if *name == "new_pr_first_review_median_seconds_24h" {
                     let ratio = values
                         .and_then(|v| v.get("new_pr_first_review_coverage_24h"))
                         .copied()
-                        .unwrap_or(0.0);
+                        .unwrap_or(0.0)
+                        .min(s.github_repo_coverage);
                     coverage(&mut out, &labels, name, ratio)?;
                 }
                 let value = value.filter(|_| {
@@ -522,41 +580,36 @@ pub fn render(
                 )?;
                 if let Some(value) = value {
                     out.metric(&format!("ix_team_{name}"), &labels, *value, false)?;
+                } else {
+                    let reason = if values.and_then(|v| v.get(*name)).is_none() {
+                        missing_reason
+                    } else {
+                        "metric has no qualifying observations"
+                    };
+                    unavailable(&mut out, &labels, name, reason)?;
                 }
             }
         }
-        let verified = s
-            .record
-            .as_ref()
-            .filter(|_| tracker_fresh && github_fresh)
-            .and_then(|r| {
-                let closed = r.metrics.get("path_closed")?.value?;
-                let unverified = r.metrics.get("path_closed_unverified")?.value?;
-                (closed >= unverified).then_some(closed - unverified)
-            });
-        let effort = verified
-            .zip(
-                s.effort_points
-                    .iter()
-                    .rev()
-                    .find(|p| p.0 >= now - 86400000 && p.0 <= now - 86100000),
-            )
-            .and_then(|(closures, (_, execution, covered))| {
-                (closures > 0.0
-                    && life_fresh
-                    && history_fresh
-                    && s.covered_seconds - covered >= 86100.0)
-                    .then(|| {
-                        (s.totals.get("execution_seconds").unwrap_or(&0.0) - execution) / closures
-                    })
-            });
+        let verified = s.record.as_ref().filter(|_| tracker_fresh).and_then(|r| {
+            let closed = r.metrics.get("path_closed")?;
+            let unverified = r.metrics.get("path_closed_unverified")?;
+            if closed.status != Status::Ok || unverified.status != Status::Ok {
+                return None;
+            }
+            let count = closed.value? - unverified.value?;
+            (count >= 0.0).then_some(count)
+        });
         let effort_coverage = s
-            .effort_points
-            .iter()
-            .rev()
-            .find(|p| p.0 >= now - 86400000 && p.0 <= now - 86100000)
-            .map(|(_, _, covered)| ((s.covered_seconds - covered).max(0.0) / 86400.0).min(1.0))
+            .effort_range
+            .as_ref()
+            .filter(|_| tracker_fresh)
+            .map(|range| range.coverage)
             .unwrap_or(0.0);
+        let effort = verified
+            .filter(|closures| *closures > 0.0)
+            .zip(s.effort_range.as_ref().filter(|_| tracker_fresh))
+            .filter(|(_, range)| range.coverage >= 0.5)
+            .map(|(closures, range)| range.working_lane_seconds / closures);
         coverage(
             &mut out,
             &labels,
@@ -577,6 +630,37 @@ pub fn render(
                 "ix_team_effort_per_verified_path_closure_seconds_24h",
                 &labels,
                 value,
+                false,
+            )?;
+        } else {
+            let reason = if let Some(closures) = verified {
+                if closures == 0.0 {
+                    "no verified path closures in trailing 24h"
+                } else if effort_coverage < 0.5 {
+                    "fresh host feed coverage is below the 50% meaningful threshold"
+                } else {
+                    s.effort_range_reason
+                        .as_deref()
+                        .unwrap_or("no retained Prometheus lane history")
+                }
+            } else {
+                s.record_reason
+                    .as_deref()
+                    .or_else(|| {
+                        s.record
+                            .as_ref()
+                            .and_then(|record| record.metrics.get("path_closed_unverified"))
+                            .and_then(|metric| metric.reason.as_deref())
+                    })
+                    .unwrap_or("verified closure count unavailable")
+            };
+            out.metric(
+                "ix_team_metric_reason_info",
+                &format!(
+                    "{labels},metric=\"effort_per_verified_path_closure_seconds_24h\",reason=\"{}\"",
+                    label_value(reason)
+                ),
+                1.0,
                 false,
             )?;
         }
@@ -608,6 +692,15 @@ pub fn render(
                     *value as f64,
                     false,
                 )?;
+            } else {
+                unavailable(
+                    &mut out,
+                    &labels,
+                    &format!("closures_day_{days_ago}"),
+                    s.closures_daily_reason
+                        .as_deref()
+                        .unwrap_or("Linear closure history is unavailable"),
+                )?;
             }
             if let Some(value) = merges {
                 out.metric(
@@ -615,6 +708,15 @@ pub fn render(
                     &format!("{labels},days_ago=\"{days_ago}\""),
                     *value as f64,
                     false,
+                )?;
+            } else {
+                unavailable(
+                    &mut out,
+                    &labels,
+                    &format!("merged_prs_day_{days_ago}"),
+                    s.merged_prs_daily_reason
+                        .as_deref()
+                        .unwrap_or("GitHub merge history is unavailable"),
                 )?;
             }
         }

@@ -6,6 +6,7 @@
 //! Every method only reads. Errors are plain reason strings: the caller turns them into
 //! `unavailable` metrics (FR-026) and never into a zero.
 
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use crate::agents::AgentsReport;
@@ -49,7 +50,7 @@ pub fn read_all_pages<T>(
 }
 
 /// One workflow-state change of an issue.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct StateChange {
     /// Unix seconds of the change.
     pub at: f64,
@@ -57,6 +58,9 @@ pub struct StateChange {
     pub from: Option<WorkflowStateType>,
     /// Category entered, when known.
     pub to: Option<WorkflowStateType>,
+    /// Exact workflow state entered, when supplied by Linear history.
+    #[serde(default)]
+    pub to_name: Option<String>,
 }
 
 /// An open issue carrying the decision label.
@@ -70,6 +74,10 @@ pub struct LabeledIssue {
 
 /// Linear reads.
 pub trait LinearSource {
+    /// Count of HTTP requests sent by this source during its lifetime, when instrumented.
+    fn request_count(&self) -> Option<u64> {
+        None
+    }
     /// Provenance of the latest coordinated workspace read, when the source caches.
     fn cache_freshness(&self) -> Option<crate::CacheFreshness> {
         None

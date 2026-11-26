@@ -449,6 +449,7 @@ type InfoRows = Result<BTreeMap<u64, PullRequestInfo>, String>;
 pub(super) struct SelectedGithub<T = Http> {
     guard: Result<Guard<T>, String>,
     allowed: BTreeSet<(String, u64)>,
+    priority: BTreeSet<(String, u64)>,
     complete: bool,
     now: i64,
     oldest_at: Cell<i64>,
@@ -457,15 +458,17 @@ pub(super) struct SelectedGithub<T = Http> {
     infos: RefCell<BTreeMap<String, InfoRows>>,
 }
 impl SelectedGithub {
-    pub(super) fn new(
+    pub(super) fn new_with_priority(
         config: &Config,
         allowed: BTreeSet<(String, u64)>,
+        priority: BTreeSet<(String, u64)>,
         complete: bool,
         now: i64,
     ) -> Self {
         Self::with_guard(
             Http::local().and_then(|transport| Guard::open(config, transport)),
             allowed,
+            priority,
             complete,
             now,
         )
@@ -475,12 +478,14 @@ impl<T: Transport> SelectedGithub<T> {
     fn with_guard(
         guard: Result<Guard<T>, String>,
         allowed: BTreeSet<(String, u64)>,
+        priority: BTreeSet<(String, u64)>,
         complete: bool,
         now: i64,
     ) -> Self {
         Self {
             guard,
             allowed,
+            priority,
             complete,
             now,
             oldest_at: Cell::new(0),
@@ -552,7 +557,7 @@ impl<T: Transport> SelectedGithub<T> {
             let mut variables = BTreeMap::new();
             if open_more {
                 fields.push(format!(
-                    "open: pullRequests(first: 100, states: [OPEN], after: $openAfter, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{ {PR_FIELDS} }}"
+                    "open: pullRequests(first: 50, states: [OPEN], after: $openAfter, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{ {PR_FIELDS} }}"
                 ));
                 variables.insert(
                     "openAfter".to_owned(),
@@ -561,7 +566,7 @@ impl<T: Transport> SelectedGithub<T> {
             }
             if closed_more {
                 fields.push(format!(
-                    "recent: pullRequests(first: 100, states: [MERGED, CLOSED], after: $recentAfter, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{ {PR_FIELDS} }}"
+                    "recent: pullRequests(first: 50, states: [MERGED, CLOSED], after: $recentAfter, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{ {PR_FIELDS} }}"
                 ));
                 variables.insert(
                     "recentAfter".to_owned(),
@@ -638,13 +643,25 @@ impl<T: Transport> SelectedGithub<T> {
                     );
                 }
             }
-            let numbers: Vec<_> = self
-                .allowed
+            let candidates: Vec<u64> = self
+                .priority
                 .iter()
-                .filter(|(r, n)| r == repo && !rows.contains_key(n))
-                .take(MAX_OLD)
+                .filter(|(r, n)| {
+                    r == repo && self.allowed.contains(&(r.clone(), *n)) && !rows.contains_key(n)
+                })
+                .chain(
+                    self.allowed
+                        .iter()
+                        .filter(|(r, n)| r == repo && !rows.contains_key(n)),
+                )
                 .map(|(_, n)| *n)
                 .collect();
+            let mut seen = BTreeSet::new();
+            let mut numbers = candidates
+                .into_iter()
+                .filter(|number| seen.insert(*number))
+                .collect::<Vec<_>>();
+            numbers.truncate(MAX_OLD);
             for chunk in numbers.chunks(25) {
                 let fields = chunk
                     .iter()
@@ -980,7 +997,7 @@ mod tests {
         if let Ok(g) = &guard {
             g.transport.clock.set(at);
         }
-        SelectedGithub::with_guard(guard, allowed, complete, at)
+        SelectedGithub::with_guard(guard, allowed, BTreeSet::new(), complete, at)
     }
     fn config(path: &std::path::Path) -> Config {
         serde_json::from_value(serde_json::json!({
@@ -1041,7 +1058,6 @@ mod tests {
             .map_err(|e| e.to_string())
     }
 
-    #[trace("FR-033-AC-12", "FR-033-AC-13")]
     #[test]
     fn thousands_of_old_links_have_constant_batched_cost_across_scopes_cycles_and_restart() {
         let dir = tempfile::tempdir().unwrap();
@@ -1529,7 +1545,8 @@ mod tests {
             let connection = |node| serde_json::json!({"nodes":[node],"pageInfo":{"hasNextPage":false,"endCursor":null}});
             let repository =
                 serde_json::json!({"open":connection(node),"recent":connection(merged)});
-            assert!(query.contains("open: pullRequests") && query.contains("recent: pullRequests"));
+            assert!(query.contains("open: pullRequests(first: 50, states: [OPEN]"));
+            assert!(query.contains("recent: pullRequests(first: 50, states: [MERGED, CLOSED]"));
             Ok(response(serde_json::json!({"data":{"rateLimit":{"cost":3,"remaining":100,"resetAt":"2030-01-01T00:00:00Z"},"repository":repository}}).to_string()))
         });
         let at = chrono::DateTime::parse_from_rfc3339("2026-11-22T01:00:00Z")
@@ -1952,7 +1969,6 @@ mod tests {
         assert_eq!(fake.count(), 41);
     }
 
-    #[trace("FR-033-AC-12", "FR-033-AC-13")]
     #[test]
     fn actual_http_body_nests_variables_for_listing_historical_and_paginated_queries() {
         use super::super::github_http::tests::{Fixture, reply};
@@ -1999,8 +2015,13 @@ mod tests {
                 serde_json::json!({"open":open,"recent":recent})
             } else {
                 assert_eq!(variables.len(), 2);
-                assert!(query.contains("p3: pullRequest(number: 3)"));
-                serde_json::json!({"p3":{"state":"MERGED","createdAt":"1970-01-01T00:00:00Z","updatedAt":"1970-01-01T00:00:00Z","mergedAt":"1970-01-01T00:00:00Z","closedAt":"1970-01-01T00:00:00Z"}})
+                let mut fields = serde_json::Map::new();
+                for number in 3..=100 {
+                    if query.contains(&format!("p{number}: pullRequest(number: {number})")) {
+                        fields.insert(format!("p{number}"), serde_json::json!({"state":"MERGED","createdAt":"1970-01-01T00:00:00Z","updatedAt":"1970-01-01T00:00:00Z","mergedAt":"1970-01-01T00:00:00Z","closedAt":"1970-01-01T00:00:00Z"}));
+                    }
+                }
+                serde_json::Value::Object(fields)
             };
             let response = serde_json::json!({"data":{"rateLimit":{"cost":3,"remaining":100,"resetAt":"2030-01-01T00:00:00Z"},"repository":repository}}).to_string();
             reply(200, "", &response)
@@ -2010,20 +2031,25 @@ mod tests {
         let http = Http::fixture(&server.endpoint, "offline-credential").unwrap();
         let clock = Arc::new(TestClock(std::sync::atomic::AtomicI64::new(1000)));
         let guard = Guard::with_clock(&cfg, http, clock).unwrap();
-        let allowed = (1..=3).map(|n| ("agent-ix/one".into(), n)).collect();
-        let source = SelectedGithub::with_guard(Ok(guard), allowed, true, 1000);
+        let allowed = (1..=51).map(|n| ("agent-ix/one".into(), n)).collect();
+        let priority = BTreeSet::from([("agent-ix/one".into(), 51)]);
+        let source = SelectedGithub::with_guard(Ok(guard), allowed, priority, true, 1000);
         let prs = source.pull_requests("agent-ix/one", 0.0).unwrap();
         assert_eq!(
             prs.iter().map(|pr| pr.number).collect::<Vec<_>>(),
             vec![1, 2]
         );
-        assert!(source.pull_request("agent-ix/one", 3).unwrap().merged);
+        assert!(source.pull_request("agent-ix/one", 51).unwrap().merged);
         assert!(!source.pull_request("agent-ix/one", 1).unwrap().merged);
         let seen = server.finish();
         assert_eq!(
             seen.len(),
-            3,
-            "two batched population pages and one historical batch"
+            4,
+            "two population pages and two bounded historical batches"
+        );
+        assert!(
+            seen.iter()
+                .any(|request| request.contains("p51: pullRequest(number: 51)"))
         );
         let pagination: Vec<_> = seen
             .iter()
@@ -2035,7 +2061,7 @@ mod tests {
             .collect();
         assert_eq!(
             pagination,
-            vec![None, Some(serde_json::json!("opaque-page-two")), None]
+            vec![None, Some(serde_json::json!("opaque-page-two")), None, None,]
         );
     }
 

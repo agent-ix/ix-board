@@ -2,33 +2,241 @@
 // Copyright (C) 2026 Agent-IX
 use super::github::SelectedGithub;
 use super::history::CommandHistory;
-use super::timeline::{ExecutionSample, Member};
+use super::timeline::{ExecutionSample, LinearStageAge, Member};
 use super::{Config, Error, Event, History, Journal, ScopeState, State};
 use crate::fleet::live::{PromHttp, PromQuery};
 use crate::retro::sources::{AgentSource, GithubSource, LinearSource};
-use crate::{Issue, Project, ProjectStatusCategory, WorkflowStateType, WorkspaceSnapshot, retro};
+use crate::{Issue, WorkflowStateType, WorkspaceSnapshot, retro};
 use ix_trace_rs::implements;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// A completed tracker refresh, passed across a bounded worker channel.
 pub struct TrackerBatch {
     at_ms: i64,
+    linear_requests: u64,
     results: Vec<(String, Result<TrackerResult, String>)>,
 }
 struct TrackerResult {
     members: BTreeMap<String, Member>,
-    record: retro::Record,
+    record: Option<retro::Record>,
+    record_reason: Option<String>,
+    pr_stats_reason: Option<String>,
+    review_stats_reason: Option<String>,
+    closures_daily_reason: Option<String>,
+    merged_prs_daily_reason: Option<String>,
     build_execution_seconds_24h: Option<f64>,
     ready_issues: Option<usize>,
     blocked_issues: Option<usize>,
+    wip_active: Option<usize>,
     query_identity: String,
     resolved_selectors: super::Selectors,
     pr_stats: Option<super::pr_stats::PrStats>,
     review_stats: Option<super::reviews::ReviewStats>,
     closures_daily: Option<Vec<usize>>,
     merged_prs_daily: Option<Vec<usize>>,
+    linear_stage_ages: Vec<LinearStageAge>,
+    effort_range: Option<super::timeline::EffortRange>,
+    effort_range_reason: Option<String>,
+    github_repo_coverage: f64,
     github_at_ms: i64,
+}
+
+const REVIEW_MARKER_PAGE_BUDGET: usize = 1;
+const REVIEW_MARKER_STORE_LIMIT: usize = 16 * 1024 * 1024;
+const STAGE_HISTORY_ISSUE_BUDGET: usize = 2;
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewMarkerSync {
+    #[serde(default)]
+    channels: BTreeMap<String, ReviewMarkerChannel>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewMarkerChannel {
+    #[serde(default)]
+    backfill_complete: bool,
+    #[serde(default)]
+    scan_started_ms: Option<i64>,
+    #[serde(default)]
+    scan_since_ms: Option<i64>,
+    #[serde(default)]
+    next_cursor: Option<String>,
+    #[serde(default)]
+    watermark_ms: i64,
+    #[serde(default)]
+    comments: BTreeMap<String, crate::MarkerComment>,
+}
+
+struct ReviewMarkerRefresh {
+    comments: Vec<crate::MarkerComment>,
+    complete: bool,
+    requests: u64,
+    reason: Option<String>,
+}
+
+fn sync_review_markers(
+    client: &crate::LinearGraphQlSource,
+    state_path: &std::path::Path,
+    scope: &str,
+    repos: &[String],
+    now_ms: i64,
+) -> ReviewMarkerRefresh {
+    let mut sync = load_review_marker_sync(state_path);
+    let mut requests = 0u64;
+    let mut reasons = Vec::new();
+    let mut remaining = REVIEW_MARKER_PAGE_BUDGET;
+    for repo in repos {
+        for (prefix, channel_name) in [
+            ("<!-- reviewer ", "reviewer"),
+            ("<!-- reviewer-dispositions ", "dispositions"),
+        ] {
+            if remaining == 0 {
+                break;
+            }
+            let key = format!("{scope}:{repo}:{channel_name}");
+            let mut channel = sync.channels.get(&key).cloned().unwrap_or_default();
+            if channel.scan_started_ms.is_none() {
+                channel.scan_started_ms = Some(now_ms);
+                channel.scan_since_ms = channel
+                    .backfill_complete
+                    .then_some(channel.watermark_ms.saturating_sub(2_000));
+                channel.next_cursor = None;
+            }
+            while remaining > 0 {
+                let page = client.fetch_marker_comment_page(
+                    prefix,
+                    &format!("repo={repo}"),
+                    channel.scan_since_ms.map(|ms| ms as f64 / 1000.0),
+                    channel.next_cursor.as_deref(),
+                );
+                requests = requests.saturating_add(1);
+                remaining -= 1;
+                match page {
+                    Ok(page) => {
+                        for comment in page.items {
+                            if let Some(id) = comment.id.clone() {
+                                let mut compact = comment;
+                                compact.body = compact_marker_body(&compact.body);
+                                channel.comments.insert(id, compact);
+                            }
+                        }
+                        if page.has_next {
+                            channel.next_cursor = page.cursor;
+                            sync.channels.insert(key.clone(), channel.clone());
+                            if let Err(error) = save_review_marker_sync(state_path, &sync) {
+                                reasons.push(error);
+                                break;
+                            }
+                        } else {
+                            channel.backfill_complete = true;
+                            channel.watermark_ms = channel
+                                .scan_started_ms
+                                .unwrap_or(now_ms)
+                                .max(channel.watermark_ms);
+                            channel.scan_started_ms = None;
+                            channel.scan_since_ms = None;
+                            channel.next_cursor = None;
+                            sync.channels.insert(key.clone(), channel.clone());
+                            if let Err(error) = save_review_marker_sync(state_path, &sync) {
+                                reasons.push(error);
+                                break;
+                            }
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        // The cursor was checkpointed after the prior successful page.
+                        sync.channels.insert(key.clone(), channel.clone());
+                        let _ = save_review_marker_sync(state_path, &sync);
+                        reasons.push(error);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let complete = sync.channels.len() == repos.len() * 2
+        && sync
+            .channels
+            .values()
+            .all(|channel| channel.backfill_complete);
+    let comments = sync
+        .channels
+        .values()
+        .flat_map(|channel| channel.comments.values().cloned())
+        .collect();
+    ReviewMarkerRefresh {
+        comments,
+        complete,
+        requests,
+        reason: (!reasons.is_empty()).then(|| reasons.join("; ")),
+    }
+}
+
+fn compact_marker_body(body: &str) -> String {
+    let mut compact = body.lines().next().unwrap_or_default().to_owned();
+    let mut in_block = false;
+    let mut fence_width = 0usize;
+    for line in body.lines().skip(1) {
+        let trimmed = line.trim_start();
+        if !in_block {
+            let ticks = trimmed.bytes().take_while(|byte| *byte == b'`').count();
+            if ticks >= 3 && matches!(trimmed[ticks..].trim(), "yaml" | "yml") {
+                in_block = true;
+                fence_width = ticks;
+                compact.push('\n');
+                compact.push_str(line);
+                compact.push('\n');
+            }
+        } else {
+            compact.push_str(line);
+            compact.push('\n');
+            let trimmed = line.trim_start();
+            let ticks = trimmed.bytes().take_while(|byte| *byte == b'`').count();
+            if ticks >= fence_width && trimmed[ticks..].trim().is_empty() {
+                break;
+            }
+        }
+        if compact.len() > 65_536 {
+            return body.lines().next().unwrap_or_default().to_owned();
+        }
+    }
+    compact
+}
+
+fn load_review_marker_sync(state_path: &std::path::Path) -> ReviewMarkerSync {
+    let path = review_marker_path(state_path);
+    std::fs::read(&path)
+        .ok()
+        .filter(|bytes| bytes.len() <= REVIEW_MARKER_STORE_LIMIT)
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn save_review_marker_sync(
+    state_path: &std::path::Path,
+    sync: &ReviewMarkerSync,
+) -> Result<(), String> {
+    let path = review_marker_path(state_path);
+    let bytes = serde_json::to_vec(sync).map_err(|error| error.to_string())?;
+    if bytes.len() > REVIEW_MARKER_STORE_LIMIT {
+        return Err("review marker cursor store exceeds 16 MiB".into());
+    }
+    let temporary = path.with_extension("markers.json.tmp");
+    let mut file = std::fs::File::create(&temporary).map_err(|error| error.to_string())?;
+    file.write_all(&bytes).map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
+    std::fs::rename(temporary, path).map_err(|error| error.to_string())
+}
+
+fn review_marker_path(state_path: &std::path::Path) -> PathBuf {
+    state_path.with_extension("review-markers.json")
 }
 
 /// Owns durable state; network collection never runs on the HTTP listener.
@@ -144,74 +352,22 @@ impl Collector {
     /// Polls the installed relay command and lifecycle sources on their own cadence.
     #[implements("FR-033-AC-16")]
     pub fn activity(&mut self, now: i64) -> Result<(), Error> {
-        let mut lead_observations = BTreeMap::new();
-        let mut lead_population_complete = true;
-        for scope in &mut self.config.scopes {
-            if !scope.derive_leads_from_relay {
-                continue;
-            }
-            let Some(team) = scope.selectors.team.as_deref() else {
-                lead_population_complete = false;
-                continue;
-            };
-            match discover_relay_leads(team) {
-                Ok(leads) if !leads.is_empty() => match observe_live_leads(team, &leads) {
-                    Ok(observation) => {
-                        let complete = observation.expected > 0 && observation.coverage() >= 0.95;
-                        scope.leads = observation.live.clone();
-                        lead_population_complete &= complete;
-                        lead_observations.insert(scope.key(), observation);
-                    }
-                    Err(error) => {
-                        lead_population_complete = false;
-                        eprintln!("Herdr lead observation for {team}: {error}");
-                    }
-                },
-                Ok(_) => {
-                    lead_population_complete = false;
-                    eprintln!("relay lead directory returned no addresses for {team}");
-                }
-                Err(error) => {
-                    lead_population_complete = false;
-                    eprintln!("relay lead directory for {team}: {error}");
-                }
-            }
-        }
-        let prometheus_status = read_prometheus_status(
-            &self
-                .config
-                .scopes
-                .iter()
-                .filter_map(|scope| scope.selectors.team.clone())
-                .collect(),
-        )
-        .map_err(|error| eprintln!("Prometheus pane/lane status: {error}"))
-        .ok();
         let execution_observed_at = super::now_ms().unwrap_or(now);
         for scope in &self.config.scopes {
             let key = scope.key();
-            let observation = lead_observations.get(&key);
-            let expected = if scope.derive_leads_from_relay {
-                observation
-                    .map(|o| o.expected_addresses.as_slice())
-                    .unwrap_or(&[])
-            } else {
-                scope.leads.as_slice()
-            };
-            let no_pane = observation.map(|o| &o.no_pane).cloned().unwrap_or_default();
-            let state = self.state.scopes.get(&key);
-            let (observed, working) = classify_execution_leads(
-                expected,
-                &no_pane,
-                prometheus_status.as_ref(),
-                state,
-                &[],
-                execution_observed_at,
-            );
+            let status = scope.selectors.team.as_deref().and_then(|team| {
+                read_prometheus_status(&BTreeSet::from([team.to_owned()]))
+                    .map_err(|error| eprintln!("Prometheus lane status for {team}: {error}"))
+                    .ok()
+            });
+            let team = scope.selectors.team.as_deref().unwrap_or_default();
+            let lane_counts = status
+                .as_ref()
+                .map(|status| classify_team_lanes(status, team, execution_observed_at));
             if let Some(state) = self.state.scopes.get_mut(&key) {
-                state.relay_leads_expected = expected.len();
-                state.relay_leads_observed = observation.map_or(0, |o| o.observed);
-                state.relay_leads_not_running = observation.map_or(0, |o| o.no_pane.len());
+                let (expected, observed, working) = lane_counts.unwrap_or_default();
+                state.execution_population_expected = expected;
+                state.execution_population_observed = observed;
                 state.execution_observed_count = observed;
                 state.execution_working_count = working;
                 state.execution_observed_at_ms = execution_observed_at;
@@ -271,10 +427,9 @@ impl Collector {
         }
         let mut samples = Vec::new();
         // A missing machine keeps the healthy machines' rows but makes coverage partial.
-        let complete = lead_population_complete
-            && result
-                .as_ref()
-                .is_ok_and(|report| report.missing_hosts.is_empty());
+        let complete = result
+            .as_ref()
+            .is_ok_and(|report| report.missing_hosts.is_empty());
         if let Ok(report) = result {
             for missing in &report.missing_hosts {
                 eprintln!(
@@ -350,29 +505,23 @@ impl Collector {
         history
     }
     /// Collects tracker/VCS data using shared retro calculations, outside the activity worker.
-    #[implements("FR-033-AC-16", "FR-033-AC-18")]
     pub fn tracker(config: &Config, now: i64) -> TrackerBatch {
         let source = retro::live::linear_or_unreadable();
+        let linear_before = source.request_count().unwrap_or(0);
         let workspace = tracker_workspace(source.as_ref(), now as f64 / 1000.0 - 86400.0);
         // The native workspace reader stamps completed observations. Anchor
         // calculations after that read, rather than mistaking read duration
         // for source clock skew against the poll's starting instant.
         let now = super::now_ms().unwrap_or(now).max(now);
         let source_sync_ms = verified_sync_ms(source.cache_freshness()).unwrap_or(now);
+        let mut marker_requests = 0u64;
         let results = config
             .scopes
             .iter()
             .map(|scope| {
                 let result = (|| {
                     let workspace = workspace.as_ref().map_err(Clone::clone)?;
-                    let mut selection = scope.selectors.selection();
-                    if scope.selectors.current_release_project {
-                        let project = current_release_project(
-                            workspace,
-                            scope.selectors.team.as_deref().unwrap_or_default(),
-                        )?;
-                        selection.projects.push(project.id.0.clone());
-                    }
+                    let selection = scope.selectors.selection();
                     let summary =
                         crate::select_scope(workspace, &selection).map_err(|e| e.to_string())?;
                     let resolved_selectors = super::Selectors {
@@ -405,7 +554,6 @@ impl Collector {
                                     .map_err(|e| e.to_string())
                             })
                             .collect::<Result<_, _>>()?,
-                        current_release_project: scope.selectors.current_release_project,
                     };
                     let mut cfg =
                         retro::RetroConfig::load(&scope.retro_config).map_err(|e| e.to_string())?;
@@ -425,23 +573,13 @@ impl Collector {
                         .filter(|i| summary.issue_ids.contains(&i.id))
                         .cloned()
                         .collect();
-                    let closures_daily =
-                        daily_linear_closures(source.as_ref(), &selected, now as f64 / 1000.0);
-                    if scope.selectors.current_release_project {
-                        cfg.gate_tickets = selected
-                            .iter()
-                            .filter(|issue| {
-                                summary.leaf_ids.contains(&issue.id)
-                                    && !matches!(
-                                        issue.state_type,
-                                        WorkflowStateType::Completed
-                                            | WorkflowStateType::Canceled
-                                            | WorkflowStateType::Duplicate
-                                    )
-                            })
-                            .map(|issue| issue.identifier.clone())
-                            .collect();
-                    }
+                    let closure_candidates = gate_path_issues(
+                        workspace,
+                        &summary.issue_ids,
+                        &cfg.gate_tickets,
+                        scope.selectors.team.as_deref().unwrap_or_default(),
+                        now as f64 / 1000.0 - 7.0 * 86400.0,
+                    );
                     let selected_ids: BTreeSet<_> =
                         selected.iter().map(|i| i.identifier.as_str()).collect();
                     let teams: BTreeSet<_> =
@@ -491,22 +629,19 @@ impl Collector {
                             _ => {}
                         }
                     }
+                    let wip_active = selected
+                        .iter()
+                        .filter(|issue| {
+                            crate::issue_is_open(issue)
+                                && issue.state_type == WorkflowStateType::Started
+                        })
+                        .count();
                     let attachments_complete = selected.iter().all(|i| i.attachments_complete);
                     let allowed: BTreeSet<(String, u64)> = selected
                         .iter()
                         .flat_map(|i| &i.attachment_urls)
                         .filter_map(|u| retro::metrics::pull_request_ref(u))
                         .collect();
-                    let linear = SelectedLinear {
-                        inner: source.as_ref(),
-                        snapshot: WorkspaceSnapshot {
-                            // Keep blockers outside the selected release available to the
-                            // path evaluator; RetroConfig still limits project metrics.
-                            issues: workspace.issues.clone(),
-                            projects: workspace.projects.clone(),
-                            fetched_at: workspace.fetched_at,
-                        },
-                    };
                     if cfg.repos.is_empty() {
                         cfg.repos = allowed
                             .iter()
@@ -548,10 +683,18 @@ impl Collector {
                             Some(seconds)
                         })
                     });
-                    let github = SelectedGithub::new(config, allowed, attachments_complete, now);
-                    let agents = NoAgents;
-                    // Agent share requires session-qualified polling, not a second broad read.
-                    cfg.herdr_teams.clear();
+                    let closure_prs = closure_candidates
+                        .iter()
+                        .flat_map(|issue| &issue.attachment_urls)
+                        .filter_map(|url| retro::metrics::pull_request_ref(url))
+                        .collect();
+                    let github = SelectedGithub::new_with_priority(
+                        config,
+                        allowed,
+                        closure_prs,
+                        attachments_complete,
+                        now,
+                    );
                     if let Some(dept) = cfg.department.as_mut() {
                         dept.scope.projects = summary
                             .project_ids
@@ -562,105 +705,107 @@ impl Collector {
                             })
                             .collect();
                     }
-                    let sources = retro::Sources {
-                        linear: &linear,
-                        github: &github,
-                        agents: &agents,
-                        gate_log: &retro::live::FileGateLog,
-                        relay: &retro::live::RedisCliRelay,
-                        local: &retro::live::SystemLocal,
-                    };
                     use sha2::Digest;
                     let query_identity = format!(
                         "{:x}",
                         sha2::Sha256::digest(serde_json::to_vec(&cfg).map_err(|e| e.to_string())?)
                     );
-                    let mut record = retro::collect_snapshot(
-                        &cfg,
-                        retro::Frame {
-                            now: now as f64 / 1000.0,
-                            window_secs: 86400,
-                            end_exclusive: false,
-                        },
-                        &sources,
-                        None,
-                        None,
-                    )
-                    .map_err(|e| e.to_string())?;
-                    if cfg.gate_tickets.is_empty() {
-                        for id in [
-                            "path_remaining",
-                            "path_closed",
-                            "path_closed_unverified",
-                            "gates_remaining",
-                        ] {
-                            if let Some(metric) = record.metrics.get_mut(id) {
-                                metric.status = retro::Status::Unavailable;
-                                metric.value = None;
-                                metric.reason = Some("gate tickets not configured".into());
-                            }
-                        }
-                    }
-                    // Evidence locators stay in source stores; this cache serves metrics only.
-                    if let Some(dept) = record.department.as_mut() {
-                        dept.observations.clear();
-                        for m in dept.measurements.values_mut() {
-                            m.evidence_refs.clear();
-                        }
-                    }
+                    let (record, record_reason) = latest_retro_record(&cfg.team, now);
                     let mut all_prs = Vec::new();
                     let mut successful_repos = 0usize;
+                    let mut github_errors = Vec::new();
                     for repo in &cfg.repos {
                         match github.pull_requests(repo, now as f64 / 1000.0 - 604800.0) {
                             Ok(rows) => {
                                 successful_repos += 1;
                                 all_prs.extend(rows);
                             }
-                            Err(error) => eprintln!("GitHub evidence for {repo}: {error}"),
+                            Err(error) => {
+                                eprintln!("GitHub evidence for {repo}: {error}");
+                                github_errors.push(format!("{repo}: {error}"));
+                            }
                         }
                     }
-                    let all_prs = (!cfg.repos.is_empty()
-                        && attachments_complete
-                        && successful_repos == cfg.repos.len())
-                    .then_some(all_prs);
+                    let github_repo_coverage = if cfg.repos.is_empty() {
+                        0.0
+                    } else {
+                        successful_repos as f64 / cfg.repos.len() as f64
+                    };
+                    let all_prs = (successful_repos > 0).then_some(all_prs);
                     let pr_stats = all_prs
                         .as_ref()
                         .filter(|_| github.observed_at() > 0)
                         .map(|prs| super::pr_stats::calculate(prs, now as f64 / 1000.0));
-                    let review_stats = (|| -> Result<super::reviews::ReviewStats, String> {
-                        let client =
-                            crate::LinearGraphQlSource::from_env().map_err(|e| e.to_string())?;
-                        let prs = all_prs
-                            .as_ref()
-                            .ok_or_else(|| "GitHub PR population unavailable".to_owned())?;
-                        let allowed: BTreeSet<_> = prs
-                            .iter()
-                            .map(|p| format!("{}#{}", p.repo, p.number))
-                            .collect();
-                        let created = prs
-                            .iter()
-                            .map(|p| (format!("{}#{}", p.repo, p.number), p.created_at))
-                            .collect();
-                        let mut comments =
-                            client.fetch_marker_comments("<!-- reviewer ", "repo=", None)?;
-                        comments.extend(client.fetch_marker_comments(
-                            "<!-- reviewer-dispositions ",
-                            "repo=",
-                            None,
-                        )?);
-                        super::reviews::calculate(
-                            &comments,
-                            &allowed,
-                            &created,
-                            &prs.iter()
-                                .filter(|pr| pr.open && !pr.draft)
-                                .map(|pr| format!("{}#{}", pr.repo, pr.number))
-                                .collect(),
+                    let (closures_daily, closures_daily_reason) =
+                        match daily_verified_linear_closures(
+                            source.as_ref(),
+                            &closure_candidates,
+                            &github,
+                            &cfg.repos,
                             now as f64 / 1000.0,
-                        )
-                    })()
-                    .map_err(|error| eprintln!("review evidence for {}: {error}", scope.key()))
-                    .ok();
+                        ) {
+                            Ok(values) => (Some(values), None),
+                            Err(reason) => (None, Some(reason)),
+                        };
+                    let pr_stats_reason = pr_stats.is_none().then(|| {
+                        if !github_errors.is_empty() {
+                            github_errors.join("; ")
+                        } else {
+                            "GitHub PR poll has no fresh observation".to_owned()
+                        }
+                    });
+                    let review_result =
+                        (|| -> Result<(super::reviews::ReviewStats, Option<String>), String> {
+                            let client = crate::LinearGraphQlSource::from_env()
+                                .map_err(|e| e.to_string())?;
+                            let prs = all_prs
+                                .as_ref()
+                                .ok_or_else(|| "GitHub PR population unavailable".to_owned())?;
+                            let allowed: BTreeSet<_> = prs
+                                .iter()
+                                .map(|p| format!("{}#{}", p.repo, p.number))
+                                .collect();
+                            let created = prs
+                                .iter()
+                                .map(|p| (format!("{}#{}", p.repo, p.number), p.created_at))
+                                .collect();
+                            let refreshed = sync_review_markers(
+                                &client,
+                                &config.state_path,
+                                &scope.key(),
+                                &cfg.repos,
+                                now,
+                            );
+                            marker_requests = marker_requests.saturating_add(refreshed.requests);
+                            let stats = super::reviews::calculate(
+                                &refreshed.comments,
+                                &allowed,
+                                &created,
+                                &prs.iter()
+                                    .filter(|pr| pr.open && !pr.draft)
+                                    .map(|pr| format!("{}#{}", pr.repo, pr.number))
+                                    .collect(),
+                                now as f64 / 1000.0,
+                            )?;
+                            Ok((
+                                stats,
+                                refreshed.reason.or_else(|| {
+                                    (!refreshed.complete)
+                                        .then(|| "review marker backfill is incomplete".to_owned())
+                                }),
+                            ))
+                        })();
+                    let mut review_stats_reason = review_result.as_ref().err().cloned();
+                    if let Some(error) = &review_stats_reason {
+                        eprintln!("review evidence for {}: {error}", scope.key());
+                    }
+                    let (review_stats, marker_reason) = review_result
+                        .ok()
+                        .map(|(stats, reason)| (Some(stats), reason))
+                        .unwrap_or((None, None));
+                    if marker_reason.is_some() {
+                        review_stats_reason = marker_reason;
+                    }
                     let members = selected
                         .into_iter()
                         .map(|i| {
@@ -675,20 +820,46 @@ impl Collector {
                             )
                         })
                         .collect();
+                    let linear_stage_ages = linear_stage_ages_incremental(
+                        source.as_ref(),
+                        workspace,
+                        &summary.issue_ids,
+                        &config.state_path,
+                        now,
+                    );
+                    let (effort_range, effort_range_reason) = scope
+                        .selectors
+                        .team
+                        .as_deref()
+                        .map(|team| match prometheus_effort_range(team, now) {
+                            Ok(range) => (Some(range), None),
+                            Err(error) => (None, Some(error)),
+                        })
+                        .unwrap_or((None, Some("team selector is missing".into())));
                     Ok(TrackerResult {
                         members,
                         record,
+                        record_reason,
                         build_execution_seconds_24h,
                         ready_issues,
                         blocked_issues,
+                        wip_active: Some(wip_active),
                         query_identity,
                         resolved_selectors,
                         pr_stats,
                         review_stats,
                         closures_daily,
+                        closures_daily_reason,
                         merged_prs_daily: all_prs
                             .as_ref()
                             .map(|prs| daily_github_merges(prs, now as f64 / 1000.0)),
+                        merged_prs_daily_reason: pr_stats_reason.clone(),
+                        pr_stats_reason,
+                        review_stats_reason,
+                        linear_stage_ages,
+                        effort_range,
+                        effort_range_reason,
+                        github_repo_coverage,
                         github_at_ms: github.observed_at(),
                     })
                 })();
@@ -697,11 +868,17 @@ impl Collector {
             .collect();
         TrackerBatch {
             at_ms: source_sync_ms,
+            linear_requests: source
+                .request_count()
+                .unwrap_or(linear_before)
+                .saturating_sub(linear_before)
+                .saturating_add(marker_requests),
             results,
         }
     }
     /// Commits a completed tracker refresh without holding a network-facing lock.
     pub fn apply_tracker(&mut self, batch: TrackerBatch) -> Result<(), Error> {
+        self.state.linear_requests_last_refresh = batch.linear_requests;
         for (key, result) in batch.results {
             let Some(state) = self.state.scopes.get_mut(&key) else {
                 continue;
@@ -714,11 +891,6 @@ impl Collector {
                     if state.query_identity.as_ref() != Some(&result.query_identity)
                         || state.selectors.as_ref() != Some(&scope.selectors)
                     {
-                        state.effort_points.clear();
-                        state.samples.clear();
-                        state.stages.clear();
-                        state.lifecycle_ok = false;
-                        state.coverage_started_ms = None;
                         state.comparable_since_ms = batch.at_ms;
                     }
                     state.query_identity = Some(result.query_identity);
@@ -727,12 +899,22 @@ impl Collector {
                     state.build_execution_seconds_24h = result.build_execution_seconds_24h;
                     state.ready_issues = result.ready_issues;
                     state.blocked_issues = result.blocked_issues;
-                    state.record = Some(result.record);
+                    state.wip_active = result.wip_active;
+                    state.record = result.record;
+                    state.record_reason = result.record_reason;
+                    state.pr_stats_reason = result.pr_stats_reason;
+                    state.review_stats_reason = result.review_stats_reason;
+                    state.closures_daily_reason = result.closures_daily_reason;
+                    state.merged_prs_daily_reason = result.merged_prs_daily_reason;
                     state.pr_stats = result.pr_stats;
                     state.review_stats = result.review_stats;
                     state.closures_daily = result.closures_daily;
                     state.merged_prs_daily = result.merged_prs_daily;
+                    state.linear_stage_ages = result.linear_stage_ages;
+                    state.effort_range = result.effort_range;
+                    state.effort_range_reason = result.effort_range_reason;
                     state.github_observed_at_ms = result.github_at_ms;
+                    state.github_repo_coverage = result.github_repo_coverage;
                     if state.pr_stats.is_some() && result.github_at_ms > 0 {
                         state.pr_success_at_ms = result.github_at_ms;
                     }
@@ -762,177 +944,15 @@ impl Collector {
     }
 }
 
-#[derive(serde::Deserialize)]
-struct RelayDirectoryLead {
-    address: String,
-    workspace_label: String,
-}
-
-struct LeadObservation {
-    expected: usize,
-    observed: usize,
-    expected_addresses: Vec<String>,
-    no_pane: BTreeSet<String>,
-    live: Vec<String>,
-}
-impl LeadObservation {
-    fn coverage(&self) -> f64 {
-        self.observed as f64 / self.expected.max(1) as f64
-    }
-}
-
-/// Returns the registered addresses in the exact Linear team workspace.
-#[implements("FR-033-AC-16")]
-fn discover_relay_leads(team: &str) -> Result<Vec<String>, String> {
-    let output = super::history::read_history(
-        "agent-msg",
-        &["find", "--json", team],
-        std::time::Duration::from_secs(10),
-    )
-    .map_err(|error| error.to_string())?;
-    let text = std::str::from_utf8(&output).map_err(|_| "relay directory is not UTF-8")?;
-    let mut leads = BTreeSet::new();
-    for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        let row: RelayDirectoryLead = serde_json::from_str(line)
-            .map_err(|_| "relay directory returned an invalid lead row")?;
-        if !row.workspace_label.eq_ignore_ascii_case(team) {
-            continue;
-        }
-        if row.address.split(':').count() != 3 || row.address.split(':').any(str::is_empty) {
-            return Err("relay directory returned an invalid address".into());
-        }
-        leads.insert(row.address);
-        if leads.len() > 32 {
-            return Err("relay directory lead count exceeds configured bound".into());
-        }
-    }
-    Ok(leads.into_iter().collect())
-}
-
-/// Classifies relay-directory addresses against complete Herdr snapshots per machine.
-#[implements("FR-033-AC-16")]
-fn observe_live_leads(team: &str, leads: &[String]) -> Result<LeadObservation, String> {
-    let whoami = super::history::read_history(
-        "agent-msg",
-        &["whoami", "--json"],
-        std::time::Duration::from_secs(10),
-    )
-    .map_err(|error| error.to_string())?;
-    let identity: serde_json::Value =
-        serde_json::from_slice(&whoami).map_err(|_| "invalid relay identity")?;
-    let local_host = identity
-        .get("address")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|address| address.split(':').next())
-        .ok_or("relay identity has no server label")?;
-    let mut by_host: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for lead in leads {
-        let mut parts = lead.split(':');
-        let (Some(host), Some(workspace), Some(tab)) = (parts.next(), parts.next(), parts.next())
-        else {
-            return Err("relay directory returned an invalid address".into());
-        };
-        if parts.next().is_some() || workspace.is_empty() || tab.is_empty() {
-            return Err("relay directory returned an invalid address".into());
-        }
-        by_host.entry(host).or_default().push(lead);
-    }
-    let mut observed = 0;
-    let mut no_pane = BTreeSet::new();
-    let mut live = Vec::new();
-    for (host, addresses) in by_host {
-        let (program, args): (&str, Vec<&str>) = if host.eq_ignore_ascii_case(local_host) {
-            ("herdr", vec!["api", "snapshot"])
-        } else {
-            ("herdr", vec!["--machine", host, "api", "snapshot"])
-        };
-        let Ok(output) =
-            super::history::read_history(program, &args, std::time::Duration::from_secs(20))
-        else {
-            continue;
-        };
-        let Ok(envelope) = serde_json::from_slice::<serde_json::Value>(&output) else {
-            continue;
-        };
-        let Some(snapshot) = envelope
-            .get("result")
-            .and_then(|result| result.get("snapshot"))
-        else {
-            continue;
-        };
-        let Some(workspaces) = snapshot
-            .get("workspaces")
-            .and_then(serde_json::Value::as_array)
-        else {
-            continue;
-        };
-        let Some(tabs) = snapshot.get("tabs").and_then(serde_json::Value::as_array) else {
-            continue;
-        };
-        let workspace_labels: BTreeMap<_, _> = workspaces
-            .iter()
-            .filter_map(|workspace| {
-                Some((
-                    workspace.get("workspace_id")?.as_str()?,
-                    workspace.get("label")?.as_str()?,
-                ))
-            })
-            .collect();
-        let live_tabs: BTreeSet<_> = tabs
-            .iter()
-            .filter(|tab| {
-                tab.get("pane_count")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0)
-                    > 0
-            })
-            .filter_map(|tab| {
-                let workspace = workspace_labels.get(tab.get("workspace_id")?.as_str()?)?;
-                let tab_label = tab.get("label")?.as_str()?;
-                Some((*workspace, tab_label))
-            })
-            .collect();
-        for address in addresses {
-            let mut parts = address.split(':');
-            let _host = parts.next();
-            let workspace = parts.next().unwrap_or_default();
-            let tab = parts.next().unwrap_or_default();
-            if !workspace.eq_ignore_ascii_case(team) {
-                continue;
-            }
-            observed += 1;
-            if live_tabs
-                .iter()
-                .any(|(w, t)| w.eq_ignore_ascii_case(workspace) && t.eq_ignore_ascii_case(tab))
-            {
-                live.push((*address).to_owned());
-            } else {
-                no_pane.insert((*address).to_owned());
-            }
-        }
-    }
-    live.sort();
-    Ok(LeadObservation {
-        expected: leads.len(),
-        observed,
-        expected_addresses: leads.to_vec(),
-        no_pane,
-        live,
-    })
-}
-
 #[derive(Clone, Debug, Default)]
-struct PrometheusLeadStatus {
-    pane_info: Vec<PrometheusSample>,
-    pane_status: Vec<PrometheusSample>,
-    lane_status: Vec<PrometheusSample>,
+pub(super) struct PrometheusLeadStatus {
+    pub(super) lane_status: Vec<PrometheusSample>,
 }
 
 #[derive(Clone, Debug)]
-struct PrometheusSample {
-    labels: BTreeMap<String, String>,
-    timestamp_seconds: f64,
-    value: f64,
+pub(super) struct PrometheusSample {
+    pub(super) labels: BTreeMap<String, String>,
+    pub(super) timestamp_seconds: f64,
 }
 
 #[implements("FR-033-AC-16")]
@@ -940,7 +960,6 @@ fn read_prometheus_status(teams: &BTreeSet<String>) -> Result<PrometheusLeadStat
     let base = std::env::var("IX_PROMETHEUS_URL")
         .unwrap_or_else(|_| "http://prometheus.luna.ix".to_owned());
     let client = PromHttp::new(&base, Duration::from_secs(5)).map_err(|e| e.to_string())?;
-    let pane_info_query = "timestamp(herdr_pane_info_ratio)";
     let lane_filter = teams
         .iter()
         .map(|team| format!(".*:{}:.*", regex_escape(team)))
@@ -948,14 +967,6 @@ fn read_prometheus_status(teams: &BTreeSet<String>) -> Result<PrometheusLeadStat
         .join("|");
     let lane_query = format!("timestamp(ix_fleet_lane_state_ratio{{lane=~\"{lane_filter}\"}})");
     Ok(PrometheusLeadStatus {
-        pane_info: parse_prometheus_samples(
-            &client.query(pane_info_query).map_err(|e| e.to_string())?,
-        )?,
-        pane_status: parse_prometheus_samples(
-            &client
-                .query("timestamp(herdr_pane_status_ratio)")
-                .map_err(|e| e.to_string())?,
-        )?,
         lane_status: parse_prometheus_samples(
             &client.query(&lane_query).map_err(|e| e.to_string())?,
         )?,
@@ -1020,7 +1031,6 @@ fn parse_prometheus_samples(body: &str) -> Result<Vec<PrometheusSample>, String>
             Ok(PrometheusSample {
                 labels,
                 timestamp_seconds: value,
-                value: 1.0,
             })
         })
         .collect()
@@ -1039,177 +1049,215 @@ fn status_is_fresh(sample: &PrometheusSample, now_ms: i64) -> bool {
 }
 
 #[implements("FR-033-AC-16")]
-fn classify_execution_leads(
-    expected: &[String],
-    no_pane: &BTreeSet<String>,
-    prometheus: Option<&PrometheusLeadStatus>,
-    state: Option<&ScopeState>,
-    samples: &[ExecutionSample],
+pub(super) fn classify_team_lanes(
+    status: &PrometheusLeadStatus,
+    team: &str,
     now_ms: i64,
-) -> (usize, usize) {
+) -> (usize, usize, usize) {
+    let mut latest = BTreeMap::<String, &PrometheusSample>::new();
+    for sample in &status.lane_status {
+        let Some(lane) = sample.labels.get("lane") else {
+            continue;
+        };
+        let Some((_, workspace, _)) = lane.split_once(':').and_then(|(host, rest)| {
+            rest.split_once(':')
+                .map(|(workspace, tab)| (host, workspace, tab))
+        }) else {
+            continue;
+        };
+        if !workspace.eq_ignore_ascii_case(team) {
+            continue;
+        }
+        let key = lane.to_ascii_lowercase();
+        if latest
+            .get(&key)
+            .is_none_or(|previous| sample.timestamp_seconds > previous.timestamp_seconds)
+        {
+            latest.insert(key, sample);
+        }
+    }
+    let expected = latest.len();
     let mut observed = 0;
     let mut working = 0;
-    for lead in expected {
-        let machine = lead.split(':').next().unwrap_or_default();
-        if no_pane.contains(lead)
-            && prometheus.is_some_and(|status| host_feed_is_fresh(machine, status, now_ms))
-        {
+    for sample in latest.into_values() {
+        if status_is_fresh(sample, now_ms) {
             observed += 1;
-            continue;
-        }
-        if let Some((is_working, _)) = prometheus.and_then(|status| {
-            observed_pane_status(lead, status, now_ms)
-                .or_else(|| observed_lane_status(lead, status, now_ms))
-        }) {
-            observed += 1;
-            working += usize::from(is_working);
-            continue;
-        }
-        let binding = state.and_then(|scope| scope.bindings.get(&lead.to_lowercase()));
-        if let Some(sample) = binding.and_then(|binding| {
-            samples.iter().find(|sample| {
-                sample.machine == binding.machine
-                    && sample.session == binding.session
-                    && now_ms.saturating_sub(sample.at_ms).abs() <= 90_000
-            })
-        }) {
-            observed += 1;
-            working += usize::from(sample.working);
+            working += usize::from(sample.labels.get("state").is_some_and(|s| s == "working"));
         }
     }
-    (observed, working)
+    (expected, observed, working)
 }
 
-#[implements("FR-033-AC-16")]
-fn host_feed_is_fresh(machine: &str, status: &PrometheusLeadStatus, now_ms: i64) -> bool {
-    status.pane_info.iter().any(|sample| {
-        status_is_fresh(sample, now_ms)
-            && sample
-                .labels
-                .get("machine")
-                .is_some_and(|host| host.eq_ignore_ascii_case(machine))
-    })
-}
-
-#[implements("FR-033-AC-16")]
-fn observed_pane_status(
-    lead: &str,
-    status: &PrometheusLeadStatus,
-    now_ms: i64,
-) -> Option<(bool, i64)> {
-    let mut parts = lead.splitn(3, ':');
-    let (machine, workspace, tab) = (parts.next()?, parts.next()?, parts.next()?);
-    let pane = status
-        .pane_info
-        .iter()
-        .filter(|sample| {
-            status_is_fresh(sample, now_ms)
-                && sample
-                    .labels
-                    .get("machine")
-                    .is_some_and(|v| v.eq_ignore_ascii_case(machine))
-                && sample
-                    .labels
-                    .get("workspace_label")
-                    .is_some_and(|v| v.eq_ignore_ascii_case(workspace))
-                && sample
-                    .labels
-                    .get("tab_label")
-                    .is_some_and(|v| v.eq_ignore_ascii_case(tab))
-                && sample.value > 0.0
-        })
-        .find_map(|info| info.labels.get("pane").map(|pane| (info, pane)))?;
-    let (info, pane) = pane;
-    let matching = status
-        .pane_status
-        .iter()
-        .filter(|sample| {
-            status_is_fresh(sample, now_ms)
-                && sample.labels.get("machine") == info.labels.get("machine")
-                && sample.labels.get("pane") == Some(pane)
-                && sample.value > 0.0
-        })
-        .max_by(|a, b| a.timestamp_seconds.total_cmp(&b.timestamp_seconds))?;
-    Some((
-        matching
-            .labels
-            .get("status")
-            .is_some_and(|s| s == "working"),
-        (matching.timestamp_seconds * 1000.0) as i64,
-    ))
-}
-
-#[implements("FR-033-AC-16")]
-fn observed_lane_status(
-    lead: &str,
-    status: &PrometheusLeadStatus,
-    now_ms: i64,
-) -> Option<(bool, i64)> {
-    let matching = status
-        .lane_status
-        .iter()
-        .filter(|sample| {
-            status_is_fresh(sample, now_ms)
-                && sample
-                    .labels
-                    .get("lane")
-                    .is_some_and(|lane| lane.eq_ignore_ascii_case(lead))
-                && sample.value > 0.0
-        })
-        .max_by(|a, b| a.timestamp_seconds.total_cmp(&b.timestamp_seconds))?;
-    Some((
-        matching
-            .labels
-            .get("state")
-            .is_some_and(|state| state == "working"),
-        (matching.timestamp_seconds * 1000.0) as i64,
-    ))
-}
-
-/// Selects the only started release project for the team; ambiguity fails closed.
-#[implements("FR-033-AC-16")]
-fn current_release_project<'a>(
-    workspace: &'a WorkspaceSnapshot,
-    team: &str,
-) -> Result<&'a Project, String> {
-    let mut candidates = workspace.projects.iter().filter(|project| {
-        project.status_category == ProjectStatusCategory::Started
-            && project.name.to_ascii_lowercase().contains("release")
-            && project
-                .team_keys
-                .iter()
-                .any(|key| key.0.eq_ignore_ascii_case(team))
-    });
-    let project = candidates
-        .next()
-        .ok_or_else(|| format!("no started release project found for team {team}"))?;
-    if candidates.next().is_some() {
-        return Err(format!(
-            "multiple started release projects found for team {team}"
-        ));
-    }
-    Ok(project)
-}
-
-/// Returns seven UTC-day completion counts only when every selected ticket history is readable.
-#[implements("FR-033-AC-18")]
-fn daily_linear_closures(
+/// Counts verified path closures by UTC day from retained Linear histories and configured repos.
+fn daily_verified_linear_closures(
     source: &dyn LinearSource,
     issues: &[Issue],
+    github: &dyn GithubSource,
+    repos: &[String],
     now: f64,
-) -> Option<Vec<usize>> {
-    let ids = issues
+) -> Result<Vec<usize>, String> {
+    let cache_path = match std::env::var_os("IX_BOARD_CACHE_PATH") {
+        Some(path) => PathBuf::from(path),
+        None => crate::default_cache_path().map_err(|error| error.to_string())?,
+    }
+    .with_extension("verified-closure-histories.json");
+    let mut cache: BTreeMap<String, ClosureHistoryCache> = std::fs::read(&cache_path)
+        .ok()
+        .filter(|bytes| bytes.len() <= REVIEW_MARKER_STORE_LIMIT)
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    let missing = issues
         .iter()
-        .map(|issue| issue.id.0.clone())
+        .filter(|issue| {
+            cache.get(&issue.id.0).is_none_or(|cached| {
+                issue.updated_at.is_none() || cached.updated_at != issue.updated_at
+            })
+        })
         .collect::<Vec<_>>();
-    let histories = source.state_histories(&ids);
+    let fetched = if missing.is_empty() {
+        Vec::new()
+    } else {
+        source.state_histories(
+            &missing
+                .iter()
+                .map(|issue| issue.id.0.clone())
+                .collect::<Vec<_>>(),
+        )
+    };
+    if fetched.len() != missing.len() {
+        return Err("Linear returned a different number of path histories than requested".into());
+    }
+    let mut fetch_errors = Vec::new();
+    for (issue, history) in missing.into_iter().zip(fetched) {
+        match history {
+            Ok(history) => {
+                cache.insert(
+                    issue.id.0.clone(),
+                    ClosureHistoryCache {
+                        updated_at: issue.updated_at.clone(),
+                        history,
+                    },
+                );
+            }
+            Err(error) => fetch_errors.push(format!("{}: {error}", issue.identifier)),
+        }
+    }
+    if !fetch_errors.is_empty() {
+        return Err(format!(
+            "Linear history unavailable: {}",
+            fetch_errors.join("; ")
+        ));
+    }
+    let histories = issues
+        .iter()
+        .map(|issue| {
+            cache
+                .get(&issue.id.0)
+                .filter(|cached| cached.updated_at == issue.updated_at)
+                .map(|cached| cached.history.clone())
+                .ok_or_else(|| format!("no retained Linear history for {}", issue.identifier))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let bytes = serde_json::to_vec(&cache).map_err(|error| error.to_string())?;
+    if bytes.len() > REVIEW_MARKER_STORE_LIMIT {
+        return Err("verified closure history cache exceeds 16 MiB".into());
+    }
+    let temporary = cache_path.with_extension("closure-histories.json.tmp");
+    if let Some(parent) = temporary.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let mut file = std::fs::File::create(&temporary).map_err(|error| error.to_string())?;
+    file.write_all(&bytes).map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
+    std::fs::rename(temporary, cache_path).map_err(|error| error.to_string())?;
+    let configured: BTreeSet<_> = repos.iter().map(String::as_str).collect();
+    let mut refs = BTreeSet::new();
+    let mut completed_histories = Vec::with_capacity(histories.len());
+    for (issue, history) in issues.iter().zip(histories) {
+        if !issue.attachments_complete {
+            return Err(format!(
+                "Linear PR attachments incomplete for {}",
+                issue.identifier
+            ));
+        }
+        refs.extend(
+            issue
+                .attachment_urls
+                .iter()
+                .filter_map(|url| retro::metrics::pull_request_ref(url))
+                .filter(|(repo, _)| configured.contains(repo.as_str())),
+        );
+        completed_histories.push(history);
+    }
+    let mut merged = BTreeSet::new();
+    for (repo, number) in refs {
+        let info = github.pull_request(&repo, number).map_err(|error| {
+            format!(
+                "GitHub verification for {}#{number} unavailable: {error}",
+                repo
+            )
+        })?;
+        if info.merged {
+            merged.insert((repo, number));
+        }
+    }
+    verified_daily_closure_counts(issues, &completed_histories, &merged, &configured, now)
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ClosureHistoryCache {
+    updated_at: Option<String>,
+    history: Vec<retro::sources::StateChange>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StageHistoryStore {
+    #[serde(default)]
+    last_issue_id: Option<String>,
+    #[serde(default)]
+    entries: BTreeMap<String, StageHistoryCache>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StageHistoryCache {
+    updated_at: String,
+    history: Vec<retro::sources::StateChange>,
+}
+
+#[implements("FR-033-AC-18")]
+fn verified_daily_closure_counts(
+    issues: &[Issue],
+    histories: &[Vec<retro::sources::StateChange>],
+    merged_prs: &BTreeSet<(String, u64)>,
+    repos: &BTreeSet<&str>,
+    now: f64,
+) -> Result<Vec<usize>, String> {
     if histories.len() != issues.len() {
-        return None;
+        return Err("Linear returned a different number of path histories than requested".into());
     }
     let day_now = (now / 86400.0).floor() as i64;
     let mut counts = vec![0usize; 7];
-    for history in histories {
-        let history = history.ok()?;
+    let mut seen = BTreeSet::new();
+    for (issue, history) in issues.iter().zip(histories) {
+        if !issue.attachments_complete {
+            return Err(format!(
+                "Linear PR attachments incomplete for {}",
+                issue.identifier
+            ));
+        }
+        let refs: BTreeSet<_> = issue
+            .attachment_urls
+            .iter()
+            .filter_map(|url| retro::metrics::pull_request_ref(url))
+            .filter(|(repo, _)| repos.contains(repo.as_str()))
+            .collect();
+        let verified = refs.iter().any(|reference| merged_prs.contains(reference));
+        if !verified {
+            continue;
+        }
         for change in history {
             if change.to != Some(WorkflowStateType::Completed)
                 || change.from == Some(WorkflowStateType::Completed)
@@ -1219,12 +1267,72 @@ fn daily_linear_closures(
                 continue;
             }
             let days_ago = day_now - (change.at / 86400.0).floor() as i64;
-            if (0..7).contains(&days_ago) {
-                counts[usize::try_from(days_ago).ok()?] += 1;
+            if !(0..7).contains(&days_ago) {
+                continue;
+            }
+            let event = (issue.id.0.clone(), change.at.to_bits());
+            if seen.insert(event)
+                && let Ok(index) = usize::try_from(days_ago)
+                && let Some(count) = counts.get_mut(index)
+            {
+                *count += 1;
             }
         }
     }
-    Some(counts)
+    Ok(counts)
+}
+
+fn gate_path_issues(
+    workspace: &WorkspaceSnapshot,
+    selected_ids: &BTreeSet<crate::IssueId>,
+    gates: &[String],
+    team: &str,
+    updated_since: f64,
+) -> Vec<Issue> {
+    let by_id: BTreeMap<_, _> = workspace
+        .issues
+        .iter()
+        .filter(|issue| {
+            selected_ids.contains(&issue.id) && issue.team_key.0.eq_ignore_ascii_case(team)
+        })
+        .map(|issue| (issue.id.clone(), issue))
+        .collect();
+    let mut stack: Vec<_> = gates
+        .iter()
+        .filter_map(|gate| {
+            by_id
+                .values()
+                .find(|issue| issue.identifier.eq_ignore_ascii_case(gate))
+                .map(|issue| issue.id.clone())
+        })
+        .collect();
+    let mut visited = BTreeSet::new();
+    while let Some(id) = stack.pop() {
+        if !visited.insert(id.clone()) || visited.len() > 256 {
+            continue;
+        }
+        if let Some(issue) = by_id.get(&id) {
+            stack.extend(
+                issue
+                    .blocked_by
+                    .iter()
+                    .filter(|blocker| by_id.contains_key(*blocker))
+                    .cloned(),
+            );
+        }
+    }
+    visited
+        .into_iter()
+        .filter_map(|id| by_id.get(&id).copied())
+        .filter(|issue| {
+            issue
+                .updated_at
+                .as_deref()
+                .and_then(|at| crate::drift::timestamp_epoch(at).ok())
+                .is_some_and(|at| at >= updated_since)
+        })
+        .cloned()
+        .collect()
 }
 
 /// Counts GitHub merge timestamps by UTC day for the trailing seven calendar days.
@@ -1246,6 +1354,354 @@ fn daily_github_merges(prs: &[crate::retro::sources::PullRequest], now: f64) -> 
     counts
 }
 
+fn linear_stage_ages_incremental(
+    source: &dyn LinearSource,
+    workspace: &WorkspaceSnapshot,
+    selected_ids: &BTreeSet<crate::IssueId>,
+    state_path: &std::path::Path,
+    now_ms: i64,
+) -> Vec<LinearStageAge> {
+    let cache_path = state_path.with_extension("stage-histories.json");
+    let mut cache: StageHistoryStore = std::fs::read(&cache_path)
+        .ok()
+        .filter(|bytes| bytes.len() <= REVIEW_MARKER_STORE_LIMIT)
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    let issues = workspace
+        .issues
+        .iter()
+        .filter(|issue| {
+            selected_ids.contains(&issue.id)
+                && crate::issue_is_open(issue)
+                && issue.state_type == WorkflowStateType::Started
+        })
+        .collect::<Vec<_>>();
+    let mut changed = issues
+        .iter()
+        .filter(|issue| {
+            issue.updated_at.as_ref().is_some_and(|updated_at| {
+                cache
+                    .entries
+                    .get(&issue.id.0)
+                    .is_none_or(|entry| &entry.updated_at != updated_at)
+            })
+        })
+        .collect::<Vec<_>>();
+    changed.sort_by_key(|issue| issue.id.0.clone());
+    if let Some(cursor) = cache.last_issue_id.as_deref() {
+        let split = changed.partition_point(|issue| issue.id.0.as_str() <= cursor);
+        changed.rotate_left(split);
+    }
+    let selected = changed
+        .into_iter()
+        .take(STAGE_HISTORY_ISSUE_BUDGET)
+        .collect::<Vec<_>>();
+    if !selected.is_empty() {
+        let ids = selected
+            .iter()
+            .map(|issue| issue.id.0.clone())
+            .collect::<Vec<_>>();
+        let histories = source.state_histories(&ids);
+        for (issue, history) in selected.iter().zip(histories) {
+            cache.last_issue_id = Some(issue.id.0.clone());
+            if let (Some(updated_at), Ok(history)) = (&issue.updated_at, history) {
+                cache.entries.insert(
+                    issue.id.0.clone(),
+                    StageHistoryCache {
+                        updated_at: updated_at.clone(),
+                        history,
+                    },
+                );
+            }
+        }
+        if let Ok(bytes) = serde_json::to_vec(&cache)
+            && bytes.len() <= REVIEW_MARKER_STORE_LIMIT
+        {
+            let temporary = cache_path.with_extension("stage-histories.json.tmp");
+            if let Some(parent) = temporary.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(mut file) = std::fs::File::create(&temporary)
+                && file.write_all(&bytes).is_ok()
+                && file.sync_all().is_ok()
+            {
+                let _ = std::fs::rename(temporary, cache_path);
+            }
+        }
+    }
+    linear_stage_ages_from_histories(workspace, selected_ids, &cache.entries, now_ms)
+}
+
+fn linear_stage_ages_from_histories(
+    workspace: &WorkspaceSnapshot,
+    selected_ids: &BTreeSet<crate::IssueId>,
+    history_cache: &BTreeMap<String, StageHistoryCache>,
+    now_ms: i64,
+) -> Vec<LinearStageAge> {
+    let now = now_ms as f64 / 1000.0;
+    let issues = workspace
+        .issues
+        .iter()
+        .filter(|issue| {
+            selected_ids.contains(&issue.id)
+                && crate::issue_is_open(issue)
+                && issue.state_type == WorkflowStateType::Started
+        })
+        .collect::<Vec<_>>();
+    let mut populations = BTreeMap::<String, (usize, Vec<f64>)>::new();
+    for issue in issues {
+        let stage = workflow_stage_label(&issue.state_name);
+        let entry = populations.entry(stage).or_default();
+        entry.0 += 1;
+        if let Some(updated_at) = &issue.updated_at
+            && let Some(history) = history_cache.get(&issue.id.0)
+            && &history.updated_at == updated_at
+            && let Some(started_at) = history
+                .history
+                .iter()
+                .filter(|change| {
+                    change.to_name.as_deref() == Some(issue.state_name.as_str())
+                        && change.to == Some(WorkflowStateType::Started)
+                        && change.at.is_finite()
+                        && change.at <= now
+                })
+                .max_by(|left, right| left.at.total_cmp(&right.at))
+                .map(|change| change.at)
+        {
+            entry.1.push((now - started_at).max(0.0));
+        }
+    }
+    populations
+        .into_iter()
+        .map(|(stage, (expected, mut ages))| {
+            ages.sort_by(f64::total_cmp);
+            LinearStageAge {
+                stage,
+                oldest_seconds: ages.last().copied().unwrap_or_default(),
+                coverage: ages.len() as f64 / expected.max(1) as f64,
+                available: ages.len() as f64 / expected.max(1) as f64 >= 0.5,
+            }
+        })
+        .collect()
+}
+
+fn workflow_stage_label(name: &str) -> String {
+    let mut label = String::new();
+    let mut underscore = false;
+    for character in name.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_alphanumeric() {
+            label.push(character);
+            underscore = false;
+        } else if !label.is_empty() && !underscore {
+            label.push('_');
+            underscore = true;
+        }
+    }
+    label.trim_end_matches('_').to_owned()
+}
+
+fn latest_retro_record(team: &str, now_ms: i64) -> (Option<retro::Record>, Option<String>) {
+    let store = match retro::store::Store::from_env(team) {
+        Ok(store) => store,
+        Err(error) => return (None, Some(error.to_string())),
+    };
+    let records = match store.read_all() {
+        Ok(records) => records,
+        Err(error) => return (None, Some(error.to_string())),
+    };
+    let latest = records
+        .into_iter()
+        .filter(|record| {
+            record.team.eq_ignore_ascii_case(team)
+                && record.kind == retro::RecordKind::Snapshot
+                && record.window == "1d"
+        })
+        .filter_map(|record| {
+            let taken_at = crate::drift::timestamp_epoch(&record.taken_at).ok()?;
+            Some((taken_at, record))
+        })
+        .max_by(|left, right| left.0.total_cmp(&right.0));
+    let Some((taken_at, record)) = latest else {
+        return (
+            None,
+            Some("no 1d retro snapshot is stored for this team".into()),
+        );
+    };
+    let age = now_ms as f64 / 1000.0 - taken_at;
+    if !(0.0..=900.0).contains(&age) {
+        return (
+            None,
+            Some("latest 1d retro snapshot is stale or from the future".into()),
+        );
+    }
+    (Some(record), None)
+}
+
+fn prometheus_effort_range(
+    team: &str,
+    now_ms: i64,
+) -> Result<super::timeline::EffortRange, String> {
+    let base = std::env::var("IX_PROMETHEUS_URL")
+        .unwrap_or_else(|_| "http://prometheus.luna.ix".to_owned());
+    let client = PromHttp::new(&base, Duration::from_secs(20)).map_err(|e| e.to_string())?;
+    let end = now_ms as f64 / 1000.0;
+    let start = end - 86400.0;
+    let filter = regex_escape(team);
+    let selector = format!("ix_fleet_lane_state_ratio{{lane=~\".*:{filter}:.*\"}}");
+    let working_selector =
+        format!("ix_fleet_lane_state_ratio{{lane=~\".*:{filter}:.*\",state=\"working\"}}");
+    let timestamps = client
+        .query_range(&format!("timestamp({selector})"), start, end, 60)
+        .map_err(|e| e.to_string())?;
+    let working = client
+        .query_range(
+            &format!("{working_selector} * timestamp({working_selector})"),
+            start,
+            end,
+            60,
+        )
+        .map_err(|e| e.to_string())?;
+    parse_effort_range(&timestamps, &working, start, end)
+}
+
+pub(super) fn parse_effort_range(
+    timestamp_body: &str,
+    working_body: &str,
+    start_seconds: f64,
+    end_seconds: f64,
+) -> Result<super::timeline::EffortRange, String> {
+    fn rows(body: &str) -> Result<Vec<serde_json::Value>, String> {
+        let value: serde_json::Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
+        if value.get("status").and_then(serde_json::Value::as_str) != Some("success") {
+            return Err("Prometheus range query did not succeed".into());
+        }
+        value
+            .pointer("/data/result")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .ok_or_else(|| "Prometheus range response omitted result rows".to_owned())
+    }
+    let timestamp_rows = rows(timestamp_body)?;
+    let working_rows = rows(working_body)?;
+    let first_slot = (start_seconds / 60.0).ceil() as i64;
+    let last_slot = (end_seconds / 60.0).floor() as i64;
+    let slot_count = usize::try_from(last_slot.saturating_sub(first_slot))
+        .map_err(|_| "Prometheus range has invalid sample count")?;
+    if slot_count == 0 || slot_count > 1440 {
+        return Err("Prometheus range has invalid one-minute coverage grid".into());
+    }
+    let mut expected_hosts = BTreeSet::new();
+    let mut observed_slots = BTreeSet::<(String, String, i64)>::new();
+    let mut working_slots = BTreeSet::<(String, String, i64)>::new();
+    for row in &timestamp_rows {
+        let labels = row
+            .get("metric")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| "Prometheus range row omitted labels".to_owned())?;
+        let label = |key: &str| {
+            labels
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        };
+        let lane = label("lane").ok_or_else(|| "Prometheus range row omitted lane".to_owned())?;
+        let _state = label("state");
+        let host = label("host")
+            .or_else(|| lane.split(':').next().map(str::to_owned))
+            .ok_or_else(|| "Prometheus range row omitted host".to_owned())?;
+        expected_hosts.insert(host.clone());
+        let values = row
+            .get("values")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "Prometheus range row omitted values".to_owned())?;
+        for pair in values {
+            let Some(pair) = pair.as_array().filter(|pair| pair.len() == 2) else {
+                continue;
+            };
+            let Some(evaluated) = pair[0].as_f64() else {
+                continue;
+            };
+            let source_at = pair[1]
+                .as_f64()
+                .or_else(|| pair[1].as_str().and_then(|s| s.parse::<f64>().ok()));
+            let Some(source_at) = source_at.filter(|at| at.is_finite() && *at > 0.0) else {
+                continue;
+            };
+            let slot = (evaluated / 60.0).round() as i64;
+            if slot < first_slot || slot >= last_slot || evaluated - source_at > 90.0 {
+                continue;
+            }
+            observed_slots.insert((host.clone(), lane.clone(), slot));
+        }
+    }
+    if expected_hosts.is_empty() {
+        return Err("no retained QSL lane samples in the trailing day".into());
+    }
+    for row in &working_rows {
+        let labels = row
+            .get("metric")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| "Prometheus working range row omitted labels".to_owned())?;
+        let label = |key: &str| {
+            labels
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        };
+        let lane =
+            label("lane").ok_or_else(|| "Prometheus working range row omitted lane".to_owned())?;
+        let host = label("host")
+            .or_else(|| lane.split(':').next().map(str::to_owned))
+            .ok_or_else(|| "Prometheus working range row omitted host".to_owned())?;
+        let values = row
+            .get("values")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "Prometheus working range row omitted values".to_owned())?;
+        for pair in values {
+            let Some(pair) = pair.as_array().filter(|pair| pair.len() == 2) else {
+                continue;
+            };
+            let Some(evaluated) = pair[0].as_f64() else {
+                continue;
+            };
+            let source_at = pair[1]
+                .as_f64()
+                .or_else(|| pair[1].as_str().and_then(|s| s.parse::<f64>().ok()));
+            let Some(source_at) = source_at.filter(|at| at.is_finite() && *at > 0.0) else {
+                continue;
+            };
+            let slot = (evaluated / 60.0).round() as i64;
+            if slot >= first_slot
+                && slot < last_slot
+                && evaluated - source_at <= 90.0
+                && observed_slots.contains(&(host.clone(), lane.clone(), slot))
+            {
+                working_slots.insert((host.clone(), lane.clone(), slot));
+            }
+        }
+    }
+    let mut covered_host_slots = 0usize;
+    let mut working_lane_seconds = 0.0;
+    for slot in first_slot..last_slot {
+        let mut hosts = BTreeSet::new();
+        for (host, lane, observed_slot) in &observed_slots {
+            if *observed_slot == slot {
+                hosts.insert(host);
+            }
+            if *observed_slot == slot && working_slots.contains(&(host.clone(), lane.clone(), slot))
+            {
+                working_lane_seconds += 60.0;
+            }
+        }
+        covered_host_slots += hosts.len();
+    }
+    let coverage = covered_host_slots as f64 / (expected_hosts.len() * slot_count) as f64;
+    Ok(super::timeline::EffortRange {
+        working_lane_seconds,
+        coverage: coverage.clamp(0.0, 1.0),
+    })
+}
+
 fn update_members(
     state: &mut ScopeState,
     new: &BTreeMap<String, Member>,
@@ -1253,11 +1709,7 @@ fn update_members(
 ) {
     let baseline = state.selectors.is_some();
     if baseline && state.selectors.as_ref() != Some(selectors) {
-        state.effort_points.clear();
-        state.samples.clear();
-        state.stages.clear();
-        state.lifecycle_ok = false;
-        state.coverage_started_ms = None;
+        state.comparable_since_ms = state.tracker_at_ms;
     }
     if baseline {
         for (id, member) in new {
@@ -1331,121 +1783,113 @@ fn execution_evidence_usable(
     pane_complete && transcript_complete && verdict != crate::agents::Verdict::Unknown
 }
 
-struct NoAgents;
-impl AgentSource for NoAgents {
-    fn report(&self, _: &[String]) -> Result<crate::agents::AgentsReport, String> {
-        Err("use session-qualified activity source".into())
-    }
-}
-struct SelectedLinear<'a> {
-    inner: &'a dyn LinearSource,
-    snapshot: WorkspaceSnapshot,
-}
-impl LinearSource for SelectedLinear<'_> {
-    fn department_evidence(
-        &self,
-        scope: &retro::department::Scope,
-        _since: f64,
-    ) -> retro::department::Evidence {
-        // Current WIP requires only current facts. Historical claims/movement
-        // retain unavailable provenance until their authoritative producers exist.
-        retro::department::workspace_evidence(&self.snapshot, scope)
-    }
-    fn workspace(&self, _: f64) -> Result<WorkspaceSnapshot, String> {
-        Ok(self.snapshot.clone())
-    }
-    fn project_open_count(&self, project: &str) -> Result<usize, String> {
-        Ok(self
-            .snapshot
-            .issues
-            .iter()
-            .filter(|i| {
-                i.project_id.as_ref().is_some_and(|p| {
-                    p.0 == project
-                        || self.snapshot.projects.iter().any(|native| {
-                            native.id == *p && native.name.eq_ignore_ascii_case(project)
-                        })
-                }) && !matches!(
-                    i.state_type,
-                    WorkflowStateType::Completed
-                        | WorkflowStateType::Canceled
-                        | WorkflowStateType::Duplicate
-                )
-            })
-            .count())
-    }
-    fn state_history(&self, id: &str) -> Result<Vec<retro::sources::StateChange>, String> {
-        self.inner.state_history(id)
-    }
-    fn state_histories(
-        &self,
-        ids: &[String],
-    ) -> Vec<Result<Vec<retro::sources::StateChange>, String>> {
-        self.inner.state_histories(ids)
-    }
-    fn marker_lines(&self, prefix: &str, needle: &str) -> Result<Vec<String>, String> {
-        self.inner.marker_lines(prefix, needle)
-    }
-    fn open_issues_with_label(
-        &self,
-        label: &str,
-    ) -> Result<Vec<retro::sources::LabeledIssue>, String> {
-        let ids: BTreeSet<_> = self
-            .snapshot
-            .issues
-            .iter()
-            .map(|i| i.identifier.as_str())
-            .collect();
-        self.inner.open_issues_with_label(label).map(|v| {
-            v.into_iter()
-                .filter(|i| ids.contains(i.identifier.as_str()))
-                .collect()
-        })
-    }
-}
 #[cfg(test)]
 mod tests {
     use super::*;
     use ix_trace_rs::trace;
     #[trace("FR-033-AC-16")]
     #[test]
-    fn current_release_selector_requires_one_started_team_release_project() {
-        let project = |id: &str, name: &str, status_category: &str| {
-            serde_json::from_value::<Project>(serde_json::json!({
-                "id": id,
-                "identifier": null,
-                "name": name,
-                "updated_at": null,
-                "description": "",
-                "content": null,
-                "status": "Started",
-                "status_name": null,
-                "status_category": status_category,
-                "priority": 0,
-                "sort_order": 0.0,
-                "target_date": null,
-                "team_keys": ["QSL"],
-                "milestones": [],
-                "initiatives": []
+    fn linear_stage_age_only_emits_started_workflow_states_with_measurements() {
+        let issue = |id: &str,
+                     identifier: &str,
+                     state_name: &str,
+                     state_type: &str,
+                     started_at: Option<&str>| {
+            serde_json::from_value::<Issue>(serde_json::json!({
+                "id":id,"identifier":identifier,"title":"example","description":null,
+                "state":"Started","state_name":state_name,"state_type":state_type,
+                "parent_id":null,"team_key":"QSL","assignee_id":null,"assignee_name":null,
+                "project_id":null,"project_milestone_id":null,"priority":0,"sort_order":0,
+                "blocked_by":[],"created_at":"2026-11-01T00:00:00Z","updated_at":"2026-11-25T20:01:00Z",
+                "attachment_urls":[],"attachments_complete":true,"started_at":started_at,
+                "completed_at":null,"pull_requests":[]
             }))
             .unwrap()
         };
-        let selected = project("release", "FSL alpha release", "started");
-        let planned = project("planned", "QSL next release", "planned");
         let workspace = WorkspaceSnapshot {
-            projects: vec![selected.clone(), planned],
+            issues: vec![
+                issue(
+                    "1",
+                    "QSL-1",
+                    "In Progress",
+                    "started",
+                    Some("2026-11-25T20:00:00Z"),
+                ),
+                issue("2", "QSL-2", "In Progress", "started", None),
+                issue(
+                    "3",
+                    "QSL-3",
+                    "Ready for Review",
+                    "unstarted",
+                    Some("2026-11-25T00:00:00Z"),
+                ),
+            ],
             ..Default::default()
         };
-        assert_eq!(
-            current_release_project(&workspace, "QSL").unwrap().id,
-            selected.id
+        let history_cache = BTreeMap::from([(
+            "1".to_owned(),
+            StageHistoryCache {
+                updated_at: "2026-11-25T20:01:00Z".into(),
+                history: vec![retro::sources::StateChange {
+                    at: crate::drift::timestamp_epoch("2026-11-25T20:00:00Z").unwrap(),
+                    from: Some(WorkflowStateType::Unstarted),
+                    to: Some(WorkflowStateType::Started),
+                    to_name: Some("In Progress".into()),
+                }],
+            },
+        )]);
+        let ages = linear_stage_ages_from_histories(
+            &workspace,
+            &BTreeSet::from([
+                crate::IssueId("1".into()),
+                crate::IssueId("2".into()),
+                crate::IssueId("3".into()),
+            ]),
+            &history_cache,
+            crate::drift::timestamp_epoch("2026-11-25T21:00:00Z").unwrap() as i64 * 1000,
         );
-
-        let ambiguous = WorkspaceSnapshot {
-            projects: vec![selected, project("other", "QSL beta release", "started")],
-            ..Default::default()
+        assert_eq!(ages.len(), 1);
+        assert_eq!(ages[0].stage, "in_progress");
+        assert_eq!(ages[0].oldest_seconds, 3600.0);
+        assert_eq!(ages[0].coverage, 0.5);
+        assert!(ages[0].available);
+    }
+    #[test]
+    fn daily_closures_count_only_merged_pr_verified_path_events() {
+        use crate::retro::sources::StateChange;
+        let issue = |id: &str, number: Option<u64>| {
+            let attachment_urls = number.map_or_else(Vec::new, |number| {
+                vec![format!("https://github.com/agent-ix/repo/pull/{number}")]
+            });
+            serde_json::from_value::<Issue>(serde_json::json!({
+                "id":id,"identifier":format!("QSL-{id}"),"title":"example","description":null,
+                "state":"Completed","state_name":"Done","state_type":"completed",
+                "parent_id":null,"team_key":"QSL","assignee_id":null,"assignee_name":null,
+                "project_id":null,"project_milestone_id":null,"priority":0,"sort_order":0,
+                "blocked_by":[],"created_at":"2026-11-01T00:00:00Z","updated_at":null,
+                "attachment_urls":attachment_urls,"attachments_complete":true,"started_at":null,
+                "completed_at":null,"pull_requests":[]
+            }))
+            .unwrap()
         };
-        assert!(current_release_project(&ambiguous, "QSL").is_err());
+        let event = StateChange {
+            at: 180_000.0,
+            from: Some(WorkflowStateType::Started),
+            to: Some(WorkflowStateType::Completed),
+            to_name: Some("Done".into()),
+        };
+        let issues = vec![issue("1", Some(1)), issue("2", None), issue("3", Some(2))];
+        let histories = vec![vec![event.clone()], vec![event.clone()], vec![event]];
+        let merged = BTreeSet::from([("agent-ix/repo".into(), 1)]);
+        let counts = verified_daily_closure_counts(
+            &issues,
+            &histories,
+            &merged,
+            &BTreeSet::from(["agent-ix/repo"]),
+            200_000.0,
+        )
+        .unwrap();
+        assert_eq!(counts, vec![1, 0, 0, 0, 0, 0, 0]);
     }
     #[trace("FR-033-AC-15")]
     #[test]
@@ -1480,20 +1924,31 @@ mod tests {
             .unwrap();
             TrackerBatch {
                 at_ms: linear_at,
+                linear_requests: 0,
                 results: vec![(
                     "fixture:work".into(),
                     Ok(TrackerResult {
                         members: BTreeMap::new(),
-                        record,
+                        record: Some(record),
+                        record_reason: None,
+                        pr_stats_reason: None,
+                        review_stats_reason: None,
+                        closures_daily_reason: None,
+                        merged_prs_daily_reason: None,
                         build_execution_seconds_24h: None,
                         ready_issues: None,
                         blocked_issues: None,
+                        wip_active: None,
                         query_identity: "fixture".into(),
                         resolved_selectors: super::super::Selectors::default(),
                         pr_stats: available.then(|| super::super::pr_stats::calculate(&[], 0.0)),
                         review_stats: None,
                         closures_daily: None,
                         merged_prs_daily: None,
+                        linear_stage_ages: Vec::new(),
+                        effort_range: None,
+                        effort_range_reason: None,
+                        github_repo_coverage: 1.0,
                         github_at_ms: github_at,
                     }),
                 )],
@@ -1574,6 +2029,42 @@ mod tests {
         assert_eq!(state.totals["scope_removed"], 1.0);
         assert!(!state.totals.contains_key("completed"));
     }
+    #[test]
+    fn review_marker_cursor_and_payload_survive_restart_without_prose() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("exporter.sqlite");
+        let mut sync = ReviewMarkerSync::default();
+        sync.channels.insert(
+            "fsl:agent-ix/repo:reviewer".into(),
+            ReviewMarkerChannel {
+                backfill_complete: false,
+                scan_started_ms: Some(1000),
+                scan_since_ms: None,
+                next_cursor: Some("opaque-cursor".into()),
+                watermark_ms: 0,
+                comments: BTreeMap::from([(
+                    "comment-id".into(),
+                    crate::MarkerComment {
+                        id: Some("comment-id".into()),
+                        created_at: Some("1970-01-01T00:00:01Z".into()),
+                        updated_at: Some("1970-01-01T00:00:01Z".into()),
+                        body: compact_marker_body("<!-- reviewer repo=agent-ix/repo -->\nprivate prose\n```yaml\nclean: true\nfindings: []\n```\nmore prose"),
+                    },
+                )]),
+            },
+        );
+        save_review_marker_sync(&state_path, &sync).unwrap();
+        let restored = load_review_marker_sync(&state_path);
+        let channel = &restored.channels["fsl:agent-ix/repo:reviewer"];
+        assert_eq!(channel.next_cursor.as_deref(), Some("opaque-cursor"));
+        assert!(channel.comments["comment-id"].body.contains("clean: true"));
+        assert!(
+            !channel.comments["comment-id"]
+                .body
+                .contains("private prose")
+        );
+        assert!(!channel.comments["comment-id"].body.contains("more prose"));
+    }
 }
 
 #[cfg(test)]
@@ -1583,7 +2074,7 @@ mod revision_tests {
 
     #[trace("FR-033-AC-6")]
     #[test]
-    fn changing_selectors_invalidates_comparable_effort_history() {
+    fn changing_selectors_preserves_retained_effort_history() {
         let old = super::super::Selectors {
             team: Some("QSL".into()),
             ..Default::default()
@@ -1599,139 +2090,8 @@ mod revision_tests {
             ..Default::default()
         };
         update_members(&mut state, &BTreeMap::new(), &new);
-        assert!(state.effort_points.is_empty());
-        assert!(!state.lifecycle_ok);
+        assert_eq!(state.effort_points, vec![(1000, 10.0, 30.0)]);
+        assert!(state.lifecycle_ok);
         assert_eq!(state.totals["scope_revisions"], 1.0);
-    }
-
-    #[trace("FR-033-AC-16")]
-    #[test]
-    fn fresh_and_stale_pane_lane_and_host_feeds_classify_lead_coverage() {
-        let now_ms = 1_000_000;
-        let decoded = parse_prometheus_samples(
-            r#"{"status":"success","data":{"resultType":"vector","result":[{"metric":{"machine":"luna"},"value":[1000,"999.95"]}]}}"#,
-        )
-        .unwrap();
-        assert_eq!(decoded[0].timestamp_seconds, 999.95);
-        let sample = |labels: &[(&str, &str)], timestamp_seconds: f64| PrometheusSample {
-            labels: labels
-                .iter()
-                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
-                .collect(),
-            timestamp_seconds,
-            value: 1.0,
-        };
-        let status = PrometheusLeadStatus {
-            pane_info: vec![
-                sample(
-                    &[
-                        ("machine", "luna"),
-                        ("pane", "wZ:p1"),
-                        ("workspace_label", "QSL"),
-                        ("tab_label", "code"),
-                    ],
-                    999.95,
-                ),
-                sample(
-                    &[
-                        ("machine", "draco"),
-                        ("pane", "w1F:p9"),
-                        ("workspace_label", "OTHER"),
-                        ("tab_label", "shell"),
-                    ],
-                    999.95,
-                ),
-                sample(
-                    &[
-                        ("machine", "terra"),
-                        ("pane", "wE:p88"),
-                        ("workspace_label", "QSL"),
-                        ("tab_label", "stale-info"),
-                    ],
-                    909.0,
-                ),
-                sample(
-                    &[
-                        ("machine", "terra"),
-                        ("pane", "wE:p89"),
-                        ("workspace_label", "QSL"),
-                        ("tab_label", "stale-status"),
-                    ],
-                    999.95,
-                ),
-                sample(
-                    &[
-                        ("machine", "titan"),
-                        ("pane", "wB:pZ"),
-                        ("workspace_label", "QSL"),
-                        ("tab_label", "stale-host"),
-                    ],
-                    909.0,
-                ),
-            ],
-            pane_status: vec![
-                sample(
-                    &[
-                        ("machine", "luna"),
-                        ("pane", "wZ:p1"),
-                        ("status", "working"),
-                    ],
-                    999.95,
-                ),
-                sample(
-                    &[
-                        ("machine", "terra"),
-                        ("pane", "wE:p88"),
-                        ("status", "working"),
-                    ],
-                    999.95,
-                ),
-                sample(
-                    &[
-                        ("machine", "terra"),
-                        ("pane", "wE:p89"),
-                        ("status", "working"),
-                    ],
-                    909.0,
-                ),
-            ],
-            lane_status: vec![
-                sample(
-                    &[
-                        ("host", "terra"),
-                        ("lane", "terra:QSL:plan"),
-                        ("state", "working"),
-                    ],
-                    999.95,
-                ),
-                sample(
-                    &[
-                        ("host", "titan"),
-                        ("lane", "titan:QSL:stale-lane"),
-                        ("state", "working"),
-                    ],
-                    909.0,
-                ),
-            ],
-        };
-        let expected = vec![
-            "luna:QSL:code".to_owned(),
-            "terra:QSL:plan".to_owned(),
-            "draco:QSL:idle-lead".to_owned(),
-            "titan:QSL:missing-feed".to_owned(),
-            "terra:QSL:stale-info".to_owned(),
-            "terra:QSL:stale-status".to_owned(),
-            "titan:QSL:stale-lane".to_owned(),
-            "titan:QSL:stale-host".to_owned(),
-        ];
-        let no_pane = BTreeSet::from([
-            "draco:QSL:idle-lead".to_owned(),
-            "titan:QSL:missing-feed".to_owned(),
-            "titan:QSL:stale-host".to_owned(),
-        ]);
-        assert_eq!(
-            classify_execution_leads(&expected, &no_pane, Some(&status), None, &[], now_ms),
-            (3, 2)
-        );
     }
 }

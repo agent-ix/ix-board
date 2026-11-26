@@ -130,6 +130,32 @@ query MarkerComments($first: Int!, $after: String, $prefix: String!, $needle: St
   }
 }"#;
 
+const MARKER_COMMENT_PAGE_QUERY: &str = r#"
+query MarkerCommentPage($first: Int!, $after: String, $prefix: String!, $needle: String!, $since: DateTimeOrDuration!) {
+  comments(
+    first: $first
+    after: $after
+    orderBy: updatedAt
+    filter: { and: [{ body: { startsWith: $prefix } }, { body: { contains: $needle } }, { updatedAt: { gte: $since } }] }
+  ) {
+    nodes { id createdAt updatedAt body }
+    pageInfo { hasNextPage endCursor }
+  }
+}"#;
+
+const MARKER_COMMENT_BACKFILL_QUERY: &str = r#"
+query MarkerCommentBackfill($first: Int!, $after: String, $prefix: String!, $needle: String!) {
+  comments(
+    first: $first
+    after: $after
+    orderBy: updatedAt
+    filter: { and: [{ body: { startsWith: $prefix } }, { body: { contains: $needle } }] }
+  ) {
+    nodes { id createdAt updatedAt body }
+    pageInfo { hasNextPage endCursor }
+  }
+}"#;
+
 const ISSUE_UPDATES_QUERY: &str = r#"
 query IssueUpdates($first: Int!, $after: String, $since: DateTimeOrDuration!) {
   issues(first: $first, after: $after, filter: { updatedAt: { gte: $since } }) {
@@ -367,6 +393,12 @@ pub(crate) fn request_count() -> u64 {
 }
 
 impl LinearGraphQlSource {
+    pub(crate) fn request_count(&self) -> u64 {
+        self.metrics
+            .requests
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub(crate) fn metrics_start(&self) -> (u64, u64, u64, u64, std::time::Instant) {
         use std::sync::atomic::Ordering;
         (
@@ -982,7 +1014,8 @@ impl LinearGraphQlSource {
                 Ok(crate::retro::sources::StateChange {
                     at,
                     from: event.from_state.map(|state| state.status_type),
-                    to: event.to_state.map(|state| state.status_type),
+                    to: event.to_state.as_ref().map(|state| state.status_type),
+                    to_name: event.to_state.map(|state| state.name),
                 })
             })
             .collect()
@@ -1209,6 +1242,37 @@ impl LinearGraphQlSource {
                 has_next: data.comments.page_info.has_next_page,
                 cursor: data.comments.page_info.end_cursor,
             })
+        })
+    }
+
+    /// Reads one stable page of marker comments by native update time for resumable sync.
+    pub fn fetch_marker_comment_page(
+        &self,
+        prefix: &str,
+        needle: &str,
+        updated_since: Option<f64>,
+        after: Option<&str>,
+    ) -> Result<crate::retro::sources::Page<MarkerComment>, String> {
+        let data: CommentData = self
+            .request(
+                if updated_since.is_some() {
+                    MARKER_COMMENT_PAGE_QUERY
+                } else {
+                    MARKER_COMMENT_BACKFILL_QUERY
+                },
+                MarkerVariables {
+                    first: ISSUE_PAGE_SIZE,
+                    after: after.map(str::to_owned),
+                    prefix: prefix.to_owned(),
+                    needle: needle.to_owned(),
+                    since: updated_since.map(crate::drift::format_timestamp),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(crate::retro::sources::Page {
+            items: data.comments.nodes,
+            has_next: data.comments.page_info.has_next_page,
+            cursor: data.comments.page_info.end_cursor,
         })
     }
 
@@ -2478,7 +2542,7 @@ struct CommentData {
 }
 
 /// Native tracker comment retained for attributed review evidence.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MarkerComment {
     /// Native comment ID, absent in older selected projections.
@@ -2487,6 +2551,9 @@ pub struct MarkerComment {
     /// Source creation time, never inferred from prose.
     #[serde(default, rename = "createdAt")]
     pub created_at: Option<String>,
+    /// Source update time used to incrementally refresh marker evidence.
+    #[serde(default, rename = "updatedAt")]
+    pub updated_at: Option<String>,
     /// Structured marker/data payload, kept outside metric labels.
     pub body: String,
 }
