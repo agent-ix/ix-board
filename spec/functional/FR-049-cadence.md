@@ -59,6 +59,7 @@ manifest is shared configuration and is not stored in the fleet ledger.
 | FR-049-AC-5 | `--alert` emits an alert only when the configured cadence checker job is overdue. | Test |
 | FR-049-AC-6 | Cadence uses the existing fleet ledger and does not create a scheduler or write state into a repository. | Test |
 | FR-049-AC-7 | A valid snapshot job runs its configured notifying delta only after snapshot success; snapshot failure skips the delta, and a delta failure is recorded as a failed cadence run. Cadence tests cover both failure transitions. Delta tests use hand-written retro records and an injected sender; no test sends a real notification. | Test |
+| FR-049-AC-8 | First `cadence due` without an explicit or environment manifest atomically creates a default 30-minute retro snapshot job for the requested program/team; reruns are byte-for-byte no-ops and existing manifests are never replaced. | Test |
 
 ## Dependencies
 

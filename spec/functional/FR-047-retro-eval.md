@@ -62,7 +62,7 @@ or partial evidence and SHALL NOT write to source systems.
   empty view without that coverage is `unavailable`, not a zero value. The
   capacity views also require a capacity data row in the window; a generic
   fleet collector run alone does not certify an empty capacity view. The
-  evaluator reads ledger schema versions 3 through 9 without migrating them;
+  evaluator reads ledger schema versions 3 through 10 without migrating them;
   an unknown schema version is `unavailable`.
 - Capacity rules use the SWM-252 view name `unrecorded_hosts_with_demand`.
   Demand is covered when `ready_buffer` is at least the host's lane count; a
@@ -120,6 +120,7 @@ or partial evidence and SHALL NOT write to source systems.
 | FR-047-AC-7 | `--team`, `--role`, `--session`, `--since` and `--json` produce the documented scope and stable JSON schema; text and JSON carry the same values and statuses. | Test |
 | FR-047-AC-8 | Evaluation is read-only: a run does not modify retro snapshots, the fleet ledger, tracker, GitHub, relay, hook events or transcripts. | Test |
 | FR-047-AC-9 | Evaluation reuses stored retro records across windows, reports attempted Linear/GitHub/Prometheus request counts in JSON, and writes stage timings to stderr while preserving partial results when a source is unavailable. | Test |
+| FR-047-AC-10 | The evaluator reads ledger schema versions 3 through 10 without migrating them and refuses versions outside that range. | Test |
 
 ## Dependencies
 
@@ -131,9 +132,9 @@ or partial evidence and SHALL NOT write to source systems.
 - Exported team metrics: FR-033. Fleet ledger queries and retained events:
   FR-039. Relay receipt and hook event protocols remain owned by ix-relay.
 - SWM-261 and the fleet lane own their ledger producers and schema versions:
-  capacity schema v6 in #102, role views v7, transcript ids v8 and stream
-  cursors v9 in #103. SWM-221 reads their stable views without migration and
-  accepts schema versions 3 through 9; a future retro-owned persistent
+  capacity schema v6 in #102, role views v7, transcript ids v8, stream
+  cursors v9 in #103 and cadence v10. SWM-221 reads their stable views without migration and
+  accepts schema versions 3 through 10; a future retro-owned persistent
   producer would require the next schema version.
 - Fleet capacity decisions and views: FR-041, including demand coverage for
   the orchestrator's discovery rules.

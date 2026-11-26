@@ -85,7 +85,7 @@ pub enum JobKind {
 }
 
 /// Cadence manifest containing program/team job entries.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     /// Single relay address notified when `cadence due --alert` finds the checker needs attention.
@@ -235,6 +235,67 @@ pub fn load_manifest(path: &Path) -> Result<Manifest, CadenceError> {
         .map_err(|error| CadenceError::Manifest(error.to_string()))?;
     validate_manifest(&manifest)?;
     Ok(manifest)
+}
+
+/// Creates the default team retro job once, without replacing an existing manifest.
+#[implements("FR-049-AC-4")]
+pub fn generate_default_manifest(
+    path: &Path,
+    program: &str,
+    team: &str,
+) -> Result<Manifest, CadenceError> {
+    let manifest = Manifest {
+        alert_recipient: None,
+        jobs: vec![Job {
+            program: program.to_owned(),
+            team: team.to_owned(),
+            id: format!("retro-{}", team.to_ascii_lowercase()),
+            interval_secs: 30 * 60,
+            kind: JobKind::RetroSnapshot,
+            command: vec![
+                "retro".into(),
+                "snapshot".into(),
+                "--team".into(),
+                team.to_owned(),
+            ],
+            after_success: None,
+            owner_role: "minder".into(),
+        }],
+    };
+    validate_manifest(&manifest)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    if let Some(parent) = parent {
+        std::fs::create_dir_all(parent).map_err(|source| CadenceError::Read {
+            path: parent.to_owned(),
+            source,
+        })?;
+    }
+    let bytes = serde_json::to_vec_pretty(&manifest)
+        .map_err(|error| CadenceError::Manifest(error.to_string()))?;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => {
+            use std::io::Write;
+            file.write_all(&bytes)
+                .map_err(|source| CadenceError::Read {
+                    path: path.to_owned(),
+                    source,
+                })?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(source) => {
+            return Err(CadenceError::Read {
+                path: path.to_owned(),
+                source,
+            });
+        }
+    }
+    load_manifest(path)
 }
 
 /// Validates cadence job identity, interval and supported argv shape.

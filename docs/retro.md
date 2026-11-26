@@ -10,7 +10,8 @@ type: reference
 ```bash
 export TEAM_RETRO_HOME=~/.local/state/team-retro     # default; must be outside any git work tree
 ix-board retro backfill --config retro.json --since 2026-10-31 --until 2026-11-06   # once, for a baseline
-ix-board retro snapshot --config retro.json          # every few hours
+ix-board retro snapshot --team QSL                    # generated cadence job, every 30 minutes
+ix-board retro snapshot --config retro.json          # custom scope
 ix-board retro delta    --config retro.json          # after each snapshot
 ```
 
@@ -32,12 +33,12 @@ file stops the command and names the file and field.
 | `projects` | Linear project names whose issues count toward progress metrics. |
 | `gate_tickets` | Issue ids whose transitive blockers define the path. |
 | `repos` | `owner/name` repositories whose pull requests belong to the team. |
-| `herdr_teams` | Herdr workspace labels read for utilization metrics. |
+| `herdr_teams` | Herdr workspace labels read for utilization metrics (defaults to `team`). |
 | `thresholds` | `pr_idle_hours`, `pr_oversize_lines`, `in_progress_stale_hours`. Each is optional with no default; a metric whose threshold is absent is `unavailable: not configured`. |
 | `main_check` | `{"repo": "owner/name", "branch": "main"}`; check-runs define main status. |
 | `local_paths` | Directories read for prunable worktrees and disk bytes. |
 | `slot_process`, `orphan_slot_hours` | Sibling top-level fields: process-name substring of build-slot wrappers, and the age in hours after which an orphaned wrapper counts. `orphan_slots` needs both. |
-| `gate_log` | Path to the gate JSONL log. The dev-team `team-gate` wrapper writes it, one line per gate run and re-pin. |
+| `gate_log` | Path to the gate JSONL log (defaults to `$TEAM_RETRO_HOME/<team>/gate.jsonl`). The dev-team `team-gate` wrapper writes it, one line per gate run and re-pin. |
 | `relay_leads`, `message_stale_minutes` | Sibling top-level fields: relay addresses (`server:workspace:tab`) and the age in minutes after which a pending message counts as undelivered. `messages_undelivered` needs both. |
 | `decision_label` | Linear label marking issues that wait on an owner decision. |
 | `baseline_taken_at` | UTC time naming the baseline record. |
@@ -80,7 +81,7 @@ inside the window, keyed by the marker's `pr=` value; a disposition counts only 
 is a pass-to-fail transition between consecutive checked commits in the window; commits with
 pending or no check-runs are skipped, and minutes run from the first failing commit to the next
 passing one, or to the snapshot time. `agents_idle_minutes_max` is the largest time since an
-agent's last turn. `net_closed_minus_new` counts the union of project and path issues once.
+agent's last turn. `net_closed_minus_new` counts path completions minus new issues.
 
 A relay address must be `server:workspace:tab`; anything else, or an address with no registration, makes the metric unavailable. The ix-relay queues are keyed by registered session name, so each relay address is resolved
 read-only through the bus registry (`HGETALL <prefix>agents`) by machine, workspace and tab, and
@@ -115,20 +116,13 @@ queries); `neutral` metrics never regress. There is no combined score.
 Delta also emits a `defects` array. Increases in `prs_idle`, `fix_rounds_max` and
 `agents_idle_minutes_max` become `retro_metric_rising` defects; an
 `unnamed_wait_minutes_max` above 20 becomes `lead_wait_without_named_wait`.
-Use `--notify` to send these stored findings to the configured `minder_address`.
-Without that flag, delta sends nothing.
+Delta records each finding in the fleet ledger. `--notify` sends findings through
+the cadence manifest's single `alert_recipient`; no per-team recipient is stored
+in retro configuration.
 
-## QSL cadence example
-
-The QSL examples under `examples/qsl/` connect the 30-minute cadence runner to
-retro snapshots and stored delta notifications for the verified
-`terra:QSL:minder` address. The snapshot configuration includes the QSL Herdr
-workspace and gate log, so `agents_working_share`, `agents_idle_minutes_max`,
-`full_gates_max` and `build_lock_wait_minutes` are available when their source
-records are complete. Install the manifest at `~/.config/ix-board/cadence.json`
-and the supplied LaunchAgent under `~/Library/LaunchAgents/`, then load it with
-`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agentix.ix-board-retro-qsl.plist`.
-The examples use local QSL paths from this machine and need path updates elsewhere.
+The first `ix-board cadence due --program P --team T` creates a default manifest
+with one 30-minute retro snapshot job. The job uses `retro snapshot --team T`;
+the host scheduler is installed and managed by the operator.
 
 ## Backfill
 

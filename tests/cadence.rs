@@ -51,6 +51,57 @@ fn due_command(manifest: &Path, ledger: &Path) -> std::process::Output {
 }
 
 #[test]
+#[trace("FR-049-AC-8")]
+fn default_retro_manifest_generation_is_idempotent_and_never_clobbers() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("nested/cadence.json");
+    let generated = ix_board::cadence::generate_default_manifest(&path, "SWM", "qsl").unwrap();
+    assert_eq!(generated.jobs.len(), 1);
+    assert_eq!(generated.jobs[0].interval_secs, 1800);
+    assert_eq!(
+        generated.jobs[0].command,
+        ["retro", "snapshot", "--team", "qsl"]
+    );
+    let bytes = std::fs::read(&path).unwrap();
+    let rerun = ix_board::cadence::generate_default_manifest(&path, "OTHER", "other").unwrap();
+    assert_eq!(rerun, generated);
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+    let existing = directory.path().join("existing.json");
+    std::fs::write(&existing, br#"{"jobs":[]}"#).unwrap();
+    let original = std::fs::read(&existing).unwrap();
+    let existing_manifest =
+        ix_board::cadence::generate_default_manifest(&existing, "SWM", "qsl").unwrap();
+    assert!(existing_manifest.jobs.is_empty());
+    assert_eq!(std::fs::read(&existing).unwrap(), original);
+}
+
+#[test]
+#[trace("FR-049-AC-8")]
+fn cadence_due_creates_the_default_manifest_on_first_run() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_home = directory.path().join("config");
+    let ledger = directory.path().join("ledger.sqlite3");
+    let run = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_ix-board"))
+            .args(["cadence", "due", "--program", "SWM", "--team", "qsl"])
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("IX_BOARD_LEDGER_PATH", &ledger)
+            .env_remove("IX_BOARD_CADENCE_MANIFEST")
+            .output()
+            .unwrap()
+    };
+    let first = run();
+    assert_eq!(first.status.code(), Some(1));
+    let path = config_home.join("ix-board/cadence.json");
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(String::from_utf8_lossy(&first.stdout).contains("retro-qsl due"));
+    let second = run();
+    assert_eq!(second.status.code(), Some(1));
+    assert_eq!(std::fs::read(path).unwrap(), bytes);
+}
+
+#[test]
 #[trace("FR-049-AC-3", "FR-049-AC-6")]
 fn cadence_run_releases_ledger_for_fleet_tick_and_concurrent_due() {
     let directory = tempfile::tempdir().unwrap();
@@ -151,8 +202,7 @@ fn cadence_runs_stored_delta_after_snapshot_without_sending_when_no_defect_exist
             "team": "QSL",
             "projects": [],
             "gate_tickets": [],
-            "repos": [],
-            "minder_address": "terra:QSL:minder"
+            "repos": []
         }))
         .unwrap(),
     )
@@ -176,6 +226,7 @@ fn cadence_runs_stored_delta_after_snapshot_without_sending_when_no_defect_exist
         .arg(&manifest_path)
         .env("IX_BOARD_LEDGER_PATH", &ledger_path)
         .env("TEAM_RETRO_HOME", &retro_home)
+        .env("IX_BOARD_CADENCE_MANIFEST", &manifest_path)
         .output()
         .unwrap();
     assert!(
@@ -211,7 +262,7 @@ fn cadence_skips_delta_after_snapshot_failure_and_records_follow_up_failure() {
             "projects": [],
             "gate_tickets": [],
             "repos": [],
-            "minder_address": "terra:QSL:minder"
+            "gate_log": null
         }))
         .unwrap(),
     )
@@ -298,21 +349,17 @@ fn cadence_skips_delta_after_snapshot_failure_and_records_follow_up_failure() {
 }
 
 #[test]
-#[trace("FR-049-AC-7")]
-fn qsl_cadence_example_runs_every_thirty_minutes_and_after_success_delta() {
+#[trace("FR-049-AC-8", "FR-024-AC-24")]
+fn generated_cadence_manifest_uses_the_auto_detected_team_sources() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("qsl-cadence.json");
-    std::fs::write(&path, include_str!("../examples/qsl/cadence.json")).unwrap();
-    let manifest = ix_board::cadence::load_manifest(&path).unwrap();
+    let manifest = ix_board::cadence::generate_default_manifest(&path, "QSL", "QSL").unwrap();
     assert_eq!(manifest.jobs.len(), 1);
     assert_eq!(manifest.jobs[0].interval_secs, 1800);
     assert_eq!(manifest.jobs[0].owner_role, "minder");
-    assert!(
-        manifest.jobs[0]
-            .after_success
-            .as_ref()
-            .unwrap()
-            .contains(&"--notify".to_owned())
+    assert_eq!(
+        manifest.jobs[0].command,
+        ["retro", "snapshot", "--team", "QSL"]
     );
     let retro_config = ix_board::retro::RetroConfig::parse(
         Path::new("examples/qsl/retro.json"),
@@ -321,11 +368,13 @@ fn qsl_cadence_example_runs_every_thirty_minutes_and_after_success_delta() {
     .unwrap();
     assert_eq!(retro_config.team, "QSL");
     assert_eq!(retro_config.herdr_teams, ["QSL"]);
-    assert_eq!(
-        retro_config.minder_address.as_deref(),
-        Some("terra:QSL:minder")
+    assert!(
+        retro_config
+            .gate_log
+            .as_ref()
+            .unwrap()
+            .ends_with("QSL/gate.jsonl")
     );
-    assert!(retro_config.gate_log.is_some());
 }
 
 #[test]

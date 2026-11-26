@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
+use ix_trace_rs::implements;
 use serde::{Deserialize, Serialize};
 use thiserror::Error as ThisError;
 
@@ -129,9 +130,6 @@ pub struct RetroConfig {
     /// Optional UTC time naming the baseline record.
     #[serde(default)]
     pub baseline_taken_at: Option<String>,
-    /// Optional verified relay address for explicit retro delta defect delivery.
-    #[serde(default)]
-    pub minder_address: Option<String>,
     /// Optional reviewer-round policy limit for additive churn metrics.
     #[serde(default)]
     pub review_round_limit: Option<u64>,
@@ -203,6 +201,7 @@ impl RetroConfig {
         if config.linear_teams.is_empty() {
             config.linear_teams = vec![config.team.clone()];
         }
+        config.auto_detect_sources();
         if let Some(baseline) = &config.baseline_taken_at
             && crate::drift::timestamp_epoch(baseline).is_err()
         {
@@ -214,6 +213,43 @@ impl RetroConfig {
         }
         config.validate_department()?;
         Ok(config)
+    }
+
+    /// Minimal configuration used by the generated cadence snapshot command.
+    #[implements("FR-024-AC-24")]
+    pub fn for_team(team: String) -> Self {
+        let mut config = Self {
+            department: None,
+            linear_teams: vec![team.clone()],
+            projects: Vec::new(),
+            gate_tickets: Vec::new(),
+            repos: Vec::new(),
+            herdr_teams: Vec::new(),
+            thresholds: Thresholds::default(),
+            main_check: None,
+            local_paths: Vec::new(),
+            slot_process: None,
+            orphan_slot_hours: None,
+            gate_log: None,
+            relay_leads: Vec::new(),
+            message_stale_minutes: None,
+            decision_label: None,
+            baseline_taken_at: None,
+            review_round_limit: None,
+            team,
+        };
+        config.auto_detect_sources();
+        config
+    }
+
+    #[implements("FR-024-AC-24")]
+    fn auto_detect_sources(&mut self) {
+        if self.herdr_teams.is_empty() {
+            self.herdr_teams.push(self.team.clone());
+        }
+        if self.gate_log.is_none() {
+            self.gate_log = Some(retro_home().join(&self.team).join("gate.jsonl"));
+        }
     }
 
     /// Validates department configuration before any source or store operation.
@@ -229,6 +265,18 @@ impl RetroConfig {
         }
         Ok(())
     }
+}
+
+fn retro_home() -> PathBuf {
+    std::env::var_os("TEAM_RETRO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(PathBuf::from)
+                .map(|home| home.join(".local").join("state").join("team-retro"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".local/state/team-retro"))
 }
 
 /// Parses `90s`, `20m`, `4h` or `2d` into seconds.

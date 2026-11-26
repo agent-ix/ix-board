@@ -4131,7 +4131,7 @@ mod tests {
     }
 
     #[test]
-    #[trace("FR-047-AC-1")]
+    #[trace("FR-047-AC-1", "FR-047-AC-10")]
     fn fleet_ledger_due_action_adapter_uses_due_time_and_action_id() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("ledger.sqlite3");

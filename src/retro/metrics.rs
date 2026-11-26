@@ -83,6 +83,7 @@ pub fn collect_selected(
 #[implements("FR-024-AC-20")]
 #[implements("FR-024-AC-21")]
 #[implements("FR-024-AC-22")]
+#[implements("FR-024-AC-25")]
 fn collect_inner(
     config: &RetroConfig,
     frame: Frame,
@@ -193,7 +194,11 @@ fn collect_inner(
     if out.wants_any(&["main_red_incidents", "main_red_minutes"]) {
         stability(&mut out, sources);
     }
-    if out.wants_any(&["agents_working_share", "agents_idle_minutes_max"]) {
+    if out.wants_any(&[
+        "agents_working_share",
+        "agents_idle_minutes_max",
+        "unnamed_wait_minutes_max",
+    ]) {
         utilization(&mut out, sources);
     }
     if out.wants_any(&["worktrees_prunable", "disk_bytes", "orphan_slots"]) {
@@ -205,6 +210,7 @@ fn collect_inner(
     if out.wants("messages_undelivered") {
         relay(&mut out, sources);
     }
+    explicit_unavailable_metrics(&mut out);
     if let Some(requested) = requested {
         for id in requested {
             if out.metrics.contains_key(id) {
@@ -222,12 +228,54 @@ fn collect_inner(
         }
     } else {
         for entry in CATALOG {
-            if !out.metrics.contains_key(entry.id) {
-                out.put(entry.id, Err("collector/history not configured".to_owned()));
-            }
+            debug_assert!(
+                out.metrics.contains_key(entry.id),
+                "catalog metric {} has no collector",
+                entry.id
+            );
         }
     }
     out.metrics
+}
+
+#[implements("FR-024-AC-20")]
+fn explicit_unavailable_metrics(out: &mut Out<'_>) {
+    for (id, source, detail) in [
+        (
+            "prs_per_ticket_max",
+            "Linear/GitHub",
+            "attached pull-request collector is not configured",
+        ),
+        (
+            "commits_per_pr_max",
+            "GitHub",
+            "commit-history collector is not configured",
+        ),
+        (
+            "review_file_only_commits",
+            "GitHub",
+            "file-change collector is not configured",
+        ),
+        (
+            "review_rounds_over_limit",
+            "Linear markers",
+            "review-round collector is not configured",
+        ),
+        (
+            "non_code_check_reruns",
+            "GitHub checks",
+            "check-run collector is not configured",
+        ),
+        (
+            "host_load_per_core_max",
+            "scheduler host activity",
+            "host-load collector is not configured",
+        ),
+    ] {
+        if out.wants(id) && !out.metrics.contains_key(id) {
+            out.unavailable(id, format!("{source} source unavailable: {detail}"));
+        }
+    }
 }
 
 const LINEAR_SNAPSHOT_IDS: [&str; 12] = [
@@ -664,6 +712,7 @@ fn progress(
 /// the frame.
 #[implements("FR-047-AC-1")]
 #[implements("FR-024-AC-19")]
+#[implements("FR-024-AC-3")]
 fn window_progress(
     out: &mut Out<'_>,
     scope: &Scope<'_>,
@@ -677,9 +726,6 @@ fn window_progress(
     let mut wanted = Vec::new();
     if needs_path_done || needs_net || needs_closed_rate {
         wanted.extend(scope.path_ok().unwrap_or_default().iter().copied());
-    }
-    if needs_net || needs_closed_rate {
-        wanted.extend(scope.projects_ok().unwrap_or_default().iter().copied());
     }
     if !wanted.is_empty() {
         wanted.sort_by(|left, right| left.id.cmp(&right.id));
@@ -720,11 +766,7 @@ fn window_progress(
     }
     if needs_net {
         let net = (|| {
-            let mut union = scope.path_ok()?.to_vec();
-            union.extend(scope.projects_ok()?);
-            union.sort_by(|left, right| left.id.cmp(&right.id));
-            union.dedup_by(|left, right| left.id == right.id);
-            let closed = history.changed_in_window(&union, frame, to_completed)?;
+            let closed = history.changed_in_window(scope.path_ok()?, frame, to_completed)?;
             Ok::<_, String>(count(closed.len()) - count(created.clone().unwrap_or(Ok(0))?))
         })();
         out.put("net_closed_minus_new", net);
@@ -1317,19 +1359,38 @@ fn stability(out: &mut Out<'_>, sources: &Sources<'_>) {
 }
 
 #[implements("FR-047-AC-1")]
+#[implements("FR-024-AC-25")]
 fn utilization(out: &mut Out<'_>, sources: &Sources<'_>) {
     if out.config.herdr_teams.is_empty() {
-        out.not_configured("agents_working_share");
-        out.not_configured("agents_idle_minutes_max");
+        let reason = "herdr source missing: no workspace labels are configured".to_owned();
+        for id in [
+            "agents_working_share",
+            "agents_idle_minutes_max",
+            "unnamed_wait_minutes_max",
+        ] {
+            out.unavailable(id, reason.clone());
+        }
     } else {
         match sources.agents.report(&out.config.herdr_teams) {
             Err(error) => {
                 let reason = format!("herdr unavailable: {error}");
                 out.unavailable("agents_working_share", reason.clone());
-                out.unavailable("agents_idle_minutes_max", reason);
+                for id in ["agents_idle_minutes_max", "unnamed_wait_minutes_max"] {
+                    out.unavailable(id, reason.clone());
+                }
             }
-            Ok(report) if !report.errors.is_empty() || !report.missing_hosts.is_empty() => {
+            Ok(report)
+                if !report.errors.is_empty()
+                    || !report.missing_hosts.is_empty()
+                    || !report.missing_teams.is_empty() =>
+            {
                 let mut reasons = report.errors.clone();
+                reasons.extend(
+                    report
+                        .missing_teams
+                        .iter()
+                        .map(|team| format!("team {team}: Herdr workspace source missing")),
+                );
                 reasons.extend(
                     report
                         .missing_hosts
@@ -1344,7 +1405,9 @@ fn utilization(out: &mut Out<'_>, sources: &Sources<'_>) {
                 );
                 let reason = format!("herdr unavailable: {}", reasons.join("; "));
                 out.unavailable("agents_working_share", reason.clone());
-                out.unavailable("agents_idle_minutes_max", reason);
+                for id in ["agents_idle_minutes_max", "unnamed_wait_minutes_max"] {
+                    out.unavailable(id, reason.clone());
+                }
             }
             Ok(report) => {
                 let total = report.agents.len();
@@ -1362,7 +1425,7 @@ fn utilization(out: &mut Out<'_>, sources: &Sources<'_>) {
                             .iter()
                             .any(|row| row.verdict == crate::agents::Verdict::Unknown)
                     {
-                        Err("agent classification or population unresolved".into())
+                        Err("herdr agent-activity source has unresolved classification or population".into())
                     } else if total == 0 {
                         Err(EMPTY.to_owned())
                     } else {
@@ -1384,9 +1447,46 @@ fn utilization(out: &mut Out<'_>, sources: &Sources<'_>) {
                         (_, Some(secs)) => Ok(secs as f64 / 60.0),
                     },
                 );
+                let wait = if report.schema_version != crate::agents::AGENTS_SCHEMA_VERSION
+                    || !report.missing_teams.is_empty()
+                    || report.agents.iter().any(|row| row.partial)
+                {
+                    Err("herdr activity source incomplete for wait-loop evidence".to_owned())
+                } else {
+                    report
+                        .agents
+                        .iter()
+                        .filter(|row| is_unnamed_wait(row))
+                        .map(|row| {
+                            row.recent_activity_at
+                                .map(|at| row.host_now.saturating_sub(at) as f64 / 60.0)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "herdr activity source lacks last activity for {}",
+                                        row.title
+                                    )
+                                })
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                        .map(|waits| waits.into_iter().reduce(f64::max).unwrap_or(0.0))
+                };
+                out.put("unnamed_wait_minutes_max", wait);
             }
         }
     }
+}
+
+#[implements("FR-024-AC-25")]
+fn is_unnamed_wait(row: &crate::agents::AgentRow) -> bool {
+    let status = row.herdr_status.trim();
+    let wait_loop =
+        status.eq_ignore_ascii_case("LOOP(wait_loop)") || status.eq_ignore_ascii_case("wait_loop");
+    let named = row.notes.iter().any(|note| {
+        note.strip_prefix("named_wait:")
+            .or_else(|| note.strip_prefix("wait_name:"))
+            .is_some_and(|name| !name.trim().is_empty())
+    });
+    wait_loop && !named
 }
 
 fn relay(out: &mut Out<'_>, sources: &Sources<'_>) {
@@ -1471,10 +1571,11 @@ fn resources(out: &mut Out<'_>, sources: &Sources<'_>) {
     out.put("orphan_slots", orphans);
 }
 
+#[implements("FR-024-AC-24")]
 fn gate_log(out: &mut Out<'_>, sources: &Sources<'_>) {
     let Some(path) = out.config.gate_log.clone() else {
         for id in ["full_gates_max", "repins_total", "build_lock_wait_minutes"] {
-            out.not_configured(id);
+            out.unavailable(id, "gate_log source missing: no path configured".to_owned());
         }
         return;
     };
@@ -1519,14 +1620,13 @@ pub const NOT_RECONSTRUCTIBLE: &str = "not reconstructible";
 
 /// The metrics a past day can be measured for from issue creation, state history and pull
 /// request timestamps (FR-028).
-pub const RECONSTRUCTIBLE: [&str; 8] = [
+pub const RECONSTRUCTIBLE: [&str; 7] = [
     "prs_merged_per_hour",
     "pr_cycle_median_hours",
     "pr_cycle_p90_hours",
     "path_closed",
     "intake_new",
     "net_closed_minus_new",
-    "tickets_closed_per_hour",
     "done_reopened",
 ];
 
