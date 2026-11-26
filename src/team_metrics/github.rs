@@ -1769,6 +1769,7 @@ mod tests {
         );
     }
 
+    #[trace("FR-033-AC-13", "FR-033-AC-18")]
     #[test]
     fn repository_population_includes_merges_from_the_full_seven_day_window() {
         let dir = tempfile::tempdir().unwrap();

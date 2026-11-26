@@ -828,6 +828,7 @@ mod tests {
         assert_eq!(values["pr_changes_requested_share"], 1.0);
     }
 
+    #[trace("FR-033-AC-10", "FR-033-AC-17")]
     #[test]
     fn same_artifact_id_in_distinct_review_methods_keeps_findings_separate() {
         let first = comment(

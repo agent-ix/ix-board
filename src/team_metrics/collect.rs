@@ -366,12 +366,14 @@ fn load_review_marker_sync(state_path: &std::path::Path) -> ReviewMarkerSync {
     sync
 }
 
+#[implements("FR-033-AC-17")]
 fn prune_review_marker_age(sync: &mut ReviewMarkerSync, cutoff_ms: i64) {
     for channel in sync.channels.values_mut() {
         prune_marker_channel_age(channel, cutoff_ms);
     }
 }
 
+#[implements("FR-033-AC-17")]
 fn prune_marker_channel_age(channel: &mut ReviewMarkerChannel, cutoff_ms: i64) {
     channel.comments.retain(|_, comment| {
         comment
@@ -384,6 +386,7 @@ fn prune_marker_channel_age(channel: &mut ReviewMarkerChannel, cutoff_ms: i64) {
     });
 }
 
+#[implements("FR-033-AC-17")]
 fn prune_oldest_marker_comments(
     sync: &mut ReviewMarkerSync,
     max_bytes: usize,
@@ -2045,6 +2048,7 @@ fn prometheus_effort_range(
     parse_effort_range(&timestamps, &values, &expected_hosts, start, end)
 }
 
+#[implements("FR-033-AC-15")]
 fn expected_effort_hosts(
     inventory_values: &str,
     inventory_timestamps: &str,
@@ -2846,6 +2850,7 @@ mod tests {
         assert!(!channel.comments["comment-id"].body.contains("more prose"));
     }
 
+    #[trace("FR-033-AC-17")]
     #[test]
     fn marker_backfill_starts_at_the_retention_floor_and_store_prunes_oldest_rows() {
         let directory = tempfile::tempdir().unwrap();
@@ -2899,6 +2904,7 @@ mod tests {
         );
     }
 
+    #[trace("FR-033-AC-15")]
     #[test]
     fn effort_host_inventory_includes_hosts_without_current_lane_rows() {
         let values = serde_json::json!({

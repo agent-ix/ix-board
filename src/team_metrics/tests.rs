@@ -107,6 +107,7 @@ fn stale_review_evidence_omits_values_and_coverage() {
     assert!(text.contains("metric=\"pr_changes_requested_share\"} 0"));
 }
 
+#[trace("FR-033-AC-17")]
 #[test]
 fn empty_open_review_population_reports_why_changes_share_is_unavailable() {
     let dir = tempfile::tempdir().unwrap();
@@ -1235,6 +1236,7 @@ fn team_only_scope_accepts_narrower_reported_work_slices() {
     assert!(super::timeline::scope_matches(&selected, &reported));
 }
 
+#[trace("FR-033-AC-16")]
 #[test]
 fn team_only_scope_rejects_unattributed_or_other_team_ticket_slices() {
     let selected = Selectors {
