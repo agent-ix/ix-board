@@ -1010,6 +1010,7 @@ fn read_prometheus_status(teams: &BTreeSet<String>) -> Result<PrometheusLeadStat
     Ok(PrometheusLeadStatus { lane_status })
 }
 
+#[implements("FR-033-AC-16")]
 pub(super) fn join_prometheus_samples(
     values_body: &str,
     timestamps_body: &str,
@@ -1169,6 +1170,7 @@ pub(super) fn classify_team_lanes(
     (expected, observed, working)
 }
 
+#[implements("FR-033-AC-17")]
 fn first_review_population(prs: &[retro::sources::PullRequest]) -> BTreeMap<String, f64> {
     prs.iter()
         .filter(|pr| !pr.draft)
@@ -1177,6 +1179,7 @@ fn first_review_population(prs: &[retro::sources::PullRequest]) -> BTreeMap<Stri
 }
 
 /// Counts verified path closures by UTC day from retained Linear histories and configured repos.
+#[implements("FR-033-AC-18")]
 fn verified_closure_history_path() -> Result<PathBuf, String> {
     let cache_path = match std::env::var_os("IX_BOARD_CACHE_PATH") {
         Some(path) => PathBuf::from(path),
@@ -2033,6 +2036,7 @@ mod tests {
         }
     }
 
+    #[trace("FR-033-AC-17")]
     #[test]
     fn first_review_population_excludes_draft_pull_requests() {
         let pull_request = |number, draft| retro::sources::PullRequest {
@@ -2061,6 +2065,7 @@ mod tests {
         );
     }
 
+    #[trace("FR-033-AC-18")]
     #[test]
     fn daily_closures_keep_successful_repositories_when_one_verification_fails() {
         let directory = tempfile::tempdir().unwrap();

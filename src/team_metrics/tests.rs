@@ -437,6 +437,7 @@ fn team_lane_classification_uses_latest_state_and_exact_workspace() {
     );
 }
 
+#[trace("FR-033-AC-16")]
 #[test]
 fn prometheus_lane_join_keeps_gauge_value_and_source_timestamp() {
     let labels = serde_json::json!({
@@ -458,6 +459,7 @@ fn prometheus_lane_join_keeps_gauge_value_and_source_timestamp() {
     assert_eq!(joined[0].value, 1.0);
 }
 
+#[trace("FR-033-AC-16")]
 #[test]
 fn conflicting_fresh_lane_states_are_not_classified() {
     use super::collect::{PrometheusLeadStatus, PrometheusSample};

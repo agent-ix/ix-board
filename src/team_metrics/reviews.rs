@@ -582,6 +582,7 @@ mod tests {
         assert_eq!(values["review_prs_with_findings_share_24h"], 0.0);
     }
 
+    #[trace("FR-033-AC-17")]
     #[test]
     fn later_clean_review_does_not_hide_an_unresolved_older_finding() {
         let older = comment(
@@ -603,6 +604,7 @@ mod tests {
         assert_eq!(values["pr_changes_requested_share"], 1.0);
     }
 
+    #[trace("FR-033-AC-17")]
     #[test]
     fn latest_disposition_mergeability_marks_the_open_pr() {
         let review = comment(
