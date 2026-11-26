@@ -4,6 +4,7 @@
 use super::Config;
 use super::github_http::Http;
 use crate::retro::sources::{GithubSource, MainCommit, PullRequest, PullRequestInfo};
+use ix_trace_rs::implements;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -43,6 +44,29 @@ impl Request {
         Ok(body)
     }
 }
+
+/// Executes one bounded, quota-admitted GraphQL query through the shared GitHub
+/// journal. Callers must include a `repository` field in the returned `data`.
+/// The query and variables are part of the shared cache key; response validation,
+/// timeout, rolling-hour admission and cooldown are handled by `Guard`.
+pub(crate) fn guarded_graphql(
+    state_path: &std::path::Path,
+    max_bytes: u64,
+    query: &str,
+    variables: BTreeMap<String, String>,
+) -> Result<serde_json::Value, String> {
+    if query.is_empty() || query.len() > MAX_QUERY || variables.len() > 16 {
+        return Err("GitHub query exceeds bounded request shape".into());
+    }
+    let request = Request {
+        query: query.to_owned(),
+        variables,
+        conditional: false,
+    };
+    let guard = Guard::open_storage(state_path, max_bytes, Http::local()?)?;
+    let cached = guard.request(&request, |body, _| graph_body(body).map(|_| ()))?;
+    serde_json::from_str(&cached.body).map_err(|_| "GitHub response is not valid JSON".into())
+}
 pub(super) struct Response {
     pub(super) status: u16,
     pub(super) headers: BTreeMap<String, String>,
@@ -73,15 +97,36 @@ struct Guard<T> {
 }
 impl<T: Transport> Guard<T> {
     fn open(config: &Config, transport: T) -> Result<Self, String> {
-        Self::with_clock(config, transport, Arc::new(SystemClock))
+        Self::with_storage(
+            &config.state_path,
+            config.max_bytes,
+            transport,
+            Arc::new(SystemClock),
+        )
     }
+    fn open_storage(
+        state_path: &std::path::Path,
+        max_bytes: u64,
+        transport: T,
+    ) -> Result<Self, String> {
+        Self::with_storage(state_path, max_bytes, transport, Arc::new(SystemClock))
+    }
+    #[cfg(test)]
     fn with_clock(config: &Config, transport: T, clock: Arc<dyn Clock>) -> Result<Self, String> {
+        Self::with_storage(&config.state_path, config.max_bytes, transport, clock)
+    }
+    fn with_storage(
+        state_path: &std::path::Path,
+        max_bytes: u64,
+        transport: T,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self, String> {
         if transport.namespace().is_empty() || transport.namespace().len() > 256 {
             return Err("GitHub credential namespace unavailable".into());
         }
         // Use the journal itself: two workers and restarted processes share admission,
         // response leases and the configured SQLite page ceiling, with no new quota file.
-        let db = Connection::open(&config.state_path).map_err(|e| e.to_string())?;
+        let db = Connection::open(state_path).map_err(|e| e.to_string())?;
         db.busy_timeout(Duration::from_millis(250))
             .map_err(|e| e.to_string())?;
         let version: i64 = db
@@ -96,10 +141,10 @@ impl<T: Transport> Guard<T> {
         let pages: u64 = db
             .pragma_query_value(None, "page_count", |r| r.get(0))
             .map_err(|e| e.to_string())?;
-        if pages.saturating_mul(page_size) > config.max_bytes {
+        if pages.saturating_mul(page_size) > max_bytes {
             return Err("GitHub shared journal exceeds storage ceiling".into());
         }
-        db.pragma_update(None, "max_page_count", config.max_bytes / page_size)
+        db.pragma_update(None, "max_page_count", max_bytes / page_size)
             .map_err(|e| e.to_string())?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS github_gate(id INTEGER PRIMARY KEY CHECK(id=1), cooldown INTEGER NOT NULL, lease INTEGER NOT NULL); INSERT OR IGNORE INTO github_gate VALUES(1,0,0); CREATE TABLE IF NOT EXISTS github_clock(id INTEGER PRIMARY KEY CHECK(id=1), at INTEGER NOT NULL); INSERT OR IGNORE INTO github_clock VALUES(1,0); CREATE TABLE IF NOT EXISTS github_sends(at INTEGER NOT NULL, cost INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS github_responses(key TEXT PRIMARY KEY, body TEXT NOT NULL, etag TEXT, at INTEGER NOT NULL);").map_err(|e| e.to_string())?;
         db.execute("UPDATE github_clock SET at=max(at,coalesce((SELECT max(at) FROM github_sends),0),coalesce((SELECT max(at) FROM github_responses),0)) WHERE id=1", []).map_err(|e| e.to_string())?;
@@ -107,7 +152,7 @@ impl<T: Transport> Guard<T> {
             db: RefCell::new(db),
             transport,
             clock,
-            cache_bytes: i64::try_from(config.max_bytes / 8)
+            cache_bytes: i64::try_from(max_bytes / 8)
                 .map_err(|_| "cache budget overflow")?
                 .min(CACHE_BYTES),
         })
@@ -310,6 +355,8 @@ fn backoff(response: &Response, now: i64) -> i64 {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GraphResponse {
+    #[serde(default)]
+    errors: Option<Vec<serde_json::Value>>,
     data: GraphData,
 }
 #[derive(Deserialize)]
@@ -317,7 +364,10 @@ struct GraphResponse {
 struct GraphData {
     #[serde(rename = "rateLimit")]
     rate: Rate,
-    repository: serde_json::Value,
+    #[serde(default)]
+    repository: Option<serde_json::Value>,
+    #[serde(default)]
+    node: Option<serde_json::Value>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -327,15 +377,42 @@ struct Rate {
     #[serde(rename = "resetAt")]
     reset_at: String,
 }
+#[implements("FR-033-AC-13")]
 fn graph_body(body: &str) -> Result<String, String> {
-    let response: GraphResponse = serde_json::from_str(body).map_err(|e| e.to_string())?;
-    if response.data.rate.cost > u64::try_from(RESERVED_COST).map_err(|_| "cost overflow")?
-        || response.data.rate.remaining == 0
-        || epoch(&response.data.rate.reset_at).is_err()
+    let value: serde_json::Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    if value
+        .get("errors")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|errors| !errors.is_empty())
+    {
+        return Err("GitHub GraphQL returned errors".into());
+    }
+    let response: GraphResponse = serde_json::from_value(value).map_err(|e| e.to_string())?;
+    if response
+        .errors
+        .as_ref()
+        .is_some_and(|errors| !errors.is_empty())
+    {
+        return Err("GitHub GraphQL returned errors".into());
+    }
+    let response_data = response.data;
+    if response_data.rate.cost > u64::try_from(RESERVED_COST).map_err(|_| "cost overflow")?
+        || response_data.rate.remaining == 0
+        || epoch(&response_data.rate.reset_at).is_err()
     {
         return Err("GitHub GraphQL cost/quota evidence unavailable".into());
     }
-    Ok(serde_json::json!({"data":{"repository":response.data.repository}}).to_string())
+    if response_data.repository.is_none() && response_data.node.is_none() {
+        return Err("GitHub GraphQL response has no supported data connection".into());
+    }
+    let mut data = serde_json::Map::new();
+    if let Some(repository) = response_data.repository {
+        data.insert("repository".into(), repository);
+    }
+    if let Some(node) = response_data.node {
+        data.insert("node".into(), node);
+    }
+    Ok(serde_json::json!({"data":data}).to_string())
 }
 fn graph_request(query: &str, repo: &str, after: Option<&str>) -> Result<Request, String> {
     let mut pieces = repo.split('/');
@@ -589,6 +666,8 @@ fn validate_page(
     let nodes = response
         .data
         .repository
+        .as_ref()
+        .ok_or("GitHub PR repository unavailable")?
         .get("pullRequests")
         .and_then(|r| r.get("nodes"))
         .and_then(serde_json::Value::as_array)
@@ -695,8 +774,12 @@ fn parse_infos(
 ) -> Result<BTreeMap<u64, PullRequestInfo>, String> {
     graph_body(body)?;
     let response: GraphResponse = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    let repository = response
+        .data
+        .repository
+        .ok_or_else(|| "GitHub PR repository unavailable".to_owned())?;
     let mut data: BTreeMap<String, Option<RawInfo>> =
-        serde_json::from_value(response.data.repository).map_err(|e| e.to_string())?;
+        serde_json::from_value(repository).map_err(|e| e.to_string())?;
     let mut rows = BTreeMap::new();
     for n in numbers {
         let info = data
@@ -1295,6 +1378,29 @@ mod tests {
     }
     fn graph_body_validator(body: &str, _at: i64) -> Result<(), String> {
         graph_body(body).map(|_| ())
+    }
+
+    #[trace("FR-033-AC-13")]
+    #[test]
+    fn graph_body_preserves_node_connections_and_rejects_graph_errors() {
+        let body = serde_json::json!({
+            "data": {
+                "rateLimit": {"cost": 1, "remaining": 100, "resetAt": "2030-01-01T00:00:00Z"},
+                "node": {"pullRequests": {"nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}}}
+            }
+        })
+        .to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&graph_body(&body).unwrap()).unwrap();
+        assert_eq!(
+            parsed.pointer("/data/node/pullRequests/nodes"),
+            Some(&serde_json::json!([]))
+        );
+
+        let errors = r#"{"errors":[{"message":"denied"}]}"#;
+        assert_eq!(
+            graph_body(errors).unwrap_err(),
+            "GitHub GraphQL returned errors"
+        );
     }
 
     #[trace("FR-033-AC-12", "FR-033-AC-13")]

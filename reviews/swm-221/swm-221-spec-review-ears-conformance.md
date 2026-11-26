@@ -1,0 +1,56 @@
+---
+id: SR-6713
+title: "SWM-221 FR-047 EARS conformance review"
+type: SpecReview
+analysis: ears-conformance
+scope: "agent-ix/ix-board@7d500013413471112318d4e8b8727089b54d8ed6; spec/functional/FR-047-retro-eval.md"
+review_set: subset
+relationships:
+  - target: "ix://agent-ix/ix-board/FR-047"
+    type: reviews
+---
+
+# SR-6713: SWM-221 FR-047 EARS conformance review
+
+## Summary
+
+Ticket: SWM-221. EARS grammar conformance of FR-047 description and behaviour statements.
+
+## Verdict
+
+**CONDITIONAL** - low findings only.
+
+## Findings
+
+| ID | Severity | Summary | Refs |
+| --- | --- | --- | --- |
+| FND-001 | low | The description packs five obligations (evaluate, return, show change, read, not infer and not write) into three compound SHALL sentences. | spec/functional/FR-047-retro-eval.md:23-29 |
+| FND-002 | low | Behaviour bullets state obligations descriptively (`accepts`, `is`, `are`) without SHALL, and `a bounded duration` names no bound. | spec/functional/FR-047-retro-eval.md:44-47 |
+
+## Scope
+
+- FR-047 (examined): spec/functional/FR-047-retro-eval.md
+- FR-047/Behavior (examined): spec/functional/FR-047-retro-eval.md
+
+## Dispositions
+
+| FND | Outcome | Reason |
+| --- | --- | --- |
+| FND-001 | still-open | The Description continues to combine several independent obligations in compound SHALL sentences. |
+| FND-002 | still-open | Behavior bullets remain descriptive rather than SHALL requirements, and “bounded duration” still gives no bound. |
+
+### Round 2
+
+| FND | Outcome | Reason |
+| --- | --- | --- |
+| FND-001 | still-open | Compound SHALL obligations remain in the Description. |
+| FND-002 | still-open | Behavior remains descriptive and “bounded duration” remains unbounded. |
+
+### Round 3
+
+Reviewed head: `81e2852d82a2c128fdb3e5f8c05fc2a7d58f6811`. No spec changes since round 2.
+
+| FND | Outcome | Reason |
+| --- | --- | --- |
+| FND-001 | still-open | Compound SHALL clauses remain. |
+| FND-002 | still-open | Descriptive behavior and unbounded duration remain. |

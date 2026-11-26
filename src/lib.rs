@@ -170,6 +170,9 @@ pub enum Error {
     /// A single request exceeds Linear's fixed complexity ceiling.
     #[error("Linear query complexity {cost} exceeds limit {limit}")]
     LinearQueryComplexityExceeded { cost: u64, limit: u64 },
+    /// This retro evaluation has used its shared Linear request allowance.
+    #[error("retro-evaluation Linear request budget exhausted at {limit} requests")]
+    RetroEvaluationRequestBudgetExceeded { limit: u64 },
     /// Neither an environment override nor a saved Linear credential exists.
     #[error("Linear API key is missing; run `ix-board auth login` or set LINEAR_API_KEY")]
     MissingApiKey,
@@ -487,6 +490,7 @@ impl RefreshOutcome {
             Error::LinearRateLimited { .. }
             | Error::LinearLocalBudgetExhausted { .. }
             | Error::LinearQueryComplexityExceeded { .. }
+            | Error::RetroEvaluationRequestBudgetExceeded { .. }
             | Error::InvalidQuotaConfig { .. } => Self::Unknown,
             _ => Self::SourceFailed,
         }

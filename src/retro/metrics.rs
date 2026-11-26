@@ -6,6 +6,7 @@
 //! Every source is read at most once per run. A metric whose source failed, was incomplete or
 //! is not configured is `unavailable` with a reason and a null value, never zero.
 
+use ix_trace_rs::implements;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::catalog::{CATALOG, Metric, Status, definition};
@@ -55,64 +56,184 @@ impl Frame {
 }
 
 /// Computes every catalog metric once.
+#[implements("FR-047-AC-1")]
 pub fn collect(
     config: &RetroConfig,
     frame: Frame,
     sources: &Sources<'_>,
 ) -> BTreeMap<String, Metric> {
+    collect_inner(config, frame, sources, None)
+}
+
+/// Computes only the requested catalog ids, avoiding unrelated live source families.
+/// Missing requested ids are explicitly unavailable and never synthesized as zero.
+#[implements("FR-047-AC-1")]
+pub fn collect_selected(
+    config: &RetroConfig,
+    frame: Frame,
+    sources: &Sources<'_>,
+    requested: &BTreeSet<String>,
+) -> BTreeMap<String, Metric> {
+    collect_inner(config, frame, sources, Some(requested))
+}
+
+#[implements("FR-047-AC-1")]
+#[implements("FR-024-AC-19")]
+fn collect_inner(
+    config: &RetroConfig,
+    frame: Frame,
+    sources: &Sources<'_>,
+    requested: Option<&BTreeSet<String>>,
+) -> BTreeMap<String, Metric> {
     let mut out = Out {
         config,
         frame,
         metrics: BTreeMap::new(),
+        requested,
     };
-    let stale_hours = config.thresholds.in_progress_stale_hours.unwrap_or(0);
-    // The stale rule looks back further than the window when its threshold is larger.
-    let since = frame
-        .start()
-        .min(frame.now - stale_hours as f64 * 3600.0)
-        .max(0.0);
-    let workspace = sources.linear.workspace(since);
-    let mut history = History {
-        source: sources.linear,
-        cache: BTreeMap::new(),
-    };
-    let prs = list_pull_requests(config, sources.github, frame.start());
-    match &workspace {
-        Ok(snapshot) => {
-            let scope = Scope::new(config, snapshot, frame);
-            progress(&mut out, &scope, &mut history, sources);
-            rework_issues(&mut out, &scope, &mut history);
-            issue_scope(&mut out, &scope, &mut history, sources);
-        }
-        Err(error) => {
-            let reason = format!("Linear unavailable: {error}");
-            for id in LINEAR_SNAPSHOT_IDS {
-                out.unavailable(id, reason.clone());
+    let wants_linear = out.wants_any(&[
+        "path_remaining",
+        "path_closed",
+        "intake_new",
+        "net_closed_minus_new",
+        "tickets_closed_per_hour",
+        "gates_remaining",
+        "path_closed_unverified",
+        "done_reopened",
+        "issues_without_project",
+        "issues_without_milestone",
+        "in_progress_stale",
+        "source_count_disagreement",
+    ]);
+    if wants_linear {
+        let stale_hours = config.thresholds.in_progress_stale_hours.unwrap_or(0);
+        // The stale rule looks back further than the window when its threshold is larger.
+        let since = frame
+            .start()
+            .min(frame.now - stale_hours as f64 * 3600.0)
+            .max(0.0);
+        let workspace = sources.linear.workspace(since);
+        let mut history = History {
+            source: sources.linear,
+            cache: BTreeMap::new(),
+        };
+        match &workspace {
+            Ok(snapshot) => {
+                let scope = Scope::new(config, snapshot, frame);
+                if out.wants_any(&[
+                    "path_remaining",
+                    "path_closed",
+                    "intake_new",
+                    "net_closed_minus_new",
+                    "tickets_closed_per_hour",
+                    "gates_remaining",
+                    "path_closed_unverified",
+                ]) {
+                    progress(&mut out, &scope, &mut history, sources);
+                }
+                if out.wants("done_reopened") {
+                    rework_issues(&mut out, &scope, &mut history);
+                }
+                if out.wants_any(&[
+                    "issues_without_project",
+                    "issues_without_milestone",
+                    "in_progress_stale",
+                    "source_count_disagreement",
+                ]) {
+                    issue_scope(&mut out, &scope, &mut history, sources);
+                }
+            }
+            Err(error) => {
+                let reason = format!("Linear unavailable: {error}");
+                for id in LINEAR_SNAPSHOT_IDS {
+                    out.unavailable(id, reason.clone());
+                }
+                out.unavailable("done_reopened", reason);
             }
         }
     }
-    decisions(&mut out, sources);
-    fix_rounds(&mut out, sources, &prs);
-    flow(&mut out, &prs);
-    stability(&mut out, sources);
-    utilization(&mut out, sources);
-    resources(&mut out, sources);
-    gate_log(&mut out, sources);
-    for entry in CATALOG {
-        debug_assert!(
-            out.metrics.contains_key(entry.id),
-            "{} not computed",
-            entry.id
-        );
+
+    if out.wants_any(&["decisions_open", "decision_oldest_hours"]) {
+        decisions(&mut out, sources);
+    }
+    let needs_prs = out.wants_any(&[
+        "fix_rounds_max",
+        "fix_rounds_total",
+        "head_force_pushes_max",
+        "prs_merged_per_hour",
+        "pr_cycle_median_hours",
+        "pr_cycle_p90_hours",
+        "prs_open",
+        "prs_idle",
+        "prs_oversize",
+        "prs_ready_unmerged",
+    ]);
+    if needs_prs {
+        let prs = list_pull_requests(config, sources.github, frame.start());
+        if out.wants_any(&["fix_rounds_max", "fix_rounds_total"]) {
+            fix_rounds(&mut out, sources, &prs);
+        }
+        if out.wants_any(&[
+            "head_force_pushes_max",
+            "prs_merged_per_hour",
+            "pr_cycle_median_hours",
+            "pr_cycle_p90_hours",
+            "prs_open",
+            "prs_idle",
+            "prs_oversize",
+            "prs_ready_unmerged",
+        ]) {
+            flow(&mut out, &prs);
+        }
+    }
+    if out.wants_any(&["main_red_incidents", "main_red_minutes"]) {
+        stability(&mut out, sources);
+    }
+    if out.wants_any(&["agents_working_share", "agents_idle_minutes_max"]) {
+        utilization(&mut out, sources);
+    }
+    if out.wants_any(&["worktrees_prunable", "disk_bytes", "orphan_slots"]) {
+        resources(&mut out, sources);
+    }
+    if out.wants_any(&["full_gates_max", "repins_total", "build_lock_wait_minutes"]) {
+        gate_log(&mut out, sources);
+    }
+    if out.wants("messages_undelivered") {
+        relay(&mut out, sources);
+    }
+    if let Some(requested) = requested {
+        for id in requested {
+            if out.metrics.contains_key(id) {
+                continue;
+            }
+            if let Some(entry) = definition(id) {
+                out.put(
+                    entry.id,
+                    Err(
+                        "requested retro metric was not produced by its selected source family"
+                            .to_owned(),
+                    ),
+                );
+            }
+        }
+    } else {
+        for entry in CATALOG {
+            debug_assert!(
+                out.metrics.contains_key(entry.id),
+                "{} not computed",
+                entry.id
+            );
+        }
     }
     out.metrics
 }
 
-const LINEAR_SNAPSHOT_IDS: [&str; 11] = [
+const LINEAR_SNAPSHOT_IDS: [&str; 12] = [
     "path_remaining",
     "path_closed",
     "intake_new",
     "net_closed_minus_new",
+    "tickets_closed_per_hour",
     "gates_remaining",
     "path_closed_unverified",
     "done_reopened",
@@ -126,10 +247,15 @@ struct Out<'a> {
     config: &'a RetroConfig,
     frame: Frame,
     metrics: BTreeMap<String, Metric>,
+    requested: Option<&'a BTreeSet<String>>,
 }
 
 impl Out<'_> {
+    #[implements("FR-047-AC-1")]
     fn put(&mut self, id: &'static str, outcome: Outcome) {
+        if !self.wants(id) {
+            return;
+        }
         let Some(entry) = definition(id) else {
             return;
         };
@@ -159,6 +285,17 @@ impl Out<'_> {
         }
     }
 
+    #[implements("FR-047-AC-1")]
+    fn wants(&self, id: &str) -> bool {
+        self.requested
+            .is_none_or(|requested| requested.contains(id))
+    }
+
+    #[implements("FR-047-AC-1")]
+    fn wants_any(&self, ids: &[&str]) -> bool {
+        ids.iter().any(|id| self.wants(id))
+    }
+
     fn not_configured(&mut self, id: &'static str) {
         self.unavailable(id, NOT_CONFIGURED.to_owned());
     }
@@ -182,6 +319,10 @@ impl Out<'_> {
             "net_closed_minus_new" => (
                 "linear",
                 format!("project and path issues completed in the window (counted once) minus intake_new; {window}"),
+            ),
+            "tickets_closed_per_hour" => (
+                "linear+github",
+                format!("unique configured project and gate-path issues completed in the window with at least one attached merged pull request, divided by window hours; {window}"),
             ),
             "gates_remaining" => ("linear", format!("gate tickets not completed; gates={gates}")),
             "path_closed_unverified" => (
@@ -455,81 +596,143 @@ fn count(value: usize) -> f64 {
     value as f64
 }
 
+#[implements("FR-047-AC-1")]
+#[implements("FR-024-AC-19")]
 fn progress(
     out: &mut Out<'_>,
     scope: &Scope<'_>,
     history: &mut History<'_>,
     sources: &Sources<'_>,
 ) {
-    let path_done = window_progress(out, scope, history);
-    out.put(
-        "path_remaining",
-        scope
-            .path_ok()
-            .map(|path| count(path.iter().filter(|issue| issue_is_open(issue)).count())),
-    );
-    let gates = gate_issues(scope).map(|gates| {
-        count(
-            gates
-                .iter()
-                .filter(|issue| issue.state_type != WorkflowStateType::Completed)
-                .count(),
-        )
-    });
-    out.put("gates_remaining", gates);
-    let unverified = path_done.and_then(|done| {
-        let candidates = scope
-            .path_ok()?
-            .iter()
-            .filter(|issue| done.contains(&issue.id))
-            .copied()
-            .collect::<Vec<_>>();
-        unverified_count(&candidates, sources)
-    });
-    out.put("path_closed_unverified", unverified);
+    if out.wants("path_remaining") {
+        out.put(
+            "path_remaining",
+            scope
+                .path_ok()
+                .map(|path| count(path.iter().filter(|issue| issue_is_open(issue)).count())),
+        );
+    }
+    if out.wants("gates_remaining") {
+        let gates = gate_issues(scope).map(|gates| {
+            count(
+                gates
+                    .iter()
+                    .filter(|issue| issue.state_type != WorkflowStateType::Completed)
+                    .count(),
+            )
+        });
+        out.put("gates_remaining", gates);
+    }
+    if out.wants_any(&[
+        "path_closed",
+        "intake_new",
+        "net_closed_minus_new",
+        "tickets_closed_per_hour",
+        "path_closed_unverified",
+    ]) {
+        let path_done = window_progress(out, scope, history, sources.github);
+        if out.wants("path_closed_unverified") {
+            let unverified = path_done.and_then(|done| {
+                let candidates = scope
+                    .path_ok()?
+                    .iter()
+                    .filter(|issue| done.contains(&issue.id))
+                    .copied()
+                    .collect::<Vec<_>>();
+                unverified_count(&candidates, sources)
+            });
+            out.put("path_closed_unverified", unverified);
+        }
+    }
 }
 
-/// `path_closed`, `intake_new` and `net_closed_minus_new`: the progress metrics that depend only
+/// Progress metrics that depend only
 /// on issue creation and state history inside the frame. Returns the path issues completed in
 /// the frame.
+#[implements("FR-047-AC-1")]
+#[implements("FR-024-AC-19")]
 fn window_progress(
     out: &mut Out<'_>,
     scope: &Scope<'_>,
     history: &mut History<'_>,
+    github: &dyn GithubSource,
 ) -> Result<BTreeSet<IssueId>, String> {
     let frame = scope.frame;
-    let mut wanted = scope.path_ok().unwrap_or_default().to_vec();
-    wanted.extend(scope.projects_ok().unwrap_or_default().iter().copied());
-    history.prefetch(&wanted, frame.start());
-    let path_done = scope
-        .path_ok()
-        .and_then(|path| history.changed_in_window(path, frame, to_completed));
-    out.put(
-        "path_closed",
-        path_done.clone().map(|done| count(done.len())),
-    );
-    let created = scope.projects_ok().map(|issues| {
-        issues
-            .iter()
-            .filter(|issue| {
-                issue
-                    .created_at
-                    .as_deref()
-                    .and_then(epoch)
-                    .is_some_and(|at| frame.contains(at))
-            })
-            .count()
-    });
-    out.put("intake_new", created.clone().map(count));
-    let net = (|| {
-        let mut union = scope.projects_ok()?.to_vec();
-        union.extend(scope.path_ok()?.iter().copied());
-        union.sort_by(|left, right| left.id.cmp(&right.id));
-        union.dedup_by(|left, right| left.id == right.id);
-        let closed = history.changed_in_window(&union, frame, to_completed)?;
-        Ok::<_, String>(count(closed.len()) - count(created.clone()?))
-    })();
-    out.put("net_closed_minus_new", net);
+    let needs_path_done = out.wants_any(&["path_closed", "path_closed_unverified"]);
+    let needs_net = out.wants("net_closed_minus_new");
+    let needs_closed_rate = out.wants("tickets_closed_per_hour");
+    let mut wanted = Vec::new();
+    if needs_path_done || needs_net || needs_closed_rate {
+        wanted.extend(scope.path_ok().unwrap_or_default().iter().copied());
+    }
+    if needs_net || needs_closed_rate {
+        wanted.extend(scope.projects_ok().unwrap_or_default().iter().copied());
+    }
+    if !wanted.is_empty() {
+        wanted.sort_by(|left, right| left.id.cmp(&right.id));
+        wanted.dedup_by(|left, right| left.id == right.id);
+        history.prefetch(&wanted, frame.start());
+    }
+    let path_done = if needs_path_done {
+        scope
+            .path_ok()
+            .and_then(|path| history.changed_in_window(path, frame, to_completed))
+    } else {
+        Ok(BTreeSet::new())
+    };
+    if out.wants("path_closed") {
+        out.put(
+            "path_closed",
+            path_done.clone().map(|done| count(done.len())),
+        );
+    }
+    let created = if out.wants_any(&["intake_new", "net_closed_minus_new"]) {
+        Some(scope.projects_ok().map(|issues| {
+            issues
+                .iter()
+                .filter(|issue| {
+                    issue
+                        .created_at
+                        .as_deref()
+                        .and_then(epoch)
+                        .is_some_and(|at| frame.contains(at))
+                })
+                .count()
+        }))
+    } else {
+        None
+    };
+    if out.wants("intake_new") {
+        out.put("intake_new", created.clone().unwrap_or(Ok(0)).map(count));
+    }
+    if needs_net {
+        let net = (|| {
+            let union = wanted;
+            let closed = history.changed_in_window(&union, frame, to_completed)?;
+            Ok::<_, String>(count(closed.len()) - count(created.clone().unwrap_or(Ok(0))?))
+        })();
+        out.put("net_closed_minus_new", net);
+    }
+    if needs_closed_rate {
+        let closed_rate = (|| {
+            let mut eligible = scope.path_ok()?.to_vec();
+            eligible.extend(scope.projects_ok()?);
+            eligible.sort_by(|left, right| left.id.cmp(&right.id));
+            eligible.dedup_by(|left, right| left.id == right.id);
+            let closed = history.changed_in_window(&eligible, frame, to_completed)?;
+            let candidates = eligible
+                .into_iter()
+                .filter(|issue| closed.contains(&issue.id))
+                .collect::<Vec<_>>();
+            let unverified = unverified_count_with_github(&candidates, github)? as usize;
+            let merged_closed = candidates.len().saturating_sub(unverified);
+            if frame.hours() <= 0.0 {
+                return Err("closed-ticket rate requires a positive frame duration".to_owned());
+            }
+            Ok(count(merged_closed) / frame.hours())
+        })();
+        out.put("tickets_closed_per_hour", closed_rate);
+    }
     path_done
 }
 
@@ -568,6 +771,11 @@ fn attached_pull_requests(issue: &Issue) -> Vec<(String, u64)> {
 }
 
 fn unverified_count(candidates: &[&Issue], sources: &Sources<'_>) -> Outcome {
+    unverified_count_with_github(candidates, sources.github)
+}
+
+#[implements("FR-024-AC-19")]
+fn unverified_count_with_github(candidates: &[&Issue], github: &dyn GithubSource) -> Outcome {
     let mut unverified = 0;
     for issue in candidates {
         if !issue.attachments_complete {
@@ -578,8 +786,7 @@ fn unverified_count(candidates: &[&Issue], sources: &Sources<'_>) -> Outcome {
         }
         let mut merged = false;
         for (repo, number) in attached_pull_requests(issue) {
-            merged |= sources
-                .github
+            merged |= github
                 .pull_request(&repo, number)
                 .map_err(|error| format!("GitHub unavailable: {repo}#{number}: {error}"))?
                 .merged;
@@ -607,6 +814,7 @@ fn rework_issues(out: &mut Out<'_>, scope: &Scope<'_>, history: &mut History<'_>
     out.put("done_reopened", reopened);
 }
 
+#[implements("FR-047-AC-1")]
 fn issue_scope(
     out: &mut Out<'_>,
     scope: &Scope<'_>,
@@ -627,47 +835,55 @@ fn issue_scope(
             issue_is_open(issue) && teams.contains(&issue.team_key.0.to_ascii_uppercase())
         })
         .collect::<Vec<_>>();
-    out.put(
-        "issues_without_project",
-        Ok(count(
-            open_in_teams
+    if out.wants("issues_without_project") {
+        out.put(
+            "issues_without_project",
+            Ok(count(
+                open_in_teams
+                    .iter()
+                    .filter(|issue| issue.project_id.is_none())
+                    .count(),
+            )),
+        );
+    }
+    if out.wants("issues_without_milestone") {
+        out.put(
+            "issues_without_milestone",
+            Ok(count(
+                open_in_teams
+                    .iter()
+                    .filter(|issue| issue.project_milestone_id.is_none())
+                    .count(),
+            )),
+        );
+    }
+    if out.wants("source_count_disagreement") {
+        let disagreement = (|| {
+            let snapshot_open = scope
+                .projects_ok()?
                 .iter()
-                .filter(|issue| issue.project_id.is_none())
-                .count(),
-        )),
-    );
-    out.put(
-        "issues_without_milestone",
-        Ok(count(
-            open_in_teams
-                .iter()
-                .filter(|issue| issue.project_milestone_id.is_none())
-                .count(),
-        )),
-    );
-    let disagreement = (|| {
-        let snapshot_open = scope
-            .projects_ok()?
-            .iter()
-            .filter(|issue| issue_is_open(issue))
-            .count();
-        let mut chunk_open = 0;
-        for project in &config.projects {
-            chunk_open += sources
-                .linear
-                .project_open_count(project)
-                .map_err(|error| {
-                    format!("Linear unavailable: project-chunk read of {project}: {error}")
-                })?;
-        }
-        Ok::<_, String>(count(snapshot_open.abs_diff(chunk_open)))
-    })();
-    out.put("source_count_disagreement", disagreement);
-    let stale = match config.thresholds.in_progress_stale_hours {
-        None => Err(NOT_CONFIGURED.to_owned()),
-        Some(hours) => stale_count(scope, history, sources, &open_in_teams, hours),
-    };
-    out.put("in_progress_stale", stale);
+                .filter(|issue| issue_is_open(issue))
+                .count();
+            let mut chunk_open = 0;
+            for project in &config.projects {
+                chunk_open += sources
+                    .linear
+                    .project_open_count(project)
+                    .map_err(|error| {
+                        format!("Linear unavailable: project-chunk read of {project}: {error}")
+                    })?;
+            }
+            Ok::<_, String>(count(snapshot_open.abs_diff(chunk_open)))
+        })();
+        out.put("source_count_disagreement", disagreement);
+    }
+    if out.wants("in_progress_stale") {
+        let stale = match config.thresholds.in_progress_stale_hours {
+            None => Err(NOT_CONFIGURED.to_owned()),
+            Some(hours) => stale_count(scope, history, sources, &open_in_teams, hours),
+        };
+        out.put("in_progress_stale", stale);
+    }
 }
 
 fn stale_count(
@@ -1084,6 +1300,7 @@ fn stability(out: &mut Out<'_>, sources: &Sources<'_>) {
     }
 }
 
+#[implements("FR-047-AC-1")]
 fn utilization(out: &mut Out<'_>, sources: &Sources<'_>) {
     if out.config.herdr_teams.is_empty() {
         out.not_configured("agents_working_share");
@@ -1154,7 +1371,6 @@ fn utilization(out: &mut Out<'_>, sources: &Sources<'_>) {
             }
         }
     }
-    relay(out, sources);
 }
 
 fn relay(out: &mut Out<'_>, sources: &Sources<'_>) {
@@ -1181,11 +1397,13 @@ fn relay(out: &mut Out<'_>, sources: &Sources<'_>) {
     out.put("messages_undelivered", total);
 }
 
+#[implements("FR-047-AC-1")]
 fn resources(out: &mut Out<'_>, sources: &Sources<'_>) {
-    if out.config.local_paths.is_empty() {
+    let needs_paths = out.wants_any(&["worktrees_prunable", "disk_bytes"]);
+    if needs_paths && out.config.local_paths.is_empty() {
         out.not_configured("worktrees_prunable");
         out.not_configured("disk_bytes");
-    } else {
+    } else if needs_paths {
         let paths = out.config.local_paths.clone();
         let sum = |read: &dyn Fn(&std::path::Path) -> Result<u64, String>, who: &str| {
             let mut total = 0_u64;
@@ -1195,14 +1413,21 @@ fn resources(out: &mut Out<'_>, sources: &Sources<'_>) {
             }
             Ok::<_, String>(total as f64)
         };
-        out.put(
-            "worktrees_prunable",
-            sum(&|dir| sources.local.prunable_worktrees(dir), "local git"),
-        );
-        out.put(
-            "disk_bytes",
-            sum(&|dir| sources.local.disk_bytes(dir), "local disk"),
-        );
+        if out.wants("worktrees_prunable") {
+            out.put(
+                "worktrees_prunable",
+                sum(&|dir| sources.local.prunable_worktrees(dir), "local git"),
+            );
+        }
+        if out.wants("disk_bytes") {
+            out.put(
+                "disk_bytes",
+                sum(&|dir| sources.local.disk_bytes(dir), "local disk"),
+            );
+        }
+    }
+    if !out.wants("orphan_slots") {
+        return;
     }
     let (Some(name), Some(hours)) = (
         out.config.slot_process.clone(),
@@ -1278,13 +1503,14 @@ pub const NOT_RECONSTRUCTIBLE: &str = "not reconstructible";
 
 /// The metrics a past day can be measured for from issue creation, state history and pull
 /// request timestamps (FR-028).
-pub const RECONSTRUCTIBLE: [&str; 7] = [
+pub const RECONSTRUCTIBLE: [&str; 8] = [
     "prs_merged_per_hour",
     "pr_cycle_median_hours",
     "pr_cycle_p90_hours",
     "path_closed",
     "intake_new",
     "net_closed_minus_new",
+    "tickets_closed_per_hour",
     "done_reopened",
 ];
 
@@ -1316,11 +1542,12 @@ pub fn collect_history(
                 config,
                 frame: *frame,
                 metrics: BTreeMap::new(),
+                requested: None,
             };
             match &workspace {
                 Ok(snapshot) => {
                     let scope = Scope::new(config, snapshot, *frame);
-                    let _ = window_progress(&mut out, &scope, &mut history);
+                    let _ = window_progress(&mut out, &scope, &mut history, github);
                     rework_issues(&mut out, &scope, &mut history);
                 }
                 Err(error) => {
@@ -1339,4 +1566,278 @@ pub fn collect_history(
             out.metrics
         })
         .collect()
+}
+
+#[cfg(test)]
+mod selected_tests {
+    use super::*;
+    use crate::agents::AgentsReport;
+    use crate::model::{
+        Issue, IssueId, Project, ProjectId, ProjectStatusCategory, TeamKey, WorkflowStateType,
+    };
+    use crate::retro::sources::{
+        GateLine, LabeledIssue, MainCommit, PullRequest, PullRequestInfo, StateChange,
+    };
+    use ix_trace_rs::trace;
+
+    struct NoReads;
+
+    impl LinearSource for NoReads {
+        fn workspace(&self, _: f64) -> Result<WorkspaceSnapshot, String> {
+            panic!("unrequested Linear read")
+        }
+        fn project_open_count(&self, _: &str) -> Result<usize, String> {
+            panic!("unrequested Linear read")
+        }
+        fn state_history(&self, _: &str) -> Result<Vec<StateChange>, String> {
+            panic!("unrequested Linear read")
+        }
+        fn marker_lines(&self, _: &str, _: &str) -> Result<Vec<String>, String> {
+            panic!("unrequested Linear read")
+        }
+        fn open_issues_with_label(&self, _: &str) -> Result<Vec<LabeledIssue>, String> {
+            panic!("unrequested Linear read")
+        }
+    }
+
+    impl GithubSource for NoReads {
+        fn pull_requests(&self, _: &str, _: f64) -> Result<Vec<PullRequest>, String> {
+            panic!("unrequested GitHub read")
+        }
+        fn pull_request(&self, _: &str, _: u64) -> Result<PullRequestInfo, String> {
+            panic!("unrequested GitHub read")
+        }
+        fn main_commits(&self, _: &str, _: &str, _: f64) -> Result<Vec<MainCommit>, String> {
+            panic!("unrequested GitHub read")
+        }
+    }
+
+    impl crate::retro::sources::AgentSource for NoReads {
+        fn report(&self, _: &[String]) -> Result<AgentsReport, String> {
+            panic!("unrequested Herdr read")
+        }
+    }
+
+    impl crate::retro::sources::GateLogSource for NoReads {
+        fn lines(&self, _: &std::path::Path) -> Result<Vec<GateLine>, String> {
+            panic!("unrequested gate log read")
+        }
+    }
+
+    impl crate::retro::sources::RelaySource for NoReads {
+        fn pending_sent_at_ms(&self, _: &str) -> Result<Vec<i64>, String> {
+            panic!("unrequested relay read")
+        }
+    }
+
+    impl crate::retro::sources::LocalSource for NoReads {
+        fn prunable_worktrees(&self, _: &std::path::Path) -> Result<u64, String> {
+            panic!("unrequested local git read")
+        }
+        fn disk_bytes(&self, _: &std::path::Path) -> Result<u64, String> {
+            panic!("unrequested disk read")
+        }
+        fn processes(&self) -> Result<Vec<crate::retro::sources::ProcessRow>, String> {
+            panic!("unrequested process read")
+        }
+    }
+
+    struct ClosedRateSources {
+        snapshot: WorkspaceSnapshot,
+    }
+
+    impl LinearSource for ClosedRateSources {
+        fn workspace(&self, _: f64) -> Result<WorkspaceSnapshot, String> {
+            Ok(self.snapshot.clone())
+        }
+        fn project_open_count(&self, _: &str) -> Result<usize, String> {
+            Ok(0)
+        }
+        fn state_history(&self, _issue_id: &str) -> Result<Vec<StateChange>, String> {
+            Ok(vec![StateChange {
+                at: 5_000.0,
+                from: Some(WorkflowStateType::Started),
+                to: Some(WorkflowStateType::Completed),
+            }])
+        }
+        fn marker_lines(&self, _: &str, _: &str) -> Result<Vec<String>, String> {
+            Ok(Vec::new())
+        }
+        fn open_issues_with_label(&self, _: &str) -> Result<Vec<LabeledIssue>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl GithubSource for ClosedRateSources {
+        fn pull_requests(&self, _: &str, _: f64) -> Result<Vec<PullRequest>, String> {
+            Ok(Vec::new())
+        }
+        fn pull_request(&self, _: &str, number: u64) -> Result<PullRequestInfo, String> {
+            Ok(PullRequestInfo {
+                merged: number == 1,
+                updated_at: 5_100.0,
+            })
+        }
+        fn main_commits(&self, _: &str, _: &str, _: f64) -> Result<Vec<MainCommit>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl crate::retro::sources::AgentSource for ClosedRateSources {
+        fn report(&self, _: &[String]) -> Result<AgentsReport, String> {
+            Ok(AgentsReport {
+                schema_version: 1,
+                teams: Vec::new(),
+                idle_after_secs: 0,
+                agents: Vec::new(),
+                missing_teams: Vec::new(),
+                errors: Vec::new(),
+                missing_hosts: Vec::new(),
+                ready_queue_error: None,
+                ready_queue_warnings: Vec::new(),
+            })
+        }
+    }
+
+    impl crate::retro::sources::GateLogSource for ClosedRateSources {
+        fn lines(&self, _: &std::path::Path) -> Result<Vec<GateLine>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl crate::retro::sources::RelaySource for ClosedRateSources {
+        fn pending_sent_at_ms(&self, _: &str) -> Result<Vec<i64>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl crate::retro::sources::LocalSource for ClosedRateSources {
+        fn prunable_worktrees(&self, _: &std::path::Path) -> Result<u64, String> {
+            Ok(0)
+        }
+        fn disk_bytes(&self, _: &std::path::Path) -> Result<u64, String> {
+            Ok(0)
+        }
+        fn processes(&self) -> Result<Vec<crate::retro::sources::ProcessRow>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    #[trace("FR-024-AC-19")]
+    fn tickets_closed_per_hour_requires_a_completed_issue_with_a_merged_attached_pr() {
+        let config = RetroConfig::parse(
+            std::path::Path::new("eval.json"),
+            r#"{"team":"TEST","gate_tickets":[],"projects":["P"],"repos":[]}"#,
+        )
+        .expect("parse retro config");
+        let issue = |id: &str, number: u64| Issue {
+            id: IssueId(id.to_owned()),
+            identifier: id.to_owned(),
+            title: id.to_owned(),
+            description: None,
+            state: "Done".to_owned(),
+            state_name: "Done".to_owned(),
+            state_type: WorkflowStateType::Completed,
+            parent_id: None,
+            team_key: TeamKey("TEST".to_owned()),
+            assignee_id: None,
+            assignee_name: None,
+            project_id: Some(ProjectId("project-1".to_owned())),
+            project_milestone_id: None,
+            priority: 0.0,
+            sort_order: 0.0,
+            blocked_by: Vec::new(),
+            created_at: Some("1970-01-01T00:01:00Z".to_owned()),
+            updated_at: Some("1970-01-01T01:23:20Z".to_owned()),
+            attachment_urls: vec![format!(
+                "https://github.com/agent-ix/ix-board/pull/{number}"
+            )],
+            attachments_complete: true,
+            started_at: None,
+            completed_at: None,
+            pull_requests: Vec::new(),
+        };
+        let sources = ClosedRateSources {
+            snapshot: WorkspaceSnapshot {
+                projects: vec![Project {
+                    id: ProjectId("project-1".to_owned()),
+                    identifier: None,
+                    name: "P".to_owned(),
+                    updated_at: None,
+                    description: String::new(),
+                    content: None,
+                    status: "Started".to_owned(),
+                    status_name: None,
+                    status_category: ProjectStatusCategory::Started,
+                    priority: 0,
+                    sort_order: 0.0,
+                    target_date: None,
+                    team_keys: vec![TeamKey("TEST".to_owned())],
+                    milestones: Vec::new(),
+                    initiatives: Vec::new(),
+                }],
+                issues: vec![issue("TEST-1", 1), issue("TEST-2", 2)],
+                fetched_at: 7_200,
+            },
+        };
+        let sources_bundle = Sources {
+            linear: &sources,
+            github: &sources,
+            agents: &sources,
+            gate_log: &sources,
+            relay: &sources,
+            local: &sources,
+        };
+        let metrics = collect_selected(
+            &config,
+            Frame {
+                now: 7_200.0,
+                window_secs: 3_600,
+                end_exclusive: true,
+            },
+            &sources_bundle,
+            &BTreeSet::from(["tickets_closed_per_hour".to_owned()]),
+        );
+        let metric = &metrics["tickets_closed_per_hour"];
+        assert_eq!(metric.status, Status::Ok, "{metric:?}");
+        assert_eq!(metric.value, Some(1.0));
+        assert_eq!(metric.unit, "tickets_per_hour");
+    }
+
+    #[test]
+    #[trace("FR-047-AC-1")]
+    fn selected_collection_skips_unrequested_source_families_and_returns_only_requested_ids() {
+        let config = RetroConfig::parse(
+            std::path::Path::new("eval.json"),
+            r#"{"team":"TEST","gate_tickets":[],"projects":[],"repos":[]}"#,
+        )
+        .unwrap();
+        let no_reads = NoReads;
+        let sources = Sources {
+            linear: &no_reads,
+            github: &no_reads,
+            agents: &no_reads,
+            gate_log: &no_reads,
+            relay: &no_reads,
+            local: &no_reads,
+        };
+        let requested = BTreeSet::from(["decisions_open".to_owned(), "disk_bytes".to_owned()]);
+        let metrics = collect_selected(
+            &config,
+            Frame {
+                now: 100.0,
+                window_secs: 60,
+                end_exclusive: false,
+            },
+            &sources,
+            &requested,
+        );
+        assert_eq!(metrics.keys().cloned().collect::<BTreeSet<_>>(), requested);
+        assert!(
+            metrics
+                .values()
+                .all(|metric| metric.status == Status::Unavailable)
+        );
+    }
 }

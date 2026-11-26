@@ -21,7 +21,9 @@ the command SHALL refuse a day that has not ended.
 The command SHALL reconstruct only these metrics from history: `prs_merged_per_hour`,
 `pr_cycle_median_hours`, `pr_cycle_p90_hours` (from pull-request creation and
 merge timestamps), and `path_closed`, `intake_new`, `net_closed_minus_new` and
-`done_reopened` (from Linear issue creation and state history). Every other
+`done_reopened` (from Linear issue creation and state history), plus
+`tickets_closed_per_hour` (completed project/path issues with an attached merged
+pull request, divided by window hours). Every other
 metric SHALL be `unavailable` with reason `not reconstructible`, including
 `path_remaining`, because the blocker graph at a past time is not recorded. For the same
 reason the Linear metrics use the current path and the current project membership of each
