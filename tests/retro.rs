@@ -2609,6 +2609,26 @@ fn one_snapshot_reports_no_delta_and_exits_zero_without_a_score() {
     assert!(delta(&[], "{}").unwrap().message.is_some());
 }
 
+#[trace("FR-027-AC-14")]
+#[test]
+fn retro_delta_team_mode_reads_the_team_store_without_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_in(&dir);
+    store
+        .append(&snap(
+            "2026-11-07T12:00:00Z",
+            &[("prs_idle", Some(1.0), QUERY)],
+        ))
+        .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ix-board"))
+        .args(["retro", "delta", "--team", "SWM"])
+        .env("TEAM_RETRO_HOME", dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("no delta"));
+}
+
 /// Trace: FR-027-AC-6
 #[test]
 fn delta_succeeds_from_the_store_alone_and_touches_no_source() {

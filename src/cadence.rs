@@ -65,7 +65,7 @@ pub struct Job {
     pub kind: JobKind,
     /// Arguments passed to this ix-board executable, without shell expansion.
     pub command: Vec<String>,
-    /// Optional `retro delta --notify` command run only after this command succeeds.
+    /// Optional configured `retro delta --notify` command run only after success.
     #[serde(default)]
     pub after_success: Option<Vec<String>>,
     /// Role responsible for this job.
@@ -258,7 +258,13 @@ pub fn generate_default_manifest(
                 "--team".into(),
                 team.to_owned(),
             ],
-            after_success: None,
+            after_success: Some(vec![
+                "retro".into(),
+                "delta".into(),
+                "--team".into(),
+                team.to_owned(),
+                "--notify".into(),
+            ]),
             owner_role: "minder".into(),
         }],
     };
@@ -300,6 +306,7 @@ pub fn generate_default_manifest(
 
 /// Validates cadence job identity, interval and supported argv shape.
 #[implements("FR-049-AC-4")]
+#[implements("FR-049-AC-7")]
 pub fn validate_manifest(manifest: &Manifest) -> Result<(), CadenceError> {
     if manifest
         .alert_recipient
@@ -341,17 +348,18 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), CadenceError> {
             )));
         }
         let valid_delta = job.after_success.as_deref().is_some_and(|command| {
+            let configured_scope = command
+                .windows(2)
+                .any(|pair| (pair[0] == "--config" || pair[0] == "--team") && !pair[1].is_empty());
             command.len() >= 2
                 && command[0] == "retro"
                 && command[1] == "delta"
-                && command
-                    .windows(2)
-                    .any(|pair| pair[0] == "--config" && !pair[1].is_empty())
+                && configured_scope
                 && command.iter().any(|arg| arg == "--notify")
         });
         if job.after_success.is_some() && (job.kind != JobKind::RetroSnapshot || !valid_delta) {
             return Err(CadenceError::Manifest(format!(
-                "job {} after_success must be a retro delta command",
+                "job {} after_success must be a retro delta --notify command with --config or --team",
                 job.id
             )));
         }

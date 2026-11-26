@@ -62,6 +62,10 @@ fn default_retro_manifest_generation_is_idempotent_and_never_clobbers() {
         generated.jobs[0].command,
         ["retro", "snapshot", "--team", "qsl"]
     );
+    assert_eq!(
+        generated.jobs[0].after_success.as_deref().unwrap(),
+        ["retro", "delta", "--team", "qsl", "--notify"]
+    );
     let bytes = std::fs::read(&path).unwrap();
     let rerun = ix_board::cadence::generate_default_manifest(&path, "OTHER", "other").unwrap();
     assert_eq!(rerun, generated);
@@ -360,6 +364,10 @@ fn generated_cadence_manifest_uses_the_auto_detected_team_sources() {
     assert_eq!(
         manifest.jobs[0].command,
         ["retro", "snapshot", "--team", "QSL"]
+    );
+    assert_eq!(
+        manifest.jobs[0].after_success.as_deref().unwrap(),
+        ["retro", "delta", "--team", "QSL", "--notify"]
     );
     let retro_config = ix_board::retro::RetroConfig::parse(
         Path::new("examples/qsl/retro.json"),

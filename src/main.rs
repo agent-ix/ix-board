@@ -431,11 +431,17 @@ enum RetroCommand {
     /// Compare the latest snapshot with the previous one and the baseline, reading only the store.
     Delta {
         /// JSON retro configuration file.
-        #[arg(long)]
-        config: PathBuf,
+        #[arg(long, required_unless_present = "team", conflicts_with = "team")]
+        config: Option<PathBuf>,
+        /// Team using automatically discovered Herdr and gate log sources.
+        #[arg(long, required_unless_present = "config")]
+        team: Option<String>,
         /// Send stored delta defects to the cadence manifest alert_recipient.
         #[arg(long)]
         notify: bool,
+        /// Cadence manifest carrying the single alert_recipient.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
     },
     /// Append one record per UTC day from Linear and GitHub history.
     Backfill {
@@ -1141,8 +1147,20 @@ fn run(command: Command) -> Result<Output, Error> {
                 },
         } => run_retro_snapshot(config.as_deref(), team.as_deref(), &window),
         Command::Retro {
-            command: RetroCommand::Delta { config, notify },
-        } => run_retro_delta(&config, notify).map(Output::RetroDelta),
+            command:
+                RetroCommand::Delta {
+                    config,
+                    team,
+                    notify,
+                    manifest,
+                },
+        } => run_retro_delta(
+            config.as_deref(),
+            team.as_deref(),
+            notify,
+            manifest.as_deref(),
+        )
+        .map(Output::RetroDelta),
         Command::Retro {
             command:
                 RetroCommand::Backfill {
@@ -1916,11 +1934,18 @@ fn run_retro_snapshot(
 
 #[implements("FR-027-AC-12")]
 #[implements("FR-027-AC-13")]
+#[implements("FR-027-AC-14")]
 fn run_retro_delta(
-    config_path: &std::path::Path,
+    config_path: Option<&std::path::Path>,
+    team: Option<&str>,
     notify: bool,
+    cadence_manifest: Option<&std::path::Path>,
 ) -> Result<retro::DeltaReport, Error> {
-    let config = retro::RetroConfig::load(config_path).map_err(retro::RetroError::from)?;
+    let config = match (config_path, team) {
+        (Some(path), None) => retro::RetroConfig::load(path).map_err(retro::RetroError::from)?,
+        (None, Some(team)) => retro::RetroConfig::for_team(team.to_owned()),
+        _ => unreachable!("clap requires exactly one of --config and --team"),
+    };
     let store = retro::Store::from_env(&config.team).map_err(retro::RetroError::from)?;
     let report = retro::run_delta(&config, &store)?;
     if !report.defects.is_empty() {
@@ -1932,7 +1957,7 @@ fn run_retro_delta(
             .map_err(|error| Error::Cadence(error.to_string()))?;
     }
     if notify && !report.defects.is_empty() {
-        let path = ix_board::cadence::manifest_path(None)
+        let path = ix_board::cadence::manifest_path(cadence_manifest)
             .map_err(|error| Error::Cadence(error.to_string()))?;
         let manifest = ix_board::cadence::load_manifest(&path)
             .map_err(|error| Error::Cadence(error.to_string()))?;
@@ -3357,8 +3382,20 @@ fn run_cadence(command: CadenceCommand) -> Result<Output, Error> {
             Ok(Output::CadenceDue(report))
         }
         CadenceCommand::Run { job, .. } => {
+            let mut execution_manifest = manifest.clone();
+            if let Some(job) = execution_manifest
+                .jobs
+                .iter_mut()
+                .find(|candidate| candidate.id == job)
+                && let Some(after_success) = &mut job.after_success
+                && after_success.iter().any(|arg| arg == "--notify")
+                && !after_success.iter().any(|arg| arg == "--manifest")
+            {
+                after_success.push("--manifest".to_owned());
+                after_success.push(path.to_string_lossy().into_owned());
+            }
             let report = ix_board::cadence::run_job(
-                &manifest,
+                &execution_manifest,
                 || ix_board::cadence::open_ledger(settings.as_ref()),
                 &job,
                 cadence_now_ms(),

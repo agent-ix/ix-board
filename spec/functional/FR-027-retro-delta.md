@@ -10,7 +10,7 @@ relationships:
 
 ## Description
 
-`ix-board retro delta --config <file> [--json]` SHALL read the store of the
+`ix-board retro delta --config <file> [--json]` or `ix-board retro delta --team <team> [--json]` SHALL read the store of the
 configured team and, for each metric of the latest record, report the value, the
 change since the previous record, and the change since the baseline. The latest
 and previous records SHALL be the two records of kind `snapshot` with the
@@ -69,6 +69,7 @@ single `alert_recipient` (`server:workspace:tab`).
 | FR-027-AC-11 | Hand-written records that show each watched metric rising produce one structured defect with the metric's stored prior value and current value; flat, falling, unavailable, or query-changed metrics produce none. Unnamed wait emits only above 20 and only on a rise or first crossing, including the first snapshot. | Test |
 | FR-027-AC-12 | Without `--notify`, delta makes no notification call; with `--notify`, each defect is sent once to the cadence manifest's `alert_recipient`, and missing or invalid routing configuration returns an error without sending. | Test |
 | FR-027-AC-13 | Each emitted defect is appended as an individual fleet ledger defect row with team, class, metric id, previous and current values. | Test |
+| FR-027-AC-14 | `retro delta --team T` reads team T's store without a retro config file; `--notify` reads its recipient from the selected cadence manifest. | Test |
 
 ## Dependencies
 

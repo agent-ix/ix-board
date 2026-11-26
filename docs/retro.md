@@ -97,7 +97,7 @@ which the agent metrics are `unavailable`.
 
 ## Delta
 
-`ix-board retro delta --config retro.json [--json]` reads only the store; it makes no Linear,
+`ix-board retro delta --config retro.json [--json]` (or `--team QSL`) reads only the store; it makes no Linear,
 GitHub, Herdr or local request. The latest and previous records are the two `snapshot` records
 with the greatest `taken_at`. The baseline is the record whose `taken_at` equals
 `baseline_taken_at`, or the earliest record of either kind when that field is absent; a value that

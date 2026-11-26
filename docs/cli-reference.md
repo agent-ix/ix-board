@@ -729,12 +729,14 @@ Compares the latest snapshot with the previous one and the baseline, reading onl
 [delta](retro.md#delta).
 
 ```text
-ix-board retro delta [OPTIONS] --config <CONFIG>
+ix-board retro delta [OPTIONS] (--config <CONFIG> | --team <TEAM>)
 
 Options:
       --config <CONFIG>              JSON retro configuration file
+      --team <TEAM>                  Team using automatically discovered sources
       --json                         Emit machine-readable JSON on stdout instead of human-readable text
       --notify                       Send stored delta defects to cadence alert_recipient
+      --manifest <MANIFEST>          Cadence manifest carrying alert_recipient (used by --notify)
       --diagnostics-format <FORMAT>  Diagnostic stream format on stderr [default: human]
       --color <WHEN>                 Colorize human diagnostics on stderr: auto (TTY only), always, or never [default: auto]
   -h, --help                         Print help
