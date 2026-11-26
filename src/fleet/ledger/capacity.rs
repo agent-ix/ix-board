@@ -524,6 +524,7 @@ pub fn mark_draining(
     Ok(())
 }
 
+#[implements("FR-041-AC-14")]
 fn live_lane_current(
     query: &dyn crate::fleet::live::PromQuery,
     host: &str,

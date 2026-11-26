@@ -671,6 +671,7 @@ mod tests {
     use crate::fleet::{ClassKind, FleetConfig, FleetReport};
     use ix_trace_rs::trace;
 
+    #[trace("FR-041-AC-16")]
     #[test]
     fn overload_events_record_only_breach_transitions() {
         let directory = tempfile::tempdir().unwrap();

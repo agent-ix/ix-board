@@ -787,6 +787,7 @@ mod tests {
     use ix_trace_rs::trace;
 
     #[test]
+    #[trace("FR-041-AC-24")]
     fn unattributed_pr_does_not_keep_a_lane_stale_pr_action_open() {
         let report = FleetReport {
             schema_version: 1,

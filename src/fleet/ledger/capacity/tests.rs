@@ -20,6 +20,7 @@ fn path() -> (tempfile::TempDir, std::path::PathBuf) {
     (dir, path)
 }
 
+#[trace("FR-041-AC-16", "FR-041-AC-17")]
 #[test]
 fn schema_two_ledger_supports_read_only_queries_without_capacity_tables() {
     let (_dir, path) = path();

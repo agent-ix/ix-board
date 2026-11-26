@@ -111,6 +111,7 @@ impl PullRequestFacts for LivePullRequestFacts {
         github_activity(&client, &api_url, token.as_deref().ok())
     }
 
+    #[implements("FR-041-AC-25")]
     fn search_open_pull_requests(
         &self,
         tickets: &[String],
@@ -304,6 +305,7 @@ fn github_api_url_at(url: &str, api_root: &str) -> Result<String, String> {
     ))
 }
 
+#[implements("FR-041-AC-25")]
 #[implements("FR-041-AC-25")]
 fn contains_ticket(text: &str, identifier: &str) -> bool {
     let upper = text.to_ascii_uppercase();
@@ -797,6 +799,7 @@ mod tests {
         }
     }
 
+    #[trace("FR-041-AC-25")]
     #[test]
     fn missing_lane_ticket_mapping_remains_unavailable() {
         let result = read_lane_prs(&BTreeMap::new(), &mut Facts(Vec::new())).unwrap();
@@ -806,6 +809,7 @@ mod tests {
         assert!(result.unavailable[0].pr.is_none());
     }
 
+    #[trace("FR-041-AC-25")]
     #[test]
     fn production_repository_scan_matches_ticket_in_pull_request_branch() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

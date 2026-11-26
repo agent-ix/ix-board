@@ -167,6 +167,7 @@ fn duration(window: &WindowRequest) -> Result<String, CapacityError> {
     Ok(format!("{seconds}s"))
 }
 
+#[implements("FR-041-AC-10")]
 fn output_rate(
     request: &WindowRequest,
     tickets_closed: &Observation<u64>,
@@ -236,6 +237,7 @@ fn output_rate(
     }
 }
 
+#[implements("FR-041-AC-10")]
 fn coverage_query(expression: &str, span: &str, sample_interval_secs: u64) -> String {
     format!(
         "avg_over_time((max(present_over_time(({expression})[{}s])))[{span}:{}s])",
@@ -473,6 +475,7 @@ type LinearOutput = (
     BTreeMap<String, String>,
 );
 
+#[implements("FR-041-AC-10")]
 fn linear_output(request: &WindowRequest, config: &FleetConfig) -> LinearOutput {
     let timeout = config.host_timeout;
     let fail = |source: &str, reason: String| unavailable(source, reason);
@@ -853,6 +856,7 @@ fn lane_ticket_history(
     Ok(matched.into_iter().collect())
 }
 
+#[implements("FR-041-AC-10")]
 fn normalized_ticket_key(ticket: &str) -> String {
     ticket
         .trim()
@@ -863,6 +867,7 @@ fn normalized_ticket_key(ticket: &str) -> String {
         .to_lowercase()
 }
 
+#[implements("FR-041-AC-10")]
 fn normalized_ticket_keys(ticket: &str) -> impl Iterator<Item = String> + '_ {
     ticket
         .split([',', ';'])
@@ -1139,6 +1144,7 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    #[trace("FR-041-AC-10")]
     fn output_ticket_keys_are_case_insensitive_and_split_aggregated_rows() {
         assert_eq!(
             normalized_ticket_keys("https://linear.app/team/issue/SWM-1, qsl-2")
@@ -1148,6 +1154,7 @@ mod tests {
     }
 
     #[test]
+    #[trace("FR-041-AC-10")]
     fn unavailable_ticket_totals_do_not_fall_back_to_commits() {
         let request = WindowRequest {
             host: "example-host".to_owned(),

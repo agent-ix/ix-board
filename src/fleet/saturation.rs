@@ -546,6 +546,7 @@ fn allocate_ready_shares(hosts: &[HostInput], ready: u32) -> BTreeMap<String, u3
     shares
 }
 
+#[implements("FR-041-AC-11")]
 fn allocate_ready_by_targets(targets: &[(String, u32)], ready: u32) -> BTreeMap<String, u32> {
     let total = targets
         .iter()
@@ -1362,6 +1363,7 @@ mod tests {
     use ix_trace_rs::trace;
 
     #[test]
+    #[trace("FR-041-AC-11")]
     fn configured_host_with_no_reachable_lanes_is_not_registry_current() {
         let report = evaluate(SaturationInput {
             observed_at_ms: 1_000,
@@ -1891,6 +1893,7 @@ mod tests {
     }
 
     #[test]
+    #[trace("FR-041-AC-11")]
     fn per_host_ready_buffers_and_deficits_sum_to_the_global_values() {
         let hosts = ["draco", "terra", "titan"]
             .into_iter()
