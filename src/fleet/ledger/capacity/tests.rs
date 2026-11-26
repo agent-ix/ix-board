@@ -500,10 +500,15 @@ fn judged_without_demand_view_reports_each_invalid_transition_once() {
                VALUES(1,'draco','first',1000);
              INSERT INTO capacity_step(run_id,step_no,repeat_of,host,valid,knee_signal,window_end)
                VALUES(1,1,NULL,'draco',0,0,2000),
-                     (1,2,NULL,'draco',0,1,3000),
-                     (1,3,2,'draco',0,0,4000);
+                     (1,2,NULL,'draco',0,1,3000);
              INSERT INTO capacity_level(host,level,recorded_at,run_id,reason,evidence_steps)
-               VALUES('draco',2,5000,1,'step_bound','[2]');",
+               VALUES('draco',2,5000,1,'step_bound','[2]');
+             INSERT INTO capacity_run(run_id,host,trigger,started_at)
+               VALUES(2,'draco','first',1000);
+             INSERT INTO capacity_step(run_id,step_no,repeat_of,host,valid,knee_signal,window_end)
+               VALUES(2,1,NULL,'draco',0,0,2000),
+                     (2,1,1,'draco',1,0,3000),
+                     (2,2,NULL,'draco',1,0,4000);",
         )
         .unwrap();
     let rows = query_ledger(&path, "discovery_steps_judged_without_demand", None)
@@ -520,7 +525,7 @@ fn judged_without_demand_view_reports_each_invalid_transition_once() {
         rows.iter()
             .any(|row| row["violation"] == "level_uses_invalid_step")
     );
-    assert!(!rows.iter().any(|row| row["step_no"] == 3));
+    assert!(!rows.iter().any(|row| row["run_id"] == 2));
 }
 
 #[test]
