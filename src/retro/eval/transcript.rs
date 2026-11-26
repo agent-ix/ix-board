@@ -2195,8 +2195,8 @@ mod tests {
                 .adapters_by_transcript(
                     &spec,
                     &EvalWindow {
-                        start_ms: 1_795_607_000_000,
-                        end_ms: 1_795_609_000_000,
+                        start_ms: 1_699_999_000_000,
+                        end_ms: 1_700_001_000_000,
                     },
                     &AdapterContext::default(),
                 )

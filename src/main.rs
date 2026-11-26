@@ -4369,7 +4369,7 @@ mod tests {
         let connection = rusqlite::Connection::open(&ledger_path).expect("create ledger fixture");
         connection
             .execute_batch(
-                "PRAGMA user_version=8;
+                "PRAGMA user_version=9;
                  CREATE TABLE run(relay_ms INTEGER NOT NULL);
                  INSERT INTO run VALUES (1700000000000);
                  CREATE TABLE lane_orders_due(
@@ -4419,8 +4419,8 @@ mod tests {
             ],
         }];
         let window = EvalWindow {
-            start_ms: 1_795_607_000_000,
-            end_ms: 1_795_609_000_000,
+            start_ms: 1_699_999_000_000,
+            end_ms: 1_700_001_000_000,
         };
         let session_row = serde_json::json!({
             "session_addr":"test:workspace:coder",
