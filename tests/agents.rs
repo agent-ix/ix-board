@@ -5,7 +5,7 @@
 use ix_board::agents::*;
 use ix_trace_rs::trace;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -486,7 +486,8 @@ impl Host for Machine {
         }
         match args {
             ["workspace","list"]=>Ok(json!({"result":{"workspaces":[{"workspace_id":"w","label":"Team"}]}}).to_string()),
-            ["agent","list"]=>Ok(json!({"result":{"agents":[{"pane_id":"w:p","workspace_id":"w","agent":self.harness,"agent_status":self.status,"agent_session":{"value":"root"},"cwd":"/work"}]}}).to_string()),
+            ["agent","list"]=>Ok(json!({"result":{"agents":[{"pane_id":"w:p","workspace_id":"w","tab_id":"t","agent":self.harness,"agent_status":self.status,"agent_session":{"value":"root"},"cwd":"/work"}]}}).to_string()),
+            ["tab","list"]=>Ok(json!({"result":{"tabs":[{"workspace_id":"w","tab_id":"t","label":"coder"}]}}).to_string()),
             ["agent","read",_,"--lines","30"]=>self.tail.clone().map_err(|e| AgentsError::ProbeFormat(e.into())),
             _=>panic!("unexpected {args:?}")
         }
@@ -543,6 +544,43 @@ fn report(machines: Vec<Machine>) -> AgentsReport {
         },
     )
 }
+
+#[trace("FR-018-AC-30", "FR-048-AC-9")]
+#[test]
+fn live_locked_build_lease_matches_canonical_herdr_workspace_and_tab_labels() {
+    let host: Vec<Arc<dyn Host>> = vec![Arc::new(machine())];
+    let leases = BTreeSet::from(["local:team:coder".to_owned()]);
+    let report = build_report_with_leases(
+        &host,
+        &["team".into()],
+        IDLE,
+        HOST_TIMEOUT,
+        &mut |_| Ok(None),
+        &leases,
+    );
+    assert_eq!(report.agents.len(), 1);
+    assert!(
+        report.agents[0]
+            .processes
+            .contains(&"locked-build lease".to_owned())
+    );
+
+    let pane_id_owner = BTreeSet::from(["local:team:w:p".to_owned()]);
+    let report = build_report_with_leases(
+        &host,
+        &["team".into()],
+        IDLE,
+        HOST_TIMEOUT,
+        &mut |_| Ok(None),
+        &pane_id_owner,
+    );
+    assert!(
+        !report.agents[0]
+            .processes
+            .contains(&"locked-build lease".to_owned())
+    );
+}
+
 #[trace(
     "FR-018-AC-1",
     "FR-018-AC-5",

@@ -7,6 +7,7 @@
 //! structs name only the fields the detector uses and ignore the rest.
 
 use super::AgentsError;
+use ix_trace_rs::implements;
 use serde::{Deserialize, Serialize};
 
 /// herdr's lifecycle classification of an agent pane.
@@ -51,12 +52,26 @@ pub struct HerdrAgent {
     pub cwd: String,
     /// Pane identifier, unique within one herdr server.
     pub pane_id: String,
+    /// Stable tab identity used to resolve the current Herdr tab label.
+    #[serde(default)]
+    pub tab_id: String,
     /// Owning workspace identifier.
     #[serde(default)]
     pub workspace_id: String,
     /// Terminal title with status glyphs removed.
     #[serde(default)]
     pub terminal_title_stripped: String,
+}
+
+/// One tab from `herdr tab list`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct HerdrTab {
+    /// Current Herdr tab label.
+    pub label: String,
+    /// Tab identity corresponding to [`HerdrAgent::tab_id`].
+    pub tab_id: String,
+    /// Owning workspace identity corresponding to [`HerdrAgent::workspace_id`].
+    pub workspace_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -113,6 +128,11 @@ struct WorkspaceList {
     workspaces: Vec<HerdrWorkspace>,
 }
 
+#[derive(Deserialize)]
+struct TabList {
+    tabs: Vec<HerdrTab>,
+}
+
 fn decode<'a, T: Deserialize<'a>>(what: &'static str, text: &'a str) -> Result<T, AgentsError> {
     serde_json::from_str(text).map_err(|source| AgentsError::Decode { what, source })
 }
@@ -131,6 +151,14 @@ pub fn parse_workspaces(text: &str) -> Result<Vec<HerdrWorkspace>, AgentsError> 
             .result
             .workspaces,
     )
+}
+
+/// Decodes `herdr tab list` output.
+#[implements("FR-018-AC-30")]
+pub fn parse_tabs(text: &str) -> Result<Vec<HerdrTab>, AgentsError> {
+    Ok(decode::<Envelope<TabList>>("herdr tab list", text)?
+        .result
+        .tabs)
 }
 
 /// Decodes `herdr machine list --json` output.

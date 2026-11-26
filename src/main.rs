@@ -4,7 +4,7 @@
 //! Command-line interface for deterministic cached Linear reads.
 
 use clap::{Parser, Subcommand};
-use ix_board::agents::{AgentsReport, ReadyTicket, build_report, parse_duration, render_text};
+use ix_board::agents::{AgentsReport, ReadyTicket, parse_duration, render_text};
 use ix_board::chain::{ChainReport, evaluate_chain, open_scope_issues, resolve_issue};
 use ix_board::orphans::{OrphansReport, find_orphans};
 #[cfg(test)]
@@ -102,6 +102,9 @@ enum Command {
         /// Quiet time after which a ready agent counts as idle (for example 90s, 20m, 2h).
         #[arg(long, default_value = "20m", value_parser = parse_duration)]
         idle_after: u64,
+        /// Prometheus text exposition URL containing locked-build running-owner metrics.
+        #[arg(long)]
+        lease_metrics_url: Option<String>,
     },
     /// Fleet lane commands.
     Fleet {
@@ -956,7 +959,11 @@ fn run(command: Command) -> Result<Output, Error> {
             evidence,
             live,
         } => run_drift(&config, evidence.as_ref(), live),
-        Command::Agents { teams, idle_after } => run_agents(&teams, idle_after).map(Output::Agents),
+        Command::Agents {
+            teams,
+            idle_after,
+            lease_metrics_url,
+        } => run_agents(&teams, idle_after, lease_metrics_url.as_deref()).map(Output::Agents),
         Command::Hygiene { command } => match command {
             HygieneCommand::Check(args) => run_hygiene(&args, false).map(Output::Hygiene),
             HygieneCommand::Clean { args, apply } => run_hygiene(&args, apply).map(Output::Hygiene),
@@ -1734,8 +1741,32 @@ fn run_fleet_assign(
     )?)
 }
 
-fn run_agents(teams: &[String], idle_after: u64) -> Result<AgentsReport, Error> {
+fn run_agents(
+    teams: &[String],
+    idle_after: u64,
+    lease_metrics_url: Option<&str>,
+) -> Result<AgentsReport, Error> {
     let hosts = ix_board::agents::system_hosts()?;
+    let metrics_url = lease_metrics_url
+        .map(str::to_owned)
+        .or_else(|| std::env::var("IX_BUILD_METRICS_URL").ok());
+    let (leases, lease_error) = match metrics_url.as_deref() {
+        Some(url) => match fetch_metrics_text(url) {
+            Ok(text) => (
+                ix_board::host_hygiene::parse_build_metrics(&text)
+                    .into_values()
+                    .flat_map(|host| host.leases_by_lane.into_keys())
+                    .map(|address| address.to_lowercase())
+                    .collect(),
+                None,
+            ),
+            Err(error) => (std::collections::BTreeSet::new(), Some(error.to_string())),
+        },
+        None => (
+            std::collections::BTreeSet::new(),
+            Some("locked-build metrics are unavailable; configure IX_BUILD_METRICS_URL".into()),
+        ),
+    };
     let mut service = None;
     let mut warnings = BTreeSet::new();
     let mut next_ready = |team: &str| -> Result<Option<ReadyTicket>, String> {
@@ -1750,9 +1781,51 @@ fn run_agents(teams: &[String], idle_after: u64) -> Result<AgentsReport, Error> 
             .map_err(|error| error.to_string())?;
         Ok(first_ready(read, &mut warnings))
     };
-    let mut report = build_report(&hosts, teams, idle_after, &mut next_ready);
+    let mut report = ix_board::agents::build_report_with_leases(
+        &hosts,
+        teams,
+        idle_after,
+        ix_board::agents::HOST_TIMEOUT,
+        &mut next_ready,
+        &leases,
+    );
+    report.errors.extend(lease_error);
     report.ready_queue_warnings = warnings.into_iter().collect();
     Ok(report)
+}
+
+#[implements("FR-048-AC-7", "FR-048-AC-9")]
+fn fetch_metrics_text(url: &str) -> Result<String, Error> {
+    const MAX_METRICS_BYTES: u64 = 8 * 1024 * 1024;
+    let mut response = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?
+        .get(url)
+        .send()
+        .map_err(|error| Error::ProgramReview {
+            message: format!("metrics request failed: {}", error.without_url()),
+        })?
+        .error_for_status()
+        .map_err(|error| Error::ProgramReview {
+            message: format!("metrics response failed: {}", error.without_url()),
+        })?;
+    let mut bytes = Vec::new();
+    response
+        .by_ref()
+        .take(MAX_METRICS_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| Error::ProgramReview {
+            message: format!("cannot read metrics exposition: {error}"),
+        })?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_METRICS_BYTES {
+        return Err(Error::ProgramReview {
+            message: "metrics exposition exceeds 8 MiB".to_owned(),
+        });
+    }
+    String::from_utf8(bytes).map_err(|error| Error::ProgramReview {
+        message: format!("metrics exposition is not UTF-8: {error}"),
+    })
 }
 
 fn run_retro_snapshot(config_path: &std::path::Path, window: &str) -> Result<Output, Error> {
@@ -3525,28 +3598,7 @@ fn run_build_status(
     Error,
 > {
     use ix_board::host_hygiene::{BuildPolicy, Eligibility, parse_build_metrics};
-    const MAX_METRICS_BYTES: u64 = 8 * 1024 * 1024;
-    let response = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?
-        .get(metrics_url)
-        .send()?
-        .error_for_status()?;
-    let mut bytes = Vec::new();
-    std::io::Read::take(response, MAX_METRICS_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| Error::ProgramReview {
-            message: format!("cannot read metrics exposition: {error}"),
-        })?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_METRICS_BYTES {
-        return Err(Error::ProgramReview {
-            message: "metrics exposition exceeds 8 MiB".to_owned(),
-        });
-    }
-    let response = String::from_utf8(bytes).map_err(|error| Error::ProgramReview {
-        message: format!("metrics exposition is not UTF-8: {error}"),
-    })?;
+    let response = fetch_metrics_text(metrics_url)?;
     let configured = policies
         .iter()
         .map(|policy| {

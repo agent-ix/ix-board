@@ -480,7 +480,13 @@ Options:
   -h, --help                         Print help
 ```
 
-Exit status: zero when every machine was read. When some machines are missing (they time out after 45 seconds or cannot be read) but other machines returned rows, the command prints those rows, lists the missing machines in `missing_hosts` with reason and elapsed time, and exits with the partial code. When no row could be read it exits with the internal-error code.
+Exit status: zero when every machine and configured lease source was read. Set
+`IX_BUILD_METRICS_URL` or pass `--lease-metrics-url` to map locked-build owner lanes onto current
+Herdr workspace and tab labels. Without readable metrics, agent rows are retained and the report
+exits partial with the lease source error. When some machines are missing (they time out after 45
+seconds or cannot be read) but other machines returned rows, the command prints those rows, lists
+the missing machines in `missing_hosts` with reason and elapsed time, and exits with the partial
+code. When no row could be read it exits with the internal-error code.
 
 ## ix-board hygiene check
 
