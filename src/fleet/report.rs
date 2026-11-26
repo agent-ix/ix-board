@@ -78,7 +78,6 @@ mod tests {
 
     use super::*;
 
-    #[trace("FR-041-AC-9")]
     #[test]
     fn covered_hosts_come_from_the_registry_with_config_hosts_as_optional_extra() {
         let host = |name: &str, lanes| HostSummary {
