@@ -580,6 +580,7 @@ mod tests {
         assert_eq!(values["pr_changes_requested_share"], 1.0 / 19.0);
     }
 
+    #[trace("FR-033-AC-17")]
     #[test]
     fn first_review_distribution_is_published_for_partial_coverage() {
         let open = BTreeSet::from(["owner/repo#1".into(), "owner/repo#2".into()]);

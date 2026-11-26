@@ -458,6 +458,7 @@ pub(super) struct SelectedGithub<T = Http> {
     infos: RefCell<BTreeMap<String, InfoRows>>,
 }
 impl SelectedGithub {
+    #[implements("FR-033-AC-18")]
     pub(super) fn new_with_priority(
         config: &Config,
         allowed: BTreeSet<(String, u64)>,
@@ -543,6 +544,7 @@ impl<T: Transport> SelectedGithub<T> {
         });
         Ok(cached)
     }
+    #[implements("FR-033-AC-13")]
     fn list_recent_population(&self, repo: &str, since: f64) -> PrRows {
         let mut open_after: Option<String> = None;
         let mut closed_after: Option<String> = None;
@@ -621,6 +623,7 @@ impl<T: Transport> SelectedGithub<T> {
         self.lists.borrow_mut().insert(repo.into(), result.clone());
         result
     }
+    #[implements("FR-033-AC-18")]
     fn repository_infos(&self, repo: &str) -> InfoRows {
         if let Some(rows) = self.infos.borrow().get(repo) {
             return rows.clone();
@@ -1058,6 +1061,7 @@ mod tests {
             .map_err(|e| e.to_string())
     }
 
+    #[trace("FR-033-AC-12", "FR-033-AC-13", "FR-033-AC-18")]
     #[test]
     fn thousands_of_old_links_have_constant_batched_cost_across_scopes_cycles_and_restart() {
         let dir = tempfile::tempdir().unwrap();
@@ -1969,6 +1973,7 @@ mod tests {
         assert_eq!(fake.count(), 41);
     }
 
+    #[trace("FR-033-AC-12", "FR-033-AC-13", "FR-033-AC-18")]
     #[test]
     fn actual_http_body_nests_variables_for_listing_historical_and_paginated_queries() {
         use super::super::github_http::tests::{Fixture, reply};

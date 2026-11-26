@@ -399,6 +399,7 @@ fn partial_lane_coverage_publishes_execution_value_and_exposes_ratio() {
     ));
 }
 
+#[trace("FR-033-AC-16")]
 #[test]
 fn team_lane_classification_uses_latest_state_and_exact_workspace() {
     use super::collect::{PrometheusLeadStatus, PrometheusSample};
@@ -433,6 +434,7 @@ fn team_lane_classification_uses_latest_state_and_exact_workspace() {
     );
 }
 
+#[trace("FR-033-AC-15")]
 #[test]
 fn retained_lane_range_integrates_working_time_and_host_coverage() {
     let timestamps = serde_json::json!({
@@ -726,6 +728,8 @@ fn linear_stage_age_ignores_reported_assignment_duration() {
     assert!(!text.contains("stage_oldest_age_seconds"));
 }
 
+/// Trace: FR-033-AC-15, FR-033-AC-16
+#[trace("FR-033-AC-15", "FR-033-AC-16")]
 #[test]
 fn team_series_have_linear_team_labels_and_explicit_empty_population_status() {
     let dir = tempfile::tempdir().unwrap();

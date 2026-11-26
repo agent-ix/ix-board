@@ -980,6 +980,7 @@ impl LinearGraphQlSource {
 
     /// Reads one issue's complete state history for the retro commands; a history that stops
     /// before its last page is an error.
+    #[implements("FR-033-AC-16")]
     pub fn fetch_state_changes(
         &self,
         issue_id: &str,
@@ -1246,6 +1247,7 @@ impl LinearGraphQlSource {
     }
 
     /// Reads one stable page of marker comments by native update time for resumable sync.
+    #[implements("FR-033-AC-17")]
     pub fn fetch_marker_comment_page(
         &self,
         prefix: &str,

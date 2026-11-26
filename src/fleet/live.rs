@@ -309,6 +309,7 @@ impl PromHttp {
     }
 
     /// Runs one bounded Prometheus range query and returns the response body.
+    #[implements("FR-033-AC-15")]
     pub fn query_range(
         &self,
         expr: &str,

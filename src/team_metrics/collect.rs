@@ -80,6 +80,7 @@ struct ReviewMarkerRefresh {
     reason: Option<String>,
 }
 
+#[implements("FR-033-AC-17")]
 fn sync_review_markers(
     client: &crate::LinearGraphQlSource,
     state_path: &std::path::Path,
@@ -179,6 +180,7 @@ fn sync_review_markers(
     }
 }
 
+#[implements("FR-033-AC-17")]
 fn compact_marker_body(body: &str) -> String {
     let mut compact = body.lines().next().unwrap_or_default().to_owned();
     let mut in_block = false;
@@ -505,6 +507,7 @@ impl Collector {
         history
     }
     /// Collects tracker/VCS data using shared retro calculations, outside the activity worker.
+    #[implements("FR-033-AC-16", "FR-033-AC-17", "FR-033-AC-18")]
     pub fn tracker(config: &Config, now: i64) -> TrackerBatch {
         let source = retro::live::linear_or_unreadable();
         let linear_before = source.request_count().unwrap_or(0);
@@ -1089,6 +1092,7 @@ pub(super) fn classify_team_lanes(
 }
 
 /// Counts verified path closures by UTC day from retained Linear histories and configured repos.
+#[implements("FR-033-AC-18")]
 fn daily_verified_linear_closures(
     source: &dyn LinearSource,
     issues: &[Issue],
@@ -1282,6 +1286,7 @@ fn verified_daily_closure_counts(
     Ok(counts)
 }
 
+#[implements("FR-033-AC-18")]
 fn gate_path_issues(
     workspace: &WorkspaceSnapshot,
     selected_ids: &BTreeSet<crate::IssueId>,
@@ -1354,6 +1359,7 @@ fn daily_github_merges(prs: &[crate::retro::sources::PullRequest], now: f64) -> 
     counts
 }
 
+#[implements("FR-033-AC-16")]
 fn linear_stage_ages_incremental(
     source: &dyn LinearSource,
     workspace: &WorkspaceSnapshot,
@@ -1432,6 +1438,7 @@ fn linear_stage_ages_incremental(
     linear_stage_ages_from_histories(workspace, selected_ids, &cache.entries, now_ms)
 }
 
+#[implements("FR-033-AC-16")]
 fn linear_stage_ages_from_histories(
     workspace: &WorkspaceSnapshot,
     selected_ids: &BTreeSet<crate::IssueId>,
@@ -1485,6 +1492,7 @@ fn linear_stage_ages_from_histories(
         .collect()
 }
 
+#[implements("FR-033-AC-16")]
 fn workflow_stage_label(name: &str) -> String {
     let mut label = String::new();
     let mut underscore = false;
@@ -1500,6 +1508,7 @@ fn workflow_stage_label(name: &str) -> String {
     label.trim_end_matches('_').to_owned()
 }
 
+#[implements("FR-033-AC-5", "FR-033-AC-16")]
 fn latest_retro_record(team: &str, now_ms: i64) -> (Option<retro::Record>, Option<String>) {
     let store = match retro::store::Store::from_env(team) {
         Ok(store) => store,
@@ -1537,6 +1546,7 @@ fn latest_retro_record(team: &str, now_ms: i64) -> (Option<retro::Record>, Optio
     (Some(record), None)
 }
 
+#[implements("FR-033-AC-15")]
 fn prometheus_effort_range(
     team: &str,
     now_ms: i64,
@@ -1564,6 +1574,7 @@ fn prometheus_effort_range(
     parse_effort_range(&timestamps, &working, start, end)
 }
 
+#[implements("FR-033-AC-15")]
 pub(super) fn parse_effort_range(
     timestamp_body: &str,
     working_body: &str,
@@ -1702,6 +1713,7 @@ pub(super) fn parse_effort_range(
     })
 }
 
+#[implements("FR-033-AC-6")]
 fn update_members(
     state: &mut ScopeState,
     new: &BTreeMap<String, Member>,
@@ -1854,6 +1866,7 @@ mod tests {
         assert_eq!(ages[0].coverage, 0.5);
         assert!(ages[0].available);
     }
+    #[trace("FR-033-AC-18")]
     #[test]
     fn daily_closures_count_only_merged_pr_verified_path_events() {
         use crate::retro::sources::StateChange;
@@ -2029,6 +2042,7 @@ mod tests {
         assert_eq!(state.totals["scope_removed"], 1.0);
         assert!(!state.totals.contains_key("completed"));
     }
+    #[trace("FR-033-AC-17")]
     #[test]
     fn review_marker_cursor_and_payload_survive_restart_without_prose() {
         let directory = tempfile::tempdir().unwrap();
