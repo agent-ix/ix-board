@@ -184,7 +184,7 @@ pub(super) fn time_column(query: &str) -> &'static str {
 
 /// Reads one event-time slice through SQLite's read-only API. The fleet writer
 /// changes its exact schema version as migrations land; retro evaluation only
-/// needs stable views and therefore accepts the v3-v8 stack range without
+/// needs stable views and therefore accepts the v3-v9 stack range without
 /// opening the ledger for migration or write access.
 #[implements("FR-047-AC-6")]
 pub(super) fn read_view_rows(
@@ -960,7 +960,7 @@ mod tests {
         let path = directory.path().join("ledger.sqlite3");
         let connection = rusqlite::Connection::open(&path).expect("create ledger fixture");
         connection
-            .pragma_update(None, "user_version", 9)
+            .pragma_update(None, "user_version", 10)
             .expect("set future version");
         drop(connection);
         let error = read_view_rows(
