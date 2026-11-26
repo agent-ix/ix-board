@@ -99,6 +99,8 @@ pub struct CleanDecision {
 pub struct BuildHostMetrics {
     /// Host label from the exposition.
     pub host: String,
+    /// Latest explicit sample timestamp, in Unix seconds, when supplied.
+    pub observed_at_epoch_secs: Option<u64>,
     /// One-minute load average.
     pub load1: Option<f64>,
     /// CPU core count used to normalize load.
@@ -298,7 +300,14 @@ impl HygieneReport {
         if self.unsupported {
             return 3;
         }
-        if self.free_bytes.is_none() || !self.process_table_complete || !self.mount_table_complete {
+        if self.free_bytes.is_none()
+            || !self.process_table_complete
+            || !self.mount_table_complete
+            || self
+                .targets
+                .iter()
+                .any(|target| target.reason == "mount_evidence_unknown")
+        {
             return 2;
         }
         if self
@@ -307,7 +316,7 @@ impl HygieneReport {
             || self.targets.iter().any(|target| {
                 matches!(
                     target.reason.as_str(),
-                    "eligible" | "process_evidence_incomplete"
+                    "eligible" | "process_evidence_incomplete" | "mount_boundary"
                 )
             })
             || !self.prunable_worktrees.is_empty()
@@ -370,13 +379,21 @@ pub fn parse_mount_table(text: &str) -> io::Result<Vec<MountEntry>> {
             if left.len() < 5 || right.len() < 2 {
                 continue;
             }
-            (left[0].to_owned(), unescape_mount_field(left[4]), right[0].to_owned())
+            (
+                left[0].to_owned(),
+                unescape_mount_field(left[4]),
+                right[0].to_owned(),
+            )
         } else {
             let fields = line.split_whitespace().collect::<Vec<_>>();
             if fields.len() < 3 {
                 continue;
             }
-            (unescape_mount_field(fields[0]), unescape_mount_field(fields[1]), fields[2].to_owned())
+            (
+                unescape_mount_field(fields[0]),
+                unescape_mount_field(fields[1]),
+                fields[2].to_owned(),
+            )
         };
         entries.push(MountEntry {
             source: fields.0,
@@ -413,9 +430,10 @@ pub fn mount_safety(path: &Path, anchor: &Path, mounts: &[MountEntry]) -> MountS
     if path_mount.source != anchor_mount.source || path_mount.fs_type != anchor_mount.fs_type {
         return MountSafety::Boundary;
     }
-    if mounts.iter().any(|entry| {
-        entry.mount_point != path && entry.mount_point.starts_with(&path)
-    }) {
+    if mounts
+        .iter()
+        .any(|entry| entry.mount_point != path && entry.mount_point.starts_with(&path))
+    {
         return MountSafety::Boundary;
     }
     MountSafety::Safe
@@ -907,6 +925,7 @@ pub fn parse_build_metrics(text: &str) -> BTreeMap<String, BuildHostMetrics> {
         let Some(raw_value) = fields.next() else {
             continue;
         };
+        let raw_timestamp = fields.next();
         let Ok(value) = raw_value.parse::<f64>() else {
             continue;
         };
@@ -928,6 +947,16 @@ pub fn parse_build_metrics(text: &str) -> BTreeMap<String, BuildHostMetrics> {
                 host: host.clone(),
                 ..BuildHostMetrics::default()
             });
+        if let Some(timestamp) = raw_timestamp
+            .and_then(|value| value.parse::<f64>().ok())
+            .and_then(value_u64)
+        {
+            let timestamp_secs = timestamp / 1000;
+            row.observed_at_epoch_secs = Some(
+                row.observed_at_epoch_secs
+                    .map_or(timestamp_secs, |current| current.max(timestamp_secs)),
+            );
+        }
         if name == "node_cpu_seconds_total"
             && let Some(cpu) = label(labels, "cpu")
         {
@@ -1022,6 +1051,19 @@ fn label<'a>(labels: &'a str, wanted: &str) -> Option<&'a str> {
 /// Evaluates host telemetry against a configured heavy-gate policy.
 #[implements("FR-048-AC-8", "FR-050-AC-3")]
 pub fn eligibility(metrics: &BuildHostMetrics, policy: BuildPolicy) -> Eligibility {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    eligibility_at(metrics, policy, now)
+}
+
+/// Evaluates host telemetry with a deterministic current timestamp.
+#[implements("FR-048-AC-8", "FR-050-AC-3")]
+pub fn eligibility_at(
+    metrics: &BuildHostMetrics,
+    policy: BuildPolicy,
+    now_epoch_secs: u64,
+) -> Eligibility {
     let (Some(load1), Some(cores)) = (metrics.load1, metrics.cores) else {
         return Eligibility::Unknown;
     };
@@ -1034,6 +1076,9 @@ pub fn eligibility(metrics: &BuildHostMetrics, policy: BuildPolicy) -> Eligibili
         || metrics.swap_free_bytes.is_none()
         || !metrics.queue_depth_available
         || !metrics.running_leases_available
+        || metrics
+            .observed_at_epoch_secs
+            .is_some_and(|observed| observed > now_epoch_secs || now_epoch_secs - observed > 120)
     {
         return Eligibility::Unknown;
     }
@@ -1601,6 +1646,13 @@ mod tests {
         metrics.load1 = Some(7.9);
         metrics.running_leases = 1;
         assert_eq!(eligibility(&metrics, policy), Eligibility::Ineligible);
+        metrics.running_leases = 0;
+        metrics.observed_at_epoch_secs = Some(1000);
+        assert_eq!(
+            eligibility_at(&metrics, policy, 1120),
+            Eligibility::Eligible
+        );
+        assert_eq!(eligibility_at(&metrics, policy, 1121), Eligibility::Unknown);
     }
 
     #[test]
@@ -1648,13 +1700,14 @@ mod tests {
     #[test]
     #[trace("FR-048-AC-10")]
     fn mount_table_parser_unescapes_spaces_in_mountpoints() {
-        let mounts = parse_mount_table("36 25 8:1 / /home/p/dev\\040space rw - ext4 /dev/root rw\n")
-            .expect("mount table parses");
+        let mounts =
+            parse_mount_table("36 25 8:1 / /home/p/dev\\040space rw - ext4 /dev/root rw\n")
+                .expect("mount table parses");
         assert_eq!(mounts[0].mount_point, Path::new("/home/p/dev space"));
     }
 
     #[test]
-    #[trace("FR-048-AC-1")]
+    #[trace("FR-048-AC-1", "FR-048-AC-10")]
     fn check_exit_code_compares_free_bytes_with_policy_floor() {
         let report = |free_bytes| HygieneReport {
             host: "draco".into(),
@@ -1669,6 +1722,32 @@ mod tests {
         };
         assert_eq!(report(Some(99)).exit_code(), 1);
         assert_eq!(report(Some(100)).exit_code(), 0);
+        assert_eq!(
+            HygieneReport {
+                targets: vec![CleanDecision {
+                    target: "/wt/target".into(),
+                    age_secs: 0,
+                    eligible: false,
+                    reason: "mount_boundary".into(),
+                }],
+                ..report(Some(100))
+            }
+            .exit_code(),
+            1
+        );
+        assert_eq!(
+            HygieneReport {
+                targets: vec![CleanDecision {
+                    target: "/wt/target".into(),
+                    age_secs: 0,
+                    eligible: false,
+                    reason: "mount_evidence_unknown".into(),
+                }],
+                ..report(Some(100))
+            }
+            .exit_code(),
+            2
+        );
         assert_eq!(report(None).exit_code(), 2);
         assert_eq!(
             HygieneReport {

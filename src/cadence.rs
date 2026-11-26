@@ -720,9 +720,7 @@ mod tests {
         validate_manifest(&manifest).expect("host check command accepted");
         let report = run_job_with_executor(
             &manifest,
-            || {
-                Ok(Ledger::open(&ledger_path, &FleetConfig::default())?)
-            },
+            || Ok(Ledger::open(&ledger_path, &FleetConfig::default())?),
             "host-check",
             1000,
             |job| {

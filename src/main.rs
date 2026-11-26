@@ -3590,10 +3590,9 @@ fn run_hygiene(
 ) -> Result<ix_board::host_hygiene::HygieneReport, Error> {
     use ix_board::host_hygiene::{
         CleanDecision, HostPolicy, HygieneConfig, HygieneReport, MountSafety, apply_clean_decision,
-        canonicalize_worktree_root, clean_decision, free_disk_bytes, newest_mtime_under,
-        mount_filesystem_matches, mount_safety, mount_table_covers, recheck_clean_decision,
-        system_mount_table,
-        system_process_table,
+        canonicalize_worktree_root, clean_decision, free_disk_bytes, mount_filesystem_matches,
+        mount_safety, mount_table_covers, newest_mtime_under, recheck_clean_decision,
+        system_mount_table, system_process_table,
     };
     use std::time::{Duration, SystemTime};
 
@@ -3655,7 +3654,6 @@ fn run_hygiene(
     let free_bytes = free_disk_bytes(&root).ok();
     let processes = system_process_table().unwrap_or_default();
     let mounts = system_mount_table().ok();
-    let mount_table_complete = mounts.is_some();
     let root_mount_safety = if mounts
         .as_ref()
         .is_some_and(|mounts| mount_table_covers(&root, mounts))
@@ -3664,6 +3662,7 @@ fn run_hygiene(
     } else {
         MountSafety::Unknown
     };
+    let mount_table_complete = mounts.is_some() && root_mount_safety == MountSafety::Safe;
     let prunable_worktrees = if root_mount_safety == MountSafety::Safe {
         find_prunable_worktrees(&root, mounts.as_deref().unwrap_or_default())
     } else {
@@ -3857,7 +3856,9 @@ fn run_host_check() -> ix_board::host_check::HostCheckReport {
             Ok(_) => AuthState::Unavailable,
             Err(Error::Credential(_)) => AuthState::KeyringLocked,
             Err(Error::MissingApiKey) => AuthState::Missing,
-            Err(Error::Http(error)) if error.status() == Some(reqwest::StatusCode::UNAUTHORIZED) => {
+            Err(Error::Http(error))
+                if error.status() == Some(reqwest::StatusCode::UNAUTHORIZED) =>
+            {
                 AuthState::Unauthorized
             }
             Err(_) => AuthState::Unavailable,
@@ -3875,7 +3876,8 @@ fn run_host_check() -> ix_board::host_check::HostCheckReport {
     let linear = AuthCheck {
         service: "linear".to_owned(),
         state: linear_state,
-        source: linear_source.filter(|source| !matches!(source.as_str(), "keyring_locked" | "unavailable")),
+        source: linear_source
+            .filter(|source| !matches!(source.as_str(), "keyring_locked" | "unavailable")),
     };
     let auth = vec![gh, linear];
 
@@ -3952,7 +3954,11 @@ fn resolve_host_label(config: Option<&ix_board::host_hygiene::HygieneConfig>) ->
             return None;
         }
         configured
-            .and_then(|hosts| hosts.keys().find(|host| host.eq_ignore_ascii_case(&normalized)))
+            .and_then(|hosts| {
+                hosts
+                    .keys()
+                    .find(|host| host.eq_ignore_ascii_case(&normalized))
+            })
             .cloned()
             .or_else(|| configured.is_none().then_some(normalized))
     })
@@ -3986,8 +3992,7 @@ fn find_prunable_worktrees(
         for line in String::from_utf8_lossy(&output.stdout).lines() {
             if let Some(path) = line.strip_prefix("worktree ") {
                 let path = PathBuf::from(path);
-                current = (mount_safety(&path, root, mounts) == MountSafety::Safe)
-                    .then_some(path);
+                current = (mount_safety(&path, root, mounts) == MountSafety::Safe).then_some(path);
             } else if line.starts_with("prunable")
                 && let Some(path) = current.as_ref().filter(|path| path.starts_with(root))
             {

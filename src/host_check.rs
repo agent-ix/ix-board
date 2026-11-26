@@ -190,7 +190,10 @@ mod tests {
             auth_state(true, false, false, None, false),
             AuthState::PathMissing
         );
-        assert_eq!(auth_state(true, false, true, Some(200), true), AuthState::Ready);
+        assert_eq!(
+            auth_state(true, false, true, Some(200), true),
+            AuthState::Ready
+        );
         assert!(find_executable(std::ffi::OsStr::new("/nonexistent"), "gh").is_none());
     }
 
@@ -251,12 +254,27 @@ mod tests {
             host: "terra".to_owned(),
             ..Default::default()
         };
-        assert_eq!(host_exit_code(&auth, Some(&metrics), Eligibility::Eligible, &[], true), 0);
-        assert_eq!(host_exit_code(&auth, None, Eligibility::Unknown, &[], false), 1);
-        assert_eq!(host_exit_code(&auth, Some(&metrics), Eligibility::Eligible, &[super::DevProcessFinding {
-            pid: 1,
-            executable: "rg".to_owned(),
-            cwd: PathBuf::from("/home/p/dev"),
-        }], true), 1);
+        assert_eq!(
+            host_exit_code(&auth, Some(&metrics), Eligibility::Eligible, &[], true),
+            0
+        );
+        assert_eq!(
+            host_exit_code(&auth, None, Eligibility::Unknown, &[], false),
+            1
+        );
+        assert_eq!(
+            host_exit_code(
+                &auth,
+                Some(&metrics),
+                Eligibility::Eligible,
+                &[super::DevProcessFinding {
+                    pid: 1,
+                    executable: "rg".to_owned(),
+                    cwd: PathBuf::from("/home/p/dev"),
+                }],
+                true
+            ),
+            1
+        );
     }
 }
