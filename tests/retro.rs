@@ -554,7 +554,13 @@ fn git_init(dir: &Path) {
 
 // ---- FR-024 ----------------------------------------------------------------------------
 
-#[trace("FR-024-AC-1", "FR-024-AC-14")]
+#[trace(
+    "FR-024-AC-1",
+    "FR-024-AC-14",
+    "FR-024-AC-20",
+    "FR-024-AC-21",
+    "FR-024-AC-22"
+)]
 #[test]
 fn snapshot_appends_one_record_with_every_catalog_id() {
     let rig = base_rig();
@@ -577,6 +583,26 @@ fn snapshot_appends_one_record_with_every_catalog_id() {
     assert_eq!(value(&record, "path_remaining"), Some(1.0));
     assert_eq!(value(&record, "prs_open"), Some(1.0));
     assert_eq!(value(&record, "fix_rounds_total"), Some(3.0));
+    for id in [
+        "prs_per_ticket_max",
+        "commits_per_pr_max",
+        "review_file_only_commits",
+        "review_rounds_over_limit",
+        "non_code_check_reruns",
+        "unnamed_wait_minutes_max",
+        "host_load_per_core_max",
+    ] {
+        assert_eq!(value(&record, id), None, "{id} must not invent a value");
+        assert_eq!(reason(&record, id), "collector/history not configured");
+    }
+    let wait_metric = definition("unnamed_wait_minutes_max").unwrap();
+    assert_eq!(wait_metric.family, "utilization");
+    assert_eq!(wait_metric.unit, "minutes");
+    assert_eq!(wait_metric.direction, ix_board::retro::Direction::Down);
+    let host_metric = definition("host_load_per_core_max").unwrap();
+    assert_eq!(host_metric.family, "resource");
+    assert_eq!(host_metric.unit, "ratio");
+    assert_eq!(host_metric.direction, ix_board::retro::Direction::Down);
     assert_eq!(reason(&record, "main_red_incidents"), "not configured");
     assert_eq!(record.kind, ix_board::retro::RecordKind::Snapshot);
     assert_eq!(record.taken_at, "2026-11-07T12:00:00Z");
@@ -2249,6 +2275,140 @@ fn a_metric_moving_against_its_direction_twice_in_a_row_is_regressing() {
     assert!(!one(&delta(&two, "{}").unwrap(), "prs_idle").regressing);
 }
 
+#[trace("FR-027-AC-11")]
+#[test]
+fn rising_retro_metrics_and_unnamed_wait_emit_structured_defects() {
+    let records = vec![
+        snap(
+            "2026-11-05T12:00:00Z",
+            &[
+                ("prs_idle", Some(2.0), QUERY),
+                ("fix_rounds_max", Some(1.0), QUERY),
+                ("agents_idle_minutes_max", Some(10.0), QUERY),
+                ("unnamed_wait_minutes_max", Some(20.0), QUERY),
+            ],
+        ),
+        snap(
+            "2026-11-06T12:00:00Z",
+            &[
+                ("prs_idle", Some(3.0), QUERY),
+                ("fix_rounds_max", Some(1.0), QUERY),
+                ("agents_idle_minutes_max", Some(14.0), QUERY),
+                ("unnamed_wait_minutes_max", Some(20.0), QUERY),
+            ],
+        ),
+    ];
+    let report = delta(&records, "{}").unwrap();
+    assert_eq!(
+        report
+            .defects
+            .iter()
+            .map(|defect| defect.metric_id.as_str())
+            .collect::<Vec<_>>(),
+        ["prs_idle", "agents_idle_minutes_max"]
+    );
+    assert_eq!(report.defects[0].class, "retro_metric_rising");
+    assert_eq!(report.defects[0].previous, Some(2.0));
+    assert_eq!(report.defects[0].current, 3.0);
+
+    let mut above_boundary = records[1].clone();
+    above_boundary
+        .metrics
+        .get_mut("unnamed_wait_minutes_max")
+        .unwrap()
+        .value = Some(20.1);
+    let above = delta(&[records[0].clone(), above_boundary], "{}").unwrap();
+    assert!(above.defects.iter().any(|defect| {
+        defect.class == "lead_wait_without_named_wait"
+            && defect.metric_id == "unnamed_wait_minutes_max"
+            && defect.current == 20.1
+    }));
+
+    let no_defect_records = vec![
+        snap(
+            "2026-11-05T12:00:00Z",
+            &[
+                ("prs_idle", Some(4.0), QUERY),
+                ("fix_rounds_max", Some(2.0), QUERY),
+                ("agents_idle_minutes_max", None, QUERY),
+                ("unnamed_wait_minutes_max", Some(20.0), QUERY),
+            ],
+        ),
+        snap(
+            "2026-11-06T12:00:00Z",
+            &[
+                ("prs_idle", Some(3.0), QUERY),
+                ("fix_rounds_max", Some(2.0), QUERY),
+                ("agents_idle_minutes_max", None, QUERY),
+                ("unnamed_wait_minutes_max", Some(20.0), QUERY),
+            ],
+        ),
+    ];
+    assert!(delta(&no_defect_records, "{}").unwrap().defects.is_empty());
+
+    let mut changed_query = no_defect_records[1].clone();
+    changed_query.metrics.get_mut("prs_idle").unwrap().value = Some(5.0);
+    changed_query
+        .metrics
+        .get_mut("fix_rounds_max")
+        .unwrap()
+        .query = "different counting rule".to_owned();
+    assert_eq!(
+        delta(&[no_defect_records[0].clone(), changed_query], "{}")
+            .unwrap()
+            .defects
+            .iter()
+            .map(|defect| defect.metric_id.as_str())
+            .collect::<Vec<_>>(),
+        ["prs_idle"]
+    );
+}
+
+#[trace("FR-027-AC-12")]
+#[test]
+fn delta_notification_is_opt_in_and_uses_the_configured_minder() {
+    let records = vec![
+        snap("2026-11-05T12:00:00Z", &[("prs_idle", Some(2.0), QUERY)]),
+        snap("2026-11-06T12:00:00Z", &[("prs_idle", Some(3.0), QUERY)]),
+    ];
+    let report = delta(&records, "{}").unwrap();
+    let mut sent = Vec::new();
+    ix_board::retro::notify_defects(&report, false, Some("terra:QSL:minder"), |to, message| {
+        sent.push((to.to_owned(), message.to_owned()));
+        Ok(())
+    })
+    .unwrap();
+    assert!(sent.is_empty(), "without --notify the sender is not called");
+    ix_board::retro::notify_defects(&report, true, Some("terra:QSL:minder"), |to, message| {
+        sent.push((to.to_owned(), message.to_owned()));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].0, "terra:QSL:minder");
+    assert!(sent[0].1.contains("prs_idle"));
+
+    let mut sent_without_route = 0;
+    assert!(
+        ix_board::retro::notify_defects(&report, true, None, |_, _| {
+            sent_without_route += 1;
+            Ok(())
+        })
+        .is_err()
+    );
+    assert_eq!(sent_without_route, 0);
+
+    let mut sent_to_invalid_route = 0;
+    assert!(
+        ix_board::retro::notify_defects(&report, true, Some("QSL:minder"), |_, _| {
+            sent_to_invalid_route += 1;
+            Ok(())
+        })
+        .is_err()
+    );
+    assert_eq!(sent_to_invalid_route, 0);
+}
+
 /// Trace: FR-027-AC-3
 #[test]
 fn unavailable_and_query_changed_metrics_report_no_numeric_change() {
@@ -2606,13 +2766,14 @@ fn running_the_same_range_twice_appends_nothing_and_reports_each_skipped_day() {
 fn live_state_metrics_are_not_reconstructible_in_every_backfill_record() {
     let (_dir, store) = store_with(&[]);
     let report = backfill_range(&base_rig(), &store, ("2026-11-02", "2026-11-04"), DAY).unwrap();
-    const KEPT: [&str; 7] = [
+    const KEPT: [&str; 8] = [
         "prs_merged_per_hour",
         "pr_cycle_median_hours",
         "pr_cycle_p90_hours",
         "path_closed",
         "intake_new",
         "net_closed_minus_new",
+        "tickets_closed_per_hour",
         "done_reopened",
     ];
     for record in &report.appended {

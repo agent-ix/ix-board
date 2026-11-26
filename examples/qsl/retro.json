@@ -1,0 +1,32 @@
+{
+  "team": "QSL",
+  "linear_teams": ["QSL"],
+  "projects": [
+    "FSL alpha release",
+    "FSL stability: red main and blowups",
+    "FSL residual language, checker and replay defects",
+    "FSL probability engine completion",
+    "FSL standard conformance against the compiler",
+    "QSL performance and scaling",
+    "FSL L5: agent journey evals"
+  ],
+  "gate_tickets": ["QSL-2844", "QSL-2845", "QSL-2846", "QSL-2856", "QSL-2918"],
+  "repos": [
+    "agent-ix/filament-spec-language",
+    "agent-ix/filament-contract-ir",
+    "agent-ix/filament-specification"
+  ],
+  "herdr_teams": ["QSL"],
+  "thresholds": {
+    "pr_idle_hours": 3,
+    "pr_oversize_lines": 1500,
+    "in_progress_stale_hours": 24
+  },
+  "main_check": {
+    "repo": "agent-ix/filament-spec-language",
+    "branch": "main"
+  },
+  "gate_log": "/Users/peter/.local/state/team-retro/QSL/gate.jsonl",
+  "review_round_limit": 2,
+  "minder_address": "terra:QSL:minder"
+}

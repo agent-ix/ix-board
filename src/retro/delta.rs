@@ -4,6 +4,7 @@
 //! `ix-board retro delta`: compares the latest snapshot with the previous one and the baseline,
 //! reading only the store (FR-027).
 
+use ix_trace_rs::implements;
 use serde::{Deserialize, Serialize};
 
 use super::RetroError;
@@ -80,6 +81,21 @@ pub struct MetricDelta {
     pub regressing: bool,
 }
 
+/// One actionable regression for the configured minder.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeltaDefect {
+    /// Stable defect class.
+    pub class: String,
+    /// Metric that supplied the evidence.
+    pub metric_id: String,
+    /// Earlier value, when the defect is a rise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous: Option<f64>,
+    /// Latest value.
+    pub current: f64,
+}
+
 /// The delta report. There is deliberately no combined score.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -106,6 +122,9 @@ pub struct DeltaReport {
     pub baseline_kind: Option<RecordKind>,
     /// One entry per metric of the latest record, in catalog order.
     pub metrics: Vec<MetricDelta>,
+    /// Actionable findings derived only from the stored snapshots.
+    #[serde(default)]
+    pub defects: Vec<DeltaDefect>,
 }
 
 /// Compares the stored records of the configured team. Reads no source.
@@ -116,6 +135,7 @@ pub fn run_delta(config: &RetroConfig, store: &Store) -> Result<DeltaReport, Ret
 }
 
 /// Applies the store's existing comparison selection to already validated, time-ordered records.
+#[implements("FR-027-AC-11")]
 pub(crate) fn compare_records(
     team: &str,
     baseline_taken_at: Option<&str>,
@@ -150,6 +170,7 @@ pub(crate) fn compare_records(
             baseline: baseline.map(|record| record.taken_at.clone()),
             baseline_kind: baseline.map(|record| record.kind),
             metrics: Vec::new(),
+            defects: Vec::new(),
         });
     };
     let baseline = baseline.unwrap_or(latest);
@@ -184,7 +205,8 @@ pub(crate) fn compare_records(
                 regressing,
             }
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let defects = delta_defects(&metrics);
     Ok(DeltaReport {
         department: latest.department.as_ref().map(|report| {
             super::department::delta(
@@ -200,7 +222,85 @@ pub(crate) fn compare_records(
         baseline: Some(baseline.taken_at.clone()),
         baseline_kind: Some(baseline.kind),
         metrics,
+        defects,
     })
+}
+
+#[implements("FR-027-AC-11")]
+fn delta_defects(metrics: &[MetricDelta]) -> Vec<DeltaDefect> {
+    let mut defects = Vec::new();
+    for metric in metrics.iter().filter(|metric| {
+        matches!(
+            metric.id.as_str(),
+            "prs_idle" | "fix_rounds_max" | "agents_idle_minutes_max"
+        )
+    }) {
+        if metric.status == Status::Ok
+            && metric.since_previous.state == ChangeState::Changed
+            && metric
+                .since_previous
+                .change
+                .is_some_and(|change| change > 0.0)
+            && let (Some(current), Some(previous)) = (
+                metric.value,
+                metric
+                    .value
+                    .zip(metric.since_previous.change)
+                    .map(|(v, d)| v - d),
+            )
+        {
+            defects.push(DeltaDefect {
+                class: "retro_metric_rising".to_owned(),
+                metric_id: metric.id.clone(),
+                previous: Some(previous),
+                current,
+            });
+        }
+    }
+    if let Some(metric) = metrics
+        .iter()
+        .find(|metric| metric.id == "unnamed_wait_minutes_max")
+        && metric.status == Status::Ok
+        && let Some(current) = metric.value.filter(|value| *value > 20.0)
+    {
+        defects.push(DeltaDefect {
+            class: "lead_wait_without_named_wait".to_owned(),
+            metric_id: metric.id.clone(),
+            previous: None,
+            current,
+        });
+    }
+    defects
+}
+
+/// Delivers stored delta defects only when the caller explicitly requests notification.
+#[implements("FR-027-AC-12")]
+pub fn notify_defects(
+    report: &DeltaReport,
+    enabled: bool,
+    recipient: Option<&str>,
+    mut notify: impl FnMut(&str, &str) -> Result<(), String>,
+) -> Result<(), String> {
+    if !enabled || report.defects.is_empty() {
+        return Ok(());
+    }
+    let recipient = recipient
+        .filter(|address| crate::relay_address::is_valid(address))
+        .ok_or_else(|| "retro config must set minder_address as server:workspace:tab".to_owned())?;
+    for defect in &report.defects {
+        let message = format!(
+            "ix-board retro defect {}: {} = {}{}",
+            defect.class,
+            defect.metric_id,
+            defect.current,
+            defect
+                .previous
+                .map(|previous| format!(" (previously {previous})"))
+                .unwrap_or_default()
+        );
+        notify(recipient, &message)?;
+    }
+    Ok(())
 }
 
 /// The instant a stored or configured UTC time names, with its fractional seconds.
@@ -297,6 +397,12 @@ pub fn render_delta_text(report: &DeltaReport) -> String {
             } else {
                 ""
             }
+        )
+    }));
+    lines.extend(report.defects.iter().map(|defect| {
+        format!(
+            "defect {}: {} = {}",
+            defect.class, defect.metric_id, defect.current
         )
     }));
     if let Some(department) = &report.department {

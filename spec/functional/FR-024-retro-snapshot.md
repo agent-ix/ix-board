@@ -44,6 +44,8 @@ word never has to serve as Linear key, workspace label and directory.
 | `relay_leads` | Optional relay addresses (`server:workspace:tab`) read for undelivered messages. |
 | `message_stale_minutes` | Optional age in minutes after which a pending message counts as undelivered. A sibling top-level field of `relay_leads`; `messages_undelivered` needs both. |
 | `decision_label` | Optional Linear label name marking issues that wait on an owner decision. |
+| `review_round_limit` | Optional maximum reviewer round count used by `review_rounds_over_limit`; without it, only that metric is unavailable. |
+| `minder_address` | Optional verified `server:workspace:tab` relay destination for explicit `retro delta --notify` defect delivery. |
 | `baseline_taken_at` | Optional UTC time naming the baseline record ([FR-027](./FR-027-retro-delta.md)). |
 
 ### Metric catalog
@@ -82,6 +84,12 @@ with reason `empty population`.
 | resource | `build_lock_wait_minutes` | Sum of `acquired_lock_at` minus `requested_lock_at` over `gate_log` lines finished inside the window. |
 | utilization | `messages_undelivered` | Messages pending longer than `message_stale_minutes` in the ix-relay bus queues of the addresses in `relay_leads`, read without dequeuing. Queues are keyed by the registered session name, so each address is resolved read-only through the bus registry by machine, workspace and tab, and the messages of every matching registration count; an address with no registration makes the metric `unavailable`. The bus URL and prefix come from `IX_RELAY_URL` and `IX_RELAY_PREFIX`, then `~/.ix/relay/config.toml`, then the relay defaults. |
 | scope | `decisions_open`, `decision_oldest_hours` | Open issues carrying `decision_label`, and the age in hours of the oldest. |
+| rework | `prs_per_ticket_max` | Largest number of pull requests attached to one configured project or gate-path issue, from the complete Linear attachment list and matching GitHub pull requests. |
+| rework | `commits_per_pr_max`, `review_file_only_commits` | Largest commit count on an open or merged-in-window pull request, and total commits whose complete changed-file list contains only `reviews/` paths, from complete GitHub commit and file pages. |
+| rework | `review_rounds_over_limit` | Number of open or merged-in-window pull requests whose highest matching reviewer-disposition `round=` exceeds `review_round_limit`; unavailable when the limit or marker population is not configured or complete. |
+| rework | `non_code_check_reruns` | Check runs repeated after a pull-request head move where every intervening commit changes only documentation, tests, or review records; source is complete GitHub head, commit-file and check-run history. |
+| utilization | `unnamed_wait_minutes_max` | Largest time a configured lane was classified `LOOP(wait_loop)` without a structured named wait, from complete lane status observations; unavailable when lane status or wait-name evidence is incomplete. |
+| resource | `host_load_per_core_max` | Maximum one-minute host load divided by logical core count for configured build hosts, from complete scheduler host observations. |
 
 The command reads the state history of an issue only when the issue was updated inside the window (or, for `in_progress_stale`, inside `in_progress_stale_hours`), because an issue cannot change state without being updated. That holds only for a current update time, so the issue snapshot must be proven current first: a cached snapshot is used only when a fresh read of the issues updated since then shows the same update time for each, and is refetched otherwise. Independent histories are read concurrently, and a partial read is never reported as a smaller count.
 
@@ -108,6 +116,9 @@ existing id (see [FR-025](./FR-025-retro-store.md)).
 | FR-024-AC-17 | A configuration file that is missing, unreadable, not valid JSON, or lacks `team`, `gate_tickets`, `projects` or `repos` stops the command with a non-zero exit and a message naming the file and the field, and appends nothing. | Test |
 | FR-024-AC-18 | A missing threshold makes only the metrics that use it `unavailable` with reason `not configured`, and `slot_process` without `orphan_slot_hours`, or `relay_leads` without `message_stale_minutes`, (and the reverse) makes its metric `unavailable` with reason `not configured`. | Test |
 | FR-024-AC-19 | `tickets_closed_per_hour` counts the unique configured project/path issues completed inside the half-open event window that have an attached merged pull request, divides by window hours, and is unavailable when state history, issue attachments or GitHub merge state is incomplete. | Test |
+| FR-024-AC-20 | The additive churn metric IDs are present in each snapshot; until their complete structured collectors are configured, they are unavailable with no invented values. The role evaluator passes hand-written stored values through the corresponding `retro.<metric_id>` adapters. | Test |
+| FR-024-AC-21 | `unnamed_wait_minutes_max` is catalogued as a utilization metric measured in minutes with a lower-is-better direction, and is unavailable until a complete structured wait collector is configured. | Test |
+| FR-024-AC-22 | `host_load_per_core_max` is present in the catalog and is unavailable without a complete host collector; no value is invented. | Test |
 | FR-024-AC-12 | The command makes no Linear mutation, no GitHub write and no repository write; test source doubles that record writes see none. | Test |
 | FR-024-AC-13 | Each source is read with one paginated pass per run, and a source read that does not reach its last page makes dependent metrics unavailable ([FR-026](./FR-026-retro-unavailable-not-zero.md)). | Test |
 | FR-024-AC-14 | `--json` output exposes every metric with id, value, unit, direction, status, source, query and its FR-024 catalog family as `class`; it includes the FR-029 department class as `department_class` when defined. These class fields are output-only and are never written to the append-only store. Text output prints one line per metric. | Test |

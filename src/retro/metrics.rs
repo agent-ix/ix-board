@@ -79,6 +79,10 @@ pub fn collect_selected(
 
 #[implements("FR-047-AC-1")]
 #[implements("FR-024-AC-19")]
+#[implements("FR-024-AC-1")]
+#[implements("FR-024-AC-20")]
+#[implements("FR-024-AC-21")]
+#[implements("FR-024-AC-22")]
 fn collect_inner(
     config: &RetroConfig,
     frame: Frame,
@@ -218,11 +222,9 @@ fn collect_inner(
         }
     } else {
         for entry in CATALOG {
-            debug_assert!(
-                out.metrics.contains_key(entry.id),
-                "{} not computed",
-                entry.id
-            );
+            if !out.metrics.contains_key(entry.id) {
+                out.put(entry.id, Err("collector/history not configured".to_owned()));
+            }
         }
     }
     out.metrics
@@ -301,6 +303,7 @@ impl Out<'_> {
     }
 
     /// The source name and counting rule (with window and thresholds) of one metric.
+    #[implements("FR-024-AC-1")]
     fn describe(&self, id: &str) -> (&'static str, String) {
         let window = format!("window={}", format_window(self.frame.window_secs));
         let t = &self.config.thresholds;
@@ -357,6 +360,16 @@ impl Out<'_> {
             "messages_undelivered" => ("ix-relay", format!("messages pending longer than message_stale_minutes={} in the queues of relay_leads", threshold(self.config.message_stale_minutes))),
             "decisions_open" => ("linear", format!("open issues carrying decision_label={:?}", self.config.decision_label.clone().unwrap_or_default())),
             "decision_oldest_hours" => ("linear", format!("age in hours of the oldest open issue carrying decision_label={:?}", self.config.decision_label.clone().unwrap_or_default())),
+            "prs_per_ticket_max" => ("linear+github", format!("largest attached pull-request count for one project or gate-path issue; {window}")),
+            "commits_per_pr_max" => ("github", format!("largest complete commit count on an open or merged-in-window pull request; {window}")),
+            "review_file_only_commits" => ("github", format!("commits whose complete file list contains only reviews/ paths; {window}")),
+            "review_rounds_over_limit" => ("linear+github", format!("pull requests whose highest matching reviewer round exceeds review_round_limit={}; {window}", threshold(self.config.review_round_limit))),
+            "non_code_check_reruns" => ("github", format!("check runs repeated after a head move whose intervening complete commit files are non-code; {window}")),
+            "unnamed_wait_minutes_max" => ("Herdr and structured lane status", format!("largest duration of LOOP(wait_loop) without a named wait; defect over 20 minutes; {window}")),
+            "host_load_per_core_max" => (
+                "scheduler host observations",
+                "maximum one-minute load divided by logical cores".to_owned(),
+            ),
             _ => ("unknown", String::new()),
         };
         (source, rule)
@@ -707,7 +720,10 @@ fn window_progress(
     }
     if needs_net {
         let net = (|| {
-            let union = wanted;
+            let mut union = scope.path_ok()?.to_vec();
+            union.extend(scope.projects_ok()?);
+            union.sort_by(|left, right| left.id.cmp(&right.id));
+            union.dedup_by(|left, right| left.id == right.id);
             let closed = history.changed_in_window(&union, frame, to_completed)?;
             Ok::<_, String>(count(closed.len()) - count(created.clone().unwrap_or(Ok(0))?))
         })();

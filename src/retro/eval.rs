@@ -1065,6 +1065,7 @@ pub fn retro_adapters(
 /// Adapts an in-memory, read-only retro collection without appending it to the store.
 #[implements("FR-047-AC-1")]
 #[implements("FR-047-AC-9")]
+#[implements("FR-024-AC-20")]
 pub fn retro_record_adapters(
     specs: &[RoleSpec],
     record: Result<&super::Record, &str>,
@@ -3739,6 +3740,61 @@ mod tests {
                 evidence_refs: vec!["retro:prs_oversize:2023-11-14T22:13:20Z".into()],
             }
         );
+    }
+
+    #[test]
+    #[trace("FR-047-AC-9")]
+    #[trace("FR-024-AC-20")]
+    fn retro_adapter_reads_hand_written_additive_churn_metrics() {
+        let record: super::super::Record = serde_json::from_str(
+            r#"{"schema_version":1,"kind":"snapshot","taken_at":"2026-11-14T22:13:20Z","team":"QSL","window":"24h","metrics":{"prs_per_ticket_max":{"id":"prs_per_ticket_max","status":"ok","value":3,"unit":"pull_requests","direction":"down","source":"linear+github","query":"attached pull requests per ticket","class":"rework"},"commits_per_pr_max":{"id":"commits_per_pr_max","status":"ok","value":7,"unit":"commits","direction":"down","source":"github","query":"commits on pull request","class":"rework"},"review_file_only_commits":{"id":"review_file_only_commits","status":"ok","value":2,"unit":"commits","direction":"down","source":"github","query":"review-only commits","class":"rework"},"review_rounds_over_limit":{"id":"review_rounds_over_limit","status":"ok","value":1,"unit":"pull_requests","direction":"down","source":"linear+github","query":"review rounds above limit","class":"rework"},"non_code_check_reruns":{"id":"non_code_check_reruns","status":"ok","value":4,"unit":"check_runs","direction":"down","source":"github","query":"check reruns after non-code changes","class":"rework"},"unnamed_wait_minutes_max":{"id":"unnamed_wait_minutes_max","status":"ok","value":21,"unit":"minutes","direction":"down","source":"Herdr and structured lane status","query":"unnamed wait duration","class":"utilization"},"host_load_per_core_max":{"id":"host_load_per_core_max","status":"ok","value":0.75,"unit":"ratio","direction":"down","source":"scheduler host observations","query":"maximum host load per core","class":"resource"}}}"#,
+        )
+        .unwrap();
+        let spec = RoleSpec {
+            role: "coder".into(),
+            metrics: Vec::new(),
+            rules: [
+                "prs_per_ticket_max",
+                "commits_per_pr_max",
+                "review_file_only_commits",
+                "review_rounds_over_limit",
+                "non_code_check_reruns",
+                "unnamed_wait_minutes_max",
+                "host_load_per_core_max",
+            ]
+            .into_iter()
+            .map(|metric_id| EvaluationRule {
+                id: format!("R-{metric_id}"),
+                rule: "rule".into(),
+                evidence_source: "ix-board-metric".into(),
+                trigger: format!("retro.{metric_id}"),
+                method: "deterministic".into(),
+                query_or_rubric: format!("retro.{metric_id}"),
+                comparator: "=".into(),
+                target: 0.0,
+                unit: "count".into(),
+            })
+            .collect(),
+        };
+        let live = retro_record_adapters(std::slice::from_ref(&spec), Ok(&record));
+        for (metric_id, value) in [
+            ("prs_per_ticket_max", 3.0),
+            ("commits_per_pr_max", 7.0),
+            ("review_file_only_commits", 2.0),
+            ("review_rounds_over_limit", 1.0),
+            ("non_code_check_reruns", 4.0),
+            ("unnamed_wait_minutes_max", 21.0),
+            ("host_load_per_core_max", 0.75),
+        ] {
+            assert_eq!(
+                live[&format!("retro.{metric_id}")],
+                QueryValue::Value {
+                    value,
+                    evidence_refs: vec![format!("retro:{metric_id}:2026-11-14T22:13:20Z")],
+                },
+                "{metric_id}"
+            );
+        }
     }
 
     #[test]

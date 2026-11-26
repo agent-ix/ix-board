@@ -138,6 +138,197 @@ fn cadence_hygiene_job_runs_the_focus_hygiene_argv() {
 }
 
 #[test]
+#[trace("FR-049-AC-7")]
+fn cadence_runs_stored_delta_after_snapshot_without_sending_when_no_defect_exists() {
+    let directory = tempfile::tempdir().unwrap();
+    let manifest_path = directory.path().join("cadence.json");
+    let ledger_path = directory.path().join("ledger.sqlite3");
+    let retro_home = directory.path().join("team-retro");
+    let retro_config = directory.path().join("retro.json");
+    std::fs::write(
+        &retro_config,
+        serde_json::to_vec(&json!({
+            "team": "QSL",
+            "projects": [],
+            "gate_tickets": [],
+            "repos": [],
+            "minder_address": "terra:QSL:minder"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let config_path = retro_config.to_string_lossy().into_owned();
+    let manifest_value = json!({
+        "jobs": [{
+            "program": "QSL",
+            "team": "qsl",
+            "id": "retro",
+            "interval_secs": 1800,
+            "kind": "retro_snapshot",
+            "command": ["retro", "snapshot", "--help"],
+            "after_success": ["retro", "delta", "--config", config_path, "--notify"],
+            "owner_role": "minder"
+        }]
+    });
+    std::fs::write(&manifest_path, serde_json::to_vec(&manifest_value).unwrap()).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ix-board"))
+        .args(["cadence", "run", "retro", "--manifest"])
+        .arg(&manifest_path)
+        .env("IX_BOARD_LEDGER_PATH", &ledger_path)
+        .env("TEAM_RETRO_HOME", &retro_home)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Usage: ix-board retro snapshot"));
+    assert!(stdout.contains("no delta:"));
+    let ledger = Ledger::open(&ledger_path, &FleetConfig::default()).unwrap();
+    assert_eq!(
+        ledger
+            .cadence_last_run("QSL", "qsl", "retro")
+            .unwrap()
+            .unwrap()
+            .outcome,
+        "succeeded"
+    );
+}
+
+#[test]
+#[trace("FR-049-AC-7")]
+fn cadence_skips_delta_after_snapshot_failure_and_records_follow_up_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let ledger_path = directory.path().join("ledger.sqlite3");
+    let retro_home = directory.path().join("team-retro");
+    let retro_config = directory.path().join("retro.json");
+    std::fs::write(
+        &retro_config,
+        serde_json::to_vec(&json!({
+            "team": "QSL",
+            "projects": [],
+            "gate_tickets": [],
+            "repos": [],
+            "minder_address": "terra:QSL:minder"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let config_path = retro_config.to_string_lossy().into_owned();
+    let invalid_snapshot_config = directory.path().join("invalid-snapshot.json");
+    std::fs::write(&invalid_snapshot_config, "{").unwrap();
+    let failed_snapshot_manifest = directory.path().join("failed-snapshot.json");
+    let failed_snapshot = json!({
+        "jobs": [{
+            "program": "QSL",
+            "team": "qsl",
+            "id": "failed-snapshot",
+            "interval_secs": 1800,
+            "kind": "retro_snapshot",
+            "command": ["retro", "snapshot", "--config", invalid_snapshot_config],
+            "after_success": ["retro", "delta", "--config", config_path, "--notify"],
+            "owner_role": "minder"
+        }]
+    });
+    std::fs::write(
+        &failed_snapshot_manifest,
+        serde_json::to_vec(&failed_snapshot).unwrap(),
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ix-board"))
+        .args(["cadence", "run", "failed-snapshot", "--manifest"])
+        .arg(&failed_snapshot_manifest)
+        .env("IX_BOARD_LEDGER_PATH", &ledger_path)
+        .env("TEAM_RETRO_HOME", &retro_home)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("no delta:"),
+        "follow-up delta must be skipped after snapshot failure"
+    );
+    let ledger = Ledger::open(&ledger_path, &FleetConfig::default()).unwrap();
+    assert_eq!(
+        ledger
+            .cadence_last_run("QSL", "qsl", "failed-snapshot")
+            .unwrap()
+            .unwrap()
+            .outcome,
+        "failed"
+    );
+    drop(ledger);
+
+    let failed_delta_manifest = directory.path().join("failed-delta.json");
+    let failed_delta = json!({
+        "jobs": [{
+            "program": "QSL",
+            "team": "qsl",
+            "id": "failed-delta",
+            "interval_secs": 1800,
+            "kind": "retro_snapshot",
+            "command": ["retro", "snapshot", "--help"],
+            "after_success": ["retro", "delta", "--config", invalid_snapshot_config, "--notify"],
+            "owner_role": "minder"
+        }]
+    });
+    std::fs::write(
+        &failed_delta_manifest,
+        serde_json::to_vec(&failed_delta).unwrap(),
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ix-board"))
+        .args(["cadence", "run", "failed-delta", "--manifest"])
+        .arg(&failed_delta_manifest)
+        .env("IX_BOARD_LEDGER_PATH", &ledger_path)
+        .env("TEAM_RETRO_HOME", &retro_home)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let ledger = Ledger::open(&ledger_path, &FleetConfig::default()).unwrap();
+    assert_eq!(
+        ledger
+            .cadence_last_run("QSL", "qsl", "failed-delta")
+            .unwrap()
+            .unwrap()
+            .outcome,
+        "failed"
+    );
+}
+
+#[test]
+#[trace("FR-049-AC-7")]
+fn qsl_cadence_example_runs_every_thirty_minutes_and_after_success_delta() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("qsl-cadence.json");
+    std::fs::write(&path, include_str!("../examples/qsl/cadence.json")).unwrap();
+    let manifest = ix_board::cadence::load_manifest(&path).unwrap();
+    assert_eq!(manifest.jobs.len(), 1);
+    assert_eq!(manifest.jobs[0].interval_secs, 1800);
+    assert_eq!(manifest.jobs[0].owner_role, "minder");
+    assert!(
+        manifest.jobs[0]
+            .after_success
+            .as_ref()
+            .unwrap()
+            .contains(&"--notify".to_owned())
+    );
+    let retro_config = ix_board::retro::RetroConfig::parse(
+        Path::new("examples/qsl/retro.json"),
+        include_str!("../examples/qsl/retro.json"),
+    )
+    .unwrap();
+    assert_eq!(retro_config.team, "QSL");
+    assert_eq!(retro_config.herdr_teams, ["QSL"]);
+    assert_eq!(
+        retro_config.minder_address.as_deref(),
+        Some("terra:QSL:minder")
+    );
+    assert!(retro_config.gate_log.is_some());
+}
+
+#[test]
 #[trace("FR-049-AC-3")]
 fn cadence_run_records_a_child_failure() {
     let directory = tempfile::tempdir().unwrap();
