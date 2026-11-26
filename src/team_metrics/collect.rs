@@ -1697,6 +1697,7 @@ fn latest_retro_record(team: &str, now_ms: i64) -> (Option<retro::Record>, Optio
     (Some(record), None)
 }
 
+#[implements("FR-033-AC-5")]
 fn retro_snapshot_is_fresh(age_seconds: f64) -> bool {
     (0.0..=RETRO_SNAPSHOT_MAX_AGE_SECONDS).contains(&age_seconds)
 }
