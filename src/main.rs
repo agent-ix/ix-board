@@ -4376,8 +4376,8 @@ mod tests {
                    order_id TEXT, lane TEXT, at_ms INTEGER, available INTEGER,
                    unavailable_reason TEXT);
                  INSERT INTO lane_orders_due VALUES
-                   ('team-order','test:workspace:coder',1700000000100,1,NULL),
-                   ('foreign-order','test:other:coder',1700000000100,1,NULL);",
+                   ('team-order','test:TEST:coder',1700000000100,1,NULL),
+                   ('foreign-order','test:OTHER:coder',1700000000100,1,NULL);",
             )
             .expect("seed read-only ledger fixture");
         drop(connection);
@@ -4423,7 +4423,7 @@ mod tests {
             end_ms: 1_700_001_000_000,
         };
         let session_row = serde_json::json!({
-            "session_addr":"test:workspace:coder",
+            "session_addr":"test:TEST:coder",
             "session_role":"coder",
             "started_at":1_700_000_000_000_i64,
             "transcript_id":"transcript-1"
@@ -4446,7 +4446,7 @@ mod tests {
             std::slice::from_ref(&session_row),
         )
         .expect("collect scoped lane-order adapter");
-        let session_key = ("coder".to_owned(), "test:workspace:coder".to_owned());
+        let session_key = ("coder".to_owned(), "test:TEST:coder".to_owned());
         assert!(matches!(
             lane_adapters[&session_key]["ledger.lane_orders_due"],
             QueryValue::Value { value: 1.0, .. }
