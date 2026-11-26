@@ -51,6 +51,55 @@ fn due_command(manifest: &Path, ledger: &Path) -> std::process::Output {
 }
 
 #[test]
+#[trace("FR-048-AC-3")]
+fn cadence_run_releases_ledger_for_fleet_tick_and_concurrent_due() {
+    let directory = tempfile::tempdir().unwrap();
+    let manifest_path = directory.path().join("cadence.json");
+    let ledger_path = directory.path().join("ledger.sqlite3");
+    let value = json!({
+        "jobs": [{
+            "program": "QSL",
+            "team": "qsl",
+            "id": "tick",
+            "interval_secs": 3600,
+            "kind": "fleet_tick",
+            "command": ["fleet", "tick"],
+            "owner_role": "minder"
+        }]
+    });
+    std::fs::write(&manifest_path, serde_json::to_vec(&value).unwrap()).unwrap();
+    let config_path = directory.path().join("config.toml");
+    std::fs::write(&config_path, "[fleet]\nhost_timeout_secs = 1\n").unwrap();
+
+    let run = std::process::Command::new(env!("CARGO_BIN_EXE_ix-board"))
+        .args(["cadence", "run", "tick", "--manifest"])
+        .arg(&manifest_path)
+        .env("IX_BOARD_LEDGER_PATH", &ledger_path)
+        .env("IX_BOARD_CONFIG_PATH", &config_path)
+        .env("IX_RELAY_URL", "redis://127.0.0.1:1")
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let due = due_command(&manifest_path, &ledger_path);
+    assert!(
+        String::from_utf8_lossy(&due.stderr).is_empty(),
+        "concurrent due could not open the ledger: {}",
+        String::from_utf8_lossy(&due.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&due.stdout).contains("tick"),
+        "concurrent due did not report the scheduled job: {}",
+        String::from_utf8_lossy(&due.stdout)
+    );
+    let run = run.wait_with_output().unwrap();
+    assert!(
+        !String::from_utf8_lossy(&run.stderr).contains("another writer holds the ledger lock"),
+        "fleet tick child was blocked by the cadence writer lock: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+#[test]
 #[trace("FR-048-AC-1")]
 fn cadence_due_cli_uses_exit_codes_zero_one_and_two() {
     let clear_dir = tempfile::tempdir().unwrap();

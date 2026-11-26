@@ -303,7 +303,7 @@ fn classify_due(interval_secs: u64, last_run: Option<&CadenceRun>, now_ms: i64) 
 #[implements("FR-048-AC-3")]
 pub fn run_job(
     manifest: &Manifest,
-    ledger: &mut Ledger,
+    mut open_ledger: impl FnMut() -> Result<Ledger, CadenceError>,
     job_id: &str,
     now_ms: i64,
 ) -> Result<JobRunReport, CadenceError> {
@@ -315,14 +315,16 @@ pub fn run_job(
     if matching.next().is_some() {
         return Err(CadenceError::Job(job_id.to_owned()));
     }
+    let mut ledger = open_ledger()?;
     ledger.cadence_start(&job.program, &job.team, &job.id, now_ms)?;
+    drop(ledger);
     let result = execute(job);
     let finished_at_ms = unix_time_ms();
     match result {
         Ok(status) => {
             let succeeded = status.success();
             let code = status.code().map(|code| code.to_string());
-            ledger.cadence_finish(
+            open_ledger()?.cadence_finish(
                 &job.program,
                 &job.team,
                 &job.id,
@@ -339,7 +341,7 @@ pub fn run_job(
         }
         Err(error) => {
             let detail = error.to_string();
-            ledger.cadence_finish(
+            open_ledger()?.cadence_finish(
                 &job.program,
                 &job.team,
                 &job.id,

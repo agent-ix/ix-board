@@ -3093,8 +3093,6 @@ fn run_cadence(command: CadenceCommand) -> Result<Output, Error> {
     let manifest = ix_board::cadence::load_manifest(&path)
         .map_err(|error| Error::Cadence(error.to_string()))?;
     let settings = ix_board::settings_value()?;
-    let mut ledger = ix_board::cadence::open_ledger(settings.as_ref())
-        .map_err(|error| Error::Cadence(error.to_string()))?;
     match command {
         CadenceCommand::Due {
             program,
@@ -3102,6 +3100,8 @@ fn run_cadence(command: CadenceCommand) -> Result<Output, Error> {
             alert,
             ..
         } => {
+            let ledger = ix_board::cadence::open_ledger(settings.as_ref())
+                .map_err(|error| Error::Cadence(error.to_string()))?;
             let report = ix_board::cadence::due(
                 &manifest,
                 &ledger,
@@ -3114,8 +3114,13 @@ fn run_cadence(command: CadenceCommand) -> Result<Output, Error> {
             Ok(Output::CadenceDue(report))
         }
         CadenceCommand::Run { job, .. } => {
-            let report = ix_board::cadence::run_job(&manifest, &mut ledger, &job, cadence_now_ms())
-                .map_err(|error| Error::Cadence(error.to_string()))?;
+            let report = ix_board::cadence::run_job(
+                &manifest,
+                || ix_board::cadence::open_ledger(settings.as_ref()),
+                &job,
+                cadence_now_ms(),
+            )
+            .map_err(|error| Error::Cadence(error.to_string()))?;
             Ok(Output::CadenceRun(report))
         }
     }
