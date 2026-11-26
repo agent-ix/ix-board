@@ -130,6 +130,7 @@ pub struct DueReport {
 
 impl DueReport {
     /// Required process exit code: 0 clear, 1 due, 2 overdue.
+    #[implements("FR-048-AC-1")]
     pub fn exit_code(&self) -> u8 {
         if self.jobs.iter().any(|job| job.state == DueState::Overdue) {
             2
@@ -141,6 +142,7 @@ impl DueReport {
     }
 
     /// Renders a stable human-readable report.
+    #[implements("FR-048-AC-1")]
     pub fn render_text(&self) -> String {
         let mut lines = self
             .jobs

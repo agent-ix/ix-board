@@ -108,6 +108,11 @@ enum Command {
         #[command(subcommand)]
         command: FleetCommand,
     },
+    /// Check and run recurring program jobs.
+    Cadence {
+        #[command(subcommand)]
+        command: CadenceCommand,
+    },
     /// Render a deterministic drift report from versioned structured evidence.
     Drift {
         /// JSON file containing thresholds and configured leads.
@@ -219,6 +224,30 @@ enum FleetCommand {
     Capacity {
         #[command(subcommand)]
         command: CapacityCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CadenceCommand {
+    /// Report due and overdue jobs for one program and team.
+    Due {
+        #[arg(long)]
+        program: String,
+        #[arg(long)]
+        team: String,
+        /// Emit an alert when the cadence checker job is overdue.
+        #[arg(long)]
+        alert: bool,
+        /// Override the configured cadence manifest.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+    },
+    /// Run one uniquely identified cadence job.
+    Run {
+        job: String,
+        /// Override the configured cadence manifest.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
     },
 }
 
@@ -573,6 +602,8 @@ enum Output {
     FleetCycle(FleetCycleReport),
     FleetAssign(ix_board::fleet::assign::AssignReport),
     FleetTick(ix_board::fleet::tick::TickOutput),
+    CadenceDue(ix_board::cadence::DueReport),
+    CadenceRun(ix_board::cadence::JobRunReport),
     FleetSaturation(ix_board::fleet::saturation::SaturationReport),
     Retro(Box<retro::SnapshotOutput>),
     FleetCapacity(ix_board::fleet::ledger::CapacityStatus),
@@ -716,6 +747,7 @@ fn main() -> std::process::ExitCode {
                 | Error::DriftInputRead { .. }
                 | Error::DriftInputDecode { .. }
                 | Error::Drift(_)
+                | Error::Cadence(_)
                 | Error::Fleet(_)
                 | Error::Assign(_)
                 | Error::Retro(_) => Outcome::Invalid,
@@ -736,6 +768,7 @@ fn encode_output_json(output: &Output) -> Result<String, String> {
     }
 }
 
+#[implements("FR-048-AC-1")]
 fn output_outcome(output: &Output) -> Outcome {
     match output {
         Output::Cached { result, .. } => output_outcome(result),
@@ -751,6 +784,9 @@ fn output_outcome(output: &Output) -> Outcome {
         Output::FleetAssign(report) if report.operational_failure() => Outcome::Internal,
         Output::FleetAssign(_) => Outcome::Partial,
         Output::FleetTick(tick) if !tick.complete => Outcome::Partial,
+        Output::CadenceDue(report) if report.exit_code() == 1 => Outcome::Partial,
+        Output::CadenceDue(report) if report.exit_code() == 2 => Outcome::Invalid,
+        Output::CadenceRun(report) if !report.succeeded => Outcome::Internal,
         Output::FleetSaturation(report) if !report.complete => Outcome::Partial,
         Output::Agents(report) => match report.coverage() {
             ix_board::agents::Coverage::Complete => Outcome::Ok,
@@ -888,6 +924,7 @@ fn run(command: Command) -> Result<Output, Error> {
         } => ix_board::fleet::tick::run(ix_board::settings_value()?.as_ref(), session.as_deref())
             .map(Output::FleetTick)
             .map_err(Error::Fleet),
+        Command::Cadence { command } => run_cadence(command),
         Command::Fleet {
             command: FleetCommand::Saturation { command },
         } => run_fleet_saturation(matches!(command, Some(SaturationCommand::Collect)))
@@ -3044,6 +3081,54 @@ fn run_auth(command: AuthCommand) -> Result<Output, Error> {
     }
 }
 
+#[implements("FR-048-AC-3")]
+fn run_cadence(command: CadenceCommand) -> Result<Output, Error> {
+    let manifest_override = match &command {
+        CadenceCommand::Due { manifest, .. } | CadenceCommand::Run { manifest, .. } => {
+            manifest.as_deref()
+        }
+    };
+    let path = ix_board::cadence::manifest_path(manifest_override)
+        .map_err(|error| Error::Cadence(error.to_string()))?;
+    let manifest = ix_board::cadence::load_manifest(&path)
+        .map_err(|error| Error::Cadence(error.to_string()))?;
+    let settings = ix_board::settings_value()?;
+    let mut ledger = ix_board::cadence::open_ledger(settings.as_ref())
+        .map_err(|error| Error::Cadence(error.to_string()))?;
+    match command {
+        CadenceCommand::Due {
+            program,
+            team,
+            alert,
+            ..
+        } => {
+            let report = ix_board::cadence::due(
+                &manifest,
+                &ledger,
+                &program,
+                &team,
+                cadence_now_ms(),
+                alert,
+            )
+            .map_err(|error| Error::Cadence(error.to_string()))?;
+            Ok(Output::CadenceDue(report))
+        }
+        CadenceCommand::Run { job, .. } => {
+            let report = ix_board::cadence::run_job(&manifest, &mut ledger, &job, cadence_now_ms())
+                .map_err(|error| Error::Cadence(error.to_string()))?;
+            Ok(Output::CadenceRun(report))
+        }
+    }
+}
+
+fn cadence_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or(i64::MAX)
+}
+
 fn run_linear(command: Command) -> Result<Output, Error> {
     let source = LinearGraphQlSource::from_env()?;
     let mut service = ReadService::open_default(source)?;
@@ -3357,6 +3442,16 @@ fn render_human(output: &Output) -> String {
                 .unwrap_or_default()
         ),
         Output::FleetTick(tick) => tick.render_text(),
+        Output::CadenceDue(report) => report.render_text(),
+        Output::CadenceRun(report) => format!(
+            "{} {} at {} (exit status {})",
+            report.id,
+            if report.succeeded { "succeeded" } else { "failed" },
+            report.finished_at_ms,
+            report
+                .exit_status
+                .map_or_else(|| "signal".to_owned(), |status| status.to_string())
+        ),
         Output::FleetSaturation(report) => serde_json::to_string_pretty(report)
             .unwrap_or_else(|error| format!("could not render fleet saturation JSON: {error}")),
         Output::Retro(output) => retro::render_text(output.record()),

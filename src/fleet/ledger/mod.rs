@@ -321,6 +321,7 @@ fn apply_v9(tx: &rusqlite::Transaction<'_>) -> Result<(), LedgerError> {
     Ok(())
 }
 
+#[implements("FR-048-AC-2")]
 fn apply_v10(tx: &rusqlite::Transaction<'_>) -> Result<(), LedgerError> {
     for statement in schema::V10 {
         tx.execute_batch(statement)?;
