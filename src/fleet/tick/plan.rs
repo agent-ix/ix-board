@@ -750,10 +750,16 @@ pub fn plan(input: &PlanInput<'_>) -> Plan {
             ActionKind::EscalateStalePr => {
                 input.facts.prs.is_none()
                     || input.facts.pr_unavailable.iter().any(|unavailable| {
-                        unavailable
-                            .lane
-                            .as_deref()
-                            .is_some_and(|lane| lane.eq_ignore_ascii_case(&open.subject))
+                        match unavailable.lane.as_deref() {
+                            Some(lane) => lane.eq_ignore_ascii_case(&open.subject),
+                            None => matches!(
+                                unavailable.source_basis.as_str(),
+                                "relay_assignment_lists"
+                                    | "fleet_ledger_assignment_history"
+                                    | "agent_msg_work_events"
+                                    | "relay_assignment_lists+fleet_ledger_assignment_history+agent_msg_work_events"
+                            ),
+                        }
                     })
             }
             _ => false,
@@ -830,6 +836,29 @@ mod tests {
             open: &open,
         });
         assert_eq!(result.resolved, open);
+
+        let source_wide_failure = TickFacts {
+            prs: Some(Vec::new()),
+            pr_unavailable: vec![LanePrUnavailable {
+                lane: None,
+                ticket: None,
+                pr: None,
+                source_basis: "agent_msg_work_events".to_owned(),
+                reason: "work event source unavailable".to_owned(),
+            }],
+            ..TickFacts::default()
+        };
+        let unresolved = plan(&PlanInput {
+            report: &report,
+            first_seen: &[],
+            settings: &settings,
+            interval_ms: 300_000,
+            facts: &source_wide_failure,
+            capacity: &Capacity::default(),
+            orders: &StandingOrders::Missing,
+            open: &open,
+        });
+        assert!(unresolved.resolved.is_empty());
 
         let mapped_unavailable = TickFacts {
             prs: Some(vec![super::super::LanePr {

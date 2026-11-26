@@ -283,6 +283,14 @@ fn refresh_v6_host_output_view(tx: &rusqlite::Transaction<'_>) -> Result<(), Led
             "ALTER TABLE capacity_event ADD COLUMN drain_cap_ms INTEGER NOT NULL DEFAULT 14400000",
         )?;
     }
+    let ceiling_lanes_column: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('capacity_event') WHERE name='ceiling_lanes'",
+        [],
+        |row| row.get(0),
+    )?;
+    if ceiling_lanes_column == 0 {
+        tx.execute_batch("ALTER TABLE capacity_event ADD COLUMN ceiling_lanes INTEGER")?;
+    }
     let sample_interval_column: i64 = tx.query_row(
         "SELECT COUNT(*) FROM pragma_table_info('host_output_sample')
          WHERE name='sample_interval_ms'",

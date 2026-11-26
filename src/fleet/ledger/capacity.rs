@@ -197,6 +197,8 @@ pub struct CapacityEvent {
     pub at: i64,
     /// End of a cool-off ceiling.
     pub ceiling_until: Option<i64>,
+    /// Lane count captured at a step-down, if a host lane sample existed.
+    pub ceiling_lanes: Option<i64>,
 }
 
 /// The currently open hold window for one capacity-discovery step.
@@ -499,10 +501,30 @@ pub fn mark_draining(
     if active_mark {
         return Ok(());
     }
+    let ceiling_lanes: Option<i64> = tx.query_row(
+        "SELECT CASE WHEN EXISTS (
+           SELECT 1 FROM lane_tick_rows t WHERE lower(t.host)=lower(?1) AND t.observed_ms=(
+             SELECT MAX(x.observed_ms) FROM lane_tick_rows x
+             WHERE lower(x.host)=lower(?1) AND x.observed_ms<=?3))
+         THEN (SELECT COUNT(DISTINCT t.lane) FROM lane_tick_rows t
+           WHERE lower(t.host)=lower(?1) AND t.observed_ms=(
+             SELECT MAX(x.observed_ms) FROM lane_tick_rows x
+             WHERE lower(x.host)=lower(?1) AND x.observed_ms<=?3)
+             AND lower(t.lane)<>lower(?2)
+             AND NOT EXISTS (SELECT 1 FROM capacity_event draining
+               WHERE lower(draining.lane)=lower(t.lane) AND draining.kind='draining_mark'
+                 AND draining.at<=?3 AND NOT EXISTS (
+                   SELECT 1 FROM capacity_event finished WHERE lower(finished.lane)=lower(t.lane)
+                     AND finished.kind IN ('drain_done','lane_removed','lane_lost')
+                     AND finished.at>=draining.at AND finished.at<=?3)))
+         ELSE NULL END",
+        params![host, lane, at_ms],
+        |row| row.get(0),
+    )?;
     for kind in ["draining_mark", "step_down"] {
         tx.execute(
             "INSERT INTO capacity_event(host,lane,kind,reason,evidence_kind,at,ceiling_until,
-               source_basis,drain_cap_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+               source_basis,drain_cap_ms,ceiling_lanes) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
                 host,
                 lane,
@@ -517,7 +539,8 @@ pub fn mark_draining(
                     "drain_cap_ms": i64::try_from(drain_cap.as_millis()).unwrap_or(i64::MAX)
                 })
                 .to_string(),
-                i64::try_from(drain_cap.as_millis()).unwrap_or(i64::MAX)
+                i64::try_from(drain_cap.as_millis()).unwrap_or(i64::MAX),
+                (kind == "step_down").then_some(ceiling_lanes).flatten()
             ],
         )?;
     }
@@ -1202,11 +1225,22 @@ pub fn status(path: &Path) -> Result<CapacityStatus, LedgerError> {
     }
     let mut events = Vec::new();
     {
-        let mut statement = connection.prepare(
-            "SELECT event_id, host, lane, kind, reason, evidence_kind, cycle_id, at, ceiling_until,
-                    source_basis
-             FROM capacity_event ORDER BY at DESC, event_id DESC",
+        let has_ceiling_lanes: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('capacity_event')
+             WHERE name='ceiling_lanes')",
+            [],
+            |row| row.get(0),
         )?;
+        let query = if has_ceiling_lanes {
+            "SELECT event_id, host, lane, kind, reason, evidence_kind, cycle_id, at,
+                    ceiling_until, source_basis,ceiling_lanes
+             FROM capacity_event ORDER BY at DESC, event_id DESC"
+        } else {
+            "SELECT event_id, host, lane, kind, reason, evidence_kind, cycle_id, at,
+                    ceiling_until, source_basis,NULL AS ceiling_lanes
+             FROM capacity_event ORDER BY at DESC, event_id DESC"
+        };
+        let mut statement = connection.prepare(query)?;
         for row in statement.query_map([], |r| {
             Ok(CapacityEvent {
                 event_id: r.get(0)?,
@@ -1219,6 +1253,7 @@ pub fn status(path: &Path) -> Result<CapacityStatus, LedgerError> {
                 at: r.get(7)?,
                 ceiling_until: r.get(8)?,
                 source_basis: r.get(9)?,
+                ceiling_lanes: r.get(10)?,
             })
         })? {
             events.push(row?);

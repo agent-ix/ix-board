@@ -489,6 +489,40 @@ fn demand_coverage_does_not_depend_on_deficit_availability() {
 }
 
 #[test]
+fn judged_without_demand_view_reports_each_invalid_transition_once() {
+    let (_dir, path) = path();
+    Ledger::open(&path, &capacity_config()).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO capacity_run(run_id,host,trigger,started_at)
+               VALUES(1,'draco','first',1000);
+             INSERT INTO capacity_step(run_id,step_no,repeat_of,host,valid,knee_signal,window_end)
+               VALUES(1,1,NULL,'draco',0,0,2000),
+                     (1,2,NULL,'draco',0,1,3000),
+                     (1,3,2,'draco',0,0,4000);
+             INSERT INTO capacity_level(host,level,recorded_at,run_id,reason,evidence_steps)
+               VALUES('draco',2,5000,1,'step_bound','[2]');",
+        )
+        .unwrap();
+    let rows = query_ledger(&path, "discovery_steps_judged_without_demand", None)
+        .unwrap()
+        .rows;
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|row| row["step_no"] == 2));
+    assert!(
+        rows.iter()
+            .any(|row| row["violation"] == "new_step_after_invalid")
+    );
+    assert!(rows.iter().any(|row| row["violation"] == "knee_on_invalid"));
+    assert!(
+        rows.iter()
+            .any(|row| row["violation"] == "level_uses_invalid_step")
+    );
+    assert!(!rows.iter().any(|row| row["step_no"] == 3));
+}
+
+#[test]
 #[trace("FR-041-AC-11", "FR-041-AC-17")]
 fn discovery_start_view_requires_demand_and_an_available_run_slot() {
     let (_dir, path) = path();
@@ -821,15 +855,18 @@ fn version_six_ledger_refreshes_output_share_provenance_columns() {
              DROP VIEW unrecorded_hosts_without_discovery_run;
              DROP VIEW unrecorded_hosts_ready_for_discovery;
              DROP VIEW drains_over_cap_without_escalation;
+             DROP VIEW raises_during_cool_off;
              ALTER TABLE host_output_sample DROP COLUMN sample_interval_ms;
              ALTER TABLE saturation_sample DROP COLUMN source_basis;
              ALTER TABLE saturation_sample DROP COLUMN unavailable_reason;
              ALTER TABLE saturation_sample DROP COLUMN coverage;
              ALTER TABLE saturation_sample DROP COLUMN queued_behind_first;
              ALTER TABLE saturation_sample DROP COLUMN bootstrap_ticket_pool;
-             ALTER TABLE capacity_event DROP COLUMN drain_cap_ms",
+             ALTER TABLE capacity_event DROP COLUMN drain_cap_ms;
+             ALTER TABLE capacity_event DROP COLUMN ceiling_lanes",
         )
         .unwrap();
+    assert!(status(&path).unwrap().events.is_empty());
     drop(Ledger::open(&path, &config).unwrap());
     let connection = Connection::open(&path).unwrap();
     let columns = connection
@@ -850,6 +887,7 @@ fn version_six_ledger_refreshes_output_share_provenance_columns() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert!(event_columns.iter().any(|column| column == "drain_cap_ms"));
+    assert!(event_columns.iter().any(|column| column == "ceiling_lanes"));
     let saturation_columns = connection
         .prepare("PRAGMA table_info(saturation_sample)")
         .unwrap()
@@ -1235,6 +1273,23 @@ fn live_drain_records_missing_evidence_idempotently_and_knee_has_no_ceiling() {
             .as_millis(),
     )
     .unwrap();
+    {
+        let config = capacity_config();
+        drop(Ledger::open(&path, &config).unwrap());
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(&format!(
+                "INSERT INTO run(kind,relay_ms,tick_interval_s) VALUES('status',{},{});
+                 INSERT INTO lane_tick(run_seq,lane,host,class,observed_ms,evidence) VALUES
+                   (1,'draco:workspace:a','draco','IDLE',{},'{{}}'),
+                   (1,'draco:workspace:b','draco','IDLE',{},'{{}}');",
+                now_ms - 10_000,
+                300,
+                now_ms - 1_000,
+                now_ms - 1_000
+            ))
+            .unwrap();
+    }
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let sample_ts = now_ms / 1000;
@@ -1308,6 +1363,12 @@ fn live_drain_records_missing_evidence_idempotently_and_knee_has_no_ceiling() {
     let events = status(&path).unwrap().events;
     assert_eq!(events.len(), 4);
     assert!(events.iter().all(|event| event.evidence_kind.is_none()));
+    let step_down_ceilings = events
+        .iter()
+        .filter(|event| event.kind == "step_down")
+        .map(|event| event.ceiling_lanes)
+        .collect::<Vec<_>>();
+    assert_eq!(step_down_ceilings, vec![Some(0), Some(1)]);
     let drain_caps = Connection::open(&path)
         .unwrap()
         .prepare("SELECT DISTINCT drain_cap_ms FROM capacity_event")
@@ -1401,26 +1462,26 @@ fn drain_over_cap_uses_the_recorded_drain_cap_not_the_cool_off() {
 
 #[trace("FR-041-AC-14")]
 #[test]
-fn cool_off_view_lists_only_additions_that_exceed_the_recorded_level() {
+fn cool_off_view_uses_the_captured_lane_ceiling_with_or_without_a_recorded_level() {
     let (_dir, path) = path();
     Ledger::open(&path, &capacity_config()).unwrap();
     let connection = Connection::open(&path).unwrap();
     connection
         .execute_batch(
             "INSERT INTO run(kind,relay_ms,tick_interval_s) VALUES('status',1000000,300);
-             INSERT INTO capacity_level(host,level,recorded_at,reason)
-               VALUES('draco',2,40000,'step_bound');
-             INSERT INTO capacity_event(host,lane,kind,at,ceiling_until)
-               VALUES('draco','draco:workspace:a','step_down',50000,900000);
+             INSERT INTO capacity_event(host,lane,kind,at,ceiling_until,ceiling_lanes)
+               VALUES('draco','draco:workspace:a','step_down',50000,900000,2);
              INSERT INTO capacity_event(host,lane,kind,at)
-               VALUES('draco','draco:workspace:c','lane_added',100000),
-                     ('draco','draco:workspace:d','lane_added',400000);
+               VALUES('draco','draco:workspace:a','draining_mark',45000);
+             INSERT INTO capacity_event(host,lane,kind,at)
+               VALUES('draco','draco:workspace:d','lane_added',100000);
              INSERT INTO lane_tick(run_seq,lane,host,class,observed_ms,evidence) VALUES
-               (1,'draco:workspace:a','draco','IDLE',200000,'{}'),
+               (1,'draco:workspace:a','draco','IDLE',40000,'{}'),
+               (1,'draco:workspace:b','draco','IDLE',40000,'{}'),
+               (1,'draco:workspace:c','draco','IDLE',40000,'{}'),
                (1,'draco:workspace:b','draco','IDLE',200000,'{}'),
                (1,'draco:workspace:c','draco','IDLE',200000,'{}'),
-               (1,'draco:workspace:a','draco','IDLE',600000,'{}'),
-               (1,'draco:workspace:b','draco','IDLE',600000,'{}');",
+               (1,'draco:workspace:d','draco','IDLE',200000,'{}');",
         )
         .unwrap();
     let view = query_ledger(&path, "raises_during_cool_off", None).unwrap();
@@ -1429,5 +1490,16 @@ fn cool_off_view_lists_only_additions_that_exceed_the_recorded_level() {
         .iter()
         .filter_map(|row| row.get("lane").and_then(serde_json::Value::as_str))
         .collect::<Vec<_>>();
-    assert_eq!(lanes, vec!["draco:workspace:c"]);
+    assert_eq!(lanes, vec!["draco:workspace:d"]);
+    Connection::open(&path)
+        .unwrap()
+        .execute("DELETE FROM capacity_level", [])
+        .unwrap();
+    assert_eq!(
+        query_ledger(&path, "raises_during_cool_off", None)
+            .unwrap()
+            .rows
+            .len(),
+        1
+    );
 }

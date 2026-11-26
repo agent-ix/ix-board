@@ -49,11 +49,11 @@ The command family `ix-board fleet capacity` SHALL also record capacity discover
   window length for each lane; this is the watcher-presence basis because no observed-lane-seconds
   series exists. Both watcher inputs need at least 90% sample coverage. A lane with less than the
   configured minimum of engaged time is excluded from the mean; idle time does not dilute duty.
-- **Capacity measurement sources and basis.** Every field in a discovery step and
-  each per-lane output observation SHALL retain its source name, availability,
-  reason, coverage and observation time. A field with less than 90% window
-  coverage SHALL be serialized as `null` with its reason; it SHALL NOT be
-  replaced with zero. Interim sustainable slots use the explicit
+- **Capacity measurement sources and basis.** ix-board SHALL retain, for every
+  field in a discovery step and each per-lane output observation, its source
+  name, availability, reason, coverage and observation time. When a field has
+  less than 90% window coverage, ix-board SHALL serialize it as `null` with its
+  reason, never as zero. Interim sustainable slots use the explicit
   `fleet.capacity_limits.<host>.build_slots` value. Relay
   SWM-242 supplies `ix_build_slots_busy`, `ix_build_slots_configured`,
   `ix_build_queue_wait_seconds`, `ix_build_admission_blocked_seconds_total`
@@ -149,7 +149,7 @@ host already has an open run, when two runs of that host started the same UTC da
 | `capacity_step` | `run_id`, `step_no`, `repeat_of` (the `step_no` of an inconclusive window this one repeats, else empty), host, `lanes`, `window_start`, `window_end`, `rampup_end`, `window_min_ms`, `valid`, `inconclusive_reason` (`demand_short`, `deficit_coverage`), `deficit_coverage` (union of distinct sample intervals that cover demand), `deficit_zero_throughout` (separate backlog indicator), `host_output_per_hour`, `tickets_closed`, `prs_merged`, `commits_pushed`, `output_basis` (`tickets_prs` or `commits`), `queue_wait_p90_s`, `throttled_share`, `memory_headroom_min`, `thermal_headroom_min`, `slots_busy_equals_sustainable`, `knee_signal`, `knee_reason` (`output_gain`, `throttle`), `source_basis` (JSON object keyed by field, with availability, source, reason, coverage and observation time) |
 | `capacity_step_lane_output` | `run_id`, `step_no`, lane, `window_end`, `tickets_closed`, `prs_merged`, `commits_pushed`, `source_basis` (same JSON shape per lane field) |
 | `capacity_level` | host, `level`, `output_basis` (`tickets_prs` or `commits`, of the step the level was found at), `recorded_at`, `run_id`, `reason`, `evidence_steps`, `superseded_at` |
-| `capacity_event` | event id, host, lane, `kind` (`lane_added`, `draining_mark`, `drain_done`, `lane_removed`, `lane_lost`, `step_down`, `overload_event`), `reason` (as given, or `lane_change_unrecorded`), `evidence_kind` (`admission_block`, `build_abort`, `memory_below_reserve`, `thermal_abort`, `thermal_limit_breach`, `knee`, `throttle_share`, empty; set by ix-board, below), `cycle_id`, `at`, `ceiling_until`, `drain_cap_ms` (configured cap captured on each `draining_mark`, default 4 hours), `source_basis` |
+| `capacity_event` | event id, host, lane, `kind` (`lane_added`, `draining_mark`, `drain_done`, `lane_removed`, `lane_lost`, `step_down`, `overload_event`), `reason` (as given, or `lane_change_unrecorded`), `evidence_kind` (`admission_block`, `build_abort`, `memory_below_reserve`, `thermal_abort`, `thermal_limit_breach`, `knee`, `throttle_share`, empty; set by ix-board, below), `cycle_id`, `at`, `ceiling_until`, `ceiling_lanes` (distinct lanes in the latest host `lane_tick` at or before the step-down, excluding the draining lane and any other lane with an open draining mark; null when no such tick exists), `drain_cap_ms` (configured cap captured on each `draining_mark`, default 4 hours), `source_basis` |
 | `host_output_sample` | host, `at`, `lanes`, trailing-hour `tickets_closed`, `prs_merged`, `commits_pushed`, `source_basis` (JSON source, availability, reason, coverage and observation time for each current sample field) |
 | `saturation_sample` | one row per host and collection time: ready buffer, active/supplied/unsupplied lane counts, ready share, queued tickets behind first assignment, zero-lane bootstrap pool, registry-current flag, deficit, source basis and unavailable reason |
 | `capacity_throttle_sample` | host, time, interval, admission-blocked share, coverage, unavailable reason and `admission_only` source basis; no pause-seconds series is recorded |
@@ -234,7 +234,7 @@ watcher behavior.
 | `hosts_with_recorded_level` | `capacity_level` rows with `superseded_at` empty |
 | `host_minutes_above_recorded_level_outside_bounded_discovery` | minutes in which the host's non-draining `lane_tick` count exceeds its `capacity_level.level` and no run with 8 or fewer steps was open |
 | `host_step_downs` | `capacity_event` rows of kind `step_down` |
-| `raises_during_cool_off` | `lane_added` events before the host's `ceiling_until` that raise the lane count above the ceiling |
+| `raises_during_cool_off` | `lane_added` events before the host's `ceiling_until` whose current lane count exceeds that step-down's captured `ceiling_lanes`; reported even when no `capacity_level` exists |
 | `discovery_runs` | `capacity_run` rows |
 | `discovery_runs_per_host_day_max` | maximum count of runs started per host per UTC day |
 | `overload_events_without_draining_mark_in_cycle` | `overload_event` rows with no `draining_mark` of the host by the end of the first cycle ending after them |

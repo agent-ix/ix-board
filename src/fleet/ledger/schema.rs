@@ -153,7 +153,8 @@ pub const V2: &[&str] = &[
        event_id INTEGER PRIMARY KEY AUTOINCREMENT, host TEXT NOT NULL, lane TEXT,
        kind TEXT NOT NULL CHECK(kind IN ('lane_added','draining_mark','drain_done',
          'lane_removed','lane_lost','step_down','overload_event')),
-       reason TEXT, evidence_kind TEXT, cycle_id INTEGER, at INTEGER NOT NULL, ceiling_until INTEGER)",
+       reason TEXT, evidence_kind TEXT, cycle_id INTEGER, at INTEGER NOT NULL,
+       ceiling_until INTEGER)",
     "CREATE TABLE host_output_sample(
        host TEXT NOT NULL, at INTEGER NOT NULL, lanes INTEGER, tickets_closed INTEGER,
        prs_merged INTEGER, commits_pushed INTEGER, PRIMARY KEY(host, at))",
@@ -199,6 +200,7 @@ pub const V6: &[&str] = &[
        PRIMARY KEY(host,cause))",
     "ALTER TABLE capacity_event ADD COLUMN source_basis TEXT",
     "ALTER TABLE capacity_event ADD COLUMN drain_cap_ms INTEGER NOT NULL DEFAULT 14400000",
+    "ALTER TABLE capacity_event ADD COLUMN ceiling_lanes INTEGER",
     "ALTER TABLE host_output_sample ADD COLUMN source_basis TEXT NOT NULL DEFAULT '{}'",
     "ALTER TABLE host_output_sample ADD COLUMN sample_interval_ms INTEGER NOT NULL DEFAULT 3600000",
     "ALTER TABLE capacity_step_lane_output ADD COLUMN window_end INTEGER",
@@ -317,24 +319,23 @@ pub const CAPACITY_VIEWS: &[&str] = &[
     "CREATE VIEW host_step_downs AS
        SELECT *,at AS at_ms FROM capacity_event WHERE kind='step_down'",
     "CREATE VIEW raises_during_cool_off AS
-       SELECT a.*,a.at AS at_ms FROM capacity_event a JOIN capacity_event d
+       SELECT DISTINCT a.*,a.at AS at_ms FROM capacity_event a JOIN capacity_event d
          ON lower(d.host)=lower(a.host) AND d.kind='step_down' AND a.kind='lane_added'
           AND a.at>=d.at AND d.ceiling_until IS NOT NULL AND a.at<d.ceiling_until
-       JOIN capacity_level l ON lower(l.host)=lower(a.host) AND l.recorded_at<=d.at
-          AND (l.superseded_at IS NULL OR l.superseded_at>d.at)
        WHERE EXISTS (SELECT 1 FROM lane_tick_rows sample
          WHERE lower(sample.host)=lower(a.host) AND sample.observed_ms=(
            SELECT MIN(t.observed_ms) FROM lane_tick_rows t
            WHERE lower(t.host)=lower(a.host) AND t.observed_ms>=a.at
              AND t.observed_ms<=a.at+t.tick_ms)
-         AND (SELECT COUNT(DISTINCT t.lane) FROM lane_tick_rows t
+         AND (d.ceiling_lanes IS NULL OR (SELECT COUNT(DISTINCT t.lane) FROM lane_tick_rows t
            WHERE lower(t.host)=lower(a.host) AND t.observed_ms=sample.observed_ms
              AND NOT EXISTS (SELECT 1 FROM capacity_event draining
                WHERE lower(draining.lane)=lower(t.lane) AND draining.kind='draining_mark'
                  AND draining.at<=sample.observed_ms AND NOT EXISTS (
                    SELECT 1 FROM capacity_event finished WHERE lower(finished.lane)=lower(t.lane)
                      AND finished.kind IN ('drain_done','lane_removed','lane_lost')
-                     AND finished.at>=draining.at AND finished.at<=sample.observed_ms)))>l.level)",
+                     AND finished.at>=draining.at AND finished.at<=sample.observed_ms)))
+             > d.ceiling_lanes))",
     "CREATE VIEW discovery_runs AS SELECT *,started_at AS at_ms FROM capacity_run",
     "CREATE VIEW discovery_steps_ended AS
        SELECT s.*,s.window_end AS at_ms FROM capacity_step s",
