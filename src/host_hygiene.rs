@@ -309,7 +309,12 @@ fn path_references(bytes: &[u8], target: &Path) -> bool {
     let needle = target.as_os_str().as_encoded_bytes();
     bytes
         .split(|byte| *byte == 0 || byte.is_ascii_whitespace())
-        .any(|part| part.starts_with(needle))
+        .any(|part| {
+            part.starts_with(needle)
+                || part
+                    .split(|byte| *byte == b'=')
+                    .any(|value| value.starts_with(needle))
+        })
 }
 
 /// Finds a process reference using cwd, command, environment, descriptors and maps.
