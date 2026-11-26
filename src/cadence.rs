@@ -238,7 +238,7 @@ fn command_matches_kind(kind: JobKind, command: &[String]) -> bool {
     match (kind, command) {
         (JobKind::RetroSnapshot, [root, sub, ..]) => root == "retro" && sub == "snapshot",
         (JobKind::FleetTick, [root, sub, ..]) => root == "fleet" && sub == "tick",
-        (JobKind::Hygiene, [root, ..]) => root == "hygiene",
+        (JobKind::Hygiene, [root, sub, ..]) => root == "focus" && sub == "hygiene",
         _ => false,
     }
 }

@@ -100,6 +100,38 @@ fn cadence_run_releases_ledger_for_fleet_tick_and_concurrent_due() {
 }
 
 #[test]
+#[trace("FR-048-AC-3")]
+fn cadence_hygiene_job_runs_the_focus_hygiene_argv() {
+    let directory = tempfile::tempdir().unwrap();
+    let manifest_path = directory.path().join("cadence.json");
+    let ledger_path = directory.path().join("ledger.sqlite3");
+    let value = json!({
+        "jobs": [{
+            "program": "QSL",
+            "team": "qsl",
+            "id": "hygiene",
+            "interval_secs": 3600,
+            "kind": "hygiene",
+            "command": ["focus", "hygiene", "--help"],
+            "owner_role": "minder"
+        }]
+    });
+    std::fs::write(&manifest_path, serde_json::to_vec(&value).unwrap()).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ix-board"))
+        .args(["cadence", "run", "hygiene", "--manifest"])
+        .arg(&manifest_path)
+        .env("IX_BOARD_LEDGER_PATH", &ledger_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "cadence did not run focus hygiene: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Usage: ix-board focus hygiene"));
+}
+
+#[test]
 #[trace("FR-048-AC-1")]
 fn cadence_due_cli_uses_exit_codes_zero_one_and_two() {
     let clear_dir = tempfile::tempdir().unwrap();
