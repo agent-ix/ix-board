@@ -143,6 +143,7 @@ pub struct HygieneReport {
 
 impl HygieneReport {
     /// Stable command status: 0 clean, 1 findings, 2 missing evidence, 3 unsupported platform.
+    #[implements("FR-048-AC-1", "FR-048-AC-3")]
     pub fn exit_code(&self) -> u8 {
         if self.unsupported {
             return 3;
@@ -170,6 +171,7 @@ impl HygieneReport {
 }
 
 /// Collects process references using the host platform's native process table.
+#[implements("FR-048-AC-2", "FR-048-AC-3")]
 pub fn system_process_table() -> io::Result<ProcessTable> {
     #[cfg(target_os = "linux")]
     {
@@ -189,12 +191,17 @@ pub fn system_process_table() -> io::Result<ProcessTable> {
 }
 
 #[cfg(target_os = "linux")]
+#[implements("FR-048-AC-2")]
 fn linux_process_table(proc_root: &Path) -> io::Result<ProcessTable> {
+    const MAX_PROCESSES: usize = 50_000;
+    const MAX_PROCESS_PATHS: usize = 16_384;
+    const MAX_REFERENCES: usize = 1_000_000;
     use std::fs;
     let mut table = ProcessTable {
         processes: Vec::new(),
         complete: true,
     };
+    let mut references = 0_usize;
     for entry in fs::read_dir(proc_root)? {
         let entry = match entry {
             Ok(entry) => entry,
@@ -210,6 +217,10 @@ fn linux_process_table(proc_root: &Path) -> io::Result<ProcessTable> {
         else {
             continue;
         };
+        if table.processes.len() >= MAX_PROCESSES {
+            table.complete = false;
+            break;
+        }
         let process_dir = entry.path();
         let mut read_optional = |name: &str| match fs::read(process_dir.join(name)) {
             Ok(value) => Some(value),
@@ -250,11 +261,12 @@ fn linux_process_table(proc_root: &Path) -> io::Result<ProcessTable> {
         match fs::read_to_string(process_dir.join("maps")) {
             Ok(text) => {
                 for line in text.lines() {
-                    if let Some(path) = line
+                    let path = line
                         .split_whitespace()
-                        .nth(5)
-                        .filter(|part| part.starts_with('/'))
-                    {
+                        .skip(5)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if path.starts_with('/') {
                         maps.push(PathBuf::from(path));
                     }
                 }
@@ -262,6 +274,14 @@ fn linux_process_table(proc_root: &Path) -> io::Result<ProcessTable> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(_) => table.complete = false,
         }
+        let process_references = fds.len().saturating_add(maps.len());
+        if process_references > MAX_PROCESS_PATHS
+            || references.saturating_add(process_references) > MAX_REFERENCES
+        {
+            table.complete = false;
+            break;
+        }
+        references += process_references;
         table.processes.push(ProcessEvidence {
             pid,
             cwd,
@@ -275,6 +295,7 @@ fn linux_process_table(proc_root: &Path) -> io::Result<ProcessTable> {
 }
 
 #[cfg(target_os = "macos")]
+#[implements("FR-048-AC-3")]
 fn macos_process_table() -> io::Result<ProcessTable> {
     let output = Command::new("lsof")
         .args(["-nP", "-Fpn", "-d", "cwd,txt,0-"])
@@ -315,6 +336,7 @@ fn macos_process_table() -> io::Result<ProcessTable> {
 }
 
 /// Reads available disk bytes through the platform `df` utility without a shell.
+#[implements("FR-048-AC-1")]
 pub fn free_disk_bytes(path: &Path) -> io::Result<u64> {
     let output = Command::new("df").args(["-Pk"]).arg(path).output()?;
     if !output.status.success() {
