@@ -458,7 +458,11 @@ pub fn run(file: Option<&toml::Value>, session: Option<&str>) -> Result<TickOutp
         }
     });
     let (relay, receipts) = live::read_relay(config.host_timeout);
-    let (session_events, session_coverage) = session_turn_input(&relay);
+    let role_observations = relay
+        .as_ref()
+        .ok()
+        .map(|snapshot| snapshot.events.clone())
+        .unwrap_or_default();
     let sources = Sources {
         relay,
         series: series.clone(),
@@ -473,16 +477,7 @@ pub fn run(file: Option<&toml::Value>, session: Option<&str>) -> Result<TickOutp
             .map_or_else(|| "no lane could be read".to_owned(), |d| d.reason.clone());
         return Err(FleetError::Tick(why));
     }
-    match ledger::resolve_path(&config).and_then(|path| Ledger::open(&path, &config)) {
-        Ok(mut store) => {
-            if let Err(error) =
-                store.record_session_turns(&settings, &session_events, &session_coverage)
-            {
-                report.add_unreadable_source("relay:session_turn", error);
-            }
-        }
-        Err(error) => report.add_ledger_defect(format!("session-turn ledger: {error}")),
-    }
+    live::record_session_turn_page(&config, &settings, &role_observations, &mut report);
     let facts = TickFacts::read(
         &live_sources(&report, config.host_timeout, &config, &settings),
         report.run_ms,
@@ -509,34 +504,6 @@ pub fn run(file: Option<&toml::Value>, session: Option<&str>) -> Result<TickOutp
         },
         &mut bus,
     )
-}
-
-fn session_turn_input(
-    relay: &Result<crate::fleet::RelaySnapshot, SourceError>,
-) -> (Vec<crate::fleet::RawEvent>, ledger::ActivityCoverage) {
-    match relay {
-        Ok(snapshot) => {
-            let coverage = if snapshot.activity_stream_capped {
-                ledger::ActivityCoverage::Unavailable(
-                    "relay activity stream reached its retention cap".to_owned(),
-                )
-            } else if snapshot.activity_absent {
-                ledger::ActivityCoverage::Unavailable("relay activity stream is absent".to_owned())
-            } else if snapshot.unreadable_events > 0 {
-                ledger::ActivityCoverage::Unavailable(format!(
-                    "{} relay activity events could not be decoded",
-                    snapshot.unreadable_events
-                ))
-            } else {
-                ledger::ActivityCoverage::Complete
-            };
-            (snapshot.events.clone(), coverage)
-        }
-        Err(error) => (
-            Vec::new(),
-            ledger::ActivityCoverage::Unavailable(error.to_string()),
-        ),
-    }
 }
 
 /// The FR-037 focus state of each lane, read in one relay stream pass. Missing or unreadable

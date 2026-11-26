@@ -25,6 +25,7 @@ path = "src/bin/ix-team-exporter.rs"
 serde_yaml = { package = "yaml_serde", version = "=0.10.7" }
 relay-work-wire = { git = "https://github.com/agent-ix/ix-relay", tag = "v0.6.0" }
 relay-core = { git = "https://github.com/agent-ix/ix-relay", tag = "v0.6.0" }
+redis = { version = "=1.8.3", default-features = false, features = ["streams"] }
 # Shared CLI foundation: exit taxonomy, stream discipline, canonical JSON,
 # version provenance, config precedence. Follow main; Cargo.lock records the
 # resolved commit (see agent-ix/ix-cli-kit README, "Consuming this crate").

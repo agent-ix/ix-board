@@ -203,6 +203,7 @@ fn version_five_ledger_adds_planner_action_columns_without_losing_rows() {
              ALTER TABLE assignment_history DROP COLUMN sender_role;
              ALTER TABLE assignment_history DROP COLUMN sender_addr;
              ALTER TABLE cycle_missed DROP COLUMN at_ms;
+             ALTER TABLE session_turn DROP COLUMN transcript_id;
              DROP TABLE lane_lead;
              DROP TABLE failed_probe_tick;
              DROP TABLE relay_order;
@@ -211,6 +212,8 @@ fn version_five_ledger_adds_planner_action_columns_without_losing_rows() {
              ALTER TABLE action DROP COLUMN project;
              ALTER TABLE action DROP COLUMN requested_count;
              DROP TABLE capacity_throttle_sample;
+             DROP TABLE session_turn_stream_state;
+             DROP TABLE session_turn_session_role;
              ALTER TABLE capacity_event DROP COLUMN source_basis;
              ALTER TABLE host_output_sample DROP COLUMN source_basis;
              PRAGMA user_version=5;",
@@ -358,17 +361,17 @@ fn an_unsupported_schema_version_is_refused_without_a_change() {
     drop(open(&path));
     Connection::open(&path)
         .unwrap()
-        .pragma_update(None, "user_version", 9)
+        .pragma_update(None, "user_version", 10)
         .unwrap();
     let before = std::fs::read(&path).unwrap();
     let error = Ledger::open(&path, &FleetConfig::default()).err().unwrap();
     assert!(matches!(
         error,
-        LedgerError::UnsupportedVersion { found: 9, .. }
+        LedgerError::UnsupportedVersion { found: 10, .. }
     ));
     assert!(matches!(
         query(&path, "defect_rows", None),
-        Err(LedgerError::UnsupportedVersion { found: 9, .. })
+        Err(LedgerError::UnsupportedVersion { found: 10, .. })
     ));
     assert_eq!(std::fs::read(&path).unwrap(), before);
 }
@@ -895,8 +898,8 @@ fn session_turn_rows_are_readable_with_relay_time_filtering() {
     ledger
         .connection
         .execute(
-            "INSERT INTO session_turn(session_addr,session_role,started_at)
-             VALUES('test-server:test-workspace:test-minder','minder',1200)",
+            "INSERT INTO session_turn(session_addr,session_role,started_at,transcript_id)
+             VALUES('test-server:test-workspace:test-minder','minder',1200,'session-1200')",
             [],
         )
         .unwrap();
@@ -907,7 +910,46 @@ fn session_turn_rows_are_readable_with_relay_time_filtering() {
     assert_eq!(rows.rows[0]["session_addr"], "test-server:test-workspace:test-minder");
     assert_eq!(rows.rows[0]["session_role"], "minder");
     assert_eq!(rows.rows[0]["started_at"], 1200);
+    assert_eq!(rows.rows[0]["transcript_id"], "session-1200");
     assert_eq!(rows.rows[0]["at_ms"], 1200);
+}
+
+#[trace("FR-039-AC-14")]
+#[test]
+fn version_seven_migration_adds_nullable_transcript_id_without_rewriting_turns() {
+    let (_dir, path) = path();
+    let ledger = open(&path);
+    ledger
+        .connection
+        .execute(
+            "INSERT INTO session_turn(session_addr,session_role,started_at)
+             VALUES('test-server:test-workspace:test-minder','minder',1200)",
+            [],
+        )
+        .unwrap();
+    drop(ledger);
+
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "DROP VIEW session_turn_stream_coverage;
+             DROP VIEW session_turn_rows;
+             DROP TABLE session_turn_stream_state;
+             DROP TABLE session_turn_session_role;
+             ALTER TABLE session_turn DROP COLUMN transcript_id;
+             CREATE VIEW session_turn_rows AS
+               SELECT session_addr,session_role,started_at,started_at AS at_ms FROM session_turn;
+             PRAGMA user_version=7;",
+        )
+        .unwrap();
+
+    drop(open(&path));
+    assert_eq!(count(&path, "PRAGMA user_version"), 9);
+    let rows = query(&path, "session_turn_rows", Some(Duration::from_millis(1))).unwrap();
+    assert_eq!(rows.rows.len(), 1);
+    assert_eq!(rows.rows[0]["session_addr"], "test-server:test-workspace:test-minder");
+    assert_eq!(rows.rows[0]["started_at"], 1200);
+    assert!(rows.rows[0]["transcript_id"].is_null());
 }
 
 #[test]

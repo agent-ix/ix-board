@@ -9,7 +9,7 @@
 use ix_trace_rs::implements;
 
 /// The schema version this build writes.
-pub const VERSION: i64 = 7;
+pub const VERSION: i64 = 9;
 
 pub const V1: &str = "
 CREATE TABLE run(
@@ -208,6 +208,42 @@ pub const V7: &[&str] = &[
        start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL CHECK(end_ms >= start_ms))",
     "CREATE INDEX host_build_pause_interval_host_time
        ON host_build_pause_interval(host, start_ms, end_ms)",
+];
+
+/// Version 8 adds the relay-authored transcript identity to prompt-turn rows.
+pub const V8: &[&str] = &[
+    "ALTER TABLE session_turn ADD COLUMN transcript_id TEXT",
+    "DROP VIEW IF EXISTS session_turn_rows",
+    "CREATE VIEW session_turn_rows AS
+       SELECT session_addr,session_role,started_at,transcript_id,started_at AS at_ms
+       FROM session_turn",
+];
+
+/// Version 9 records the durable position and historical coverage of prompt-turn ingestion.
+pub const V9: &[&str] = &[
+    "CREATE TABLE session_turn_session_role(
+       session_addr TEXT NOT NULL, transcript_id TEXT NOT NULL,
+       session_role TEXT, PRIMARY KEY(session_addr,transcript_id))",
+    "CREATE TABLE session_turn_stream_state(
+       singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+       cursor_ms INTEGER NOT NULL, cursor_sequence INTEGER NOT NULL,
+       coverage_start_ms INTEGER, incomplete_before_ms INTEGER,
+       last_read_ms INTEGER NOT NULL, events_read INTEGER NOT NULL DEFAULT 0,
+       unreadable_events INTEGER NOT NULL DEFAULT 0, pages_read INTEGER NOT NULL DEFAULT 0,
+       retention_gaps INTEGER NOT NULL DEFAULT 0, latest_gap_start_ms INTEGER)",
+    "CREATE VIEW session_turn_stream_coverage AS
+       SELECT cursor_ms,cursor_sequence,coverage_start_ms,incomplete_before_ms,
+              last_read_ms,events_read,unreadable_events,pages_read,retention_gaps,
+              latest_gap_start_ms,
+              (SELECT COUNT(*) FROM session_turn_session_role WHERE session_role IS NOT NULL)
+                AS role_mappings,
+              CASE WHEN coverage_start_ms IS NULL THEN 'no_events_seen'
+                   WHEN retention_gaps > 0 THEN 'incomplete_possible_retention_gap'
+                   WHEN unreadable_events > 0 THEN 'incomplete_unreadable_events'
+                   WHEN incomplete_before_ms IS NOT NULL THEN 'incomplete_before_first_observed_event'
+                   ELSE 'observed_since_stream_start' END AS status,
+              last_read_ms AS at_ms
+       FROM session_turn_stream_state WHERE singleton=1",
 ];
 
 /// Views replaced when installing the version 7 definitions.
@@ -1194,6 +1230,7 @@ pub const QUERYABLE: &[&str] = &[
     "tick_actions_unexecuted_by_minder",
     "minder_turns_without_committed_tick",
     "session_turn_rows",
+    "session_turn_stream_coverage",
     "minder_orders_unconfirmed_at_deadline",
     "unconfirmed_orders_not_resent_or_escalated",
     "cycle_events",

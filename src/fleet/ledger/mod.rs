@@ -298,6 +298,24 @@ fn apply_v7(tx: &rusqlite::Transaction<'_>) -> Result<(), LedgerError> {
     for statement in schema::CAPACITY_VIEWS {
         tx.execute_batch(statement)?;
     }
+    tx.pragma_update(None, "user_version", 7)?;
+    Ok(())
+}
+
+#[implements("FR-039-AC-14")]
+fn apply_v8(tx: &rusqlite::Transaction<'_>) -> Result<(), LedgerError> {
+    for statement in schema::V8 {
+        tx.execute_batch(statement)?;
+    }
+    tx.pragma_update(None, "user_version", 8)?;
+    Ok(())
+}
+
+#[implements("FR-039-AC-14")]
+fn apply_v9(tx: &rusqlite::Transaction<'_>) -> Result<(), LedgerError> {
+    for statement in schema::V9 {
+        tx.execute_batch(statement)?;
+    }
     tx.pragma_update(None, "user_version", schema::VERSION)?;
     Ok(())
 }
@@ -558,6 +576,8 @@ impl Ledger {
                 apply_v5(&tx)?;
                 apply_v6(&tx)?;
                 apply_v7(&tx)?;
+                apply_v8(&tx)?;
+                apply_v9(&tx)?;
                 tx.commit()?;
             }
             1 => {
@@ -568,6 +588,8 @@ impl Ledger {
                 apply_v5(&tx)?;
                 apply_v6(&tx)?;
                 apply_v7(&tx)?;
+                apply_v8(&tx)?;
+                apply_v9(&tx)?;
                 tx.commit()?;
             }
             2 => {
@@ -577,6 +599,8 @@ impl Ledger {
                 apply_v5(&tx)?;
                 apply_v6(&tx)?;
                 apply_v7(&tx)?;
+                apply_v8(&tx)?;
+                apply_v9(&tx)?;
                 tx.commit()?;
             }
             3 => {
@@ -585,6 +609,8 @@ impl Ledger {
                 apply_v5(&tx)?;
                 apply_v6(&tx)?;
                 apply_v7(&tx)?;
+                apply_v8(&tx)?;
+                apply_v9(&tx)?;
                 tx.commit()?;
             }
             4 => {
@@ -592,21 +618,38 @@ impl Ledger {
                 apply_v5(&tx)?;
                 apply_v6(&tx)?;
                 apply_v7(&tx)?;
+                apply_v8(&tx)?;
+                apply_v9(&tx)?;
                 tx.commit()?;
             }
             5 => {
                 let tx = connection.transaction()?;
                 apply_v6(&tx)?;
                 apply_v7(&tx)?;
+                apply_v8(&tx)?;
+                apply_v9(&tx)?;
                 tx.commit()?;
             }
             6 => {
                 let tx = connection.transaction()?;
                 refresh_v6_host_output_view(&tx)?;
                 apply_v7(&tx)?;
+                apply_v8(&tx)?;
+                apply_v9(&tx)?;
                 tx.commit()?;
             }
-            7 => {}
+            7 => {
+                let tx = connection.transaction()?;
+                apply_v8(&tx)?;
+                apply_v9(&tx)?;
+                tx.commit()?;
+            }
+            8 => {
+                let tx = connection.transaction()?;
+                apply_v9(&tx)?;
+                tx.commit()?;
+            }
+            9 => {}
             found => {
                 return Err(LedgerError::UnsupportedVersion {
                     path: path.to_owned(),

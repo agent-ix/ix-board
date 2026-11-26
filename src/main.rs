@@ -1143,7 +1143,11 @@ fn run_fleet_status() -> Result<ix_board::fleet::FleetReport, Error> {
             Err(error) => std::sync::Arc::new(live::UnavailablePrometheus(error.to_string())),
         });
     let (relay, receipts) = live::read_relay(config.host_timeout);
-    let (session_events, session_coverage) = session_turn_input(&relay);
+    let role_observations = relay
+        .as_ref()
+        .ok()
+        .map(|snapshot| snapshot.events.clone())
+        .unwrap_or_default();
     let sources = ix_board::fleet::Sources {
         relay,
         series,
@@ -1163,13 +1167,7 @@ fn run_fleet_status() -> Result<ix_board::fleet::FleetReport, Error> {
             ix_board::fleet::tick::TickSettings::default()
         }
     };
-    record_run(
-        &config,
-        &tick_settings,
-        &session_events,
-        &session_coverage,
-        &mut report,
-    );
+    record_run(&config, &tick_settings, &role_observations, &mut report);
     Ok(report)
 }
 
@@ -1180,22 +1178,15 @@ fn run_fleet_status() -> Result<ix_board::fleet::FleetReport, Error> {
 fn record_run(
     config: &ix_board::fleet::FleetConfig,
     tick_settings: &ix_board::fleet::tick::TickSettings,
-    session_events: &[ix_board::fleet::RawEvent],
-    session_coverage: &ix_board::fleet::ledger::ActivityCoverage,
+    role_observations: &[ix_board::fleet::RawEvent],
     report: &mut ix_board::fleet::FleetReport,
 ) {
-    match ix_board::fleet::ledger::resolve_path(config)
-        .and_then(|path| ix_board::fleet::ledger::Ledger::open(&path, config))
-    {
-        Ok(mut ledger) => {
-            if let Err(error) =
-                ledger.record_session_turns(tick_settings, session_events, session_coverage)
-            {
-                report.add_unreadable_source("relay:session_turn", error);
-            }
-        }
-        Err(error) => report.add_ledger_defect(format!("session-turn ledger: {error}")),
-    }
+    ix_board::fleet::live::record_session_turn_page(
+        config,
+        tick_settings,
+        role_observations,
+        report,
+    );
     let relay = relay_core::config::load_core(relay_core::config::CoreFlags::default())
         .ok()
         .and_then(|settings| {
@@ -1213,39 +1204,6 @@ fn record_run(
             );
         }
         None => ix_board::fleet::ledger::record_status(config, report),
-    }
-}
-
-fn session_turn_input(
-    relay: &Result<ix_board::fleet::RelaySnapshot, ix_board::fleet::SourceError>,
-) -> (
-    Vec<ix_board::fleet::RawEvent>,
-    ix_board::fleet::ledger::ActivityCoverage,
-) {
-    match relay {
-        Ok(snapshot) => {
-            let coverage = if snapshot.activity_stream_capped {
-                ix_board::fleet::ledger::ActivityCoverage::Unavailable(
-                    "relay activity stream reached its retention cap".to_owned(),
-                )
-            } else if snapshot.activity_absent {
-                ix_board::fleet::ledger::ActivityCoverage::Unavailable(
-                    "relay activity stream is absent".to_owned(),
-                )
-            } else if snapshot.unreadable_events > 0 {
-                ix_board::fleet::ledger::ActivityCoverage::Unavailable(format!(
-                    "{} relay activity events could not be decoded",
-                    snapshot.unreadable_events
-                ))
-            } else {
-                ix_board::fleet::ledger::ActivityCoverage::Complete
-            };
-            (snapshot.events.clone(), coverage)
-        }
-        Err(error) => (
-            Vec::new(),
-            ix_board::fleet::ledger::ActivityCoverage::Unavailable(error.to_string()),
-        ),
     }
 }
 
@@ -3670,7 +3628,7 @@ mod fleet_assign_output {
         AssignReport {
             sender_role: "orchestrator".into(),
             sender_addr: "test-server:test-workspace:test-lead".into(),
-            lane: "terra:SWM:one".into(),
+            lane: "test-server:test-workspace:test-lane".into(),
             tickets: vec!["SWM-211".into()],
             order_id: Some("order-1".into()),
             expect_ticket: "SWM-211".into(),

@@ -100,6 +100,7 @@ struct Args {
     ledger: Option<PathBuf>,
     prometheus_url: Option<String>,
     output: Option<PathBuf>,
+    sample_minder_address: Option<String>,
 }
 
 struct OrderSource {
@@ -130,6 +131,38 @@ struct ExpiredSource {
 struct PrometheusSource {
     families: BTreeMap<String, usize>,
     error: Option<String>,
+}
+
+#[derive(Default)]
+struct SessionTurnProof {
+    relay_events: usize,
+    activity_stream_capped: bool,
+    relay_prompt_events: usize,
+    prompt_events_with_transcript_id: usize,
+    prompt_events_without_transcript_id: usize,
+    unique_source_prompt_ids: usize,
+    copy_rows_changed: usize,
+    copy_session_turn_rows: i64,
+    copy_rows_with_transcript_id: i64,
+    copy_rows_without_transcript_id: i64,
+    source_rows_matched_in_copy: usize,
+    copy_pages_read: usize,
+    copy_events_read: usize,
+    copy_prompt_events: usize,
+    copy_role_session_starts: usize,
+    copy_role_mappings_written: i64,
+    copy_cursor: Option<String>,
+    coverage_start_ms: Option<i64>,
+    incomplete_before_ms: Option<i64>,
+    copy_retention_gaps: i64,
+    copy_unreadable_events: i64,
+    copy_coverage_status: Option<String>,
+    sample_role: Option<String>,
+    sample_role_override_used: bool,
+    sample_copy_rows_changed: usize,
+    sample_identity_matched_in_copy: bool,
+    activity_coverage: String,
+    reason: Option<String>,
 }
 
 fn main() {
@@ -163,6 +196,14 @@ fn run() -> Result<(), Box<dyn Error>> {
     // Ledger::open applies migrations and writer setup only to the isolated copy.
     drop(Ledger::open(&copied_ledger, &config)?);
     let copied_version = sqlite_version(&copied_ledger)?;
+    let settings_value = ix_board::settings_value()?;
+    let tick_settings = ix_board::fleet::tick::TickSettings::from_toml(settings_value.as_ref())?;
+    let session_turn_proof = write_session_turns_to_copy(
+        &copied_ledger,
+        &config,
+        &tick_settings,
+        args.sample_minder_address.as_deref(),
+    )?;
     let order_source = read_orders(since_ms, now_ms)?;
     let expired_source = read_expired_orders()?;
     let work_source = read_work_events()?;
@@ -174,6 +215,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         copied_version,
         now_ms,
         &source_counts,
+        &session_turn_proof,
         &order_source,
         &expired_source,
         &work_source,
@@ -189,6 +231,248 @@ fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn write_session_turns_to_copy(
+    copied_ledger: &Path,
+    config: &FleetConfig,
+    settings: &ix_board::fleet::tick::TickSettings,
+    sample_minder_address: Option<&str>,
+) -> Result<SessionTurnProof, Box<dyn Error>> {
+    let mut proof = SessionTurnProof::default();
+    let (snapshot, _) = ix_board::fleet::live::read_relay(config.host_timeout);
+    let snapshot = match snapshot {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            proof.activity_coverage = "unavailable".to_owned();
+            proof.reason = Some(error.to_string());
+            return Ok(proof);
+        }
+    };
+    proof.relay_events = snapshot.events.len();
+    proof.activity_stream_capped = snapshot.activity_stream_capped;
+    proof.activity_coverage = if snapshot.activity_stream_capped {
+        "bounded incremental XRANGE pages; snapshot is capped, pre-baseline coverage is reported separately".to_owned()
+    } else {
+        "bounded incremental XRANGE pages; snapshot is not capped".to_owned()
+    };
+
+    let mut source_prompt_ids = BTreeSet::new();
+    let mut roles_by_session = BTreeMap::new();
+    let mut sample_settings = settings.clone();
+    if let Some(address) = sample_minder_address {
+        sample_settings.minder = Some(address.to_owned());
+        proof.sample_role_override_used = true;
+    }
+    for event in &snapshot.events {
+        if event.event.kind != ix_board::fleet::HookKind::SessionStart {
+            continue;
+        }
+        let (Some(transcript_id), Some(role)) = (
+            event.transcript_id.as_deref(),
+            event.session_role.as_deref().and_then(valid_relay_role),
+        ) else {
+            continue;
+        };
+        roles_by_session.insert(
+            (event.addr.clone(), transcript_id.to_owned()),
+            (event, role),
+        );
+    }
+    let mut sample: Option<(String, i64, String, String, Vec<ix_board::fleet::RawEvent>)> = None;
+    for event in &snapshot.events {
+        if event.event.kind != ix_board::fleet::HookKind::Prompt {
+            continue;
+        }
+        proof.relay_prompt_events += 1;
+        if let Some(transcript_id) = event.transcript_id.as_deref() {
+            proof.prompt_events_with_transcript_id += 1;
+            source_prompt_ids.insert((
+                event.addr.clone(),
+                event.event.server_ms,
+                transcript_id.to_owned(),
+            ));
+            if sample.is_none() {
+                let configured_role = match sample_settings.role_of(&event.addr) {
+                    role @ ("orchestrator" | "minder") => Some(role),
+                    _ => roles_by_session
+                        .get(&(event.addr.clone(), transcript_id.to_owned()))
+                        .map(|(_, role)| *role),
+                };
+                if let Some(role) = configured_role {
+                    let mut sample_events = Vec::new();
+                    if let Some((start, _)) =
+                        roles_by_session.get(&(event.addr.clone(), transcript_id.to_owned()))
+                    {
+                        sample_events.push((*start).clone());
+                    }
+                    sample_events.push(event.clone());
+                    sample = Some((
+                        event.addr.clone(),
+                        event.event.server_ms,
+                        transcript_id.to_owned(),
+                        role.to_owned(),
+                        sample_events,
+                    ));
+                }
+            }
+        } else {
+            proof.prompt_events_without_transcript_id += 1;
+        }
+    }
+    proof.unique_source_prompt_ids = source_prompt_ids.len();
+
+    let mut ledger = Ledger::open(copied_ledger, config)?;
+    proof.copy_role_session_starts = snapshot
+        .events
+        .iter()
+        .filter(|event| {
+            event.event.kind == ix_board::fleet::HookKind::SessionStart
+                && event
+                    .session_role
+                    .as_deref()
+                    .and_then(valid_relay_role)
+                    .is_some()
+        })
+        .count();
+    let mut cursor = ledger.session_turn_stream_cursor()?;
+    for _ in 0..40 {
+        let page = match ix_board::fleet::live::read_session_turn_page(cursor, config.host_timeout)
+        {
+            Ok(page) => page,
+            Err(error) => {
+                proof.reason = Some(error.to_string());
+                break;
+            }
+        };
+        if page.entries.is_empty() {
+            break;
+        }
+        let mut entries = Vec::with_capacity(page.entries.len());
+        for entry in &page.entries {
+            let parsed = entry
+                .event_json
+                .as_deref()
+                .and_then(ix_board::fleet::parse_event);
+            if let Some(event) = &parsed
+                && event.event.kind == ix_board::fleet::HookKind::Prompt
+            {
+                proof.copy_prompt_events += 1;
+                if let Some(transcript_id) = event.transcript_id.as_deref() {
+                    source_prompt_ids.insert((
+                        event.addr.clone(),
+                        event.event.server_ms,
+                        transcript_id.to_owned(),
+                    ));
+                }
+            }
+            entries.push((entry.id.clone(), parsed));
+        }
+        proof.copy_rows_changed += ledger.record_session_turn_page(
+            &sample_settings,
+            &entries,
+            &snapshot.events,
+            page.oldest_available_id.as_deref(),
+            unix_ms()?,
+        )?;
+        proof.copy_pages_read += 1;
+        proof.copy_events_read += entries.len();
+        cursor = entries
+            .last()
+            .map(|(id, _)| parse_stream_cursor(id))
+            .transpose()?;
+        if proof.copy_rows_changed > 0 {
+            break;
+        }
+    }
+    proof.copy_cursor = cursor.map(|(millis, sequence)| format!("{millis}-{sequence}"));
+    proof.unique_source_prompt_ids = source_prompt_ids.len();
+    drop(ledger);
+    let coverage_rows = ledger::query(copied_ledger, "session_turn_stream_coverage", None)?;
+    if let Some(coverage) = coverage_rows.rows.first() {
+        proof.coverage_start_ms = coverage.get("coverage_start_ms").and_then(Value::as_i64);
+        proof.incomplete_before_ms = coverage.get("incomplete_before_ms").and_then(Value::as_i64);
+        proof.copy_retention_gaps = coverage
+            .get("retention_gaps")
+            .and_then(Value::as_i64)
+            .unwrap_or_default();
+        proof.copy_unreadable_events = coverage
+            .get("unreadable_events")
+            .and_then(Value::as_i64)
+            .unwrap_or_default();
+        proof.copy_coverage_status = coverage
+            .get("status")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        proof.copy_role_mappings_written = coverage
+            .get("role_mappings")
+            .and_then(Value::as_i64)
+            .unwrap_or_default();
+    }
+    let copied_rows = ledger::query(copied_ledger, "session_turn_rows", None)?;
+    let mut copied_prompt_ids = BTreeSet::new();
+    for row in &copied_rows.rows {
+        proof.copy_session_turn_rows += 1;
+        let Some(address) = row.get("session_addr").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(started_at) = row.get("started_at").and_then(Value::as_i64) else {
+            continue;
+        };
+        if let Some(transcript_id) = row.get("transcript_id").and_then(Value::as_str) {
+            proof.copy_rows_with_transcript_id += 1;
+            copied_prompt_ids.insert((address.to_owned(), started_at, transcript_id.to_owned()));
+        } else {
+            proof.copy_rows_without_transcript_id += 1;
+        }
+    }
+
+    proof.source_rows_matched_in_copy = source_prompt_ids.intersection(&copied_prompt_ids).count();
+
+    if let Some((address, started_at, transcript_id, role, events)) = sample {
+        proof.sample_role = Some(role);
+        let sample_workspace = TempWorkspace::create()?;
+        let sample_copy = sample_workspace.path("fleet-ledger-sample.sqlite3");
+        backup_read_only(copied_ledger, &sample_copy)?;
+        let mut sample_ledger = Ledger::open(&sample_copy, config)?;
+        // This is one explicitly selected prompt sample in a disposable copy, not a completeness
+        // claim for the capped relay stream or a production ledger write.
+        proof.sample_copy_rows_changed = sample_ledger.record_session_turns(
+            &sample_settings,
+            &events,
+            &ix_board::fleet::ledger::ActivityCoverage::Complete,
+        )?;
+        drop(sample_ledger);
+        let sample_rows = ledger::query(&sample_copy, "session_turn_rows", None)?;
+        proof.sample_identity_matched_in_copy = sample_rows.rows.iter().any(|row| {
+            row.get("session_addr").and_then(Value::as_str) == Some(address.as_str())
+                && row.get("started_at").and_then(Value::as_i64) == Some(started_at)
+                && row.get("transcript_id").and_then(Value::as_str) == Some(transcript_id.as_str())
+                && row.get("session_role").and_then(Value::as_str) == proof.sample_role.as_deref()
+        });
+    } else if proof.reason.is_none() {
+        proof.reason = Some(
+            "no relay prompt with an authoritative session ID and configured role was present in the bounded source sample".to_owned(),
+        );
+    }
+    Ok(proof)
+}
+
+fn valid_relay_role(role: &str) -> Option<&'static str> {
+    match role {
+        "code-lead" => Some("code-lead"),
+        "coder" => Some("coder"),
+        "minder" => Some("minder"),
+        "orchestrator" => Some("orchestrator"),
+        "planner" => Some("planner"),
+        "reviewer" => Some("reviewer"),
+        _ => None,
+    }
+}
+
+fn parse_stream_cursor(id: &str) -> Result<(i64, i64), Box<dyn Error>> {
+    let (milliseconds, sequence) = id.split_once('-').ok_or("invalid Redis stream ID")?;
+    Ok((milliseconds.parse()?, sequence.parse()?))
+}
+
 fn parse_args() -> Result<Args, Box<dyn Error>> {
     let mut args = Args::default();
     let mut iter = env::args().skip(1);
@@ -198,6 +482,7 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
             "--ledger" => args.ledger = Some(value.into()),
             "--prometheus-url" => args.prometheus_url = Some(value),
             "--output" => args.output = Some(value.into()),
+            "--sample-minder-address" => args.sample_minder_address = Some(value),
             _ => return Err(format!("unknown argument {flag}").into()),
         }
     }
@@ -584,6 +869,7 @@ fn render_report(
     copied_version: i64,
     observed_at_ms: i64,
     source_counts: &BTreeMap<String, i64>,
+    session_turn_proof: &SessionTurnProof,
     orders: &OrderSource,
     expired: &ExpiredSource,
     work: &WorkSource,
@@ -595,7 +881,9 @@ fn render_report(
         "# SWM-261 / SWM-255 live-source acceptance snapshot\n\n\
          This report was generated by `src/bin/swm261_acceptance.rs`. The live SQLite source was\n\
          opened read-only, copied with SQLite's online backup API, and only the temporary copy was\n\
-         migrated to the branch schema. Relay and Prometheus access used read-only requests.\n\n",
+         migrated to the branch schema. Relay and Prometheus access used read-only requests. The \
+         session-turn writer was exercised only against the temporary copy; transcript identifiers \
+         are represented as counts and are not printed.\n\n",
     );
     report.push_str(&format!(
         "- Observed at: `{observed_at_ms}` UTC epoch milliseconds\n- Live ledger: `{}`\n- Live ledger schema: `v{source_version}`; temporary copy schema after migration: `v{copied_version}`\n- Temporary config: `[temporary, removed after run]` (contains only the copied ledger path and Prometheus URL)\n- Temporary copied ledger: `[temporary, removed after run]`\n- Relay order window: `{}..{}` (effective lower bound through observation time)\n\n",
@@ -609,6 +897,41 @@ fn render_report(
     report.push_str(&format!("- Schema: `v{source_version}`\n"));
     for (table, count) in source_counts {
         report.push_str(&format!("- `{table}`: `{count}` rows\n"));
+    }
+    report.push_str("\n### Relay prompt session IDs written to copy\n\n");
+    report.push_str(&format!(
+        "- Newest-N relay snapshot entries: `{}`; snapshot capped: `{}`; incremental coverage: `{}`\n- Relay prompt events in bounded snapshot: `{}`; with authoritative relay `session` field: `{}`; without it: `{}`\n- Incremental copy pages/events: `{}` / `{}`; prompts: `{}`; role-bearing `session_start` observations: `{}`; durable role mappings: `{}`; durable cursor: `{}`; coverage starts at `{}`; history before `{}` is explicitly incomplete; possible retention gaps: `{}`; unreadable entries: `{}`; coverage status: `{}`\n- Unique source prompt identities with session IDs observed: `{}`; matching identities in copied `session_turn_rows`: `{}`\n- Incremental copy writer rows changed: `{}` (sample role override: `{}`); copied `session_turn_rows`: `{}` (`{}` with transcript IDs, `{}` null)\n- Isolated sample-copy role: `{}`; explicit sample-role override used: `{}`; sample prompt rows changed: `{}`; exact address/time/session-ID/role identity matched in the sample copy: `{}`. The sample contains one real prompt and its matching `session_start` when needed.\n",
+        session_turn_proof.relay_events,
+        session_turn_proof.activity_stream_capped,
+        session_turn_proof.activity_coverage,
+        session_turn_proof.relay_prompt_events,
+        session_turn_proof.prompt_events_with_transcript_id,
+        session_turn_proof.prompt_events_without_transcript_id,
+        session_turn_proof.copy_pages_read,
+        session_turn_proof.copy_events_read,
+        session_turn_proof.copy_prompt_events,
+        session_turn_proof.copy_role_session_starts,
+        session_turn_proof.copy_role_mappings_written,
+        session_turn_proof.copy_cursor.as_deref().unwrap_or("null"),
+        session_turn_proof.coverage_start_ms.map_or_else(|| "null".to_owned(), |value| value.to_string()),
+        session_turn_proof.incomplete_before_ms.map_or_else(|| "null".to_owned(), |value| value.to_string()),
+        session_turn_proof.copy_retention_gaps,
+        session_turn_proof.copy_unreadable_events,
+        session_turn_proof.copy_coverage_status.as_deref().unwrap_or("not_initialized"),
+        session_turn_proof.unique_source_prompt_ids,
+        session_turn_proof.source_rows_matched_in_copy,
+        session_turn_proof.copy_rows_changed,
+        session_turn_proof.sample_role_override_used,
+        session_turn_proof.copy_session_turn_rows,
+        session_turn_proof.copy_rows_with_transcript_id,
+        session_turn_proof.copy_rows_without_transcript_id,
+        session_turn_proof.sample_role.as_deref().unwrap_or("none"),
+        session_turn_proof.sample_role_override_used,
+        session_turn_proof.sample_copy_rows_changed,
+        session_turn_proof.sample_identity_matched_in_copy
+    ));
+    if let Some(reason) = session_turn_proof.reason.as_deref() {
+        report.push_str(&format!("- Proof limitation: `{reason}`\n"));
     }
     report.push_str("\n### Relay orders\n\n");
     report.push_str(&format!(

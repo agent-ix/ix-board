@@ -1213,6 +1213,7 @@ fn version_three_ledger_migrates_additively_to_resumable_windows() {
              ALTER TABLE assignment_history DROP COLUMN sender_role;
              ALTER TABLE assignment_history DROP COLUMN sender_addr;
              ALTER TABLE cycle_missed DROP COLUMN at_ms;
+             ALTER TABLE session_turn DROP COLUMN transcript_id;
              DROP TABLE lane_lead;
              DROP TABLE failed_probe_tick;
              DROP TABLE relay_order;
@@ -1224,6 +1225,8 @@ fn version_three_ledger_migrates_additively_to_resumable_windows() {
              ALTER TABLE action DROP COLUMN project;
              ALTER TABLE action DROP COLUMN requested_count;
              DROP TABLE capacity_throttle_sample;
+             DROP TABLE session_turn_stream_state;
+             DROP TABLE session_turn_session_role;
              ALTER TABLE capacity_event DROP COLUMN source_basis;
              ALTER TABLE host_output_sample DROP COLUMN source_basis;
              CREATE UNIQUE INDEX capacity_step_run_step ON capacity_step(run_id,step_no);

@@ -1114,6 +1114,7 @@ dependencies = [
  "ix-cli-kit",
  "ix-trace-rs",
  "predicates",
+ "redis",
  "relay-core",
  "relay-work-wire",
  "reqwest",
