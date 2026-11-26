@@ -417,25 +417,70 @@ fn macos_process_table() -> io::Result<ProcessTable> {
             complete: false,
         });
     }
-    let mut table = ProcessTable {
-        processes: Vec::new(),
-        complete: true,
-    };
     let process_names = Command::new("ps").args(["-axo", "pid=,comm="]).output()?;
-    if !process_names.status.success() {
-        table.complete = false;
-    }
-    let mut commands = BTreeMap::new();
+    let mut environments = BTreeMap::new();
     for line in String::from_utf8_lossy(&process_names.stdout).lines() {
         let Some((pid, command)) = line.trim().split_once(char::is_whitespace) else {
             continue;
         };
-        if let Ok(pid) = pid.trim().parse::<u32>() {
-            commands.insert(pid, command.trim().as_bytes().to_vec());
+        let Ok(pid) = pid.trim().parse::<u32>() else {
+            continue;
+        };
+        if is_build_command(command.trim().as_bytes()) {
+            match Command::new("ps")
+                .args(["eww", "-p", &pid.to_string(), "-o", "command="])
+                .output()
+            {
+                Ok(output) if output.status.success() && output.stdout.len() <= 1_048_576 => {
+                    environments.insert(pid, output.stdout);
+                }
+                _ => {}
+            }
         }
     }
+    Ok(parse_macos_process_output(
+        &output.stdout,
+        &process_names.stdout,
+        &environments,
+        output.status.success() && process_names.status.success(),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn is_build_command(command: &[u8]) -> bool {
+    command
+        .split(|byte| byte.is_ascii_whitespace())
+        .next()
+        .and_then(|command| std::str::from_utf8(command).ok())
+        .and_then(|command| Path::new(command).file_name())
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, "cargo" | "rustc"))
+}
+
+#[cfg(target_os = "macos")]
+#[implements("FR-048-AC-3")]
+fn parse_macos_process_output(
+    lsof_output: &[u8],
+    process_names: &[u8],
+    environments: &BTreeMap<u32, Vec<u8>>,
+    sources_complete: bool,
+) -> ProcessTable {
+    let mut table = ProcessTable {
+        processes: Vec::new(),
+        complete: sources_complete,
+    };
+    let commands = String::from_utf8_lossy(process_names)
+        .lines()
+        .filter_map(|line| {
+            let (pid, command) = line.trim().split_once(char::is_whitespace)?;
+            Some((
+                pid.trim().parse::<u32>().ok()?,
+                command.trim().as_bytes().to_vec(),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut current: Option<ProcessEvidence> = None;
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
+    for line in String::from_utf8_lossy(lsof_output).lines() {
         if let Some(pid) = line
             .strip_prefix('p')
             .and_then(|pid| pid.parse::<u32>().ok())
@@ -457,31 +502,19 @@ fn macos_process_table() -> io::Result<ProcessTable> {
         table.processes.push(process);
     }
     for process in &mut table.processes {
-        process.cmdline = commands.remove(&process.pid).unwrap_or_default();
+        process.cmdline = commands.get(&process.pid).cloned().unwrap_or_default();
         if process.cmdline.is_empty() {
             table.complete = false;
-            continue;
         }
-        let executable = process
-            .cmdline
-            .split(|byte| byte.is_ascii_whitespace())
-            .next()
-            .and_then(|command| std::str::from_utf8(command).ok())
-            .and_then(|command| Path::new(command).file_name())
-            .and_then(|name| name.to_str());
-        if matches!(executable, Some("cargo" | "rustc")) {
-            match Command::new("ps")
-                .args(["eww", "-p", &process.pid.to_string(), "-o", "command="])
-                .output()
-            {
-                Ok(output) if output.status.success() && output.stdout.len() <= 1_048_576 => {
-                    process.environ = output.stdout;
-                }
-                _ => table.complete = false,
+        if is_build_command(&process.cmdline) {
+            if let Some(environment) = environments.get(&process.pid) {
+                process.environ = environment.clone();
+            } else {
+                table.complete = false;
             }
         }
     }
-    Ok(table)
+    table
 }
 
 /// Reads available disk bytes through the platform `df` utility without a shell.
@@ -693,6 +726,33 @@ pub fn eligibility(metrics: &BuildHostMetrics, policy: BuildPolicy) -> Eligibili
 mod tests {
     use super::*;
     use ix_trace_rs::trace;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[trace("FR-048-AC-3")]
+    fn macos_process_output_retains_build_commands_and_pane_environment() {
+        let environments = BTreeMap::from([
+            (123, b"HERDR_PANE_ID=tab-123\0".to_vec()),
+            (124, b"OTHER=value\0".to_vec()),
+        ]);
+        let table = parse_macos_process_output(
+            b"p123\nn/worktrees/active/target/debug\np124\nn/worktrees/old/target/debug\n",
+            b"123 cargo\n124 cargo\n",
+            &environments,
+            true,
+        );
+        assert!(table.complete);
+        assert_eq!(table.processes.len(), 2);
+        assert_eq!(table.processes[0].cmdline, b"cargo");
+        assert_eq!(table.processes[0].environ, b"HERDR_PANE_ID=tab-123\0");
+        assert_eq!(table.processes[1].cmdline, b"cargo");
+        assert!(
+            !table.processes[1]
+                .environ
+                .windows(b"HERDR_PANE_ID=".len())
+                .any(|window| window == b"HERDR_PANE_ID=")
+        );
+    }
 
     #[test]
     #[trace("FR-048-AC-1", "FR-048-AC-8")]
