@@ -749,11 +749,7 @@ fn window_progress(
     }
     if needs_net {
         let net = (|| {
-            let mut union = scope.path_ok()?.to_vec();
-            union.extend(scope.projects_ok()?);
-            union.sort_by(|left, right| left.id.cmp(&right.id));
-            union.dedup_by(|left, right| left.id == right.id);
-            let closed = history.changed_in_window(&union, frame, to_completed)?;
+            let closed = history.changed_in_window(&wanted, frame, to_completed)?;
             Ok::<_, String>(count(closed.len()) - count(created.clone().unwrap_or(Ok(0))?))
         })();
         out.put("net_closed_minus_new", net);

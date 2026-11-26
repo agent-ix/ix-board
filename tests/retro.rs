@@ -627,7 +627,6 @@ fn path_remaining_is_unavailable_when_the_blocker_expansion_is_partial() {
     for id in [
         "path_remaining",
         "path_closed",
-        "net_closed_minus_new",
         "path_closed_unverified",
         "done_reopened",
     ] {
