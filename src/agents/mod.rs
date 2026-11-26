@@ -17,8 +17,8 @@ mod probe;
 
 pub use harness::{Harness, HarnessKind, adapter_for};
 pub use herdr::{
-    HerdrAgent, HerdrMachine, HerdrState, HerdrWorkspace, parse_agents, parse_machines,
-    parse_workspaces,
+    HerdrAgent, HerdrMachine, HerdrState, HerdrTab, HerdrWorkspace, parse_agents, parse_machines,
+    parse_tabs, parse_workspaces,
 };
 pub use probe::{
     GitTimes, Host, PaneProcess, Probe, ProbeRequest, SessionFiles, SessionQuery, SystemHost,
@@ -26,6 +26,7 @@ pub use probe::{
 };
 
 pub use collect::collect_probe;
+use ix_trace_rs::implements;
 pub use lifecycle::{
     AgentAvailability, AgentId, Availability, EvidenceSource, Lifecycle, WorkerCounts,
     WorkerObservation, WorkerRole, WorkerState, count_workers,
@@ -472,6 +473,26 @@ pub fn build_report_with_timeout(
     host_timeout: Duration,
     ready: &mut ReadyLookup<'_>,
 ) -> AgentsReport {
+    build_report_with_leases(
+        hosts,
+        teams,
+        idle_after_secs,
+        host_timeout,
+        ready,
+        &BTreeSet::new(),
+    )
+}
+
+/// Builds the report with live locked-build owners matched to canonical Herdr labels.
+#[implements("FR-018-AC-30")]
+pub fn build_report_with_leases(
+    hosts: &[Arc<dyn Host>],
+    teams: &[String],
+    idle_after_secs: u64,
+    host_timeout: Duration,
+    ready: &mut ReadyLookup<'_>,
+    leases: &BTreeSet<String>,
+) -> AgentsReport {
     let started = Instant::now();
     let receivers: Vec<_> = hosts
         .iter()
@@ -479,9 +500,10 @@ pub fn build_report_with_timeout(
             let (sender, receiver) = mpsc::channel();
             let host = Arc::clone(host);
             let teams = teams.to_vec();
+            let leases = leases.clone();
             std::thread::spawn(move || {
                 let began = Instant::now();
-                let result = gather_host(host.as_ref(), &teams, idle_after_secs);
+                let result = gather_host(host.as_ref(), &teams, idle_after_secs, &leases);
                 let _ = sender.send((result, began.elapsed()));
             });
             receiver
@@ -563,7 +585,13 @@ fn attach_next_ready(agents: &mut [AgentRow], ready: &mut ReadyLookup<'_>) -> Op
     failure
 }
 
-fn gather_host(host: &dyn Host, teams: &[String], idle_after: u64) -> HostResult {
+#[implements("FR-018-AC-30")]
+fn gather_host(
+    host: &dyn Host,
+    teams: &[String],
+    idle_after: u64,
+    leases: &BTreeSet<String>,
+) -> HostResult {
     let mut result = HostResult {
         rows: Vec::new(),
         found: BTreeSet::new(),
@@ -586,6 +614,17 @@ fn gather_host(host: &dyn Host, teams: &[String], idle_after: u64) -> HostResult
             return result;
         }
     };
+    let (tabs, tab_error) = match host
+        .herdr(&["tab", "list"])
+        .and_then(|text| parse_tabs(&text))
+    {
+        Ok(tabs) => (tabs, None),
+        Err(error) => {
+            let message = format!("{label}: tab list unavailable: {error}");
+            result.errors.push(message.clone());
+            (Vec::new(), Some(message))
+        }
+    };
     let team_of: BTreeMap<&str, &HerdrWorkspace> = workspaces
         .iter()
         .filter(|workspace| {
@@ -603,6 +642,19 @@ fn gather_host(host: &dyn Host, teams: &[String], idle_after: u64) -> HostResult
     let agents: Vec<&HerdrAgent> = agents
         .iter()
         .filter(|agent| team_of.contains_key(agent.workspace_id.as_str()))
+        .collect();
+    let workspace_labels: BTreeMap<&str, &str> = workspaces
+        .iter()
+        .map(|workspace| (workspace.workspace_id.as_str(), workspace.label.as_str()))
+        .collect();
+    let tab_labels: BTreeMap<(&str, &str), &str> = tabs
+        .iter()
+        .map(|tab| {
+            (
+                (tab.workspace_id.as_str(), tab.tab_id.as_str()),
+                tab.label.as_str(),
+            )
+        })
         .collect();
     let request = ProbeRequest {
         sessions: agents
@@ -632,19 +684,45 @@ fn gather_host(host: &dyn Host, teams: &[String], idle_after: u64) -> HostResult
     };
     for agent in agents {
         let team = team_of[agent.workspace_id.as_str()].label.clone();
-        let mut row = build_row(host, agent, &probe, idle_after, team);
+        let lease_active = workspace_labels
+            .get(agent.workspace_id.as_str())
+            .zip(tab_labels.get(&(agent.workspace_id.as_str(), agent.tab_id.as_str())))
+            .and_then(|(workspace, tab)| canonical_lane_address(host.label(), workspace, tab))
+            .is_some_and(|address| leases.contains(&address));
+        let mut row = build_row(host, agent, &probe, idle_after, team, lease_active);
         row.notes.extend(probe_note.clone());
+        row.notes.extend(tab_error.clone());
         result.rows.push(row);
     }
     result
 }
 
+#[implements("FR-018-AC-30")]
+fn canonical_lane_address(server: &str, workspace: &str, tab: &str) -> Option<String> {
+    let labels = [server, workspace, tab];
+    if labels
+        .iter()
+        .any(|label| label.is_empty() || label.contains(':'))
+    {
+        return None;
+    }
+    Some(
+        labels
+            .iter()
+            .map(|label| label.to_lowercase())
+            .collect::<Vec<_>>()
+            .join(":"),
+    )
+}
+
+#[implements("FR-018-AC-30")]
 fn build_row(
     host: &dyn Host,
     agent: &HerdrAgent,
     probe: &Probe,
     idle_after: u64,
     team: String,
+    lease_active: bool,
 ) -> AgentRow {
     let mut notes = Vec::new();
     let state = agent.state();
@@ -700,6 +778,13 @@ fn build_row(
         if is_work_command(process) && !processes.contains(&process.comm) {
             processes.push(process.comm.clone());
         }
+    }
+    if lease_active
+        && !processes
+            .iter()
+            .any(|process| process == "locked-build lease")
+    {
+        processes.push("locked-build lease".to_owned());
     }
     let verdict = decide(&Evidence {
         herdr: state,
@@ -803,13 +888,9 @@ fn build_row(
     }
 }
 
+#[implements("FR-018-AC-30")]
 fn is_work_command(process: &PaneProcess) -> bool {
-    let runs_gate_wrapper = process
-        .args
-        .split_whitespace()
-        .take(2)
-        .any(|word| word.rsplit('/').next() == Some("locked-build.sh"));
-    WORK_COMMANDS.contains(&process.comm.as_str()) || runs_gate_wrapper
+    WORK_COMMANDS.contains(&process.comm.as_str())
 }
 
 fn last_chars(text: &str, count: usize) -> String {
@@ -930,6 +1011,7 @@ pub fn render_text(report: &AgentsReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ix_trace_rs::trace;
 
     #[test]
     fn duration_accepts_units_and_refuses_the_rest() {
@@ -950,5 +1032,20 @@ mod tests {
             "Is this ok? I checked it myself.\nPR opened."
         ));
         assert!(!asks_for_input("All gates are green and the PR is open."));
+    }
+
+    #[test]
+    #[trace("FR-018-AC-30", "FR-048-AC-9")]
+    fn locked_build_wrapper_name_does_not_establish_running_work() {
+        let wrapper = PaneProcess {
+            comm: "bash".into(),
+            args: "locked-build.sh".into(),
+        };
+        let leased_command = PaneProcess {
+            comm: "cargo".into(),
+            args: "cargo test".into(),
+        };
+        assert!(!is_work_command(&wrapper));
+        assert!(is_work_command(&leased_command));
     }
 }

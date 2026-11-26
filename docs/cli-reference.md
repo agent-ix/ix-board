@@ -1,6 +1,6 @@
 # CLI reference
 
-Generated from the `--help` output of `ix-board` 0.4.0. Run `ix-board <command> --help` for the same text.
+Run `ix-board <command> --help` for current usage.
 
 ## ix-board
 
@@ -16,6 +16,8 @@ Commands:
   search         Search structured project and issue fields
   issues         Read multiple exact Linear issues in one cached workspace request
   agents         Say whether each agent in a team's herdr workspaces is working right now
+  hygiene        Inspect or clean build-host worktree output
+  build          Compare build-host capacity telemetry
   fleet          Fleet lane commands
   drift          Render a deterministic drift report from versioned structured evidence
   focus          Resolve an inline Linear initiative/project/issue focus
@@ -478,7 +480,68 @@ Options:
   -h, --help                         Print help
 ```
 
-Exit status: zero when every machine was read. When some machines are missing (they time out after 45 seconds or cannot be read) but other machines returned rows, the command prints those rows, lists the missing machines in `missing_hosts` with reason and elapsed time, and exits with the partial code. When no row could be read it exits with the internal-error code.
+Exit status: zero when every machine and configured lease source was read. Set
+`IX_BUILD_METRICS_URL` or pass `--lease-metrics-url` to map locked-build owner lanes onto current
+Herdr workspace and tab labels. Without readable metrics, agent rows are retained and the report
+exits partial with the lease source error. When some machines are missing (they time out after 45
+seconds or cannot be read) but other machines returned rows, the command prints those rows, lists
+the missing machines in `missing_hosts` with reason and elapsed time, and exits with the partial
+code. When no row could be read it exits with the internal-error code.
+
+## ix-board hygiene check
+
+```text
+ix-board hygiene check --host <HOST> [--free-floor-gb <GIB>] [--root <WORKTREES>] [--idle-minutes <MINUTES>]
+```
+
+Reports free disk space, target directories and their ages, prunable worktrees, and build
+processes without a Herdr pane association. The worktree root must be named `worktrees`. Values
+may be set in the ix-board settings file under `[hygiene]`; command-line values override the
+configured ones. The default policy floor is 100 GiB, with 150 GiB for terra; the default idle age
+is 60 minutes. Set `hygiene.default_free_floor_gb`, a host-specific
+`hygiene.hosts.<host>.free_floor_gb`, or `hygiene.idle_minutes` to change those policy fields.
+Exit status is 0 when clear,
+1 when findings exist, 2 when required evidence is unavailable, and 3 on unsupported Windows.
+
+## ix-board hygiene clean
+
+```text
+ix-board hygiene clean --host <HOST> [--free-floor-gb <GIB>] [--root <WORKTREES>] [--idle-minutes <MINUTES>] [--apply]
+```
+
+Dry-run by default. `--apply` removes only old `target/` directories under discovered Git
+worktrees when complete process evidence proves they are unused. Example policy:
+
+```toml
+[hygiene]
+worktree_root = "/srv/dev/worktrees"
+idle_minutes = 90
+default_free_floor_gb = 100
+
+[hygiene.hosts.terra]
+free_floor_gb = 150
+max_load1 = 32.0
+heavy_gate_slots = 2
+
+[hygiene.hosts.luna]
+free_floor_gb = 100
+max_load1 = 8.0
+heavy_gate_slots = 1
+```
+
+## ix-board build status
+
+```text
+ix-board build status --metrics-url <URL> [--policy <HOST:MAX_LOAD1:HEAVY_GATE_SLOTS>...]
+```
+
+Reads Prometheus text exposition from the configured endpoint and reports per-host one-minute
+load per core, root filesystem free space, memory, swap, queued requests, running locked-build
+leases and policy eligibility.
+Without `--policy`, the command uses configured `[hygiene.hosts.<host>]` entries that provide
+both `max_load1` and `heavy_gate_slots`. Pass one `--policy` for each host to override the
+configured host list. For luna's current rule use `luna:8:1` (raw load must be below 8 and no
+heavy gate may already be running).
 
 ## ix-board fleet status
 
