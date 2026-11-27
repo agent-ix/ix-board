@@ -329,17 +329,30 @@ fn decode_status(text: &str) -> Option<DecodedStatus> {
     let mut value: serde_json::Value = serde_json::from_str(text).ok()?;
     let object = value.as_object_mut()?;
     let requests = object.get_mut("requests")?.as_array_mut()?;
-    let mut rejected = BTreeSet::new();
-    let mut invalid_requests = 0;
-    requests.retain(|request| {
-        if serde_json::from_value::<RequestInput>(request.clone()).is_ok() {
-            return true;
-        }
-        invalid_requests += 1;
+    // Count identities before typed decoding: a malformed duplicate still makes
+    // every retained row with that identity ambiguous.
+    let mut ids = BTreeMap::new();
+    for request in requests.iter() {
         if let Some(id) = request
             .get("request_id")
             .and_then(serde_json::Value::as_str)
         {
+            *ids.entry(id.to_owned()).or_insert(0_u64) += 1;
+        }
+    }
+    let mut rejected = BTreeSet::new();
+    let mut invalid_requests = 0;
+    requests.retain(|request| {
+        let id = request
+            .get("request_id")
+            .and_then(serde_json::Value::as_str);
+        if !id.is_some_and(|id| ids[id] > 1)
+            && serde_json::from_value::<RequestInput>(request.clone()).is_ok()
+        {
+            return true;
+        }
+        invalid_requests += 1;
+        if let Some(id) = id {
             rejected.insert(id.to_owned());
         }
         false

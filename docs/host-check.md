@@ -38,7 +38,7 @@ the local Herdr server identity is not discoverable, and configure
 | Script | ix-board command or cadence job | Disposition |
 | --- | --- | --- |
 | `host-probe.sh` | `host check` / cadence `host_check` | Replaced by the local per-host report. |
-| `host-watch.sh` | `fleet status` and cadence `fleet_tick` | Use structured host/lane coverage and the fleet ledger instead of local notifications. |
+| `host-watch.sh` | `fleet status` and cadence `fleet_tick` | Use structured host/lane coverage and the fleet ledger. |
 | `hosts-status.sh` | `build status --metrics-url <url>` | Use the all-configured-host capacity table. |
 | `lane-status.sh` | `build status --metrics-url <url>` and `agents <TEAM>` | Split host metrics from evidence-backed lane verdicts. |
 | `status-qsl.sh` | `agents QSL` | Read the QSL lane state directly; the legacy relay status-request wrapper is delete. |
