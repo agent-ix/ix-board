@@ -75,7 +75,9 @@ Legacy status supplies `state`, `enqueued_at_ms`, `started_at_ms`, `ended_at_ms`
   `blocked_baseline_gap_ms`. Later cumulative endpoints are clipped to the
   caller's window end and queue overlap; `blocked_observation_gap_ms` reports
   the maximum sampling delay. These gaps expose uncertainty rather than imply
-  interpolated precision. Legacy reason labels are retained without attributing
+  interpolated precision. A contribution with a nonzero boundary gap is an
+  upper bound on its in-window duration, capped by elapsed queue overlap.
+  Legacy reason labels are retained without attributing
   an entire wait to the last reason.
 - Event snapshots SHALL NOT count a retained request twice. A correction SHALL
   retain the original request identity and SHALL NOT create another attempt.

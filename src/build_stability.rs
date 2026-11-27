@@ -1742,6 +1742,12 @@ mod independent_review_fixes {
             serde_json::to_value(&hour.queue["all"]).unwrap()["blocked_observation_gap_ms"],
             json!(3000)
         );
+        let longer = r#"{"schema_version":1,"host":"draco","observed_at_ms":100003000,"requests":[{"request_id":"open","class":"point","lifecycle_state":"queued","queued_at_ms":99990000,"queued_seconds":13,"blocked_reasons":[{"reason":"memory_budget","value":12,"limit":10,"seconds":12}]}],"events":[]}"#;
+        let hour = from_status(longer, "draco", 100_000_000).last_1h.unwrap();
+        assert_eq!(
+            hour.queue["all"].blocked_seconds.as_ref().unwrap()["memory_budget"],
+            10.0
+        );
     }
 
     #[test]
