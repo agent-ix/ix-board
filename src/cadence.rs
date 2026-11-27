@@ -65,7 +65,7 @@ pub struct Job {
     pub kind: JobKind,
     /// Arguments passed to this ix-board executable, without shell expansion.
     pub command: Vec<String>,
-    /// Optional configured `retro delta --notify` command run only after success.
+    /// Optional configured `retro delta` command run only after success.
     #[serde(default)]
     pub after_success: Option<Vec<String>>,
     /// Role responsible for this job.
@@ -90,7 +90,7 @@ pub enum JobKind {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
-    /// Single relay address notified when `cadence due --alert` finds the checker needs attention.
+    /// Single relay address used by explicitly requested interactive notifications.
     #[serde(default)]
     pub alert_recipient: Option<String>,
     /// Jobs in the manifest.
@@ -266,7 +266,6 @@ pub fn generate_default_manifest(
                     "delta".into(),
                     "--team".into(),
                     team.to_owned(),
-                    "--notify".into(),
                 ]),
                 owner_role: "minder".into(),
             },
@@ -375,18 +374,18 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), CadenceError> {
         let valid_delta = job.after_success.as_deref().is_some_and(|command| {
             matches!(
                 command,
-                [root, sub, scope, value, notify]
+                [root, sub, scope, value, options @ ..]
                     if root == "retro"
                         && sub == "delta"
                         && (scope == "--config" || scope == "--team")
                         && !value.is_empty()
                         && !value.starts_with("--")
-                        && notify == "--notify"
+                        && (options.is_empty() || options == ["--notify"])
             )
         });
         if job.after_success.is_some() && (job.kind != JobKind::RetroSnapshot || !valid_delta) {
             return Err(CadenceError::Manifest(format!(
-                "job {} after_success must be a retro delta --notify command with --config or --team",
+                "job {} after_success must be retro delta with --config or --team and optional --notify",
                 job.id
             )));
         }

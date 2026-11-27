@@ -173,7 +173,7 @@ fn default_retro_manifest_generation_is_idempotent_and_never_clobbers() {
     );
     assert_eq!(
         generated.jobs[0].after_success.as_deref().unwrap(),
-        ["retro", "delta", "--team", "qsl", "--notify"]
+        ["retro", "delta", "--team", "qsl"]
     );
     assert_eq!(generated.jobs[1].id, "cadence-checker");
     assert_eq!(generated.jobs[1].interval_secs, 300);
@@ -311,7 +311,7 @@ fn cadence_hygiene_job_runs_the_focus_hygiene_argv() {
 
 #[test]
 #[trace("FR-049-AC-7")]
-fn cadence_runs_stored_delta_after_snapshot_without_sending_when_no_defect_exists() {
+fn cadence_runs_non_notifying_delta_after_snapshot() {
     let directory = tempfile::tempdir().unwrap();
     let manifest_path = directory.path().join("cadence.json");
     let ledger_path = directory.path().join("ledger.sqlite3");
@@ -339,7 +339,7 @@ fn cadence_runs_stored_delta_after_snapshot_without_sending_when_no_defect_exist
             "interval_secs": 1800,
             "kind": "retro_snapshot",
             "command": ["retro", "snapshot", "--help"],
-            "after_success": ["retro", "delta", "--config", config_path, "--notify"],
+            "after_success": ["retro", "delta", "--config", config_path],
             "owner_role": "minder"
         }]
     });
@@ -486,7 +486,7 @@ fn generated_cadence_manifest_uses_the_auto_detected_team_sources() {
     );
     assert_eq!(
         manifest.jobs[0].after_success.as_deref().unwrap(),
-        ["retro", "delta", "--team", "QSL", "--notify"]
+        ["retro", "delta", "--team", "QSL"]
     );
     let retro_config = ix_board::retro::RetroConfig::parse(
         Path::new("examples/qsl/retro.json"),

@@ -28,9 +28,14 @@ the matching manifest job, without a shell, and SHALL persist the start time,
 completion time and outcome in the existing fleet ledger whether the command
 succeeds or fails. A snapshot job MAY declare `after_success`.
 
-When declared, `after_success` SHALL be exactly a `retro delta --config <file> --notify`
-or `retro delta --team <team> --notify` argv; cadence SHALL run it with the
-selected manifest path and only after the snapshot exits successfully. A failed
+When declared, `after_success` SHALL be exactly a `retro delta --config <file>`
+or `retro delta --team <team>` argv, optionally followed by `--notify` for
+interactive harness callers. Scheduled jobs SHALL NOT notify: a scheduler has
+no genuine harness identity. The default follow-up SHALL omit `--notify`;
+the minder/program-manager reads stored snapshot defects through `retro delta`
+and job outcomes through `cadence due`. Cadence SHALL run the follow-up only
+after the snapshot exits successfully, passing the selected manifest path
+when notification is explicitly requested. A failed
 follow-up SHALL make the cadence run fail. Supported
 job kinds are `retro_snapshot`, `fleet_tick`, `hygiene` and `host_check`. A
 `host_check` job SHALL use exactly the argv `["host", "check"]` and run on the
@@ -54,7 +59,7 @@ cadence freshness is distinct from check health.
 Existing manifests are preserved. To adopt the new defaults, move an existing
 manifest to an operator-selected backup path, then run `due` again. Set its
 single `alert_recipient` to the owning minder's full relay address before
-enabling notifications. `due --alert --dry-run` exercises the same alert
+using interactive notifications. `due --alert --dry-run` exercises the same alert
 decision and address validation, prints the intended recipient on stderr, and
 does not invoke the relay. `all` is invalid even for dry runs.
 
@@ -77,8 +82,8 @@ manifest is shared configuration and is not stored in the fleet ledger.
 | FR-049-AC-4 | Program/team selection, unknown jobs, duplicate jobs, invalid intervals and malformed manifest fields are handled deterministically before running a job. | Test |
 | FR-049-AC-5 | `--alert` emits an alert only when the configured cadence checker job is overdue. | Test |
 | FR-049-AC-6 | Cadence uses the existing fleet ledger and does not create a scheduler or write state into a repository. | Test |
-| FR-049-AC-7 | A valid snapshot job runs its configured notifying delta only after snapshot success; snapshot failure skips the delta, and a delta failure is recorded as a failed cadence run. Cadence tests cover both failure transitions. Delta tests use hand-written retro records and an injected sender; no test sends a real notification. | Test |
-| FR-049-AC-8 | First `cadence due` without an explicit or environment manifest creates a default 30-minute retro snapshot job for the requested program/team, followed by `retro delta --team <team> --notify`; reruns are byte-for-byte no-ops and existing manifests are never replaced. | Test |
+| FR-049-AC-7 | A valid snapshot job runs its configured delta only after snapshot success; snapshot failure skips the delta, and a delta failure is recorded as a failed cadence run. Non-notifying delta and explicit interactive --notify argv are accepted. Cadence tests cover both failure transitions. Delta tests use hand-written retro records and an injected sender; no test sends a real notification. | Test |
+| FR-049-AC-8 | First `cadence due` without an explicit or environment manifest creates a default 30-minute retro snapshot job for the requested program/team, followed by `retro delta --team <team>` without notifications; reruns are byte-for-byte no-ops and existing manifests are never replaced. | Test |
 | FR-049-AC-9 | A host-check job accepts only `host check`, runs that argv as a child without shell expansion, and records its success or failure in the cadence ledger. | Test |
 | FR-049-AC-10 | Default generation adds a 300-second local host-check heartbeat and a 300-second local hygiene check. Check runs without host flags using local identity; cadence rejects hygiene clean and apply argv. Existing manifests remain unchanged. | Test |
 | FR-049-AC-11 | An alert dry run validates and names one full relay recipient without starting notification transport; broadcast addresses are rejected. | Test |
@@ -95,8 +100,10 @@ existing ix-board setup. Never copy credential values into unit files.
 On draco, the `deploy/launchd/com.agentix.ix-board-cadence-*.plist` examples
 use Peter's `/Users/peter` paths. Copy them to `~/Library/LaunchAgents/` and
 bootstrap each into `gui/<uid>`. There are separate 30-minute snapshot,
-5-minute host-check and hygiene-check jobs, plus a one-minute `due --alert`
-checker. Use `launchctl bootout` / `bootstrap` on one job to demonstrate aging
+5-minute host-check and hygiene-check jobs, plus a one-minute `due`
+checker without `--alert`. All scheduled jobs omit `--notify` and `--alert`;
+`alert_recipient` remains available for interactive harness-run commands only.
+Use `launchctl bootout` / `bootstrap` on one job to demonstrate aging
 without altering ledger timestamps; a job is overdue after two full intervals.
 
 On Linux, copy `deploy/systemd-user/` contents to `~/.config/systemd/user/`.
