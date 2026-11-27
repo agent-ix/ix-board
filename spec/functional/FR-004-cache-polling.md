@@ -135,6 +135,17 @@ ordinary reads adopt the coordinated TTL and explicitly labeled fallback above.
 
 ## Dependencies
 
+Cache recovery (SWM-399): default path selection verifies restricted permissions,
+SQLite writes and the adjacent lock file. Permission/read-only failures select a
+private per-user temporary cache automatically; corruption and lock contention
+remain errors. An explicit override never silently falls back. Ordinary refresh
+lock waits remain bounded to five seconds and identify the lock path and owner PID.
+
+| ID | Criteria | Verification |
+| --- | --- | --- |
+| FR-004-AC-22 | If the default cache or its adjacent lock is inaccessible or read-only, automatic selection opens a writable private per-user temporary cache. An explicit IX_BOARD_CACHE_PATH failure names the path and ownership/permission or override fix. Corrupt databases and contention are reported without silently switching caches. | Test |
+| FR-004-AC-23 | A held refresh lock reports its path and holder PID within five seconds; absent legacy holder metadata is explicitly unknown. Stale metadata cannot prevent acquisition after the OS releases the lock. Bounded reads retain their operation deadline. | Test |
+
 - **Upstream**: [US-001](../usecase/US-001-team-leader-reads.md)
 - **Consumers**: [FR-010](FR-010-explicit-work-scope.md),
   [FR-012](FR-012-focus-status-and-ready-queue.md) and

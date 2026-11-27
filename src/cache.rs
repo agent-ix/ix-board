@@ -547,6 +547,59 @@ pub(crate) fn restrict_permissions(_path: &Path) -> Result<(), Error> {
 mod tests {
     use super::*;
     use crate::{FocusBaseline, FocusBaselineIssue, IssueId, WorkflowStateType};
+    use ix_trace_rs::trace;
+
+    #[test]
+    #[trace("FR-004-AC-22")]
+    fn cache_selection_falls_back_and_preserves_explicit_override_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let blocked = directory.path().join("not-a-directory");
+        std::fs::write(&blocked, b"occupied").unwrap();
+        let preferred = blocked.join("linear.sqlite3");
+        let fallback = directory.path().join("fallback/linear.sqlite3");
+        assert_eq!(select_cache_path(None, &preferred, &fallback).unwrap(), fallback);
+        SnapshotCache::open(&fallback, "test").unwrap();
+        let error = select_cache_path(Some(&preferred), &preferred, &fallback).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains(&preferred.display().to_string()), "{message}");
+        assert!(message.contains("IX_BOARD_CACHE_PATH"), "{message}");
+        assert!(message.contains("writable"), "{message}");
+    }
+
+    #[test]
+    #[trace("FR-004-AC-22")]
+    fn cache_selection_checks_sqlite_writes_and_lock_path_without_replacing_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let preferred = directory.path().join("preferred.sqlite3");
+        let fallback = directory.path().join("fallback.sqlite3");
+        std::fs::write(&preferred, b"not sqlite").unwrap();
+        assert!(select_cache_path(None, &preferred, &fallback).is_err(), "corruption is actionable, never hidden by fallback");
+        std::fs::remove_file(&preferred).unwrap();
+        std::fs::create_dir(refresh_lock_path(&preferred)).unwrap();
+        assert_eq!(select_cache_path(None, &preferred, &fallback).unwrap(), fallback);
+    }
+
+    #[test]
+    #[trace("FR-004-AC-23")]
+    fn refresh_lock_records_current_pid_and_names_holder_on_timeout() {
+        use std::io::Write;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache.sqlite3");
+        let lock = RefreshLock::acquire(&path, None).unwrap();
+        let metadata = std::fs::read_to_string(refresh_lock_path(&path)).unwrap();
+        assert!(metadata.contains(&format!("pid={}", std::process::id())), "{metadata}");
+        let started = Instant::now();
+        let error = RefreshLock::acquire(&path, None).err().expect("held lock times out");
+        assert!(started.elapsed() < Duration::from_secs(6));
+        let message = error.to_string();
+        assert!(message.contains(&format!("pid={}", std::process::id())), "{message}");
+        assert!(message.contains(&refresh_lock_path(&path).display().to_string()), "{message}");
+        drop(lock);
+        let mut stale = std::fs::OpenOptions::new().write(true).truncate(true).open(refresh_lock_path(&path)).unwrap();
+        stale.write_all(b"pid=999999\n").unwrap();
+        let _recovered = RefreshLock::acquire(&path, None).unwrap();
+        assert!(!std::fs::read_to_string(refresh_lock_path(&path)).unwrap().contains("999999"));
+    }
 
     #[cfg(unix)]
     #[test]

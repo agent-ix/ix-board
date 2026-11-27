@@ -1130,6 +1130,43 @@ mod tests {
     use super::*;
     use ix_trace_rs::trace;
 
+    #[test]
+    #[trace("FR-048-AC-11")]
+    fn target_discovery_reaches_three_levels_without_backups_symlinks_or_mount_crossings() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        for name in ["direct", "group/nested", "too/deep/worktree", "dev_bak/saved", "mounted/wt"] {
+            let worktree = root.join(name);
+            std::fs::create_dir_all(worktree.join("target")).unwrap();
+            std::fs::write(worktree.join(".git"), b"gitdir: fixture").unwrap();
+        }
+        std::fs::create_dir_all(root.join("source/target")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("direct"), root.join("linked")).unwrap();
+        let mounts = vec![
+            MountEntry { source: "root".into(), mount_point: root.clone(), fs_type: "fixture".into() },
+            MountEntry { source: "other".into(), mount_point: root.join("mounted"), fs_type: "fixture".into() },
+        ];
+        let found = discover_targets(&root, &mounts).unwrap();
+        assert_eq!(found, vec![(root.join("direct/target"), root.join("direct")), (root.join("group/nested/target"), root.join("group/nested"))]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[trace("FR-048-AC-12")]
+    fn unprivileged_process_cwd_evidence_is_complete_only_for_reconciled_live_owner_processes() {
+        let commands = b"123 cargo\n124 editor\n";
+        let environments = BTreeMap::from([(123, b"CARGO_TARGET_DIR=/work/active/target\0".to_vec())]);
+        let table = parse_native_process_output(b"p123\nfcwd\nn/work/active\np124\nfcwd\nn/elsewhere\np999\nfcwd\nn/vanished\n", commands, &environments, true);
+        assert!(table.complete);
+        assert_eq!(target_use(Path::new("/work/active/target"), &table), UseState::InUse);
+        assert_eq!(target_use(Path::new("/work/idle/target"), &table), UseState::Unused);
+        let missing = parse_native_process_output(b"p123\nfcwd\nn/work/active\n", commands, &environments, true);
+        assert!(!missing.complete, "missing live owner cwd never authorizes cleanup");
+        let failed = parse_native_process_output(b"p123\nfcwd\nn/work/active\n", b"123 cargo\n", &environments, false);
+        assert!(!failed.complete);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     #[trace("FR-048-AC-3", "FR-050-AC-4")]
