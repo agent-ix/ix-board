@@ -1699,6 +1699,18 @@ mod independent_review_fixes {
 
     #[test]
     #[trace("FR-051-AC-1", "FR-051-AC-5")]
+    fn review_duplicate_identity_is_quarantined_even_when_one_record_is_type_invalid() {
+        let input = r#"{"schema_version":1,"host":"draco","observed_at_ms":100000000,"requests":[{"request_id":"same","enqueued_at_ms":"bad"},{"request_id":"same","class":"point","state":"succeeded","enqueued_at_ms":99990000,"ended_at_ms":99999000,"exit_code":0},{"request_id":"healthy","class":"point","state":"succeeded","enqueued_at_ms":99990000,"ended_at_ms":99999000,"exit_code":0}],"events":[{"request_id":"same","observed_at_ms":99999000,"class":"point","state":"succeeded","enqueued_at_ms":99990000,"ended_at_ms":99999000,"exit_code":0}]}"#;
+        let report = from_status(input, "draco", 100_000_000);
+        assert_eq!(report.reason, None);
+        assert_eq!(report.invalid_requests, 2);
+        let hour = report.last_1h.unwrap();
+        assert_eq!(hour.requests, 1);
+        assert_eq!(hour.completed, 1);
+    }
+
+    #[test]
+    #[trace("FR-051-AC-1", "FR-051-AC-5")]
     fn review_type_invalid_records_cannot_discard_healthy_requests_or_leak_labels() {
         let input = r#"{"schema_version":2,"host":"draco","observed_at_ms":100000000,"requests":[{"request_id":"good","class":"point","state":"succeeded","enqueued_at_ms":99990000,"ended_at_ms":99999000,"exit_code":0},{"request_id":"bad-type","class":"point","state":"running","enqueued_at_ms":"private-invalid-time"},{"request_id":"future-code","class":"point","state":"failed","enqueued_at_ms":99990000,"ended_at_ms":99999000,"code":"LB_PRIVATE_FUTURE"}],"events":[{"request_id":"bad-type","observed_at_ms":99998000,"class":"point","state":"succeeded","enqueued_at_ms":99990000,"ended_at_ms":99998000,"exit_code":0},{"request_id":"broken-event","observed_at_ms":"private-event-time"}],"metrics":{"ix_build_terminations_total":[{"host":"draco","class":"point","code":"LB_PRIVATE_FUTURE","value":1}]}}"#;
         let report = from_status(input, "draco", 100_000_000);
