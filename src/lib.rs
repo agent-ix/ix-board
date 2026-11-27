@@ -156,7 +156,7 @@ pub enum Error {
     RefreshLockTimeout,
     /// The refresh lock wait expired, with diagnostic owner metadata.
     #[error(
-        "Linear refresh lock timed out after 5s at {path}; holder {holder}; wait for that process or check its status; do not delete a held lock file"
+        "Linear refresh lock timed out after 5s at {path}; recorded holder {holder}; wait for that process or check its status; do not delete a held lock file"
     )]
     RefreshLockHeld {
         /// Adjacent operating-system lock file.

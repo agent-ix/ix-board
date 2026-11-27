@@ -88,9 +88,10 @@ An explicit override failure names the path and asks you to fix permissions or
 choose another writable path. Parent directories are created automatically.
 Corruption and SQLite contention remain errors.
 
-Refresh waits last at most five seconds. Timeouts name the lock path and holder
-process ID (PID); legacy holders may be unknown. Check that process or wait for it.
-Keep the file: locks release when owners exit, and later owners replace stale metadata.
+Lock contention immediately reports the holder process ID (PID), age and path on stderr.
+Waits end within five seconds. Released dead-holder locks are detected and reclaimed.
+Legacy metadata uses file modification age; missing holder IDs appear as unknown.
+Keep the file: bypassing a held OS lock could allow parallel refreshes.
 
 ## macOS Keychain prompts
 

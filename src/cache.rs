@@ -465,10 +465,89 @@ pub(crate) struct RefreshLock {
     _file: std::fs::File,
 }
 
+#[derive(Clone, Copy, Default)]
+struct LockOwner {
+    pid: Option<u32>,
+    acquired_at_ms: Option<u64>,
+}
+
+impl LockOwner {
+    fn diagnostic(self) -> String {
+        let pid = self
+            .pid
+            .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string());
+        let age = unix_millis()
+            .zip(self.acquired_at_ms)
+            .and_then(|(now, acquired)| now.checked_sub(acquired))
+            .map_or_else(|| "unknown".to_owned(), |age| format!("{}s", age / 1000));
+        format!("pid={pid} age={age}")
+    }
+
+    fn is_dead(self) -> bool {
+        #[cfg(unix)]
+        {
+            self.pid
+                .and_then(|pid| i32::try_from(pid).ok())
+                .and_then(rustix::process::Pid::from_raw)
+                .is_some_and(|pid| {
+                    rustix::process::test_kill_process(pid) == Err(rustix::io::Errno::SRCH)
+                })
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+}
+
+fn unix_millis() -> Option<u64> {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis(),
+    )
+    .ok()
+}
+
+fn read_lock_owner(file: &mut std::fs::File) -> LockOwner {
+    use std::io::{Read, Seek};
+    let mut bytes = Vec::new();
+    if file.rewind().is_err() || (&mut *file).take(512).read_to_end(&mut bytes).is_err() {
+        return LockOwner::default();
+    }
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return LockOwner::default();
+    };
+    let mut owner = LockOwner::default();
+    for line in text.lines().filter(|line| !line.is_empty()) {
+        match line.split_once('=') {
+            Some(("pid", value)) if owner.pid.is_none() => {
+                owner.pid = value.parse().ok().filter(|pid| *pid > 0)
+            }
+            Some(("acquired_at_ms", value)) if owner.acquired_at_ms.is_none() => {
+                owner.acquired_at_ms = value.parse().ok()
+            }
+            _ => return LockOwner::default(),
+        }
+    }
+    // Legacy writers recorded only a PID. Their file's modification time is
+    // the best available age evidence; the OS lock remains authoritative.
+    if owner.acquired_at_ms.is_none() {
+        owner.acquired_at_ms = file
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|age| u64::try_from(age.as_millis()).ok());
+    }
+    owner
+}
+
 impl RefreshLock {
     #[implements("FR-004-AC-20", "FR-004-AC-23")]
     pub(crate) fn acquire(path: &Path, deadline: Option<&Deadline<'_>>) -> Result<Self, Error> {
-        use std::io::{Read, Seek, Write};
+        use std::io::{Seek, Write};
         let lock_path = refresh_lock_path(path);
         restrict_permissions(&lock_path).map_err(|error| Error::CachePathUnavailable {
             path: lock_path.clone(),
@@ -482,15 +561,29 @@ impl RefreshLock {
             .open(&lock_path)
             .map_err(Error::CachePermissions)?;
         let started = Instant::now();
+        let mut announced = false;
         loop {
             if let Some(deadline) = deadline {
                 deadline.remaining()?;
             }
             match file.try_lock() {
                 Ok(()) => {
+                    let previous = read_lock_owner(&mut file);
+                    if previous.is_dead() {
+                        let _ = writeln!(
+                            std::io::stderr().lock(),
+                            "ix-board: recovered Linear refresh lock at {}; dead holder {}; caller may proceed",
+                            lock_path.display(),
+                            previous.diagnostic()
+                        );
+                    }
+                    file.rewind().map_err(Error::CachePermissions)?;
                     file.set_len(0).map_err(Error::CachePermissions)?;
                     writeln!(file, "pid={}", std::process::id())
                         .map_err(Error::CachePermissions)?;
+                    if let Some(now) = unix_millis() {
+                        writeln!(file, "acquired_at_ms={now}").map_err(Error::CachePermissions)?;
+                    }
                     file.flush().map_err(Error::CachePermissions)?;
                     return Ok(Self { _file: file });
                 }
@@ -501,21 +594,7 @@ impl RefreshLock {
             }
             let left = LEGACY_BUSY_TIMEOUT.saturating_sub(started.elapsed());
             if left.is_zero() {
-                let mut metadata = Vec::new();
-                file.rewind().map_err(Error::CachePermissions)?;
-                (&file)
-                    .take(128)
-                    .read_to_end(&mut metadata)
-                    .map_err(Error::CachePermissions)?;
-                let metadata = String::from_utf8_lossy(&metadata);
-                let holder = metadata
-                    .trim()
-                    .strip_prefix("pid=")
-                    .and_then(|pid| pid.parse::<u32>().ok())
-                    .map_or_else(
-                        || "unknown (legacy or unavailable metadata)".to_owned(),
-                        |pid| format!("pid={pid}"),
-                    );
+                let holder = read_lock_owner(&mut file).diagnostic();
                 return Err(Error::RefreshLockHeld {
                     path: lock_path,
                     holder,
@@ -525,6 +604,17 @@ impl RefreshLock {
                 Some(deadline) => left.min(deadline.remaining()?),
                 None => left,
             };
+            if !announced {
+                let holder = read_lock_owner(&mut file).diagnostic();
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "ix-board: waiting for Linear refresh lock at {}; recorded holder {}; wait limited to {}ms; caller has not completed",
+                    lock_path.display(),
+                    holder,
+                    wait.as_millis()
+                );
+                announced = true;
+            }
             std::thread::sleep(wait.min(Duration::from_millis(10)));
         }
     }
@@ -682,6 +772,39 @@ mod tests {
     use super::*;
     use crate::{FocusBaseline, FocusBaselineIssue, IssueId, WorkflowStateType};
     use ix_trace_rs::trace;
+
+    #[cfg(unix)]
+    #[test]
+    #[trace("FR-004-AC-19", "FR-004-AC-24")]
+    fn dead_pid_metadata_never_bypasses_a_still_held_os_lock() {
+        use std::os::unix::fs::MetadataExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache.sqlite3");
+        let lock_path = refresh_lock_path(&path);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&lock_path)
+            .unwrap();
+        file.lock().unwrap();
+        let mut dead = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = dead.id();
+        assert!(dead.wait().unwrap().success());
+        std::fs::write(&lock_path, format!("pid={dead_pid}\nacquired_at_ms=1\n")).unwrap();
+        let inode = file.metadata().unwrap().ino();
+        let clock = SystemClock;
+        let deadline = Deadline::start(&clock, Duration::from_millis(25));
+        assert!(matches!(
+            RefreshLock::acquire(&path, Some(&deadline)),
+            Err(Error::ReadTimeout { .. })
+        ));
+        assert_eq!(std::fs::metadata(&lock_path).unwrap().ino(), inode);
+        let contender = std::fs::File::open(lock_path).unwrap();
+        assert!(matches!(
+            contender.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+    }
 
     #[test]
     #[trace("FR-004-AC-22")]

@@ -504,10 +504,12 @@ fn native_process_table() -> io::Result<ProcessTable> {
         .map(u32::to_string)
         .collect::<Vec<_>>()
         .join(",");
-    let arguments = Command::new("ps")
-        .args(["-ww", "-p", &pids, "-o", "pid=,args="])
-        .output()?;
-    let arguments_by_pid = process_arguments(&arguments.stdout, &sampled)?;
+    let arguments_by_pid = read_process_arguments(&sampled, |pid| {
+        let output = Command::new("ps")
+            .args(["-ww", "-p", &pid.to_string(), "-o", "args="])
+            .output()?;
+        Ok(output.status.success().then_some(output.stdout))
+    })?;
     let output = Command::new("lsof")
         .args(["-nP", "-Ffpn", "-a", "-u", &uid.to_string(), "-p", &pids])
         .output()?;
@@ -516,28 +518,18 @@ fn native_process_table() -> io::Result<ProcessTable> {
         .args(["-p", &pids, "-o", "pid=,uid=,stat="])
         .output()?;
     let live = owner_process_ids(&remaining.stdout, uid)?;
-    let mut commands = String::new();
-    for pid in live {
-        use std::fmt::Write;
-        let command = arguments_by_pid
-            .get(&pid)
-            .ok_or_else(|| io::Error::other("ps command missing for a live sampled process"))?;
-        writeln!(commands, "{pid} {}", command.replace('\n', " ")).map_err(io::Error::other)?;
-    }
+    let commands = live
+        .into_iter()
+        .map(|pid| (pid, arguments_by_pid.get(&pid).cloned().unwrap_or_default()))
+        .collect::<BTreeMap<_, _>>();
     let mut environments = BTreeMap::new();
-    for line in commands.lines() {
-        let Some((pid, command)) = line.trim().split_once(char::is_whitespace) else {
-            continue;
-        };
-        let Ok(pid) = pid.trim().parse::<u32>() else {
-            continue;
-        };
-        if is_build_command(command.trim().as_bytes()) {
+    for (pid, command) in &commands {
+        if is_build_command(command) {
             #[cfg(target_os = "linux")]
             if let Ok(environment) = std::fs::read(format!("/proc/{pid}/environ"))
                 && environment.len() <= 1_048_576
             {
-                environments.insert(pid, environment);
+                environments.insert(*pid, environment);
             }
             #[cfg(target_os = "macos")]
             match Command::new("ps")
@@ -545,7 +537,7 @@ fn native_process_table() -> io::Result<ProcessTable> {
                 .output()
             {
                 Ok(output) if output.status.success() && output.stdout.len() <= 1_048_576 => {
-                    environments.insert(pid, output.stdout);
+                    environments.insert(*pid, output.stdout);
                 }
                 _ => {}
             }
@@ -553,10 +545,9 @@ fn native_process_table() -> io::Result<ProcessTable> {
     }
     Ok(parse_native_process_output(
         &output.stdout,
-        commands.as_bytes(),
+        &commands,
         &environments,
-        arguments.status.success()
-            && remaining.status.success()
+        remaining.status.success()
             && matches!(output.status.code(), Some(0 | 1))
             && output.stderr.is_empty(),
     ))
@@ -593,38 +584,30 @@ fn owner_process_ids(output: &[u8], uid: u32) -> io::Result<Vec<u32>> {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[implements("FR-048-AC-12")]
-fn process_arguments(output: &[u8], sampled: &[u32]) -> io::Result<BTreeMap<u32, String>> {
-    if output.len() > 64 * 1024 * 1024 {
-        return Err(io::Error::other("ps arguments exceed 64 MiB"));
-    }
-    let text =
-        std::str::from_utf8(output).map_err(|_| io::Error::other("ps arguments are not UTF-8"))?;
-    let sampled = sampled
-        .iter()
-        .copied()
-        .collect::<std::collections::BTreeSet<_>>();
+fn read_process_arguments(
+    sampled: &[u32],
+    mut read: impl FnMut(u32) -> io::Result<Option<Vec<u8>>>,
+) -> io::Result<BTreeMap<u32, Vec<u8>>> {
     let mut commands = BTreeMap::new();
-    let mut current = None;
-    for line in text.lines() {
-        let header = line
-            .trim_start()
-            .split_once(char::is_whitespace)
-            .and_then(|(pid, command)| Some((pid.parse::<u32>().ok()?, command.trim_start())))
-            .filter(|(pid, _)| sampled.contains(pid));
-        if let Some((pid, command)) = header {
-            if commands.insert(pid, command.to_owned()).is_some() {
-                return Err(io::Error::other("duplicate ps argument record"));
+    let mut bytes = 0_usize;
+    for pid in sampled {
+        if let Some(mut command) = read(*pid)? {
+            if command.len() > 1_048_576 {
+                return Err(io::Error::other("process arguments exceed 1 MiB"));
             }
-            current = Some(pid);
-        } else if let Some(command) = current.and_then(|pid| commands.get_mut(&pid)) {
-            command.push('\n');
-            command.push_str(line);
-        } else if !line.trim().is_empty() {
-            return Err(io::Error::other("ps arguments lack a sampled PID record"));
+            bytes = bytes.saturating_add(command.len());
+            if bytes > 64 * 1024 * 1024 {
+                return Err(io::Error::other("process arguments exceed 64 MiB"));
+            }
+            if command.last() == Some(&b'\n') {
+                command.pop();
+            }
+            commands.insert(*pid, command);
         }
     }
     Ok(commands)
 }
+
 /// Identifies Cargo and rustc from native text or NUL-separated command lines.
 #[implements("FR-048-AC-4")]
 #[implements("FR-048-AC-3")]
@@ -644,7 +627,7 @@ pub fn is_build_command(command: &[u8]) -> bool {
 #[implements("FR-048-AC-2", "FR-048-AC-12")]
 fn parse_native_process_output(
     lsof_output: &[u8],
-    process_names: &[u8],
+    commands: &BTreeMap<u32, Vec<u8>>,
     environments: &BTreeMap<u32, Vec<u8>>,
     sources_complete: bool,
 ) -> ProcessTable {
@@ -655,24 +638,6 @@ fn parse_native_process_output(
         processes: Vec::new(),
         complete: sources_complete,
     };
-    let commands = String::from_utf8_lossy(process_names)
-        .lines()
-        .filter_map(|line| {
-            let (pid, command) = line.trim().split_once(char::is_whitespace)?;
-            Some((
-                pid.trim().parse::<u32>().ok()?,
-                command.trim().as_bytes().to_vec(),
-            ))
-        })
-        .collect::<BTreeMap<_, _>>();
-    if commands.len()
-        != String::from_utf8_lossy(process_names)
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .count()
-    {
-        table.complete = false;
-    }
     let mut current: Option<ProcessEvidence> = None;
     let mut current_descriptor: Option<String> = None;
     for line in String::from_utf8_lossy(lsof_output).lines() {
@@ -1235,17 +1200,40 @@ mod tests {
         assert_eq!(pids, [13]);
         assert!(owner_process_ids(b"invalid row", 501).is_err());
         assert!(owner_process_ids(b"12 501 S\n13 invalid S\n", 501).is_err());
-        let args = process_arguments(
-            b"13 zsh -c echo\n501 numeric continuation\nprintf hello\n16 cargo build\n",
-            &[13, 16],
-        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[trace("FR-048-AC-12")]
+    fn per_pid_argument_reads_preserve_matching_pid_continuations_as_payload() {
+        let mut read_ids = Vec::new();
+        let commands = read_process_arguments(&[13, 16, 20], |pid| {
+            read_ids.push(pid);
+            Ok(match pid {
+                13 => Some(
+                    b"zsh -c echo\n13 numeric continuation\n16 cargo-looking continuation\n"
+                        .to_vec(),
+                ),
+                16 => Some(b"cargo build\n".to_vec()),
+                _ => None,
+            })
+        })
         .unwrap();
+        assert_eq!(read_ids, [13, 16, 20]);
         assert_eq!(
-            args[&13],
-            "zsh -c echo\n501 numeric continuation\nprintf hello"
+            commands[&13],
+            b"zsh -c echo\n13 numeric continuation\n16 cargo-looking continuation"
         );
-        assert_eq!(args[&16], "cargo build");
-        assert!(process_arguments(b"13 editor\n13 repeated\n", &[13]).is_err());
+        assert_eq!(commands[&16], b"cargo build");
+        assert!(!commands.contains_key(&20));
+        let table = parse_native_process_output(
+            b"p13\nfcwd\nn/elsewhere\np16\nfcwd\nn/elsewhere\n",
+            &commands,
+            &BTreeMap::from([(16, Vec::new())]),
+            true,
+        );
+        assert!(table.complete);
+        assert_eq!(table.processes[0].cmdline, commands[&13]);
     }
 
     #[test]
@@ -1294,12 +1282,12 @@ mod tests {
     #[test]
     #[trace("FR-048-AC-12")]
     fn unprivileged_process_cwd_evidence_is_complete_only_for_reconciled_live_owner_processes() {
-        let commands = b"123 cargo\n124 editor\n";
+        let commands = BTreeMap::from([(123, b"cargo".to_vec()), (124, b"editor".to_vec())]);
         let environments =
             BTreeMap::from([(123, b"CARGO_TARGET_DIR=/work/active/target\0".to_vec())]);
         let table = parse_native_process_output(
             b"p123\nfcwd\nn/work/active\np124\nfcwd\nn/elsewhere\np999\nfcwd\nn/vanished\n",
-            commands,
+            &commands,
             &environments,
             true,
         );
@@ -1314,7 +1302,7 @@ mod tests {
         );
         let missing = parse_native_process_output(
             b"p123\nfcwd\nn/work/active\n",
-            commands,
+            &commands,
             &environments,
             true,
         );
@@ -1324,21 +1312,21 @@ mod tests {
         );
         let failed = parse_native_process_output(
             b"p123\nfcwd\nn/work/active\n",
-            b"123 cargo\n",
+            &BTreeMap::from([(123, b"cargo".to_vec())]),
             &environments,
             false,
         );
         assert!(!failed.complete);
         let missing_environment = parse_native_process_output(
             b"p123\nfcwd\nn/work/active\n",
-            b"123 cargo\n",
+            &BTreeMap::from([(123, b"cargo".to_vec())]),
             &BTreeMap::new(),
             true,
         );
         assert!(!missing_environment.complete);
         let malformed_inventory = parse_native_process_output(
             b"p123\nfcwd\nn/work/active\n",
-            b"123 cargo\ninvalid\n",
+            &BTreeMap::from([(123, Vec::new())]),
             &environments,
             true,
         );
@@ -1489,7 +1477,7 @@ mod tests {
         ]);
         let table = parse_native_process_output(
             b"p123\nfcwd\nn/Users/peter/dev/worktrees/active\nftxt\nn/usr/bin/cargo\np124\nfcwd\nn/Users/peter/other\nf0\nn/dev/null\n",
-            b"123 cargo\n124 cargo\n",
+            &BTreeMap::from([(123, b"cargo".to_vec()), (124, b"cargo".to_vec())]),
             &environments,
             true,
         );
@@ -2263,7 +2251,13 @@ mod tests {
     #[trace("FR-048-AC-3", "FR-048-AC-5")]
     fn incomplete_macos_process_visibility_never_authorizes_cleanup() {
         assert!(
-            !parse_native_process_output(b"", b"123 editor\n", &BTreeMap::new(), true).complete
+            !parse_native_process_output(
+                b"",
+                &BTreeMap::from([(123, b"editor".to_vec())]),
+                &BTreeMap::new(),
+                true
+            )
+            .complete
         );
         let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(10_000);
         let decision = clean_decision(
@@ -2277,8 +2271,13 @@ mod tests {
             },
             &ProcessTable {
                 processes: Vec::new(),
-                complete: parse_native_process_output(b"", b"123 editor\n", &BTreeMap::new(), true)
-                    .complete,
+                complete: parse_native_process_output(
+                    b"",
+                    &BTreeMap::from([(123, b"editor".to_vec())]),
+                    &BTreeMap::new(),
+                    true,
+                )
+                .complete,
             },
         );
         assert_eq!(decision.reason, "process_evidence_incomplete");
