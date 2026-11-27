@@ -439,6 +439,7 @@ pub fn parse_mount_table(text: &str) -> io::Result<Vec<MountEntry>> {
     Ok(entries)
 }
 
+#[implements("FR-048-AC-10")]
 fn unescape_mount_field(field: &str) -> String {
     field
         .replace("\\040", " ")
@@ -805,7 +806,7 @@ pub fn canonicalize_worktree_root(root: &Path) -> io::Result<PathBuf> {
 
 /// Discovers targets at depth at most three, retaining the containing Git checkout.
 /// Symlinks, backups and unexpected filesystems are never traversed.
-#[implements("FR-048-AC-11")]
+#[implements("FR-048-AC-11", "FR-048-AC-13")]
 pub fn discover_targets(root: &Path, mounts: &[MountEntry]) -> io::Result<Vec<(PathBuf, PathBuf)>> {
     let mut pending = vec![(root.to_owned(), 0_u8, None::<PathBuf>)];
     let mut targets = Vec::new();
