@@ -71,6 +71,7 @@ use locked-build lease evidence instead of identifying a shell wrapper by its na
 | FR-048-AC-10 | An injected mount table proves hygiene ignores worktrees on an unexpected filesystem and refuses to scan or clean a target containing a nested mount point; unreadable mount evidence prevents cleanup. | Test |
 | FR-048-AC-11 | Target discovery includes worktree targets at depths one through three under the configured root, deterministically, without following symlinks, traversing backups, or crossing filesystem boundaries; directories without a containing worktree are excluded. | Test |
 | FR-048-AC-12 | Unprivileged lsof and ps reconcile cwd evidence for the invoking user's live processes on macOS and Linux. A missing live process cwd, failed inventory, or missing build environment leaves evidence incomplete; exited processes do not. Cleanup is restricted to worktrees owned by that user, preserves live references, and rechecks process evidence and the configured idle age (default one hour) before applying. | Test |
+| FR-048-AC-13 | Both --root and hygiene.worktree_root accept any directory name, including a flat clone layout. Targets directly below Git clones or worktrees are discovered through depth three under that root, including grouped checkouts; source subtrees and targets beyond the depth limit are preserved. | Test |
 
 ## Traceability
 
