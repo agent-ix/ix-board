@@ -1621,6 +1621,7 @@ fn run_fleet_saturation(
 
 // The live reader covers registry hosts plus explicit hosts. Pass that same
 // observed population to the writer, including hosts with unavailable leases.
+#[implements("FR-041-AC-7")]
 fn saturation_writer_config<'a>(
     config: &ix_board::fleet::FleetConfig,
     observed_hosts: impl Iterator<Item = &'a str>,
