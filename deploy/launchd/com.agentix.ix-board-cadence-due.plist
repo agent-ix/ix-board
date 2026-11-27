@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+<plist version="1.0"><dict>
+<key>Label</key><string>com.agentix.ix-board-cadence-due</string>
+<key>ProgramArguments</key><array>
+<string>/Users/peter/.local/bin/ix-board</string>
+<string>cadence</string>
+<string>due</string>
+<string>--program</string>
+<string>QSL</string>
+<string>--team</string>
+<string>qsl</string>
+</array>
+<key>EnvironmentVariables</key><dict>
+<key>PATH</key><string>/Users/peter/.local/bin:/Users/peter/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+<key>IX_BOARD_HOST</key><string>draco</string>
+</dict>
+<key>StartInterval</key><integer>60</integer>
+<key>RunAtLoad</key><true/>
+<key>StandardOutPath</key><string>/Users/peter/Library/Logs/ix-board-cadence-due.log</string>
+<key>StandardErrorPath</key><string>/Users/peter/Library/Logs/ix-board-cadence-due.err.log</string>
+</dict></plist>

@@ -224,9 +224,9 @@ enum HostCommand {
 
 #[derive(clap::Args, Debug)]
 struct HygieneArgs {
-    /// Host label.
+    /// Host label; defaults to the local host identity.
     #[arg(long)]
-    host: String,
+    host: Option<String>,
     /// Worktree root on this host.
     #[arg(long)]
     root: Option<PathBuf>,
@@ -312,6 +312,9 @@ enum CadenceCommand {
         /// Emit an alert when the cadence checker job is overdue.
         #[arg(long)]
         alert: bool,
+        /// Describe an alert's single recipient without sending a notification.
+        #[arg(long, requires = "alert")]
+        dry_run: bool,
         /// Override the configured cadence manifest.
         #[arg(long)]
         manifest: Option<PathBuf>,
@@ -3384,6 +3387,7 @@ fn run_auth(command: AuthCommand) -> Result<Output, Error> {
 #[implements("FR-049-AC-5")]
 #[implements("FR-049-AC-8")]
 #[implements("FR-049-AC-9")]
+#[implements("FR-049-AC-8", "FR-049-AC-11")]
 fn run_cadence(command: CadenceCommand) -> Result<Output, Error> {
     let manifest_override = match &command {
         CadenceCommand::Due { manifest, .. } | CadenceCommand::Run { manifest, .. } => {
@@ -3409,6 +3413,7 @@ fn run_cadence(command: CadenceCommand) -> Result<Output, Error> {
             program,
             team,
             alert,
+            dry_run,
             ..
         } => {
             let ledger = ix_board::cadence::open_ledger(settings.as_ref())
@@ -3425,7 +3430,14 @@ fn run_cadence(command: CadenceCommand) -> Result<Output, Error> {
             ix_board::cadence::notify_if_alert(
                 &report,
                 manifest.alert_recipient.as_deref(),
-                send_relay_message,
+                |recipient, message| {
+                    if dry_run {
+                        eprintln!("dry-run: cadence alert to {recipient}; no notification sent");
+                        Ok(())
+                    } else {
+                        send_relay_message(recipient, message)
+                    }
+                },
             )
             .map_err(|error| Error::Cadence(error.to_string()))?;
             Ok(Output::CadenceDue(report))
@@ -3674,7 +3686,13 @@ fn run_drift(
     Ok(Output::Drift(evaluate_drift_file(&config, &evidence)?))
 }
 
-#[implements("FR-048-AC-1", "FR-048-AC-4", "FR-048-AC-5", "FR-048-AC-10")]
+#[implements(
+    "FR-048-AC-1",
+    "FR-048-AC-4",
+    "FR-048-AC-5",
+    "FR-048-AC-10",
+    "FR-049-AC-10"
+)]
 fn run_hygiene(
     args: &HygieneArgs,
     apply: bool,
@@ -3687,9 +3705,18 @@ fn run_hygiene(
     };
     use std::time::{Duration, SystemTime};
 
+    let host = args
+        .host
+        .clone()
+        .or_else(resolve_host_label)
+        .ok_or_else(|| Error::ProgramReview {
+            message: "local host identity unavailable; configure IX_BOARD_HOST or pass --host"
+                .to_owned(),
+        })?;
+
     if cfg!(target_os = "windows") {
         return Ok(HygieneReport {
-            host: args.host.clone(),
+            host: host.clone(),
             free_bytes: None,
             free_floor_bytes: 0,
             targets: Vec::new(),
@@ -3712,10 +3739,10 @@ fn run_hygiene(
         canonicalize_worktree_root(&configured_root).map_err(|error| Error::ProgramReview {
             message: format!("cannot canonicalize worktree root: {error}"),
         })?;
-    let host_policy = config.hosts.get(&args.host.to_lowercase());
+    let host_policy = config.hosts.get(&host.to_lowercase());
     let floor_gb = args.free_floor_gb.or_else(|| host_policy.and_then(|policy| policy.free_floor_gb)).or(config.default_free_floor_gb)
         .ok_or_else(|| Error::ProgramReview {
-            message: format!("no free-space floor configured for host {:?}; set hygiene.hosts.{}.free_floor_gb or pass --free-floor-gb", args.host, args.host),
+            message: format!("no free-space floor configured for host {host:?}; set hygiene.hosts.{host}.free_floor_gb or pass --free-floor-gb"),
         })?;
     let idle_minutes =
         args.idle_minutes
@@ -3866,7 +3893,7 @@ fn run_hygiene(
     }
     targets.sort_by(|left: &CleanDecision, right| left.target.cmp(&right.target));
     Ok(HygieneReport {
-        host: args.host.clone(),
+        host,
         free_bytes,
         free_floor_bytes: floor,
         targets,
@@ -3891,7 +3918,7 @@ fn run_host_check() -> ix_board::host_check::HostCheckReport {
 
     let settings = ix_board::settings_value().ok().flatten();
     let hygiene = HygieneConfig::from_settings(settings.as_ref()).ok();
-    let host = resolve_host_label(hygiene.as_ref());
+    let host = resolve_host_label();
     let host_name = host.clone().unwrap_or_else(|| "unknown".to_owned());
     let path = std::env::var_os("PATH").unwrap_or_default();
 
@@ -4030,9 +4057,8 @@ fn linear_credential_error_state(error: &ix_board::Error) -> ix_board::host_chec
     }
 }
 
-#[implements("FR-050-AC-1")]
-fn resolve_host_label(config: Option<&ix_board::host_hygiene::HygieneConfig>) -> Option<String> {
-    let configured = config.map(|config| &config.hosts);
+#[implements("FR-050-AC-1", "FR-049-AC-10")]
+fn resolve_host_label() -> Option<String> {
     let candidates = [
         std::env::var("IX_BOARD_HOST").ok(),
         std::env::var("HERDR_SERVER").ok(),
@@ -4060,14 +4086,7 @@ fn resolve_host_label(config: Option<&ix_board::host_hygiene::HygieneConfig>) ->
         if normalized.is_empty() {
             return None;
         }
-        configured
-            .and_then(|hosts| {
-                hosts
-                    .keys()
-                    .find(|host| host.eq_ignore_ascii_case(&normalized))
-            })
-            .cloned()
-            .or_else(|| configured.is_none().then_some(normalized))
+        Some(normalized)
     })
 }
 

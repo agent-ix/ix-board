@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+[Unit]
+Description=ix-board local cadence job %i
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+Environment=IX_BOARD_HOST=%H
+ExecStart=%h/.local/bin/ix-board cadence run %i
+

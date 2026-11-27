@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+[Unit]
+Description=Check the QSL cadence ledger every minute
+
+[Timer]
+OnStartupSec=60s
+OnUnitInactiveSec=60s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
+

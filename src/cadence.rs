@@ -65,7 +65,7 @@ pub struct Job {
     pub kind: JobKind,
     /// Arguments passed to this ix-board executable, without shell expansion.
     pub command: Vec<String>,
-    /// Optional configured `retro delta --notify` command run only after success.
+    /// Optional configured `retro delta` command run only after success.
     #[serde(default)]
     pub after_success: Option<Vec<String>>,
     /// Role responsible for this job.
@@ -90,7 +90,7 @@ pub enum JobKind {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
-    /// Single relay address notified when `cadence due --alert` finds the checker needs attention.
+    /// Single relay address used by explicitly requested interactive notifications.
     #[serde(default)]
     pub alert_recipient: Option<String>,
     /// Jobs in the manifest.
@@ -239,8 +239,8 @@ pub fn load_manifest(path: &Path) -> Result<Manifest, CadenceError> {
     Ok(manifest)
 }
 
-/// Creates the default team retro job once, without replacing an existing manifest.
-#[implements("FR-049-AC-4")]
+/// Creates the local team jobs once, without replacing an existing manifest.
+#[implements("FR-049-AC-4", "FR-049-AC-8", "FR-049-AC-10")]
 pub fn generate_default_manifest(
     path: &Path,
     program: &str,
@@ -248,27 +248,48 @@ pub fn generate_default_manifest(
 ) -> Result<Manifest, CadenceError> {
     let manifest = Manifest {
         alert_recipient: None,
-        jobs: vec![Job {
-            program: program.to_owned(),
-            team: team.to_owned(),
-            id: format!("retro-{}", team.to_ascii_lowercase()),
-            interval_secs: 30 * 60,
-            kind: JobKind::RetroSnapshot,
-            command: vec![
-                "retro".into(),
-                "snapshot".into(),
-                "--team".into(),
-                team.to_owned(),
-            ],
-            after_success: Some(vec![
-                "retro".into(),
-                "delta".into(),
-                "--team".into(),
-                team.to_owned(),
-                "--notify".into(),
-            ]),
-            owner_role: "minder".into(),
-        }],
+        jobs: vec![
+            Job {
+                program: program.to_owned(),
+                team: team.to_owned(),
+                id: format!("retro-{}", team.to_ascii_lowercase()),
+                interval_secs: 30 * 60,
+                kind: JobKind::RetroSnapshot,
+                command: vec![
+                    "retro".into(),
+                    "snapshot".into(),
+                    "--team".into(),
+                    team.to_owned(),
+                ],
+                after_success: Some(vec![
+                    "retro".into(),
+                    "delta".into(),
+                    "--team".into(),
+                    team.to_owned(),
+                ]),
+                owner_role: "minder".into(),
+            },
+            Job {
+                program: program.to_owned(),
+                team: team.to_owned(),
+                id: CHECKER_JOB_ID.to_owned(),
+                interval_secs: 300,
+                kind: JobKind::HostCheck,
+                command: vec!["host".into(), "check".into()],
+                after_success: None,
+                owner_role: "minder".into(),
+            },
+            Job {
+                program: program.to_owned(),
+                team: team.to_owned(),
+                id: "hygiene-check".to_owned(),
+                interval_secs: 300,
+                kind: JobKind::Hygiene,
+                command: vec!["hygiene".into(), "check".into()],
+                after_success: None,
+                owner_role: "minder".into(),
+            },
+        ],
     };
     validate_manifest(&manifest)?;
     let parent = path
@@ -353,18 +374,18 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), CadenceError> {
         let valid_delta = job.after_success.as_deref().is_some_and(|command| {
             matches!(
                 command,
-                [root, sub, scope, value, notify]
+                [root, sub, scope, value, options @ ..]
                     if root == "retro"
                         && sub == "delta"
                         && (scope == "--config" || scope == "--team")
                         && !value.is_empty()
                         && !value.starts_with("--")
-                        && notify == "--notify"
+                        && (options.is_empty() || options == ["--notify"])
             )
         });
         if job.after_success.is_some() && (job.kind != JobKind::RetroSnapshot || !valid_delta) {
             return Err(CadenceError::Manifest(format!(
-                "job {} after_success must be a retro delta --notify command with --config or --team",
+                "job {} after_success must be retro delta with --config or --team and optional --notify",
                 job.id
             )));
         }
@@ -372,12 +393,15 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), CadenceError> {
     Ok(())
 }
 
-#[implements("FR-049-AC-9")]
+#[implements("FR-049-AC-9", "FR-049-AC-10")]
 fn command_matches_kind(kind: JobKind, command: &[String]) -> bool {
     match (kind, command) {
         (JobKind::RetroSnapshot, [root, sub, ..]) => root == "retro" && sub == "snapshot",
         (JobKind::FleetTick, [root, sub, ..]) => root == "fleet" && sub == "tick",
-        (JobKind::Hygiene, [root, sub, ..]) => root == "focus" && sub == "hygiene",
+        (JobKind::Hygiene, [root, sub, rest @ ..]) => {
+            (root == "focus" && sub == "hygiene")
+                || (root == "hygiene" && sub == "check" && !rest.iter().any(|arg| arg == "--apply"))
+        }
         (JobKind::HostCheck, [root, sub]) => root == "host" && sub == "check",
         _ => false,
     }
