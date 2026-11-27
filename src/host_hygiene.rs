@@ -1203,7 +1203,7 @@ mod tests {
     use ix_trace_rs::trace;
 
     #[test]
-    #[trace("FR-048-AC-10", "FR-048-AC-13")]
+    #[trace("FR-048-AC-10")]
     fn native_macos_mount_rows_preserve_space_paths_and_reject_malformed_evidence() {
         let mounts = parse_mount_table("/dev/root on / (apfs, local, read-only)\n/dev/build on /Volumes/Build - Output (apfs, local, journaled)\n").unwrap();
         assert_eq!(
