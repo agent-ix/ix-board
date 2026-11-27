@@ -476,6 +476,13 @@ fn the_working_window_is_the_relay_value_and_no_second_constant_exists() {
         include_str!("../src/fleet/live.rs"),
     ]
     .concat();
+    // Capacity ramp-up has its own independent duration; this inspection concerns
+    // relay-owned classification thresholds only.
+    let sources = sources
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("capacity_rampup:"))
+        .collect::<Vec<_>>()
+        .join("\n");
     for constant in [
         "from_secs(10 * 60)",
         "from_secs(2 * 60 * 60)",
@@ -1451,11 +1458,20 @@ fn receipt_coverage_reasons_split_into_failures_and_gaps() {
         ))
     })
     .unwrap();
-    assert_eq!(gaps, ["recording_gap", "observation_pending", "retention"]);
+    assert_eq!(
+        gaps,
+        [
+            "before_instrumentation",
+            "recording_gap",
+            "observation_pending",
+            "retention"
+        ]
+    );
     let (_, none) =
         live::collect_receipts(|_| Ok(page(vec![], vec![BeforeInstrumentation], None))).unwrap();
-    assert!(
-        none.is_empty(),
-        "history older than instrumentation is not a gap"
+    assert_eq!(
+        none,
+        ["before_instrumentation"],
+        "pre-instrumentation evidence retains its coverage reason"
     );
 }

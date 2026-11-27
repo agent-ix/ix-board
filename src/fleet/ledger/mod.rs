@@ -148,6 +148,27 @@ pub fn resolve_path(config: &FleetConfig) -> Result<PathBuf, LedgerError> {
     }
 }
 
+/// Checks writer compatibility without creating, migrating or changing the ledger.
+/// A missing ledger is permitted because the writer initializes it after collection.
+#[implements("FR-039-AC-8")]
+pub fn check_compatible(path: &Path) -> Result<(), LedgerError> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let found = user_version(&connection)?;
+    if !(0..=VERSION).contains(&found) {
+        return Err(LedgerError::UnsupportedVersion {
+            path: path.to_owned(),
+            found,
+        });
+    }
+    if found == 0 && has_tables(&connection)? {
+        return Err(LedgerError::NotALedger(path.to_owned()));
+    }
+    Ok(())
+}
+
 /// Refuses a path whose existing ancestors include a git work tree.
 fn refuse_inside_git(path: &Path) -> Result<(), LedgerError> {
     let io = |source| LedgerError::Io {

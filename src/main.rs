@@ -1546,8 +1546,9 @@ fn run_fleet_saturation(
         std::env::var("IX_PROMETHEUS_URL").ok(),
     )?;
     let tick_settings = TickSettings::from_toml(settings_value.as_ref())?;
-    let report =
-        ix_board::fleet::saturation::read_live(&config, &tick_settings).map_err(Error::Fleet)?;
+    let report = saturation_after_preflight(&config, collect_sample, || {
+        ix_board::fleet::saturation::read_live(&config, &tick_settings)
+    })?;
     if collect_sample {
         let path = ledger::resolve_path(&config)
             .map_err(|error| Error::Fleet(FleetError::Ledger(error.to_string())))?;
@@ -1614,6 +1615,21 @@ fn run_fleet_saturation(
         .map_err(|error| Error::Fleet(FleetError::Ledger(error.to_string())))?;
     }
     Ok(report)
+}
+
+#[implements("FR-041-AC-7")]
+fn saturation_after_preflight<T>(
+    config: &ix_board::fleet::FleetConfig,
+    collect_sample: bool,
+    read: impl FnOnce() -> Result<T, ix_board::fleet::FleetError>,
+) -> Result<T, Error> {
+    if collect_sample {
+        let path = ix_board::fleet::ledger::resolve_path(config)
+            .map_err(|error| ix_board::fleet::FleetError::Ledger(error.to_string()))?;
+        ix_board::fleet::ledger::check_compatible(&path)
+            .map_err(|error| ix_board::fleet::FleetError::Ledger(error.to_string()))?;
+    }
+    read().map_err(Error::Fleet)
 }
 
 fn fleet_capacity_config() -> Result<(ix_board::fleet::FleetConfig, PathBuf), Error> {
@@ -4986,6 +5002,44 @@ fn render_chunk(chunk: &ProjectChunk) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[trace("FR-039-AC-8", "FR-041-AC-7")]
+    #[test]
+    fn saturation_schema_preflight_precedes_all_live_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.sqlite");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.pragma_update(None, "user_version", ix_board::fleet::ledger::VERSION + 1)
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let config = ix_board::fleet::FleetConfig {
+            ledger_path: Some(path.clone()),
+            ..Default::default()
+        };
+        let result: Result<(), super::Error> =
+            super::saturation_after_preflight(&config, true, || {
+                panic!("external read before schema check")
+            });
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported ledger schema")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        db.pragma_update(None, "user_version", ix_board::fleet::ledger::VERSION)
+            .unwrap();
+        assert_eq!(
+            super::saturation_after_preflight(&config, true, || Ok(7)).unwrap(),
+            7
+        );
+        // The live read-only report does not depend on ledger writer compatibility.
+        db.pragma_update(None, "user_version", ix_board::fleet::ledger::VERSION + 1)
+            .unwrap();
+        assert_eq!(
+            super::saturation_after_preflight(&config, false, || Ok(9)).unwrap(),
+            9
+        );
+    }
     use super::{
         Cli, Command, FocusCommand, Output, ProgramRoadmap, ProgramScopeCommand,
         encode_output_json, format_issue_ref, format_snapshot_time_at, output_outcome,

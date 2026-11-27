@@ -647,7 +647,7 @@ watcher compiler counter and lane-presence samples over the configured window; i
 coverage is unavailable with a reason. A positive project deficit emits a `need_ready_tickets`
 tick action and stores `project`, `requested_count`, `emitted_at` and `resolved_at` in the
 action ledger row. The read-only command does not collect history; install the included
-300-second LaunchAgent on the collector host to run `fleet saturation collect` independently
+900-second LaunchAgent on the collector host to run `fleet saturation collect` independently
 of panel reads.
 This command replaces no `_lead-bin` script.
 
