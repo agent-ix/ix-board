@@ -76,6 +76,8 @@ fn child(directory: &Path, mode: &str, name: &str) -> Child {
         .env("IX_BOARD_COORDINATION_NAME", name)
         .env_remove("IX_BOARD_CACHE_TTL_SECONDS")
         .env_remove("IX_BOARD_CONFIG_PATH")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("launch separate cache process")
 }
@@ -141,6 +143,13 @@ fn cache_coordination_child() {
     let started = Instant::now();
     let result = service.workspace_snapshot();
     match mode.as_str() {
+        "status-update" => match result {
+            Ok(_) => fs::write(directory.join("status-reported"), b"done").expect("status receipt"),
+            Err(error) => {
+                eprintln!("status update not reported: {error}");
+                std::process::exit(1);
+            }
+        },
         "stale-lock" => {
             assert_eq!(result.expect("last complete snapshot").fetched_at, 1000);
             let freshness = service.cache_freshness().expect("fallback provenance");
@@ -207,6 +216,61 @@ fn terminating_lock_owner_releases_refresh_ownership_for_another_process() {
         2,
         "abandoned fetch and one recovery fetch"
     );
+}
+
+#[trace("FR-004-AC-23", "FR-004-AC-24")]
+#[test]
+fn dead_holder_is_taken_over_and_status_update_finishes_without_pending_work() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut owner = child(directory.path(), "block", "owner");
+    wait_for(&directory.path().join("fetching"));
+    let dead_pid = owner.id();
+    owner.kill().unwrap();
+    assert!(!owner.wait().unwrap().success());
+    let started = Instant::now();
+    let output = child(directory.path(), "status-update", "recovery").wait_with_output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(directory.path().join("status-reported").exists());
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    assert!(diagnostic.contains("recovered"), "{diagnostic}");
+    assert!(diagnostic.contains(&format!("pid={dead_pid}")), "{diagnostic}");
+    assert!(diagnostic.contains("age="), "{diagnostic}");
+    assert!(diagnostic.contains(&directory.path().join("cache.sqlite.refresh.lock").display().to_string()), "{diagnostic}");
+}
+
+#[trace("FR-004-AC-23", "FR-004-AC-24")]
+#[test]
+fn waiting_status_update_announces_holder_then_fails_explicitly_within_five_seconds() {
+    use std::io::BufRead;
+    let directory = tempfile::tempdir().unwrap();
+    let lock = lock_refresh(directory.path());
+    let acquired = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() - 42_000;
+    fs::write(directory.path().join("cache.sqlite.refresh.lock"), format!("pid={}\nacquired_at_ms={acquired}\n", std::process::id())).unwrap();
+    let mut waiter = child(directory.path(), "status-update", "waiting");
+    let stderr = waiter.stderr.take().unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stderr);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        send.send(line.clone()).unwrap();
+        reader.read_to_string(&mut line).unwrap();
+        line
+    });
+    let started = Instant::now();
+    let initial = receive.recv_timeout(Duration::from_secs(2));
+    let output = waiter.wait_with_output().unwrap();
+    let diagnostic = reader.join().unwrap();
+    drop(lock);
+    assert!(!output.status.success());
+    assert!(started.elapsed() < Duration::from_secs(6));
+    assert!(initial.expect("waiting must be visible before the final timeout").contains("waiting"));
+    assert!(diagnostic.contains(&format!("pid={}", std::process::id())), "{diagnostic}");
+    assert!(diagnostic.contains("age=4"), "{diagnostic}");
+    assert!(diagnostic.contains(&directory.path().join("cache.sqlite.refresh.lock").display().to_string()), "{diagnostic}");
+    assert!(diagnostic.contains("status update not reported"), "{diagnostic}");
+    assert!(!directory.path().join("status-reported").exists());
 }
 
 #[trace("FR-004-AC-3", "FR-004-AC-20")]
