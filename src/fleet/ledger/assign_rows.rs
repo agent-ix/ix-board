@@ -451,6 +451,13 @@ pub fn complete_pending(
         let Some(decision) = decide(events, evidence, timing, &keys, &row.expect) else {
             continue;
         };
+        // Terminal outcomes were observed before this pass; only their missing
+        // deadline focus is filled, even when that earlier evidence has aged out.
+        let outcome = if row.result == AssignResult::Pending {
+            decision.result
+        } else {
+            row.result
+        };
         let deadline_focus = focus::derive(events, row.deadline_at, window_ms, None, &keys);
         let focus = deadline_focus.label();
         if row.result == AssignResult::Pending {
@@ -490,7 +497,7 @@ pub fn complete_pending(
                 focus_ticket: deadline_focus.ticket(),
                 focus_state: focus_state(&deadline_focus),
                 followup_at: None,
-                outcome: decision.result.name(),
+                outcome: outcome.name(),
             },
         )
         .map_err(|e| e.to_string())?;
@@ -939,10 +946,12 @@ fn open_rows(ledger: &Ledger, now_ms: i64) -> Result<Vec<Open>, LedgerError> {
                 COALESCE(sender_role,'orchestrator'), COALESCE(sender_addr,'ix-board')
          FROM assignment_history
          WHERE order_id IS NOT NULL AND sent_at IS NOT NULL AND deadline_at IS NOT NULL
-           AND deadline_at < ?1 AND result = 'pending'
+           AND deadline_at < ?1
+           AND (result = 'pending' OR (focus_at_deadline IS NULL AND sent_at >= ?2))
          ORDER BY id",
     )?;
-    let rows = statement.query_map([now_ms], |r| {
+    let receipt_floor = now_ms.saturating_sub(7 * 24 * 60 * 60 * 1_000);
+    let rows = statement.query_map([now_ms, receipt_floor], |r| {
         let tickets: String = r.get(3)?;
         let result: String = r.get(7)?;
         Ok(Open {
@@ -1590,6 +1599,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(focus_rows, 1);
+        let recorded_outcome: String = connection
+            .query_row(
+                "SELECT outcome FROM order_focus_at_deadline WHERE order_id='recent-order'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded_outcome, "confirmed");
         assert_eq!(complete_pending(&config, &settings, &mut bus).unwrap(), 0);
     }
 

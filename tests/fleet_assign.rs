@@ -1378,8 +1378,9 @@ fn a_status_run_commits_the_completed_row_with_its_run() {
 }
 
 #[trace("FR-035-AC-12")]
+#[trace("FR-039-AC-12")]
 #[test]
-fn a_failed_completion_is_a_defect_committed_with_the_run() {
+fn a_failed_source_completion_is_an_unreadable_source_committed_with_the_run() {
     let (_c, port) = Container::start();
     let mut relay = connect(port);
     let target = lane(&mut relay, "s-one", "one");
@@ -1402,9 +1403,17 @@ fn a_failed_completion_is_a_defect_committed_with_the_run() {
     assert_eq!(
         count(
             &ledger,
-            "SELECT COUNT(*) FROM defect WHERE kind='ledger_unwritable'"
+            "SELECT COUNT(*) FROM defect WHERE kind='unreadable_source' AND source='relay:order_history'"
         ),
         1,
         "the completion defect is stored with the run"
+    );
+    assert_eq!(
+        count(
+            &ledger,
+            "SELECT COUNT(*) FROM defect WHERE kind='ledger_unwritable'"
+        ),
+        0,
+        "a source read failure is not a ledger write failure"
     );
 }
