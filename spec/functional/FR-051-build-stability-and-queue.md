@@ -20,10 +20,11 @@ redacted retained status and transition events.
 
 ## Inputs
 
-The producer contract is dev-tools PR A's `locked_build::wire` projection:
+The producer contract is dev-tools' shared `locked_build::wire` projection:
 request and event lifecycle timestamps, stable diagnostic codes and limits,
 queue depth at enqueue, position, cumulative state timings and blocker
-observations, requested/granted memory, and status-only needed/free-budget memory. The consumer accepts additive fields.
+observations, separate requested/granted hard caps and admission reservations,
+and status-only needed/free-budget memory. The consumer accepts additive fields.
 Legacy status supplies `state`, `enqueued_at_ms`, `started_at_ms`, `ended_at_ms`,
 `wait_ms`, `reason`, `signal` and `exit_code` until the producer is installed.
 
@@ -50,13 +51,20 @@ Legacy status supplies `state`, `enqueued_at_ms`, `started_at_ms`, `ended_at_ms`
   cancellation, clipped to each window and including a baseline. Position and
   enqueue-depth observations are retained when present. Memory values are per
   request, not measured RSS; missing legacy fields remain null. Status-only
-  `memory_needed_bytes` and `memory_free_budget_bytes` show the cap needed and
+  Existing `requested_memory_bytes` and `granted_memory_bytes` remain hard-cap
+  aliases. Separate `requested_memory_reservation_bytes` and
+  `granted_memory_reservation_bytes` retain admission reservations; missing
+  reservation evidence stays null. `memory_needed_bytes` and
+  `memory_free_budget_bytes` show the reservation needed and
   currently unreserved budget without substituting granted bytes.
 - Blocked seconds sum cumulative per-request observations, allowing overlapping
   reasons. A request spanning the start boundary needs a cumulative observation
   at that boundary; otherwise its blocked duration is unavailable. Legacy reason
   labels are retained without attributing an entire wait to the last reason.
-- Event snapshots SHALL NOT count a retained request twice. Refused attempts that
+- Event snapshots SHALL NOT count a retained request twice. A correction SHALL
+  retain the original request identity and SHALL NOT create another attempt.
+  Retained status is authoritative; event-only attempts use the latest snapshot,
+  with producer event order breaking equal timestamp ties. Refused attempts that
   exist only in events, ix-board SHALL include them once per request id.
 - Malformed, stale (over 120 seconds), future (over five seconds), wrong-host,
   duplicate-identity, incompatible-version and pruned history SHALL be unavailable
@@ -76,9 +84,9 @@ Legacy status supplies `state`, `enqueued_at_ms`, `started_at_ms`, `ended_at_ms`
 
 | ID | Criteria | Verification |
 | --- | --- | --- |
-| FR-051-AC-1 | Hand-written status and event evidence produces per-host 1h/24h requests, completions, success rates and termination counts with exact boundary inclusion and one count per attempt, including event-only refusals. | Test |
+| FR-051-AC-1 | Hand-written status and event evidence produces per-host 1h/24h requests, completions, success rates and termination counts with exact boundary inclusion and one count per attempt, including event-only refusals and historical corrections sharing a timestamp with the original outcome. | Test |
 | FR-051-AC-2 | Stable codes override legacy reasons; legacy RSS, timeout, supervision, refusal, cancellation, external signal and command exits map correctly; successful degraded supervision retains its diagnostic without becoming a failed or killed attempt; top violated limit carries limit and measured evidence. | Test |
-| FR-051-AC-3 | Per-host/class queue p50/p95, depth steps, blocker seconds and requested/granted and needed/free-budget memory match injected values; empty waits and incomplete blocking history remain null. | Test |
+| FR-051-AC-3 | Per-host/class queue p50/p95, depth steps, blocker seconds and separate requested/granted hard caps, reservations and needed/free-budget memory match injected values; empty waits and incomplete blocking history remain null. | Test |
 | FR-051-AC-4 | Additive retro ids for all four hosts collect injected stability values and rising values become existing delta defects; missing hosts stay unavailable and notifications require explicit request through the existing recipient. | Test |
 | FR-051-AC-5 | No-argument host check includes all four host rows through bounded read-only collection, rejects stale/malformed/wrong-host/pruned history without leaking raw payloads, and default cadence includes the view and retro metrics without notification flags. | Test |
 

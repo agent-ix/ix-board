@@ -1276,11 +1276,12 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 [[package]]
 name = "locked-build"
 version = "0.1.0"
-source = "git+https://github.com/agent-ix/dev-tools?rev=f58017a13014829035ca30fb87170c96f54df42d#f58017a13014829035ca30fb87170c96f54df42d"
+source = "git+https://github.com/agent-ix/dev-tools?rev=a50cdbe899eb8a3006d115f4a47c4157b0a3cc15#a50cdbe899eb8a3006d115f4a47c4157b0a3cc15"
 dependencies = [
  "clap",
  "nix 0.30.1",
  "rustix",
+ "semver",
  "serde",
  "serde_json",
  "signal-hook",
@@ -2109,6 +2110,12 @@ dependencies = [
  "core-foundation-sys",
  "libc",
 ]
+
+[[package]]
+name = "semver"
+version = "1.0.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "serde"

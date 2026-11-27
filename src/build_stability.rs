@@ -172,11 +172,17 @@ pub struct EnqueueObservation {
 pub struct MemoryGrant {
     /// Stable producer request id.
     pub request_id: String,
-    /// Requested memory bytes, if recorded.
+    /// Requested hard-cap bytes, if recorded; never an admission reservation.
     pub requested_memory_bytes: Option<u64>,
-    /// Granted memory bytes, if recorded.
+    /// Granted hard-cap bytes, if recorded; never an admission reservation.
     pub granted_memory_bytes: Option<u64>,
-    /// Memory cap currently needed for admission, if supplied by status.
+    /// Requested admission reservation, distinct from the hard cap.
+    #[serde(default)]
+    pub requested_memory_reservation_bytes: Option<u64>,
+    /// Granted admission reservation, distinct from the hard cap.
+    #[serde(default)]
+    pub granted_memory_reservation_bytes: Option<u64>,
+    /// Admission reservation currently needed, if supplied by status.
     #[serde(default)]
     pub memory_needed_bytes: Option<u64>,
     /// Currently unreserved admission budget, if supplied by status.
@@ -550,6 +556,13 @@ fn queue_analysis(
             memory.push(MemoryGrant {
                 request_id: request.request_id.clone(),
                 requested_memory_bytes: request.trace.requested_memory_bytes,
+                requested_memory_reservation_bytes: request
+                    .trace
+                    .requested_memory_reservation_bytes,
+                granted_memory_reservation_bytes: request
+                    .admitted_at()
+                    .filter(|at| *at <= end_ms)
+                    .and(request.trace.granted_memory_reservation_bytes),
                 memory_needed_bytes: request.memory_needed_bytes,
                 memory_free_budget_bytes: request.memory_free_budget_bytes,
                 granted_memory_bytes: request
@@ -699,7 +712,8 @@ fn blocked_in_window(
 
 #[implements("FR-051-AC-1", "FR-051-AC-2")]
 fn enrich_events(status: &mut StatusInput) -> bool {
-    // Refusals can exist only in events. Latest snapshot per attempt wins; transitions,
+    // Refusals can exist only in events. Latest snapshot per attempt wins (producer
+    // event order breaks timestamp ties); corrections, transitions,
     // blocker snapshots and command-start events never increment counts independently.
     let mut missing = BTreeMap::new();
     let retained: BTreeSet<_> = status
@@ -714,7 +728,7 @@ fn enrich_events(status: &mut StatusInput) -> bool {
         }
         if missing
             .get(id)
-            .is_none_or(|(previous, _)| event.observed_at_ms > *previous)
+            .is_none_or(|(previous, _)| event.observed_at_ms >= *previous)
         {
             missing.insert(id, (event.observed_at_ms, &event.request));
         }
@@ -1187,6 +1201,8 @@ mod review_regressions {
                 vec![MemoryGrant {
                     request_id: "memory-refusal".into(),
                     requested_memory_bytes: Some(500),
+                    requested_memory_reservation_bytes: None,
+                    granted_memory_reservation_bytes: None,
                     granted_memory_bytes: None,
                     memory_needed_bytes: None,
                     memory_free_budget_bytes: None
@@ -1238,6 +1254,8 @@ mod status_memory_tests {
                 vec![MemoryGrant {
                     request_id: "waiting".into(),
                     requested_memory_bytes: Some(500),
+                    requested_memory_reservation_bytes: None,
+                    granted_memory_reservation_bytes: None,
                     granted_memory_bytes: None,
                     memory_needed_bytes: Some(600),
                     memory_free_budget_bytes: Some(300),
@@ -1253,7 +1271,83 @@ mod status_memory_tests {
             r#"{"request_id":"old","requested_memory_bytes":500,"granted_memory_bytes":400}"#,
         )
         .unwrap();
+        assert_eq!(legacy.requested_memory_bytes, Some(500));
+        assert_eq!(legacy.granted_memory_bytes, Some(400));
+        assert_eq!(legacy.requested_memory_reservation_bytes, None);
+        assert_eq!(legacy.granted_memory_reservation_bytes, None);
         assert_eq!(legacy.memory_needed_bytes, None);
         assert_eq!(legacy.memory_free_budget_bytes, None);
+    }
+}
+
+#[cfg(test)]
+mod reservation_contract_tests {
+    use super::*;
+
+    #[test]
+    fn stability_admission_reservation_is_distinct_from_hard_cap() {
+        let input = r#"{"schema_version":1,"host":"draco","observed_at_ms":100000000,"requests":[{"request_id":"waiting","class":"block","state":"queued","lifecycle_state":"queued","queued_at_ms":99990000,"requested_memory_bytes":4096,"requested_memory_reservation_bytes":512,"memory_needed_bytes":512,"memory_free_budget_bytes":256},{"request_id":"admitted","class":"block","state":"running","lifecycle_state":"running","queued_at_ms":99990000,"admitted_at_ms":99991000,"requested_memory_bytes":8192,"granted_memory_bytes":8192,"requested_memory_reservation_bytes":1024,"granted_memory_reservation_bytes":1024,"memory_needed_bytes":1024,"memory_free_budget_bytes":256}],"events":[]}"#;
+        let report = from_status(input, "draco", 100_000_000);
+        let hour = report.last_1h.as_ref().unwrap();
+        for class in ["all", "block"] {
+            let memory = &hour.queue[class].memory;
+            assert_eq!(memory.len(), 2);
+            assert_eq!(memory[0].request_id, "admitted");
+            assert_eq!(memory[0].requested_memory_bytes, Some(8192));
+            assert_eq!(memory[0].granted_memory_bytes, Some(8192));
+            assert_eq!(memory[0].requested_memory_reservation_bytes, Some(1024));
+            assert_eq!(memory[0].granted_memory_reservation_bytes, Some(1024));
+            assert_eq!(memory[1].requested_memory_bytes, Some(4096));
+            assert_eq!(memory[1].granted_memory_bytes, None);
+            assert_eq!(memory[1].requested_memory_reservation_bytes, Some(512));
+            assert_eq!(memory[1].granted_memory_reservation_bytes, None);
+            assert_eq!(memory[1].memory_needed_bytes, Some(512));
+            assert_eq!(memory[1].memory_free_budget_bytes, Some(256));
+        }
+        let text = render_text(&StabilityReport {
+            hosts: [("draco".into(), report)].into(),
+        });
+        assert!(text.contains("requested_memory_reservation_bytes: Some(1024)"));
+        assert!(text.contains("granted_memory_bytes: Some(8192)"));
+    }
+}
+
+#[cfg(test)]
+mod correction_contract_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn stability_correction_of_a_historical_outcome_counts_one_attempt() {
+        let mut source = json!({"schema_version":1,"host":"draco","observed_at_ms":100000000,"requests":[],"events":[
+            {"event_id":"original","observed_at_ms":99995000,"request_id":"one","class":"point","state":"failed","lifecycle_state":"failed","queued_at_ms":99990000,"admitted_at_ms":99991000,"finished_at_ms":99995000,"code":"LB_COMMAND_EXIT","exit_code":101},
+            {"event_id":"repair","correction":true,"observed_at_ms":99999000,"request_id":"one","class":"point","state":"succeeded","lifecycle_state":"succeeded","queued_at_ms":99990000,"admitted_at_ms":99991000,"finished_at_ms":99999000,"code":"LB_SUPERVISION_LOST","exit_code":0}
+        ]});
+        let decoded = serde_json::from_value::<StatusInput>(source.clone()).unwrap();
+        assert!(!decoded.events[0].correction);
+        assert!(decoded.events[1].correction);
+        let event_only = from_status(&source.to_string(), "draco", 100_000_000)
+            .last_1h
+            .unwrap();
+        assert_eq!(event_only.requests, 1);
+        assert_eq!(event_only.completed, 1);
+        assert_eq!(event_only.success_rate, Some(1.0));
+        assert_eq!(event_only.kill_rate, Some(0.0));
+        assert_eq!(
+            event_only.terminations_by_code,
+            BTreeMap::from([("LB_SUPERVISION_LOST".into(), 1)])
+        );
+        let mut tied = source.clone();
+        tied["events"][1]["observed_at_ms"] = json!(99995000);
+        tied["events"][1]["finished_at_ms"] = json!(99995000);
+        let tied_report = from_status(&tied.to_string(), "draco", 100_000_000)
+            .last_1h
+            .unwrap();
+        assert_eq!(tied_report, event_only);
+        source["requests"] = json!([source["events"][1].clone()]);
+        let retained = from_status(&source.to_string(), "draco", 100_000_000)
+            .last_1h
+            .unwrap();
+        assert_eq!(retained, event_only);
     }
 }
