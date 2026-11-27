@@ -492,26 +492,43 @@ code. When no row could be read it exits with the internal-error code.
 ## ix-board hygiene check
 
 ```text
-ix-board hygiene check --host <HOST> [--free-floor-gb <GIB>] [--root <WORKTREES>] [--idle-minutes <MINUTES>]
+ix-board hygiene check --host <HOST> [--free-floor-gb <GIB>] [--root <ROOT>] [--idle-minutes <MINUTES>]
 ```
 
 Reports free disk space, target directories and their ages, prunable worktrees, and build
-processes without a Herdr pane association. The worktree root must be named `worktrees`. Values
+processes without a Herdr pane association. The root may contain Git clones and linked worktrees;
+its directory name is unrestricted. Values
 may be set in the ix-board settings file under `[hygiene]`; command-line values override the
 configured ones. The default policy floor is 100 GiB, with 150 GiB for terra; the default idle age
 is 60 minutes. Set `hygiene.default_free_floor_gb`, a host-specific
 `hygiene.hosts.<host>.free_floor_gb`, or `hygiene.idle_minutes` to change those policy fields.
+Discovery includes targets up to three directory levels below the configured root.
+Targets are at depth one when the root is a checkout, depth two for flat clones,
+and depth three for grouped checkouts. It skips symlinks, backups and unexpected filesystems.
+Only each checkout's direct `target/` is included; source subdirectories are preserved.
+`--root` overrides `hygiene.worktree_root`; both accept these layouts.
+On macOS and Linux, install `lsof` and `ps`; inspection runs without elevated rights.
+`process_evidence_scope: current_user` identifies the invoking user's process inventory.
+Missing live cwd records, failed process commands, and unavailable build environments
+leave evidence incomplete. Exited processes do not block an otherwise complete inventory.
 Exit status is 0 when clear,
 1 when findings exist, 2 when required evidence is unavailable, and 3 on unsupported Windows.
 
 ## ix-board hygiene clean
 
 ```text
-ix-board hygiene clean --host <HOST> [--free-floor-gb <GIB>] [--root <WORKTREES>] [--idle-minutes <MINUTES>] [--apply]
+ix-board hygiene clean --host <HOST> [--free-floor-gb <GIB>] [--root <ROOT>] [--idle-minutes <MINUTES>] [--apply]
 ```
 
 Dry-run by default. `--apply` removes only old `target/` directories under discovered Git
-worktrees when complete process evidence proves they are unused. Example policy:
+clones or linked worktrees when complete process evidence proves they are unused.
+
+Cleanup checks targets and worktrees owned by the invoking user. Run it as the
+account that runs the builds, in a worktree root reserved for that account.
+Other users' processes fall outside this evidence scope. Cleanup rechecks ownership,
+process references and modification times before removal; incomplete evidence preserves the target.
+
+Example policy:
 
 ```toml
 [hygiene]

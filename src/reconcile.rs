@@ -5,6 +5,7 @@
 
 use crate::program_review::ProgramScope;
 use crate::{Error, Issue, Project, ProjectId, WorkflowStateType, WorkspaceSnapshot};
+use ix_trace_rs::implements;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::{Command, Stdio};
@@ -101,28 +102,18 @@ pub struct ReconcileEvidence {
     pub branches: BTreeMap<String, Vec<String>>,
 }
 
-/// Resolve a Linear project by exact identifier or case-insensitive exact name.
+/// Resolve a project using the shared UUID, slug and exact-name identity rules.
+#[implements("FR-021-AC-1", "FR-021-AC-4")]
 pub fn resolve_project<'a>(
     snapshot: &'a WorkspaceSnapshot,
     selector: &str,
 ) -> Result<&'a Project, ReconcileError> {
-    let matches = snapshot
+    let id = crate::scope::resolve_project_id(snapshot, selector)?;
+    snapshot
         .projects
         .iter()
-        .filter(|project| {
-            project.identifier.as_deref() == Some(selector)
-                || project.name.eq_ignore_ascii_case(selector)
-        })
-        .collect::<Vec<_>>();
-    match matches.as_slice() {
-        [project] => Ok(project),
-        [] => Err(ReconcileError::Invalid(format!(
-            "project not found: {selector}"
-        ))),
-        _ => Err(ReconcileError::Invalid(format!(
-            "project selector is ambiguous: {selector}"
-        ))),
-    }
+        .find(|project| project.id == id)
+        .ok_or_else(|| ReconcileError::Invalid(format!("project not found: {selector}")))
 }
 
 /// Collect current PR and branch records through the authenticated GitHub CLI.
@@ -503,6 +494,7 @@ fn pull_request_repository(value: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::{ProjectId, TeamKey};
+    use ix_trace_rs::trace;
 
     fn project() -> Project {
         Project {
@@ -588,6 +580,82 @@ mod tests {
             fetched_at: 0,
         };
         assert!(resolve_project(&ambiguous, "program review").is_err());
+    }
+
+    #[test]
+    #[trace("FR-021-AC-1", "FR-021-AC-4")]
+    fn project_uuid_slug_and_name_produce_identical_reconciliation() {
+        let mut selected = project();
+        selected.id = ProjectId("abcdef01-2345-4678-9abc-def012345678".to_owned());
+        selected.identifier = Some("program-review-a1b2c3d4".to_owned());
+        let (mut issues, evidence) = recorded_evidence();
+        for issue in &mut issues {
+            issue.project_id = Some(selected.id.clone());
+        }
+        let snapshot = WorkspaceSnapshot {
+            projects: vec![selected.clone()],
+            issues,
+            fetched_at: 0,
+        };
+        let now = crate::drift::timestamp_epoch("2026-10-21T00:00:00Z").unwrap();
+        let mut expected = None;
+        for selector in [
+            &selected.id.0,
+            &selected.id.0.to_uppercase(),
+            selected.identifier.as_ref().unwrap(),
+            &selected.identifier.as_ref().unwrap().to_uppercase(),
+            &selected.name,
+            &selected.name.to_lowercase(),
+        ] {
+            let resolved = resolve_project(&snapshot, selector).unwrap();
+            assert_eq!(resolved, &selected);
+            let issues = snapshot
+                .issues
+                .iter()
+                .filter(|issue| issue.project_id.as_ref() == Some(&resolved.id))
+                .cloned()
+                .collect::<Vec<_>>();
+            let report = evaluate_reconcile(
+                resolved,
+                &issues,
+                &evidence,
+                vec!["agent-ix/reconcile-demo".to_owned()],
+                DEFAULT_STALE_DAYS,
+                now,
+            )
+            .unwrap();
+            if let Some(expected) = &expected {
+                assert_eq!(&report, expected);
+            } else {
+                expected = Some(report);
+            }
+            let scope = crate::select_scope(
+                &snapshot,
+                &crate::ScopeSelection {
+                    projects: vec![selector.to_owned()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(scope.project_ids, BTreeSet::from([selected.id.clone()]));
+        }
+    }
+
+    #[test]
+    #[trace("FR-021-AC-4")]
+    fn project_identity_takes_precedence_over_another_projects_colliding_name() {
+        let selected = project();
+        for collision in [&selected.id.0, selected.identifier.as_ref().unwrap()] {
+            let mut other = selected.clone();
+            other.id = ProjectId("other-project".to_owned());
+            other.identifier = Some("OTHER".to_owned());
+            other.name = collision.clone();
+            let snapshot = WorkspaceSnapshot {
+                projects: vec![selected.clone(), other],
+                ..Default::default()
+            };
+            assert_eq!(resolve_project(&snapshot, collision).unwrap(), &selected);
+        }
     }
 
     /// Trace: FR-021-AC-1

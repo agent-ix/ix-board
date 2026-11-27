@@ -227,7 +227,7 @@ struct HygieneArgs {
     /// Host label; defaults to the local host identity.
     #[arg(long)]
     host: Option<String>,
-    /// Worktree root on this host.
+    /// Directory containing Git clones or linked worktrees on this host.
     #[arg(long)]
     root: Option<PathBuf>,
     /// Configured minimum free space in GiB.
@@ -3693,13 +3693,15 @@ fn run_drift(
     "FR-048-AC-10",
     "FR-049-AC-10"
 )]
+#[implements("FR-048-AC-11", "FR-048-AC-12", "FR-048-AC-13")]
 fn run_hygiene(
     args: &HygieneArgs,
     apply: bool,
 ) -> Result<ix_board::host_hygiene::HygieneReport, Error> {
     use ix_board::host_hygiene::{
-        CleanDecision, HostPolicy, HygieneConfig, HygieneReport, MountSafety, apply_clean_decision,
-        canonicalize_worktree_root, clean_decision, free_disk_bytes, mount_filesystem_matches,
+        CleanDecision, HostPolicy, HygieneConfig, HygieneReport, MountSafety, ProcessEvidenceScope,
+        apply_clean_decision, canonicalize_worktree_root, clean_decision,
+        cleanup_owned_by_current_user, discover_targets, free_disk_bytes, is_build_command,
         mount_safety, mount_table_covers, newest_mtime_under, recheck_clean_decision,
         system_mount_table, system_process_table,
     };
@@ -3723,6 +3725,7 @@ fn run_hygiene(
             prunable_worktrees: Vec::new(),
             orphan_build_processes: Vec::new(),
             process_table_complete: false,
+            process_evidence_scope: ProcessEvidenceScope::Unknown,
             mount_table_complete: false,
             unsupported: true,
         });
@@ -3752,11 +3755,6 @@ fn run_hygiene(
                     "no target idle age configured; set hygiene.idle_minutes or pass --idle-minutes"
                         .to_owned(),
             })?;
-    if root.file_name().is_none_or(|name| name != "worktrees") {
-        return Err(Error::ProgramReview {
-            message: "hygiene root must be a worktrees directory".to_owned(),
-        });
-    }
     let floor = floor_gb
         .checked_mul(1024 * 1024 * 1024)
         .ok_or_else(|| Error::ProgramReview {
@@ -3794,14 +3792,7 @@ fn run_hygiene(
                 .cwd
                 .as_deref()
                 .is_some_and(|cwd| cwd.starts_with(&root))
-                && process.cmdline.split(|byte| *byte == 0).any(|word| {
-                    matches!(
-                        PathBuf::from(String::from_utf8_lossy(word).as_ref())
-                            .file_name()
-                            .and_then(|name| name.to_str()),
-                        Some("cargo" | "rustc")
-                    )
-                })
+                && is_build_command(&process.cmdline)
                 && !process
                     .environ
                     .windows(b"HERDR_PANE_ID=".len())
@@ -3814,40 +3805,24 @@ fn run_hygiene(
         free_floor_bytes: floor,
         idle_age_secs: age,
     };
-    let entries = std::fs::read_dir(&root).map_err(|error| Error::ProgramReview {
-        message: format!("cannot read worktree root: {error}"),
-    })?;
+    let discovered = if root_mount_safety == MountSafety::Safe {
+        discover_targets(&root, mounts.as_deref().unwrap_or_default()).map_err(|error| {
+            Error::ProgramReview {
+                message: format!("cannot discover worktree targets: {error}"),
+            }
+        })?
+    } else {
+        Vec::new()
+    };
     let mut targets = Vec::new();
-    for entry in entries.flatten() {
-        let Ok(worktree) = std::fs::canonicalize(entry.path()) else {
-            continue;
-        };
-        if !worktree.starts_with(&root) {
-            continue;
-        }
-        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            continue;
-        }
-        if !worktree.join(".git").exists() {
-            continue;
-        }
-        if root_mount_safety != MountSafety::Safe
-            || mount_filesystem_matches(&worktree, &root, mounts.as_deref().unwrap_or_default())
-                != MountSafety::Safe
-        {
-            continue;
-        }
-        let target_path = worktree.join("target");
-        let Ok(metadata) = std::fs::symlink_metadata(&target_path) else {
-            continue;
-        };
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            continue;
-        }
-        let Ok(target) = std::fs::canonicalize(&target_path) else {
-            continue;
-        };
-        if !target.starts_with(&worktree) {
+    for (target, worktree) in discovered {
+        if !cleanup_owned_by_current_user(&target, &worktree) {
+            targets.push(CleanDecision {
+                target,
+                age_secs: 0,
+                eligible: false,
+                reason: "owner_evidence_unknown_or_foreign".to_owned(),
+            });
             continue;
         }
         let safety = mount_safety(&target, &root, mounts.as_deref().unwrap_or_default());
@@ -3881,7 +3856,7 @@ fn run_hygiene(
                 &policy,
                 &latest,
             );
-            if decision.eligible {
+            if decision.eligible && cleanup_owned_by_current_user(&target, &worktree) {
                 decision = apply_clean_decision(&decision, true).unwrap_or_else(|error| {
                     let mut failed = decision.clone();
                     failed.reason = format!("remove_failed:{}", error.kind());
@@ -3900,6 +3875,7 @@ fn run_hygiene(
         prunable_worktrees,
         orphan_build_processes,
         process_table_complete: processes.complete,
+        process_evidence_scope: ProcessEvidenceScope::CurrentUser,
         mount_table_complete,
         unsupported: false,
     })
@@ -4213,6 +4189,7 @@ fn run_build_status(
 }
 
 #[implements("FR-050-AC-1")]
+#[implements("FR-048-AC-12")]
 fn render_human(output: &Output) -> String {
     match output {
         Output::Cached { result, freshness } => format!(
@@ -4291,7 +4268,7 @@ fn render_human(output: &Output) -> String {
         Output::Fleet(report) => ix_board::fleet::render_text(report),
         Output::Hygiene(report) => {
             format!(
-                "{} hygiene: free={} floor={} targets={} process_evidence_complete={} unsupported={}",
+                "{} hygiene: free={} floor={} targets={} process_evidence_complete={} process_evidence_scope={:?} unsupported={}",
                 report.host,
                 report
                     .free_bytes
@@ -4299,6 +4276,7 @@ fn render_human(output: &Output) -> String {
                 report.free_floor_bytes,
                 report.targets.len(),
                 report.process_table_complete,
+                report.process_evidence_scope,
                 report.unsupported,
             ) + &report
                 .targets

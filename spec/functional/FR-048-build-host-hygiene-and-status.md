@@ -33,6 +33,10 @@ use locked-build lease evidence instead of identifying a shell wrapper by its na
   whether a process uses a target directory. On macOS, lsof and proc_pidinfo-equivalent APIs provide
   the same evidence. Incomplete process evidence is reported as unknown and is never treated as
   unused. Windows is unsupported.
+  Unprivileged inspection reconciles `lsof` paths and `ps` commands for the invoking
+  user's sampled live PIDs. Build environments are required for cargo/rustc processes.
+  The report labels this evidence `current_user`; cleanup requires targets and
+  containing worktrees owned by that user, in a root reserved for that account.
 - **Clean.** `hygiene clean --host H` is a dry run unless `--apply` is passed. A target directory
   is eligible only if it is older than configured idle age, belongs to a worktree, is not in use by
   any process, and is not under a source, `.git`, `dev_bak`, or `dev_archive` path. Apply removes
@@ -65,6 +69,9 @@ use locked-build lease evidence instead of identifying a shell wrapper by its na
 | FR-048-AC-8 | Eligibility uses the host policy and missing or stale telemetry is ineligible; luna is eligible for one heavy gate only when no heavy gate is running and system load is below 8. | Test |
 | FR-048-AC-9 | Agent activity recognizes locked-build ownership from lease evidence and does not infer it from `locked-build.sh` command text. | Test |
 | FR-048-AC-10 | An injected mount table proves hygiene ignores worktrees on an unexpected filesystem and refuses to scan or clean a target containing a nested mount point; unreadable mount evidence prevents cleanup. | Test |
+| FR-048-AC-11 | Target discovery includes worktree targets at depths one through three under the configured root, deterministically, without following symlinks, traversing backups, or crossing filesystem boundaries; directories without a containing worktree are excluded. | Test |
+| FR-048-AC-12 | Unprivileged lsof and ps reconcile cwd evidence for the invoking user's live processes on macOS and Linux. A missing live process cwd, failed inventory, or missing build environment leaves evidence incomplete; exited processes do not. Cleanup is restricted to worktrees owned by that user, preserves live references, and rechecks process evidence and the configured idle age (default one hour) before applying. | Test |
+| FR-048-AC-13 | Both --root and hygiene.worktree_root accept any directory name, including a flat clone layout. Targets directly below Git clones or worktrees are discovered through depth three under that root, including grouped checkouts; source subtrees and targets beyond the depth limit are preserved. | Test |
 
 ## Traceability
 

@@ -78,6 +78,21 @@ on Linux, `~/Library/Caches/com.agent-ix.ix-board` on macOS, and
 `%LOCALAPPDATA%\agent-ix\ix-board\cache` on Windows. See
 [how it works](how-it-works.md#cache).
 
+ix-board checks database writes, permissions and the adjacent lock. An inaccessible
+or read-only default selects `$TMPDIR/ix-board-<uid>/linear.sqlite3` on Unix,
+using the system temporary directory when `TMPDIR` is unset. The fallback directory
+belongs to the invoking user with mode `0700`. The operating system may clear it.
+`ix-board cache status --json` reports the selected `cache_path`.
+
+An override failure names the path; fix permissions or choose a writable path.
+Parent directories are created automatically.
+Corruption and SQLite contention remain errors.
+
+Lock contention immediately reports the holder process ID (PID), age and path on stderr.
+Waits end within five seconds. Released dead-holder locks are detected and reclaimed.
+Legacy metadata uses file modification age; missing holder IDs appear as unknown.
+Keep the file: bypassing a held OS lock could allow parallel refreshes.
+
 ## macOS Keychain prompts
 
 A build that is not code-signed can trigger a new Keychain prompt for the saved

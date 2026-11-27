@@ -152,7 +152,7 @@ pub struct HostPolicyConfig {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HygieneConfig {
-    /// Worktree directory on this host.
+    /// Root directory containing Git clones or linked worktrees on this host.
     pub worktree_root: Option<PathBuf>,
     /// Minimum target-directory idle age in minutes.
     pub idle_minutes: Option<u64>,
@@ -269,6 +269,17 @@ pub enum Eligibility {
     Ineligible,
 }
 
+/// Scope certified by a process evidence result.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessEvidenceScope {
+    /// Legacy or unsupported evidence has no certified scope.
+    #[default]
+    Unknown,
+    /// Live processes belonging to the invoking effective user.
+    CurrentUser,
+}
+
 /// Host-scoped hygiene observation used by `hygiene check` and `clean`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -285,8 +296,11 @@ pub struct HygieneReport {
     pub prunable_worktrees: Vec<PathBuf>,
     /// Build processes under the worktree root without a Herdr pane association.
     pub orphan_build_processes: Vec<u32>,
-    /// Whether process inspection was complete.
+    /// Whether process inspection was complete within `process_evidence_scope`.
     pub process_table_complete: bool,
+    /// User boundary of the process inventory; legacy reports have unknown scope.
+    #[serde(default)]
+    pub process_evidence_scope: ProcessEvidenceScope,
     /// Whether the mount table could be read and interpreted.
     pub mount_table_complete: bool,
     /// Unsupported host OS/platform condition.
@@ -329,16 +343,13 @@ impl HygieneReport {
     }
 }
 
-/// Collects process references using the host platform's native process table.
-#[implements("FR-048-AC-2", "FR-048-AC-3")]
+/// Collects the invoking user's process references without elevated rights.
+/// Completeness describes that user's live processes, not inaccessible other users.
+#[implements("FR-048-AC-2", "FR-048-AC-3", "FR-048-AC-12")]
 pub fn system_process_table() -> io::Result<ProcessTable> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        linux_process_table(Path::new("/proc"))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        macos_process_table()
+        native_process_table()
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -356,7 +367,7 @@ pub fn system_mount_table() -> io::Result<Vec<MountEntry>> {
     let text = std::fs::read_to_string("/proc/self/mountinfo")?;
     #[cfg(target_os = "macos")]
     let text = {
-        let output = Command::new("mount").arg("-p").output()?;
+        let output = Command::new("mount").output()?;
         if !output.status.success() {
             return Err(io::Error::other("mount table command failed"));
         }
@@ -368,12 +379,25 @@ pub fn system_mount_table() -> io::Result<Vec<MountEntry>> {
     parse_mount_table(&text)
 }
 
-/// Parses Linux mountinfo or BSD `mount -p` rows.
+/// Parses Linux mountinfo, native macOS mount output, or BSD `mount -p` rows.
 #[implements("FR-048-AC-10")]
 pub fn parse_mount_table(text: &str) -> io::Result<Vec<MountEntry>> {
     let mut entries = Vec::new();
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        let fields = if let Some((before, after)) = line.split_once(" - ") {
+        let fields = if let Some((source, rest)) = line.split_once(" on ") {
+            let (mount_point, options) = rest
+                .rsplit_once(" (")
+                .ok_or_else(|| io::Error::other("mount table contains a malformed macOS row"))?;
+            let options = options
+                .strip_suffix(')')
+                .ok_or_else(|| io::Error::other("mount table contains an unclosed macOS row"))?;
+            let fs_type = options.split(',').next().unwrap_or_default().trim();
+            (
+                source.trim().to_owned(),
+                unescape_mount_field(mount_point),
+                fs_type.to_owned(),
+            )
+        } else if let Some((before, after)) = line.split_once(" - ") {
             let left = before.split_whitespace().collect::<Vec<_>>();
             let right = after.split_whitespace().collect::<Vec<_>>();
             if left.len() < 5 || right.len() < 2 {
@@ -395,7 +419,11 @@ pub fn parse_mount_table(text: &str) -> io::Result<Vec<MountEntry>> {
                 fields[2].to_owned(),
             )
         };
-        if fields.0.is_empty() || fields.1.is_empty() || fields.2.is_empty() {
+        if fields.0.is_empty()
+            || !Path::new(&fields.1).is_absolute()
+            || fields.2.is_empty()
+            || fields.2.contains(char::is_whitespace)
+        {
             return Err(io::Error::other("mount table contains an incomplete row"));
         }
         entries.push(MountEntry {
@@ -411,10 +439,12 @@ pub fn parse_mount_table(text: &str) -> io::Result<Vec<MountEntry>> {
     Ok(entries)
 }
 
+#[implements("FR-048-AC-10")]
 fn unescape_mount_field(field: &str) -> String {
     field
         .replace("\\040", " ")
         .replace("\\011", "\t")
+        .replace("\\012", "\n")
         .replace("\\012", "\n")
         .replace("\\134", "\\")
 }
@@ -471,179 +501,139 @@ pub fn mount_filesystem_matches(left: &Path, right: &Path, mounts: &[MountEntry]
     }
 }
 
-#[cfg(target_os = "linux")]
-#[implements("FR-048-AC-2")]
-fn linux_process_table(proc_root: &Path) -> io::Result<ProcessTable> {
-    const MAX_PROCESSES: usize = 50_000;
-    const MAX_PROCESS_PATHS: usize = 16_384;
-    const MAX_REFERENCES: usize = 1_000_000;
-    use std::fs;
-    let mut table = ProcessTable {
-        processes: Vec::new(),
-        complete: true,
-    };
-    let mut references = 0_usize;
-    for entry in fs::read_dir(proc_root)? {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => {
-                table.complete = false;
-                continue;
-            }
-        };
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse().ok())
-        else {
-            continue;
-        };
-        if table.processes.len() >= MAX_PROCESSES {
-            table.complete = false;
-            break;
-        }
-        let process_dir = entry.path();
-        let mut optional_read_failed = false;
-        let mut read_optional = |name: &str| match fs::read(process_dir.join(name)) {
-            Ok(value) => Some(value),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(_) => {
-                optional_read_failed = true;
-                None
-            }
-        };
-        let cwd = match fs::read_link(process_dir.join("cwd")) {
-            Ok(path) => Some(path),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(_) => {
-                table.complete = false;
-                None
-            }
-        };
-        let cmdline = read_optional("cmdline").unwrap_or_default();
-        let environ = read_optional("environ").unwrap_or_default();
-        if optional_read_failed {
-            table.complete = false;
-        }
-        let mut fds = Vec::new();
-        match fs::read_dir(process_dir.join("fd")) {
-            Ok(entries) => {
-                for fd in entries {
-                    match fd {
-                        Ok(fd) => match fs::read_link(fd.path()) {
-                            Ok(path) => fds.push(path),
-                            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                            Err(_) => table.complete = false,
-                        },
-                        Err(_) => table.complete = false,
-                    }
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(_) => table.complete = false,
-        }
-        let mut maps = Vec::new();
-        match fs::read_to_string(process_dir.join("maps")) {
-            Ok(text) => {
-                for line in text.lines() {
-                    let path = line
-                        .split_whitespace()
-                        .skip(5)
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    if path.starts_with('/') {
-                        maps.push(PathBuf::from(path));
-                    }
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(_) => table.complete = false,
-        }
-        let process_references = fds.len().saturating_add(maps.len());
-        if process_references > MAX_PROCESS_PATHS
-            || references.saturating_add(process_references) > MAX_REFERENCES
-        {
-            table.complete = false;
-            break;
-        }
-        references += process_references;
-        table.processes.push(ProcessEvidence {
-            pid,
-            cwd,
-            cmdline,
-            environ,
-            fds,
-            maps,
-        });
-    }
-    Ok(table)
-}
-
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[implements("FR-048-AC-3")]
-fn macos_process_table() -> io::Result<ProcessTable> {
-    let output = Command::new("lsof")
-        .args(["-nP", "-Ffpn", "-d", "cwd,txt,mem,0-"])
+#[implements("FR-048-AC-12")]
+fn native_process_table() -> io::Result<ProcessTable> {
+    let uid = rustix::process::geteuid().as_raw();
+    // Metadata has no command arguments, so embedded argument newlines cannot
+    // masquerade as missing or malformed process records.
+    let inventory = Command::new("ps")
+        .args(["-axo", "pid=,uid=,stat="])
         .output()?;
-    if !output.status.success() {
-        return Ok(ProcessTable {
-            processes: Vec::new(),
-            complete: false,
-        });
+    if !inventory.status.success() {
+        return Ok(ProcessTable::default());
     }
-    let process_names = Command::new("ps").args(["-axo", "pid=,args="]).output()?;
+    let sampled = owner_process_ids(&inventory.stdout, uid)?;
+    if sampled.is_empty() {
+        return Ok(ProcessTable::default());
+    }
+    let pids = sampled
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let arguments_by_pid = read_process_arguments(&sampled, |pid| {
+        let output = Command::new("ps")
+            .args(["-ww", "-p", &pid.to_string(), "-o", "args="])
+            .output()?;
+        Ok(output.status.success().then_some(output.stdout))
+    })?;
+    let output = Command::new("lsof")
+        .args(["-nP", "-Ffpn", "-a", "-u", &uid.to_string(), "-p", &pids])
+        .output()?;
+    // Reconcile only sampled PIDs; ps itself and exited processes disappear.
+    let remaining = Command::new("ps")
+        .args(["-p", &pids, "-o", "pid=,uid=,stat="])
+        .output()?;
+    let live = owner_process_ids(&remaining.stdout, uid)?;
+    let commands = live
+        .into_iter()
+        .map(|pid| (pid, arguments_by_pid.get(&pid).cloned().unwrap_or_default()))
+        .collect::<BTreeMap<_, _>>();
     let mut environments = BTreeMap::new();
-    for line in String::from_utf8_lossy(&process_names.stdout).lines() {
-        let Some((pid, command)) = line.trim().split_once(char::is_whitespace) else {
-            continue;
-        };
-        let Ok(pid) = pid.trim().parse::<u32>() else {
-            continue;
-        };
-        if is_build_command(command.trim().as_bytes()) {
+    for (pid, command) in &commands {
+        if is_build_command(command) {
+            #[cfg(target_os = "linux")]
+            if let Ok(environment) = std::fs::read(format!("/proc/{pid}/environ"))
+                && environment.len() <= 1_048_576
+            {
+                environments.insert(*pid, environment);
+            }
+            #[cfg(target_os = "macos")]
             match Command::new("ps")
                 .args(["eww", "-p", &pid.to_string(), "-o", "command="])
                 .output()
             {
                 Ok(output) if output.status.success() && output.stdout.len() <= 1_048_576 => {
-                    environments.insert(pid, output.stdout);
+                    environments.insert(*pid, output.stdout);
                 }
                 _ => {}
             }
         }
     }
-    Ok(parse_macos_process_output(
+    Ok(parse_native_process_output(
         &output.stdout,
-        &process_names.stdout,
+        &commands,
         &environments,
-        macos_process_evidence_complete(
-            current_user_is_root(),
-            output.status.success(),
-            process_names.status.success(),
-        ),
+        remaining.status.success()
+            && matches!(output.status.code(), Some(0 | 1))
+            && output.stderr.is_empty(),
     ))
 }
 
-#[cfg(target_os = "macos")]
-#[implements("FR-048-AC-3")]
-fn current_user_is_root() -> bool {
-    Command::new("id")
-        .arg("-u")
-        .output()
-        .is_ok_and(|output| output.status.success() && output.stdout.trim_ascii() == b"0")
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[implements("FR-048-AC-12")]
+fn owner_process_ids(output: &[u8], uid: u32) -> io::Result<Vec<u32>> {
+    if output.len() > 64 * 1024 * 1024 {
+        return Err(io::Error::other("ps inventory exceeds 64 MiB"));
+    }
+    let text =
+        std::str::from_utf8(output).map_err(|_| io::Error::other("ps inventory is not UTF-8"))?;
+    let mut pids = std::collections::BTreeSet::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let malformed = || io::Error::other("ps inventory has a malformed pid/uid/state row");
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        let [pid, owner, state] = fields.as_slice() else {
+            return Err(malformed());
+        };
+        let pid = pid.parse::<u32>().map_err(|_| malformed())?;
+        // Darwin formats the nobody account as -2 rather than its unsigned UID.
+        let owner = owner.parse::<i64>().map_err(|_| malformed())?;
+        // Explicit effective UID excludes setuid login helpers selected by macOS -u.
+        if owner == i64::from(uid) && !state.starts_with(['Z', 'X']) && !pids.insert(pid) {
+            return Err(malformed());
+        }
+        if pids.len() > 50_000 {
+            return Err(io::Error::other("ps inventory exceeds 50000 processes"));
+        }
+    }
+    Ok(pids.into_iter().collect())
 }
 
-#[cfg(target_os = "macos")]
-#[implements("FR-048-AC-3")]
-fn macos_process_evidence_complete(is_root: bool, lsof_ok: bool, ps_ok: bool) -> bool {
-    is_root && lsof_ok && ps_ok
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[implements("FR-048-AC-12")]
+fn read_process_arguments(
+    sampled: &[u32],
+    mut read: impl FnMut(u32) -> io::Result<Option<Vec<u8>>>,
+) -> io::Result<BTreeMap<u32, Vec<u8>>> {
+    let mut commands = BTreeMap::new();
+    let mut bytes = 0_usize;
+    for pid in sampled {
+        if let Some(mut command) = read(*pid)? {
+            if command.len() > 1_048_576 {
+                return Err(io::Error::other("process arguments exceed 1 MiB"));
+            }
+            bytes = bytes.saturating_add(command.len());
+            if bytes > 64 * 1024 * 1024 {
+                return Err(io::Error::other("process arguments exceed 64 MiB"));
+            }
+            if command.last() == Some(&b'\n') {
+                command.pop();
+            }
+            commands.insert(*pid, command);
+        }
+    }
+    Ok(commands)
 }
 
-#[cfg(target_os = "macos")]
+/// Identifies Cargo and rustc from native text or NUL-separated command lines.
+#[implements("FR-048-AC-4")]
 #[implements("FR-048-AC-3")]
-fn is_build_command(command: &[u8]) -> bool {
+#[implements("FR-048-AC-12")]
+pub fn is_build_command(command: &[u8]) -> bool {
     command
-        .split(|byte| byte.is_ascii_whitespace())
+        .split(|byte| *byte == 0 || byte.is_ascii_whitespace())
         .next()
         .and_then(|command| std::str::from_utf8(command).ok())
         .and_then(|command| Path::new(command).file_name())
@@ -651,28 +641,22 @@ fn is_build_command(command: &[u8]) -> bool {
         .is_some_and(|name| matches!(name, "cargo" | "rustc"))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[implements("FR-048-AC-3")]
-fn parse_macos_process_output(
+#[implements("FR-048-AC-2", "FR-048-AC-12")]
+fn parse_native_process_output(
     lsof_output: &[u8],
-    process_names: &[u8],
+    commands: &BTreeMap<u32, Vec<u8>>,
     environments: &BTreeMap<u32, Vec<u8>>,
     sources_complete: bool,
 ) -> ProcessTable {
+    if lsof_output.len() > 64 * 1024 * 1024 {
+        return ProcessTable::default();
+    }
     let mut table = ProcessTable {
         processes: Vec::new(),
         complete: sources_complete,
     };
-    let commands = String::from_utf8_lossy(process_names)
-        .lines()
-        .filter_map(|line| {
-            let (pid, command) = line.trim().split_once(char::is_whitespace)?;
-            Some((
-                pid.trim().parse::<u32>().ok()?,
-                command.trim().as_bytes().to_vec(),
-            ))
-        })
-        .collect::<BTreeMap<_, _>>();
     let mut current: Option<ProcessEvidence> = None;
     let mut current_descriptor: Option<String> = None;
     for line in String::from_utf8_lossy(lsof_output).lines() {
@@ -702,6 +686,26 @@ fn parse_macos_process_output(
     }
     if let Some(process) = current {
         table.processes.push(process);
+    }
+    table
+        .processes
+        .retain(|process| commands.contains_key(&process.pid));
+    for pid in commands.keys() {
+        if !table.processes.iter().any(|process| process.pid == *pid) {
+            table.processes.push(ProcessEvidence {
+                pid: *pid,
+                ..Default::default()
+            });
+        }
+    }
+    if commands.is_empty()
+        || commands.keys().any(|pid| {
+            !table.processes.iter().any(|process| {
+                process.pid == *pid && process.cwd.as_deref().is_some_and(Path::is_absolute)
+            })
+        })
+    {
+        table.complete = false;
     }
     for process in &mut table.processes {
         process.cmdline = commands.get(&process.pid).cloned().unwrap_or_default();
@@ -794,10 +798,78 @@ pub fn target_use(target: &Path, table: &ProcessTable) -> UseState {
     target_use_in_worktree(target, target.parent().unwrap_or(target), table)
 }
 
-/// Canonicalizes a configured worktree root before scanning it.
+/// Canonicalizes a configured checkout root before scanning it.
 #[implements("FR-048-AC-1", "FR-048-AC-5")]
 pub fn canonicalize_worktree_root(root: &Path) -> io::Result<PathBuf> {
     std::fs::canonicalize(root)
+}
+
+/// Discovers targets at depth at most three, retaining the containing Git checkout.
+/// Symlinks, backups and unexpected filesystems are never traversed.
+#[implements("FR-048-AC-11", "FR-048-AC-13")]
+pub fn discover_targets(root: &Path, mounts: &[MountEntry]) -> io::Result<Vec<(PathBuf, PathBuf)>> {
+    let mut pending = vec![(root.to_owned(), 0_u8, None::<PathBuf>)];
+    let mut targets = Vec::new();
+    let mut scanned = 0_usize;
+    while let Some((directory, depth, owner)) = pending.pop() {
+        let owner = if directory.join(".git").exists() {
+            Some(directory.clone())
+        } else {
+            owner
+        };
+        for entry in std::fs::read_dir(&directory)? {
+            let entry = entry?;
+            scanned += 1;
+            if scanned > 100_000 {
+                return Err(io::Error::other(
+                    "worktree discovery exceeded 100000 entries",
+                ));
+            }
+            let kind = entry.file_type()?;
+            if !kind.is_dir()
+                || kind.is_symlink()
+                || matches!(
+                    entry.file_name().to_str(),
+                    Some(".git" | "dev_bak" | "dev_archive")
+                )
+            {
+                continue;
+            }
+            let path = entry.path();
+            if mount_filesystem_matches(&path, root, mounts) != MountSafety::Safe {
+                continue;
+            }
+            if entry.file_name() == "target" {
+                if let Some(owner) = &owner {
+                    targets.push((path, owner.clone()));
+                }
+            } else if depth + 1 < 3 && owner.is_none() {
+                pending.push((path, depth + 1, owner.clone()));
+            }
+        }
+    }
+    targets.sort();
+    Ok(targets)
+}
+
+/// Owner-scoped process evidence only authorizes deletion of this user's output.
+#[implements("FR-048-AC-12")]
+pub fn cleanup_owned_by_current_user(target: &Path, worktree: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let uid = rustix::process::geteuid().as_raw();
+        [target, worktree].iter().all(|path| {
+            std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+                metadata.is_dir() && !metadata.file_type().is_symlink() && metadata.uid() == uid
+            })
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (target, worktree);
+        false
+    }
 }
 
 fn canonical_or_original(path: &Path) -> PathBuf {
@@ -1130,6 +1202,333 @@ mod tests {
     use super::*;
     use ix_trace_rs::trace;
 
+    #[test]
+    #[trace("FR-048-AC-10")]
+    fn native_macos_mount_rows_preserve_space_paths_and_reject_malformed_evidence() {
+        let mounts = parse_mount_table("/dev/root on / (apfs, local, read-only)\n/dev/build on /Volumes/Build - Output (apfs, local, journaled)\n").unwrap();
+        assert_eq!(
+            mounts,
+            vec![
+                MountEntry {
+                    source: "/dev/root".to_owned(),
+                    mount_point: PathBuf::from("/"),
+                    fs_type: "apfs".to_owned()
+                },
+                MountEntry {
+                    source: "/dev/build".to_owned(),
+                    mount_point: PathBuf::from("/Volumes/Build - Output"),
+                    fs_type: "apfs".to_owned()
+                },
+            ]
+        );
+        let escaped = parse_mount_table(
+            "/dev/root on / (apfs, local)\n/dev/other on /work/wt\\012name/target (apfs, local)\n",
+        )
+        .unwrap();
+        assert_eq!(
+            mount_safety(
+                Path::new("/work/wt\nname/target"),
+                Path::new("/work"),
+                &escaped
+            ),
+            MountSafety::Boundary
+        );
+        for invalid in [
+            "/dev/bad on relative (apfs, local)",
+            "/dev/bad on /bad (apfs, local",
+            "/dev/bad on /bad ()",
+        ] {
+            assert!(
+                parse_mount_table(&format!("/dev/root on / (apfs, local)\n{invalid}\n")).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    #[trace("FR-048-AC-4", "FR-048-AC-12")]
+    fn build_commands_accept_native_text_and_nul_separated_process_arguments() {
+        assert!(is_build_command(b"/usr/bin/cargo test -j 4"));
+        assert!(is_build_command(b"/usr/bin/rustc\0--crate-name\0app"));
+        assert!(!is_build_command(b"sh -c cargo test"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[trace("FR-048-AC-12")]
+    fn owner_inventory_excludes_privileged_login_helpers_and_exited_processes() {
+        let pids =
+            owner_process_ids(b"12 0 Ss\n13 501 S\n14 501 Z\n15 502 S\n16 -2 Ss\n", 501).unwrap();
+        assert_eq!(pids, [13]);
+        assert!(owner_process_ids(b"invalid row", 501).is_err());
+        assert!(owner_process_ids(b"12 501 S\n13 invalid S\n", 501).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[trace("FR-048-AC-12")]
+    fn per_pid_argument_reads_preserve_matching_pid_continuations_as_payload() {
+        let mut read_ids = Vec::new();
+        let commands = read_process_arguments(&[13, 16, 20], |pid| {
+            read_ids.push(pid);
+            Ok(match pid {
+                13 => Some(
+                    b"zsh -c echo\n13 numeric continuation\n16 cargo-looking continuation\n"
+                        .to_vec(),
+                ),
+                16 => Some(b"cargo build\n".to_vec()),
+                _ => None,
+            })
+        })
+        .unwrap();
+        assert_eq!(read_ids, [13, 16, 20]);
+        assert_eq!(
+            commands[&13],
+            b"zsh -c echo\n13 numeric continuation\n16 cargo-looking continuation"
+        );
+        assert_eq!(commands[&16], b"cargo build");
+        assert!(!commands.contains_key(&20));
+        let table = parse_native_process_output(
+            b"p13\nfcwd\nn/elsewhere\np16\nfcwd\nn/elsewhere\n",
+            &commands,
+            &BTreeMap::from([(16, Vec::new())]),
+            true,
+        );
+        assert!(table.complete);
+        assert_eq!(table.processes[0].cmdline, commands[&13]);
+    }
+
+    #[test]
+    #[trace("FR-048-AC-11")]
+    fn target_discovery_reaches_three_levels_without_backups_symlinks_or_mount_crossings() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        for name in [
+            "direct",
+            "group/nested",
+            "too/deep/worktree",
+            "dev_bak/saved",
+            "mounted/wt",
+        ] {
+            let worktree = root.join(name);
+            std::fs::create_dir_all(worktree.join("target")).unwrap();
+            std::fs::write(worktree.join(".git"), b"gitdir: fixture").unwrap();
+        }
+        std::fs::create_dir_all(root.join("source/target")).unwrap();
+        std::fs::create_dir_all(root.join("direct/src/target")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("direct"), root.join("linked")).unwrap();
+        let mounts = vec![
+            MountEntry {
+                source: "root".into(),
+                mount_point: root.clone(),
+                fs_type: "fixture".into(),
+            },
+            MountEntry {
+                source: "other".into(),
+                mount_point: root.join("mounted"),
+                fs_type: "fixture".into(),
+            },
+        ];
+        let found = discover_targets(&root, &mounts).unwrap();
+        assert_eq!(
+            found,
+            vec![
+                (root.join("direct/target"), root.join("direct")),
+                (root.join("group/nested/target"), root.join("group/nested"))
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[trace("FR-048-AC-12")]
+    fn unprivileged_process_cwd_evidence_is_complete_only_for_reconciled_live_owner_processes() {
+        let commands = BTreeMap::from([(123, b"cargo".to_vec()), (124, b"editor".to_vec())]);
+        let environments =
+            BTreeMap::from([(123, b"CARGO_TARGET_DIR=/work/active/target\0".to_vec())]);
+        let table = parse_native_process_output(
+            b"p123\nfcwd\nn/work/active\np124\nfcwd\nn/elsewhere\np999\nfcwd\nn/vanished\n",
+            &commands,
+            &environments,
+            true,
+        );
+        assert!(table.complete);
+        assert_eq!(
+            target_use(Path::new("/work/active/target"), &table),
+            UseState::InUse
+        );
+        assert_eq!(
+            target_use(Path::new("/work/idle/target"), &table),
+            UseState::Unused
+        );
+        let missing = parse_native_process_output(
+            b"p123\nfcwd\nn/work/active\n",
+            &commands,
+            &environments,
+            true,
+        );
+        assert!(
+            !missing.complete,
+            "missing live owner cwd never authorizes cleanup"
+        );
+        let failed = parse_native_process_output(
+            b"p123\nfcwd\nn/work/active\n",
+            &BTreeMap::from([(123, b"cargo".to_vec())]),
+            &environments,
+            false,
+        );
+        assert!(!failed.complete);
+        let missing_environment = parse_native_process_output(
+            b"p123\nfcwd\nn/work/active\n",
+            &BTreeMap::from([(123, b"cargo".to_vec())]),
+            &BTreeMap::new(),
+            true,
+        );
+        assert!(!missing_environment.complete);
+        let malformed_inventory = parse_native_process_output(
+            b"p123\nfcwd\nn/work/active\n",
+            &BTreeMap::from([(123, Vec::new())]),
+            &environments,
+            true,
+        );
+        assert!(!malformed_inventory.complete);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[trace("FR-048-AC-5", "FR-048-AC-11", "FR-048-AC-12")]
+    fn discovered_hour_idle_targets_clean_only_after_fresh_complete_owner_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let worktree = root.join("group/idle");
+        let target = worktree.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(worktree.join(".git"), b"gitdir: fixture").unwrap();
+        std::fs::write(worktree.join("source.rs"), b"source").unwrap();
+        let mounts = vec![MountEntry {
+            source: "root".into(),
+            mount_point: root.clone(),
+            fs_type: "fixture".into(),
+        }];
+        let found = discover_targets(&root, &mounts).unwrap();
+        assert_eq!(found, vec![(target.clone(), worktree.clone())]);
+        assert!(cleanup_owned_by_current_user(&target, &worktree));
+        assert!(!cleanup_owned_by_current_user(
+            &root.join("missing"),
+            &worktree
+        ));
+        let policy = HostPolicy {
+            free_floor_bytes: 1,
+            idle_age_secs: 3600,
+        };
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(10_000);
+        let modified = now - Duration::from_secs(3601);
+        let idle = ProcessTable {
+            processes: vec![],
+            complete: true,
+        };
+        let planned = clean_decision(&target, &worktree, now, modified, &policy, &idle);
+        assert!(planned.eligible);
+        assert_eq!(
+            apply_clean_decision(&planned, false).unwrap().reason,
+            "eligible"
+        );
+        assert!(target.exists());
+        let live = ProcessTable {
+            processes: vec![ProcessEvidence {
+                pid: 12,
+                cwd: Some(worktree.clone()),
+                ..Default::default()
+            }],
+            complete: true,
+        };
+        let active = recheck_clean_decision(&planned, &worktree, now, modified, &policy, &live);
+        assert_eq!(active.reason, "process_in_use");
+        assert!(!active.eligible);
+        let unknown = recheck_clean_decision(
+            &planned,
+            &worktree,
+            now,
+            modified,
+            &policy,
+            &ProcessTable::default(),
+        );
+        assert!(!unknown.eligible);
+        assert_eq!(unknown.reason, "process_evidence_incomplete");
+        let checked = recheck_clean_decision(&planned, &worktree, now, modified, &policy, &idle);
+        assert_eq!(
+            apply_clean_decision(&checked, true).unwrap().reason,
+            "removed"
+        );
+        assert!(!target.exists());
+        assert!(worktree.join("source.rs").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "native unprivileged lsof/ps acceptance check"]
+    #[trace("FR-048-AC-12")]
+    fn native_owner_process_evidence_includes_a_live_target_cwd() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let target = root.join("target");
+        std::fs::create_dir(&target).unwrap();
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .current_dir(&target)
+            .spawn()
+            .unwrap();
+        let result = system_process_table();
+        let _ = child.kill();
+        let _ = child.wait();
+        let table = result.unwrap();
+        for process in table
+            .processes
+            .iter()
+            .filter(|process| process.cwd.is_none())
+        {
+            let executable = process
+                .cmdline
+                .split(|byte| byte.is_ascii_whitespace())
+                .next()
+                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                .and_then(|name| Path::new(name).file_name())
+                .unwrap_or_default();
+            eprintln!(
+                "missing cwd: pid={} executable={:?}",
+                process.pid, executable
+            );
+        }
+        assert!(
+            table
+                .processes
+                .iter()
+                .any(|process| process.pid == child.id()
+                    && process.cwd.as_deref() == Some(target.as_path()))
+        );
+        assert_eq!(target_use(&target, &table), UseState::InUse);
+        eprintln!(
+            "native process evidence: scope=current_user processes={} complete={} missing_cwd={} missing_build_environment={}",
+            table.processes.len(),
+            table.complete,
+            table
+                .processes
+                .iter()
+                .filter(|process| process.cwd.is_none())
+                .count(),
+            table
+                .processes
+                .iter()
+                .filter(|process| is_build_command(&process.cmdline) && process.environ.is_empty())
+                .count()
+        );
+        assert!(
+            table.complete,
+            "native host must provide complete owner-scoped evidence"
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     #[trace("FR-048-AC-3", "FR-050-AC-4")]
@@ -1138,9 +1537,9 @@ mod tests {
             (123, b"HERDR_PANE_ID=tab-123\0".to_vec()),
             (124, b"OTHER=value\0".to_vec()),
         ]);
-        let table = parse_macos_process_output(
+        let table = parse_native_process_output(
             b"p123\nfcwd\nn/Users/peter/dev/worktrees/active\nftxt\nn/usr/bin/cargo\np124\nfcwd\nn/Users/peter/other\nf0\nn/dev/null\n",
-            b"123 cargo\n124 cargo\n",
+            &BTreeMap::from([(123, b"cargo".to_vec()), (124, b"cargo".to_vec())]),
             &environments,
             true,
         );
@@ -1829,6 +2228,7 @@ mod tests {
             prunable_worktrees: Vec::new(),
             orphan_build_processes: Vec::new(),
             process_table_complete: true,
+            process_evidence_scope: ProcessEvidenceScope::CurrentUser,
             mount_table_complete: true,
             unsupported: false,
         };
@@ -1912,7 +2312,15 @@ mod tests {
     #[test]
     #[trace("FR-048-AC-3", "FR-048-AC-5")]
     fn incomplete_macos_process_visibility_never_authorizes_cleanup() {
-        assert!(!macos_process_evidence_complete(false, true, true));
+        assert!(
+            !parse_native_process_output(
+                b"",
+                &BTreeMap::from([(123, b"editor".to_vec())]),
+                &BTreeMap::new(),
+                true
+            )
+            .complete
+        );
         let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(10_000);
         let decision = clean_decision(
             Path::new("/work/wt/target"),
@@ -1925,7 +2333,13 @@ mod tests {
             },
             &ProcessTable {
                 processes: Vec::new(),
-                complete: macos_process_evidence_complete(false, true, true),
+                complete: parse_native_process_output(
+                    b"",
+                    &BTreeMap::from([(123, b"editor".to_vec())]),
+                    &BTreeMap::new(),
+                    true,
+                )
+                .complete,
             },
         );
         assert_eq!(decision.reason, "process_evidence_incomplete");

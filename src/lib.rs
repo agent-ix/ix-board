@@ -92,6 +92,7 @@ pub use focus_activity::DEFAULT_CLOSED_SINCE_SECONDS;
 use focus_activity::{
     ActivityWindow, finish_activity, focus_issue_with_state, project_events, recently_closed,
 };
+use ix_trace_rs::implements;
 use model::{compare_f64, issue_is_open};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -153,6 +154,16 @@ pub enum Error {
     /// The ordinary refresh could not acquire its shared lock within five seconds.
     #[error("Linear refresh lock timed out")]
     RefreshLockTimeout,
+    /// The refresh lock wait expired, with diagnostic owner metadata.
+    #[error(
+        "Linear refresh lock timed out after 5s at {path}; recorded holder {holder}; wait for that process or check its status; do not delete a held lock file"
+    )]
+    RefreshLockHeld {
+        /// Adjacent operating-system lock file.
+        path: PathBuf,
+        /// Recorded PID, or unknown for legacy writers.
+        holder: String,
+    },
     /// An explicit cache lifetime was malformed or nonpositive.
     #[error("cache TTL must be a positive integer number of seconds")]
     InvalidCacheTtl,
@@ -234,6 +245,17 @@ pub enum Error {
     /// The cache database permissions could not be restricted.
     #[error("could not restrict cache database permissions: {0}")]
     CachePermissions(#[source] std::io::Error),
+    /// A selected cache could not be used; includes the path and recovery action.
+    #[error(
+        "cache at {path} is unavailable: {source}; fix its ownership/permissions (including its directory and adjacent .refresh.lock), or set IX_BOARD_CACHE_PATH to a writable local database path"
+    )]
+    CachePathUnavailable {
+        /// Database location that failed validation.
+        path: PathBuf,
+        /// Original filesystem or SQLite error.
+        #[source]
+        source: Box<Error>,
+    },
     /// A cached timestamp could not be represented safely.
     #[error("cached timestamp overflow")]
     CacheTimestamp,
@@ -491,12 +513,13 @@ pub enum RefreshOutcome {
 }
 
 impl RefreshOutcome {
+    #[implements("FR-004-AC-23")]
     pub(crate) fn from_error(error: &Error) -> Self {
         match error {
             Error::QuotaAdmissionRefused { decision } => Self::QuotaRefused {
                 decision: (**decision).clone(),
             },
-            Error::RefreshLockTimeout => Self::RefreshLockRefused,
+            Error::RefreshLockTimeout | Error::RefreshLockHeld { .. } => Self::RefreshLockRefused,
             Error::LinearRateLimited { .. }
             | Error::LinearLocalBudgetExhausted { .. }
             | Error::LinearQueryComplexityExceeded { .. }
@@ -591,8 +614,7 @@ impl<S: WorkspaceSource> ReadService<S, SystemClock> {
     }
 }
 
-/// Returns ix-board's SQLite cache path, creating the parent directory for the
-/// platform default.
+/// Returns a writable SQLite cache path, creating its parent and validating writes.
 ///
 /// `IX_BOARD_CACHE_PATH` overrides the platform location. Without that override,
 /// Linux uses `$XDG_CACHE_HOME/ix-board` or `$HOME/.cache/ix-board`, macOS uses
@@ -604,13 +626,34 @@ impl<S: WorkspaceSource> ReadService<S, SystemClock> {
 /// when neither standard environment variable is available. The standard library
 /// has no portable API for resolving the operating system account database, so
 /// callers in stripped environments can provide `XDG_CACHE_HOME` explicitly.
+/// An inaccessible default falls back to a private per-user temporary directory.
+/// Explicit overrides, corrupt databases and contention return a path-bearing error.
+#[implements("FR-004-AC-5", "FR-004-AC-6", "FR-004-AC-22")]
 pub fn default_cache_path() -> Result<PathBuf, Error> {
-    if let Some(path) = std::env::var_os("IX_BOARD_CACHE_PATH") {
-        return Ok(PathBuf::from(path));
+    let explicit = std::env::var_os("IX_BOARD_CACHE_PATH").map(PathBuf::from);
+    if let Some(path) = explicit {
+        return cache::select_cache_path(Some(&path), &path, &path);
     }
-    let cache_dir = platform_cache_dir()?;
-    std::fs::create_dir_all(&cache_dir).map_err(Error::CacheDirectory)?;
-    Ok(cache_dir.join("linear.sqlite3"))
+    let preferred = platform_cache_dir()?.join("linear.sqlite3");
+    #[cfg(unix)]
+    let user = rustix::process::geteuid().as_raw().to_string();
+    #[cfg(not(unix))]
+    let user = {
+        use sha2::{Digest, Sha256};
+        format!(
+            "{:x}",
+            Sha256::digest(
+                home_dir()
+                    .unwrap_or_default()
+                    .as_os_str()
+                    .as_encoded_bytes()
+            )
+        )
+    };
+    let fallback = std::env::temp_dir()
+        .join(format!("ix-board-{user}"))
+        .join("linear.sqlite3");
+    cache::select_cache_path(None, &preferred, &fallback)
 }
 
 #[cfg(target_os = "windows")]

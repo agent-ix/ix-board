@@ -39,6 +39,7 @@ to 14. It SHALL perform read-only Linear and GitHub operations.
 | FR-021-AC-1 | Given structured Linear issues, pull requests, and branches for a project, reconciliation emits the applicable five finding groups deterministically and resolves project identity without substituting an unknown or ambiguous project. | Test |
 | FR-021-AC-2 | When the Linear attachment connection has another page after its 50 returned URLs, the issue is marked incomplete, a warning is emitted, and no all-linked-pull-requests-merged conclusion is emitted; the fixture includes 50 attached merged PRs and an unseen open PR. | Test |
 | FR-021-AC-3 | The CLI accepts the project selector, optional scope, and positive stale-day threshold; terminal and JSON output expose the same five finding groups. | Test |
+| FR-021-AC-4 | A project's UUID, slug/identifier and exact name resolve to the same canonical project and identical reconciliation findings, without case sensitivity. UUID or slug matches take precedence over colliding names, using the same resolver as explicit project scope; unknown selectors and ambiguous names still fail. | Test |
 
 ## Dependencies
 
