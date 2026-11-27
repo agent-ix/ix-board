@@ -196,7 +196,7 @@ low.
 
 ## Releases
 
-Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`, which builds the `x86_64-unknown-linux-gnu` binary and attaches the tarball and `.sha256` to the GitHub release, creating the release if it does not exist. The `aarch64-apple-darwin` asset is built and attached by hand. When the release already exists, upload it with `gh release upload <tag> <tarball> <tarball>.sha256`.
+Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`, which builds `ix-board` and `ix-team-exporter` for `x86_64-unknown-linux-gnu`. It attaches both binaries and the license in one tarball, with a `.sha256` checksum. The workflow also builds the native Windows CLI for `x86_64-pc-windows-msvc`, packaged with its license. Windows exporter collection uses WSL. The `aarch64-apple-darwin` asset uses the Linux archive layout and is built and attached by hand. When the release already exists, upload it with `gh release upload <tag> <tarball> <tarball>.sha256`.
 
 ## Contributing
 
