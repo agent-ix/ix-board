@@ -238,6 +238,7 @@ pub fn from_status(text: &str, expected_host: &str, now_ms: u64) -> HostStabilit
     from_status_at(text, expected_host, now_ms, now_ms)
 }
 
+#[implements("FR-051-AC-1", "FR-051-AC-2", "FR-051-AC-3", "FR-051-AC-5")]
 fn from_status_at(
     text: &str,
     expected_host: &str,
@@ -330,6 +331,7 @@ fn valid_request(request: &RequestInput, observed_at_ms: u64) -> bool {
         && request.blockers().is_none_or(valid_blockers)
 }
 
+#[implements("FR-051-AC-3", "FR-051-AC-5")]
 fn valid_blockers(reasons: &[BlockObservation]) -> bool {
     let mut seen = BTreeSet::new();
     reasons.iter().all(|reason| {
@@ -723,6 +725,7 @@ pub fn collect(hosts: &[Arc<dyn Host>], now_ms: u64) -> StabilityReport {
     collect_at(hosts, now_ms, now_ms)
 }
 
+#[implements("FR-051-AC-5")]
 fn collect_at(hosts: &[Arc<dyn Host>], window_end_ms: u64, freshness_ms: u64) -> StabilityReport {
     let collection_started = Instant::now();
     let mut report = StabilityReport {
@@ -1113,9 +1116,11 @@ mod collection_tests {
 #[cfg(test)]
 mod review_regressions {
     use super::*;
+    use ix_trace_rs::trace;
     use serde_json::json;
 
     #[test]
+    #[trace("FR-051-AC-1", "FR-051-AC-5")]
     fn stability_freshness_after_slow_reads_preserves_requested_window_end() {
         let input = r#"{"schema_version":1,"host":"draco","observed_at_ms":100010000,"requests":[{"request_id":"before","class":"point","state":"succeeded","enqueued_at_ms":99990000,"ended_at_ms":99999000},{"request_id":"after","class":"point","state":"succeeded","enqueued_at_ms":100001000,"ended_at_ms":100009000}],"events":[]}"#;
         let report = from_status_at(input, "draco", 100_000_000, 100_010_000);
@@ -1133,6 +1138,7 @@ mod review_regressions {
     }
 
     #[test]
+    #[trace("FR-051-AC-3", "FR-051-AC-5")]
     fn stability_invalid_event_blocker_baselines_cannot_inflate_seconds() {
         let source = json!({"schema_version":1,"host":"draco","observed_at_ms":100000000,"requests":[{"request_id":"old","class":"point","lifecycle_state":"running","queued_at_ms":96000000,"admitted_at_ms":96410000,"queued_seconds":410,"blocked_reasons":[{"reason":"memory_budget","value":100,"limit":90,"seconds":15.0}]}],"events":[{"event_id":"baseline","observed_at_ms":96400000,"request_id":"old","lifecycle_state":"queued","blocked_reasons":[]}]});
         for baseline in [
@@ -1161,6 +1167,7 @@ mod review_regressions {
     }
 
     #[test]
+    #[trace("FR-051-AC-1", "FR-051-AC-3")]
     fn stability_refused_attempt_retains_requested_memory_without_queue_entry() {
         let input = r#"{"schema_version":1,"host":"draco","observed_at_ms":100000000,"requests":[],"events":[{"event_id":"refused","observed_at_ms":99999000,"request_id":"memory-refusal","class":"block","lifecycle_state":"refused","queued_at_ms":null,"finished_at_ms":99999000,"requested_memory_bytes":500,"granted_memory_bytes":null,"code":"LB_REFUSED_MEMORY_BUDGET"}]}"#;
         let report = from_status(input, "draco", 100_000_000).last_1h.unwrap();
