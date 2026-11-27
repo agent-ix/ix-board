@@ -1558,8 +1558,44 @@ mod tests {
     }
 
     #[trace("FR-039-AC-12")]
+    #[trace("FR-035-AC-11")]
     #[test]
-    fn completed_local_orders_without_focus_are_not_reprocessed() {
+    fn recent_confirmed_orders_fill_deadline_focus_once_without_changing_the_outcome() {
+        let (_directory, config, path) = test_ledger();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute_batch(
+            "INSERT INTO assignment_history(lane,ticket,assigned_at,order_id,expect_ticket,
+               sent_at,deadline_at,result,result_at,confirm_latency_s,focus_at_deadline,
+               sender_role,sender_addr)
+             VALUES('test-server:test-workspace:test-coder','SWM-9',100,'recent-order','SWM-9',100,200,
+               'confirmed',150,1,NULL,'minder','test-server:test-workspace:test-minder');",
+        ).unwrap();
+        let mut bus = expired_bus(false);
+        bus.expired.orders.clear();
+        bus.receipts.clear();
+        let settings = TickSettings::default();
+        assert_eq!(complete_pending(&config, &settings, &mut bus).unwrap(), 1);
+        let stored: (String, i64, i64, String) = connection.query_row(
+            "SELECT result,result_at,confirm_latency_s,focus_at_deadline FROM assignment_history
+             WHERE order_id='recent-order'",
+            [],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+        ).unwrap();
+        assert_eq!(stored, ("confirmed".into(), 150, 1, "no_worktree".into()));
+        let focus_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM order_focus_at_deadline WHERE order_id='recent-order'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(focus_rows, 1);
+        assert_eq!(complete_pending(&config, &settings, &mut bus).unwrap(), 0);
+    }
+
+    #[trace("FR-039-AC-12")]
+    #[test]
+    fn completed_local_orders_outside_receipt_retention_are_not_reprocessed() {
         let (_directory, config, path) = test_ledger();
         let settings = TickSettings::default();
         let connection = rusqlite::Connection::open(&path).unwrap();
@@ -1575,6 +1611,7 @@ mod tests {
             .unwrap();
         drop(connection);
         let mut bus = expired_bus(false);
+        bus.now_ms = 7 * 24 * 60 * 60 * 1_000 + 1_200;
         bus.expired.orders.clear();
         bus.receipts.clear();
 
