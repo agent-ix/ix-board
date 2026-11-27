@@ -5,6 +5,7 @@
 
 use crate::program_review::ProgramScope;
 use crate::{Error, Issue, Project, ProjectId, WorkflowStateType, WorkspaceSnapshot};
+use ix_trace_rs::implements;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::{Command, Stdio};
@@ -102,6 +103,7 @@ pub struct ReconcileEvidence {
 }
 
 /// Resolve a project using the shared UUID, slug and exact-name identity rules.
+#[implements("FR-021-AC-1", "FR-021-AC-4")]
 pub fn resolve_project<'a>(
     snapshot: &'a WorkspaceSnapshot,
     selector: &str,

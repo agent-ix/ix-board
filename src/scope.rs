@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::read_bound::Budget;
 use crate::{Error, IssueId, Project, ProjectId, TeamKey, WorkflowStateType, WorkspaceSnapshot};
+use ix_trace_rs::implements;
 
 /// Explicit assignment selectors, combined as a union within an optional team boundary.
 #[derive(Clone, Debug, Default)]
@@ -83,6 +84,7 @@ pub(crate) fn resolve_initiative_id_within(
 }
 
 /// Resolve a project selector, preferring its UUID or identifier over a colliding name.
+#[implements("FR-021-AC-4")]
 pub(crate) fn resolve_project_id(
     snapshot: &WorkspaceSnapshot,
     value: &str,
@@ -91,6 +93,7 @@ pub(crate) fn resolve_project_id(
 }
 
 /// [`resolve_project_id`] that stops with [`Error::ReadTimeout`] once `budget` has expired.
+#[implements("FR-021-AC-4")]
 pub(crate) fn resolve_project_id_within(
     snapshot: &WorkspaceSnapshot,
     value: &str,
