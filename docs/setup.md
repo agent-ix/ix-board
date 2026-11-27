@@ -84,8 +84,8 @@ using the system temporary directory when `TMPDIR` is unset. The fallback direct
 belongs to the invoking user with mode `0700`. The operating system may clear it.
 `ix-board cache status --json` reports the selected `cache_path`.
 
-An explicit override failure names the path and asks you to fix permissions or
-choose another writable path. Parent directories are created automatically.
+An override failure names the path; fix permissions or choose a writable path.
+Parent directories are created automatically.
 Corruption and SQLite contention remain errors.
 
 Lock contention immediately reports the holder process ID (PID), age and path on stderr.
