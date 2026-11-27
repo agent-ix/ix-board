@@ -1206,8 +1206,10 @@ mod review_regressions {
 #[cfg(test)]
 mod contract_clarification_tests {
     use super::*;
+    use ix_trace_rs::trace;
 
     #[test]
+    #[trace("FR-051-AC-1", "FR-051-AC-2", "FR-051-AC-4")]
     fn stability_successful_degraded_supervision_is_success_with_a_diagnostic() {
         let input = r#"{"schema_version":1,"host":"draco","observed_at_ms":100000000,"requests":[{"request_id":"degraded","class":"point","state":"succeeded","lifecycle_state":"succeeded","queued_at_ms":99990000,"admitted_at_ms":99991000,"running_at_ms":99992000,"finished_at_ms":99999000,"exit_code":0,"code":"LB_SUPERVISION_LOST","message":"degraded supervision"}],"events":[]}"#;
         let hour = from_status(input, "draco", 100_000_000).last_1h.unwrap();
@@ -1222,8 +1224,10 @@ mod contract_clarification_tests {
 #[cfg(test)]
 mod status_memory_tests {
     use super::*;
+    use ix_trace_rs::trace;
 
     #[test]
+    #[trace("FR-051-AC-3", "FR-051-AC-5")]
     fn stability_status_memory_needed_and_free_budget_are_distinct_and_optional() {
         let input = r#"{"schema_version":1,"host":"draco","observed_at_ms":100000000,"requests":[{"request_id":"waiting","class":"block","state":"queued","enqueued_at_ms":99990000,"requested_memory_bytes":500,"granted_memory_bytes":null,"memory_needed_bytes":600,"memory_free_budget_bytes":300}],"events":[]}"#;
         let report = from_status(input, "draco", 100_000_000);
