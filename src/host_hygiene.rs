@@ -592,6 +592,7 @@ fn owner_process_ids(output: &[u8], uid: u32) -> io::Result<Vec<u32>> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[implements("FR-048-AC-12")]
 fn process_arguments(output: &[u8], sampled: &[u32]) -> io::Result<BTreeMap<u32, String>> {
     if output.len() > 64 * 1024 * 1024 {
         return Err(io::Error::other("ps arguments exceed 64 MiB"));
@@ -625,6 +626,7 @@ fn process_arguments(output: &[u8], sampled: &[u32]) -> io::Result<BTreeMap<u32,
     Ok(commands)
 }
 /// Identifies Cargo and rustc from native text or NUL-separated command lines.
+#[implements("FR-048-AC-4")]
 #[implements("FR-048-AC-3")]
 #[implements("FR-048-AC-12")]
 pub fn is_build_command(command: &[u8]) -> bool {
