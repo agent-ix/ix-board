@@ -501,6 +501,12 @@ may be set in the ix-board settings file under `[hygiene]`; command-line values 
 configured ones. The default policy floor is 100 GiB, with 150 GiB for terra; the default idle age
 is 60 minutes. Set `hygiene.default_free_floor_gb`, a host-specific
 `hygiene.hosts.<host>.free_floor_gb`, or `hygiene.idle_minutes` to change those policy fields.
+Discovery includes targets up to three directory levels below the worktree root,
+including grouped worktrees. It skips symlinks, backups and unexpected filesystems.
+On macOS and Linux, install `lsof` and `ps`; inspection runs without elevated rights.
+`process_evidence_scope: current_user` identifies the invoking user's process inventory.
+Missing live cwd records, failed process commands, and unavailable build environments
+leave evidence incomplete. Exited processes do not block an otherwise complete inventory.
 Exit status is 0 when clear,
 1 when findings exist, 2 when required evidence is unavailable, and 3 on unsupported Windows.
 
@@ -511,7 +517,14 @@ ix-board hygiene clean --host <HOST> [--free-floor-gb <GIB>] [--root <WORKTREES>
 ```
 
 Dry-run by default. `--apply` removes only old `target/` directories under discovered Git
-worktrees when complete process evidence proves they are unused. Example policy:
+worktrees when complete process evidence proves they are unused.
+
+Cleanup checks targets and worktrees owned by the invoking user. Run it as the
+account that runs the builds, in a worktree root reserved for that account.
+Other users' processes fall outside this evidence scope. Cleanup rechecks ownership,
+process references and modification times before removal; incomplete evidence preserves the target.
+
+Example policy:
 
 ```toml
 [hygiene]

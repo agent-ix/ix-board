@@ -19,6 +19,95 @@ pub const CACHE_TTL_SECONDS: i64 = 300;
 /// The lock wait SQLite connections use outside a bounded read.
 const LEGACY_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Validates the database and its lock before transport and snapshot readers share it.
+
+pub(crate) fn select_cache_path(
+    explicit: Option<&Path>,
+    preferred: &Path,
+    fallback: &Path,
+) -> Result<PathBuf, Error> {
+    let path = explicit.unwrap_or(preferred);
+    match probe_cache_path(path, false) {
+        Ok(()) => Ok(path.to_owned()),
+        Err(error) if explicit.is_none() && cache_access_failure(&error) => {
+            probe_cache_path(fallback, true).map_err(|fallback_error| {
+                Error::CachePathUnavailable {
+                    path: preferred.to_owned(),
+                    source: Box::new(Error::CachePathUnavailable {
+                        path: fallback.to_owned(),
+                        source: Box::new(fallback_error),
+                    }),
+                }
+            })?;
+            Ok(fallback.to_owned())
+        }
+        Err(error) => Err(Error::CachePathUnavailable {
+            path: path.to_owned(),
+            source: Box::new(error),
+        }),
+    }
+}
+
+fn cache_access_failure(error: &Error) -> bool {
+    match error {
+        Error::CachePermissions(_) | Error::CacheDirectory(_) => true,
+        Error::Cache(rusqlite::Error::SqliteFailure(code, _)) => matches!(
+            code.code,
+            ErrorCode::ReadOnly
+                | ErrorCode::CannotOpen
+                | ErrorCode::PermissionDenied
+                | ErrorCode::SystemIoFailure
+        ),
+        _ => false,
+    }
+}
+
+fn probe_cache_path(path: &Path, private: bool) -> Result<(), Error> {
+    if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
+        if private {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+                match std::fs::DirBuilder::new().mode(0o700).create(parent) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(Error::CacheDirectory(error)),
+                }
+                let metadata =
+                    std::fs::symlink_metadata(parent).map_err(Error::CachePermissions)?;
+                if !metadata.is_dir()
+                    || metadata.file_type().is_symlink()
+                    || metadata.uid() != rustix::process::geteuid().as_raw()
+                    || metadata.permissions().mode() & 0o777 != 0o700
+                {
+                    return Err(Error::CachePermissions(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "temporary cache directory must be owned by this user, mode 0700, and not a symlink",
+                    )));
+                }
+            }
+            #[cfg(not(unix))]
+            std::fs::create_dir_all(parent).map_err(Error::CacheDirectory)?;
+        } else {
+            std::fs::create_dir_all(parent).map_err(Error::CacheDirectory)?;
+        }
+    }
+    restrict_permissions(path)?;
+    restrict_permissions(&refresh_lock_path(path))?;
+    let connection = Connection::open(path).map_err(Error::Cache)?;
+    connection
+        .busy_timeout(LEGACY_BUSY_TIMEOUT)
+        .map_err(Error::Cache)?;
+    connection.execute_batch("BEGIN IMMEDIATE; CREATE TABLE IF NOT EXISTS ix_board_write_probe (value INTEGER); DROP TABLE ix_board_write_probe; ROLLBACK;").map_err(Error::Cache)?;
+    Ok(())
+}
+
+fn refresh_lock_path(path: &Path) -> PathBuf {
+    let mut lock_path = path.as_os_str().to_owned();
+    lock_path.push(".refresh.lock");
+    PathBuf::from(lock_path)
+}
+
 /// Read-only source of Unix timestamps, replaceable for deterministic tests.
 pub trait Clock: Send + Sync {
     /// Current Unix timestamp in seconds.
@@ -373,12 +462,18 @@ pub(crate) struct RefreshLock {
 
 impl RefreshLock {
     pub(crate) fn acquire(path: &Path, deadline: Option<&Deadline<'_>>) -> Result<Self, Error> {
-        let mut lock_path = path.as_os_str().to_owned();
-        lock_path.push(".refresh.lock");
-        let file = std::fs::OpenOptions::new()
+        use std::io::{Read, Seek, Write};
+        let lock_path = refresh_lock_path(path);
+        restrict_permissions(&lock_path).map_err(|error| Error::CachePathUnavailable {
+            path: lock_path.clone(),
+            source: Box::new(error),
+        })?;
+        let mut file = std::fs::OpenOptions::new()
             .create(true)
-            .append(true)
-            .open(PathBuf::from(lock_path))
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
             .map_err(Error::CachePermissions)?;
         let started = Instant::now();
         loop {
@@ -386,7 +481,13 @@ impl RefreshLock {
                 deadline.remaining()?;
             }
             match file.try_lock() {
-                Ok(()) => return Ok(Self { _file: file }),
+                Ok(()) => {
+                    file.set_len(0).map_err(Error::CachePermissions)?;
+                    writeln!(file, "pid={}", std::process::id())
+                        .map_err(Error::CachePermissions)?;
+                    file.flush().map_err(Error::CachePermissions)?;
+                    return Ok(Self { _file: file });
+                }
                 Err(std::fs::TryLockError::WouldBlock) => {}
                 Err(std::fs::TryLockError::Error(error)) => {
                     return Err(Error::CachePermissions(error));
@@ -394,7 +495,25 @@ impl RefreshLock {
             }
             let left = LEGACY_BUSY_TIMEOUT.saturating_sub(started.elapsed());
             if left.is_zero() {
-                return Err(Error::RefreshLockTimeout);
+                let mut metadata = Vec::new();
+                file.rewind().map_err(Error::CachePermissions)?;
+                (&file)
+                    .take(128)
+                    .read_to_end(&mut metadata)
+                    .map_err(Error::CachePermissions)?;
+                let metadata = String::from_utf8_lossy(&metadata);
+                let holder = metadata
+                    .trim()
+                    .strip_prefix("pid=")
+                    .and_then(|pid| pid.parse::<u32>().ok())
+                    .map_or_else(
+                        || "unknown (legacy or unavailable metadata)".to_owned(),
+                        |pid| format!("pid={pid}"),
+                    );
+                return Err(Error::RefreshLockHeld {
+                    path: lock_path,
+                    holder,
+                });
             }
             let wait = match deadline {
                 Some(deadline) => left.min(deadline.remaining()?),
@@ -402,6 +521,14 @@ impl RefreshLock {
             };
             std::thread::sleep(wait.min(Duration::from_millis(10)));
         }
+    }
+}
+
+impl Drop for RefreshLock {
+    fn drop(&mut self) {
+        // The OS lock remains held until the file field is dropped. Clearing
+        // diagnostic metadata cannot unlock or replace another owner's file.
+        let _ = self._file.set_len(0);
     }
 }
 
@@ -557,11 +684,17 @@ mod tests {
         std::fs::write(&blocked, b"occupied").unwrap();
         let preferred = blocked.join("linear.sqlite3");
         let fallback = directory.path().join("fallback/linear.sqlite3");
-        assert_eq!(select_cache_path(None, &preferred, &fallback).unwrap(), fallback);
+        assert_eq!(
+            select_cache_path(None, &preferred, &fallback).unwrap(),
+            fallback
+        );
         SnapshotCache::open(&fallback, "test").unwrap();
         let error = select_cache_path(Some(&preferred), &preferred, &fallback).unwrap_err();
         let message = error.to_string();
-        assert!(message.contains(&preferred.display().to_string()), "{message}");
+        assert!(
+            message.contains(&preferred.display().to_string()),
+            "{message}"
+        );
         assert!(message.contains("IX_BOARD_CACHE_PATH"), "{message}");
         assert!(message.contains("writable"), "{message}");
     }
@@ -571,12 +704,20 @@ mod tests {
     fn cache_selection_checks_sqlite_writes_and_lock_path_without_replacing_data() {
         let directory = tempfile::tempdir().unwrap();
         let preferred = directory.path().join("preferred.sqlite3");
-        let fallback = directory.path().join("fallback.sqlite3");
+        let fallback = directory.path().join("fallback/linear.sqlite3");
         std::fs::write(&preferred, b"not sqlite").unwrap();
-        assert!(select_cache_path(None, &preferred, &fallback).is_err(), "corruption is actionable, never hidden by fallback");
+        assert!(
+            select_cache_path(None, &preferred, &fallback).is_err(),
+            "corruption is actionable, never hidden by fallback"
+        );
+        assert_eq!(std::fs::read(&preferred).unwrap(), b"not sqlite");
         std::fs::remove_file(&preferred).unwrap();
+        std::fs::remove_file(refresh_lock_path(&preferred)).unwrap();
         std::fs::create_dir(refresh_lock_path(&preferred)).unwrap();
-        assert_eq!(select_cache_path(None, &preferred, &fallback).unwrap(), fallback);
+        assert_eq!(
+            select_cache_path(None, &preferred, &fallback).unwrap(),
+            fallback
+        );
     }
 
     #[test]
@@ -587,18 +728,76 @@ mod tests {
         let path = directory.path().join("cache.sqlite3");
         let lock = RefreshLock::acquire(&path, None).unwrap();
         let metadata = std::fs::read_to_string(refresh_lock_path(&path)).unwrap();
-        assert!(metadata.contains(&format!("pid={}", std::process::id())), "{metadata}");
+        assert!(
+            metadata.contains(&format!("pid={}", std::process::id())),
+            "{metadata}"
+        );
         let started = Instant::now();
-        let error = RefreshLock::acquire(&path, None).err().expect("held lock times out");
+        let error = RefreshLock::acquire(&path, None)
+            .err()
+            .expect("held lock times out");
         assert!(started.elapsed() < Duration::from_secs(6));
         let message = error.to_string();
-        assert!(message.contains(&format!("pid={}", std::process::id())), "{message}");
-        assert!(message.contains(&refresh_lock_path(&path).display().to_string()), "{message}");
+        assert!(
+            message.contains(&format!("pid={}", std::process::id())),
+            "{message}"
+        );
+        assert!(
+            message.contains(&refresh_lock_path(&path).display().to_string()),
+            "{message}"
+        );
         drop(lock);
-        let mut stale = std::fs::OpenOptions::new().write(true).truncate(true).open(refresh_lock_path(&path)).unwrap();
+        let mut stale = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(refresh_lock_path(&path))
+            .unwrap();
         stale.write_all(b"pid=999999\n").unwrap();
         let _recovered = RefreshLock::acquire(&path, None).unwrap();
-        assert!(!std::fs::read_to_string(refresh_lock_path(&path)).unwrap().contains("999999"));
+        assert!(
+            !std::fs::read_to_string(refresh_lock_path(&path))
+                .unwrap()
+                .contains("999999")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "native unprivileged Unix SQLite directory-permission acceptance"]
+    #[trace("FR-004-AC-22")]
+    fn cache_selection_recovers_from_readonly_sqlite_journal_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        assert_ne!(
+            rustix::process::geteuid().as_raw(),
+            0,
+            "run as an unprivileged user"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("readonly");
+        std::fs::create_dir(&parent).unwrap();
+        let preferred = parent.join("linear.sqlite3");
+        let connection = Connection::open(&preferred).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE retained(value TEXT); INSERT INTO retained VALUES('saved');",
+            )
+            .unwrap();
+        drop(connection);
+        restrict_permissions(&preferred).unwrap();
+        restrict_permissions(&refresh_lock_path(&preferred)).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let fallback = directory.path().join("private/linear.sqlite3");
+        let selected = select_cache_path(None, &preferred, &fallback);
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(selected.unwrap(), fallback);
+        let connection = Connection::open(preferred).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT value FROM retained", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "saved"
+        );
     }
 
     #[cfg(unix)]

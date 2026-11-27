@@ -158,7 +158,7 @@ fn cache_coordination_child() {
             );
         }
         "empty-lock" => {
-            assert!(matches!(result, Err(Error::RefreshLockTimeout)));
+            assert!(matches!(result, Err(Error::RefreshLockHeld { .. })));
             assert!(
                 started.elapsed() < Duration::from_secs(6),
                 "five-second wait plus scheduler tolerance"

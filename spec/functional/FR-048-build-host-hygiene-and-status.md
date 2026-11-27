@@ -33,6 +33,10 @@ use locked-build lease evidence instead of identifying a shell wrapper by its na
   whether a process uses a target directory. On macOS, lsof and proc_pidinfo-equivalent APIs provide
   the same evidence. Incomplete process evidence is reported as unknown and is never treated as
   unused. Windows is unsupported.
+  Unprivileged inspection reconciles `lsof` paths and `ps` commands for the invoking
+  user's sampled live PIDs. Build environments are required for cargo/rustc processes.
+  The report labels this evidence `current_user`; cleanup requires targets and
+  containing worktrees owned by that user, in a root reserved for that account.
 - **Clean.** `hygiene clean --host H` is a dry run unless `--apply` is passed. A target directory
   is eligible only if it is older than configured idle age, belongs to a worktree, is not in use by
   any process, and is not under a source, `.git`, `dev_bak`, or `dev_archive` path. Apply removes
