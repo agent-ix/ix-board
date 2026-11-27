@@ -23,7 +23,7 @@ redacted retained status and transition events.
 The producer contract is dev-tools PR A's `locked_build::wire` projection:
 request and event lifecycle timestamps, stable diagnostic codes and limits,
 queue depth at enqueue, position, cumulative state timings and blocker
-observations, and requested/granted memory. The consumer accepts additive fields.
+observations, requested/granted memory, and status-only needed/free-budget memory. The consumer accepts additive fields.
 Legacy status supplies `state`, `enqueued_at_ms`, `started_at_ms`, `ended_at_ms`,
 `wait_ms`, `reason`, `signal` and `exit_code` until the producer is installed.
 
@@ -33,9 +33,12 @@ Legacy status supplies `state`, `enqueued_at_ms`, `started_at_ms`, `ended_at_ms`
 - Requests count enqueue attempts, including event-only pre-enqueue refusals.
   Completed counts terminal attempts finishing within the window; success rate
   is successful attempts divided by completed attempts. Empty rates are null.
+  A succeeded lifecycle with observed exit zero remains successful when a
+  supervision-loss diagnostic is present; the loss is still counted as a diagnostic.
 - Terminations by code include all abnormal terminal/refused attempts, including
   command exits. Kill rate counts RSS cap, OOM, hold timeout, supervision loss,
-  cancellation and external signal outcomes divided by completed attempts.
+  cancellation and external signal outcomes divided by completed attempts;
+  known successful attempts do not enter the kill numerator.
 - Stable codes take precedence over legacy evidence. Signal 9 alone is an external
   signal, never proof of OOM. Ordinary nonzero exits are command failures.
 - The top violated limit is the most frequent resource/hold/refusal bound, with
@@ -46,7 +49,9 @@ Legacy status supplies `state`, `enqueued_at_ms`, `started_at_ms`, `ended_at_ms`
 - Queue depth is a step series reconstructed from enqueue to admission or terminal
   cancellation, clipped to each window and including a baseline. Position and
   enqueue-depth observations are retained when present. Memory values are per
-  request, not measured RSS; missing legacy fields remain null.
+  request, not measured RSS; missing legacy fields remain null. Status-only
+  `memory_needed_bytes` and `memory_free_budget_bytes` show the cap needed and
+  currently unreserved budget without substituting granted bytes.
 - Blocked seconds sum cumulative per-request observations, allowing overlapping
   reasons. A request spanning the start boundary needs a cumulative observation
   at that boundary; otherwise its blocked duration is unavailable. Legacy reason
@@ -72,8 +77,8 @@ Legacy status supplies `state`, `enqueued_at_ms`, `started_at_ms`, `ended_at_ms`
 | ID | Criteria | Verification |
 | --- | --- | --- |
 | FR-051-AC-1 | Hand-written status and event evidence produces per-host 1h/24h requests, completions, success rates and termination counts with exact boundary inclusion and one count per attempt, including event-only refusals. | Test |
-| FR-051-AC-2 | Stable codes override legacy reasons; legacy RSS, timeout, supervision, refusal, cancellation, external signal and command exits map correctly; top violated limit carries limit and measured evidence. | Test |
-| FR-051-AC-3 | Per-host/class queue p50/p95, depth steps, blocker seconds and requested/granted memory match injected values; empty waits and incomplete blocking history remain null. | Test |
+| FR-051-AC-2 | Stable codes override legacy reasons; legacy RSS, timeout, supervision, refusal, cancellation, external signal and command exits map correctly; successful degraded supervision retains its diagnostic without becoming a failed or killed attempt; top violated limit carries limit and measured evidence. | Test |
+| FR-051-AC-3 | Per-host/class queue p50/p95, depth steps, blocker seconds and requested/granted and needed/free-budget memory match injected values; empty waits and incomplete blocking history remain null. | Test |
 | FR-051-AC-4 | Additive retro ids for all four hosts collect injected stability values and rising values become existing delta defects; missing hosts stay unavailable and notifications require explicit request through the existing recipient. | Test |
 | FR-051-AC-5 | No-argument host check includes all four host rows through bounded read-only collection, rejects stale/malformed/wrong-host/pruned history without leaking raw payloads, and default cadence includes the view and retro metrics without notification flags. | Test |
 

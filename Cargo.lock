@@ -1276,7 +1276,7 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 [[package]]
 name = "locked-build"
 version = "0.1.0"
-source = "git+https://github.com/agent-ix/dev-tools?rev=4fa4335b01040182daa183a8480d95e55d02406d#4fa4335b01040182daa183a8480d95e55d02406d"
+source = "git+https://github.com/agent-ix/dev-tools?rev=f58017a13014829035ca30fb87170c96f54df42d#f58017a13014829035ca30fb87170c96f54df42d"
 dependencies = [
  "clap",
  "nix 0.30.1",

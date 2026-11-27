@@ -461,7 +461,7 @@ impl Out<'_> {
             ),
             id if crate::build_stability::metric_host(id).is_some() => (
                 "locked-build status/events",
-                "retained request outcomes and nearest-rank admitted queue waits; fixed rolling window=24h; per-host; kills exclude refusals and command exits".to_owned(),
+                "retained request outcomes and nearest-rank admitted queue waits; fixed rolling window=24h; per-host; kills exclude successful attempts, refusals and command exits".to_owned(),
             ),
             _ => ("unknown", String::new()),
         };

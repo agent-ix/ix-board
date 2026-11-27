@@ -176,6 +176,12 @@ pub struct MemoryGrant {
     pub requested_memory_bytes: Option<u64>,
     /// Granted memory bytes, if recorded.
     pub granted_memory_bytes: Option<u64>,
+    /// Memory cap currently needed for admission, if supplied by status.
+    #[serde(default)]
+    pub memory_needed_bytes: Option<u64>,
+    /// Currently unreserved admission budget, if supplied by status.
+    #[serde(default)]
+    pub memory_free_budget_bytes: Option<u64>,
 }
 
 // The producer owns the writer and reader types. Only local derived report types live here.
@@ -446,11 +452,12 @@ fn summarize(status: &StatusInput, start_ms: u64, end_ms: u64) -> Window {
         .iter()
         .map(|code| terminations_by_code.get(*code).copied().unwrap_or(0))
         .sum();
-    let kills = terminations_by_code
+    let kills = completed
         .iter()
-        .filter(|(code, _)| is_kill(code))
-        .map(|(_, count)| count)
-        .sum();
+        .filter(|request| request.phase() != "succeeded")
+        .filter_map(|request| termination_code(request))
+        .filter(|code| is_kill(code.as_str()))
+        .count() as u64;
     let top_limit_violated = limits.into_values().max_by(|left, right| {
         left.count
             .cmp(&right.count)
@@ -543,6 +550,8 @@ fn queue_analysis(
             memory.push(MemoryGrant {
                 request_id: request.request_id.clone(),
                 requested_memory_bytes: request.trace.requested_memory_bytes,
+                memory_needed_bytes: request.memory_needed_bytes,
+                memory_free_budget_bytes: request.memory_free_budget_bytes,
                 granted_memory_bytes: request
                     .admitted_at()
                     .filter(|at| *at <= end_ms)
@@ -1178,7 +1187,9 @@ mod review_regressions {
                 vec![MemoryGrant {
                     request_id: "memory-refusal".into(),
                     requested_memory_bytes: Some(500),
-                    granted_memory_bytes: None
+                    granted_memory_bytes: None,
+                    memory_needed_bytes: None,
+                    memory_free_budget_bytes: None
                 }]
             );
             assert!(
@@ -1189,5 +1200,56 @@ mod review_regressions {
             );
             assert_eq!(report.queue[class].wait_p95_seconds, None);
         }
+    }
+}
+
+#[cfg(test)]
+mod contract_clarification_tests {
+    use super::*;
+
+    #[test]
+    fn stability_successful_degraded_supervision_is_success_with_a_diagnostic() {
+        let input = r#"{"schema_version":1,"host":"draco","observed_at_ms":100000000,"requests":[{"request_id":"degraded","class":"point","state":"succeeded","lifecycle_state":"succeeded","queued_at_ms":99990000,"admitted_at_ms":99991000,"running_at_ms":99992000,"finished_at_ms":99999000,"exit_code":0,"code":"LB_SUPERVISION_LOST","message":"degraded supervision"}],"events":[]}"#;
+        let hour = from_status(input, "draco", 100_000_000).last_1h.unwrap();
+        assert_eq!(hour.completed, 1);
+        assert_eq!(hour.success_rate, Some(1.0));
+        assert_eq!(hour.kill_rate, Some(0.0));
+        assert_eq!(hour.terminations_by_code["LB_SUPERVISION_LOST"], 1);
+        assert_eq!(hour.metric_value("build_supervision_loss_count"), Some(1.0));
+    }
+}
+
+#[cfg(test)]
+mod status_memory_tests {
+    use super::*;
+
+    #[test]
+    fn stability_status_memory_needed_and_free_budget_are_distinct_and_optional() {
+        let input = r#"{"schema_version":1,"host":"draco","observed_at_ms":100000000,"requests":[{"request_id":"waiting","class":"block","state":"queued","enqueued_at_ms":99990000,"requested_memory_bytes":500,"granted_memory_bytes":null,"memory_needed_bytes":600,"memory_free_budget_bytes":300}],"events":[]}"#;
+        let report = from_status(input, "draco", 100_000_000);
+        let hour = report.last_1h.as_ref().unwrap();
+        for class in ["all", "block"] {
+            assert_eq!(
+                hour.queue[class].memory,
+                vec![MemoryGrant {
+                    request_id: "waiting".into(),
+                    requested_memory_bytes: Some(500),
+                    granted_memory_bytes: None,
+                    memory_needed_bytes: Some(600),
+                    memory_free_budget_bytes: Some(300),
+                }]
+            );
+        }
+        let text = render_text(&StabilityReport {
+            hosts: [("draco".to_owned(), report)].into(),
+        });
+        assert!(text.contains("memory_needed_bytes: Some(600)"));
+        assert!(text.contains("memory_free_budget_bytes: Some(300)"));
+        let legacy = serde_json::from_str::<MemoryGrant>(
+            r#"{"request_id":"old","requested_memory_bytes":500,"granted_memory_bytes":400}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.memory_needed_bytes, None);
+        assert_eq!(legacy.memory_free_budget_bytes, None);
     }
 }
