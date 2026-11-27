@@ -15,7 +15,10 @@ use std::{
 };
 
 #[derive(Parser)]
-#[command(about = "Export bounded operational-team flow and effort metrics")]
+#[command(
+    version,
+    about = "Export bounded operational-team flow and effort metrics"
+)]
 struct Args {
     /// Version-one configuration JSON, containing only credential references/paths.
     #[arg(long)]

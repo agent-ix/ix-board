@@ -23,14 +23,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build release binary
-        run: cargo build --release --locked --bin ix-board
+      - name: Build release binaries
+        run: cargo build --release --locked --bins -j 4
 
       - name: Package ix-board
         run: |
           mkdir -p dist/stage
-          cp target/release/ix-board LICENSE dist/stage/
-          tar -C dist/stage -czf "dist/ix-board-${GITHUB_REF_NAME}-${TARGET}.tar.gz" ix-board LICENSE
+          cp target/release/ix-board target/release/ix-team-exporter LICENSE dist/stage/
+          tar -C dist/stage -czf "dist/ix-board-${GITHUB_REF_NAME}-${TARGET}.tar.gz" ix-board ix-team-exporter LICENSE
           rm -rf dist/stage
 
       - name: Write checksum
