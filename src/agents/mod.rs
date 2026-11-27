@@ -437,6 +437,7 @@ struct HostResult {
 pub const HOST_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// The local machine plus every enabled saved herdr machine.
+#[implements("FR-051-AC-5")]
 pub fn system_hosts() -> Result<Vec<Arc<dyn Host>>, AgentsError> {
     let local = SystemHost::local();
     let machines = parse_machines(&local.herdr(&["machine", "list", "--json"])?)?;
@@ -456,6 +457,7 @@ pub fn system_hosts() -> Result<Vec<Arc<dyn Host>>, AgentsError> {
     Ok(inventory_hosts(local_name.as_deref(), machines))
 }
 
+#[implements("FR-051-AC-5")]
 fn inventory_hosts(local_name: Option<&str>, machines: Vec<HerdrMachine>) -> Vec<Arc<dyn Host>> {
     let mut hosts: Vec<Arc<dyn Host>> = vec![Arc::new(SystemHost::local())];
     let identity = |value: &str| {

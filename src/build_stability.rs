@@ -206,6 +206,7 @@ pub struct MemorySummary {
 }
 
 impl MemorySummary {
+    #[implements("FR-051-AC-3")]
     fn fields(&self) -> [(&'static str, &MemoryDistribution); 6] {
         [
             ("requested_memory_bytes", &self.requested_memory_bytes),
@@ -224,6 +225,7 @@ impl MemorySummary {
     }
 }
 
+#[implements("FR-051-AC-3")]
 fn summarize_memory(grants: &[MemoryGrant]) -> MemorySummary {
     let requests = u64::try_from(grants.len()).unwrap_or(u64::MAX);
     let distribution = |field: fn(&MemoryGrant) -> Option<u64>| {
@@ -322,6 +324,7 @@ struct DecodedStatus {
     invalid_events: u64,
 }
 
+#[implements("FR-051-AC-5")]
 fn decode_status(text: &str) -> Option<DecodedStatus> {
     let mut value: serde_json::Value = serde_json::from_str(text).ok()?;
     let object = value.as_object_mut()?;
@@ -377,6 +380,7 @@ trait RequestTimes {
 }
 
 impl RequestTimes for RequestInput {
+    #[implements("FR-051-AC-2")]
     fn phase(&self) -> &str {
         if self.trace.lifecycle_state.is_empty() {
             if self.state == "failed" && self.reason.as_deref() == Some("refused") {
@@ -594,6 +598,7 @@ fn termination_code(request: &RequestInput) -> Option<Code> {
     }
 }
 
+#[implements("FR-051-AC-2")]
 fn is_kill(code: &str) -> bool {
     matches!(
         code,
@@ -710,7 +715,7 @@ fn summarize(status: &StatusInput, start_ms: u64, end_ms: u64) -> Window {
     }
 }
 
-#[implements("FR-051-AC-3")]
+#[implements("FR-051-AC-3", "FR-051-AC-5")]
 fn queue_analysis(
     status: &StatusInput,
     class: Option<&str>,
@@ -989,7 +994,7 @@ fn blocked_in_window(
     })
 }
 
-#[implements("FR-051-AC-1", "FR-051-AC-2")]
+#[implements("FR-051-AC-1", "FR-051-AC-2", "FR-051-AC-5")]
 fn enrich_events(status: &mut StatusInput) -> u64 {
     // Refusals can exist only in events. Latest snapshot per attempt wins (producer
     // event order breaks timestamp ties); corrections, transitions,
