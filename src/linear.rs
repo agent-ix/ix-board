@@ -312,7 +312,7 @@ impl LinearRequestBudget {
     #[implements("FR-047-AC-9")]
     fn admit_request(&self) -> Result<(), Error> {
         self.remaining()?;
-        let admitted = self.used.fetch_update(
+        let admitted = self.used.try_update(
             std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
             |used| (used < self.limit).then_some(used.saturating_add(1)),
