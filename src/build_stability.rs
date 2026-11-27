@@ -94,9 +94,9 @@ pub struct Window {
     pub completed: u64,
     /// Successful terminal requests divided by completed; null for no completions.
     pub success_rate: Option<f64>,
-    /// Terminations classified by stable code; command failures are excluded.
+    /// Abnormal terminal/refused attempts by code, including command failures.
     pub terminations_by_code: BTreeMap<String, u64>,
-    /// Terminations divided by completed; null for no completions.
+    /// Kills (excluding command failures/refusals) divided by completed; null if empty.
     pub kill_rate: Option<f64>,
     /// OOM kills plus supervision loss, counted once per request.
     pub oom_supervision_loss_count: u64,
@@ -106,7 +106,7 @@ pub struct Window {
     pub queue: BTreeMap<String, QueueAnalysis>,
 }
 
-/// Most frequent violated bound; ties use lexical code order.
+/// Most frequent violated bound; ties use lexical limit-key order.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LimitViolation {
@@ -235,6 +235,15 @@ impl HostStability {
 /// Decodes a redacted status document without exposing raw producer content on errors.
 #[implements("FR-051-AC-1", "FR-051-AC-2", "FR-051-AC-3", "FR-051-AC-5")]
 pub fn from_status(text: &str, expected_host: &str, now_ms: u64) -> HostStability {
+    from_status_at(text, expected_host, now_ms, now_ms)
+}
+
+fn from_status_at(
+    text: &str,
+    expected_host: &str,
+    now_ms: u64,
+    freshness_ms: u64,
+) -> HostStability {
     if text.len() > crate::agents::MAX_PROTOCOL_BYTES {
         return HostStability::unavailable("status_too_large");
     }
@@ -244,8 +253,8 @@ pub fn from_status(text: &str, expected_host: &str, now_ms: u64) -> HostStabilit
     if status.schema_version != Some(1) || status.host.to_lowercase() != expected_host {
         return HostStability::unavailable("incompatible_status_or_host");
     }
-    if observed_ms(&status) > now_ms.saturating_add(5_000)
-        || now_ms.saturating_sub(observed_ms(&status)) > 120_000
+    if observed_ms(&status) > freshness_ms.saturating_add(5_000)
+        || freshness_ms.saturating_sub(observed_ms(&status)) > 120_000
     {
         return HostStability::unavailable("stale_status");
     }
@@ -318,15 +327,19 @@ fn valid_request(request: &RequestInput, observed_at_ms: u64) -> bool {
         .into_iter()
         .flatten()
         .all(|seconds| seconds.is_finite() && seconds >= 0.0)
-        && request.blockers().is_none_or(|reasons| {
-            reasons.iter().all(|reason| {
-                BLOCK_REASONS.contains(&reason.reason.as_str())
-                    && reason.value.is_finite()
-                    && reason.limit.is_finite()
-                    && reason.seconds.is_finite()
-                    && reason.seconds >= 0.0
-            })
-        })
+        && request.blockers().is_none_or(valid_blockers)
+}
+
+fn valid_blockers(reasons: &[BlockObservation]) -> bool {
+    let mut seen = BTreeSet::new();
+    reasons.iter().all(|reason| {
+        seen.insert(&reason.reason)
+            && BLOCK_REASONS.contains(&reason.reason.as_str())
+            && reason.value.is_finite()
+            && reason.limit.is_finite()
+            && reason.seconds.is_finite()
+            && reason.seconds >= 0.0
+    })
 }
 
 const BLOCK_REASONS: [&str; 7] = [
@@ -520,13 +533,18 @@ fn queue_analysis(
         .collect::<BTreeMap<_, _>>();
     let mut blocked_complete = true;
     for request in requests {
-        if request.queued_at().is_some_and(|at| at <= end_ms)
+        if (request.queued_at().is_some_and(|at| at <= end_ms)
+            || (request.phase() == "refused"
+                && request.finished_at().is_some_and(|at| at <= end_ms)))
             && request.finished_at().unwrap_or(end_ms) > start_ms
         {
             memory.push(MemoryGrant {
                 request_id: request.request_id.clone(),
                 requested_memory_bytes: request.trace.requested_memory_bytes,
-                granted_memory_bytes: request.trace.granted_memory_bytes,
+                granted_memory_bytes: request
+                    .admitted_at()
+                    .filter(|at| *at <= end_ms)
+                    .and(request.trace.granted_memory_bytes),
             });
         }
         let Some(queued_at) = request.queued_at() else {
@@ -641,13 +659,22 @@ fn blocked_in_window(
         let event = status.events.iter().find(|event| {
             event.request.request_id == request.request_id && event.observed_at_ms == start_ms
         })?;
-        event
-            .request
-            .blockers()?
+        let baseline = event.request.blockers()?;
+        if !valid_blockers(baseline) {
+            return None;
+        }
+        baseline
             .iter()
             .map(|observation| (observation.reason.clone(), observation.seconds))
             .collect()
     };
+    if baseline.keys().any(|reason| {
+        !observations
+            .iter()
+            .any(|observation| &observation.reason == reason)
+    }) {
+        return None;
+    }
     let mut seconds = BTreeMap::new();
     for observation in observations {
         let previous = baseline.get(&observation.reason).copied().unwrap_or(0.0);
@@ -693,6 +720,11 @@ fn enrich_events(status: &mut StatusInput) -> bool {
 /// Reads each reachable machine once in parallel and retains explicit missing hosts.
 #[implements("FR-051-AC-5")]
 pub fn collect(hosts: &[Arc<dyn Host>], now_ms: u64) -> StabilityReport {
+    collect_at(hosts, now_ms, now_ms)
+}
+
+fn collect_at(hosts: &[Arc<dyn Host>], window_end_ms: u64, freshness_ms: u64) -> StabilityReport {
+    let collection_started = Instant::now();
     let mut report = StabilityReport {
         hosts: HOSTS
             .into_iter()
@@ -714,7 +746,6 @@ pub fn collect(hosts: &[Arc<dyn Host>], now_ms: u64) -> StabilityReport {
         });
     }
     drop(sender);
-    let collection_started = Instant::now();
     let deadline = collection_started + Duration::from_secs(45);
     let mut seen = BTreeSet::new();
     while let Ok((label, result)) =
@@ -732,10 +763,11 @@ pub fn collect(hosts: &[Arc<dyn Host>], now_ms: u64) -> StabilityReport {
         };
         if let Some(host) = host.filter(|host| HOSTS.contains(&host.as_str())) {
             let row = if seen.insert(host.clone()) {
-                from_status(
+                from_status_at(
                     &text,
                     &host,
-                    now_ms.saturating_add(
+                    window_end_ms,
+                    freshness_ms.saturating_add(
                         u64::try_from(collection_started.elapsed().as_millis()).unwrap_or(u64::MAX),
                     ),
                 )
@@ -751,11 +783,16 @@ pub fn collect(hosts: &[Arc<dyn Host>], now_ms: u64) -> StabilityReport {
 /// Collects the configured Herdr host inventory; discovery failure still reports all hosts.
 #[implements("FR-051-AC-5")]
 pub fn live(now_ms: u64) -> StabilityReport {
-    collect(
-        &crate::agents::system_hosts()
-            .unwrap_or_else(|_| vec![Arc::new(crate::agents::SystemHost::local())]),
-        now_ms,
-    )
+    let hosts = crate::agents::system_hosts()
+        .unwrap_or_else(|_| vec![Arc::new(crate::agents::SystemHost::local())]);
+    // Freshness is observed after discovery and preceding retro source reads. The window
+    // retains the caller's as-of time, even if gathering evidence takes several seconds.
+    let freshness_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0);
+    collect_at(&hosts, now_ms, freshness_ms)
 }
 
 /// Renders rolling host stability and queue evidence without raw producer strings.
@@ -1070,5 +1107,80 @@ mod collection_tests {
             2.0
         );
         assert_eq!(hour.queue["all"].depth_over_time[0].depth, 1);
+    }
+}
+
+#[cfg(test)]
+mod review_regressions {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn stability_freshness_after_slow_reads_preserves_requested_window_end() {
+        let input = r#"{"schema_version":1,"host":"draco","observed_at_ms":100010000,"requests":[{"request_id":"before","class":"point","state":"succeeded","enqueued_at_ms":99990000,"ended_at_ms":99999000},{"request_id":"after","class":"point","state":"succeeded","enqueued_at_ms":100001000,"ended_at_ms":100009000}],"events":[]}"#;
+        let report = from_status_at(input, "draco", 100_000_000, 100_010_000);
+        assert_eq!(report.reason, None);
+        let hour = report.last_1h.unwrap();
+        assert_eq!(hour.end_ms, 100_000_000);
+        assert_eq!(hour.completed, 1);
+        assert_eq!(hour.requests, 1);
+        assert_eq!(
+            from_status_at(input, "draco", 100_000_000, 100_200_000)
+                .reason
+                .as_deref(),
+            Some("stale_status")
+        );
+    }
+
+    #[test]
+    fn stability_invalid_event_blocker_baselines_cannot_inflate_seconds() {
+        let source = json!({"schema_version":1,"host":"draco","observed_at_ms":100000000,"requests":[{"request_id":"old","class":"point","lifecycle_state":"running","queued_at_ms":96000000,"admitted_at_ms":96410000,"queued_seconds":410,"blocked_reasons":[{"reason":"memory_budget","value":100,"limit":90,"seconds":15.0}]}],"events":[{"event_id":"baseline","observed_at_ms":96400000,"request_id":"old","lifecycle_state":"queued","blocked_reasons":[]}]});
+        for baseline in [
+            json!([{"reason":"memory_budget","value":100,"limit":90,"seconds":-10.0}]),
+            json!([{"reason":"unknown","value":100,"limit":90,"seconds":10.0}]),
+            json!([{"reason":"units","value":8,"limit":4,"seconds":10.0}]),
+            json!([{"reason":"memory_budget","value":100,"limit":90,"seconds":10.0},{"reason":"memory_budget","value":100,"limit":90,"seconds":11.0}]),
+            json!([{"reason":"memory_budget","value":100,"limit":90,"seconds":16.0}]),
+        ] {
+            let mut input = source.clone();
+            input["events"][0]["blocked_reasons"] = baseline;
+            let report = from_status(&input.to_string(), "draco", 100_000_000);
+            assert_eq!(report.last_1h.unwrap().queue["all"].blocked_seconds, None);
+        }
+        let mut input = source;
+        input["events"][0]["blocked_reasons"] =
+            json!([{"reason":"memory_budget","value":100,"limit":90,"seconds":10.0}]);
+        let report = from_status(&input.to_string(), "draco", 100_000_000);
+        assert_eq!(
+            report.last_1h.unwrap().queue["all"]
+                .blocked_seconds
+                .as_ref()
+                .unwrap()["memory_budget"],
+            5.0
+        );
+    }
+
+    #[test]
+    fn stability_refused_attempt_retains_requested_memory_without_queue_entry() {
+        let input = r#"{"schema_version":1,"host":"draco","observed_at_ms":100000000,"requests":[],"events":[{"event_id":"refused","observed_at_ms":99999000,"request_id":"memory-refusal","class":"block","lifecycle_state":"refused","queued_at_ms":null,"finished_at_ms":99999000,"requested_memory_bytes":500,"granted_memory_bytes":null,"code":"LB_REFUSED_MEMORY_BUDGET"}]}"#;
+        let report = from_status(input, "draco", 100_000_000).last_1h.unwrap();
+        assert_eq!(report.requests, 1);
+        for class in ["all", "block"] {
+            assert_eq!(
+                report.queue[class].memory,
+                vec![MemoryGrant {
+                    request_id: "memory-refusal".into(),
+                    requested_memory_bytes: Some(500),
+                    granted_memory_bytes: None
+                }]
+            );
+            assert!(
+                report.queue[class]
+                    .depth_over_time
+                    .iter()
+                    .all(|point| point.depth == 0)
+            );
+            assert_eq!(report.queue[class].wait_p95_seconds, None);
+        }
     }
 }

@@ -39,7 +39,7 @@ Legacy status supplies `state`, `enqueued_at_ms`, `started_at_ms`, `ended_at_ms`
 - Stable codes take precedence over legacy evidence. Signal 9 alone is an external
   signal, never proof of OOM. Ordinary nonzero exits are command failures.
 - The top violated limit is the most frequent resource/hold/refusal bound, with
-  deterministic lexical tie breaking and the latest measured/limit values.
+  deterministic lexical limit-key tie breaking and the latest measured/limit values.
 - Queue waits use completed admission waits (nearest-rank p50/p95), independently
   per host and class. Open waits do not enter the percentile population. Precise
   admitted timestamps take precedence over legacy started timestamps.
@@ -55,7 +55,9 @@ Legacy status supplies `state`, `enqueued_at_ms`, `started_at_ms`, `ended_at_ms`
   exist only in events, ix-board SHALL include them once per request id.
 - Malformed, stale (over 120 seconds), future (over five seconds), wrong-host,
   duplicate-identity, incompatible-version and pruned history SHALL be unavailable
-  with a safe reason rather than zero. Raw command, owner, environment, message
+  with a safe reason rather than zero. Freshness uses the actual collection clock,
+  independently of the requested window end and preceding slow source reads.
+  Raw command, owner, environment, message
   and credential data SHALL NOT appear in the view or errors.
 - The retro catalog SHALL add per-host build kill rate, OOM count, supervision
   loss count and queue wait p95 seconds ids without changing existing ids. These
