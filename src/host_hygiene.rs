@@ -503,11 +503,12 @@ fn linux_process_table(proc_root: &Path) -> io::Result<ProcessTable> {
             break;
         }
         let process_dir = entry.path();
+        let mut optional_read_failed = false;
         let mut read_optional = |name: &str| match fs::read(process_dir.join(name)) {
             Ok(value) => Some(value),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(_) => {
-                table.complete = false;
+                optional_read_failed = true;
                 None
             }
         };
@@ -521,6 +522,9 @@ fn linux_process_table(proc_root: &Path) -> io::Result<ProcessTable> {
         };
         let cmdline = read_optional("cmdline").unwrap_or_default();
         let environ = read_optional("environ").unwrap_or_default();
+        if optional_read_failed {
+            table.complete = false;
+        }
         let mut fds = Vec::new();
         match fs::read_dir(process_dir.join("fd")) {
             Ok(entries) => {
