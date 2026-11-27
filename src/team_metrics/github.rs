@@ -533,6 +533,7 @@ fn graph_body(body: &str) -> Result<String, String> {
     }
     Ok(serde_json::json!({"data":data}).to_string())
 }
+#[implements("FR-033-AC-13")]
 fn repository_coordinates(repo: &str) -> Result<(&str, &str), String> {
     let mut pieces = repo.split('/');
     let (Some(owner), Some(name), None) = (pieces.next(), pieces.next(), pieces.next()) else {
@@ -551,6 +552,7 @@ fn repository_coordinates(repo: &str) -> Result<(&str, &str), String> {
     }
     Ok((owner, name))
 }
+#[implements("FR-033-AC-12", "FR-033-AC-13")]
 fn graph_request(query: &str, repo: &str, after: Option<&str>) -> Result<Request, String> {
     let (owner, name) = repository_coordinates(repo)?;
     let mut variables =
