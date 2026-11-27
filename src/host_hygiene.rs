@@ -152,7 +152,7 @@ pub struct HostPolicyConfig {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HygieneConfig {
-    /// Worktree directory on this host.
+    /// Root directory containing Git clones or linked worktrees on this host.
     pub worktree_root: Option<PathBuf>,
     /// Minimum target-directory idle age in minutes.
     pub idle_minutes: Option<u64>,
@@ -779,13 +779,13 @@ pub fn target_use(target: &Path, table: &ProcessTable) -> UseState {
     target_use_in_worktree(target, target.parent().unwrap_or(target), table)
 }
 
-/// Canonicalizes a configured worktree root before scanning it.
+/// Canonicalizes a configured checkout root before scanning it.
 #[implements("FR-048-AC-1", "FR-048-AC-5")]
 pub fn canonicalize_worktree_root(root: &Path) -> io::Result<PathBuf> {
     std::fs::canonicalize(root)
 }
 
-/// Discovers targets at depth at most three, retaining the containing Git worktree.
+/// Discovers targets at depth at most three, retaining the containing Git checkout.
 /// Symlinks, backups and unexpected filesystems are never traversed.
 #[implements("FR-048-AC-11")]
 pub fn discover_targets(root: &Path, mounts: &[MountEntry]) -> io::Result<Vec<(PathBuf, PathBuf)>> {
@@ -1182,6 +1182,19 @@ pub fn eligibility_at(
 mod tests {
     use super::*;
     use ix_trace_rs::trace;
+
+    #[test]
+    #[trace("FR-048-AC-10", "FR-048-AC-13")]
+    fn native_macos_mount_rows_preserve_space_paths_and_reject_malformed_evidence() {
+        let mounts = parse_mount_table("/dev/root on / (apfs, local, read-only)\n/dev/build on /Volumes/Build - Output (apfs, local, journaled)\n").unwrap();
+        assert_eq!(mounts, vec![
+            MountEntry { source: "/dev/root".to_owned(), mount_point: PathBuf::from("/"), fs_type: "apfs".to_owned() },
+            MountEntry { source: "/dev/build".to_owned(), mount_point: PathBuf::from("/Volumes/Build - Output"), fs_type: "apfs".to_owned() },
+        ]);
+        for invalid in ["/dev/bad on relative (apfs, local)", "/dev/bad on /bad (apfs, local", "/dev/bad on /bad ()"] {
+            assert!(parse_mount_table(&format!("/dev/root on / (apfs, local)\n{invalid}\n")).is_err(), "{invalid}");
+        }
+    }
 
     #[test]
     #[trace("FR-048-AC-4", "FR-048-AC-12")]
