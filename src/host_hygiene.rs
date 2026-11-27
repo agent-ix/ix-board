@@ -367,7 +367,7 @@ pub fn system_mount_table() -> io::Result<Vec<MountEntry>> {
     let text = std::fs::read_to_string("/proc/self/mountinfo")?;
     #[cfg(target_os = "macos")]
     let text = {
-        let output = Command::new("mount").arg("-p").output()?;
+        let output = Command::new("mount").output()?;
         if !output.status.success() {
             return Err(io::Error::other("mount table command failed"));
         }
@@ -379,12 +379,25 @@ pub fn system_mount_table() -> io::Result<Vec<MountEntry>> {
     parse_mount_table(&text)
 }
 
-/// Parses Linux mountinfo or BSD `mount -p` rows.
+/// Parses Linux mountinfo, native macOS mount output, or BSD `mount -p` rows.
 #[implements("FR-048-AC-10")]
 pub fn parse_mount_table(text: &str) -> io::Result<Vec<MountEntry>> {
     let mut entries = Vec::new();
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        let fields = if let Some((before, after)) = line.split_once(" - ") {
+        let fields = if let Some((source, rest)) = line.split_once(" on ") {
+            let (mount_point, options) = rest
+                .rsplit_once(" (")
+                .ok_or_else(|| io::Error::other("mount table contains a malformed macOS row"))?;
+            let options = options
+                .strip_suffix(')')
+                .ok_or_else(|| io::Error::other("mount table contains an unclosed macOS row"))?;
+            let fs_type = options.split(',').next().unwrap_or_default().trim();
+            (
+                source.trim().to_owned(),
+                unescape_mount_field(mount_point),
+                fs_type.to_owned(),
+            )
+        } else if let Some((before, after)) = line.split_once(" - ") {
             let left = before.split_whitespace().collect::<Vec<_>>();
             let right = after.split_whitespace().collect::<Vec<_>>();
             if left.len() < 5 || right.len() < 2 {
@@ -406,7 +419,11 @@ pub fn parse_mount_table(text: &str) -> io::Result<Vec<MountEntry>> {
                 fields[2].to_owned(),
             )
         };
-        if fields.0.is_empty() || fields.1.is_empty() || fields.2.is_empty() {
+        if fields.0.is_empty()
+            || !Path::new(&fields.1).is_absolute()
+            || fields.2.is_empty()
+            || fields.2.contains(char::is_whitespace)
+        {
             return Err(io::Error::other("mount table contains an incomplete row"));
         }
         entries.push(MountEntry {
@@ -426,6 +443,7 @@ fn unescape_mount_field(field: &str) -> String {
     field
         .replace("\\040", " ")
         .replace("\\011", "\t")
+        .replace("\\012", "\n")
         .replace("\\012", "\n")
         .replace("\\134", "\\")
 }
@@ -1187,12 +1205,42 @@ mod tests {
     #[trace("FR-048-AC-10", "FR-048-AC-13")]
     fn native_macos_mount_rows_preserve_space_paths_and_reject_malformed_evidence() {
         let mounts = parse_mount_table("/dev/root on / (apfs, local, read-only)\n/dev/build on /Volumes/Build - Output (apfs, local, journaled)\n").unwrap();
-        assert_eq!(mounts, vec![
-            MountEntry { source: "/dev/root".to_owned(), mount_point: PathBuf::from("/"), fs_type: "apfs".to_owned() },
-            MountEntry { source: "/dev/build".to_owned(), mount_point: PathBuf::from("/Volumes/Build - Output"), fs_type: "apfs".to_owned() },
-        ]);
-        for invalid in ["/dev/bad on relative (apfs, local)", "/dev/bad on /bad (apfs, local", "/dev/bad on /bad ()"] {
-            assert!(parse_mount_table(&format!("/dev/root on / (apfs, local)\n{invalid}\n")).is_err(), "{invalid}");
+        assert_eq!(
+            mounts,
+            vec![
+                MountEntry {
+                    source: "/dev/root".to_owned(),
+                    mount_point: PathBuf::from("/"),
+                    fs_type: "apfs".to_owned()
+                },
+                MountEntry {
+                    source: "/dev/build".to_owned(),
+                    mount_point: PathBuf::from("/Volumes/Build - Output"),
+                    fs_type: "apfs".to_owned()
+                },
+            ]
+        );
+        let escaped = parse_mount_table(
+            "/dev/root on / (apfs, local)\n/dev/other on /work/wt\\012name/target (apfs, local)\n",
+        )
+        .unwrap();
+        assert_eq!(
+            mount_safety(
+                Path::new("/work/wt\nname/target"),
+                Path::new("/work"),
+                &escaped
+            ),
+            MountSafety::Boundary
+        );
+        for invalid in [
+            "/dev/bad on relative (apfs, local)",
+            "/dev/bad on /bad (apfs, local",
+            "/dev/bad on /bad ()",
+        ] {
+            assert!(
+                parse_mount_table(&format!("/dev/root on / (apfs, local)\n{invalid}\n")).is_err(),
+                "{invalid}"
+            );
         }
     }
 

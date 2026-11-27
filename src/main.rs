@@ -227,7 +227,7 @@ struct HygieneArgs {
     /// Host label; defaults to the local host identity.
     #[arg(long)]
     host: Option<String>,
-    /// Worktree root on this host.
+    /// Directory containing Git clones or linked worktrees on this host.
     #[arg(long)]
     root: Option<PathBuf>,
     /// Configured minimum free space in GiB.
@@ -3755,11 +3755,6 @@ fn run_hygiene(
                     "no target idle age configured; set hygiene.idle_minutes or pass --idle-minutes"
                         .to_owned(),
             })?;
-    if root.file_name().is_none_or(|name| name != "worktrees") {
-        return Err(Error::ProgramReview {
-            message: "hygiene root must be a worktrees directory".to_owned(),
-        });
-    }
     let floor = floor_gb
         .checked_mul(1024 * 1024 * 1024)
         .ok_or_else(|| Error::ProgramReview {
