@@ -32,6 +32,27 @@ const NOW: f64 = 1_794_052_800.0; // 2026-11-07T12:00:00Z
 const HOUR: f64 = 3600.0;
 const DAY: u64 = 86_400;
 
+// Resource tests exercise real local IO without invoking unrelated fleet probes.
+struct LocalFilesystem;
+
+impl LocalSource for LocalFilesystem {
+    fn build_stability(&self, _now_ms: u64) -> ix_board::build_stability::StabilityReport {
+        Default::default()
+    }
+
+    fn prunable_worktrees(&self, dir: &Path) -> Result<u64, String> {
+        ix_board::retro::live::SystemLocal.prunable_worktrees(dir)
+    }
+
+    fn disk_bytes(&self, dir: &Path) -> Result<u64, String> {
+        ix_board::retro::live::SystemLocal.disk_bytes(dir)
+    }
+
+    fn processes(&self) -> Result<Vec<ProcessRow>, String> {
+        ix_board::retro::live::SystemLocal.processes()
+    }
+}
+
 fn ago(hours: f64) -> f64 {
     NOW - hours * HOUR
 }
@@ -60,6 +81,7 @@ fn iso(epoch: f64) -> String {
 
 #[derive(Default)]
 struct Rig {
+    build_status: BTreeMap<String, String>,
     workspace: Option<Result<WorkspaceSnapshot, String>>,
     project_counts: BTreeMap<String, usize>,
     histories: BTreeMap<String, Result<Vec<StateChange>, String>>,
@@ -224,6 +246,21 @@ impl RelaySource for Rig {
 }
 
 impl LocalSource for Rig {
+    fn build_stability(&self, now_ms: u64) -> ix_board::build_stability::StabilityReport {
+        self.log("build_stability");
+        ix_board::build_stability::StabilityReport {
+            hosts: self
+                .build_status
+                .iter()
+                .map(|(host, text)| {
+                    (
+                        host.clone(),
+                        ix_board::build_stability::from_status(text, host, now_ms),
+                    )
+                })
+                .collect(),
+        }
+    }
     fn prunable_worktrees(&self, _dir: &Path) -> Result<u64, String> {
         self.log("prunable_worktrees");
         unset(&self.worktrees, "worktrees")
@@ -906,7 +943,7 @@ fn local_metrics_read_a_real_directory_with_a_prunable_worktree() {
     std::fs::remove_dir_all(&worktree).unwrap();
     std::fs::write(repo.join("data.bin"), [0_u8; 100]).unwrap();
 
-    let local = ix_board::retro::live::SystemLocal;
+    let local = LocalFilesystem;
     let rig = base_rig();
     let sources = Sources {
         local: &local,
@@ -1241,7 +1278,7 @@ fn a_snapshot_only_reads_and_leaves_a_repository_untouched() {
         out
     };
     let before = listing(repo.path());
-    let local = ix_board::retro::live::SystemLocal;
+    let local = LocalFilesystem;
     let mut rig = base_rig();
     rig.gate_lines = Some(Ok(Vec::new()));
     rig.processes = Some(Ok(Vec::new()));
@@ -3835,4 +3872,92 @@ fn a_missing_host_names_itself_in_the_unavailable_agent_metrics() {
     let record = snapshot(&rig);
     assert_eq!(value(&record, "agents_working_share"), None);
     assert!(reason(&record, "agents_working_share").contains("luna: timed out after 45s"));
+}
+
+#[test]
+#[trace("FR-051-AC-4")]
+fn stability_retro_collects_additive_host_metrics_once_and_routes_rises_as_existing_defects() {
+    let mut rig = base_rig();
+    let now_ms = (NOW * 1000.0) as u64;
+    let source = serde_json::json!({"schema_version":1,"host":"draco","observed_at_ms":now_ms,"requests":[
+        {"request_id":"one","state":"succeeded","class":"point","enqueued_at_ms":now_ms-5000,"started_at_ms":now_ms-4000,"ended_at_ms":now_ms-3000,"exit_code":0},
+        {"request_id":"two","state":"failed","class":"block","enqueued_at_ms":now_ms-5000,"started_at_ms":now_ms-2000,"ended_at_ms":now_ms-1000,"code":"LB_OOM_KILLED"},
+        {"request_id":"three","state":"failed","class":"point","enqueued_at_ms":now_ms-5000,"started_at_ms":now_ms-3000,"ended_at_ms":now_ms-1000,"reason":"supervisor_lost"}
+    ],"events":[]});
+    rig.build_status
+        .insert("draco".to_owned(), source.to_string());
+    let directory = tempfile::tempdir().unwrap();
+    let store = store_in(&directory);
+    let record = run_snapshot(&config(), DAY, NOW, &rig.sources(), &store).unwrap();
+    assert_eq!(value(&record, "build_kill_rate_draco"), Some(2.0 / 3.0));
+    assert_eq!(value(&record, "build_oom_count_draco"), Some(1.0));
+    assert_eq!(
+        value(&record, "build_supervision_loss_count_draco"),
+        Some(1.0)
+    );
+    assert_eq!(
+        value(&record, "build_queue_wait_p95_seconds_draco"),
+        Some(3.0)
+    );
+    assert_eq!(rig.count("build_stability"), 1);
+    for host in ["luna", "titan", "terra"] {
+        for kind in [
+            "build_kill_rate",
+            "build_oom_count",
+            "build_supervision_loss_count",
+            "build_queue_wait_p95_seconds",
+        ] {
+            assert_eq!(value(&record, &format!("{kind}_{host}")), None);
+        }
+    }
+    let mut previous = record.clone();
+    previous.taken_at = "2026-11-07T11:00:00Z".into();
+    for id in [
+        "build_kill_rate_draco",
+        "build_oom_count_draco",
+        "build_supervision_loss_count_draco",
+        "build_queue_wait_p95_seconds_draco",
+    ] {
+        previous.metrics.get_mut(id).unwrap().value = Some(0.0);
+    }
+    // Store owns only a path; keep its parent alive for the complete comparison.
+    let comparison_dir = tempfile::tempdir().unwrap();
+    let comparison_store = store_in(&comparison_dir);
+    comparison_store.append(&previous).unwrap();
+    comparison_store.append(&record).unwrap();
+    let delta = ix_board::retro::run_delta(&config(), &comparison_store).unwrap();
+    let stability_defects = delta
+        .defects
+        .iter()
+        .filter(|defect| defect.metric_id.starts_with("build_"))
+        .collect::<Vec<_>>();
+    assert_eq!(stability_defects.len(), 4);
+    assert!(
+        stability_defects
+            .iter()
+            .all(|defect| defect.class == "retro_metric_rising" && defect.previous == Some(0.0))
+    );
+    let mut delivered = Vec::new();
+    ix_board::retro::notify_defects(&delta, false, None, |recipient, message| {
+        delivered.push((recipient.to_owned(), message.to_owned()));
+        Ok(())
+    })
+    .unwrap();
+    assert!(delivered.is_empty());
+    ix_board::retro::notify_defects(
+        &delta,
+        true,
+        Some("draco:tooling:minder"),
+        |recipient, message| {
+            delivered.push((recipient.to_owned(), message.to_owned()));
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(
+        delivered
+            .iter()
+            .any(|(recipient, message)| recipient == "draco:tooling:minder"
+                && message.contains("build_queue_wait_p95_seconds_draco"))
+    );
 }

@@ -240,14 +240,14 @@ pub(crate) fn compare_records(
     })
 }
 
-#[implements("FR-027-AC-11")]
+#[implements("FR-027-AC-11", "FR-051-AC-4")]
 fn delta_defects(metrics: &[MetricDelta], previous_record: Option<&Record>) -> Vec<DeltaDefect> {
     let mut defects = Vec::new();
     for metric in metrics.iter().filter(|metric| {
         matches!(
             metric.id.as_str(),
             "prs_idle" | "fix_rounds_max" | "agents_idle_minutes_max"
-        )
+        ) || crate::build_stability::metric_host(&metric.id).is_some()
     }) {
         if metric.status == Status::Ok
             && metric.since_previous.state == ChangeState::Changed

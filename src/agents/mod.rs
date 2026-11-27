@@ -437,19 +437,54 @@ struct HostResult {
 pub const HOST_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// The local machine plus every enabled saved herdr machine.
+#[implements("FR-051-AC-5")]
 pub fn system_hosts() -> Result<Vec<Arc<dyn Host>>, AgentsError> {
     let local = SystemHost::local();
     let machines = parse_machines(&local.herdr(&["machine", "list", "--json"])?)?;
-    let mut hosts: Vec<Arc<dyn Host>> = vec![Arc::new(local)];
+    let local_name = std::env::var("IX_BOARD_HOST")
+        .ok()
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            std::process::Command::new("hostname")
+                .arg("-s")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .map(|name| name.trim().to_owned())
+                .filter(|name| !name.is_empty())
+        });
+    Ok(inventory_hosts(local_name.as_deref(), machines))
+}
+
+#[implements("FR-051-AC-5")]
+fn inventory_hosts(local_name: Option<&str>, machines: Vec<HerdrMachine>) -> Vec<Arc<dyn Host>> {
+    let mut hosts: Vec<Arc<dyn Host>> = vec![Arc::new(SystemHost::local())];
+    let identity = |value: &str| {
+        let host = value.rsplit('@').next().unwrap_or(value).to_lowercase();
+        if matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1" | "[::1]") {
+            return "local".to_owned();
+        }
+        host.split('.').next().unwrap_or(&host).to_owned()
+    };
+    let local_name = local_name.map(identity);
+    let mut seen = BTreeSet::from(["local".to_owned()]);
     hosts.extend(
         machines
             .into_iter()
-            .filter(|machine| machine.enabled)
+            .filter(|machine| {
+                machine.enabled
+                    && local_name.as_deref().is_none_or(|local| {
+                        identity(&machine.label) != local && identity(&machine.target) != local
+                    })
+                    && identity(&machine.target) != "local"
+                    && seen.insert(machine.label.to_lowercase())
+            })
             .map(|machine| {
                 Arc::new(SystemHost::remote(machine.label, machine.target)) as Arc<dyn Host>
             }),
     );
-    Ok(hosts)
+    hosts
 }
 
 /// Reads every host in parallel, each under [`HOST_TIMEOUT`], and builds the report.
@@ -1047,5 +1082,55 @@ mod tests {
         };
         assert!(!is_work_command(&wrapper));
         assert!(is_work_command(&leased_command));
+    }
+}
+
+#[cfg(test)]
+mod stability_inventory_review {
+    use super::*;
+    use ix_trace_rs::trace;
+
+    #[test]
+    #[trace("FR-051-AC-5")]
+    fn review_local_machine_and_duplicate_saved_profiles_are_not_probed_twice() {
+        let hosts = inventory_hosts(
+            Some("draco"),
+            vec![
+                HerdrMachine {
+                    label: "draco".into(),
+                    target: "peter@draco.local".into(),
+                    enabled: true,
+                },
+                HerdrMachine {
+                    label: "local-alias".into(),
+                    target: "draco".into(),
+                    enabled: true,
+                },
+                HerdrMachine {
+                    label: "loopback".into(),
+                    target: "peter@LOCALHOST".into(),
+                    enabled: true,
+                },
+                HerdrMachine {
+                    label: "terra".into(),
+                    target: "terra-ssh".into(),
+                    enabled: true,
+                },
+                HerdrMachine {
+                    label: "TERRA".into(),
+                    target: "other-alias".into(),
+                    enabled: true,
+                },
+                HerdrMachine {
+                    label: "luna".into(),
+                    target: "luna".into(),
+                    enabled: false,
+                },
+            ],
+        );
+        assert_eq!(
+            hosts.iter().map(|host| host.label()).collect::<Vec<_>>(),
+            ["local", "terra"]
+        );
     }
 }

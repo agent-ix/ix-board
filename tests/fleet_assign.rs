@@ -31,7 +31,7 @@ use std::time::Duration;
 struct Container(String);
 
 impl Container {
-    fn start() -> (Self, u16) {
+    fn start_uninstrumented() -> (Self, u16) {
         let out = Command::new("docker")
             .args(["run", "-d", "--rm", "-p", "127.0.0.1::6379", "redis:7"])
             .output()
@@ -49,6 +49,31 @@ impl Container {
             .and_then(|l| l.rsplit(':').next())
             .and_then(|p| p.trim().parse().ok())
             .expect("mapped port");
+        (me, port)
+    }
+
+    fn start() -> (Self, u16) {
+        let (me, port) = Self::start_uninstrumented();
+        // The assignment reader requires complete history from one second before
+        // its first registry observation. Instrument this fresh relay before that
+        // interval using the real producer, rather than fabricating coverage.
+        let mut relay = connect(port);
+        let bootstrap = lane(&mut relay, "receipt-bootstrap", "receipt-bootstrap");
+        relay
+            .send_as(
+                &Message {
+                    from: "fixture".parse().unwrap(),
+                    to: relay_core::Target::Agent(bootstrap.name.clone()),
+                    text: "initialize receipt history".into(),
+                    sent_at_ms: 1,
+                    forwarded: false,
+                },
+                None,
+            )
+            .unwrap();
+        deliver(&mut relay, &bootstrap.name);
+        let now = relay.lane_lists().unwrap().now_ms;
+        wait_past(&mut relay, now + 1_000);
         (me, port)
     }
 }
@@ -328,6 +353,31 @@ fn wait_past(relay: &mut Relay, ms: i64) {
     }
 }
 
+#[test]
+#[trace("FR-039-AC-12")]
+fn a_cold_relay_reports_unidentified_pending_instead_of_claiming_complete_history() {
+    let (_container, port) = Container::start_uninstrumented();
+    let mut relay = connect(port);
+    let target = lane(&mut relay, "cold-start", "cold-start");
+    let report = assign(
+        &mut relay,
+        &mut NoLedger,
+        &request(&target, &["SWM-211"], 30),
+        &batch(vec![open("SWM-211")]),
+        &orchestrator(),
+    )
+    .unwrap();
+    assert_eq!(report.result, AssignResult::Pending);
+    assert!(report.order_id.is_none());
+    let error = report.list_write_error.unwrap();
+    assert!(
+        error.contains("order accepted but not identified"),
+        "{error}"
+    );
+    assert!(error.contains("before_instrumentation"), "{error}");
+    assert!(relay.assignment(&target.addr).unwrap().is_none());
+}
+
 #[trace("FR-035-AC-1")]
 #[trace("FR-035-AC-2")]
 #[trace("FR-035-AC-5")]
@@ -379,7 +429,7 @@ fn confirmed_assignment_stores_the_list_carries_the_text_and_joins_by_order_id()
     assert!(body.contains("within 30s"));
     // AC-9 and AC-10: the expectation rode on the order; the transition holds the order id.
     let order_id = report.order_id.clone().unwrap();
-    let receipts = relay.receipts_since(0).unwrap();
+    let receipts = relay.receipts_since(report.sent_at_ms.unwrap()).unwrap();
     let acted = receipts
         .iter()
         .find(|e: &&ReceiptEvent| e.original_id == order_id && e.expect_ticket.is_some())
@@ -1328,8 +1378,9 @@ fn a_status_run_commits_the_completed_row_with_its_run() {
 }
 
 #[trace("FR-035-AC-12")]
+#[trace("FR-039-AC-12")]
 #[test]
-fn a_failed_completion_is_a_defect_committed_with_the_run() {
+fn a_failed_source_completion_is_an_unreadable_source_committed_with_the_run() {
     let (_c, port) = Container::start();
     let mut relay = connect(port);
     let target = lane(&mut relay, "s-one", "one");
@@ -1352,9 +1403,17 @@ fn a_failed_completion_is_a_defect_committed_with_the_run() {
     assert_eq!(
         count(
             &ledger,
-            "SELECT COUNT(*) FROM defect WHERE kind='ledger_unwritable'"
+            "SELECT COUNT(*) FROM defect WHERE kind='unreadable_source' AND source='relay:order_history'"
         ),
         1,
         "the completion defect is stored with the run"
+    );
+    assert_eq!(
+        count(
+            &ledger,
+            "SELECT COUNT(*) FROM defect WHERE kind='ledger_unwritable'"
+        ),
+        0,
+        "a source read failure is not a ledger write failure"
     );
 }

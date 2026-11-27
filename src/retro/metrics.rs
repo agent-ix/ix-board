@@ -84,6 +84,7 @@ pub fn collect_selected(
 #[implements("FR-024-AC-21")]
 #[implements("FR-024-AC-22")]
 #[implements("FR-024-AC-25")]
+#[implements("FR-051-AC-4")]
 fn collect_inner(
     config: &RetroConfig,
     frame: Frame,
@@ -211,6 +212,7 @@ fn collect_inner(
         relay(&mut out, sources);
     }
     explicit_unavailable_metrics(&mut out);
+    build_stability(&mut out, sources);
     if let Some(requested) = requested {
         for id in requested {
             if out.metrics.contains_key(id) {
@@ -275,6 +277,44 @@ fn explicit_unavailable_metrics(out: &mut Out<'_>) {
         if out.wants(id) && !out.metrics.contains_key(id) {
             out.unavailable(id, format!("{source} source unavailable: {detail}"));
         }
+    }
+}
+
+#[implements("FR-051-AC-4")]
+fn build_stability(out: &mut Out<'_>, sources: &Sources<'_>) {
+    let entries: Vec<_> = CATALOG
+        .iter()
+        .filter_map(|entry| {
+            crate::build_stability::metric_host(entry.id)
+                .filter(|_| out.wants(entry.id))
+                .map(|(kind, host)| (entry.id, kind, host))
+        })
+        .collect();
+    if entries.is_empty() {
+        return;
+    }
+    let report = sources
+        .local
+        .build_stability((out.frame.now.max(0.0) * 1000.0) as u64);
+    for (id, kind, host) in entries {
+        let value = report
+            .hosts
+            .get(host)
+            .ok_or_else(|| format!("locked-build {host} source unavailable"))
+            .and_then(|row| {
+                row.last_24h.as_ref().ok_or_else(|| {
+                    format!(
+                        "locked-build {host} source unavailable: {}",
+                        row.reason.as_deref().unwrap_or("unknown")
+                    )
+                })
+            })
+            .and_then(|window| {
+                window
+                    .metric_value(kind)
+                    .ok_or_else(|| "empty population".to_owned())
+            });
+        out.put(id, value);
     }
 }
 
@@ -352,6 +392,7 @@ impl Out<'_> {
 
     /// The source name and counting rule (with window and thresholds) of one metric.
     #[implements("FR-024-AC-1")]
+    #[implements("FR-051-AC-4")]
     fn describe(&self, id: &str) -> (&'static str, String) {
         let window = format!("window={}", format_window(self.frame.window_secs));
         let t = &self.config.thresholds;
@@ -417,6 +458,10 @@ impl Out<'_> {
             "host_load_per_core_max" => (
                 "scheduler host observations",
                 "maximum one-minute load divided by logical cores".to_owned(),
+            ),
+            id if crate::build_stability::metric_host(id).is_some() => (
+                "locked-build status/events",
+                "retained request outcomes and nearest-rank admitted queue waits; fixed rolling window=24h; per-host; kills exclude successful attempts, refusals and command exits".to_owned(),
             ),
             _ => ("unknown", String::new()),
         };

@@ -3882,6 +3882,13 @@ fn run_hygiene(
 }
 
 #[implements("FR-050-AC-1", "FR-050-AC-2", "FR-050-AC-3", "FR-050-AC-4")]
+#[implements(
+    "FR-050-AC-1",
+    "FR-050-AC-2",
+    "FR-050-AC-3",
+    "FR-050-AC-4",
+    "FR-051-AC-5"
+)]
 fn run_host_check() -> ix_board::host_check::HostCheckReport {
     use ix_board::host_check::{
         AuthCheck, AuthState, auth_state, dev_process_findings, find_executable, host_exit_code,
@@ -4011,6 +4018,7 @@ fn run_host_check() -> ix_board::host_check::HostCheckReport {
     );
     ix_board::host_check::HostCheckReport {
         host: host_name,
+        stability: ix_board::build_stability::live(u64::try_from(cadence_now_ms()).unwrap_or(0)),
         auth,
         metrics,
         admission,
@@ -4190,6 +4198,7 @@ fn run_build_status(
 
 #[implements("FR-050-AC-1")]
 #[implements("FR-048-AC-12")]
+#[implements("FR-051-AC-1", "FR-051-AC-3")]
 fn render_human(output: &Output) -> String {
     match output {
         Output::Cached { result, freshness } => format!(
@@ -4329,6 +4338,7 @@ fn render_human(output: &Output) -> String {
             .join("\n"),
         Output::HostCheck(report) => {
             let mut lines = vec![format!("{} host check exit={}", report.host, report.exit_code)];
+            lines.push(ix_board::build_stability::render_text(&report.stability));
             lines.extend(report.auth.iter().map(|check| {
                 format!("auth {}={:?} source={}", check.service, check.state, check.source.as_deref().unwrap_or("unknown"))
             }));
@@ -5483,9 +5493,11 @@ mod tests {
 
     #[test]
     #[trace("FR-050-AC-1", "FR-050-AC-2")]
+    #[trace("FR-051-AC-1", "FR-051-AC-3")]
     fn host_check_text_contains_safe_statuses_without_credential_material() {
         let report = ix_board::host_check::HostCheckReport {
             host: "terra".to_owned(),
+            stability: ix_board::build_stability::StabilityReport { hosts: [("draco".to_owned(), ix_board::build_stability::from_status(r#"{"schema_version":1,"host":"draco","observed_at_ms":100000000,"requests":[],"events":[]}"#, "draco", 100000000))].into() },
             auth: vec![
                 ix_board::host_check::AuthCheck {
                     service: "gh".to_owned(),
@@ -5508,6 +5520,8 @@ mod tests {
         assert!(text.contains("auth gh=Ready"));
         assert!(text.contains("auth linear=Unauthorized"));
         assert!(!text.contains("LINEAR_API_KEY"));
+        assert!(text.contains("stability draco 1h requests=0 completed=0"));
+        assert!(text.contains("queue draco 24h class=all"));
     }
 
     #[trace("FR-047-AC-7")]
