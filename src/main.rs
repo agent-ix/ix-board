@@ -3693,6 +3693,7 @@ fn run_drift(
     "FR-048-AC-10",
     "FR-049-AC-10"
 )]
+#[implements("FR-048-AC-11", "FR-048-AC-12")]
 fn run_hygiene(
     args: &HygieneArgs,
     apply: bool,
@@ -4200,6 +4201,7 @@ fn run_build_status(
 }
 
 #[implements("FR-050-AC-1")]
+#[implements("FR-048-AC-12")]
 fn render_human(output: &Output) -> String {
     match output {
         Output::Cached { result, freshness } => format!(

@@ -345,7 +345,7 @@ impl HygieneReport {
 
 /// Collects the invoking user's process references without elevated rights.
 /// Completeness describes that user's live processes, not inaccessible other users.
-#[implements("FR-048-AC-2", "FR-048-AC-3")]
+#[implements("FR-048-AC-2", "FR-048-AC-3", "FR-048-AC-12")]
 pub fn system_process_table() -> io::Result<ProcessTable> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
@@ -484,6 +484,7 @@ pub fn mount_filesystem_matches(left: &Path, right: &Path, mounts: &[MountEntry]
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[implements("FR-048-AC-3")]
+#[implements("FR-048-AC-12")]
 fn native_process_table() -> io::Result<ProcessTable> {
     let uid = rustix::process::geteuid().as_raw().to_string();
     // Sample first, then inspect just those PIDs. Processes born during lsof's
@@ -552,6 +553,7 @@ fn native_process_table() -> io::Result<ProcessTable> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[implements("FR-048-AC-12")]
 fn owner_process_commands(output: &[u8], uid: u32) -> io::Result<Vec<u8>> {
     if output.len() > 64 * 1024 * 1024 {
         return Err(io::Error::other("ps inventory exceeds 64 MiB"));
@@ -612,6 +614,7 @@ fn owner_process_commands(output: &[u8], uid: u32) -> io::Result<Vec<u8>> {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[implements("FR-048-AC-3")]
+#[implements("FR-048-AC-12")]
 fn is_build_command(command: &[u8]) -> bool {
     command
         .split(|byte| byte.is_ascii_whitespace())
@@ -624,6 +627,7 @@ fn is_build_command(command: &[u8]) -> bool {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[implements("FR-048-AC-3")]
+#[implements("FR-048-AC-2", "FR-048-AC-12")]
 fn parse_native_process_output(
     lsof_output: &[u8],
     process_names: &[u8],
@@ -804,6 +808,7 @@ pub fn canonicalize_worktree_root(root: &Path) -> io::Result<PathBuf> {
 
 /// Discovers targets at depth at most three, retaining the containing Git worktree.
 /// Symlinks, backups and unexpected filesystems are never traversed.
+#[implements("FR-048-AC-11")]
 pub fn discover_targets(root: &Path, mounts: &[MountEntry]) -> io::Result<Vec<(PathBuf, PathBuf)>> {
     let mut pending = vec![(root.to_owned(), 0_u8, None::<PathBuf>)];
     let mut targets = Vec::new();
@@ -850,6 +855,7 @@ pub fn discover_targets(root: &Path, mounts: &[MountEntry]) -> io::Result<Vec<(P
 }
 
 /// Owner-scoped process evidence only authorizes deletion of this user's output.
+#[implements("FR-048-AC-12")]
 pub fn cleanup_owned_by_current_user(target: &Path, worktree: &Path) -> bool {
     #[cfg(unix)]
     {

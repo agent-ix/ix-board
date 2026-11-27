@@ -92,6 +92,7 @@ pub use focus_activity::DEFAULT_CLOSED_SINCE_SECONDS;
 use focus_activity::{
     ActivityWindow, finish_activity, focus_issue_with_state, project_events, recently_closed,
 };
+use ix_trace_rs::implements;
 use model::{compare_f64, issue_is_open};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -512,6 +513,7 @@ pub enum RefreshOutcome {
 }
 
 impl RefreshOutcome {
+    #[implements("FR-004-AC-23")]
     pub(crate) fn from_error(error: &Error) -> Self {
         match error {
             Error::QuotaAdmissionRefused { decision } => Self::QuotaRefused {
@@ -626,6 +628,7 @@ impl<S: WorkspaceSource> ReadService<S, SystemClock> {
 /// callers in stripped environments can provide `XDG_CACHE_HOME` explicitly.
 /// An inaccessible default falls back to a private per-user temporary directory.
 /// Explicit overrides, corrupt databases and contention return a path-bearing error.
+#[implements("FR-004-AC-5", "FR-004-AC-6", "FR-004-AC-22")]
 pub fn default_cache_path() -> Result<PathBuf, Error> {
     let explicit = std::env::var_os("IX_BOARD_CACHE_PATH").map(PathBuf::from);
     if let Some(path) = explicit {

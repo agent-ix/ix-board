@@ -8,6 +8,7 @@ use crate::{
     hygiene::FocusBaseline,
     read_bound::{Deadline, decode_within},
 };
+use ix_trace_rs::implements;
 use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -21,6 +22,7 @@ const LEGACY_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Validates the database and its lock before transport and snapshot readers share it.
 
+#[implements("FR-004-AC-22")]
 pub(crate) fn select_cache_path(
     explicit: Option<&Path>,
     preferred: &Path,
@@ -48,6 +50,7 @@ pub(crate) fn select_cache_path(
     }
 }
 
+#[implements("FR-004-AC-22")]
 fn cache_access_failure(error: &Error) -> bool {
     match error {
         Error::CachePermissions(_) | Error::CacheDirectory(_) => true,
@@ -62,6 +65,7 @@ fn cache_access_failure(error: &Error) -> bool {
     }
 }
 
+#[implements("FR-004-AC-22")]
 fn probe_cache_path(path: &Path, private: bool) -> Result<(), Error> {
     if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
         if private {
@@ -102,6 +106,7 @@ fn probe_cache_path(path: &Path, private: bool) -> Result<(), Error> {
     Ok(())
 }
 
+#[implements("FR-004-AC-22", "FR-004-AC-23")]
 fn refresh_lock_path(path: &Path) -> PathBuf {
     let mut lock_path = path.as_os_str().to_owned();
     lock_path.push(".refresh.lock");
@@ -461,6 +466,7 @@ pub(crate) struct RefreshLock {
 }
 
 impl RefreshLock {
+    #[implements("FR-004-AC-20", "FR-004-AC-23")]
     pub(crate) fn acquire(path: &Path, deadline: Option<&Deadline<'_>>) -> Result<Self, Error> {
         use std::io::{Read, Seek, Write};
         let lock_path = refresh_lock_path(path);
@@ -525,6 +531,7 @@ impl RefreshLock {
 }
 
 impl Drop for RefreshLock {
+    #[implements("FR-004-AC-23")]
     fn drop(&mut self) {
         // The OS lock remains held until the file field is dropped. Clearing
         // diagnostic metadata cannot unlock or replace another owner's file.
