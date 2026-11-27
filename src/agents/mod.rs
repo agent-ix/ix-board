@@ -440,7 +440,11 @@ pub const HOST_TIMEOUT: Duration = Duration::from_secs(45);
 pub fn system_hosts() -> Result<Vec<Arc<dyn Host>>, AgentsError> {
     let local = SystemHost::local();
     let machines = parse_machines(&local.herdr(&["machine", "list", "--json"])?)?;
-    let mut hosts: Vec<Arc<dyn Host>> = vec![Arc::new(local)];
+    Ok(inventory_hosts(None, machines))
+}
+
+fn inventory_hosts(_local_name: Option<&str>, machines: Vec<HerdrMachine>) -> Vec<Arc<dyn Host>> {
+    let mut hosts: Vec<Arc<dyn Host>> = vec![Arc::new(SystemHost::local())];
     hosts.extend(
         machines
             .into_iter()
@@ -449,7 +453,7 @@ pub fn system_hosts() -> Result<Vec<Arc<dyn Host>>, AgentsError> {
                 Arc::new(SystemHost::remote(machine.label, machine.target)) as Arc<dyn Host>
             }),
     );
-    Ok(hosts)
+    hosts
 }
 
 /// Reads every host in parallel, each under [`HOST_TIMEOUT`], and builds the report.
@@ -1047,5 +1051,24 @@ mod tests {
         };
         assert!(!is_work_command(&wrapper));
         assert!(is_work_command(&leased_command));
+    }
+}
+
+#[cfg(test)]
+mod stability_inventory_review {
+    use super::*;
+    use ix_trace_rs::trace;
+
+    #[test]
+    #[trace("FR-051-AC-5")]
+    fn review_local_machine_and_duplicate_saved_profiles_are_not_probed_twice() {
+        let hosts = inventory_hosts(Some("draco"), vec![
+            HerdrMachine { label: "draco".into(), target: "peter@draco.local".into(), enabled: true },
+            HerdrMachine { label: "local-alias".into(), target: "draco".into(), enabled: true },
+            HerdrMachine { label: "terra".into(), target: "terra-ssh".into(), enabled: true },
+            HerdrMachine { label: "TERRA".into(), target: "other-alias".into(), enabled: true },
+            HerdrMachine { label: "luna".into(), target: "luna".into(), enabled: false },
+        ]);
+        assert_eq!(hosts.iter().map(|host| host.label()).collect::<Vec<_>>(), ["local", "terra"]);
     }
 }

@@ -1104,6 +1104,20 @@ mod collection_tests {
 
     #[test]
     #[trace("FR-051-AC-5")]
+    fn review_duplicate_sources_keep_the_first_valid_host_row() {
+        let good = r#"{"schema_version":1,"host":"draco","observed_at_ms":100000000,"requests":[{"request_id":"one","class":"point","state":"succeeded","enqueued_at_ms":99990000,"ended_at_ms":99999000,"exit_code":0}],"events":[]}"#;
+        let hosts: Vec<Arc<dyn Host>> = vec![
+            Arc::new(FixtureHost { label: "local".into(), status: good.into() }),
+            Arc::new(FixtureHost { label: "draco".into(), status: "invalid".into() }),
+            Arc::new(FixtureHost { label: "draco".into(), status: good.into() }),
+        ];
+        let report = collect(&hosts, 100_000_000);
+        assert_eq!(report.hosts["draco"].reason, None);
+        assert_eq!(report.hosts["draco"].last_1h.as_ref().unwrap().completed, 1);
+    }
+
+    #[test]
+    #[trace("FR-051-AC-5")]
     fn stability_collects_every_injected_host_and_refuses_mismatched_identity() {
         let hosts=HOSTS.iter().map(|host| Arc::new(FixtureHost { label: if *host=="draco" {"local".into()} else {(*host).into()}, status: format!(r#"{{"schema_version":1,"host":"{host}","observed_at_ms":100000000,"requests":[],"events":[]}}"#) }) as Arc<dyn Host>).collect::<Vec<_>>();
         let report = collect(&hosts, 100_000_000);
@@ -1353,5 +1367,99 @@ mod correction_contract_tests {
             .last_1h
             .unwrap();
         assert_eq!(retained, event_only);
+    }
+}
+
+#[cfg(test)]
+mod independent_review_fixes {
+    use super::*;
+    use ix_trace_rs::trace;
+    use serde_json::json;
+
+    #[test]
+    #[trace("FR-051-AC-1", "FR-051-AC-2")]
+    fn review_legacy_supervision_and_refusal_spellings_keep_outcome_semantics() {
+        let input = r#"{"schema_version":1,"host":"draco","observed_at_ms":100000000,"requests":[{"request_id":"lost","class":"point","state":"failed","enqueued_at_ms":99990000,"ended_at_ms":99999000,"reason":"supervision_lost"},{"request_id":"degraded","class":"point","state":"succeeded","enqueued_at_ms":99990000,"ended_at_ms":99999000,"reason":"supervision_degraded","exit_code":0},{"request_id":"refused","class":"point","state":"refused","ended_at_ms":99999000,"reason":"refused"}],"events":[]}"#;
+        let hour = from_status(input, "draco", 100_000_000).last_1h.unwrap();
+        assert_eq!(hour.completed, 3);
+        assert_eq!(hour.terminations_by_code, BTreeMap::from([("LB_SUPERVISION_LOST".into(), 2), ("LB_REFUSED_QUEUE".into(), 1)]));
+        assert_eq!(hour.kill_rate, Some(1.0 / 3.0));
+        assert_eq!(hour.success_rate, Some(1.0 / 3.0));
+    }
+
+    #[test]
+    #[trace("FR-051-AC-3")]
+    fn review_open_queue_observation_after_as_of_is_clipped_not_null() {
+        let input = r#"{"schema_version":1,"host":"draco","observed_at_ms":100003000,"requests":[{"request_id":"open","class":"point","lifecycle_state":"queued","queued_at_ms":99990000,"queued_seconds":13,"blocked_reasons":[{"reason":"memory_budget","value":12,"limit":10,"seconds":9}]}],"events":[]}"#;
+        let hour = from_status(input, "draco", 100_000_000).last_1h.unwrap();
+        assert_eq!(hour.end_ms, 100_000_000);
+        assert_eq!(hour.queue["all"].blocked_seconds.as_ref().unwrap()["memory_budget"], 9.0);
+    }
+
+    #[test]
+    #[trace("FR-051-AC-3", "FR-051-AC-5")]
+    fn review_nearest_prior_baseline_and_one_missing_baseline_keep_known_contributions() {
+        let input = r#"{"schema_version":1,"host":"draco","observed_at_ms":100000000,"requests":[{"request_id":"prior","class":"point","lifecycle_state":"running","queued_at_ms":96000000,"admitted_at_ms":96410000,"queued_seconds":410,"blocked_reasons":[{"reason":"memory_budget","value":12,"limit":10,"seconds":15}]},{"request_id":"missing","class":"point","lifecycle_state":"running","queued_at_ms":96000000,"admitted_at_ms":96410000,"queued_seconds":410,"blocked_reasons":[{"reason":"memory_budget","value":12,"limit":10,"seconds":3}]},{"request_id":"fresh","class":"point","lifecycle_state":"running","queued_at_ms":99990000,"admitted_at_ms":99995000,"queued_seconds":5,"blocked_reasons":[{"reason":"memory_budget","value":12,"limit":10,"seconds":2}]}],"events":[{"request_id":"prior","observed_at_ms":96399000,"lifecycle_state":"queued","blocked_reasons":[{"reason":"memory_budget","value":12,"limit":10,"seconds":10}]}]}"#;
+        let hour = from_status(input, "draco", 100_000_000).last_1h.unwrap();
+        let queue = &hour.queue["point"];
+        assert_eq!(queue.blocked_seconds.as_ref().unwrap()["memory_budget"], 7.0);
+        let value = serde_json::to_value(queue).unwrap();
+        assert_eq!(value["blocked_requests_available"], json!(2));
+        assert_eq!(value["blocked_requests_unavailable"], json!(1));
+        assert_eq!(value["blocked_baseline_gap_ms"], json!(1000));
+    }
+
+    #[test]
+    #[trace("FR-051-AC-1", "FR-051-AC-3", "FR-051-AC-5")]
+    fn review_additive_labels_and_two_bad_requests_preserve_a_healthy_host() {
+        let input = r#"{"schema_version":2,"host":"draco","observed_at_ms":100000000,"requests":[{"request_id":"good","class":"point","state":"succeeded","enqueued_at_ms":99990000,"started_at_ms":99991000,"ended_at_ms":99992000,"exit_code":0},{"request_id":"future","class":"private-new-class","lifecycle_state":"queued","queued_at_ms":99990000,"queued_seconds":10,"blocked_reasons":[{"reason":"memory_budget","value":12,"limit":10,"seconds":2},{"reason":"private-new-reason","value":1,"limit":0,"seconds":3}]},{"request_id":"missing-time","class":"point","state":"running"},{"request_id":"backwards","class":"point","state":"failed","enqueued_at_ms":99999000,"ended_at_ms":99990000}],"events":[]}"#;
+        let report = from_status(input, "draco", 100_000_000);
+        assert_eq!(report.reason, None);
+        let hour = report.last_1h.as_ref().unwrap();
+        assert_eq!(hour.requests, 2);
+        assert_eq!(hour.completed, 1);
+        assert_eq!(hour.success_rate, Some(1.0));
+        assert_eq!(hour.queue["unknown"].blocked_seconds.as_ref().unwrap()["memory_budget"], 2.0);
+        assert_eq!(hour.queue["unknown"].blocked_seconds.as_ref().unwrap()["unknown"], 3.0);
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["invalid_requests"], json!(2));
+        assert_eq!(value["unknown_class_requests"], json!(1));
+        assert_eq!(value["last_1h"]["queue"]["unknown"]["unknown_block_reasons"], json!(1));
+        let rendered = render_text(&StabilityReport { hosts: [("draco".into(), report)].into() });
+        assert!(!rendered.contains("private-new-class"));
+        assert!(!rendered.contains("private-new-reason"));
+    }
+
+    #[test]
+    #[trace("FR-051-AC-3", "FR-051-AC-5")]
+    fn review_bad_blocker_timing_only_loses_that_requests_blocking_evidence() {
+        let input = r#"{"schema_version":1,"host":"draco","observed_at_ms":100000000,"requests":[{"request_id":"good","class":"point","lifecycle_state":"queued","queued_at_ms":99990000,"queued_seconds":10,"blocked_reasons":[{"reason":"load","value":20,"limit":16,"seconds":2}]},{"request_id":"bad","class":"point","lifecycle_state":"queued","queued_at_ms":99990000,"queued_seconds":10,"blocked_reasons":[{"reason":"load","value":20,"limit":16,"seconds":-1}]}],"events":[]}"#;
+        let report = from_status(input, "draco", 100_000_000);
+        assert_eq!(report.reason, None);
+        let queue = &report.last_1h.unwrap().queue["point"];
+        assert_eq!(queue.blocked_seconds.as_ref().unwrap()["load"], 2.0);
+        let value = serde_json::to_value(queue).unwrap();
+        assert_eq!(value["blocked_requests_unavailable"], json!(1));
+        assert_eq!(value["invalid_block_reasons"], json!(1));
+    }
+
+    #[test]
+    #[trace("FR-051-AC-3")]
+    fn review_memory_is_a_bounded_quantile_summary_with_explicit_unknown_counts() {
+        let input = r#"{"schema_version":1,"host":"draco","observed_at_ms":100000000,"requests":[{"request_id":"a","class":"point","lifecycle_state":"running","queued_at_ms":99990000,"admitted_at_ms":99991000,"requested_memory_bytes":100,"granted_memory_bytes":80,"requested_memory_reservation_bytes":10,"granted_memory_reservation_bytes":8,"memory_needed_bytes":20,"memory_free_budget_bytes":1000},{"request_id":"b","class":"point","lifecycle_state":"running","queued_at_ms":99990000,"admitted_at_ms":99991000,"requested_memory_bytes":300,"granted_memory_bytes":280,"requested_memory_reservation_bytes":30,"granted_memory_reservation_bytes":28,"memory_needed_bytes":40,"memory_free_budget_bytes":2000},{"request_id":"legacy","class":"point","state":"queued","enqueued_at_ms":99990000}],"events":[]}"#;
+        let report = from_status(input, "draco", 100_000_000);
+        let memory = &serde_json::to_value(report.last_1h.as_ref().unwrap()).unwrap()["queue"]["all"]["memory"];
+        assert!(memory.is_object());
+        assert_eq!(memory["requests"], json!(3));
+        assert_eq!(memory["requested_memory_bytes"], json!({"count":2,"unknown":1,"p50_bytes":100,"p95_bytes":300,"max_bytes":300}));
+        assert_eq!(memory["granted_memory_bytes"]["p50_bytes"], json!(80));
+        assert_eq!(memory["requested_memory_reservation_bytes"]["p95_bytes"], json!(30));
+        assert_eq!(memory["granted_memory_reservation_bytes"]["max_bytes"], json!(28));
+        assert_eq!(memory["memory_needed_bytes"]["p95_bytes"], json!(40));
+        assert_eq!(memory["memory_free_budget_bytes"]["p50_bytes"], json!(1000));
+        assert!(!memory.to_string().contains("request_id"));
+        let text = render_text(&StabilityReport { hosts: [("draco".into(), report)].into() });
+        assert!(text.contains("requested_memory_bytes count=2 unknown=1 p50_bytes=100 p95_bytes=300 max_bytes=300"));
+        assert!(!text.contains("MemoryGrant"));
     }
 }
