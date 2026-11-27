@@ -1283,8 +1283,10 @@ mod status_memory_tests {
 #[cfg(test)]
 mod reservation_contract_tests {
     use super::*;
+    use ix_trace_rs::trace;
 
     #[test]
+    #[trace("FR-051-AC-3", "FR-051-AC-5")]
     fn stability_admission_reservation_is_distinct_from_hard_cap() {
         let input = r#"{"schema_version":1,"host":"draco","observed_at_ms":100000000,"requests":[{"request_id":"waiting","class":"block","state":"queued","lifecycle_state":"queued","queued_at_ms":99990000,"requested_memory_bytes":4096,"requested_memory_reservation_bytes":512,"memory_needed_bytes":512,"memory_free_budget_bytes":256},{"request_id":"admitted","class":"block","state":"running","lifecycle_state":"running","queued_at_ms":99990000,"admitted_at_ms":99991000,"requested_memory_bytes":8192,"granted_memory_bytes":8192,"requested_memory_reservation_bytes":1024,"granted_memory_reservation_bytes":1024,"memory_needed_bytes":1024,"memory_free_budget_bytes":256}],"events":[]}"#;
         let report = from_status(input, "draco", 100_000_000);
@@ -1315,9 +1317,11 @@ mod reservation_contract_tests {
 #[cfg(test)]
 mod correction_contract_tests {
     use super::*;
+    use ix_trace_rs::trace;
     use serde_json::json;
 
     #[test]
+    #[trace("FR-051-AC-1", "FR-051-AC-2", "FR-051-AC-5")]
     fn stability_correction_of_a_historical_outcome_counts_one_attempt() {
         let mut source = json!({"schema_version":1,"host":"draco","observed_at_ms":100000000,"requests":[],"events":[
             {"event_id":"original","observed_at_ms":99995000,"request_id":"one","class":"point","state":"failed","lifecycle_state":"failed","queued_at_ms":99990000,"admitted_at_ms":99991000,"finished_at_ms":99995000,"code":"LB_COMMAND_EXIT","exit_code":101},
