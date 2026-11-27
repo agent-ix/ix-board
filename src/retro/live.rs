@@ -1217,6 +1217,7 @@ fn parse_elapsed(text: &str) -> Option<u64> {
 }
 
 impl LocalSource for SystemLocal {
+    #[implements("FR-051-AC-4", "FR-051-AC-5")]
     fn build_stability(&self, now_ms: u64) -> crate::build_stability::StabilityReport {
         crate::build_stability::live(now_ms)
     }

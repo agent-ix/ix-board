@@ -585,6 +585,7 @@ fn cadence_due_cli_uses_exit_codes_zero_one_and_two() {
 }
 
 #[test]
+#[trace("FR-051-AC-5")]
 fn stability_default_cadence_needs_no_flags_and_schedules_no_notifications() {
     let directory = tempfile::tempdir().unwrap();
     let manifest = ix_board::cadence::generate_default_manifest(

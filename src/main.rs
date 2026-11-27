@@ -3882,6 +3882,13 @@ fn run_hygiene(
 }
 
 #[implements("FR-050-AC-1", "FR-050-AC-2", "FR-050-AC-3", "FR-050-AC-4")]
+#[implements(
+    "FR-050-AC-1",
+    "FR-050-AC-2",
+    "FR-050-AC-3",
+    "FR-050-AC-4",
+    "FR-051-AC-5"
+)]
 fn run_host_check() -> ix_board::host_check::HostCheckReport {
     use ix_board::host_check::{
         AuthCheck, AuthState, auth_state, dev_process_findings, find_executable, host_exit_code,
@@ -4191,6 +4198,7 @@ fn run_build_status(
 
 #[implements("FR-050-AC-1")]
 #[implements("FR-048-AC-12")]
+#[implements("FR-051-AC-1", "FR-051-AC-3")]
 fn render_human(output: &Output) -> String {
     match output {
         Output::Cached { result, freshness } => format!(
@@ -5485,6 +5493,7 @@ mod tests {
 
     #[test]
     #[trace("FR-050-AC-1", "FR-050-AC-2")]
+    #[trace("FR-051-AC-1", "FR-051-AC-3")]
     fn host_check_text_contains_safe_statuses_without_credential_material() {
         let report = ix_board::host_check::HostCheckReport {
             host: "terra".to_owned(),

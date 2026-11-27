@@ -241,6 +241,7 @@ pub fn load_manifest(path: &Path) -> Result<Manifest, CadenceError> {
 
 /// Creates the local team jobs once, without replacing an existing manifest.
 #[implements("FR-049-AC-4", "FR-049-AC-8", "FR-049-AC-10")]
+#[implements("FR-051-AC-5")]
 pub fn generate_default_manifest(
     path: &Path,
     program: &str,

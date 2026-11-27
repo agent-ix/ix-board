@@ -3854,6 +3854,7 @@ fn a_missing_host_names_itself_in_the_unavailable_agent_metrics() {
 }
 
 #[test]
+#[trace("FR-051-AC-4")]
 fn stability_retro_collects_additive_host_metrics_once_and_routes_rises_as_existing_defects() {
     let mut rig = base_rig();
     let now_ms = (NOW * 1000.0) as u64;

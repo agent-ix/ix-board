@@ -84,6 +84,7 @@ pub fn collect_selected(
 #[implements("FR-024-AC-21")]
 #[implements("FR-024-AC-22")]
 #[implements("FR-024-AC-25")]
+#[implements("FR-051-AC-4")]
 fn collect_inner(
     config: &RetroConfig,
     frame: Frame,
@@ -279,6 +280,7 @@ fn explicit_unavailable_metrics(out: &mut Out<'_>) {
     }
 }
 
+#[implements("FR-051-AC-4")]
 fn build_stability(out: &mut Out<'_>, sources: &Sources<'_>) {
     let entries: Vec<_> = CATALOG
         .iter()
@@ -390,6 +392,7 @@ impl Out<'_> {
 
     /// The source name and counting rule (with window and thresholds) of one metric.
     #[implements("FR-024-AC-1")]
+    #[implements("FR-051-AC-4")]
     fn describe(&self, id: &str) -> (&'static str, String) {
         let window = format!("window={}", format_window(self.frame.window_secs));
         let t = &self.config.thresholds;

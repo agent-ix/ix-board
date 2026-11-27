@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use ix_trace_rs::implements;
 use serde::{Deserialize, Serialize};
 
 use crate::agents::Host;
@@ -18,6 +19,7 @@ use crate::agents::Host;
 pub const HOSTS: [&str; 4] = ["draco", "luna", "titan", "terra"];
 
 /// Recognizes only the additive stability catalog ids for the four owned hosts.
+#[implements("FR-051-AC-4")]
 pub fn metric_host(id: &str) -> Option<(&str, &str)> {
     let (kind, host) = id.rsplit_once('_')?;
     (HOSTS.contains(&host)
@@ -33,6 +35,7 @@ pub fn metric_host(id: &str) -> Option<(&str, &str)> {
 
 impl Window {
     /// Computes a stability catalog value from this window; empty rates stay unavailable.
+    #[implements("FR-051-AC-4")]
     pub fn metric_value(&self, kind: &str) -> Option<f64> {
         match kind {
             "build_kill_rate" => self.kill_rate,
@@ -230,6 +233,7 @@ impl HostStability {
 }
 
 /// Decodes a redacted status document without exposing raw producer content on errors.
+#[implements("FR-051-AC-1", "FR-051-AC-2", "FR-051-AC-3", "FR-051-AC-5")]
 pub fn from_status(text: &str, expected_host: &str, now_ms: u64) -> HostStability {
     if text.len() > crate::agents::MAX_PROTOCOL_BYTES {
         return HostStability::unavailable("status_too_large");
@@ -270,6 +274,7 @@ pub fn from_status(text: &str, expected_host: &str, now_ms: u64) -> HostStabilit
     }
 }
 
+#[implements("FR-051-AC-5")]
 fn valid_request(request: &RequestInput, observed_at_ms: u64) -> bool {
     let phase = request.phase();
     let queued = request.queued_at();
@@ -334,6 +339,7 @@ const BLOCK_REASONS: [&str; 7] = [
     "telemetry_unavailable",
 ];
 
+#[implements("FR-051-AC-2")]
 fn termination_code(request: &RequestInput) -> Option<Code> {
     if let Some(code) = request.trace.diagnostic.code {
         return Some(code);
@@ -366,6 +372,7 @@ fn is_kill(code: &str) -> bool {
     )
 }
 
+#[implements("FR-051-AC-1", "FR-051-AC-2")]
 fn summarize(status: &StatusInput, start_ms: u64, end_ms: u64) -> Window {
     let requests = &status.requests;
     let contains = |at| at > start_ms && at <= end_ms;
@@ -468,6 +475,7 @@ fn summarize(status: &StatusInput, start_ms: u64, end_ms: u64) -> Window {
     }
 }
 
+#[implements("FR-051-AC-3")]
 fn queue_analysis(
     status: &StatusInput,
     class: Option<&str>,
@@ -593,6 +601,7 @@ fn queue_analysis(
     }
 }
 
+#[implements("FR-051-AC-3")]
 fn legacy_blocker(reason: &str) -> Option<&str> {
     match reason {
         "memory_budget"
@@ -611,6 +620,7 @@ fn legacy_blocker(reason: &str) -> Option<&str> {
     }
 }
 
+#[implements("FR-051-AC-3")]
 fn blocked_in_window(
     status: &StatusInput,
     request: &RequestInput,
@@ -649,6 +659,7 @@ fn blocked_in_window(
     Some(seconds)
 }
 
+#[implements("FR-051-AC-1", "FR-051-AC-2")]
 fn enrich_events(status: &mut StatusInput) -> bool {
     // Refusals can exist only in events. Latest snapshot per attempt wins; transitions,
     // blocker snapshots and command-start events never increment counts independently.
@@ -680,6 +691,7 @@ fn enrich_events(status: &mut StatusInput) -> bool {
 }
 
 /// Reads each reachable machine once in parallel and retains explicit missing hosts.
+#[implements("FR-051-AC-5")]
 pub fn collect(hosts: &[Arc<dyn Host>], now_ms: u64) -> StabilityReport {
     let mut report = StabilityReport {
         hosts: HOSTS
@@ -737,6 +749,7 @@ pub fn collect(hosts: &[Arc<dyn Host>], now_ms: u64) -> StabilityReport {
 }
 
 /// Collects the configured Herdr host inventory; discovery failure still reports all hosts.
+#[implements("FR-051-AC-5")]
 pub fn live(now_ms: u64) -> StabilityReport {
     collect(
         &crate::agents::system_hosts()
@@ -746,6 +759,7 @@ pub fn live(now_ms: u64) -> StabilityReport {
 }
 
 /// Renders rolling host stability and queue evidence without raw producer strings.
+#[implements("FR-051-AC-1", "FR-051-AC-3")]
 pub fn render_text(report: &StabilityReport) -> String {
     let mut lines = Vec::new();
     for (host, row) in &report.hosts {
@@ -768,6 +782,7 @@ pub fn render_text(report: &StabilityReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ix_trace_rs::trace;
     use serde_json::json;
 
     const NOW: u64 = 100_000_000;
@@ -777,6 +792,7 @@ mod tests {
     }
 
     #[test]
+    #[trace("FR-051-AC-1", "FR-051-AC-2")]
     fn stability_windows_count_attempts_not_event_snapshots_and_keep_limit_evidence() {
         let source = status(
             json!([
@@ -827,6 +843,7 @@ mod tests {
     }
 
     #[test]
+    #[trace("FR-051-AC-2")]
     fn stability_legacy_outcomes_do_not_infer_oom_from_sigkill_or_exit_137() {
         for (state, reason, signal, exit_code, expected) in [
             ("failed", Some("rss_cap"), None, None, Some("LB_RSS_CAP")),
@@ -870,6 +887,7 @@ mod tests {
     }
 
     #[test]
+    #[trace("FR-051-AC-3")]
     fn stability_queue_percentiles_depth_blockers_and_memory_use_frozen_contract() {
         let source = status(
             json!([
@@ -917,6 +935,7 @@ mod tests {
     }
 
     #[test]
+    #[trace("FR-051-AC-3")]
     fn stability_queue_window_baseline_cancellation_and_unknown_legacy_duration() {
         let source = status(
             json!([
@@ -939,6 +958,7 @@ mod tests {
     }
 
     #[test]
+    #[trace("FR-051-AC-5")]
     fn stability_unavailable_sources_never_become_zeros_or_echo_payloads() {
         let source = status(json!([]), json!([]));
         for (field, value, reason) in [
@@ -980,6 +1000,7 @@ mod tests {
     }
 
     #[test]
+    #[trace("FR-051-AC-5")]
     fn stability_missing_inventory_still_names_every_host() {
         let report = collect(&[], NOW);
         assert_eq!(report.hosts.len(), 4);
@@ -997,6 +1018,7 @@ mod tests {
 mod collection_tests {
     use super::*;
     use crate::agents::{AgentsError, Probe, ProbeRequest};
+    use ix_trace_rs::trace;
 
     struct FixtureHost {
         label: String,
@@ -1018,6 +1040,7 @@ mod collection_tests {
     }
 
     #[test]
+    #[trace("FR-051-AC-5")]
     fn stability_collects_every_injected_host_and_refuses_mismatched_identity() {
         let hosts=HOSTS.iter().map(|host| Arc::new(FixtureHost { label: if *host=="draco" {"local".into()} else {(*host).into()}, status: format!(r#"{{"schema_version":1,"host":"{host}","observed_at_ms":100000000,"requests":[],"events":[]}}"#) }) as Arc<dyn Host>).collect::<Vec<_>>();
         let report = collect(&hosts, 100_000_000);
@@ -1033,6 +1056,7 @@ mod collection_tests {
     }
 
     #[test]
+    #[trace("FR-051-AC-3")]
     fn stability_blocked_seconds_subtract_exact_window_boundary_observation() {
         let input = r#"{"schema_version":1,"host":"draco","observed_at_ms":100000000,"requests":[{"request_id":"old","class":"point","lifecycle_state":"running","queued_at_ms":96000000,"admitted_at_ms":96410000,"queued_seconds":410,"blocked_reasons":[{"reason":"memory_budget","value":100,"limit":90,"seconds":15.0},{"reason":"load","value":20,"limit":16,"seconds":10.0}]}],"events":[{"event_id":"baseline","observed_at_ms":96400000,"request_id":"old","lifecycle_state":"queued","blocked_reasons":[{"reason":"memory_budget","value":100,"limit":90,"seconds":10.0},{"reason":"load","value":20,"limit":16,"seconds":8.0}]}]}"#;
         let report = from_status(input, "draco", 100_000_000);

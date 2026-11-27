@@ -10,6 +10,7 @@ use super::{
     harness::HarnessKind,
     lifecycle::{Availability, Lifecycle, WorkerObservation},
 };
+use ix_trace_rs::implements;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -358,6 +359,7 @@ pub(super) fn run(
 }
 
 impl Host for SystemHost {
+    #[implements("FR-051-AC-5")]
     fn build_status(&self) -> Result<String, AgentsError> {
         let mut command;
         match &self.machine {
