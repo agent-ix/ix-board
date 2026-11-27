@@ -32,6 +32,27 @@ const NOW: f64 = 1_794_052_800.0; // 2026-11-07T12:00:00Z
 const HOUR: f64 = 3600.0;
 const DAY: u64 = 86_400;
 
+// Resource tests exercise real local IO without invoking unrelated fleet probes.
+struct LocalFilesystem;
+
+impl LocalSource for LocalFilesystem {
+    fn build_stability(&self, _now_ms: u64) -> ix_board::build_stability::StabilityReport {
+        Default::default()
+    }
+
+    fn prunable_worktrees(&self, dir: &Path) -> Result<u64, String> {
+        ix_board::retro::live::SystemLocal.prunable_worktrees(dir)
+    }
+
+    fn disk_bytes(&self, dir: &Path) -> Result<u64, String> {
+        ix_board::retro::live::SystemLocal.disk_bytes(dir)
+    }
+
+    fn processes(&self) -> Result<Vec<ProcessRow>, String> {
+        ix_board::retro::live::SystemLocal.processes()
+    }
+}
+
 fn ago(hours: f64) -> f64 {
     NOW - hours * HOUR
 }
@@ -922,7 +943,7 @@ fn local_metrics_read_a_real_directory_with_a_prunable_worktree() {
     std::fs::remove_dir_all(&worktree).unwrap();
     std::fs::write(repo.join("data.bin"), [0_u8; 100]).unwrap();
 
-    let local = ix_board::retro::live::SystemLocal;
+    let local = LocalFilesystem;
     let rig = base_rig();
     let sources = Sources {
         local: &local,
@@ -1257,7 +1278,7 @@ fn a_snapshot_only_reads_and_leaves_a_repository_untouched() {
         out
     };
     let before = listing(repo.path());
-    let local = ix_board::retro::live::SystemLocal;
+    let local = LocalFilesystem;
     let mut rig = base_rig();
     rig.gate_lines = Some(Ok(Vec::new()));
     rig.processes = Some(Ok(Vec::new()));
