@@ -472,6 +472,7 @@ struct LockOwner {
 }
 
 impl LockOwner {
+    #[implements("FR-004-AC-23", "FR-004-AC-24")]
     fn diagnostic(self) -> String {
         let pid = self
             .pid
@@ -483,6 +484,7 @@ impl LockOwner {
         format!("pid={pid} age={age}")
     }
 
+    #[implements("FR-004-AC-24")]
     fn is_dead(self) -> bool {
         #[cfg(unix)]
         {
@@ -500,6 +502,7 @@ impl LockOwner {
     }
 }
 
+#[implements("FR-004-AC-23", "FR-004-AC-24")]
 fn unix_millis() -> Option<u64> {
     u64::try_from(
         std::time::SystemTime::now()
@@ -510,6 +513,7 @@ fn unix_millis() -> Option<u64> {
     .ok()
 }
 
+#[implements("FR-004-AC-23", "FR-004-AC-24")]
 fn read_lock_owner(file: &mut std::fs::File) -> LockOwner {
     use std::io::{Read, Seek};
     let mut bytes = Vec::new();
@@ -545,7 +549,7 @@ fn read_lock_owner(file: &mut std::fs::File) -> LockOwner {
 }
 
 impl RefreshLock {
-    #[implements("FR-004-AC-20", "FR-004-AC-23")]
+    #[implements("FR-004-AC-20", "FR-004-AC-23", "FR-004-AC-24")]
     pub(crate) fn acquire(path: &Path, deadline: Option<&Deadline<'_>>) -> Result<Self, Error> {
         use std::io::{Seek, Write};
         let lock_path = refresh_lock_path(path);
