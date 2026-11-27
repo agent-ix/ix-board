@@ -14,6 +14,7 @@ pub struct TrackerBatch {
     results: Vec<(String, Result<TrackerResult, String>)>,
 }
 struct TrackerResult {
+    github_refreshed: bool,
     members: BTreeMap<String, Member>,
     record: retro::Record,
     build_execution_seconds_24h: Option<f64>,
@@ -264,6 +265,15 @@ impl Collector {
     }
     /// Collects tracker/VCS data using shared retro calculations, outside the activity worker.
     pub fn tracker(config: &Config, now: i64) -> TrackerBatch {
+        let started = std::time::Instant::now();
+        let github_refreshed = Journal::open(&config.state_path, config)
+            .and_then(|mut journal| {
+                journal.claim_github_collection(now, config.github_interval_seconds)
+            })
+            .unwrap_or_else(|error| {
+                eprintln!("GitHub collection admission unavailable: {error}");
+                false
+            });
         let source = retro::live::linear_or_unreadable();
         let workspace = tracker_workspace(source.as_ref(), now as f64 / 1000.0 - 86400.0);
         // The native workspace reader stamps completed observations. Anchor
@@ -438,7 +448,11 @@ impl Collector {
                             Some(seconds)
                         })
                     });
-                    let github = SelectedGithub::new(config, allowed, attachments_complete, now);
+                    let github = if github_refreshed {
+                        SelectedGithub::new(config, allowed, attachments_complete, now)
+                    } else {
+                        SelectedGithub::deferred(now)
+                    };
                     let agents = NoAgents;
                     // Agent share requires session-qualified polling, not a second broad read.
                     cfg.herdr_teams.clear();
@@ -510,6 +524,9 @@ impl Collector {
                         .filter(|_| github.observed_at() > 0)
                         .map(|prs| super::pr_stats::calculate(prs, now as f64 / 1000.0));
                     let review_stats = (|| -> Result<super::reviews::ReviewStats, String> {
+                        if !github_refreshed {
+                            return Err("GitHub collection not scheduled".into());
+                        }
                         let client =
                             crate::LinearGraphQlSource::from_env().map_err(|e| e.to_string())?;
                         let prs = all_prs.as_ref().map_err(Clone::clone)?;
@@ -541,7 +558,11 @@ impl Collector {
                             now as f64 / 1000.0,
                         )
                     })()
-                    .map_err(|error| eprintln!("review evidence for {}: {error}", scope.key()))
+                    .map_err(|error| {
+                        if github_refreshed {
+                            eprintln!("review evidence for {}: {error}", scope.key());
+                        }
+                    })
                     .ok();
                     let members = selected
                         .into_iter()
@@ -558,6 +579,7 @@ impl Collector {
                         })
                         .collect();
                     Ok(TrackerResult {
+                        github_refreshed,
                         members,
                         record,
                         build_execution_seconds_24h,
@@ -573,6 +595,12 @@ impl Collector {
                 (scope.key(), result)
             })
             .collect();
+        if github_refreshed {
+            eprintln!(
+                "GitHub collection finished: duration_ms={}",
+                started.elapsed().as_millis()
+            );
+        }
         TrackerBatch {
             at_ms: source_sync_ms,
             results,
@@ -585,10 +613,22 @@ impl Collector {
                 continue;
             };
             match result {
-                Ok(result) => {
+                Ok(mut result) => {
                     let Some(scope) = self.config.scopes.iter().find(|s| s.key() == key) else {
                         continue;
                     };
+                    let same_scope = state.query_identity.as_ref() == Some(&result.query_identity)
+                        && state.selectors.as_ref() == Some(&scope.selectors);
+                    if !result.github_refreshed && same_scope {
+                        // Tracker-only observations cannot re-date GitHub evidence.
+                        if let Some(previous) = &state.record {
+                            for (name, metric) in &previous.metrics {
+                                if metric.source.split('+').any(|source| source == "github") {
+                                    result.record.metrics.insert(name.clone(), metric.clone());
+                                }
+                            }
+                        }
+                    }
                     if state.query_identity.as_ref() != Some(&result.query_identity)
                         || state.selectors.as_ref() != Some(&scope.selectors)
                     {
@@ -606,14 +646,16 @@ impl Collector {
                     state.ready_issues = result.ready_issues;
                     state.blocked_issues = result.blocked_issues;
                     state.record = Some(result.record);
-                    state.pr_stats = result.pr_stats;
-                    state.review_stats = result.review_stats;
-                    state.github_observed_at_ms = result.github_at_ms;
-                    if state.pr_stats.is_some() && result.github_at_ms > 0 {
-                        state.pr_success_at_ms = result.github_at_ms;
-                    }
-                    if state.review_stats.is_some() && result.github_at_ms > 0 {
-                        state.review_success_at_ms = result.github_at_ms.min(batch.at_ms);
+                    if result.github_refreshed || !same_scope {
+                        state.pr_stats = result.pr_stats;
+                        state.review_stats = result.review_stats;
+                        state.github_observed_at_ms = result.github_at_ms;
+                        if state.pr_stats.is_some() && result.github_at_ms > 0 {
+                            state.pr_success_at_ms = result.github_at_ms;
+                        }
+                        if state.review_stats.is_some() && result.github_at_ms > 0 {
+                            state.review_success_at_ms = result.github_at_ms.min(batch.at_ms);
+                        }
                     }
                     state.tracker_at_ms = batch.at_ms;
                     state.tracker_ok = true;
@@ -807,6 +849,7 @@ mod tests {
                 results: vec![(
                     "fixture:work".into(),
                     Ok(TrackerResult {
+                        github_refreshed: true,
                         members: BTreeMap::new(),
                         record,
                         build_execution_seconds_24h: None,
@@ -824,6 +867,18 @@ mod tests {
         collector
             .apply_tracker(batch(1_000_000, 1_020_000, true))
             .unwrap();
+        assert_eq!(
+            collector.state.scopes["fixture:work"].pr_success_at_ms,
+            1_020_000
+        );
+        let mut tracker_only = batch(1_050_000, 0, false);
+        tracker_only.results[0].1.as_mut().unwrap().github_refreshed = false;
+        collector.apply_tracker(tracker_only).unwrap();
+        assert!(collector.state.scopes["fixture:work"].pr_stats.is_some());
+        assert_eq!(
+            collector.state.scopes["fixture:work"].github_observed_at_ms,
+            1_020_000
+        );
         assert_eq!(
             collector.state.scopes["fixture:work"].pr_success_at_ms,
             1_020_000

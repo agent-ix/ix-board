@@ -166,14 +166,19 @@ pub fn render(
         let history_fresh = state.history_ok
             && now.saturating_sub(state.history_at_ms)
                 <= i64::try_from(config.activity_interval_seconds * 3000).unwrap_or(i64::MAX);
+        // An expiry allowance for scheduled evidence, not a freshness SLA. HTTP
+        // response reuse still has its independent 15-minute TTL.
+        let github_max_age = i64::try_from(config.github_interval_seconds * 1000)
+            .unwrap_or(i64::MAX)
+            .saturating_add(super::github::TTL_MS);
         let github_fresh = s.github_observed_at_ms > 0
-            && (0..super::github::TTL_MS).contains(&now.saturating_sub(s.github_observed_at_ms));
+            && (0..github_max_age).contains(&now.saturating_sub(s.github_observed_at_ms));
         let pr_fresh = tracker_fresh
             && s.pr_success_at_ms > 0
-            && (0..super::github::TTL_MS).contains(&now.saturating_sub(s.pr_success_at_ms));
+            && (0..github_max_age).contains(&now.saturating_sub(s.pr_success_at_ms));
         let review_fresh = tracker_fresh
             && s.review_success_at_ms > 0
-            && (0..super::github::TTL_MS).contains(&now.saturating_sub(s.review_success_at_ms));
+            && (0..github_max_age).contains(&now.saturating_sub(s.review_success_at_ms));
         for (source, ok, at) in [
             ("tracker", tracker_fresh, s.tracker_at_ms),
             ("lifecycle", life_fresh, s.lifecycle_success_at_ms),
@@ -192,6 +197,14 @@ pub fn render(
             let l = format!("{labels},source=\"{source}\"");
             out.metric("ix_team_source_available", &l, flag(ok), false)?;
             if at > 0 {
+                if now >= at {
+                    out.metric(
+                        "ix_team_source_age_seconds",
+                        &l,
+                        (now - at) as f64 / 1000.0,
+                        false,
+                    )?;
+                }
                 out.metric(
                     "ix_team_source_last_success_timestamp_seconds",
                     &l,

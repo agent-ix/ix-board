@@ -26,6 +26,7 @@ struct Args {
 struct Cache {
     metrics: String,
     updated: Instant,
+    stale_after: Duration,
 }
 fn serve(mut stream: TcpStream, cache: &RwLock<Cache>) -> Result<(), Error> {
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
@@ -57,7 +58,7 @@ fn serve(mut stream: TcpStream, cache: &RwLock<Cache>) -> Result<(), Error> {
         .map_err(|_| Error::Invalid("metrics cache poisoned"))?;
     let (status, body, content) = match first {
         "GET /metrics HTTP/1.1" | "GET /metrics HTTP/1.0"
-            if cache.updated.elapsed() >= Duration::from_secs(120) =>
+            if cache.updated.elapsed() >= cache.stale_after =>
         {
             (
                 "503 Service Unavailable",
@@ -74,7 +75,7 @@ fn serve(mut stream: TcpStream, cache: &RwLock<Cache>) -> Result<(), Error> {
             ("200 OK", "ok\n".into(), "text/plain")
         }
         "GET /readyz HTTP/1.1" | "GET /readyz HTTP/1.0"
-            if cache.updated.elapsed() < Duration::from_secs(120) =>
+            if cache.updated.elapsed() < cache.stale_after =>
         {
             ("200 OK", "ready\n".into(), "text/plain")
         }
@@ -130,11 +131,14 @@ fn run() -> Result<(), Error> {
     let cache = Arc::new(RwLock::new(Cache {
         metrics: metrics_text(&collector, &config, now_ms()?)?,
         updated: Instant::now(),
+        stale_after: Duration::from_secs(
+            config.activity_interval_seconds.saturating_mul(3).max(120),
+        ),
     }));
     let (sender, receiver) = mpsc::sync_channel(1);
-    for scope in &config.scopes {
-        let mut tracker_config = config.clone();
-        tracker_config.scopes = vec![scope.clone()];
+    // One worker visits scopes serially, sharing the hourly GitHub admission.
+    {
+        let tracker_config = config.clone();
         let sender = sender.clone();
         thread::spawn(move || {
             loop {
@@ -207,12 +211,46 @@ mod tests {
     use ix_trace_rs::trace;
     #[trace("FR-033-AC-8")]
     #[test]
+    fn five_minute_activity_interval_keeps_http_ready_between_updates() {
+        for (path, stale_after, expected) in [
+            ("metrics", 900, "200 OK"),
+            ("readyz", 900, "200 OK"),
+            ("metrics", 120, "503 Service Unavailable"),
+            ("readyz", 120, "503 Service Unavailable"),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let cache = RwLock::new(Cache {
+                metrics: "cached_metric 1\n".into(),
+                updated: Instant::now()
+                    .checked_sub(Duration::from_secs(180))
+                    .unwrap(),
+                stale_after: Duration::from_secs(stale_after),
+            });
+            let worker = thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                serve(stream, &cache).unwrap();
+            });
+            let mut client = TcpStream::connect(address).unwrap();
+            write!(client, "GET /{path} HTTP/1.1\r\n\r\n").unwrap();
+            let mut response = String::new();
+            client.read_to_string(&mut response).unwrap();
+            worker.join().unwrap();
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {expected}")),
+                "{response}"
+            );
+        }
+    }
+    #[trace("FR-033-AC-8")]
+    #[test]
     fn fragmented_http_line_serves_the_cached_metrics() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let cache = Arc::new(RwLock::new(Cache {
             metrics: "test_metric 7\n".into(),
             updated: Instant::now(),
+            stale_after: Duration::from_secs(900),
         }));
         let target = Arc::clone(&cache);
         let worker = thread::spawn(move || {

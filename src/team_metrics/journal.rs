@@ -11,6 +11,61 @@ pub struct Journal {
     retention_ms: i64,
 }
 impl Journal {
+    /// Reserves a complete GitHub collection before any source reads. The singleton
+    /// deadline survives restart and coalesces concurrent workers without a quota reset.
+    pub(crate) fn claim_github_collection(
+        &mut self,
+        now: i64,
+        interval: u64,
+    ) -> Result<bool, Error> {
+        if now <= 0 {
+            return Err(Error::Invalid("invalid GitHub collection clock"));
+        }
+        self.connection
+            .busy_timeout(std::time::Duration::from_millis(250))?;
+        self.connection.execute_batch("CREATE TABLE IF NOT EXISTS github_collection(id INTEGER PRIMARY KEY CHECK(id=1), next_at INTEGER NOT NULL); INSERT OR IGNORE INTO github_collection VALUES(1,0);")?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let next: i64 = tx.query_row(
+            "SELECT next_at FROM github_collection WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?;
+        if now < next {
+            return Ok(false);
+        }
+        // The request guard may not have been initialized on a new journal yet.
+        let has_gate: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='github_gate' AND type='table')",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_gate {
+            let cooldown: i64 =
+                tx.query_row("SELECT cooldown FROM github_gate WHERE id=1", [], |r| {
+                    r.get(0)
+                })?;
+            if cooldown > now {
+                tx.execute(
+                    "UPDATE github_collection SET next_at=?1 WHERE id=1",
+                    [cooldown],
+                )?;
+                tx.commit()?;
+                return Ok(false);
+            }
+        }
+        let interval_ms = i64::try_from(interval)
+            .map_err(|_| Error::Invalid("GitHub interval overflow"))?
+            .checked_mul(1000)
+            .ok_or(Error::Invalid("GitHub interval overflow"))?;
+        tx.execute(
+            "UPDATE github_collection SET next_at=?1 WHERE id=1",
+            [now.saturating_add(interval_ms)],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
     /// Opens a versioned store, refusing newer schemas without changing them.
     pub fn open(path: &Path, config: &Config) -> Result<Self, Error> {
         if let Some(parent) = path.parent() {

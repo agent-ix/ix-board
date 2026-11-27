@@ -21,6 +21,9 @@ fn interval() -> u64 {
 fn tracker_interval() -> u64 {
     300
 }
+fn github_interval() -> u64 {
+    3600
+}
 fn tick_interval() -> u64 {
     300
 }
@@ -44,9 +47,12 @@ pub struct Config {
     /// Lifecycle polling interval, in seconds.
     #[serde(default = "interval")]
     pub activity_interval_seconds: u64,
-    /// Tracker/VCS polling interval, in seconds.
+    /// Tracker polling interval, in seconds.
     #[serde(default = "tracker_interval")]
     pub tracker_interval_seconds: u64,
+    /// Minimum time between GitHub collections, shared across workers and restarts.
+    #[serde(default = "github_interval")]
+    pub github_interval_seconds: u64,
     /// Fleet ledger whose last committed `fleet tick` the exporter serves (FR-038); unset serves none.
     #[serde(default)]
     pub fleet_ledger: Option<PathBuf>,
@@ -127,8 +133,9 @@ impl Config {
         if !(1024 * 1024..=64 * 1024 * 1024).contains(&self.max_bytes)
             || self.retention_seconds == 0
             || self.retention_seconds > 604800
-            || !(10..=60).contains(&self.activity_interval_seconds)
+            || !(10..=300).contains(&self.activity_interval_seconds)
             || !(60..=3600).contains(&self.tracker_interval_seconds)
+            || !(3600..=86400).contains(&self.github_interval_seconds)
             || self.fleet_tick_interval_seconds == 0
         {
             return Err(Error::Invalid(

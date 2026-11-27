@@ -72,6 +72,36 @@ pub(super) struct Response {
     pub(super) headers: BTreeMap<String, String>,
     pub(super) body: String,
 }
+
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+enum Failure {
+    None,
+    ServerRateLimit,
+    ServerBackoff,
+    LocalHeadroom,
+    Permission,
+    Http,
+    Transport,
+    Validation,
+}
+
+/// Bounded metadata only: never URLs, tokens, query variables or response content.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Attempt {
+    received_at_ms: i64,
+    status: Option<u16>,
+    cost: Option<u64>,
+    remaining: Option<u64>,
+    reset_at_ms: Option<i64>,
+    retry_after_seconds: Option<u64>,
+    duration_ms: i64,
+    rolling_hour_attempts: i64,
+    rolling_hour_reserved_points: i64,
+    failure: Failure,
+    cooldown_until_ms: i64,
+}
 pub(super) trait Transport {
     fn namespace(&self) -> &str;
     fn send(&self, request: &Request, etag: Option<&str>) -> Result<Response, String>;
@@ -147,6 +177,7 @@ impl<T: Transport> Guard<T> {
         db.pragma_update(None, "max_page_count", max_bytes / page_size)
             .map_err(|e| e.to_string())?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS github_gate(id INTEGER PRIMARY KEY CHECK(id=1), cooldown INTEGER NOT NULL, lease INTEGER NOT NULL); INSERT OR IGNORE INTO github_gate VALUES(1,0,0); CREATE TABLE IF NOT EXISTS github_clock(id INTEGER PRIMARY KEY CHECK(id=1), at INTEGER NOT NULL); INSERT OR IGNORE INTO github_clock VALUES(1,0); CREATE TABLE IF NOT EXISTS github_sends(at INTEGER NOT NULL, cost INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS github_responses(key TEXT PRIMARY KEY, body TEXT NOT NULL, etag TEXT, at INTEGER NOT NULL);").map_err(|e| e.to_string())?;
+        db.execute_batch("CREATE TABLE IF NOT EXISTS github_health(id INTEGER PRIMARY KEY CHECK(id=1), cache_hits INTEGER NOT NULL, attempt TEXT); INSERT OR IGNORE INTO github_health VALUES(1,0,NULL);").map_err(|e| e.to_string())?;
         db.execute("UPDATE github_clock SET at=max(at,coalesce((SELECT max(at) FROM github_sends),0),coalesce((SELECT max(at) FROM github_responses),0)) WHERE id=1", []).map_err(|e| e.to_string())?;
         Ok(Self {
             db: RefCell::new(db),
@@ -213,6 +244,8 @@ impl<T: Transport> Guard<T> {
             && now.saturating_sub(*at) < TTL_MS
         {
             validate(body, *at)?;
+            tx.execute("UPDATE github_health SET cache_hits=min(cache_hits+1,9223372036854775806) WHERE id=1", []).map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
             return Ok(Cached {
                 body: body.clone(),
                 at: *at,
@@ -269,23 +302,89 @@ impl<T: Transport> Guard<T> {
             [received],
         )
         .map_err(|e| e.to_string())?;
+        let graph = response
+            .as_ref()
+            .ok()
+            .and_then(|r| serde_json::from_str::<GraphResponse>(&r.body).ok());
+        let error_backoff = response
+            .as_ref()
+            .ok()
+            .map(|r| backoff(r, received))
+            .unwrap_or_else(|| received.saturating_add(HOUR_MS));
+        let mut attempt = Attempt {
+            received_at_ms: received,
+            status: response.as_ref().ok().map(|r| r.status),
+            cost: graph.as_ref().map(|g| g.data.rate.cost),
+            remaining: graph.as_ref().map(|g| g.data.rate.remaining).or_else(|| {
+                response
+                    .as_ref()
+                    .ok()
+                    .and_then(|r| r.headers.get("x-ratelimit-remaining"))
+                    .and_then(|v| v.parse().ok())
+            }),
+            reset_at_ms: graph
+                .as_ref()
+                .and_then(|g| chrono::DateTime::parse_from_rfc3339(&g.data.rate.reset_at).ok())
+                .map(|d| d.timestamp_millis())
+                .or_else(|| {
+                    response
+                        .as_ref()
+                        .ok()
+                        .and_then(|r| r.headers.get("x-ratelimit-reset"))
+                        .and_then(|v| v.parse::<i64>().ok())
+                        .and_then(|v| v.checked_mul(1000))
+                }),
+            retry_after_seconds: response
+                .as_ref()
+                .ok()
+                .and_then(|r| r.headers.get("retry-after"))
+                .and_then(|v| v.parse().ok()),
+            duration_ms: received.saturating_sub(now),
+            rolling_hour_attempts: count + 1,
+            rolling_hour_reserved_points: cost + RESERVED_COST,
+            failure: Failure::None,
+            cooldown_until_ms: 0,
+        };
         let result = match response {
             Ok(response) => {
                 let graph_limit = serde_json::from_str::<GraphResponse>(&response.body)
                     .ok()
                     .filter(|r| r.data.rate.remaining < 25);
+                let rate_error = serde_json::from_str::<serde_json::Value>(&response.body)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("errors")
+                            .and_then(serde_json::Value::as_array)
+                            .cloned()
+                    })
+                    .is_some_and(|errors| {
+                        errors.iter().any(|e| {
+                            e.get("type").and_then(serde_json::Value::as_str)
+                                == Some("RATE_LIMITED")
+                        })
+                    });
                 let limited = response.status == 429
-                    || response.status == 403
+                    || rate_error
+                    || graph.as_ref().is_some_and(|g| g.data.rate.remaining == 0)
                     || response
                         .headers
                         .get("x-ratelimit-remaining")
-                        .is_some_and(|v| v == "0")
-                    || graph_limit.is_some();
-                if limited {
+                        .is_some_and(|v| v == "0");
+                let server_backoff =
+                    response.status >= 400 && response.headers.contains_key("retry-after");
+                if limited || server_backoff || graph_limit.is_some() {
+                    attempt.failure = if limited { Failure::ServerRateLimit } else if server_backoff { Failure::ServerBackoff } else { Failure::LocalHeadroom };
                     let graph_reset = graph_limit.and_then(|r| chrono::DateTime::parse_from_rfc3339(&r.data.rate.reset_at).ok()).map(|d| d.timestamp_millis()).unwrap_or(0);
                     let until = backoff(&response, received).max(graph_reset);
                     tx.execute("UPDATE github_gate SET cooldown=max(cooldown,?1) WHERE id=1", [until]).map_err(|e| e.to_string())?;
-                    Err("GitHub server rate limit; cooldown persisted".into())
+                    if limited {
+                        Err("GitHub server rate limit response; cooldown persisted".into())
+                    } else if server_backoff {
+                        Err("GitHub server requested backoff; cooldown persisted".into())
+                    } else {
+                        Err("GitHub local headroom safety floor; cooldown persisted".into())
+                    }
                 } else if response.status == 304 && request.conditional {
                     match &old {
                         Some((body, _, _)) => validate(body, received).map(|()| Cached { body: body.clone(), at: received }),
@@ -294,6 +393,7 @@ impl<T: Transport> Guard<T> {
                 } else if response.status == 200 && response.body.len() <= MAX_BODY {
                     validate(&response.body, received).map(|()| Cached { body: response.body.clone(), at: received })
                 } else {
+                    attempt.failure = if matches!(response.status, 401 | 403) { Failure::Permission } else { Failure::Http };
                     Err("GitHub HTTP response unavailable".into())
                 }.and_then(|cached| {
                     if i64::try_from(cached.body.len()).map_err(|_| "cache size overflow")? > self.cache_bytes {
@@ -312,18 +412,36 @@ impl<T: Transport> Guard<T> {
                     Ok(cached)
                 })
             }
-            Err(reason) => Err(reason),
+            Err(reason) => {
+                attempt.failure = Failure::Transport;
+                Err(reason)
+            }
         };
         if result.is_err() {
+            if attempt.failure == Failure::None {
+                attempt.failure = Failure::Validation;
+            }
             // Malformed payloads, transport timeouts and GraphQL errors also suppress
             // retry storms. A longer server cooldown always wins.
             tx.execute(
                 "UPDATE github_gate SET cooldown=max(cooldown,?1) WHERE id=1",
-                [received.saturating_add(HOUR_MS)],
+                [error_backoff],
             )
             .map_err(|e| e.to_string())?;
         }
+        attempt.cooldown_until_ms = tx
+            .query_row("SELECT cooldown FROM github_gate WHERE id=1", [], |r| {
+                r.get(0)
+            })
+            .map_err(|e| e.to_string())?;
+        let diagnostic = serde_json::to_string(&attempt).map_err(|e| e.to_string())?;
+        tx.execute(
+            "UPDATE github_health SET attempt=?1 WHERE id=1",
+            [&diagnostic],
+        )
+        .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
+        eprintln!("GitHub attempt {diagnostic}");
         result
     }
 }
@@ -461,6 +579,14 @@ pub(super) struct SelectedGithub<T = Http> {
     infos: RefCell<BTreeMap<String, InfoRows>>,
 }
 impl SelectedGithub {
+    pub(super) fn deferred(now: i64) -> Self {
+        Self::with_guard(
+            Err("GitHub collection not scheduled".into()),
+            BTreeSet::new(),
+            false,
+            now,
+        )
+    }
     pub(super) fn new(
         config: &Config,
         allowed: BTreeSet<(String, u64)>,
@@ -854,6 +980,87 @@ impl<T: Transport> GithubSource for SelectedGithub<T> {
 
 #[cfg(test)]
 mod tests {
+    #[trace("FR-033-AC-12")]
+    #[test]
+    fn attempt_diagnostics_distinguish_server_limits_from_local_and_other_failures() {
+        let low_headroom = serde_json::json!({"data":{"rateLimit":{"cost":1,"remaining":10,"resetAt":"1970-01-01T02:00:00Z"},"repository":{}}}).to_string();
+        let cases = [
+            (403, "{}".to_owned(), Failure::Permission),
+            (429, "{}".to_owned(), Failure::ServerRateLimit),
+            (200, low_headroom, Failure::LocalHeadroom),
+            (200, serde_json::json!({"data":{"rateLimit":{"cost":1,"remaining":0,"resetAt":"1970-01-01T02:00:00Z"},"repository":{}}}).to_string(), Failure::ServerRateLimit),
+            (200, "malformed".to_owned(), Failure::Validation),
+            (
+                200,
+                "{\"errors\":[{\"type\":\"RATE_LIMITED\"}]}".to_owned(),
+                Failure::ServerRateLimit,
+            ),
+        ];
+        for (status, body, expected) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = config(dir.path());
+            let fake = Fake::new(move |_, _| {
+                Ok(Response {
+                    status,
+                    headers: BTreeMap::new(),
+                    body: body.clone(),
+                })
+            });
+            let guard = open(&cfg, fake.clone()).unwrap();
+            assert!(
+                guard
+                    .request_at(&request(0, false), 1000, valid_json)
+                    .is_err()
+            );
+            let json: String = guard
+                .db
+                .borrow()
+                .query_row("SELECT attempt FROM github_health", [], |r| r.get(0))
+                .unwrap();
+            let diagnostic: Attempt = serde_json::from_str(&json).unwrap();
+            assert_eq!(diagnostic.failure, expected);
+            assert_eq!(diagnostic.status, Some(status));
+            assert_eq!(diagnostic.rolling_hour_attempts, 1);
+            assert_eq!(diagnostic.rolling_hour_reserved_points, 25);
+            assert!(
+                guard
+                    .request_at(&request(1, false), 2000, valid_json)
+                    .is_err()
+            );
+            assert_eq!(fake.count(), 1);
+        }
+    }
+
+    #[trace("FR-033-AC-12")]
+    #[test]
+    fn nonquota_http_failure_honors_retry_after_without_claiming_quota_exhaustion() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let fake = Fake::new(|_, _| {
+            Ok(Response {
+                status: 503,
+                headers: BTreeMap::from([("retry-after".into(), "7200".into())]),
+                body: "{}".into(),
+            })
+        });
+        let guard = open(&cfg, fake).unwrap();
+        assert!(
+            guard
+                .request_at(&request(0, false), 1000, valid_json)
+                .err()
+                .unwrap()
+                .contains("server requested backoff")
+        );
+        let json: String = guard
+            .db
+            .borrow()
+            .query_row("SELECT attempt FROM github_health", [], |r| r.get(0))
+            .unwrap();
+        let diagnostic: Attempt = serde_json::from_str(&json).unwrap();
+        assert_eq!(diagnostic.failure, Failure::ServerBackoff);
+        assert_eq!(diagnostic.cooldown_until_ms, 7_201_000);
+        assert_eq!(diagnostic.retry_after_seconds, Some(7200));
+    }
     use super::*;
     use ix_trace_rs::trace;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1179,6 +1386,14 @@ mod tests {
                 .query_row("SELECT cooldown FROM github_gate", [], |r| r.get(0))
                 .unwrap();
             assert_eq!(cooldown, 10_001_000);
+            let json: String = guard
+                .db
+                .borrow()
+                .query_row("SELECT attempt FROM github_health", [], |r| r.get(0))
+                .unwrap();
+            let diagnostic: Attempt = serde_json::from_str(&json).unwrap();
+            assert_eq!(diagnostic.remaining, Some(0));
+            assert_eq!(diagnostic.failure, Failure::ServerRateLimit);
         }
     }
 

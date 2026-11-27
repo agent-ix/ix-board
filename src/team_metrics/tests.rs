@@ -17,6 +17,7 @@ fn config(path: &std::path::Path) -> Config {
         retention_seconds: 604800,
         activity_interval_seconds: 30,
         tracker_interval_seconds: 300,
+        github_interval_seconds: 3600,
         fleet_ledger: None,
         fleet_tick_interval_seconds: 300,
         scopes: vec![ScopeConfig {
@@ -668,11 +669,95 @@ fn cached_github_values_expire_independently_of_fresh_tracker_polls() {
     let fresh = render(&config, &state, 1000, 999_999).unwrap();
     assert!(fresh.contains("source=\"github_prs\"} 1\n"));
     assert!(fresh.contains("ix_team_prs_closed_unmerged_24h{"));
-    let expired = render(&config, &state, 1000, 1_000_000).unwrap();
+    state
+        .scopes
+        .get_mut("factory:completion")
+        .unwrap()
+        .tracker_at_ms = 3_700_000;
+    let hourly = render(&config, &state, 1000, 3_700_000).unwrap();
+    assert!(hourly.contains("source=\"github_prs\"} 1\n"));
+    assert!(hourly.contains("source=\"github_prs\"} 3600\n"));
+    let expiry = 100_000 + 3_600_000 + super::github::TTL_MS;
+    state
+        .scopes
+        .get_mut("factory:completion")
+        .unwrap()
+        .tracker_at_ms = expiry;
+    let expired = render(&config, &state, 1000, expiry).unwrap();
     assert!(expired.contains("source=\"tracker\"} 1\n"));
     assert!(expired.contains("source=\"github_prs\"} 0\n"));
     assert!(!expired.contains("ix_team_prs_closed_unmerged_24h{"));
     assert!(expired.contains("ix_team_source_last_success_timestamp_seconds{team_id=\"factory\",scope_id=\"completion\",source=\"github_prs\"} 100\n"));
+}
+
+#[trace("FR-033-AC-12")]
+#[test]
+fn github_schedule_coalesces_tracker_ticks_and_survives_restart_and_cooldown() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path());
+    let mut journal = Journal::open(&cfg.state_path, &cfg).unwrap();
+    assert!(journal.claim_github_collection(1000, 3600).unwrap());
+    for tick in 1..12 {
+        assert!(
+            !journal
+                .claim_github_collection(1000 + tick * 300_000, 3600)
+                .unwrap()
+        );
+    }
+    drop(journal);
+    let mut journal = Journal::open(&cfg.state_path, &cfg).unwrap();
+    assert!(!journal.claim_github_collection(3_600_999, 3600).unwrap());
+    let db = rusqlite::Connection::open(&cfg.state_path).unwrap();
+    db.execute_batch("CREATE TABLE github_gate(id INTEGER PRIMARY KEY, cooldown INTEGER, lease INTEGER); INSERT INTO github_gate VALUES(1,4000000,0);").unwrap();
+    assert!(!journal.claim_github_collection(3_601_000, 3600).unwrap());
+    assert!(journal.claim_github_collection(4_000_000, 3600).unwrap());
+    let mut concurrent = Journal::open(&cfg.state_path, &cfg).unwrap();
+    assert!(!concurrent.claim_github_collection(4_000_000, 3600).unwrap());
+    assert_eq!(
+        db.query_row("SELECT cooldown FROM github_gate", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        4_000_000
+    );
+}
+
+#[trace("FR-033-AC-12")]
+#[test]
+fn github_schedule_defaults_hourly_and_rejects_faster_polling() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(dir.path());
+    cfg.activity_interval_seconds = 300;
+    assert!(cfg.validate().is_ok());
+    cfg.github_interval_seconds = 900;
+    assert!(cfg.validate().is_err());
+    let value = serde_json::json!({"version":1,"listen":"127.0.0.1:0","state_path":dir.path().join("state.sqlite"),"scopes":[{"team_id":"fixture","scope_id":"work","selectors":{},"leads":["draco:fixture:code"],"herdr_teams":[],"retro_config":"unused"}]});
+    let restored: Config = serde_json::from_value(value).unwrap();
+    assert_eq!(restored.github_interval_seconds, 3600);
+}
+
+#[trace("FR-033-AC-12")]
+#[test]
+fn concurrent_exporters_reserve_only_one_hourly_collection() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path());
+    let one = Journal::open(&cfg.state_path, &cfg).unwrap();
+    let two = Journal::open(&cfg.state_path, &cfg).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let workers: Vec<_> = [one, two]
+        .into_iter()
+        .map(|mut journal| {
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                journal.claim_github_collection(1000, 3600).unwrap()
+            })
+        })
+        .collect();
+    let wins = workers
+        .into_iter()
+        .map(|worker| usize::from(worker.join().unwrap()))
+        .sum::<usize>();
+    assert_eq!(wins, 1);
 }
 
 #[trace("FR-033-AC-1", "FR-033-AC-3")]
