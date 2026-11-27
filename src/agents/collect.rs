@@ -1046,6 +1046,7 @@ fn reconcile(files: &mut SessionFiles, start: u64) {
         }
     }
 }
+#[implements("FR-018-AC-30")]
 fn collect_processes(probe: &mut Probe, budget: &mut Budget) {
     if !cfg!(target_os = "linux") {
         probe
@@ -1103,13 +1104,23 @@ fn collect_processes(probe: &mut Probe, budget: &mut Budget) {
             break;
         }
         let command = read_bytes(&entry.path().join("comm"), 1024, budget);
+        let Ok(command) = command else {
+            probe
+                .process_availability
+                .missing("pane_process_unreadable");
+            continue;
+        };
+        let command = String::from_utf8_lossy(&command).trim().to_owned();
+        if !is_work_command_name(&command) {
+            continue;
+        }
         let args = read_bytes(&entry.path().join("cmdline"), 4096, budget);
-        match (command, args) {
-            (Ok(comm), Ok(args)) => {
+        match args {
+            Ok(args) => {
                 let list = probe.processes.entry(pane.into()).or_default();
                 if list.len() < 128 {
                     list.push(PaneProcess {
-                        comm: String::from_utf8_lossy(&comm).trim().into(),
+                        comm: command,
                         args: String::from_utf8_lossy(&args)
                             .split('\0')
                             .next()
@@ -1127,10 +1138,24 @@ fn collect_processes(probe: &mut Probe, budget: &mut Budget) {
     }
 }
 
+#[implements("FR-018-AC-30")]
+fn is_work_command_name(command: &str) -> bool {
+    super::WORK_COMMANDS.contains(&command)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ix_trace_rs::trace;
+
+    #[test]
+    #[trace("FR-018-AC-30")]
+    fn process_collection_accepts_known_work_commands_but_not_wrapper_names() {
+        assert!(is_work_command_name("cargo"));
+        assert!(is_work_command_name("rustc"));
+        assert!(!is_work_command_name("bash"));
+        assert!(!is_work_command_name("locked-build.sh"));
+    }
     #[trace("FR-018-AC-28")]
     #[test]
     fn the_tail_read_charges_each_scanned_byte_once_and_stays_within_the_transcript_limit() {

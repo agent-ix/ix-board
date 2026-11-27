@@ -11,6 +11,7 @@ pub mod chain;
 mod drift;
 pub mod fleet;
 mod focus_activity;
+pub mod host_check;
 pub mod host_hygiene;
 mod hygiene;
 mod linear;
@@ -182,6 +183,9 @@ pub enum Error {
     /// Neither an environment override nor a saved Linear credential exists.
     #[error("Linear API key is missing; run `ix-board auth login` or set LINEAR_API_KEY")]
     MissingApiKey,
+    /// The installed Linear CLI could not provide a credential.
+    #[error("Linear CLI credential probe failed")]
+    LinearCliUnavailable,
     /// A requested work milestone did not match a milestone in the selected projects.
     #[error("work milestone {selector:?} not found in the selected focus projects")]
     WorkMilestoneNotFound { selector: String },

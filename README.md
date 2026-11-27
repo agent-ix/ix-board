@@ -117,6 +117,10 @@ issue set and its blocker layers.
 
 See [focus](docs/focus.md) for the selector grammar and report contents.
 
+`ix-board host check` runs a no-argument local authentication, locked-build
+capacity, and process check. See [host check](docs/host-check.md) for cadence
+configuration and the `_lead-bin` migration map.
+
 ## Program review
 
 Program review commands take a TOML scope file that lists a program's

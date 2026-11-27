@@ -490,6 +490,21 @@ impl LinearGraphQlSource {
         )
     }
 
+    /// Sends a minimal authenticated request and returns only the HTTP status.
+    ///
+    /// # Errors
+    /// Returns a transport error without including the credential or response body.
+    #[implements("FR-050-AC-2")]
+    pub fn auth_status(&self) -> Result<u16, Error> {
+        let response = self
+            .client
+            .post(&self.endpoint)
+            .header(reqwest::header::AUTHORIZATION, self.api_key.expose_secret())
+            .json(&serde_json::json!({"query":"query HostCheck { viewer { id } }"}))
+            .send()?;
+        Ok(response.status().as_u16())
+    }
+
     /// Builds a source with a controlled credential provider and HTTP endpoint.
     ///
     /// `environment_override` is a snapshot of `LINEAR_API_KEY`; `None` means
@@ -513,13 +528,14 @@ impl LinearGraphQlSource {
     }
 
     /// Reports which configured credential source is available without exposing its value.
+    #[implements("FR-050-AC-2")]
     pub fn credential_source() -> Result<Option<String>, Error> {
-        Ok(resolve_credentials(
+        resolve_credentials_checked(
             &SecretStore::system(),
             std::env::var_os("LINEAR_API_KEY"),
-            linear_cli_token,
-        )?
-        .map(|(_, source)| source.to_owned()))
+            linear_cli_token_checked,
+        )
+        .map(|resolved| resolved.map(|(_, source)| source.to_owned()))
     }
 
     /// Fetches every workspace initiative through Linear's paged initiatives connection.
@@ -2737,6 +2753,20 @@ fn resolve_credentials<B: CredentialBackend>(
     Ok(cli_fallback().map(|value| (SecretValue::new(value), "linear_cli")))
 }
 
+fn resolve_credentials_checked<B: CredentialBackend>(
+    store: &SecretStore<B>,
+    environment_override: Option<OsString>,
+    cli_fallback: impl FnOnce() -> Result<Option<String>, Error>,
+) -> Result<Option<(SecretValue, &'static str)>, Error> {
+    let scope = AppScope::try_from("ix-board")?;
+    let key = SecretKey::try_from("linear-api-key")?;
+    let environment = environment_override.map(|value| ("LINEAR_API_KEY", value));
+    if let Some(resolved) = store.resolve_from(None, environment, &scope, &key)? {
+        return Ok(Some((resolved.value, resolved.source.as_str())));
+    }
+    Ok(cli_fallback()?.map(|value| (SecretValue::new(value), "linear_cli")))
+}
+
 fn linear_cli_token() -> Option<String> {
     let output = ProcessCommand::new("linear")
         .args(["auth", "token"])
@@ -2748,6 +2778,24 @@ fn linear_cli_token() -> Option<String> {
     }
     let token = String::from_utf8(output.stdout).ok()?.trim().to_owned();
     (!token.is_empty()).then_some(token)
+}
+
+fn linear_cli_token_checked() -> Result<Option<String>, Error> {
+    let output = match ProcessCommand::new("linear")
+        .args(["auth", "token"])
+        .stdin(std::process::Stdio::null())
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(Error::LinearCliUnavailable),
+    };
+    if !output.status.success() {
+        return Err(Error::LinearCliUnavailable);
+    }
+    let token = String::from_utf8(output.stdout).map_err(|_| Error::LinearCliUnavailable)?;
+    let token = token.trim().to_owned();
+    Ok((!token.is_empty()).then_some(token))
 }
 
 #[derive(Deserialize)]

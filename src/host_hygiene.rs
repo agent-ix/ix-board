@@ -37,6 +37,28 @@ pub struct ProcessTable {
     pub complete: bool,
 }
 
+/// One filesystem mount observed from the operating system mount table.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MountEntry {
+    /// Mount identifier or device source reported by the host.
+    pub source: String,
+    /// Mount location.
+    pub mount_point: PathBuf,
+    /// Filesystem type.
+    pub fs_type: String,
+}
+
+/// Whether a path can be scanned without crossing an unexpected mount.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MountSafety {
+    /// Path and anchor share one filesystem and the path contains no nested mount.
+    Safe,
+    /// The path is on another filesystem or contains a nested mount.
+    Boundary,
+    /// The mount table is absent, malformed or insufficient to identify the path.
+    Unknown,
+}
+
 /// Whether process evidence proves a directory is safe to clean.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UseState {
@@ -77,6 +99,8 @@ pub struct CleanDecision {
 pub struct BuildHostMetrics {
     /// Host label from the exposition.
     pub host: String,
+    /// Oldest explicit sample timestamp, in Unix seconds, when supplied.
+    pub observed_at_epoch_secs: Option<u64>,
     /// One-minute load average.
     pub load1: Option<f64>,
     /// CPU core count used to normalize load.
@@ -93,8 +117,12 @@ pub struct BuildHostMetrics {
     pub disk_available_bytes: Option<u64>,
     /// Number of queued build requests.
     pub queue_depth: u64,
+    /// Whether the exposition contained a queue depth sample for this host.
+    pub queue_depth_available: bool,
     /// Running locked-build lease count.
     pub running_leases: u64,
+    /// Whether the exposition contained a running lease sample for this host.
+    pub running_leases_available: bool,
     /// Running lease counts by owner lane address.
     pub leases_by_lane: BTreeMap<String, u64>,
 }
@@ -259,18 +287,27 @@ pub struct HygieneReport {
     pub orphan_build_processes: Vec<u32>,
     /// Whether process inspection was complete.
     pub process_table_complete: bool,
+    /// Whether the mount table could be read and interpreted.
+    pub mount_table_complete: bool,
     /// Unsupported host OS/platform condition.
     pub unsupported: bool,
 }
 
 impl HygieneReport {
     /// Stable command status: 0 clean, 1 findings, 2 missing evidence, 3 unsupported platform.
-    #[implements("FR-048-AC-1", "FR-048-AC-3")]
+    #[implements("FR-048-AC-1", "FR-048-AC-3", "FR-048-AC-10")]
     pub fn exit_code(&self) -> u8 {
         if self.unsupported {
             return 3;
         }
-        if self.free_bytes.is_none() || !self.process_table_complete {
+        if self.free_bytes.is_none()
+            || !self.process_table_complete
+            || !self.mount_table_complete
+            || self
+                .targets
+                .iter()
+                .any(|target| target.reason == "mount_evidence_unknown")
+        {
             return 2;
         }
         if self
@@ -279,7 +316,7 @@ impl HygieneReport {
             || self.targets.iter().any(|target| {
                 matches!(
                     target.reason.as_str(),
-                    "eligible" | "process_evidence_incomplete"
+                    "eligible" | "process_evidence_incomplete" | "mount_boundary"
                 )
             })
             || !self.prunable_worktrees.is_empty()
@@ -309,6 +346,128 @@ pub fn system_process_table() -> io::Result<ProcessTable> {
             processes: Vec::new(),
             complete: false,
         })
+    }
+}
+
+/// Reads the platform mount table into a portable source/mountpoint/type form.
+#[implements("FR-048-AC-10")]
+pub fn system_mount_table() -> io::Result<Vec<MountEntry>> {
+    #[cfg(target_os = "linux")]
+    let text = std::fs::read_to_string("/proc/self/mountinfo")?;
+    #[cfg(target_os = "macos")]
+    let text = {
+        let output = Command::new("mount").arg("-p").output()?;
+        if !output.status.success() {
+            return Err(io::Error::other("mount table command failed"));
+        }
+        String::from_utf8(output.stdout)
+            .map_err(|_| io::Error::other("mount table is not UTF-8"))?
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    return Err(io::Error::other("mount table unsupported"));
+    parse_mount_table(&text)
+}
+
+/// Parses Linux mountinfo or BSD `mount -p` rows.
+#[implements("FR-048-AC-10")]
+pub fn parse_mount_table(text: &str) -> io::Result<Vec<MountEntry>> {
+    let mut entries = Vec::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let fields = if let Some((before, after)) = line.split_once(" - ") {
+            let left = before.split_whitespace().collect::<Vec<_>>();
+            let right = after.split_whitespace().collect::<Vec<_>>();
+            if left.len() < 5 || right.len() < 2 {
+                return Err(io::Error::other("mount table contains a malformed row"));
+            }
+            (
+                left[0].to_owned(),
+                unescape_mount_field(left[4]),
+                right[0].to_owned(),
+            )
+        } else {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            if fields.len() < 6 {
+                return Err(io::Error::other("mount table contains a malformed row"));
+            }
+            (
+                unescape_mount_field(fields[0]),
+                unescape_mount_field(fields[1]),
+                fields[2].to_owned(),
+            )
+        };
+        if fields.0.is_empty() || fields.1.is_empty() || fields.2.is_empty() {
+            return Err(io::Error::other("mount table contains an incomplete row"));
+        }
+        entries.push(MountEntry {
+            source: fields.0,
+            mount_point: PathBuf::from(fields.1),
+            fs_type: fields.2,
+        });
+    }
+    if entries.is_empty() {
+        return Err(io::Error::other("mount table contains no usable entries"));
+    }
+    entries.sort_by(|left, right| left.mount_point.cmp(&right.mount_point));
+    Ok(entries)
+}
+
+fn unescape_mount_field(field: &str) -> String {
+    field
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+
+/// Checks a candidate path against an injected or system mount table.
+#[implements("FR-048-AC-10")]
+pub fn mount_safety(path: &Path, anchor: &Path, mounts: &[MountEntry]) -> MountSafety {
+    let path = canonical_or_original(path);
+    let anchor = canonical_or_original(anchor);
+    let Some(path_mount) = mount_for(&path, mounts) else {
+        return MountSafety::Unknown;
+    };
+    let Some(anchor_mount) = mount_for(&anchor, mounts) else {
+        return MountSafety::Unknown;
+    };
+    if path_mount.source != anchor_mount.source || path_mount.fs_type != anchor_mount.fs_type {
+        return MountSafety::Boundary;
+    }
+    if mounts
+        .iter()
+        .any(|entry| entry.mount_point != path && entry.mount_point.starts_with(&path))
+    {
+        return MountSafety::Boundary;
+    }
+    MountSafety::Safe
+}
+
+fn mount_for<'a>(path: &Path, mounts: &'a [MountEntry]) -> Option<&'a MountEntry> {
+    mounts
+        .iter()
+        .filter(|entry| path.starts_with(&entry.mount_point))
+        .max_by_key(|entry| entry.mount_point.components().count())
+}
+
+/// Reports whether a mount table has an entry covering a path.
+#[implements("FR-048-AC-10")]
+pub fn mount_table_covers(path: &Path, mounts: &[MountEntry]) -> bool {
+    mount_for(&canonical_or_original(path), mounts).is_some()
+}
+
+/// Reports whether two paths resolve to the same source and filesystem type.
+#[implements("FR-048-AC-10")]
+pub fn mount_filesystem_matches(left: &Path, right: &Path, mounts: &[MountEntry]) -> MountSafety {
+    let Some(left_mount) = mount_for(&canonical_or_original(left), mounts) else {
+        return MountSafety::Unknown;
+    };
+    let Some(right_mount) = mount_for(&canonical_or_original(right), mounts) else {
+        return MountSafety::Unknown;
+    };
+    if left_mount.source == right_mount.source && left_mount.fs_type == right_mount.fs_type {
+        MountSafety::Safe
+    } else {
+        MountSafety::Boundary
     }
 }
 
@@ -420,7 +579,7 @@ fn linux_process_table(proc_root: &Path) -> io::Result<ProcessTable> {
 #[implements("FR-048-AC-3")]
 fn macos_process_table() -> io::Result<ProcessTable> {
     let output = Command::new("lsof")
-        .args(["-nP", "-Fpn", "-d", "cwd,txt,mem,0-"])
+        .args(["-nP", "-Ffpn", "-d", "cwd,txt,mem,0-"])
         .output()?;
     if !output.status.success() {
         return Ok(ProcessTable {
@@ -511,6 +670,7 @@ fn parse_macos_process_output(
         })
         .collect::<BTreeMap<_, _>>();
     let mut current: Option<ProcessEvidence> = None;
+    let mut current_descriptor: Option<String> = None;
     for line in String::from_utf8_lossy(lsof_output).lines() {
         if let Some(pid) = line
             .strip_prefix('p')
@@ -523,10 +683,17 @@ fn parse_macos_process_output(
                 pid,
                 ..Default::default()
             });
+            current_descriptor = None;
+        } else if let Some(descriptor) = line.strip_prefix('f') {
+            current_descriptor = Some(descriptor.to_owned());
         } else if let Some(path) = line.strip_prefix('n').map(PathBuf::from)
             && let Some(process) = current.as_mut()
         {
-            process.fds.push(path);
+            if current_descriptor.as_deref() == Some("cwd") {
+                process.cwd = Some(path);
+            } else {
+                process.fds.push(path);
+            }
         }
     }
     if let Some(process) = current {
@@ -757,10 +924,11 @@ pub fn recheck_clean_decision(
 }
 
 /// Parses the Prometheus text exposition emitted by locked-build and node-exporter.
-#[implements("FR-048-AC-7")]
+#[implements("FR-048-AC-7", "FR-050-AC-3")]
 pub fn parse_build_metrics(text: &str) -> BTreeMap<String, BuildHostMetrics> {
     let mut result = BTreeMap::<String, BuildHostMetrics>::new();
     let mut cpus = BTreeMap::<String, std::collections::BTreeSet<String>>::new();
+    let mut busy_leases = BTreeMap::<String, u64>::new();
     for line in text.lines().filter(|line| !line.starts_with('#')) {
         let mut fields = line.split_whitespace();
         let Some(sample) = fields.next() else {
@@ -769,6 +937,7 @@ pub fn parse_build_metrics(text: &str) -> BTreeMap<String, BuildHostMetrics> {
         let Some(raw_value) = fields.next() else {
             continue;
         };
+        let raw_timestamp = fields.next();
         let Ok(value) = raw_value.parse::<f64>() else {
             continue;
         };
@@ -790,6 +959,27 @@ pub fn parse_build_metrics(text: &str) -> BTreeMap<String, BuildHostMetrics> {
                 host: host.clone(),
                 ..BuildHostMetrics::default()
             });
+        if matches!(
+            name,
+            "node_load1"
+                | "node_cpu_seconds_total"
+                | "node_memory_MemTotal_bytes"
+                | "node_memory_MemAvailable_bytes"
+                | "node_memory_SwapTotal_bytes"
+                | "node_memory_SwapFree_bytes"
+                | "ix_build_queue_depth"
+                | "ix_build_slots_busy"
+                | "ix_build_lane_running"
+        ) && let Some(timestamp) = raw_timestamp
+            .and_then(|value| value.parse::<f64>().ok())
+            .and_then(value_u64)
+        {
+            let timestamp_secs = timestamp / 1000;
+            row.observed_at_epoch_secs = Some(
+                row.observed_at_epoch_secs
+                    .map_or(timestamp_secs, |current| current.min(timestamp_secs)),
+            );
+        }
         if name == "node_cpu_seconds_total"
             && let Some(cpu) = label(labels, "cpu")
         {
@@ -808,11 +998,17 @@ pub fn parse_build_metrics(text: &str) -> BTreeMap<String, BuildHostMetrics> {
                 row.disk_available_bytes = value_u64(value)
             }
             "ix_build_queue_depth" => {
+                row.queue_depth_available = true;
                 row.queue_depth = row
                     .queue_depth
                     .saturating_add(value_u64(value).unwrap_or(0))
             }
+            "ix_build_slots_busy" => {
+                row.running_leases_available = true;
+                busy_leases.insert(host, value_u64(value).unwrap_or(0));
+            }
             "ix_build_lane_running" => {
+                row.running_leases_available = true;
                 let count = value_u64(value).unwrap_or(0);
                 row.running_leases = row.running_leases.saturating_add(count);
                 if count > 0
@@ -828,6 +1024,11 @@ pub fn parse_build_metrics(text: &str) -> BTreeMap<String, BuildHostMetrics> {
     for (host, values) in cpus {
         if let Some(row) = result.get_mut(&host) {
             row.cores = u32::try_from(values.len()).ok().map(f64::from);
+        }
+    }
+    for (host, count) in busy_leases {
+        if let Some(row) = result.get_mut(&host) {
+            row.running_leases = count;
         }
     }
     result
@@ -880,12 +1081,37 @@ fn label<'a>(labels: &'a str, wanted: &str) -> Option<&'a str> {
 }
 
 /// Evaluates host telemetry against a configured heavy-gate policy.
-#[implements("FR-048-AC-8")]
+#[implements("FR-048-AC-8", "FR-050-AC-3")]
 pub fn eligibility(metrics: &BuildHostMetrics, policy: BuildPolicy) -> Eligibility {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    eligibility_at(metrics, policy, now)
+}
+
+/// Evaluates host telemetry with a deterministic current timestamp.
+#[implements("FR-048-AC-8", "FR-050-AC-3")]
+pub fn eligibility_at(
+    metrics: &BuildHostMetrics,
+    policy: BuildPolicy,
+    now_epoch_secs: u64,
+) -> Eligibility {
     let (Some(load1), Some(cores)) = (metrics.load1, metrics.cores) else {
         return Eligibility::Unknown;
     };
     if !load1.is_finite() || !cores.is_finite() || cores <= 0.0 {
+        return Eligibility::Unknown;
+    }
+    if metrics.memory_total_bytes.is_none()
+        || metrics.memory_available_bytes.is_none()
+        || metrics.swap_total_bytes.is_none()
+        || metrics.swap_free_bytes.is_none()
+        || !metrics.queue_depth_available
+        || !metrics.running_leases_available
+        || metrics
+            .observed_at_epoch_secs
+            .is_some_and(|observed| observed > now_epoch_secs || now_epoch_secs - observed > 120)
+    {
         return Eligibility::Unknown;
     }
     if load1 >= policy.max_load1 || metrics.running_leases >= policy.heavy_gate_slots {
@@ -902,14 +1128,14 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    #[trace("FR-048-AC-3")]
+    #[trace("FR-048-AC-3", "FR-050-AC-4")]
     fn macos_process_output_retains_build_commands_and_pane_environment() {
         let environments = BTreeMap::from([
             (123, b"HERDR_PANE_ID=tab-123\0".to_vec()),
             (124, b"OTHER=value\0".to_vec()),
         ]);
         let table = parse_macos_process_output(
-            b"p123\nn/worktrees/active/target/debug\np124\nn/worktrees/old/target/debug\n",
+            b"p123\nfcwd\nn/Users/peter/dev/worktrees/active\nftxt\nn/usr/bin/cargo\np124\nfcwd\nn/Users/peter/other\nf0\nn/dev/null\n",
             b"123 cargo\n124 cargo\n",
             &environments,
             true,
@@ -917,6 +1143,10 @@ mod tests {
         assert!(table.complete);
         assert_eq!(table.processes.len(), 2);
         assert_eq!(table.processes[0].cmdline, b"cargo");
+        assert_eq!(
+            table.processes[0].cwd.as_deref(),
+            Some(Path::new("/Users/peter/dev/worktrees/active"))
+        );
         assert_eq!(table.processes[0].environ, b"HERDR_PANE_ID=tab-123\0");
         assert_eq!(table.processes[1].cmdline, b"cargo");
         assert!(
@@ -1404,6 +1634,7 @@ mod tests {
             "node_filesystem_avail_bytes{host=\"luna\",mountpoint=\"/\",fstype=\"ext4\"} 700\n",
             "ix_build_queue_depth{host=\"luna\",priority=\"must-fix\"} 2\n",
             "ix_build_queue_depth{host=\"luna\",priority=\"periodic\"} 3\n",
+            "ix_build_slots_busy{host=\"luna\"} 1\n",
             "ix_build_lane_running{host=\"luna\",lane=\"luna:team:coder\"} 1\n",
             "ix_build_lane_running{host=\"luna\",lane=\"luna:team:idle\"} 0\n",
             "node_load1{host=\"LUNA\"} 7.6 1700000000\n",
@@ -1416,7 +1647,9 @@ mod tests {
         assert_eq!(row.swap_free_bytes, Some(10));
         assert_eq!(row.disk_available_bytes, Some(700));
         assert_eq!(row.queue_depth, 5);
+        assert!(row.queue_depth_available);
         assert_eq!(row.running_leases, 1);
+        assert!(row.running_leases_available);
         assert_eq!(row.leases_by_lane["luna:team:coder"], 1);
         assert!(!row.leases_by_lane.contains_key("luna:team:idle"));
         assert_eq!(row.load1, Some(7.6));
@@ -1424,7 +1657,7 @@ mod tests {
     }
 
     #[test]
-    #[trace("FR-048-AC-8")]
+    #[trace("FR-048-AC-8", "FR-050-AC-3")]
     fn luna_policy_rejects_load_eight_and_any_existing_heavy_gate() {
         let policy = BuildPolicy {
             max_load1: 8.0,
@@ -1433,18 +1666,156 @@ mod tests {
         let mut metrics = BuildHostMetrics {
             load1: Some(7.9),
             cores: Some(8.0),
+            memory_total_bytes: Some(1000),
+            memory_available_bytes: Some(500),
+            swap_total_bytes: Some(100),
+            swap_free_bytes: Some(100),
+            queue_depth_available: true,
+            running_leases_available: true,
             ..Default::default()
         };
         assert_eq!(eligibility(&metrics, policy), Eligibility::Eligible);
         metrics.load1 = Some(8.0);
         assert_eq!(eligibility(&metrics, policy), Eligibility::Ineligible);
+        metrics.memory_available_bytes = None;
+        assert_eq!(eligibility(&metrics, policy), Eligibility::Unknown);
+        metrics.memory_available_bytes = Some(500);
         metrics.load1 = Some(7.9);
         metrics.running_leases = 1;
         assert_eq!(eligibility(&metrics, policy), Eligibility::Ineligible);
+        metrics.running_leases = 0;
+        metrics.observed_at_epoch_secs = Some(1000);
+        assert_eq!(
+            eligibility_at(&metrics, policy, 1120),
+            Eligibility::Eligible
+        );
+        assert_eq!(eligibility_at(&metrics, policy, 1121), Eligibility::Unknown);
     }
 
     #[test]
-    #[trace("FR-048-AC-1")]
+    #[trace("FR-048-AC-8", "FR-050-AC-3")]
+    fn one_stale_required_metric_cannot_be_hidden_by_a_fresh_sample() {
+        let rows = parse_build_metrics(concat!(
+            "node_load1{host=\"luna\"} 1 1700000000000\n",
+            "node_cpu_seconds_total{host=\"luna\",cpu=\"0\",mode=\"idle\"} 1 1700000000000\n",
+            "node_memory_MemTotal_bytes{host=\"luna\"} 1000 1700000000000\n",
+            "node_memory_MemAvailable_bytes{host=\"luna\"} 800 1700000000000\n",
+            "node_memory_SwapTotal_bytes{host=\"luna\"} 0 1700000000000\n",
+            "node_memory_SwapFree_bytes{host=\"luna\"} 0 1699999000000\n",
+            "ix_build_queue_depth{host=\"luna\",class=\"must-fix\"} 0 1700000000000\n",
+            "ix_build_slots_busy{host=\"luna\"} 0 1700000000000\n",
+        ));
+        let metrics = &rows["luna"];
+        assert_eq!(metrics.observed_at_epoch_secs, Some(1_699_999_000));
+        assert_eq!(
+            eligibility_at(
+                metrics,
+                BuildPolicy {
+                    max_load1: 8.0,
+                    heavy_gate_slots: 1,
+                },
+                1_700_000_000,
+            ),
+            Eligibility::Unknown
+        );
+    }
+
+    #[test]
+    #[trace("FR-048-AC-7", "FR-048-AC-8", "FR-050-AC-3")]
+    fn empty_locked_build_lease_gauge_is_known_zero() {
+        let rows = parse_build_metrics(concat!(
+            "node_load1{host=\"luna\"} 1\n",
+            "node_cpu_seconds_total{host=\"luna\",cpu=\"0\",mode=\"idle\"} 1\n",
+            "node_memory_MemTotal_bytes{host=\"luna\"} 1000\n",
+            "node_memory_MemAvailable_bytes{host=\"luna\"} 800\n",
+            "node_memory_SwapTotal_bytes{host=\"luna\"} 0\n",
+            "node_memory_SwapFree_bytes{host=\"luna\"} 0\n",
+            "ix_build_queue_depth{host=\"luna\",class=\"must-fix\"} 0\n",
+            "ix_build_queue_depth{host=\"luna\",class=\"point\"} 0\n",
+            "ix_build_queue_depth{host=\"luna\",class=\"block\"} 0\n",
+            "ix_build_queue_depth{host=\"luna\",class=\"periodic\"} 0\n",
+            "ix_build_slots_busy{host=\"luna\"} 0\n",
+        ));
+        let metrics = &rows["luna"];
+        assert!(metrics.queue_depth_available);
+        assert_eq!(metrics.queue_depth, 0);
+        assert!(metrics.running_leases_available);
+        assert_eq!(metrics.running_leases, 0);
+        assert_eq!(
+            eligibility(
+                metrics,
+                BuildPolicy {
+                    max_load1: 8.0,
+                    heavy_gate_slots: 1,
+                },
+            ),
+            Eligibility::Eligible
+        );
+    }
+
+    #[test]
+    #[trace("FR-048-AC-10")]
+    fn injected_mount_table_blocks_other_filesystems_and_nested_mounts() {
+        let mounts = parse_mount_table(
+            "36 25 8:1 / /home rw - ext4 /dev/root rw\n37 36 8:2 / /home/p/dev/worktrees/wt/target/cache rw - ext4 /dev/cache rw\n38 36 8:3 / /mnt/other rw - ext4 /dev/other rw\n",
+        )
+        .expect("mount table parses");
+        assert_eq!(
+            mount_safety(
+                Path::new("/home/p/dev/worktrees/other"),
+                Path::new("/home/p/dev/worktrees"),
+                &mounts
+            ),
+            MountSafety::Safe
+        );
+        assert_eq!(
+            mount_safety(
+                Path::new("/mnt/other"),
+                Path::new("/home/p/dev/worktrees"),
+                &mounts
+            ),
+            MountSafety::Boundary
+        );
+        assert_eq!(
+            mount_safety(
+                Path::new("/home/p/dev/worktrees/wt/target"),
+                Path::new("/home/p/dev/worktrees"),
+                &mounts
+            ),
+            MountSafety::Boundary
+        );
+        assert_eq!(
+            mount_safety(
+                Path::new("/unknown"),
+                Path::new("/home/p/dev/worktrees"),
+                &mounts
+            ),
+            MountSafety::Unknown
+        );
+        assert!(parse_mount_table("garbage").is_err());
+    }
+
+    #[test]
+    #[trace("FR-048-AC-10")]
+    fn mount_table_parser_unescapes_spaces_in_mountpoints() {
+        let mounts =
+            parse_mount_table("36 25 8:1 / /home/p/dev\\040space rw - ext4 /dev/root rw\n")
+                .expect("mount table parses");
+        assert_eq!(mounts[0].mount_point, Path::new("/home/p/dev space"));
+    }
+
+    #[test]
+    #[trace("FR-048-AC-10")]
+    fn mount_table_rejects_malformed_row_after_valid_root() {
+        let mounts = concat!(
+            "36 25 8:1 / / rw,relatime - ext4 /dev/root rw\n",
+            "malformed nested mount row\n",
+        );
+        assert!(parse_mount_table(mounts).is_err());
+    }
+
+    #[test]
+    #[trace("FR-048-AC-1", "FR-048-AC-4", "FR-048-AC-10")]
     fn check_exit_code_compares_free_bytes_with_policy_floor() {
         let report = |free_bytes| HygieneReport {
             host: "draco".into(),
@@ -1454,10 +1825,37 @@ mod tests {
             prunable_worktrees: Vec::new(),
             orphan_build_processes: Vec::new(),
             process_table_complete: true,
+            mount_table_complete: true,
             unsupported: false,
         };
         assert_eq!(report(Some(99)).exit_code(), 1);
         assert_eq!(report(Some(100)).exit_code(), 0);
+        assert_eq!(
+            HygieneReport {
+                targets: vec![CleanDecision {
+                    target: "/wt/target".into(),
+                    age_secs: 0,
+                    eligible: false,
+                    reason: "mount_boundary".into(),
+                }],
+                ..report(Some(100))
+            }
+            .exit_code(),
+            1
+        );
+        assert_eq!(
+            HygieneReport {
+                targets: vec![CleanDecision {
+                    target: "/wt/target".into(),
+                    age_secs: 0,
+                    eligible: false,
+                    reason: "mount_evidence_unknown".into(),
+                }],
+                ..report(Some(100))
+            }
+            .exit_code(),
+            2
+        );
         assert_eq!(report(None).exit_code(), 2);
         assert_eq!(
             HygieneReport {

@@ -82,6 +82,8 @@ pub enum JobKind {
     FleetTick,
     /// Run the hygiene command.
     Hygiene,
+    /// Run the local no-argument host check.
+    HostCheck,
 }
 
 /// Cadence manifest containing program/team job entries.
@@ -307,6 +309,7 @@ pub fn generate_default_manifest(
 /// Validates cadence job identity, interval and supported argv shape.
 #[implements("FR-049-AC-4")]
 #[implements("FR-049-AC-7")]
+#[implements("FR-049-AC-9")]
 pub fn validate_manifest(manifest: &Manifest) -> Result<(), CadenceError> {
     if manifest
         .alert_recipient
@@ -369,11 +372,13 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), CadenceError> {
     Ok(())
 }
 
+#[implements("FR-049-AC-9")]
 fn command_matches_kind(kind: JobKind, command: &[String]) -> bool {
     match (kind, command) {
         (JobKind::RetroSnapshot, [root, sub, ..]) => root == "retro" && sub == "snapshot",
         (JobKind::FleetTick, [root, sub, ..]) => root == "fleet" && sub == "tick",
         (JobKind::Hygiene, [root, sub, ..]) => root == "focus" && sub == "hygiene",
+        (JobKind::HostCheck, [root, sub]) => root == "host" && sub == "check",
         _ => false,
     }
 }
@@ -438,23 +443,58 @@ fn classify_due(interval_secs: u64, last_run: Option<&CadenceRun>, now_ms: i64) 
 /// Runs one uniquely identified job and records its process outcome.
 #[implements("FR-049-AC-3")]
 #[implements("FR-049-AC-7")]
+#[implements("FR-049-AC-9")]
 pub fn run_job(
     manifest: &Manifest,
-    mut open_ledger: impl FnMut() -> Result<Ledger, CadenceError>,
+    open_ledger: impl FnMut() -> Result<Ledger, CadenceError>,
     job_id: &str,
     now_ms: i64,
 ) -> Result<JobRunReport, CadenceError> {
-    run_job_with_manifest_path(manifest, None, &mut open_ledger, job_id, now_ms)
+    run_job_with_manifest_path(manifest, None, open_ledger, job_id, now_ms)
 }
 
-/// Runs one job while binding its follow-up delta to the manifest that selected the job.
-#[implements("FR-049-AC-7")]
-pub fn run_job_with_manifest_path(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RunOutcome {
+    succeeded: bool,
+    exit_status: Option<i32>,
+}
+
+#[implements("FR-049-AC-9")]
+#[cfg(test)]
+fn run_job_with_executor(
     manifest: &Manifest,
-    manifest_path: Option<&Path>,
     mut open_ledger: impl FnMut() -> Result<Ledger, CadenceError>,
     job_id: &str,
     now_ms: i64,
+    execute_job: impl FnOnce(&Job) -> Result<RunOutcome, std::io::Error>,
+) -> Result<JobRunReport, CadenceError> {
+    run_job_with_manifest_path_and_executor(manifest, &mut open_ledger, job_id, now_ms, execute_job)
+}
+
+/// Runs one job while binding its follow-up delta to the manifest that selected the job.
+#[implements("FR-049-AC-7", "FR-049-AC-9")]
+pub fn run_job_with_manifest_path(
+    manifest: &Manifest,
+    manifest_path: Option<&Path>,
+    open_ledger: impl FnMut() -> Result<Ledger, CadenceError>,
+    job_id: &str,
+    now_ms: i64,
+) -> Result<JobRunReport, CadenceError> {
+    run_job_with_manifest_path_and_executor(manifest, open_ledger, job_id, now_ms, |job| {
+        execute(job, manifest_path).map(|status| RunOutcome {
+            succeeded: status.success(),
+            exit_status: status.code(),
+        })
+    })
+}
+
+#[implements("FR-049-AC-7", "FR-049-AC-9")]
+fn run_job_with_manifest_path_and_executor(
+    manifest: &Manifest,
+    mut open_ledger: impl FnMut() -> Result<Ledger, CadenceError>,
+    job_id: &str,
+    now_ms: i64,
+    execute_job: impl FnOnce(&Job) -> Result<RunOutcome, std::io::Error>,
 ) -> Result<JobRunReport, CadenceError> {
     validate_manifest(manifest)?;
     let mut matching = manifest.jobs.iter().filter(|job| job.id == job_id);
@@ -467,24 +507,23 @@ pub fn run_job_with_manifest_path(
     let mut ledger = open_ledger()?;
     ledger.cadence_start(&job.program, &job.team, &job.id, now_ms)?;
     drop(ledger);
-    let result = execute(job, manifest_path);
+    let result = execute_job(job);
     let finished_at_ms = unix_time_ms();
     match result {
-        Ok(status) => {
-            let succeeded = status.success();
-            let code = status.code().map(|code| code.to_string());
+        Ok(outcome) => {
+            let code = outcome.exit_status.map(|code| code.to_string());
             open_ledger()?.cadence_finish(
                 &job.program,
                 &job.team,
                 &job.id,
                 finished_at_ms,
-                succeeded,
+                outcome.succeeded,
                 code.as_deref(),
             )?;
             Ok(JobRunReport {
                 id: job.id.clone(),
-                succeeded,
-                exit_status: status.code(),
+                succeeded: outcome.succeeded,
+                exit_status: outcome.exit_status,
                 finished_at_ms,
             })
         }
@@ -572,7 +611,8 @@ pub fn open_ledger(settings: Option<&toml::Value>) -> Result<Ledger, CadenceErro
 #[cfg(test)]
 mod tests {
     use super::{
-        DueState, Job, JobKind, Manifest, classify_due, due, notify_if_alert, validate_manifest,
+        DueState, Job, JobKind, Manifest, RunOutcome, classify_due, due, notify_if_alert,
+        run_job_with_executor, validate_manifest,
     };
     use crate::fleet::FleetConfig;
     use crate::fleet::ledger::Ledger;
@@ -767,6 +807,50 @@ mod tests {
         manifest.jobs[0].interval_secs = 1800;
         manifest.alert_recipient = Some("all".to_owned());
         assert!(validate_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    #[trace("FR-049-AC-9", "FR-050-AC-5")]
+    fn host_check_cadence_job_records_its_injected_child_outcome() {
+        let directory = tempfile::tempdir().unwrap();
+        let ledger_path = directory.path().join("ledger.sqlite3");
+        let manifest = Manifest {
+            alert_recipient: None,
+            jobs: vec![Job {
+                program: "QSL".to_owned(),
+                team: "qsl".to_owned(),
+                id: "host-check".to_owned(),
+                interval_secs: 3600,
+                kind: JobKind::HostCheck,
+                command: vec!["host".to_owned(), "check".to_owned()],
+                after_success: None,
+                owner_role: "minder".to_owned(),
+            }],
+        };
+        validate_manifest(&manifest).expect("host check command accepted");
+        let report = run_job_with_executor(
+            &manifest,
+            || Ok(Ledger::open(&ledger_path, &FleetConfig::default())?),
+            "host-check",
+            1000,
+            |job| {
+                assert_eq!(job.command, ["host", "check"]);
+                Ok(RunOutcome {
+                    succeeded: false,
+                    exit_status: Some(1),
+                })
+            },
+        )
+        .expect("record host-check result");
+        assert!(!report.succeeded);
+        assert_eq!(report.exit_status, Some(1));
+        let ledger = Ledger::open(&ledger_path, &FleetConfig::default()).unwrap();
+        let last = ledger
+            .cadence_last_run("QSL", "qsl", "host-check")
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.outcome, "failed");
+        assert_eq!(last.detail.as_deref(), Some("1"));
     }
 
     #[test]
