@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 use clap::Parser;
 use ix_board::team_metrics::{Collector, Config, Error, now_ms};
+use ix_trace_rs::implements;
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
@@ -28,6 +29,7 @@ struct Cache {
     updated: Instant,
     stale_after: Duration,
 }
+#[implements("FR-033-AC-8")]
 fn serve(mut stream: TcpStream, cache: &RwLock<Cache>) -> Result<(), Error> {
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
@@ -110,6 +112,7 @@ fn metrics_text(collector: &Collector, config: &Config, now: i64) -> Result<Stri
     }
     Ok(text)
 }
+#[implements("FR-033-AC-12")]
 fn run() -> Result<(), Error> {
     // SystemHost's local lifecycle transport invokes the current executable.
     // Support the same bounded, read-only protocol as the ix-board CLI.

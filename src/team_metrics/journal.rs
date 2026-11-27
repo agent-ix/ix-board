@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Agent-IX
 use super::{Config, Error, Event, State};
+use ix_trace_rs::implements;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 
@@ -13,6 +14,7 @@ pub struct Journal {
 impl Journal {
     /// Reserves a complete GitHub collection before any source reads. The singleton
     /// deadline survives restart and coalesces concurrent workers without a quota reset.
+    #[implements("FR-033-AC-12")]
     pub(crate) fn claim_github_collection(
         &mut self,
         now: i64,

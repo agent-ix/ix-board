@@ -6,6 +6,7 @@ use super::timeline::{ExecutionSample, Member};
 use super::{Config, Error, Event, History, Journal, ScopeState, State};
 use crate::retro::sources::{AgentSource, GithubSource, LinearSource};
 use crate::{WorkflowStateType, WorkspaceSnapshot, retro};
+use ix_trace_rs::implements;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A completed tracker refresh, passed across a bounded worker channel.
@@ -264,6 +265,7 @@ impl Collector {
         history
     }
     /// Collects tracker/VCS data using shared retro calculations, outside the activity worker.
+    #[implements("FR-033-AC-12")]
     pub fn tracker(config: &Config, now: i64) -> TrackerBatch {
         let started = std::time::Instant::now();
         let github_refreshed = Journal::open(&config.state_path, config)
@@ -607,6 +609,8 @@ impl Collector {
         }
     }
     /// Commits a completed tracker refresh without holding a network-facing lock.
+    #[implements("FR-033-AC-5")]
+    #[implements("FR-033-AC-12")]
     pub fn apply_tracker(&mut self, batch: TrackerBatch) -> Result<(), Error> {
         for (key, result) in batch.results {
             let Some(state) = self.state.scopes.get_mut(&key) else {

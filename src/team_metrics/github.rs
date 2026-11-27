@@ -188,6 +188,7 @@ impl<T: Transport> Guard<T> {
                 .min(CACHE_BYTES),
         })
     }
+    #[implements("FR-033-AC-12")]
     fn request(
         &self,
         request: &Request,
@@ -579,6 +580,7 @@ pub(super) struct SelectedGithub<T = Http> {
     infos: RefCell<BTreeMap<String, InfoRows>>,
 }
 impl SelectedGithub {
+    #[implements("FR-033-AC-12")]
     pub(super) fn deferred(now: i64) -> Self {
         Self::with_guard(
             Err("GitHub collection not scheduled".into()),

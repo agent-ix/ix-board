@@ -1617,6 +1617,7 @@ fn run_fleet_saturation(
     Ok(report)
 }
 
+#[implements("FR-041-AC-7")]
 fn saturation_after_preflight<T>(
     config: &ix_board::fleet::FleetConfig,
     collect_sample: bool,

@@ -150,6 +150,7 @@ pub fn resolve_path(config: &FleetConfig) -> Result<PathBuf, LedgerError> {
 
 /// Checks writer compatibility without creating, migrating or changing the ledger.
 /// A missing ledger is permitted because the writer initializes it after collection.
+#[implements("FR-039-AC-8")]
 pub fn check_compatible(path: &Path) -> Result<(), LedgerError> {
     if !path.exists() {
         return Ok(());

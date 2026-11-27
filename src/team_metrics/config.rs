@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Agent-IX
 use super::Error;
 use crate::{ScopeSelection, TeamKey};
+use ix_trace_rs::implements;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
@@ -124,6 +125,7 @@ impl Config {
         Ok(config)
     }
     /// Rejects unbounded state, unsafe label values and ambiguous monitored identities.
+    #[implements("FR-033-AC-12")]
     pub fn validate(&self) -> Result<(), Error> {
         if self.version != 1 || self.scopes.len() > 4 || self.scopes.is_empty() {
             return Err(Error::Invalid(

@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Agent-IX
 use super::{Config, Error, State};
 use crate::retro::{Status, department::Value};
+use ix_trace_rs::implements;
 use std::{collections::BTreeSet, fmt::Write};
 
 struct Text {
@@ -78,6 +79,8 @@ const DEPARTMENT: &[(&str, &str, f64)] = &[
 
 /// Encodes a bounded allowlist in Prometheus text format. Missing data emits
 /// availability=0 and omits its numeric value, never substitutes zero.
+#[implements("FR-033-AC-5")]
+#[implements("FR-033-AC-13")]
 pub fn render(
     config: &Config,
     state: &State,
