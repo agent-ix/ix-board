@@ -1606,15 +1606,31 @@ fn run_fleet_saturation(
                 coverage: host.ready_share.coverage,
             });
         }
+        let writer_config =
+            saturation_writer_config(&config, report.hosts.iter().map(|host| host.host.as_str()));
         ledger::capacity::record_saturation_samples(
             &path,
-            &config,
+            &writer_config,
             report.observed_at_ms,
             &samples,
         )
         .map_err(|error| Error::Fleet(FleetError::Ledger(error.to_string())))?;
     }
     Ok(report)
+}
+
+// The live reader covers registry hosts plus explicit hosts. Pass that same
+// observed population to the writer, including hosts with unavailable leases.
+#[implements("FR-041-AC-7")]
+fn saturation_writer_config<'a>(
+    config: &ix_board::fleet::FleetConfig,
+    observed_hosts: impl Iterator<Item = &'a str>,
+) -> ix_board::fleet::FleetConfig {
+    let mut writer = config.clone();
+    writer.hosts.extend(observed_hosts.map(str::to_owned));
+    writer.hosts.sort();
+    writer.hosts.dedup();
+    writer
 }
 
 #[implements("FR-041-AC-7")]
@@ -5002,6 +5018,64 @@ fn render_chunk(chunk: &ProjectChunk) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[trace("FR-041-AC-7")]
+    #[test]
+    fn saturation_writer_retains_registry_hosts_even_when_their_lease_is_unavailable() {
+        use ix_board::fleet::{
+            FleetConfig,
+            ledger::capacity::{SaturationSampleInput, record_saturation_samples},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.sqlite");
+        let config = FleetConfig::default();
+        assert!(config.hosts.is_empty());
+        let writer = super::saturation_writer_config(&config, ["draco", "draco"].into_iter());
+        assert_eq!(writer.hosts, ["draco"]);
+        assert!(
+            config.hosts.is_empty(),
+            "live source configuration is unchanged"
+        );
+        record_saturation_samples(
+            &path,
+            &writer,
+            1234,
+            &[SaturationSampleInput {
+                host: "draco",
+                active_lanes: 0,
+                supplied_lanes: None,
+                unsupplied_lanes: None,
+                registry_current: false,
+                ready_buffer: None,
+                ready_share: None,
+                queued_behind_first: None,
+                bootstrap_ticket_pool: None,
+                deficit: None,
+                source_basis: "{}".into(),
+                reason: Some("registry unavailable"),
+                coverage: None,
+            }],
+        )
+        .unwrap();
+        let db = rusqlite::Connection::open(&path).unwrap();
+        let row = db
+            .query_row(
+                "SELECT host,registry_current,deficit,unavailable_reason FROM saturation_sample",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            ("draco".into(), 0, None, "registry unavailable".into())
+        );
+    }
     #[trace("FR-039-AC-8", "FR-041-AC-7")]
     #[test]
     fn saturation_schema_preflight_precedes_all_live_reads() {
