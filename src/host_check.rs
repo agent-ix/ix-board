@@ -56,6 +56,9 @@ pub struct DevProcessFinding {
 pub struct HostCheckReport {
     /// Canonical host label.
     pub host: String,
+    /// Rolling stability and queue analysis for each build host.
+    #[serde(default)]
+    pub stability: crate::build_stability::StabilityReport,
     /// GitHub and Linear authentication probes.
     pub auth: Vec<AuthCheck>,
     /// Host's current locked-build and resource metrics.

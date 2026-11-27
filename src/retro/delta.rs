@@ -247,7 +247,7 @@ fn delta_defects(metrics: &[MetricDelta], previous_record: Option<&Record>) -> V
         matches!(
             metric.id.as_str(),
             "prs_idle" | "fix_rounds_max" | "agents_idle_minutes_max"
-        )
+        ) || crate::build_stability::metric_host(&metric.id).is_some()
     }) {
         if metric.status == Status::Ok
             && metric.since_previous.state == ChangeState::Changed

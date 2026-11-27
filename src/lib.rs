@@ -4,6 +4,7 @@
 //! Deterministic Linear project controls and cached reads for ready work, context, and search.
 
 pub mod agents;
+pub mod build_stability;
 mod cache;
 pub mod cache_status;
 pub mod cadence;

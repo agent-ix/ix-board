@@ -111,6 +111,62 @@ pub const CATALOG: &[MetricDef] = &[
     def("non_code_check_reruns", "rework", "check_runs", Down),
     def("unnamed_wait_minutes_max", "utilization", "minutes", Down),
     def("host_load_per_core_max", "resource", "ratio", Down),
+    def("build_kill_rate_draco", "stability", "ratio", Down),
+    def("build_oom_count_draco", "stability", "requests", Down),
+    def(
+        "build_supervision_loss_count_draco",
+        "stability",
+        "requests",
+        Down,
+    ),
+    def(
+        "build_queue_wait_p95_seconds_draco",
+        "stability",
+        "seconds",
+        Down,
+    ),
+    def("build_kill_rate_luna", "stability", "ratio", Down),
+    def("build_oom_count_luna", "stability", "requests", Down),
+    def(
+        "build_supervision_loss_count_luna",
+        "stability",
+        "requests",
+        Down,
+    ),
+    def(
+        "build_queue_wait_p95_seconds_luna",
+        "stability",
+        "seconds",
+        Down,
+    ),
+    def("build_kill_rate_titan", "stability", "ratio", Down),
+    def("build_oom_count_titan", "stability", "requests", Down),
+    def(
+        "build_supervision_loss_count_titan",
+        "stability",
+        "requests",
+        Down,
+    ),
+    def(
+        "build_queue_wait_p95_seconds_titan",
+        "stability",
+        "seconds",
+        Down,
+    ),
+    def("build_kill_rate_terra", "stability", "ratio", Down),
+    def("build_oom_count_terra", "stability", "requests", Down),
+    def(
+        "build_supervision_loss_count_terra",
+        "stability",
+        "requests",
+        Down,
+    ),
+    def(
+        "build_queue_wait_p95_seconds_terra",
+        "stability",
+        "seconds",
+        Down,
+    ),
 ];
 
 /// Looks up a catalog entry by id.

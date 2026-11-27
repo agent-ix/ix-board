@@ -288,6 +288,10 @@ pub struct ProcessRow {
 
 /// Local git, disk and process reads.
 pub trait LocalSource {
+    /// Retained locked-build stability evidence; absent adapters remain unavailable.
+    fn build_stability(&self, _now_ms: u64) -> crate::build_stability::StabilityReport {
+        Default::default()
+    }
     /// Prunable worktrees git reports for a directory.
     fn prunable_worktrees(&self, dir: &Path) -> Result<u64, String>;
     /// Total bytes below a directory.

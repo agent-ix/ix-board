@@ -24,6 +24,10 @@ pub const MAX_PROTOCOL_BYTES: usize = 16 * 1024 * 1024;
 
 /// A machine the detector can read: herdr state plus one batched file probe.
 pub trait Host: Send + Sync {
+    /// Reads redacted locked-build status; older adapters explicitly lack this source.
+    fn build_status(&self) -> Result<String, AgentsError> {
+        Err(AgentsError::ProbeFormat("build_status_unavailable".into()))
+    }
     /// Machine label shown in output.
     fn label(&self) -> &str;
 
@@ -354,6 +358,29 @@ pub(super) fn run(
 }
 
 impl Host for SystemHost {
+    fn build_status(&self) -> Result<String, AgentsError> {
+        let mut command;
+        match &self.machine {
+            None => {
+                command = Command::new("locked-build");
+                command.arg("status");
+            }
+            Some(machine) => {
+                command = Command::new("ssh");
+                command
+                    .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--"])
+                    .arg(&machine.ssh_target)
+                    .arg(r#"exec env PATH="$PATH:$HOME/.local/bin:$HOME/.cargo/bin" locked-build status"#);
+            }
+        }
+        run(
+            &mut command,
+            None,
+            self.deadline.saturating_duration_since(Instant::now()),
+        )
+        .map_err(|_| AgentsError::ProbeFormat("build_status_unavailable".into()))
+    }
+
     fn label(&self) -> &str {
         &self.label
     }
