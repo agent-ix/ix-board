@@ -22,7 +22,7 @@ directly or through the ix-board plugin for Claude Code and Codex.
 Install the CLI from source:
 
 ```bash
-cargo +1.98.1 install --git https://github.com/agent-ix/ix-board --branch main --locked
+cargo +1.100.0 install --git https://github.com/agent-ix/ix-board --branch main --locked
 ```
 
 Save a Linear API key in the operating system credential store:
