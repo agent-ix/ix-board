@@ -533,7 +533,7 @@ fn graph_body(body: &str) -> Result<String, String> {
     }
     Ok(serde_json::json!({"data":data}).to_string())
 }
-fn graph_request(query: &str, repo: &str, after: Option<&str>) -> Result<Request, String> {
+fn repository_coordinates(repo: &str) -> Result<(&str, &str), String> {
     let mut pieces = repo.split('/');
     let (Some(owner), Some(name), None) = (pieces.next(), pieces.next(), pieces.next()) else {
         return Err("invalid repository".into());
@@ -549,6 +549,10 @@ fn graph_request(query: &str, repo: &str, after: Option<&str>) -> Result<Request
     }) {
         return Err("invalid repository".into());
     }
+    Ok((owner, name))
+}
+fn graph_request(query: &str, repo: &str, after: Option<&str>) -> Result<Request, String> {
+    let (owner, name) = repository_coordinates(repo)?;
     let mut variables =
         BTreeMap::from([("owner".into(), owner.into()), ("name".into(), name.into())]);
     if let Some(after) = after {
@@ -730,6 +734,7 @@ impl<T: Transport> SelectedGithub<T> {
     }
     #[implements("FR-033-AC-12", "FR-033-AC-13")]
     fn repository_prs(&self, repo: &str) -> PrRows {
+        repository_coordinates(repo)?;
         if let Some(rows) = self.lists.borrow().get(repo) {
             return rows.clone();
         }
@@ -747,7 +752,7 @@ impl<T: Transport> SelectedGithub<T> {
             // When the complete selected population fits the historical-link ceiling,
             // read only those identities. Do not scan unrelated repository populations.
             // Larger selections retain the bounded open/recent population path below.
-            if !numbers.is_empty() && numbers.len() <= MAX_OLD {
+            if numbers.len() <= MAX_OLD {
                 let mut rows = Vec::new();
                 for chunk in numbers.chunks(25) {
                     let fields = chunk.iter().map(|number| format!(
@@ -1528,7 +1533,8 @@ mod tests {
                 + 1;
             Ok(response(serde_json::json!({"data":{"rateLimit":{"cost":1,"remaining":100,"resetAt":"2030-01-01T00:00:00Z"},"repository":{"pullRequests":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":n.to_string()}}}}}).to_string()))
         });
-        let source = source(open(&cfg, fake.clone()), BTreeSet::new(), true, 1000);
+        let allowed = (1..=51).map(|n| ("agent-ix/one".to_owned(), n)).collect();
+        let source = source(open(&cfg, fake.clone()), allowed, true, 1000);
         assert!(source.pull_requests("agent-ix/one", 0.0).is_err());
         assert_eq!(fake.count(), MAX_PAGES);
         assert!(source.pull_requests("../invalid", 0.0).is_err());
@@ -1780,6 +1786,24 @@ mod tests {
 
     #[trace("FR-033-AC-12", "FR-033-AC-13")]
     #[test]
+    fn empty_selected_population_sends_nothing_and_does_not_invent_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let fake = graph();
+        let source = source(open(&cfg, fake.clone()), BTreeSet::new(), true, 1000);
+        assert!(
+            source
+                .pull_requests("agent-ix/one", 0.0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(source.pull_requests("../invalid", 0.0).is_err());
+        assert_eq!(source.observed_at(), 0);
+        assert_eq!(fake.count(), 0);
+    }
+
+    #[trace("FR-033-AC-12", "FR-033-AC-13")]
+    #[test]
     fn partial_or_misidentified_selected_batches_are_not_cached_or_certified() {
         for invalid in [serde_json::Value::Null, serde_json::json!({"number":2})] {
             let dir = tempfile::tempdir().unwrap();
@@ -1828,7 +1852,8 @@ mod tests {
             clock.set(clock.now_ms()? + 20_000);
             Ok(response)
         });
-        let source = source(open(&cfg, fake.clone()), BTreeSet::new(), true, 1000);
+        let allowed = (1..=51).map(|n| ("agent-ix/one".to_owned(), n)).collect();
+        let source = source(open(&cfg, fake.clone()), allowed, true, 1000);
         fake.clock.set(1_000_000);
         source.pull_requests("agent-ix/one", 0.0).unwrap();
         let guard = source.guard.as_ref().unwrap();
