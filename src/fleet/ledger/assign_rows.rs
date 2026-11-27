@@ -25,6 +25,7 @@ impl Ledger {
     ///
     /// A database failure; nothing is changed.
     #[implements("FR-039-AC-12")]
+    #[implements("FR-035-AC-11")]
     pub fn upsert_assignment(
         &mut self,
         row: Option<i64>,
@@ -270,6 +271,7 @@ struct Open {
 ///
 /// A ledger or relay read failure; rows completed before it stay completed.
 #[implements("FR-039-AC-12")]
+#[implements("FR-035-AC-11")]
 pub fn complete_pending(
     config: &FleetConfig,
     settings: &TickSettings,
@@ -940,6 +942,7 @@ fn receipt_sender_addr(
 }
 
 #[implements("FR-039-AC-12")]
+#[implements("FR-035-AC-11")]
 fn open_rows(ledger: &Ledger, now_ms: i64) -> Result<Vec<Open>, LedgerError> {
     let mut statement = ledger.connection.prepare(
         "SELECT id, order_id, lane, ticket, expect_ticket, sent_at, deadline_at, result,
