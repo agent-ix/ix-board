@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+[Unit]
+Description=ix-board local cadence interval for %i
+
+[Timer]
+OnStartupSec=30s
+OnUnitInactiveSec=300s
+AccuracySec=1s
+Unit=ix-board-cadence@%i.service
+
+[Install]
+WantedBy=timers.target
+

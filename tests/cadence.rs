@@ -32,6 +32,115 @@ fn manifest(path: &Path, interval_secs: u64) {
     std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
 }
 
+#[test]
+#[trace("FR-049-AC-10")]
+fn cadence_accepts_check_jobs_and_rejects_cleanup() {
+    use ix_board::cadence::{Job, JobKind, Manifest, validate_manifest};
+    let mut manifest = Manifest {
+        alert_recipient: None,
+        jobs: vec![Job {
+            program: "QSL".into(),
+            team: "qsl".into(),
+            id: "check".into(),
+            interval_secs: 300,
+            kind: JobKind::Hygiene,
+            command: vec!["hygiene".into(), "check".into()],
+            after_success: None,
+            owner_role: "minder".into(),
+        }],
+    };
+    validate_manifest(&manifest).unwrap();
+    for command in [
+        vec!["hygiene", "clean"],
+        vec!["hygiene", "clean", "--apply"],
+        vec!["hygiene", "check", "--apply"],
+    ] {
+        manifest.jobs[0].command = command.into_iter().map(str::to_owned).collect();
+        assert!(validate_manifest(&manifest).is_err());
+    }
+    manifest.jobs[0].kind = JobKind::HostCheck;
+    manifest.jobs[0].command = vec!["host".into(), "check".into()];
+    validate_manifest(&manifest).unwrap();
+    manifest.jobs[0].command.push("--help".into());
+    assert!(validate_manifest(&manifest).is_err());
+}
+
+#[test]
+#[trace("FR-049-AC-10", "FR-048-AC-1")]
+fn cadence_hygiene_check_resolves_local_host_and_records_the_check() {
+    let directory = tempfile::tempdir().unwrap();
+    let manifest_path = directory.path().join("cadence.json");
+    let ledger_path = directory.path().join("ledger.sqlite3");
+    ix_board::cadence::generate_default_manifest(&manifest_path, "QSL", "qsl").unwrap();
+    let root = directory.path().join("worktrees");
+    std::fs::create_dir(&root).unwrap();
+    let config = directory.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[hygiene]\nworktree_root = {:?}\ndefault_free_floor_gb = 1\n",
+            root.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ix-board"))
+        .args(["cadence", "run", "hygiene-check", "--manifest"])
+        .arg(&manifest_path)
+        .env("IX_BOARD_LEDGER_PATH", &ledger_path)
+        .env("IX_BOARD_CONFIG_PATH", &config)
+        .env("IX_BOARD_HOST", "fixture-host")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("fixture-host"), "{stdout}");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("unrecognized"));
+    let ledger = Ledger::open(&ledger_path, &FleetConfig::default()).unwrap();
+    let result = ledger
+        .cadence_last_run("QSL", "qsl", "hygiene-check")
+        .unwrap()
+        .unwrap();
+    assert!(result.finished_at_ms.is_some());
+    assert!(matches!(result.outcome.as_str(), "succeeded" | "failed"));
+    assert!(root.exists());
+}
+
+#[test]
+#[trace("FR-049-AC-11")]
+fn alert_dry_run_names_one_recipient_without_starting_transport() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("cadence.json");
+    let ledger = directory.path().join("ledger.sqlite3");
+    std::fs::write(
+        &path,
+        br#"{"alert_recipient":"draco:tooling:minder","jobs":[]}"#,
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ix-board"))
+        .args([
+            "cadence",
+            "due",
+            "--program",
+            "QSL",
+            "--team",
+            "qsl",
+            "--alert",
+            "--dry-run",
+            "--manifest",
+        ])
+        .arg(&path)
+        .env("IX_BOARD_LEDGER_PATH", &ledger)
+        .env("PATH", directory.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "dry-run: cadence alert to draco:tooling:minder; no notification sent\n"
+    );
+    std::fs::write(&path, br#"{"alert_recipient":"all","jobs":[]}"#).unwrap();
+    assert_eq!(due_command(&path, &ledger).status.code(), Some(3));
+}
+
 fn due_command(manifest: &Path, ledger: &Path) -> std::process::Output {
     assert_cmd::Command::cargo_bin("ix-board")
         .unwrap()
@@ -51,12 +160,12 @@ fn due_command(manifest: &Path, ledger: &Path) -> std::process::Output {
 }
 
 #[test]
-#[trace("FR-049-AC-8")]
+#[trace("FR-049-AC-8", "FR-049-AC-10")]
 fn default_retro_manifest_generation_is_idempotent_and_never_clobbers() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("nested/cadence.json");
     let generated = ix_board::cadence::generate_default_manifest(&path, "SWM", "qsl").unwrap();
-    assert_eq!(generated.jobs.len(), 1);
+    assert_eq!(generated.jobs.len(), 3);
     assert_eq!(generated.jobs[0].interval_secs, 1800);
     assert_eq!(
         generated.jobs[0].command,
@@ -66,6 +175,14 @@ fn default_retro_manifest_generation_is_idempotent_and_never_clobbers() {
         generated.jobs[0].after_success.as_deref().unwrap(),
         ["retro", "delta", "--team", "qsl", "--notify"]
     );
+    assert_eq!(generated.jobs[1].id, "cadence-checker");
+    assert_eq!(generated.jobs[1].interval_secs, 300);
+    assert_eq!(generated.jobs[1].command, ["host", "check"]);
+    assert_eq!(generated.jobs[2].id, "hygiene-check");
+    assert_eq!(generated.jobs[2].interval_secs, 300);
+    assert_eq!(generated.jobs[2].command, ["hygiene", "check"]);
+    assert!(generated.jobs[1].after_success.is_none());
+    assert!(generated.jobs[2].after_success.is_none());
     let bytes = std::fs::read(&path).unwrap();
     let rerun = ix_board::cadence::generate_default_manifest(&path, "OTHER", "other").unwrap();
     assert_eq!(rerun, generated);
@@ -360,7 +477,7 @@ fn generated_cadence_manifest_uses_the_auto_detected_team_sources() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("qsl-cadence.json");
     let manifest = ix_board::cadence::generate_default_manifest(&path, "QSL", "QSL").unwrap();
-    assert_eq!(manifest.jobs.len(), 1);
+    assert_eq!(manifest.jobs.len(), 3);
     assert_eq!(manifest.jobs[0].interval_secs, 1800);
     assert_eq!(manifest.jobs[0].owner_role, "minder");
     assert_eq!(

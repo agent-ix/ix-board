@@ -239,8 +239,8 @@ pub fn load_manifest(path: &Path) -> Result<Manifest, CadenceError> {
     Ok(manifest)
 }
 
-/// Creates the default team retro job once, without replacing an existing manifest.
-#[implements("FR-049-AC-4")]
+/// Creates the local team jobs once, without replacing an existing manifest.
+#[implements("FR-049-AC-4", "FR-049-AC-8", "FR-049-AC-10")]
 pub fn generate_default_manifest(
     path: &Path,
     program: &str,
@@ -248,27 +248,49 @@ pub fn generate_default_manifest(
 ) -> Result<Manifest, CadenceError> {
     let manifest = Manifest {
         alert_recipient: None,
-        jobs: vec![Job {
-            program: program.to_owned(),
-            team: team.to_owned(),
-            id: format!("retro-{}", team.to_ascii_lowercase()),
-            interval_secs: 30 * 60,
-            kind: JobKind::RetroSnapshot,
-            command: vec![
-                "retro".into(),
-                "snapshot".into(),
-                "--team".into(),
-                team.to_owned(),
-            ],
-            after_success: Some(vec![
-                "retro".into(),
-                "delta".into(),
-                "--team".into(),
-                team.to_owned(),
-                "--notify".into(),
-            ]),
-            owner_role: "minder".into(),
-        }],
+        jobs: vec![
+            Job {
+                program: program.to_owned(),
+                team: team.to_owned(),
+                id: format!("retro-{}", team.to_ascii_lowercase()),
+                interval_secs: 30 * 60,
+                kind: JobKind::RetroSnapshot,
+                command: vec![
+                    "retro".into(),
+                    "snapshot".into(),
+                    "--team".into(),
+                    team.to_owned(),
+                ],
+                after_success: Some(vec![
+                    "retro".into(),
+                    "delta".into(),
+                    "--team".into(),
+                    team.to_owned(),
+                    "--notify".into(),
+                ]),
+                owner_role: "minder".into(),
+            },
+            Job {
+                program: program.to_owned(),
+                team: team.to_owned(),
+                id: CHECKER_JOB_ID.to_owned(),
+                interval_secs: 300,
+                kind: JobKind::HostCheck,
+                command: vec!["host".into(), "check".into()],
+                after_success: None,
+                owner_role: "minder".into(),
+            },
+            Job {
+                program: program.to_owned(),
+                team: team.to_owned(),
+                id: "hygiene-check".to_owned(),
+                interval_secs: 300,
+                kind: JobKind::Hygiene,
+                command: vec!["hygiene".into(), "check".into()],
+                after_success: None,
+                owner_role: "minder".into(),
+            },
+        ],
     };
     validate_manifest(&manifest)?;
     let parent = path
@@ -372,12 +394,15 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), CadenceError> {
     Ok(())
 }
 
-#[implements("FR-049-AC-9")]
+#[implements("FR-049-AC-9", "FR-049-AC-10")]
 fn command_matches_kind(kind: JobKind, command: &[String]) -> bool {
     match (kind, command) {
         (JobKind::RetroSnapshot, [root, sub, ..]) => root == "retro" && sub == "snapshot",
         (JobKind::FleetTick, [root, sub, ..]) => root == "fleet" && sub == "tick",
-        (JobKind::Hygiene, [root, sub, ..]) => root == "focus" && sub == "hygiene",
+        (JobKind::Hygiene, [root, sub, rest @ ..]) => {
+            (root == "focus" && sub == "hygiene")
+                || (root == "hygiene" && sub == "check" && !rest.iter().any(|arg| arg == "--apply"))
+        }
         (JobKind::HostCheck, [root, sub]) => root == "host" && sub == "check",
         _ => false,
     }
