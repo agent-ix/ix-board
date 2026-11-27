@@ -42,6 +42,11 @@ Legacy status supplies `state`, `enqueued_at_ms`, `started_at_ms`, `ended_at_ms`
   known successful attempts do not enter the kill numerator.
 - Stable codes take precedence over legacy evidence. Signal 9 alone is an external
   signal, never proof of OOM. Ordinary nonzero exits are command failures.
+  Legacy `supervision_lost` and `supervision_degraded` map to
+  `LB_SUPERVISION_LOST`, as declared by the producer's `wire::Code`.
+  Degraded supervision remains successful when the lifecycle and observed exit
+  say success; the diagnostic alone does not make it a kill. Legacy `refused`
+  maps to `LB_REFUSED_QUEUE` without inventing a more specific policy cause.
 - The top violated limit is the most frequent resource/hold/refusal bound, with
   deterministic lexical limit-key tie breaking and the latest measured/limit values.
 - Queue waits use completed admission waits (nearest-rank p50/p95), independently
@@ -49,27 +54,53 @@ Legacy status supplies `state`, `enqueued_at_ms`, `started_at_ms`, `ended_at_ms`
   admitted timestamps take precedence over legacy started timestamps.
 - Queue depth is a step series reconstructed from enqueue to admission or terminal
   cancellation, clipped to each window and including a baseline. Position and
-  enqueue-depth observations are retained when present. Memory values are per
-  request, not measured RSS; missing legacy fields remain null. Status-only
-  Existing `requested_memory_bytes` and `granted_memory_bytes` remain hard-cap
+  enqueue-depth observations are retained when present. Memory evidence is a
+  fixed-size summary per host, class and window: request population, known and
+  unknown counts, nearest-rank p50/p95 and maximum bytes for each memory field.
+  No per-request memory array is emitted in JSON or text. These are grants and
+  requests, not measured RSS. Existing `requested_memory_bytes` and
+  `granted_memory_bytes` remain hard-cap
   aliases. Separate `requested_memory_reservation_bytes` and
   `granted_memory_reservation_bytes` retain admission reservations; missing
-  reservation evidence stays null. `memory_needed_bytes` and
+  reservation evidence contributes to the unknown count. `memory_needed_bytes` and
   `memory_free_budget_bytes` show the reservation needed and
   currently unreserved budget without substituting granted bytes.
-- Blocked seconds sum cumulative per-request observations, allowing overlapping
-  reasons. A request spanning the start boundary needs a cumulative observation
-  at that boundary; otherwise its blocked duration is unavailable. Legacy reason
-  labels are retained without attributing an entire wait to the last reason.
+- Blocked seconds sum known cumulative per-request contributions, allowing
+  overlapping reasons. A request spanning the start uses its nearest cumulative
+  observation at or before that boundary. If none exists, only that request's
+  duration is unavailable. Available/unavailable request counts accompany each
+  sum; null means no eligible request has usable timing evidence.
+  The producer does not sample every caller-selected boundary. The nearest prior
+  observation is a boundary estimate, and its maximum gap is reported as
+  `blocked_baseline_gap_ms`. Later cumulative endpoints are clipped to the
+  caller's window end and queue overlap; `blocked_observation_gap_ms` reports
+  the maximum sampling delay. These gaps expose uncertainty rather than imply
+  interpolated precision. Legacy reason labels are retained without attributing
+  an entire wait to the last reason.
 - Event snapshots SHALL NOT count a retained request twice. A correction SHALL
   retain the original request identity and SHALL NOT create another attempt.
   Retained status is authoritative; event-only attempts use the latest snapshot,
-  with producer event order breaking equal timestamp ties. Refused attempts that
-  exist only in events, ix-board SHALL include them once per request id.
-- Malformed, stale (over 120 seconds), future (over five seconds), wrong-host,
-  duplicate-identity, incompatible-version and pruned history SHALL be unavailable
+  with producer event order breaking equal timestamp ties. ix-board SHALL include
+  event-only refusals once per request id.
+- Malformed envelopes, stale (over 120 seconds), future (over five seconds),
+  wrong-host, incompatible projections and pruned history SHALL be unavailable
   with a safe reason rather than zero. Freshness uses the actual collection clock,
   independently of the requested window end and preceding slow source reads.
+  Compatible additive schema versions remain readable. Invalid request records,
+  including duplicate identities, are excluded and counted in `invalid_requests`;
+  valid records from that host remain available. Unknown classes use the bounded
+  `unknown` class and `unknown_class_requests` count. Unknown blocker labels use
+  the `unknown` reason and a count, without echoing arbitrary producer text.
+  Invalid blocker timings affect that request's blocking contribution, not its
+  other outcomes or the host. Known-only counts and sums describe the retained
+  valid population and carry these explicit incompleteness counts.
+  Invalid typed event snapshots have a separate `invalid_events` count. Events
+  cannot resurrect a request quarantined from retained status. Rolling-window
+  calculations ignore unused cumulative metric rows, so additive vocabularies
+  there do not invalidate usable request/event evidence. Local host identity is
+  read independently of individual request validity.
+  Duplicate host sources keep the first valid row. Discovery excludes saved
+  profiles naming the local machine before probing them.
   Raw command, owner, environment, message
   and credential data SHALL NOT appear in the view or errors.
 - The retro catalog SHALL add per-host build kill rate, OOM count, supervision
@@ -86,9 +117,9 @@ Legacy status supplies `state`, `enqueued_at_ms`, `started_at_ms`, `ended_at_ms`
 | --- | --- | --- |
 | FR-051-AC-1 | Hand-written status and event evidence produces per-host 1h/24h requests, completions, success rates and termination counts with exact boundary inclusion and one count per attempt, including event-only refusals and historical corrections sharing a timestamp with the original outcome. | Test |
 | FR-051-AC-2 | Stable codes override legacy reasons; legacy RSS, timeout, supervision, refusal, cancellation, external signal and command exits map correctly; successful degraded supervision retains its diagnostic without becoming a failed or killed attempt; top violated limit carries limit and measured evidence. | Test |
-| FR-051-AC-3 | Per-host/class queue p50/p95, depth steps, blocker seconds and separate requested/granted hard caps, reservations and needed/free-budget memory match injected values; empty waits and incomplete blocking history remain null. | Test |
+| FR-051-AC-3 | Per-host/class queue p50/p95, depth steps and clipped blocker contributions match hand-written values; nearest prior baselines and missing-request contributions have explicit gap/availability counts. Memory JSON/text contains bounded count/p50/p95/max summaries for separate hard caps, reservations and needed/free-budget fields, including unknown-value counts. | Test |
 | FR-051-AC-4 | Additive retro ids for all four hosts collect injected stability values and rising values become existing delta defects; missing hosts stay unavailable and notifications require explicit request through the existing recipient. | Test |
-| FR-051-AC-5 | No-argument host check includes all four host rows through bounded read-only collection, rejects stale/malformed/wrong-host/pruned history without leaking raw payloads, and default cadence includes the view and retro metrics without notification flags. | Test |
+| FR-051-AC-5 | No-argument host check includes all four host rows through bounded read-only collection, rejects stale/malformed-envelope/wrong-host/pruned history without leaking raw payloads, preserves valid records alongside counted invalid requests or unknown additive labels, and keeps the first valid duplicate host row while discovery deduplicates local profiles; default cadence includes the view and retro metrics without notification flags. | Test |
 
 ## Dependencies
 

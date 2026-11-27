@@ -72,6 +72,15 @@ pub struct StabilityReport {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostStability {
+    /// Invalid retained/event-only request records excluded from the known population.
+    #[serde(default)]
+    pub invalid_requests: u64,
+    /// Malformed event snapshots excluded without discarding healthy requests.
+    #[serde(default)]
+    pub invalid_events: u64,
+    /// Requests whose additive class label is represented by the bounded unknown class.
+    #[serde(default)]
+    pub unknown_class_requests: u64,
     /// Safe unavailable reason; missing evidence never becomes a zero.
     pub reason: Option<String>,
     /// Last hour, or null when the retained source cannot establish it.
@@ -88,9 +97,9 @@ pub struct Window {
     pub start_ms: u64,
     /// End of the window, Unix milliseconds.
     pub end_ms: u64,
-    /// Requests enqueued in the window.
+    /// Valid requests enqueued in the window; host counters disclose excluded records.
     pub requests: u64,
-    /// Requests that reached a terminal state in the window.
+    /// Valid requests that reached a terminal state in the window.
     pub completed: u64,
     /// Successful terminal requests divided by completed; null for no completions.
     pub success_rate: Option<f64>,
@@ -134,12 +143,123 @@ pub struct QueueAnalysis {
     pub wait_p95_seconds: Option<f64>,
     /// Step series reconstructed from enqueue/start/terminal timestamps, including baseline.
     pub depth_over_time: Vec<DepthPoint>,
-    /// Clipped blocked seconds by reason, null if timing evidence is incomplete.
+    /// Known clipped blocked contributions; null when no eligible request has timing evidence.
     pub blocked_seconds: Option<BTreeMap<String, f64>>,
+    /// Eligible requests with usable blocker timing, including explicit empty observations.
+    #[serde(default)]
+    pub blocked_requests_available: u64,
+    /// Eligible requests whose blocker timing cannot be established.
+    #[serde(default)]
+    pub blocked_requests_unavailable: u64,
+    /// Greatest gap from window start to a prior cumulative baseline used in this sum.
+    #[serde(default)]
+    pub blocked_baseline_gap_ms: Option<u64>,
+    /// Greatest amount an available cumulative endpoint was sampled after this window.
+    #[serde(default)]
+    pub blocked_observation_gap_ms: Option<u64>,
+    /// Additive blocker labels grouped under unknown without exposing raw label text.
+    #[serde(default)]
+    pub unknown_block_reasons: u64,
+    /// Current block observations with invalid durations, values, limits or duplicate reasons.
+    #[serde(default)]
+    pub invalid_block_reasons: u64,
     /// Current or final legacy blocker labels; durations remain unknown without history.
     pub observed_blockers: BTreeSet<String>,
-    /// Per-request requested/granted memory; absent values remain null on legacy sources.
-    pub memory: Vec<MemoryGrant>,
+    /// Bounded requested/granted memory distributions; missing values are counted separately.
+    pub memory: MemorySummary,
+}
+
+/// Known and unknown memory values within one host/class/window population.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryDistribution {
+    /// Number of known values.
+    pub count: u64,
+    /// Number of requests without this value.
+    pub unknown: u64,
+    /// Nearest-rank median in bytes.
+    pub p50_bytes: Option<u64>,
+    /// Nearest-rank 95th percentile in bytes.
+    pub p95_bytes: Option<u64>,
+    /// Greatest known value in bytes.
+    pub max_bytes: Option<u64>,
+}
+
+/// Fixed-size memory evidence, independent of the number of retained requests.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemorySummary {
+    /// Number of requests represented by each distribution.
+    pub requests: u64,
+    /// Requested hard-cap bytes.
+    pub requested_memory_bytes: MemoryDistribution,
+    /// Granted hard-cap bytes.
+    pub granted_memory_bytes: MemoryDistribution,
+    /// Requested admission reservation bytes.
+    pub requested_memory_reservation_bytes: MemoryDistribution,
+    /// Granted admission reservation bytes.
+    pub granted_memory_reservation_bytes: MemoryDistribution,
+    /// Status admission reservation needed.
+    pub memory_needed_bytes: MemoryDistribution,
+    /// Status unreserved budget.
+    pub memory_free_budget_bytes: MemoryDistribution,
+}
+
+impl MemorySummary {
+    fn fields(&self) -> [(&'static str, &MemoryDistribution); 6] {
+        [
+            ("requested_memory_bytes", &self.requested_memory_bytes),
+            ("granted_memory_bytes", &self.granted_memory_bytes),
+            (
+                "requested_memory_reservation_bytes",
+                &self.requested_memory_reservation_bytes,
+            ),
+            (
+                "granted_memory_reservation_bytes",
+                &self.granted_memory_reservation_bytes,
+            ),
+            ("memory_needed_bytes", &self.memory_needed_bytes),
+            ("memory_free_budget_bytes", &self.memory_free_budget_bytes),
+        ]
+    }
+}
+
+fn summarize_memory(grants: &[MemoryGrant]) -> MemorySummary {
+    let requests = u64::try_from(grants.len()).unwrap_or(u64::MAX);
+    let distribution = |field: fn(&MemoryGrant) -> Option<u64>| {
+        let mut values = grants.iter().filter_map(field).collect::<Vec<_>>();
+        values.sort_unstable();
+        let percentile = |percent: usize| {
+            values
+                .len()
+                .saturating_mul(percent)
+                .div_ceil(100)
+                .checked_sub(1)
+                .and_then(|index| values.get(index))
+                .copied()
+        };
+        let count = u64::try_from(values.len()).unwrap_or(u64::MAX);
+        MemoryDistribution {
+            count,
+            unknown: requests.saturating_sub(count),
+            p50_bytes: percentile(50),
+            p95_bytes: percentile(95),
+            max_bytes: values.last().copied(),
+        }
+    };
+    MemorySummary {
+        requests,
+        requested_memory_bytes: distribution(|grant| grant.requested_memory_bytes),
+        granted_memory_bytes: distribution(|grant| grant.granted_memory_bytes),
+        requested_memory_reservation_bytes: distribution(|grant| {
+            grant.requested_memory_reservation_bytes
+        }),
+        granted_memory_reservation_bytes: distribution(|grant| {
+            grant.granted_memory_reservation_bytes
+        }),
+        memory_needed_bytes: distribution(|grant| grant.memory_needed_bytes),
+        memory_free_budget_bytes: distribution(|grant| grant.memory_free_budget_bytes),
+    }
 }
 
 /// A queue-depth step, including explicit producer enqueue depth and position when present.
@@ -192,8 +312,60 @@ pub struct MemoryGrant {
 
 // The producer owns the writer and reader types. Only local derived report types live here.
 use locked_build::wire::{
-    BlockObservation, Code, RequestProjection as RequestInput, StatusProjection as StatusInput,
+    BlockObservation, Code, EventProjection, RequestProjection as RequestInput,
+    StatusProjection as StatusInput,
 };
+
+struct DecodedStatus {
+    status: StatusInput,
+    invalid_requests: u64,
+    invalid_events: u64,
+}
+
+fn decode_status(text: &str) -> Option<DecodedStatus> {
+    let mut value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let object = value.as_object_mut()?;
+    let requests = object.get_mut("requests")?.as_array_mut()?;
+    let mut rejected = BTreeSet::new();
+    let mut invalid_requests = 0;
+    requests.retain(|request| {
+        if serde_json::from_value::<RequestInput>(request.clone()).is_ok() {
+            return true;
+        }
+        invalid_requests += 1;
+        if let Some(id) = request
+            .get("request_id")
+            .and_then(serde_json::Value::as_str)
+        {
+            rejected.insert(id.to_owned());
+        }
+        false
+    });
+    let events = object.get_mut("events")?.as_array_mut()?;
+    let mut invalid_events = 0;
+    events.retain(|event| {
+        if event
+            .get("request_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| rejected.contains(id))
+        {
+            return false;
+        }
+        if serde_json::from_value::<EventProjection>(event.clone()).is_ok() {
+            return true;
+        }
+        invalid_events += 1;
+        false
+    });
+    // Rolling windows consume request/event evidence, not cumulative metric rows.
+    // Leave unused additive metric vocabularies outside this projection's validation.
+    object.remove("metrics");
+    Some(DecodedStatus {
+        status: serde_json::from_value(value).ok()?,
+        invalid_requests,
+        invalid_events,
+    })
+}
 
 trait RequestTimes {
     fn phase(&self) -> &str;
@@ -207,7 +379,11 @@ trait RequestTimes {
 impl RequestTimes for RequestInput {
     fn phase(&self) -> &str {
         if self.trace.lifecycle_state.is_empty() {
-            &self.state
+            if self.state == "failed" && self.reason.as_deref() == Some("refused") {
+                "refused"
+            } else {
+                &self.state
+            }
         } else {
             &self.trace.lifecycle_state
         }
@@ -237,6 +413,9 @@ impl HostStability {
     /// Represents a failed, stale, incompatible or incomplete source explicitly.
     pub fn unavailable(reason: &str) -> Self {
         Self {
+            invalid_requests: 0,
+            invalid_events: 0,
+            unknown_class_requests: 0,
             reason: Some(reason.to_owned()),
             last_1h: None,
             last_24h: None,
@@ -260,10 +439,13 @@ fn from_status_at(
     if text.len() > crate::agents::MAX_PROTOCOL_BYTES {
         return HostStability::unavailable("status_too_large");
     }
-    let Ok(mut status) = serde_json::from_str::<StatusInput>(text) else {
+    let Some(decoded) = decode_status(text) else {
         return HostStability::unavailable("invalid_status");
     };
-    if status.schema_version != Some(1) || status.host.to_lowercase() != expected_host {
+    let mut status = decoded.status;
+    if !status.schema_version.is_some_and(|version| version > 0)
+        || status.host.to_lowercase() != expected_host
+    {
         return HostStability::unavailable("incompatible_status_or_host");
     }
     if observed_ms(&status) > freshness_ms.saturating_add(5_000)
@@ -275,17 +457,40 @@ fn from_status_at(
         return HostStability::unavailable("pruned_history");
     }
     // Retained requests are authoritative. Duplicate identities would inflate every metric.
-    let mut ids = BTreeSet::new();
-    if status.requests.iter().any(|request| {
-        !ids.insert(&request.request_id) || !valid_request(request, observed_ms(&status))
-    }) {
-        return HostStability::unavailable("invalid_request_history");
+    let mut ids = BTreeMap::new();
+    for request in &status.requests {
+        *ids.entry(request.request_id.clone()).or_insert(0_u64) += 1;
     }
+    let observed = observed_ms(&status);
+    let mut rejected = BTreeSet::new();
+    let mut invalid_requests = decoded.invalid_requests;
+    status.requests.retain(|request| {
+        let valid = ids[&request.request_id] == 1 && valid_request(request, observed);
+        if !valid {
+            invalid_requests += 1;
+            rejected.insert(request.request_id.clone());
+        }
+        valid
+    });
+    status
+        .events
+        .retain(|event| !rejected.contains(&event.request.request_id));
     // Events may add timing detail but must never count a retained request twice.
-    if !enrich_events(&mut status) {
-        return HostStability::unavailable("invalid_event_history");
+    invalid_requests += enrich_events(&mut status);
+    let mut unknown_class_requests = 0;
+    for request in &mut status.requests {
+        if !matches!(
+            request.class.as_str(),
+            "point" | "block" | "must-fix" | "periodic" | "arch-test" | "kani"
+        ) {
+            unknown_class_requests += 1;
+            request.class = "unknown".to_owned();
+        }
     }
     HostStability {
+        invalid_requests,
+        invalid_events: decoded.invalid_events,
+        unknown_class_requests,
         reason: None,
         last_1h: Some(summarize(&status, now_ms.saturating_sub(3_600_000), now_ms)),
         last_24h: Some(summarize(
@@ -302,20 +507,19 @@ fn valid_request(request: &RequestInput, observed_at_ms: u64) -> bool {
     let queued = request.queued_at();
     let admitted = request.admitted_at();
     let finished = request.finished_at();
-    matches!(
-        request.class.as_str(),
-        "point" | "block" | "must-fix" | "periodic" | "arch-test" | "kani"
-    ) && matches!(
-        phase,
-        "queued"
-            | "admitted"
-            | "running"
-            | "succeeded"
-            | "failed"
-            | "timed_out"
-            | "cancelled"
-            | "refused"
-    ) && (queued.is_some() || phase == "refused")
+    !request.request_id.is_empty()
+        && matches!(
+            phase,
+            "queued"
+                | "admitted"
+                | "running"
+                | "succeeded"
+                | "failed"
+                | "timed_out"
+                | "cancelled"
+                | "refused"
+        )
+        && (queued.is_some() || phase == "refused")
         && queued.is_none_or(|at| at <= observed_at_ms)
         && admitted
             .is_none_or(|at| queued.is_some_and(|queued| at >= queued) && at <= observed_at_ms)
@@ -340,7 +544,6 @@ fn valid_request(request: &RequestInput, observed_at_ms: u64) -> bool {
         .into_iter()
         .flatten()
         .all(|seconds| seconds.is_finite() && seconds >= 0.0)
-        && request.blockers().is_none_or(valid_blockers)
 }
 
 #[implements("FR-051-AC-3", "FR-051-AC-5")]
@@ -348,7 +551,6 @@ fn valid_blockers(reasons: &[BlockObservation]) -> bool {
     let mut seen = BTreeSet::new();
     reasons.iter().all(|reason| {
         seen.insert(&reason.reason)
-            && BLOCK_REASONS.contains(&reason.reason.as_str())
             && reason.value.is_finite()
             && reason.limit.is_finite()
             && reason.seconds.is_finite()
@@ -375,10 +577,15 @@ fn termination_code(request: &RequestInput) -> Option<Code> {
         Some("rss_cap") => Some(Code::RssCap),
         Some("oom_killed" | "cgroup_oom_killed") => Some(Code::OomKilled),
         Some("hold_timeout") => Some(Code::HoldTimeout),
-        Some("supervisor_lost" | "supervisor_lost_group_exit_unverified" | "host_rebooted") => {
-            Some(Code::SupervisionLost)
-        }
+        Some(
+            "supervisor_lost"
+            | "supervision_lost"
+            | "supervision_degraded"
+            | "supervisor_lost_group_exit_unverified"
+            | "host_rebooted",
+        ) => Some(Code::SupervisionLost),
         Some("memory_cap_unavailable") => Some(Code::RefusedCapUnavailable),
+        Some("refused") => Some(Code::RefusedQueue),
         _ if request.phase() == "timed_out" => Some(Code::HoldTimeout),
         _ if request.phase() == "cancelled" => Some(Code::Cancelled),
         _ if request.signal.is_some_and(|signal| signal > 0) => Some(Code::ExternalSignal),
@@ -546,7 +753,12 @@ fn queue_analysis(
         .into_iter()
         .map(|reason| (reason.to_owned(), 0.0))
         .collect::<BTreeMap<_, _>>();
-    let mut blocked_complete = true;
+    let mut blocked_requests_available = 0;
+    let mut blocked_requests_unavailable = 0;
+    let mut blocked_baseline_gap_ms = None;
+    let mut blocked_observation_gap_ms = None;
+    let mut unknown_block_reasons = 0;
+    let mut invalid_block_reasons = 0;
     for request in requests {
         if (request.queued_at().is_some_and(|at| at <= end_ms)
             || (request.phase() == "refused"
@@ -608,17 +820,54 @@ fn queue_analysis(
             if let Some(reason) = request.reason.as_deref().and_then(legacy_blocker) {
                 observed_blockers.insert(reason.to_owned());
             }
+            if let Some(observations) = request.blockers() {
+                let mut seen = BTreeSet::new();
+                for observation in observations {
+                    if !BLOCK_REASONS.contains(&observation.reason.as_str()) {
+                        unknown_block_reasons += 1;
+                    }
+                    if !seen.insert(&observation.reason)
+                        || !observation.seconds.is_finite()
+                        || observation.seconds < 0.0
+                        || !observation.value.is_finite()
+                        || !observation.limit.is_finite()
+                    {
+                        invalid_block_reasons += 1;
+                    }
+                    observed_blockers.insert(
+                        if BLOCK_REASONS.contains(&observation.reason.as_str()) {
+                            observation.reason.clone()
+                        } else {
+                            "unknown".to_owned()
+                        },
+                    );
+                }
+            }
             match blocked_in_window(status, request, start_ms, end_ms) {
-                Some(seconds) => {
-                    for (reason, seconds) in seconds {
+                Some(evidence) => {
+                    blocked_requests_available += 1;
+                    if let Some(gap) = evidence.baseline_gap_ms {
+                        blocked_baseline_gap_ms =
+                            Some(blocked_baseline_gap_ms.unwrap_or(0).max(gap));
+                    }
+                    blocked_observation_gap_ms = Some(
+                        blocked_observation_gap_ms
+                            .unwrap_or(0)
+                            .max(evidence.observation_gap_ms),
+                    );
+                    for (reason, seconds) in evidence.seconds {
+                        let reason = if BLOCK_REASONS.contains(&reason.as_str()) {
+                            reason
+                        } else {
+                            "unknown".to_owned()
+                        };
                         *blocked.entry(reason).or_default() += seconds;
                     }
                 }
-                None => blocked_complete = false,
+                None => blocked_requests_unavailable += 1,
             }
         }
     }
-    memory.sort_by(|left, right| left.request_id.cmp(&right.request_id));
     let mut depth = 0_i64;
     let depth_over_time = transitions
         .into_iter()
@@ -637,9 +886,16 @@ fn queue_analysis(
         wait_p50_seconds: percentile(50),
         wait_p95_seconds: percentile(95),
         depth_over_time,
-        blocked_seconds: blocked_complete.then_some(blocked),
+        blocked_seconds: (blocked_requests_available > 0 || blocked_requests_unavailable == 0)
+            .then_some(blocked),
+        blocked_requests_available,
+        blocked_requests_unavailable,
+        blocked_baseline_gap_ms,
+        blocked_observation_gap_ms,
+        unknown_block_reasons,
+        invalid_block_reasons,
         observed_blockers,
-        memory,
+        memory: summarize_memory(&memory),
     }
 }
 
@@ -662,27 +918,43 @@ fn legacy_blocker(reason: &str) -> Option<&str> {
     }
 }
 
+struct BlockedWindow {
+    seconds: BTreeMap<String, f64>,
+    baseline_gap_ms: Option<u64>,
+    observation_gap_ms: u64,
+}
+
 #[implements("FR-051-AC-3")]
 fn blocked_in_window(
     status: &StatusInput,
     request: &RequestInput,
     start_ms: u64,
     end_ms: u64,
-) -> Option<BTreeMap<String, f64>> {
+) -> Option<BlockedWindow> {
     let observations = request.blockers()?;
+    if !valid_blockers(observations) {
+        return None;
+    }
     let endpoint = request
         .admitted_at()
         .or(request.finished_at())
         .unwrap_or(observed_ms(status));
-    if endpoint > end_ms {
-        return None;
-    }
+    let overlap_seconds = endpoint
+        .min(end_ms)
+        .saturating_sub(request.queued_at()?.max(start_ms)) as f64
+        / 1000.0;
+    let mut baseline_gap_ms = None;
     let baseline = if request.queued_at()? >= start_ms {
         BTreeMap::new()
     } else {
-        let event = status.events.iter().find(|event| {
-            event.request.request_id == request.request_id && event.observed_at_ms == start_ms
-        })?;
+        let event = status
+            .events
+            .iter()
+            .filter(|event| {
+                event.request.request_id == request.request_id && event.observed_at_ms <= start_ms
+            })
+            .max_by_key(|event| event.observed_at_ms)?;
+        baseline_gap_ms = Some(start_ms.saturating_sub(event.observed_at_ms));
         let baseline = event.request.blockers()?;
         if !valid_blockers(baseline) {
             return None;
@@ -705,13 +977,20 @@ fn blocked_in_window(
         if observation.seconds < previous {
             return None;
         }
-        seconds.insert(observation.reason.clone(), observation.seconds - previous);
+        seconds.insert(
+            observation.reason.clone(),
+            (observation.seconds - previous).min(overlap_seconds),
+        );
     }
-    Some(seconds)
+    Some(BlockedWindow {
+        seconds,
+        baseline_gap_ms,
+        observation_gap_ms: endpoint.saturating_sub(end_ms),
+    })
 }
 
 #[implements("FR-051-AC-1", "FR-051-AC-2")]
-fn enrich_events(status: &mut StatusInput) -> bool {
+fn enrich_events(status: &mut StatusInput) -> u64 {
     // Refusals can exist only in events. Latest snapshot per attempt wins (producer
     // event order breaks timestamp ties); corrections, transitions,
     // blocker snapshots and command-start events never increment counts independently.
@@ -733,13 +1012,15 @@ fn enrich_events(status: &mut StatusInput) -> bool {
             missing.insert(id, (event.observed_at_ms, &event.request));
         }
     }
+    let mut invalid = 0;
     for (_, (_, request)) in missing {
         if !valid_request(request, observed_ms(status)) {
-            return false;
+            invalid += 1;
+            continue;
         }
         status.requests.push(request.clone());
     }
-    true
+    invalid
 }
 
 /// Reads each reachable machine once in parallel and retains explicit missing hosts.
@@ -773,7 +1054,6 @@ fn collect_at(hosts: &[Arc<dyn Host>], window_end_ms: u64, freshness_ms: u64) ->
     }
     drop(sender);
     let deadline = collection_started + Duration::from_secs(45);
-    let mut seen = BTreeSet::new();
     while let Ok((label, result)) =
         receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()))
     {
@@ -781,25 +1061,34 @@ fn collect_at(hosts: &[Arc<dyn Host>], window_end_ms: u64, freshness_ms: u64) ->
             continue;
         };
         let host = if label == "local" {
-            serde_json::from_str::<StatusInput>(&text)
-                .ok()
-                .map(|status| status.host.to_lowercase())
+            (text.len() <= crate::agents::MAX_PROTOCOL_BYTES)
+                .then(|| serde_json::from_str::<serde_json::Value>(&text).ok())
+                .flatten()
+                .and_then(|status| {
+                    status
+                        .get("host")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_lowercase)
+                })
         } else {
             Some(label)
         };
         if let Some(host) = host.filter(|host| HOSTS.contains(&host.as_str())) {
-            let row = if seen.insert(host.clone()) {
-                from_status_at(
-                    &text,
-                    &host,
-                    window_end_ms,
-                    freshness_ms.saturating_add(
-                        u64::try_from(collection_started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                    ),
-                )
-            } else {
-                HostStability::unavailable("duplicate_host_source")
-            };
+            if report
+                .hosts
+                .get(&host)
+                .is_some_and(|row| row.reason.is_none())
+            {
+                continue;
+            }
+            let row = from_status_at(
+                &text,
+                &host,
+                window_end_ms,
+                freshness_ms.saturating_add(
+                    u64::try_from(collection_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                ),
+            );
             report.hosts.insert(host, row);
         }
     }
@@ -826,6 +1115,12 @@ pub fn live(now_ms: u64) -> StabilityReport {
 pub fn render_text(report: &StabilityReport) -> String {
     let mut lines = Vec::new();
     for (host, row) in &report.hosts {
+        if row.invalid_requests > 0 || row.invalid_events > 0 || row.unknown_class_requests > 0 {
+            lines.push(format!(
+                "stability {host} invalid_requests={} invalid_events={} unknown_class_requests={}",
+                row.invalid_requests, row.invalid_events, row.unknown_class_requests
+            ));
+        }
         if let Some(reason) = &row.reason {
             lines.push(format!("stability {host} unavailable={reason}"));
         }
@@ -835,7 +1130,13 @@ pub fn render_text(report: &StabilityReport) -> String {
             };
             lines.push(format!("stability {host} {label} requests={} completed={} success_rate={:?} terminations={:?} top_limit={:?}", window.requests, window.completed, window.success_rate, window.terminations_by_code, window.top_limit_violated));
             for (class, queue) in &window.queue {
-                lines.push(format!("queue {host} {label} class={class} wait_p50_seconds={:?} wait_p95_seconds={:?} depth={:?} blocked_seconds={:?} observed_blockers={:?} memory={:?}", queue.wait_p50_seconds, queue.wait_p95_seconds, queue.depth_over_time, queue.blocked_seconds, queue.observed_blockers, queue.memory));
+                lines.push(format!("queue {host} {label} class={class} wait_p50_seconds={:?} wait_p95_seconds={:?} depth={:?} blocked_seconds={:?} blocked_requests_available={} blocked_requests_unavailable={} baseline_gap_ms={:?} observation_gap_ms={:?} unknown_block_reasons={} invalid_block_reasons={} observed_blockers={:?}", queue.wait_p50_seconds, queue.wait_p95_seconds, queue.depth_over_time, queue.blocked_seconds, queue.blocked_requests_available, queue.blocked_requests_unavailable, queue.blocked_baseline_gap_ms, queue.blocked_observation_gap_ms, queue.unknown_block_reasons, queue.invalid_block_reasons, queue.observed_blockers));
+                for (field, distribution) in queue.memory.fields() {
+                    let value = |bytes: Option<u64>| {
+                        bytes.map_or_else(|| "unavailable".to_owned(), |bytes| bytes.to_string())
+                    };
+                    lines.push(format!("memory {host} {label} class={class} {field} count={} unknown={} p50_bytes={} p95_bytes={} max_bytes={}", distribution.count, distribution.unknown, value(distribution.p50_bytes), value(distribution.p95_bytes), value(distribution.max_bytes)));
+                }
             }
         }
     }
@@ -972,9 +1273,10 @@ mod tests {
         assert_eq!(all.blocked_seconds.as_ref().unwrap()["units"], 12.0);
         assert_eq!(all.blocked_seconds.as_ref().unwrap()["load"], 5.0);
         assert_eq!(all.blocked_seconds.as_ref().unwrap()["disk"], 980.0);
-        assert_eq!(all.memory[0].requested_memory_bytes, Some(500));
-        assert_eq!(all.memory[0].granted_memory_bytes, Some(400));
-        assert_eq!(all.memory[1].requested_memory_bytes, None);
+        assert_eq!(all.memory.requests, 3);
+        assert_eq!(all.memory.requested_memory_bytes.p50_bytes, Some(500));
+        assert_eq!(all.memory.granted_memory_bytes.p50_bytes, Some(400));
+        assert_eq!(all.memory.requested_memory_bytes.unknown, 2);
         assert_eq!(
             all.depth_over_time
                 .iter()
@@ -1017,7 +1319,8 @@ mod tests {
         assert_eq!(all.depth_over_time[1].depth, 0);
         assert_eq!(all.blocked_seconds, None);
         assert!(all.observed_blockers.contains("units"));
-        assert_eq!(all.memory[0].requested_memory_bytes, None);
+        assert_eq!(all.memory.requested_memory_bytes.count, 0);
+        assert_eq!(all.memory.requested_memory_bytes.unknown, 2);
     }
 
     #[test]
@@ -1025,16 +1328,11 @@ mod tests {
     fn stability_unavailable_sources_never_become_zeros_or_echo_payloads() {
         let source = status(json!([]), json!([]));
         for (field, value, reason) in [
-            ("schema_version", json!(2), "incompatible_status_or_host"),
+            ("schema_version", json!(0), "incompatible_status_or_host"),
             ("host", json!("terra"), "incompatible_status_or_host"),
             ("observed_at_ms", json!(99_879_999), "stale_status"),
             ("observed_at_ms", json!(100_005_001), "stale_status"),
             ("pruned_events", json!(1), "pruned_history"),
-            (
-                "requests",
-                json!([{"request_id":"bad","state":"running","class":"point","enqueued_at_ms":100_000_001}]),
-                "invalid_request_history",
-            ),
         ] {
             let mut input = source.clone();
             input[field] = value;
@@ -1052,7 +1350,7 @@ mod tests {
         let bad = from_status("secret credential command", "draco", NOW);
         assert_eq!(
             serde_json::to_string(&bad).unwrap(),
-            r#"{"reason":"invalid_status","last_1h":null,"last_24h":null}"#
+            r#"{"invalid_requests":0,"invalid_events":0,"unknown_class_requests":0,"reason":"invalid_status","last_1h":null,"last_24h":null}"#
         );
         let empty = from_status(&source.to_string(), "draco", NOW)
             .last_1h
@@ -1103,13 +1401,32 @@ mod collection_tests {
     }
 
     #[test]
+    #[trace("FR-051-AC-1", "FR-051-AC-5")]
+    fn review_local_host_identity_survives_an_individually_malformed_request() {
+        let host: Arc<dyn Host> = Arc::new(FixtureHost { label: "local".into(), status: r#"{"schema_version":1,"host":"draco","observed_at_ms":100000000,"requests":[{"request_id":"good","class":"point","state":"succeeded","enqueued_at_ms":99990000,"ended_at_ms":99999000},{"request_id":"bad","enqueued_at_ms":"invalid"}],"events":[]}"#.into() });
+        let report = collect(&[host], 100_000_000);
+        assert_eq!(report.hosts["draco"].reason, None);
+        assert_eq!(report.hosts["draco"].invalid_requests, 1);
+        assert_eq!(report.hosts["draco"].last_1h.as_ref().unwrap().completed, 1);
+    }
+
+    #[test]
     #[trace("FR-051-AC-5")]
     fn review_duplicate_sources_keep_the_first_valid_host_row() {
         let good = r#"{"schema_version":1,"host":"draco","observed_at_ms":100000000,"requests":[{"request_id":"one","class":"point","state":"succeeded","enqueued_at_ms":99990000,"ended_at_ms":99999000,"exit_code":0}],"events":[]}"#;
         let hosts: Vec<Arc<dyn Host>> = vec![
-            Arc::new(FixtureHost { label: "local".into(), status: good.into() }),
-            Arc::new(FixtureHost { label: "draco".into(), status: "invalid".into() }),
-            Arc::new(FixtureHost { label: "draco".into(), status: good.into() }),
+            Arc::new(FixtureHost {
+                label: "local".into(),
+                status: good.into(),
+            }),
+            Arc::new(FixtureHost {
+                label: "draco".into(),
+                status: "invalid".into(),
+            }),
+            Arc::new(FixtureHost {
+                label: "draco".into(),
+                status: good.into(),
+            }),
         ];
         let report = collect(&hosts, 100_000_000);
         assert_eq!(report.hosts["draco"].reason, None);
@@ -1210,18 +1527,11 @@ mod review_regressions {
         let report = from_status(input, "draco", 100_000_000).last_1h.unwrap();
         assert_eq!(report.requests, 1);
         for class in ["all", "block"] {
-            assert_eq!(
-                report.queue[class].memory,
-                vec![MemoryGrant {
-                    request_id: "memory-refusal".into(),
-                    requested_memory_bytes: Some(500),
-                    requested_memory_reservation_bytes: None,
-                    granted_memory_reservation_bytes: None,
-                    granted_memory_bytes: None,
-                    memory_needed_bytes: None,
-                    memory_free_budget_bytes: None
-                }]
-            );
+            let memory = &report.queue[class].memory;
+            assert_eq!(memory.requests, 1);
+            assert_eq!(memory.requested_memory_bytes.p50_bytes, Some(500));
+            assert_eq!(memory.granted_memory_bytes.count, 0);
+            assert_eq!(memory.granted_memory_bytes.unknown, 1);
             assert!(
                 report.queue[class]
                     .depth_over_time
@@ -1263,24 +1573,20 @@ mod status_memory_tests {
         let report = from_status(input, "draco", 100_000_000);
         let hour = report.last_1h.as_ref().unwrap();
         for class in ["all", "block"] {
-            assert_eq!(
-                hour.queue[class].memory,
-                vec![MemoryGrant {
-                    request_id: "waiting".into(),
-                    requested_memory_bytes: Some(500),
-                    requested_memory_reservation_bytes: None,
-                    granted_memory_reservation_bytes: None,
-                    granted_memory_bytes: None,
-                    memory_needed_bytes: Some(600),
-                    memory_free_budget_bytes: Some(300),
-                }]
-            );
+            let memory = &hour.queue[class].memory;
+            assert_eq!(memory.requests, 1);
+            assert_eq!(memory.requested_memory_bytes.p50_bytes, Some(500));
+            assert_eq!(memory.granted_memory_bytes.unknown, 1);
+            assert_eq!(memory.requested_memory_reservation_bytes.unknown, 1);
+            assert_eq!(memory.granted_memory_reservation_bytes.unknown, 1);
+            assert_eq!(memory.memory_needed_bytes.p50_bytes, Some(600));
+            assert_eq!(memory.memory_free_budget_bytes.p50_bytes, Some(300));
         }
         let text = render_text(&StabilityReport {
             hosts: [("draco".to_owned(), report)].into(),
         });
-        assert!(text.contains("memory_needed_bytes: Some(600)"));
-        assert!(text.contains("memory_free_budget_bytes: Some(300)"));
+        assert!(text.contains("memory_needed_bytes count=1 unknown=0 p50_bytes=600"));
+        assert!(text.contains("memory_free_budget_bytes count=1 unknown=0 p50_bytes=300"));
         let legacy = serde_json::from_str::<MemoryGrant>(
             r#"{"request_id":"old","requested_memory_bytes":500,"granted_memory_bytes":400}"#,
         )
@@ -1307,24 +1613,34 @@ mod reservation_contract_tests {
         let hour = report.last_1h.as_ref().unwrap();
         for class in ["all", "block"] {
             let memory = &hour.queue[class].memory;
-            assert_eq!(memory.len(), 2);
-            assert_eq!(memory[0].request_id, "admitted");
-            assert_eq!(memory[0].requested_memory_bytes, Some(8192));
-            assert_eq!(memory[0].granted_memory_bytes, Some(8192));
-            assert_eq!(memory[0].requested_memory_reservation_bytes, Some(1024));
-            assert_eq!(memory[0].granted_memory_reservation_bytes, Some(1024));
-            assert_eq!(memory[1].requested_memory_bytes, Some(4096));
-            assert_eq!(memory[1].granted_memory_bytes, None);
-            assert_eq!(memory[1].requested_memory_reservation_bytes, Some(512));
-            assert_eq!(memory[1].granted_memory_reservation_bytes, None);
-            assert_eq!(memory[1].memory_needed_bytes, Some(512));
-            assert_eq!(memory[1].memory_free_budget_bytes, Some(256));
+            assert_eq!(memory.requests, 2);
+            assert_eq!(memory.requested_memory_bytes.p50_bytes, Some(4096));
+            assert_eq!(memory.requested_memory_bytes.p95_bytes, Some(8192));
+            assert_eq!(memory.granted_memory_bytes.p50_bytes, Some(8192));
+            assert_eq!(memory.granted_memory_bytes.unknown, 1);
+            assert_eq!(
+                memory.requested_memory_reservation_bytes.p50_bytes,
+                Some(512)
+            );
+            assert_eq!(
+                memory.requested_memory_reservation_bytes.p95_bytes,
+                Some(1024)
+            );
+            assert_eq!(
+                memory.granted_memory_reservation_bytes.p50_bytes,
+                Some(1024)
+            );
+            assert_eq!(memory.granted_memory_reservation_bytes.unknown, 1);
+            assert_eq!(memory.memory_needed_bytes.p50_bytes, Some(512));
+            assert_eq!(memory.memory_free_budget_bytes.p50_bytes, Some(256));
         }
         let text = render_text(&StabilityReport {
             hosts: [("draco".into(), report)].into(),
         });
-        assert!(text.contains("requested_memory_reservation_bytes: Some(1024)"));
-        assert!(text.contains("granted_memory_bytes: Some(8192)"));
+        assert!(text.contains(
+            "requested_memory_reservation_bytes count=2 unknown=0 p50_bytes=512 p95_bytes=1024"
+        ));
+        assert!(text.contains("granted_memory_bytes count=1 unknown=1 p50_bytes=8192"));
     }
 }
 
@@ -1377,12 +1693,32 @@ mod independent_review_fixes {
     use serde_json::json;
 
     #[test]
+    #[trace("FR-051-AC-1", "FR-051-AC-5")]
+    fn review_type_invalid_records_cannot_discard_healthy_requests_or_leak_labels() {
+        let input = r#"{"schema_version":2,"host":"draco","observed_at_ms":100000000,"requests":[{"request_id":"good","class":"point","state":"succeeded","enqueued_at_ms":99990000,"ended_at_ms":99999000,"exit_code":0},{"request_id":"bad-type","class":"point","state":"running","enqueued_at_ms":"private-invalid-time"},{"request_id":"future-code","class":"point","state":"failed","enqueued_at_ms":99990000,"ended_at_ms":99999000,"code":"LB_PRIVATE_FUTURE"}],"events":[{"request_id":"bad-type","observed_at_ms":99998000,"class":"point","state":"succeeded","enqueued_at_ms":99990000,"ended_at_ms":99998000,"exit_code":0},{"request_id":"broken-event","observed_at_ms":"private-event-time"}],"metrics":{"ix_build_terminations_total":[{"host":"draco","class":"point","code":"LB_PRIVATE_FUTURE","value":1}]}}"#;
+        let report = from_status(input, "draco", 100_000_000);
+        assert_eq!(report.reason, None);
+        assert_eq!(report.last_1h.as_ref().unwrap().completed, 1);
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["invalid_requests"], json!(2));
+        assert_eq!(value["invalid_events"], json!(1));
+        assert!(!value.to_string().contains("PRIVATE"));
+        assert!(!value.to_string().contains("private-"));
+    }
+
+    #[test]
     #[trace("FR-051-AC-1", "FR-051-AC-2")]
     fn review_legacy_supervision_and_refusal_spellings_keep_outcome_semantics() {
-        let input = r#"{"schema_version":1,"host":"draco","observed_at_ms":100000000,"requests":[{"request_id":"lost","class":"point","state":"failed","enqueued_at_ms":99990000,"ended_at_ms":99999000,"reason":"supervision_lost"},{"request_id":"degraded","class":"point","state":"succeeded","enqueued_at_ms":99990000,"ended_at_ms":99999000,"reason":"supervision_degraded","exit_code":0},{"request_id":"refused","class":"point","state":"refused","ended_at_ms":99999000,"reason":"refused"}],"events":[]}"#;
+        let input = r#"{"schema_version":1,"host":"draco","observed_at_ms":100000000,"requests":[{"request_id":"lost","class":"point","state":"failed","enqueued_at_ms":99990000,"ended_at_ms":99999000,"reason":"supervision_lost"},{"request_id":"degraded","class":"point","state":"succeeded","enqueued_at_ms":99990000,"ended_at_ms":99999000,"reason":"supervision_degraded","exit_code":0},{"request_id":"refused","class":"point","state":"failed","ended_at_ms":99999000,"reason":"refused"}],"events":[]}"#;
         let hour = from_status(input, "draco", 100_000_000).last_1h.unwrap();
         assert_eq!(hour.completed, 3);
-        assert_eq!(hour.terminations_by_code, BTreeMap::from([("LB_SUPERVISION_LOST".into(), 2), ("LB_REFUSED_QUEUE".into(), 1)]));
+        assert_eq!(
+            hour.terminations_by_code,
+            BTreeMap::from([
+                ("LB_SUPERVISION_LOST".into(), 2),
+                ("LB_REFUSED_QUEUE".into(), 1)
+            ])
+        );
         assert_eq!(hour.kill_rate, Some(1.0 / 3.0));
         assert_eq!(hour.success_rate, Some(1.0 / 3.0));
     }
@@ -1393,16 +1729,26 @@ mod independent_review_fixes {
         let input = r#"{"schema_version":1,"host":"draco","observed_at_ms":100003000,"requests":[{"request_id":"open","class":"point","lifecycle_state":"queued","queued_at_ms":99990000,"queued_seconds":13,"blocked_reasons":[{"reason":"memory_budget","value":12,"limit":10,"seconds":9}]}],"events":[]}"#;
         let hour = from_status(input, "draco", 100_000_000).last_1h.unwrap();
         assert_eq!(hour.end_ms, 100_000_000);
-        assert_eq!(hour.queue["all"].blocked_seconds.as_ref().unwrap()["memory_budget"], 9.0);
+        assert_eq!(
+            hour.queue["all"].blocked_seconds.as_ref().unwrap()["memory_budget"],
+            9.0
+        );
+        assert_eq!(
+            serde_json::to_value(&hour.queue["all"]).unwrap()["blocked_observation_gap_ms"],
+            json!(3000)
+        );
     }
 
     #[test]
     #[trace("FR-051-AC-3", "FR-051-AC-5")]
     fn review_nearest_prior_baseline_and_one_missing_baseline_keep_known_contributions() {
-        let input = r#"{"schema_version":1,"host":"draco","observed_at_ms":100000000,"requests":[{"request_id":"prior","class":"point","lifecycle_state":"running","queued_at_ms":96000000,"admitted_at_ms":96410000,"queued_seconds":410,"blocked_reasons":[{"reason":"memory_budget","value":12,"limit":10,"seconds":15}]},{"request_id":"missing","class":"point","lifecycle_state":"running","queued_at_ms":96000000,"admitted_at_ms":96410000,"queued_seconds":410,"blocked_reasons":[{"reason":"memory_budget","value":12,"limit":10,"seconds":3}]},{"request_id":"fresh","class":"point","lifecycle_state":"running","queued_at_ms":99990000,"admitted_at_ms":99995000,"queued_seconds":5,"blocked_reasons":[{"reason":"memory_budget","value":12,"limit":10,"seconds":2}]}],"events":[{"request_id":"prior","observed_at_ms":96399000,"lifecycle_state":"queued","blocked_reasons":[{"reason":"memory_budget","value":12,"limit":10,"seconds":10}]}]}"#;
+        let input = r#"{"schema_version":1,"host":"draco","observed_at_ms":100000000,"requests":[{"request_id":"prior","class":"point","lifecycle_state":"running","queued_at_ms":96000000,"admitted_at_ms":96410000,"queued_seconds":410,"blocked_reasons":[{"reason":"memory_budget","value":12,"limit":10,"seconds":15}]},{"request_id":"missing","class":"point","lifecycle_state":"running","queued_at_ms":96000000,"admitted_at_ms":96410000,"queued_seconds":410,"blocked_reasons":[{"reason":"memory_budget","value":12,"limit":10,"seconds":3}]},{"request_id":"fresh","class":"point","lifecycle_state":"running","queued_at_ms":99990000,"admitted_at_ms":99995000,"queued_seconds":5,"blocked_reasons":[{"reason":"memory_budget","value":12,"limit":10,"seconds":2}]}],"events":[{"request_id":"prior","observed_at_ms":96350000,"lifecycle_state":"queued","blocked_reasons":[{"reason":"memory_budget","value":12,"limit":10,"seconds":8}]},{"request_id":"prior","observed_at_ms":96400500,"lifecycle_state":"queued","blocked_reasons":[{"reason":"memory_budget","value":12,"limit":10,"seconds":11}]},{"request_id":"prior","observed_at_ms":96399000,"lifecycle_state":"queued","blocked_reasons":[{"reason":"memory_budget","value":12,"limit":10,"seconds":10}]}]}"#;
         let hour = from_status(input, "draco", 100_000_000).last_1h.unwrap();
         let queue = &hour.queue["point"];
-        assert_eq!(queue.blocked_seconds.as_ref().unwrap()["memory_budget"], 7.0);
+        assert_eq!(
+            queue.blocked_seconds.as_ref().unwrap()["memory_budget"],
+            7.0
+        );
         let value = serde_json::to_value(queue).unwrap();
         assert_eq!(value["blocked_requests_available"], json!(2));
         assert_eq!(value["blocked_requests_unavailable"], json!(1));
@@ -1419,13 +1765,24 @@ mod independent_review_fixes {
         assert_eq!(hour.requests, 2);
         assert_eq!(hour.completed, 1);
         assert_eq!(hour.success_rate, Some(1.0));
-        assert_eq!(hour.queue["unknown"].blocked_seconds.as_ref().unwrap()["memory_budget"], 2.0);
-        assert_eq!(hour.queue["unknown"].blocked_seconds.as_ref().unwrap()["unknown"], 3.0);
+        assert_eq!(
+            hour.queue["unknown"].blocked_seconds.as_ref().unwrap()["memory_budget"],
+            2.0
+        );
+        assert_eq!(
+            hour.queue["unknown"].blocked_seconds.as_ref().unwrap()["unknown"],
+            3.0
+        );
         let value = serde_json::to_value(&report).unwrap();
         assert_eq!(value["invalid_requests"], json!(2));
         assert_eq!(value["unknown_class_requests"], json!(1));
-        assert_eq!(value["last_1h"]["queue"]["unknown"]["unknown_block_reasons"], json!(1));
-        let rendered = render_text(&StabilityReport { hosts: [("draco".into(), report)].into() });
+        assert_eq!(
+            value["last_1h"]["queue"]["unknown"]["unknown_block_reasons"],
+            json!(1)
+        );
+        let rendered = render_text(&StabilityReport {
+            hosts: [("draco".into(), report)].into(),
+        });
         assert!(!rendered.contains("private-new-class"));
         assert!(!rendered.contains("private-new-reason"));
     }
@@ -1448,18 +1805,32 @@ mod independent_review_fixes {
     fn review_memory_is_a_bounded_quantile_summary_with_explicit_unknown_counts() {
         let input = r#"{"schema_version":1,"host":"draco","observed_at_ms":100000000,"requests":[{"request_id":"a","class":"point","lifecycle_state":"running","queued_at_ms":99990000,"admitted_at_ms":99991000,"requested_memory_bytes":100,"granted_memory_bytes":80,"requested_memory_reservation_bytes":10,"granted_memory_reservation_bytes":8,"memory_needed_bytes":20,"memory_free_budget_bytes":1000},{"request_id":"b","class":"point","lifecycle_state":"running","queued_at_ms":99990000,"admitted_at_ms":99991000,"requested_memory_bytes":300,"granted_memory_bytes":280,"requested_memory_reservation_bytes":30,"granted_memory_reservation_bytes":28,"memory_needed_bytes":40,"memory_free_budget_bytes":2000},{"request_id":"legacy","class":"point","state":"queued","enqueued_at_ms":99990000}],"events":[]}"#;
         let report = from_status(input, "draco", 100_000_000);
-        let memory = &serde_json::to_value(report.last_1h.as_ref().unwrap()).unwrap()["queue"]["all"]["memory"];
+        let memory = &serde_json::to_value(report.last_1h.as_ref().unwrap()).unwrap()["queue"]["all"]
+            ["memory"];
         assert!(memory.is_object());
         assert_eq!(memory["requests"], json!(3));
-        assert_eq!(memory["requested_memory_bytes"], json!({"count":2,"unknown":1,"p50_bytes":100,"p95_bytes":300,"max_bytes":300}));
+        assert_eq!(
+            memory["requested_memory_bytes"],
+            json!({"count":2,"unknown":1,"p50_bytes":100,"p95_bytes":300,"max_bytes":300})
+        );
         assert_eq!(memory["granted_memory_bytes"]["p50_bytes"], json!(80));
-        assert_eq!(memory["requested_memory_reservation_bytes"]["p95_bytes"], json!(30));
-        assert_eq!(memory["granted_memory_reservation_bytes"]["max_bytes"], json!(28));
+        assert_eq!(
+            memory["requested_memory_reservation_bytes"]["p95_bytes"],
+            json!(30)
+        );
+        assert_eq!(
+            memory["granted_memory_reservation_bytes"]["max_bytes"],
+            json!(28)
+        );
         assert_eq!(memory["memory_needed_bytes"]["p95_bytes"], json!(40));
         assert_eq!(memory["memory_free_budget_bytes"]["p50_bytes"], json!(1000));
         assert!(!memory.to_string().contains("request_id"));
-        let text = render_text(&StabilityReport { hosts: [("draco".into(), report)].into() });
-        assert!(text.contains("requested_memory_bytes count=2 unknown=1 p50_bytes=100 p95_bytes=300 max_bytes=300"));
+        let text = render_text(&StabilityReport {
+            hosts: [("draco".into(), report)].into(),
+        });
+        assert!(text.contains(
+            "requested_memory_bytes count=2 unknown=1 p50_bytes=100 p95_bytes=300 max_bytes=300"
+        ));
         assert!(!text.contains("MemoryGrant"));
     }
 }

@@ -3,7 +3,15 @@
 Run `ix-board host check` on each host. It takes no flags, uses that host's
 non-login process environment, and returns 0 only when authentication, locked-
 build telemetry, admission policy, and process inspection all pass. It emits
-safe status labels and metrics only. A cadence manifest can run it locally:
+safe status labels and metrics only.
+
+The stability section shows 1h/24h build outcomes and queue pressure.
+Memory output has a fixed shape: sample/unknown counts, p50/p95 and maximum bytes.
+Blocked-time sums retain known request contributions and report missing histories
+and sampling gaps separately. Invalid records and unknown class/reason labels have
+explicit counts, so partial evidence remains visible alongside healthy records.
+
+A cadence manifest can run it locally:
 
 ```json
 {
