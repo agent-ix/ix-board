@@ -589,6 +589,7 @@ impl SelectedGithub {
             now,
         )
     }
+    #[implements("FR-033-AC-12")]
     pub(super) fn new(
         config: &Config,
         allowed: BTreeSet<(String, u64)>,
@@ -727,6 +728,7 @@ impl<T: Transport> SelectedGithub<T> {
         }
         Err("GitHub repository page budget exhausted; incomplete population".into())
     }
+    #[implements("FR-033-AC-12", "FR-033-AC-13")]
     fn repository_prs(&self, repo: &str) -> PrRows {
         if let Some(rows) = self.lists.borrow().get(repo) {
             return rows.clone();
@@ -824,6 +826,7 @@ impl<T: Transport> SelectedGithub<T> {
     }
 }
 
+#[implements("FR-033-AC-13")]
 fn parse_selected_prs(body: &str, repo: &str, numbers: &[u64], at: i64) -> PrRows {
     graph_body(body)?;
     let response: GraphResponse = serde_json::from_str(body).map_err(|e| e.to_string())?;

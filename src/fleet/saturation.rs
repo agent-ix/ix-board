@@ -211,6 +211,7 @@ fn escape_label(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+#[implements("FR-041-AC-5")]
 fn query_lane_values(
     query: &dyn PromQuery,
     expression: &str,
