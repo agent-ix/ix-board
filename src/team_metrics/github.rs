@@ -595,6 +595,19 @@ impl SelectedGithub {
         complete: bool,
         now: i64,
     ) -> Self {
+        let mut repository_counts = BTreeMap::<&str, usize>::new();
+        for (repo, _) in &allowed {
+            *repository_counts.entry(repo).or_default() += 1;
+        }
+        eprintln!(
+            "GitHub selected population: repositories={}, linked_prs={}, repositories_over_50={}",
+            repository_counts.len(),
+            allowed.len(),
+            repository_counts
+                .values()
+                .filter(|count| **count > MAX_OLD)
+                .count()
+        );
         Self::with_guard(
             Http::local().and_then(|transport| Guard::open(config, transport)),
             allowed,
@@ -722,6 +735,33 @@ impl<T: Transport> SelectedGithub<T> {
             return Err("GitHub repository population exceeds collection bound".into());
         }
         let result = (|| {
+            let numbers: Vec<_> = self
+                .allowed
+                .iter()
+                .filter(|(r, _)| r == repo)
+                .take(MAX_OLD + 1)
+                .map(|(_, number)| *number)
+                .collect();
+            // When the complete selected population fits the historical-link ceiling,
+            // read only those identities. Do not scan unrelated repository populations.
+            // Larger selections retain the bounded open/recent population path below.
+            if !numbers.is_empty() && numbers.len() <= MAX_OLD {
+                let mut rows = Vec::new();
+                for chunk in numbers.chunks(25) {
+                    let fields = chunk.iter().map(|number| format!(
+                        "p{number}: pullRequest(number: {number}) {{ number createdAt mergedAt closedAt updatedAt isDraft state additions deletions reviewDecision timelineItems(first: 1, itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT]) {{ totalCount }} reopenEvents: timelineItems(first: 1, itemTypes: [REOPENED_EVENT]) {{ totalCount }} }}"
+                    )).collect::<Vec<_>>().join("\n");
+                    let query = format!(
+                        "query($owner:String!,$name:String!) {{ rateLimit {{ cost remaining resetAt }} repository(owner:$owner,name:$name) {{ {fields} }} }}"
+                    );
+                    let request = graph_request(&query, repo, None)?;
+                    let body = self.read(&request, |body, at| {
+                        parse_selected_prs(body, repo, chunk, at).map(|_| ())
+                    })?;
+                    rows.extend(parse_selected_prs(&body.body, repo, chunk, body.at)?);
+                }
+                return Ok(rows);
+            }
             let mut rows = self.list(repo, "[OPEN]", None)?;
             rows.extend(self.list(
                 repo,
@@ -782,6 +822,45 @@ impl<T: Transport> SelectedGithub<T> {
         self.infos.borrow_mut().insert(repo.into(), result.clone());
         result
     }
+}
+
+fn parse_selected_prs(body: &str, repo: &str, numbers: &[u64], at: i64) -> PrRows {
+    graph_body(body)?;
+    let response: GraphResponse = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    let mut fields: BTreeMap<String, serde_json::Value> = serde_json::from_value(
+        response
+            .data
+            .repository
+            .ok_or("GitHub selected repository absent")?,
+    )
+    .map_err(|e| e.to_string())?;
+    if fields.len() != numbers.len() {
+        return Err("GitHub selected population mismatch".to_owned());
+    }
+    let mut nodes = Vec::new();
+    for number in numbers {
+        let node = fields
+            .remove(&format!("p{number}"))
+            .ok_or("GitHub selected PR absent")?;
+        if node.get("number").and_then(serde_json::Value::as_u64) != Some(*number) {
+            return Err("GitHub selected PR identity mismatch".to_owned());
+        }
+        let mut projection = serde_json::Map::new();
+        for field in ["state", "createdAt", "mergedAt", "closedAt", "updatedAt"] {
+            projection.insert(
+                field.into(),
+                node.get(field)
+                    .ok_or("GitHub PR status field missing")?
+                    .clone(),
+            );
+        }
+        let info: RawInfo = serde_json::from_value(projection.into()).map_err(|e| e.to_string())?;
+        info.validate(at)?;
+        nodes.push(node);
+    }
+    // Reuse the existing strict PR decoder for the identical native node selection.
+    let page = serde_json::json!({"data":{"repository":{"pullRequests":{"nodes":nodes,"pageInfo":{"hasNextPage":false,"endCursor":null}}}}});
+    crate::retro::live::pull_request_page(&page.to_string(), repo, None).map(|page| page.items)
 }
 fn validate_page(
     body: &str,
@@ -1162,7 +1241,12 @@ mod tests {
                 let mut fields = serde_json::Map::new();
                 for number in query.split("pullRequest(number: ").skip(1) {
                     let n: u64 = number.split(')').next().unwrap().parse().unwrap();
-                    fields.insert(format!("p{n}"),serde_json::json!({"state":"MERGED","createdAt":"1970-01-01T00:00:00Z","mergedAt":"1970-01-01T00:00:00Z","closedAt":"1970-01-01T00:00:00Z","updatedAt":"1970-01-01T00:00:00Z"}));
+                    let mut node = serde_json::json!({"state":"MERGED","createdAt":"1970-01-01T00:00:00Z","mergedAt":"1970-01-01T00:00:00Z","closedAt":"1970-01-01T00:00:00Z","updatedAt":"1970-01-01T00:00:00Z"});
+                    if query.contains("isDraft") {
+                        let fields = node.as_object_mut().unwrap();
+                        fields.extend(serde_json::json!({"number":n,"isDraft":false,"additions":3,"deletions":2,"reviewDecision":null,"timelineItems":{"totalCount":0},"reopenEvents":{"totalCount":0}}).as_object().unwrap().clone());
+                    }
+                    fields.insert(format!("p{n}"), node);
                 }
                 assert!(fields.len() <= 25);
                 serde_json::Value::Object(fields)
@@ -1627,16 +1711,21 @@ mod tests {
         let cfg = config(dir.path());
         let fake = Fake::new(|request, _| {
             let query = &request.query;
-            let open = query.contains("states: [OPEN]");
-            let node = serde_json::json!({
-                "number":if open {1} else {2},"state":if open {"OPEN"} else {"MERGED"},
-                "createdAt":"2026-11-20T00:00:00Z","updatedAt":"2026-11-22T00:00:00Z",
-                "mergedAt":if open {None} else {Some("2026-11-22T00:00:00Z")},
-                "closedAt":if open {None} else {Some("2026-11-22T00:00:00Z")},
-                "isDraft":false,"additions":7,"deletions":3,"reviewDecision":"APPROVED",
-                "timelineItems":{"totalCount":0},"reopenEvents":{"totalCount":0}
-            });
-            Ok(response(serde_json::json!({"data":{"rateLimit":{"cost":3,"remaining":100,"resetAt":"2030-01-01T00:00:00Z"},"repository":{"pullRequests":{"nodes":[node],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}).to_string()))
+            assert!(!query.contains("pullRequests("));
+            let mut fields = serde_json::Map::new();
+            for number in 1..=2 {
+                let open = number == 1;
+                let node = serde_json::json!({
+                    "number":number,"state":if open {"OPEN"} else {"MERGED"},
+                    "createdAt":"2026-11-20T00:00:00Z","updatedAt":"2026-11-22T00:00:00Z",
+                    "mergedAt":if open {None} else {Some("2026-11-22T00:00:00Z")},
+                    "closedAt":if open {None} else {Some("2026-11-22T00:00:00Z")},
+                    "isDraft":false,"additions":7,"deletions":3,"reviewDecision":"APPROVED",
+                    "timelineItems":{"totalCount":0},"reopenEvents":{"totalCount":0}
+                });
+                fields.insert(format!("p{number}"), node);
+            }
+            Ok(response(serde_json::json!({"data":{"rateLimit":{"cost":3,"remaining":100,"resetAt":"2030-01-01T00:00:00Z"},"repository":fields}}).to_string()))
         });
         let at = chrono::DateTime::parse_from_rfc3339("2026-11-22T01:00:00Z")
             .unwrap()
@@ -1651,7 +1740,7 @@ mod tests {
         assert!(rows[0].open);
         assert!(!source.pull_request("agent-ix/one", 1).unwrap().merged);
         assert!(source.pull_request("agent-ix/one", 2).unwrap().merged);
-        assert_eq!(fake.count(), 2);
+        assert_eq!(fake.count(), 1);
         assert_eq!(source.observed_at(), at);
         source
             .guard
@@ -1665,9 +1754,62 @@ mod tests {
         assert!(source.pull_request("agent-ix/one", 1).is_err());
         assert_eq!(
             fake.count(),
-            2,
+            1,
             "a shared cooldown overrides prior per-cycle memoization"
         );
+    }
+
+    #[trace("FR-033-AC-12", "FR-033-AC-13")]
+    #[test]
+    fn fifty_selected_prs_use_two_batches_and_restart_retains_observation_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let fake = graph();
+        let allowed: BTreeSet<_> = (1..=50).map(|n| ("agent-ix/one".to_owned(), n)).collect();
+        for at in [1000, 2000] {
+            let source = source(open(&cfg, fake.clone()), allowed.clone(), true, at);
+            assert_eq!(source.pull_requests("agent-ix/one", 0.0).unwrap().len(), 50);
+            assert!(source.pull_request("agent-ix/one", 50).unwrap().merged);
+            assert_eq!(source.observed_at(), 1000);
+            assert_eq!(fake.count(), 2, "cache and callbacks must not add requests");
+        }
+    }
+
+    #[trace("FR-033-AC-12", "FR-033-AC-13")]
+    #[test]
+    fn partial_or_misidentified_selected_batches_are_not_cached_or_certified() {
+        for invalid in [serde_json::Value::Null, serde_json::json!({"number":2})] {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = config(dir.path());
+            let fake = Fake::new(move |_, _| {
+                Ok(response(
+                    serde_json::json!({"data":{
+                "rateLimit":{"cost":1,"remaining":100,"resetAt":"2030-01-01T00:00:00Z"},
+                "repository":{"p1":invalid}}})
+                    .to_string(),
+                ))
+            });
+            let source = source(
+                open(&cfg, fake.clone()),
+                [("agent-ix/one".to_owned(), 1)].into(),
+                true,
+                1000,
+            );
+            assert!(source.pull_requests("agent-ix/one", 0.0).is_err());
+            assert_eq!(source.observed_at(), 0);
+            assert_eq!(fake.count(), 1);
+            let cached: i64 = source
+                .guard
+                .as_ref()
+                .unwrap()
+                .db
+                .borrow()
+                .query_row("SELECT count(*) FROM github_responses", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(cached, 0);
+        }
     }
 
     #[trace("FR-033-AC-12", "FR-033-AC-13")]
@@ -2075,8 +2217,12 @@ mod tests {
                 serde_json::json!({"pullRequests":{"nodes":nodes,"pageInfo":{"hasNextPage":has_next,"endCursor":cursor}}})
             } else {
                 assert_eq!(variables.len(), 2);
-                assert!(query.contains("p3: pullRequest(number: 3)"));
-                serde_json::json!({"p3":{"state":"MERGED","createdAt":"1970-01-01T00:00:00Z","updatedAt":"1970-01-01T00:00:00Z","mergedAt":"1970-01-01T00:00:00Z","closedAt":"1970-01-01T00:00:00Z"}})
+                let mut fields = serde_json::Map::new();
+                for number in query.split("pullRequest(number: ").skip(1) {
+                    let n: u64 = number.split(')').next().unwrap().parse().unwrap();
+                    fields.insert(format!("p{n}"), serde_json::json!({"state":"MERGED","createdAt":"1970-01-01T00:00:00Z","updatedAt":"1970-01-01T00:00:00Z","mergedAt":"1970-01-01T00:00:00Z","closedAt":"1970-01-01T00:00:00Z"}));
+                }
+                serde_json::Value::Object(fields)
             };
             let response = serde_json::json!({"data":{"rateLimit":{"cost":3,"remaining":100,"resetAt":"2030-01-01T00:00:00Z"},"repository":repository}}).to_string();
             reply(200, "", &response)
@@ -2086,7 +2232,7 @@ mod tests {
         let http = Http::fixture(&server.endpoint, "offline-credential").unwrap();
         let clock = Arc::new(TestClock(std::sync::atomic::AtomicI64::new(1000)));
         let guard = Guard::with_clock(&cfg, http, clock).unwrap();
-        let allowed = (1..=3).map(|n| ("agent-ix/one".into(), n)).collect();
+        let allowed = (1..=51).map(|n| ("agent-ix/one".into(), n)).collect();
         let source = SelectedGithub::with_guard(Ok(guard), allowed, true, 1000);
         let prs = source.pull_requests("agent-ix/one", 0.0).unwrap();
         assert_eq!(
@@ -2098,8 +2244,8 @@ mod tests {
         let seen = server.finish();
         assert_eq!(
             seen.len(),
-            4,
-            "two open pages, one recent page and one historical batch"
+            5,
+            "two open pages, one recent page and two historical batches"
         );
         let pagination: Vec<_> = seen
             .iter()
@@ -2111,7 +2257,13 @@ mod tests {
             .collect();
         assert_eq!(
             pagination,
-            vec![None, Some(serde_json::json!("opaque-page-two")), None, None]
+            vec![
+                None,
+                Some(serde_json::json!("opaque-page-two")),
+                None,
+                None,
+                None
+            ]
         );
     }
 

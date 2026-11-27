@@ -211,6 +211,37 @@ fn escape_label(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+fn query_lane_values(
+    query: &dyn PromQuery,
+    expression: &str,
+    host: &str,
+) -> Result<BTreeMap<String, Option<f64>>, String> {
+    let body = query.query(expression).map_err(|error| error.to_string())?;
+    let response: Value = serde_json::from_str(&body).map_err(|error| error.to_string())?;
+    if response["status"] != "success" {
+        return Err("Prometheus duty query did not succeed".to_owned());
+    }
+    let rows = response["data"]["result"]
+        .as_array()
+        .filter(|rows| rows.len() <= 10_000)
+        .ok_or("Prometheus duty vector missing or oversized")?;
+    let mut values = BTreeMap::new();
+    for row in rows {
+        if row["metric"]["host"].as_str() != Some(host) {
+            return Err("Prometheus duty host mismatch".to_owned());
+        }
+        let lane = row["metric"]["lane"].as_str().ok_or("duty lane absent")?;
+        let value = row["value"][1]
+            .as_str()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value >= 0.0);
+        if values.insert(lane.to_owned(), value).is_some() {
+            values.insert(lane.to_owned(), None);
+        }
+    }
+    Ok(values)
+}
+
 #[implements("FR-041-AC-2")]
 fn fr001_ready_candidate(
     issue: &crate::Issue,
@@ -327,42 +358,44 @@ pub fn live_duty(
     let mut coverage = 1.0_f64;
     let mut under_minimum = 0usize;
     let mut excluded = 0usize;
+    let host_label = escape_label(host);
+    let compiler_selector = format!(
+        "ix_fleet_lane_compile_seconds_total{{host=\"{host_label}\",job=\"ix-relay-watcher\"}}"
+    );
+    let state_selector =
+        format!("ix_fleet_lane_state_ratio{{host=\"{host_label}\",job=\"ix-relay-watcher\"}}");
+    let engaged_state_selector = format!(
+        "ix_fleet_lane_state_ratio{{host=\"{host_label}\",job=\"ix-relay-watcher\",state!=\"idle\"}}"
+    );
+    // Four vectors per host, independent of its lane count. Preserve each lane's
+    // missing-series and coverage semantics; never sum lanes before calculating duty.
+    let readings = [
+        format!("sum by (host,lane) (increase({compiler_selector}[{span}]))"),
+        format!("sum by (host,lane) (count_over_time({compiler_selector}[{span}]))"),
+        format!("count_over_time((max by (host,lane) ({state_selector}))[{span}:{push_interval_secs}s])"),
+        format!("count_over_time((max by (host,lane) ({engaged_state_selector}))[{span}:{push_interval_secs}s])"),
+    ]
+    .map(|expression| query_lane_values(query, &expression, host));
+    let [
+        Ok(compiler),
+        Ok(compiler_samples),
+        Ok(state_samples),
+        Ok(engaged_samples),
+    ] = readings
+    else {
+        return unavailable(compile_source, "watcher_duty_vector_unavailable");
+    };
     for lane in lanes {
-        let host_label = escape_label(host);
-        let lane_label = escape_label(lane);
-        let compiler_selector = format!(
-            "ix_fleet_lane_compile_seconds_total{{host=\"{host_label}\",lane=\"{lane_label}\",job=\"ix-relay-watcher\"}}"
-        );
-        let state_selector = format!(
-            "ix_fleet_lane_state_ratio{{host=\"{host_label}\",lane=\"{lane_label}\",job=\"ix-relay-watcher\"}}"
-        );
-        let engaged_state_selector = format!(
-            "ix_fleet_lane_state_ratio{{host=\"{host_label}\",lane=\"{lane_label}\",job=\"ix-relay-watcher\",state!=\"idle\"}}"
-        );
         let read = || -> Result<(f64, f64, f64, f64), String> {
-            let compiler = query_sum(
-                query,
-                &format!("sum(increase({compiler_selector}[{span}]))"),
-            )?;
-            let compiler_samples = query_sum(
-                query,
-                &format!("sum(count_over_time({compiler_selector}[{span}]))"),
-            )?;
-            // Collapse state-label series so a state transition cannot double count one lane.
-            let state_samples = query_sum(
-                query,
-                &format!(
-                    "count_over_time((max by (host,lane) ({state_selector}))[{span}:{push_interval_secs}s])"
-                ),
-            )?
-            .ok_or_else(|| "lane_presence_series_missing".to_owned())?;
-            let engaged_samples = query_sum(
-                query,
-                &format!(
-                    "count_over_time((max by (host,lane) ({engaged_state_selector}))[{span}:{push_interval_secs}s])"
-                ),
-            )?
-            .unwrap_or(0.0);
+            let lane_value = |values: &BTreeMap<String, Option<f64>>| match values.get(lane) {
+                Some(None) => Err("invalid or duplicate duty lane".to_owned()),
+                value => Ok(value.copied().flatten()),
+            };
+            let compiler = lane_value(&compiler)?;
+            let compiler_samples = lane_value(&compiler_samples)?;
+            let state_samples = lane_value(&state_samples)?
+                .ok_or_else(|| "lane_presence_series_missing".to_owned())?;
+            let engaged_samples = lane_value(&engaged_samples)?.unwrap_or(0.0);
             let expected_samples = window_secs as f64 / push_interval_secs as f64;
             let lane_coverage =
                 (state_samples * push_interval_secs as f64 / window_secs as f64).min(1.0);
@@ -1492,6 +1525,12 @@ mod tests {
         compiler_samples: f64,
     }
 
+    fn duty_vector(values: &[(&str, f64)]) -> String {
+        serde_json::json!({"status":"success","data":{"result":values.iter().map(|(lane,value)|
+            serde_json::json!({"metric":{"host":"draco","lane":lane},"value":[0,value.to_string()]}))
+            .collect::<Vec<_>>()}}).to_string()
+    }
+
     impl PromQuery for DutyPrometheus {
         fn query(&self, expression: &str) -> Result<String, SourceError> {
             self.queries.lock().unwrap().push(expression.to_owned());
@@ -1505,9 +1544,10 @@ mod tests {
             if value == 0.0 {
                 return Ok(r#"{"status":"success","data":{"result":[]}}"#.to_owned());
             }
-            Ok(format!(
-                r#"{{"status":"success","data":{{"result":[{{"value":[0,"{value}"]}}]}}}}"#
-            ))
+            Ok(duty_vector(&[
+                ("draco:ix-relay:builder", value),
+                ("draco:workspace:unselected", value * 2.0),
+            ]))
         }
     }
 
@@ -1515,19 +1555,20 @@ mod tests {
 
     impl PromQuery for LaneCoveragePrometheus {
         fn query(&self, expression: &str) -> Result<String, SourceError> {
-            let is_short_lane = expression.contains("lane=\"draco:workspace:short\"");
-            let value = if expression.contains("increase(ix_fleet_lane_compile_seconds_total") {
-                if is_short_lane { 0.0 } else { 324.0 }
-            } else if expression.contains("count_over_time(ix_fleet_lane_compile_seconds_total")
-                || expression.contains("count_over_time((max by (host,lane)")
-            {
-                if is_short_lane { 80.0 } else { 108.0 }
-            } else {
-                return Err(SourceError(format!("unexpected query: {expression}")));
-            };
-            Ok(format!(
-                r#"{{"status":"success","data":{{"result":[{{"value":[0,"{value}"]}}]}}}}"#
-            ))
+            let (good, short) =
+                if expression.contains("increase(ix_fleet_lane_compile_seconds_total") {
+                    (324.0, 0.0)
+                } else if expression.contains("count_over_time(ix_fleet_lane_compile_seconds_total")
+                    || expression.contains("count_over_time((max by (host,lane)")
+                {
+                    (108.0, 80.0)
+                } else {
+                    return Err(SourceError(format!("unexpected query: {expression}")));
+                };
+            Ok(duty_vector(&[
+                ("draco:workspace:good", good),
+                ("draco:workspace:short", short),
+            ]))
         }
     }
 
@@ -1538,7 +1579,7 @@ mod tests {
             if expression.contains("ix_fleet_lane_compile_seconds_total") {
                 return Ok(r#"{"status":"success","data":{"result":[]}}"#.to_owned());
             }
-            Ok(r#"{"status":"success","data":{"result":[{"value":[0,"108"]}]}}"#.to_owned())
+            Ok(duty_vector(&[("draco:workspace:idle", 108.0)]))
         }
     }
 
@@ -1688,7 +1729,7 @@ mod tests {
             query.contains("ix_fleet_lane_state_ratio")
                 && query.contains("count_over_time(")
                 && query.contains("host=\"draco\"")
-                && query.contains("lane=\"draco:ix-relay:builder\"")
+                && !query.contains("lane=")
                 && query.contains("job=\"ix-relay-watcher\"")
                 && query.contains("max by (host,lane)")
         }));
@@ -1712,10 +1753,64 @@ mod tests {
             } else {
                 108.0
             };
-            Ok(format!(
-                r#"{{"status":"success","data":{{"result":[{{"value":[0,"{value}"]}}]}}}}"#
-            ))
+            Ok(duty_vector(&[("draco:workspace:builder", value)]))
         }
+    }
+
+    #[trace("FR-041-AC-5")]
+    #[test]
+    fn duty_vectors_use_four_queries_and_preserve_missing_lane_evidence() {
+        let source = DutyPrometheus {
+            queries: Mutex::new(Vec::new()),
+            compiler_samples: 108.0,
+        };
+        let lanes = vec![
+            "draco:ix-relay:builder".to_owned(),
+            "draco:workspace:missing".to_owned(),
+        ];
+        let duty = live_duty(&source, "draco", &lanes, 3_600, 30, 3_000);
+        assert_eq!(source.queries.lock().unwrap().len(), 4);
+        assert_eq!(duty.value, Some(360.0 / 3_240.0));
+        assert_eq!(duty.coverage, Some(0.9));
+        assert_eq!(
+            duty.reason.as_deref(),
+            Some("excluded_1_of_2_lanes_for_coverage_or_minimum_observation")
+        );
+    }
+
+    #[trace("FR-041-AC-5")]
+    #[test]
+    fn duty_vector_rejects_duplicate_cross_host_and_nonfinite_rows() {
+        struct Rows(String);
+        impl PromQuery for Rows {
+            fn query(&self, _: &str) -> Result<String, SourceError> {
+                Ok(self.0.clone())
+            }
+        }
+        let lane = "draco:workspace:builder";
+        let duplicate = duty_vector(&[(lane, 108.0), (lane, 108.0)]);
+        let wrong_host = duty_vector(&[(lane, 108.0)]).replace("\"draco\"", "\"luna\"");
+        let nonfinite = duty_vector(&[(lane, f64::NAN)]);
+        for body in [duplicate, wrong_host, nonfinite] {
+            let duty = live_duty(&Rows(body), "draco", &[lane.to_owned()], 3_600, 30, 3_000);
+            assert_eq!(duty.value, None);
+            assert!(duty.reason.is_some());
+        }
+        let valid = "draco:workspace:good";
+        let body = duty_vector(&[(lane, f64::NAN), (valid, 108.0)]);
+        let duty = live_duty(
+            &Rows(body),
+            "draco",
+            &[lane.to_owned(), valid.to_owned()],
+            3_600,
+            30,
+            3_000,
+        );
+        assert_eq!(duty.value, Some(108.0 / 3240.0));
+        assert_eq!(
+            duty.reason.as_deref(),
+            Some("excluded_1_of_2_lanes_for_coverage_or_minimum_observation")
+        );
     }
 
     #[trace("FR-041-AC-5")]
