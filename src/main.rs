@@ -3701,9 +3701,9 @@ fn run_hygiene(
     use ix_board::host_hygiene::{
         CleanDecision, HostPolicy, HygieneConfig, HygieneReport, MountSafety, ProcessEvidenceScope,
         apply_clean_decision, canonicalize_worktree_root, clean_decision,
-        cleanup_owned_by_current_user, discover_targets, free_disk_bytes, mount_safety,
-        mount_table_covers, newest_mtime_under, recheck_clean_decision, system_mount_table,
-        system_process_table,
+        cleanup_owned_by_current_user, discover_targets, free_disk_bytes, is_build_command,
+        mount_safety, mount_table_covers, newest_mtime_under, recheck_clean_decision,
+        system_mount_table, system_process_table,
     };
     use std::time::{Duration, SystemTime};
 
@@ -3797,14 +3797,7 @@ fn run_hygiene(
                 .cwd
                 .as_deref()
                 .is_some_and(|cwd| cwd.starts_with(&root))
-                && process.cmdline.split(|byte| *byte == 0).any(|word| {
-                    matches!(
-                        PathBuf::from(String::from_utf8_lossy(word).as_ref())
-                            .file_name()
-                            .and_then(|name| name.to_str()),
-                        Some("cargo" | "rustc")
-                    )
-                })
+                && is_build_command(&process.cmdline)
                 && !process
                     .environ
                     .windows(b"HERDR_PANE_ID=".len())

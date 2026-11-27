@@ -503,6 +503,7 @@ is 60 minutes. Set `hygiene.default_free_floor_gb`, a host-specific
 `hygiene.hosts.<host>.free_floor_gb`, or `hygiene.idle_minutes` to change those policy fields.
 Discovery includes targets up to three directory levels below the worktree root,
 including grouped worktrees. It skips symlinks, backups and unexpected filesystems.
+Only each worktree's direct `target/` is included; source subdirectories are preserved.
 On macOS and Linux, install `lsof` and `ps`; inspection runs without elevated rights.
 `process_evidence_scope: current_user` identifies the invoking user's process inventory.
 Missing live cwd records, failed process commands, and unavailable build environments

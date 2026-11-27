@@ -486,33 +486,44 @@ pub fn mount_filesystem_matches(left: &Path, right: &Path, mounts: &[MountEntry]
 #[implements("FR-048-AC-3")]
 #[implements("FR-048-AC-12")]
 fn native_process_table() -> io::Result<ProcessTable> {
-    let uid = rustix::process::geteuid().as_raw().to_string();
-    // Sample first, then inspect just those PIDs. Processes born during lsof's
-    // scan belong to the next snapshot, as with /proc directory enumeration.
+    let uid = rustix::process::geteuid().as_raw();
+    // Metadata has no command arguments, so embedded argument newlines cannot
+    // masquerade as missing or malformed process records.
     let inventory = Command::new("ps")
-        .args(["-axo", "pid=,uid=,stat=,args="])
+        .args(["-axo", "pid=,uid=,stat="])
         .output()?;
-    let initial_commands =
-        owner_process_commands(&inventory.stdout, rustix::process::geteuid().as_raw())?;
-    let pids = String::from_utf8_lossy(&initial_commands)
-        .lines()
-        .filter_map(|line| line.split_whitespace().next()?.parse::<u32>().ok())
-        .map(|pid| pid.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    if !inventory.status.success() || pids.is_empty() {
+    if !inventory.status.success() {
         return Ok(ProcessTable::default());
     }
+    let sampled = owner_process_ids(&inventory.stdout, uid)?;
+    if sampled.is_empty() {
+        return Ok(ProcessTable::default());
+    }
+    let pids = sampled
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let arguments = Command::new("ps")
+        .args(["-ww", "-p", &pids, "-o", "pid=,args="])
+        .output()?;
+    let arguments_by_pid = process_arguments(&arguments.stdout, &sampled)?;
     let output = Command::new("lsof")
-        .args(["-nP", "-Ffpn", "-a", "-u", &uid, "-p", &pids])
+        .args(["-nP", "-Ffpn", "-a", "-u", &uid.to_string(), "-p", &pids])
         .output()?;
     // Reconcile only sampled PIDs; ps itself and exited processes disappear.
-    let process_names = Command::new("ps")
-        .args(["-p", &pids, "-o", "pid=,uid=,stat=,args="])
+    let remaining = Command::new("ps")
+        .args(["-p", &pids, "-o", "pid=,uid=,stat="])
         .output()?;
-    let command_bytes =
-        owner_process_commands(&process_names.stdout, rustix::process::geteuid().as_raw())?;
-    let commands = String::from_utf8_lossy(&command_bytes);
+    let live = owner_process_ids(&remaining.stdout, uid)?;
+    let mut commands = String::new();
+    for pid in live {
+        use std::fmt::Write;
+        let command = arguments_by_pid
+            .get(&pid)
+            .ok_or_else(|| io::Error::other("ps command missing for a live sampled process"))?;
+        writeln!(commands, "{pid} {}", command.replace('\n', " ")).map_err(io::Error::other)?;
+    }
     let mut environments = BTreeMap::new();
     for line in commands.lines() {
         let Some((pid, command)) = line.trim().split_once(char::is_whitespace) else {
@@ -544,9 +555,8 @@ fn native_process_table() -> io::Result<ProcessTable> {
         &output.stdout,
         commands.as_bytes(),
         &environments,
-        // lsof exit 1 can still contain complete evidence (e.g. vanished processes).
-        // Validate its records against ps rather than discarding partial stdout.
-        process_names.status.success()
+        arguments.status.success()
+            && remaining.status.success()
             && matches!(output.status.code(), Some(0 | 1))
             && output.stderr.is_empty(),
     ))
@@ -554,70 +564,72 @@ fn native_process_table() -> io::Result<ProcessTable> {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[implements("FR-048-AC-12")]
-fn owner_process_commands(output: &[u8], uid: u32) -> io::Result<Vec<u8>> {
+fn owner_process_ids(output: &[u8], uid: u32) -> io::Result<Vec<u32>> {
     if output.len() > 64 * 1024 * 1024 {
         return Err(io::Error::other("ps inventory exceeds 64 MiB"));
     }
     let text =
         std::str::from_utf8(output).map_err(|_| io::Error::other("ps inventory is not UTF-8"))?;
-    let mut records: Vec<(u32, u32, String, String)> = Vec::new();
+    let mut pids = std::collections::BTreeSet::new();
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        let malformed =
-            || io::Error::other("ps inventory has a malformed pid/uid/state/command row");
-        let parsed = (|| {
-            let (pid, rest) = line.trim().split_once(char::is_whitespace)?;
-            let (owner, rest) = rest.trim_start().split_once(char::is_whitespace)?;
-            let (state, command) = rest
-                .trim_start()
-                .split_once(char::is_whitespace)
-                .unwrap_or((rest.trim(), ""));
-            Some((
-                pid.parse::<u32>().ok()?,
-                owner.parse::<u32>().ok()?,
-                state.to_owned(),
-                command.trim_start().to_owned(),
-            ))
-        })();
-        if let Some(record) = parsed {
-            records.push(record);
-            if records.len() > 50_000 {
-                return Err(io::Error::other("ps inventory exceeds 50000 processes"));
-            }
-        } else if line
-            .split_whitespace()
-            .next()
-            .is_some_and(|field| field.parse::<u32>().is_ok())
-        {
+        let malformed = || io::Error::other("ps inventory has a malformed pid/uid/state row");
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        let [pid, owner, state] = fields.as_slice() else {
             return Err(malformed());
-        } else if let Some(record) = records.last_mut() {
-            // ps emits embedded command newlines literally. Keep them with
-            // the preceding record instead of losing the process inventory.
-            record.3.push('\n');
-            record.3.push_str(line);
-        } else {
+        };
+        let pid = pid.parse::<u32>().map_err(|_| malformed())?;
+        // Darwin formats the nobody account as -2 rather than its unsigned UID.
+        let owner = owner.parse::<i64>().map_err(|_| malformed())?;
+        // Explicit effective UID excludes setuid login helpers selected by macOS -u.
+        if owner == i64::from(uid) && !state.starts_with(['Z', 'X']) && !pids.insert(pid) {
             return Err(malformed());
         }
-    }
-    let mut commands = String::new();
-    for (pid, owner, state, command) in records {
-        // macOS ps -u also selects real-user-owned setuid login helpers. Use
-        // the explicit effective UID column instead of treating them as readable.
-        if owner == uid && !state.starts_with(['Z', 'X']) {
-            use std::fmt::Write;
-            // The downstream inventory is one record per line; preserve the
-            // command's path evidence while making continuation lines unambiguous.
-            writeln!(commands, "{pid} {}", command.replace('\n', " ")).map_err(io::Error::other)?;
+        if pids.len() > 50_000 {
+            return Err(io::Error::other("ps inventory exceeds 50000 processes"));
         }
     }
-    Ok(commands.into_bytes())
+    Ok(pids.into_iter().collect())
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+fn process_arguments(output: &[u8], sampled: &[u32]) -> io::Result<BTreeMap<u32, String>> {
+    if output.len() > 64 * 1024 * 1024 {
+        return Err(io::Error::other("ps arguments exceed 64 MiB"));
+    }
+    let text =
+        std::str::from_utf8(output).map_err(|_| io::Error::other("ps arguments are not UTF-8"))?;
+    let sampled = sampled
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut commands = BTreeMap::new();
+    let mut current = None;
+    for line in text.lines() {
+        let header = line
+            .trim_start()
+            .split_once(char::is_whitespace)
+            .and_then(|(pid, command)| Some((pid.parse::<u32>().ok()?, command.trim_start())))
+            .filter(|(pid, _)| sampled.contains(pid));
+        if let Some((pid, command)) = header {
+            if commands.insert(pid, command.to_owned()).is_some() {
+                return Err(io::Error::other("duplicate ps argument record"));
+            }
+            current = Some(pid);
+        } else if let Some(command) = current.and_then(|pid| commands.get_mut(&pid)) {
+            command.push('\n');
+            command.push_str(line);
+        } else if !line.trim().is_empty() {
+            return Err(io::Error::other("ps arguments lack a sampled PID record"));
+        }
+    }
+    Ok(commands)
+}
+/// Identifies Cargo and rustc from native text or NUL-separated command lines.
 #[implements("FR-048-AC-3")]
 #[implements("FR-048-AC-12")]
-fn is_build_command(command: &[u8]) -> bool {
+pub fn is_build_command(command: &[u8]) -> bool {
     command
-        .split(|byte| byte.is_ascii_whitespace())
+        .split(|byte| *byte == 0 || byte.is_ascii_whitespace())
         .next()
         .and_then(|command| std::str::from_utf8(command).ok())
         .and_then(|command| Path::new(command).file_name())
@@ -845,7 +857,7 @@ pub fn discover_targets(root: &Path, mounts: &[MountEntry]) -> io::Result<Vec<(P
                 if let Some(owner) = &owner {
                     targets.push((path, owner.clone()));
                 }
-            } else if depth + 1 < 3 {
+            } else if depth + 1 < 3 && owner.is_none() {
                 pending.push((path, depth + 1, owner.clone()));
             }
         }
@@ -1204,21 +1216,34 @@ mod tests {
     use super::*;
     use ix_trace_rs::trace;
 
+    #[test]
+    #[trace("FR-048-AC-4", "FR-048-AC-12")]
+    fn build_commands_accept_native_text_and_nul_separated_process_arguments() {
+        assert!(is_build_command(b"/usr/bin/cargo test -j 4"));
+        assert!(is_build_command(b"/usr/bin/rustc\0--crate-name\0app"));
+        assert!(!is_build_command(b"sh -c cargo test"));
+    }
+
     #[cfg(unix)]
     #[test]
     #[trace("FR-048-AC-12")]
     fn owner_inventory_excludes_privileged_login_helpers_and_exited_processes() {
-        let commands = owner_process_commands(b"12 0 Ss login\n13 501 S cargo build --target-dir '/work/two  spaces/target'\n14 501 Z defunct\n15 502 S other-user\n", 501).unwrap();
+        let pids =
+            owner_process_ids(b"12 0 Ss\n13 501 S\n14 501 Z\n15 502 S\n16 -2 Ss\n", 501).unwrap();
+        assert_eq!(pids, [13]);
+        assert!(owner_process_ids(b"invalid row", 501).is_err());
+        assert!(owner_process_ids(b"12 501 S\n13 invalid S\n", 501).is_err());
+        let args = process_arguments(
+            b"13 zsh -c echo\n501 numeric continuation\nprintf hello\n16 cargo build\n",
+            &[13, 16],
+        )
+        .unwrap();
         assert_eq!(
-            commands,
-            b"13 cargo build --target-dir '/work/two  spaces/target'\n"
+            args[&13],
+            "zsh -c echo\n501 numeric continuation\nprintf hello"
         );
-        assert!(owner_process_commands(b"invalid row", 501).is_err());
-        assert!(owner_process_commands(b"12 501 S editor\n13 invalid row\n", 501).is_err());
-        assert_eq!(
-            owner_process_commands(b"12 501 S zsh -c echo\nprintf hello\n", 501).unwrap(),
-            b"12 zsh -c echo printf hello\n"
-        );
+        assert_eq!(args[&16], "cargo build");
+        assert!(process_arguments(b"13 editor\n13 repeated\n", &[13]).is_err());
     }
 
     #[test]
@@ -1238,6 +1263,7 @@ mod tests {
             std::fs::write(worktree.join(".git"), b"gitdir: fixture").unwrap();
         }
         std::fs::create_dir_all(root.join("source/target")).unwrap();
+        std::fs::create_dir_all(root.join("direct/src/target")).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(root.join("direct"), root.join("linked")).unwrap();
         let mounts = vec![

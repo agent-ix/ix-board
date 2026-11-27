@@ -78,22 +78,19 @@ on Linux, `~/Library/Caches/com.agent-ix.ix-board` on macOS, and
 `%LOCALAPPDATA%\agent-ix\ix-board\cache` on Windows. See
 [how it works](how-it-works.md#cache).
 
-ix-board checks database writes, restricted permissions, and the adjacent refresh
-lock before using the path. If the default location is inaccessible or read-only,
-it selects `$TMPDIR/ix-board-<uid>/linear.sqlite3` on Unix, using the system temporary
-directory when `TMPDIR` is unset. The fallback directory is private, owned by the
-invoking user, and mode `0700`. Temporary storage may be cleared by the operating system.
+ix-board checks database writes, permissions and the adjacent lock. An inaccessible
+or read-only default selects `$TMPDIR/ix-board-<uid>/linear.sqlite3` on Unix,
+using the system temporary directory when `TMPDIR` is unset. The fallback directory
+belongs to the invoking user with mode `0700`. The operating system may clear it.
 `ix-board cache status --json` reports the selected `cache_path`.
 
-An explicit `IX_BOARD_CACHE_PATH` stays selected on failure. The error names the
-path and asks you to fix ownership and permissions or choose another writable
-local path. Parent directories are created automatically. Database corruption and
-busy SQLite transactions remain errors; they do not select a separate cache.
+An explicit override failure names the path and asks you to fix permissions or
+choose another writable path. Parent directories are created automatically.
+Corruption and SQLite contention remain errors.
 
-Refresh waits last at most five seconds. A timeout names the `.refresh.lock` path
-and holder process ID (PID); older writers may show an unknown holder. Check that process or
-wait for it to finish. Keep the lock file in place: the operating system releases
-the lock when its owner exits, and a later owner replaces stale PID metadata.
+Refresh waits last at most five seconds. Timeouts name the lock path and holder
+process ID (PID); legacy holders may be unknown. Check that process or wait for it.
+Keep the file: locks release when owners exit, and later owners replace stale metadata.
 
 ## macOS Keychain prompts
 

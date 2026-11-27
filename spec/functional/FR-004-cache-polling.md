@@ -138,12 +138,10 @@ lock waits remain bounded to five seconds and identify the lock path and owner P
 | FR-004-AC-19 | Given a cache that is locked for longer than the deadline, a bounded read returns the typed timeout within the deadline and does not read the source; a refreshed entry is written to the cache only before expiry. | Test |
 | FR-004-AC-20 | Two separately launched processes read the same expired dataset concurrently; exactly one source refresh occurs and the waiter reuses it after rechecking. A held lock causes ordinary fallback/error within five seconds, and terminating the owner releases the OS lock without a stale lockfile preventing recovery. | Test |
 | FR-004-AC-21 | A summary refresh, failed refresh, or fallback never advances detail freshness; pre-provenance snapshots have unknown age and fail bounded freshness checks. Fallback preserves unavailable components and does not invent zero values. | Test |
-
 | FR-004-AC-22 | If the default cache or its adjacent lock is inaccessible or read-only, automatic selection opens a writable private per-user temporary cache. An explicit IX_BOARD_CACHE_PATH failure names the path and ownership/permission or override fix. Corrupt databases and contention are reported without silently switching caches. | Test |
 | FR-004-AC-23 | A held refresh lock reports its path and holder PID within five seconds; absent legacy holder metadata is explicitly unknown. Stale metadata cannot prevent acquisition after the OS releases the lock. Bounded reads retain their operation deadline. | Test |
 
 ## Dependencies
-
 
 - **Upstream**: [US-001](../usecase/US-001-team-leader-reads.md)
 - **Consumers**: [FR-010](FR-010-explicit-work-scope.md),
