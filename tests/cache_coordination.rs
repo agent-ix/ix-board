@@ -228,15 +228,33 @@ fn dead_holder_is_taken_over_and_status_update_finishes_without_pending_work() {
     owner.kill().unwrap();
     assert!(!owner.wait().unwrap().success());
     let started = Instant::now();
-    let output = child(directory.path(), "status-update", "recovery").wait_with_output().unwrap();
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let output = child(directory.path(), "status-update", "recovery")
+        .wait_with_output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(started.elapsed() < Duration::from_secs(2));
     assert!(directory.path().join("status-reported").exists());
     let diagnostic = String::from_utf8_lossy(&output.stderr);
     assert!(diagnostic.contains("recovered"), "{diagnostic}");
-    assert!(diagnostic.contains(&format!("pid={dead_pid}")), "{diagnostic}");
+    assert!(
+        diagnostic.contains(&format!("pid={dead_pid}")),
+        "{diagnostic}"
+    );
     assert!(diagnostic.contains("age="), "{diagnostic}");
-    assert!(diagnostic.contains(&directory.path().join("cache.sqlite.refresh.lock").display().to_string()), "{diagnostic}");
+    assert!(
+        diagnostic.contains(
+            &directory
+                .path()
+                .join("cache.sqlite.refresh.lock")
+                .display()
+                .to_string()
+        ),
+        "{diagnostic}"
+    );
 }
 
 #[trace("FR-004-AC-23", "FR-004-AC-24")]
@@ -245,8 +263,16 @@ fn waiting_status_update_announces_holder_then_fails_explicitly_within_five_seco
     use std::io::BufRead;
     let directory = tempfile::tempdir().unwrap();
     let lock = lock_refresh(directory.path());
-    let acquired = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() - 42_000;
-    fs::write(directory.path().join("cache.sqlite.refresh.lock"), format!("pid={}\nacquired_at_ms={acquired}\n", std::process::id())).unwrap();
+    let acquired = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        - 42_000;
+    fs::write(
+        directory.path().join("cache.sqlite.refresh.lock"),
+        format!("pid={}\nacquired_at_ms={acquired}\n", std::process::id()),
+    )
+    .unwrap();
     let mut waiter = child(directory.path(), "status-update", "waiting");
     let stderr = waiter.stderr.take().unwrap();
     let (send, receive) = std::sync::mpsc::channel();
@@ -265,11 +291,30 @@ fn waiting_status_update_announces_holder_then_fails_explicitly_within_five_seco
     drop(lock);
     assert!(!output.status.success());
     assert!(started.elapsed() < Duration::from_secs(6));
-    assert!(initial.expect("waiting must be visible before the final timeout").contains("waiting"));
-    assert!(diagnostic.contains(&format!("pid={}", std::process::id())), "{diagnostic}");
+    assert!(
+        initial
+            .expect("waiting must be visible before the final timeout")
+            .contains("waiting")
+    );
+    assert!(
+        diagnostic.contains(&format!("pid={}", std::process::id())),
+        "{diagnostic}"
+    );
     assert!(diagnostic.contains("age=4"), "{diagnostic}");
-    assert!(diagnostic.contains(&directory.path().join("cache.sqlite.refresh.lock").display().to_string()), "{diagnostic}");
-    assert!(diagnostic.contains("status update not reported"), "{diagnostic}");
+    assert!(
+        diagnostic.contains(
+            &directory
+                .path()
+                .join("cache.sqlite.refresh.lock")
+                .display()
+                .to_string()
+        ),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("status update not reported"),
+        "{diagnostic}"
+    );
     assert!(!directory.path().join("status-reported").exists());
 }
 
