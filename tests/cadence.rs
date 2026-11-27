@@ -66,7 +66,7 @@ fn cadence_accepts_check_jobs_and_rejects_cleanup() {
 }
 
 #[test]
-#[trace("FR-049-AC-10", "FR-048-AC-1")]
+#[trace("FR-049-AC-10")]
 fn cadence_hygiene_check_resolves_local_host_and_records_the_check() {
     let directory = tempfile::tempdir().unwrap();
     let manifest_path = directory.path().join("cadence.json");

@@ -3708,7 +3708,7 @@ fn run_hygiene(
     let host = args
         .host
         .clone()
-        .or_else(|| resolve_host_label(None))
+        .or_else(resolve_host_label)
         .ok_or_else(|| Error::ProgramReview {
             message: "local host identity unavailable; configure IX_BOARD_HOST or pass --host"
                 .to_owned(),
@@ -3918,7 +3918,7 @@ fn run_host_check() -> ix_board::host_check::HostCheckReport {
 
     let settings = ix_board::settings_value().ok().flatten();
     let hygiene = HygieneConfig::from_settings(settings.as_ref()).ok();
-    let host = resolve_host_label(hygiene.as_ref());
+    let host = resolve_host_label();
     let host_name = host.clone().unwrap_or_else(|| "unknown".to_owned());
     let path = std::env::var_os("PATH").unwrap_or_default();
 
@@ -4058,8 +4058,7 @@ fn linear_credential_error_state(error: &ix_board::Error) -> ix_board::host_chec
 }
 
 #[implements("FR-050-AC-1", "FR-049-AC-10")]
-fn resolve_host_label(config: Option<&ix_board::host_hygiene::HygieneConfig>) -> Option<String> {
-    let configured = config.map(|config| &config.hosts);
+fn resolve_host_label() -> Option<String> {
     let candidates = [
         std::env::var("IX_BOARD_HOST").ok(),
         std::env::var("HERDR_SERVER").ok(),
@@ -4087,14 +4086,7 @@ fn resolve_host_label(config: Option<&ix_board::host_hygiene::HygieneConfig>) ->
         if normalized.is_empty() {
             return None;
         }
-        configured
-            .and_then(|hosts| {
-                hosts
-                    .keys()
-                    .find(|host| host.eq_ignore_ascii_case(&normalized))
-            })
-            .cloned()
-            .or_else(|| configured.is_none().then_some(normalized))
+        Some(normalized)
     })
 }
 
