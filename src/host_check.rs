@@ -61,7 +61,7 @@ pub struct HostCheckReport {
     pub stability: crate::build_stability::StabilityReport,
     /// GitHub and Linear authentication probes.
     pub auth: Vec<AuthCheck>,
-    /// Host's current locked-build and resource metrics.
+    /// Host's current ix-build and resource metrics.
     pub metrics: Option<BuildHostMetrics>,
     /// Admission verdict from the configured host policy.
     pub admission: Eligibility,

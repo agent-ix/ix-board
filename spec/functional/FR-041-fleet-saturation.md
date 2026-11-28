@@ -33,7 +33,7 @@ The command family `ix-board fleet capacity` SHALL also record capacity discover
 ## Behavior
 
 - **Supply** per host: `sustainable_slots` and optional `lane_capacity`. The final source of
-  `sustainable_slots` is the build scheduler (locked-build, W6). Until it exists,
+  `sustainable_slots` is the build scheduler (ix-build, W6). Until it exists,
   `sustainable_slots` comes from the explicit `fleet.capacity_limits.<host>.build_slots`
   ix-board configuration value, with that config path retained as its source basis;
   `fleet.capacity_limits.<host>.lane_capacity` is an optional operator-entered demand bound.
@@ -42,7 +42,7 @@ The command family `ix-board fleet capacity` SHALL also record capacity discover
   A host whose registry lease is stale
   ([FR-034](./FR-034-fleet-lane-status.md)) contributes no slots and no lane capacity.
 - **Duty cycle** per lane: build seconds divided by observed engaged lane seconds over a
-  trailing window (default 24h). The final source is locked-build; the interim
+  trailing window (default 24h). The final source is ix-build; the interim
   source is `increase(ix_fleet_lane_compile_seconds_total{host,lane,job="ix-relay-watcher"}[window])`.
   State coverage uses all `ix_fleet_lane_state_ratio{host,lane}` samples. Engaged lane seconds
   count samples where `state!="idle"` and multiply by the configured push interval, capped at the
@@ -265,7 +265,7 @@ watcher behavior.
 | FR-041-AC-9 | A host with a stale registry lease contributes zero slots and zero lane capacity to supply, and its UNREACHABLE lanes are excluded from demand and from the duty mean. | Test |
 | FR-041-AC-3 | A buffer at or above target gives deficit zero and no action; one below gives the exact shortfall. | Test |
 | FR-041-AC-4 | A mean duty of zero, no lane with duty, missing sustainable slots or a missing queue makes dependent values `unavailable` with reason, omits the gauge, and never reports deficit zero; an absent optional lane cap does not. | Test |
-| FR-041-AC-5 | With interim supply from configured build slots and watcher compiler seconds divided by observed non-idle lane seconds, idle time does not dilute duty and a positive deficit still yields `need_ready_tickets`; an optional operator lane limit bounds demand only when entered, and locked-build data replaces interim supply and duty when present. Duty reads use four vectors per host independent of lane count, retain per-lane coverage and minimum-observation checks, and exclude unselected lanes. | Test |
+| FR-041-AC-5 | With interim supply from configured build slots and watcher compiler seconds divided by observed non-idle lane seconds, idle time does not dilute duty and a positive deficit still yields `need_ready_tickets`; an optional operator lane limit bounds demand only when entered, and ix-build data replaces interim supply and duty when present. Duty reads use four vectors per host independent of lane count, retain per-lane coverage and minimum-observation checks, and exclude unselected lanes. | Test |
 | FR-041-AC-24 | A positive deficit yields one planner action with `project` and the requested additional ticket count persisted on its action row; the row's `emitted_at` is the first deficient tick and `resolved_at` is set only when the project deficit clears. | Test |
 | FR-041-AC-6 | A deficit of N produces per-project actions whose counts sum to N, deterministically. | Test |
 | FR-041-AC-7 | `ix_fleet_ready_buffer_deficit` has bounded labels, matches the read-only command output, and each `fleet saturation collect` run stores one `saturation_sample` per host with global ready buffer, active/supplied/unsupplied lane counts, allocated ready share, `queued_behind_first`, `bootstrap_ticket_pool`, current-lease evidence, source basis and unavailable reason; the exporter omits the value when the newest sample is older than 600 seconds and serves its timestamp and a bounded unavailable reason. | Test |
@@ -287,7 +287,7 @@ watcher behavior.
 
 ## Dependencies
 
-- Final supply and duty: locked-build scheduler (W6). Interim supply: explicit per-host `fleet.capacity_limits.<host>.build_slots`; interim duty: the ix-relay watcher per-lane compiler seconds divided by observed non-idle lane-state seconds (ix-relay PR #52, target contract). An optional lane-demand bound comes only from explicit `fleet.capacity_limits.<host>.lane_capacity`. Lane build evidence also uses [FR-034](./FR-034-fleet-lane-status.md).
+- Final supply and duty: ix-build scheduler (W6). Interim supply: explicit per-host `fleet.capacity_limits.<host>.build_slots`; interim duty: the ix-relay watcher per-lane compiler seconds divided by observed non-idle lane-state seconds (ix-relay PR #52, target contract). An optional lane-demand bound comes only from explicit `fleet.capacity_limits.<host>.lane_capacity`. Lane build evidence also uses [FR-034](./FR-034-fleet-lane-status.md).
 - Capacity discovery reads `ix_build_queue_wait_seconds`, `ix_build_slots_busy`, `ix_build_slots_configured`, `ix_build_admission_blocked_seconds_total` and `ix_build_builds_total{outcome}` from dev-team FR-010/FR-015; interim sustainable slots from explicit per-host configuration; memory and thermal readings and explicit per-host limits as described above; Linear/GitHub for host output; [FR-037](./FR-037-fleet-focus-and-drift.md) focus for per-lane attribution; and the [FR-039](./FR-039-fleet-ledger.md) ledger. `fleet tick` ([FR-038](./FR-038-fleet-tick.md)) writes `drain_done`, `overload_event`, `lane_added`, `lane_removed` and `host_output_sample`. These producers are enablement owned by their respective projects; this requirement adds none.
 - `ix_build_builds_total{outcome}` uses the closed outcome set `ok`, `failed`, `cancelled`, `timed_out`, `aborted_memory`, `aborted_thermal`, `aborted_rss_cap` and `aborted_pause_exceeded` from dev-team FR-015. FR-010 termination reason values already include the `aborted_` prefix; producers and consumers use each value once, without adding a second prefix.
 - The dev-team orchestrator role spec still names `ix_build_slots_sustainable`, `ix_build_pause_seconds_total` and `ix_build_probe_value`; SWM-317 replaces them with `ix_build_slots_configured` and the admission-blocked share.

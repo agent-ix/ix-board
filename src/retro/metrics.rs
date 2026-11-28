@@ -300,11 +300,11 @@ fn build_stability(out: &mut Out<'_>, sources: &Sources<'_>) {
         let value = report
             .hosts
             .get(host)
-            .ok_or_else(|| format!("locked-build {host} source unavailable"))
+            .ok_or_else(|| format!("ix-build {host} source unavailable"))
             .and_then(|row| {
                 row.last_24h.as_ref().ok_or_else(|| {
                     format!(
-                        "locked-build {host} source unavailable: {}",
+                        "ix-build {host} source unavailable: {}",
                         row.reason.as_deref().unwrap_or("unknown")
                     )
                 })
@@ -460,7 +460,7 @@ impl Out<'_> {
                 "maximum one-minute load divided by logical cores".to_owned(),
             ),
             id if crate::build_stability::metric_host(id).is_some() => (
-                "locked-build status/events",
+                "ix-build status/events",
                 "retained request outcomes and nearest-rank admitted queue waits; fixed rolling window=24h; per-host; kills exclude successful attempts, refusals and command exits".to_owned(),
             ),
             _ => ("unknown", String::new()),

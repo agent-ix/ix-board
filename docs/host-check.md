@@ -31,7 +31,7 @@ The job runs wherever `ix-board cadence run host-check` runs. Install the same
 cadence manifest and scheduler on each machine. Configure `IX_BOARD_HOST` when
 the local Herdr server identity is not discoverable, and configure
 `IX_PROMETHEUS_URL` (or `[fleet].prometheus_url`) plus
-`[hygiene.hosts.<host>]` policy for locked-build capacity.
+`[hygiene.hosts.<host>]` policy for ix-build capacity.
 
 ## `_lead-bin` script disposition
 

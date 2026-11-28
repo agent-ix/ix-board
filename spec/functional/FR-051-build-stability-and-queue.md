@@ -15,12 +15,12 @@ relationships:
 ## Description
 
 When an operator runs `ix-board host check`, ix-board SHALL report rolling build
-stability and queue evidence for draco, luna, titan and terra from locked-build's
+stability and queue evidence for draco, luna, titan and terra from ix-build's
 redacted retained status and transition events.
 
 ## Inputs
 
-The producer contract is dev-tools' shared `locked_build::wire` projection:
+The producer contract is dev-tools' shared `ix_build::wire` projection:
 request and event lifecycle timestamps, stable diagnostic codes and limits,
 queue depth at enqueue, position, cumulative state timings and blocker
 observations, separate requested/granted hard caps and admission reservations,
@@ -43,10 +43,10 @@ Legacy status supplies `state`, `enqueued_at_ms`, `started_at_ms`, `ended_at_ms`
 - Stable codes take precedence over legacy evidence. Signal 9 alone is an external
   signal, never proof of OOM. Ordinary nonzero exits are command failures.
   Legacy `supervision_lost` and `supervision_degraded` map to
-  `LB_SUPERVISION_LOST`, as declared by the producer's `wire::Code`.
+  `IB_SUPERVISION_LOST`, as declared by the producer's `wire::Code`.
   Degraded supervision remains successful when the lifecycle and observed exit
   say success; the diagnostic alone does not make it a kill. Legacy `refused`
-  maps to `LB_REFUSED_QUEUE` without inventing a more specific policy cause.
+  maps to `IB_REFUSED_QUEUE` without inventing a more specific policy cause.
 - The top violated limit is the most frequent resource/hold/refusal bound, with
   deterministic lexical limit-key tie breaking and the latest measured/limit values.
 - Queue waits use completed admission waits (nearest-rank p50/p95), independently

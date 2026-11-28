@@ -16,9 +16,9 @@ relationships:
 
 The `ix-board hygiene check` and `ix-board hygiene clean` commands SHALL inspect build-host disk
 and worktree hygiene using explicit host policy and process evidence. The `ix-board build status`
-command SHALL report comparable load, memory, swap, locked-build queue, and active lease data for
+command SHALL report comparable load, memory, swap, ix-build queue, and active lease data for
 all configured hosts and apply each host's admission policy. Running-agent build detection SHALL
-use locked-build lease evidence instead of identifying a shell wrapper by its name.
+use ix-build lease evidence instead of identifying a shell wrapper by its name.
 
 ## Behavior
 
@@ -52,7 +52,7 @@ use locked-build lease evidence instead of identifying a shell wrapper by its na
   below 8;
   policy may set different limits for other hosts.
 - **Lease detection.** Agent activity reports a build as active when the current owner has a
-  running locked-build lease. The process name or command text `locked-build.sh` does not establish
+  running ix-build lease. The process name or command text `ix-build.sh` does not establish
   a lease.
 
 ## Acceptance Criteria
@@ -67,7 +67,7 @@ use locked-build lease evidence instead of identifying a shell wrapper by its na
 | FR-048-AC-6 | An injected process table produces the same cleanup decisions independent of the host's live process list. | Test |
 | FR-048-AC-7 | Build status parses Prometheus text exposition and reports per-host load per core, memory, swap, queue depth and running leases in one deterministic table. | Test |
 | FR-048-AC-8 | Eligibility uses the host policy and missing or stale telemetry is ineligible; luna is eligible for one heavy gate only when no heavy gate is running and system load is below 8. | Test |
-| FR-048-AC-9 | Agent activity recognizes locked-build ownership from lease evidence and does not infer it from `locked-build.sh` command text. | Test |
+| FR-048-AC-9 | Agent activity recognizes ix-build ownership from lease evidence and does not infer it from `ix-build.sh` command text. | Test |
 | FR-048-AC-10 | An injected mount table proves hygiene ignores worktrees on an unexpected filesystem and refuses to scan or clean a target containing a nested mount point; unreadable mount evidence prevents cleanup. | Test |
 | FR-048-AC-11 | Target discovery includes worktree targets at depths one through three under the configured root, deterministically, without following symlinks, traversing backups, or crossing filesystem boundaries; directories without a containing worktree are excluded. | Test |
 | FR-048-AC-12 | Unprivileged lsof and ps reconcile cwd evidence for the invoking user's live processes on macOS and Linux. A missing live process cwd, failed inventory, or missing build environment leaves evidence incomplete; exited processes do not. Cleanup is restricted to worktrees owned by that user, preserves live references, and rechecks process evidence and the configured idle age (default one hour) before applying. | Test |

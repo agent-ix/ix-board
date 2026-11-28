@@ -550,7 +550,7 @@ fn failed_tab_list_preserves_host_agent_rows_with_error_note() {
     assert!(
         !report.agents[0]
             .processes
-            .contains(&"locked-build lease".to_owned())
+            .contains(&"ix-build lease".to_owned())
     );
     assert!(
         report.agents[0]
@@ -584,7 +584,7 @@ fn report(machines: Vec<Machine>) -> AgentsReport {
 
 #[trace("FR-018-AC-30", "FR-048-AC-9")]
 #[test]
-fn live_locked_build_lease_matches_canonical_herdr_workspace_and_tab_labels() {
+fn live_ix_build_lease_matches_canonical_herdr_workspace_and_tab_labels() {
     let host: Vec<Arc<dyn Host>> = vec![Arc::new(machine())];
     let leases = BTreeSet::from(["local:team:coder".to_owned()]);
     let report = build_report_with_leases(
@@ -599,7 +599,7 @@ fn live_locked_build_lease_matches_canonical_herdr_workspace_and_tab_labels() {
     assert!(
         report.agents[0]
             .processes
-            .contains(&"locked-build lease".to_owned())
+            .contains(&"ix-build lease".to_owned())
     );
 
     let pane_id_owner = BTreeSet::from(["local:team:w:p".to_owned()]);
@@ -614,7 +614,7 @@ fn live_locked_build_lease_matches_canonical_herdr_workspace_and_tab_labels() {
     assert!(
         !report.agents[0]
             .processes
-            .contains(&"locked-build lease".to_owned())
+            .contains(&"ix-build lease".to_owned())
     );
 }
 

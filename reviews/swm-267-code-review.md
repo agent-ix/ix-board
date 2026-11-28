@@ -21,7 +21,7 @@ Checked and clean:
 
 - **Triggers.** `on: push: tags: ["v*.*.*"]` only. There is no PR, branch or dispatch trigger.
 - **Toolchain.** `rustup toolchain install` with no argument installs the rust-toolchain.toml pin (1.98.1) on rustup 1.28 and later.
-- **Locked build.** `cargo build --release --locked --bin ix-board`. All git dependencies (ix-relay, ix-cli-kit, ix-trace-rs) are public.
+- **Reproducible build.** `cargo build --release --locked --bin ix-board`. All git dependencies (ix-relay, ix-cli-kit, ix-trace-rs) are public.
 - **Asset naming and checksum.** `ix-board-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz` matches `ix-board-v0.7.2-aarch64-apple-darwin.tar.gz`. Both tarballs hold `ix-board` and `LICENSE` at the root. `sha256sum` run inside `dist` writes `<hash>  <basename>`, the same as the darwin `.sha256`.
 - **Permissions.** Workflow-level `contents: write` only. That is the minimum for uploading release assets.
 - **Existing manual release.** When the darwin release already exists for the tag, action-gh-release v2 finds it by tag, keeps its name, body, draft and prerelease values, and uploads the two files. That path works.

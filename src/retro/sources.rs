@@ -288,7 +288,7 @@ pub struct ProcessRow {
 
 /// Local git, disk and process reads.
 pub trait LocalSource {
-    /// Retained locked-build stability evidence; absent adapters remain unavailable.
+    /// Retained ix-build stability evidence; absent adapters remain unavailable.
     fn build_stability(&self, _now_ms: u64) -> crate::build_stability::StabilityReport {
         Default::default()
     }

@@ -45,8 +45,8 @@ Discovery SHALL include quiet children without a transcript-mtime cutoff.
 
 The command SHALL collect supported process evidence for build or gate commands
 (`cargo`, `rustc`, `make`, `gh`, `flock`, `pytest`, `npm`, `pnpm`) whose environment
-attributes them to the pane's `HERDR_PANE_ID`. A `locked-build.sh` command name alone SHALL NOT
-establish build activity. For locked builds, the command SHALL match the current
+attributes them to the pane's `HERDR_PANE_ID`. A `ix-build.sh` command name alone SHALL NOT
+establish build activity. For ix-build leases, the command SHALL match the current
 `ix_build_lane_running` lease owner against the machine, workspace label and tab label returned by
 Herdr. Missing or unreadable lease metrics SHALL be reported as unavailable. The command SHALL
 report process collection as unavailable on unsupported platforms or permission failure, rather
@@ -251,7 +251,7 @@ instead of treating a partial or failed command as a complete zero-worker report
 | FR-018-AC-27 | A herdr `done` pane with no prompt, question, worker or attributed process is IDLE (RECENT within idle-after) and not UNKNOWN; with a pending prompt or question PROMPT/ASKING still take precedence. | Test |
 | FR-018-AC-28 | A Codex rollout larger than the byte limit yields the latest lifecycle state from its tail; when no lifecycle record is found within the limit the evidence is unavailable with a reason and the row is partial. | Test |
 | FR-018-AC-29 | With one machine timing out and others healthy, the healthy machines' rows are returned unchanged within the per-machine timeout, `missing_hosts` lists the failed machine with reason and elapsed time, and the exit status is non-zero. | Test |
-| FR-018-AC-30 | A locked-build owner matching the current Herdr machine/workspace/tab labels is reported as active process evidence independently of process-name collection; only known work-command executables enter process evidence, `locked-build.sh` text alone and a pane id used as a tab label do not establish a lease, and missing metrics are explicit. | Test |
+| FR-018-AC-30 | An ix-build owner matching the current Herdr machine/workspace/tab labels is reported as active process evidence independently of process-name collection; only known work-command executables enter process evidence, `ix-build.sh` text alone and a pane id used as a tab label do not establish a lease, and missing metrics are explicit. | Test |
 
 ## Dependencies
 

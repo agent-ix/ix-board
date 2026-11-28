@@ -19,7 +19,7 @@ wire! {
     OperationalConfig {
         /// Normalized evidence exports, including relay and attributed audit records.
         #[serde(default)] evidence_files: Vec<OperationalInput>,
-        /// Redacted locked-build status exports, keyed by native host identity.
+        /// Redacted ix-build status exports, keyed by native host identity.
         #[serde(default)] scheduler_files: BTreeMap<String, PathBuf>,
         /// Filesystem reserve by native host identity.
         #[serde(default)] disk_reserve_bytes: BTreeMap<String, u64>,
@@ -1931,7 +1931,7 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<T
     serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-// Exact redacted locked-build v1 export; private command/state fields are never read.
+// Exact redacted ix-build v1 export; private command/state fields are never read.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SchedulerReport {

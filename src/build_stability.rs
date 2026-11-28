@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Agent-IX
 
-//! Build terminations and queue pressure from retained locked-build status (FR-051).
+//! Build terminations and queue pressure from retained ix-build status (FR-051).
 //!
 //! Cumulative Prometheus counters cannot establish a rolling window on their own. The
 //! status ledger supplies request timestamps and outcomes; no counter is treated as a rate.
@@ -41,13 +41,13 @@ impl Window {
             "build_kill_rate" => self.kill_rate,
             "build_oom_count" => Some(
                 self.terminations_by_code
-                    .get("LB_OOM_KILLED")
+                    .get("IB_OOM_KILLED")
                     .copied()
                     .unwrap_or(0) as f64,
             ),
             "build_supervision_loss_count" => Some(
                 self.terminations_by_code
-                    .get("LB_SUPERVISION_LOST")
+                    .get("IB_SUPERVISION_LOST")
                     .copied()
                     .unwrap_or(0) as f64,
             ),
@@ -128,9 +128,9 @@ pub struct LimitViolation {
     /// Producer's measurement name and units.
     pub measured_what: Option<String>,
     /// Latest available configured limit, in the producer's units.
-    pub limit: Option<locked_build::wire::Value>,
+    pub limit: Option<ix_build::wire::Value>,
     /// Latest available measured value, in the producer's units.
-    pub measured: Option<locked_build::wire::Value>,
+    pub measured: Option<ix_build::wire::Value>,
 }
 
 /// Queue and memory evidence for a host or class.
@@ -313,7 +313,7 @@ pub struct MemoryGrant {
 }
 
 // The producer owns the writer and reader types. Only local derived report types live here.
-use locked_build::wire::{
+use ix_build::wire::{
     BlockObservation, Code, EventProjection, RequestProjection as RequestInput,
     StatusProjection as StatusInput,
 };
@@ -615,12 +615,12 @@ fn termination_code(request: &RequestInput) -> Option<Code> {
 fn is_kill(code: &str) -> bool {
     matches!(
         code,
-        "LB_RSS_CAP"
-            | "LB_OOM_KILLED"
-            | "LB_HOLD_TIMEOUT"
-            | "LB_SUPERVISION_LOST"
-            | "LB_CANCELLED"
-            | "LB_EXTERNAL_SIGNAL"
+        "IB_RSS_CAP"
+            | "IB_OOM_KILLED"
+            | "IB_HOLD_TIMEOUT"
+            | "IB_SUPERVISION_LOST"
+            | "IB_CANCELLED"
+            | "IB_EXTERNAL_SIGNAL"
     )
 }
 
@@ -642,13 +642,13 @@ fn summarize(status: &StatusInput, start_ms: u64, end_ms: u64) -> Window {
             *terminations_by_code.entry(code.to_owned()).or_insert(0) += 1;
             if matches!(
                 code,
-                "LB_RSS_CAP"
-                    | "LB_OOM_KILLED"
-                    | "LB_HOLD_TIMEOUT"
-                    | "LB_REFUSED_MEMORY_BUDGET"
-                    | "LB_REFUSED_CLASS_CAP"
-                    | "LB_REFUSED_QUEUE"
-                    | "LB_REFUSED_CAP_UNAVAILABLE"
+                "IB_RSS_CAP"
+                    | "IB_OOM_KILLED"
+                    | "IB_HOLD_TIMEOUT"
+                    | "IB_REFUSED_MEMORY_BUDGET"
+                    | "IB_REFUSED_CLASS_CAP"
+                    | "IB_REFUSED_QUEUE"
+                    | "IB_REFUSED_CAP_UNAVAILABLE"
             ) {
                 let key = request
                     .trace
@@ -679,7 +679,7 @@ fn summarize(status: &StatusInput, start_ms: u64, end_ms: u64) -> Window {
         .iter()
         .filter(|r| r.phase() == "succeeded" && r.exit_code.is_none_or(|code| code == 0))
         .count();
-    let oom_supervision_loss_count = ["LB_OOM_KILLED", "LB_SUPERVISION_LOST"]
+    let oom_supervision_loss_count = ["IB_OOM_KILLED", "IB_SUPERVISION_LOST"]
         .iter()
         .map(|code| terminations_by_code.get(*code).copied().unwrap_or(0))
         .sum();
@@ -1179,8 +1179,8 @@ mod tests {
         let source = status(
             json!([
                 {"request_id":"ok","state":"succeeded","class":"point","enqueued_at_ms":99_000_000,"started_at_ms":99_001_000,"ended_at_ms":99_002_000,"exit_code":0},
-                {"request_id":"rss","state":"failed","class":"block","enqueued_at_ms":99_000_000,"started_at_ms":99_002_000,"ended_at_ms":99_003_000,"code":"LB_RSS_CAP","limit_key":"policy.memory_per_job_bytes*parallelism","limit_value":100,"measured_value":125,"measured_what":"rss bytes"},
-                {"request_id":"oom","state":"failed","class":"block","enqueued_at_ms":99_000_000,"started_at_ms":99_003_000,"ended_at_ms":99_004_000,"code":"LB_OOM_KILLED","reason":"rss_cap","signal":15,"limit_key":"policy.scope"},
+                {"request_id":"rss","state":"failed","class":"block","enqueued_at_ms":99_000_000,"started_at_ms":99_002_000,"ended_at_ms":99_003_000,"code":"IB_RSS_CAP","limit_key":"policy.memory_per_job_bytes*parallelism","limit_value":100,"measured_value":125,"measured_what":"rss bytes"},
+                {"request_id":"oom","state":"failed","class":"block","enqueued_at_ms":99_000_000,"started_at_ms":99_003_000,"ended_at_ms":99_004_000,"code":"IB_OOM_KILLED","reason":"rss_cap","signal":15,"limit_key":"policy.scope"},
                 {"request_id":"old","state":"failed","class":"block","enqueued_at_ms":90_000_000,"started_at_ms":90_001_000,"ended_at_ms":96_400_000,"reason":"supervisor_lost"},
                 {"request_id":"signal","state":"failed","class":"point","enqueued_at_ms":99_000_000,"started_at_ms":99_001_000,"ended_at_ms":100_000_000,"signal":9},
                 {"request_id":"exit","state":"failed","class":"point","enqueued_at_ms":99_000_000,"started_at_ms":99_001_000,"ended_at_ms":100_000_000,"exit_code":101}
@@ -1188,8 +1188,8 @@ mod tests {
             json!([
                 {"request_id":"rss","observed_at_ms":99_003_000,"kind":"transition"},
                 {"request_id":"rss","observed_at_ms":99_003_000,"kind":"blocked"},
-                {"request_id":"refused","observed_at_ms":99_999_000,"lifecycle_state":"refused","class":"point","finished_at_ms":99_999_000,"code":"LB_REFUSED_QUEUE","limit_key":"policy.queue"},
-                {"request_id":"refused","observed_at_ms":99_999_001,"lifecycle_state":"refused","class":"point","finished_at_ms":99_999_000,"code":"LB_REFUSED_QUEUE","limit_key":"policy.queue"}
+                {"request_id":"refused","observed_at_ms":99_999_000,"lifecycle_state":"refused","class":"point","finished_at_ms":99_999_000,"code":"IB_REFUSED_QUEUE","limit_key":"policy.queue"},
+                {"request_id":"refused","observed_at_ms":99_999_001,"lifecycle_state":"refused","class":"point","finished_at_ms":99_999_000,"code":"IB_REFUSED_QUEUE","limit_key":"policy.queue"}
             ]),
         );
         let report = from_status(&source.to_string(), "draco", NOW);
@@ -1202,22 +1202,19 @@ mod tests {
         assert_eq!(
             hour.terminations_by_code,
             BTreeMap::from([
-                ("LB_RSS_CAP".into(), 1),
-                ("LB_OOM_KILLED".into(), 1),
-                ("LB_EXTERNAL_SIGNAL".into(), 1),
-                ("LB_COMMAND_EXIT".into(), 1),
-                ("LB_REFUSED_QUEUE".into(), 1)
+                ("IB_RSS_CAP".into(), 1),
+                ("IB_OOM_KILLED".into(), 1),
+                ("IB_EXTERNAL_SIGNAL".into(), 1),
+                ("IB_COMMAND_EXIT".into(), 1),
+                ("IB_REFUSED_QUEUE".into(), 1)
             ])
         );
         assert_eq!(hour.oom_supervision_loss_count, 1);
         let limit = hour.top_limit_violated.unwrap();
         // A named configured resource bound wins the lexical tie with an unnamed refusal.
-        assert_eq!(limit.code, "LB_RSS_CAP");
-        assert_eq!(limit.limit, Some(locked_build::wire::Value::Integer(100)));
-        assert_eq!(
-            limit.measured,
-            Some(locked_build::wire::Value::Integer(125))
-        );
+        assert_eq!(limit.code, "IB_RSS_CAP");
+        assert_eq!(limit.limit, Some(ix_build::wire::Value::Integer(100)));
+        assert_eq!(limit.measured, Some(ix_build::wire::Value::Integer(125)));
         let day = report.last_24h.unwrap();
         assert_eq!(day.completed, 7);
         assert_eq!(day.oom_supervision_loss_count, 2);
@@ -1228,25 +1225,25 @@ mod tests {
     #[trace("FR-051-AC-2")]
     fn stability_legacy_outcomes_do_not_infer_oom_from_sigkill_or_exit_137() {
         for (state, reason, signal, exit_code, expected) in [
-            ("failed", Some("rss_cap"), None, None, Some("LB_RSS_CAP")),
-            ("timed_out", None, None, None, Some("LB_HOLD_TIMEOUT")),
+            ("failed", Some("rss_cap"), None, None, Some("IB_RSS_CAP")),
+            ("timed_out", None, None, None, Some("IB_HOLD_TIMEOUT")),
             (
                 "failed",
                 Some("supervisor_lost_group_exit_unverified"),
                 None,
                 None,
-                Some("LB_SUPERVISION_LOST"),
+                Some("IB_SUPERVISION_LOST"),
             ),
             (
                 "failed",
                 Some("memory_cap_unavailable"),
                 None,
                 None,
-                Some("LB_REFUSED_CAP_UNAVAILABLE"),
+                Some("IB_REFUSED_CAP_UNAVAILABLE"),
             ),
-            ("cancelled", None, None, None, Some("LB_CANCELLED")),
-            ("failed", None, Some(9), None, Some("LB_EXTERNAL_SIGNAL")),
-            ("failed", None, None, Some(137), Some("LB_COMMAND_EXIT")),
+            ("cancelled", None, None, None, Some("IB_CANCELLED")),
+            ("failed", None, Some(9), None, Some("IB_EXTERNAL_SIGNAL")),
+            ("failed", None, None, Some(137), Some("IB_COMMAND_EXIT")),
             ("succeeded", None, None, Some(0), None),
         ] {
             let source = status(
@@ -1541,7 +1538,7 @@ mod review_regressions {
     #[test]
     #[trace("FR-051-AC-1", "FR-051-AC-3")]
     fn stability_refused_attempt_retains_requested_memory_without_queue_entry() {
-        let input = r#"{"schema_version":1,"host":"draco","observed_at_ms":100000000,"requests":[],"events":[{"event_id":"refused","observed_at_ms":99999000,"request_id":"memory-refusal","class":"block","lifecycle_state":"refused","queued_at_ms":null,"finished_at_ms":99999000,"requested_memory_bytes":500,"granted_memory_bytes":null,"code":"LB_REFUSED_MEMORY_BUDGET"}]}"#;
+        let input = r#"{"schema_version":1,"host":"draco","observed_at_ms":100000000,"requests":[],"events":[{"event_id":"refused","observed_at_ms":99999000,"request_id":"memory-refusal","class":"block","lifecycle_state":"refused","queued_at_ms":null,"finished_at_ms":99999000,"requested_memory_bytes":500,"granted_memory_bytes":null,"code":"IB_REFUSED_MEMORY_BUDGET"}]}"#;
         let report = from_status(input, "draco", 100_000_000).last_1h.unwrap();
         assert_eq!(report.requests, 1);
         for class in ["all", "block"] {
@@ -1569,12 +1566,12 @@ mod contract_clarification_tests {
     #[test]
     #[trace("FR-051-AC-1", "FR-051-AC-2", "FR-051-AC-4")]
     fn stability_successful_degraded_supervision_is_success_with_a_diagnostic() {
-        let input = r#"{"schema_version":1,"host":"draco","observed_at_ms":100000000,"requests":[{"request_id":"degraded","class":"point","state":"succeeded","lifecycle_state":"succeeded","queued_at_ms":99990000,"admitted_at_ms":99991000,"running_at_ms":99992000,"finished_at_ms":99999000,"exit_code":0,"code":"LB_SUPERVISION_LOST","message":"degraded supervision"}],"events":[]}"#;
+        let input = r#"{"schema_version":1,"host":"draco","observed_at_ms":100000000,"requests":[{"request_id":"degraded","class":"point","state":"succeeded","lifecycle_state":"succeeded","queued_at_ms":99990000,"admitted_at_ms":99991000,"running_at_ms":99992000,"finished_at_ms":99999000,"exit_code":0,"code":"IB_SUPERVISION_LOST","message":"degraded supervision"}],"events":[]}"#;
         let hour = from_status(input, "draco", 100_000_000).last_1h.unwrap();
         assert_eq!(hour.completed, 1);
         assert_eq!(hour.success_rate, Some(1.0));
         assert_eq!(hour.kill_rate, Some(0.0));
-        assert_eq!(hour.terminations_by_code["LB_SUPERVISION_LOST"], 1);
+        assert_eq!(hour.terminations_by_code["IB_SUPERVISION_LOST"], 1);
         assert_eq!(hour.metric_value("build_supervision_loss_count"), Some(1.0));
     }
 }
@@ -1672,8 +1669,8 @@ mod correction_contract_tests {
     #[trace("FR-051-AC-1", "FR-051-AC-2", "FR-051-AC-5")]
     fn stability_correction_of_a_historical_outcome_counts_one_attempt() {
         let mut source = json!({"schema_version":1,"host":"draco","observed_at_ms":100000000,"requests":[],"events":[
-            {"event_id":"original","observed_at_ms":99995000,"request_id":"one","class":"point","state":"failed","lifecycle_state":"failed","queued_at_ms":99990000,"admitted_at_ms":99991000,"finished_at_ms":99995000,"code":"LB_COMMAND_EXIT","exit_code":101},
-            {"event_id":"repair","correction":true,"observed_at_ms":99999000,"request_id":"one","class":"point","state":"succeeded","lifecycle_state":"succeeded","queued_at_ms":99990000,"admitted_at_ms":99991000,"finished_at_ms":99999000,"code":"LB_SUPERVISION_LOST","exit_code":0}
+            {"event_id":"original","observed_at_ms":99995000,"request_id":"one","class":"point","state":"failed","lifecycle_state":"failed","queued_at_ms":99990000,"admitted_at_ms":99991000,"finished_at_ms":99995000,"code":"IB_COMMAND_EXIT","exit_code":101},
+            {"event_id":"repair","correction":true,"observed_at_ms":99999000,"request_id":"one","class":"point","state":"succeeded","lifecycle_state":"succeeded","queued_at_ms":99990000,"admitted_at_ms":99991000,"finished_at_ms":99999000,"code":"IB_SUPERVISION_LOST","exit_code":0}
         ]});
         let decoded = serde_json::from_value::<StatusInput>(source.clone()).unwrap();
         assert!(!decoded.events[0].correction);
@@ -1687,7 +1684,7 @@ mod correction_contract_tests {
         assert_eq!(event_only.kill_rate, Some(0.0));
         assert_eq!(
             event_only.terminations_by_code,
-            BTreeMap::from([("LB_SUPERVISION_LOST".into(), 1)])
+            BTreeMap::from([("IB_SUPERVISION_LOST".into(), 1)])
         );
         let mut tied = source.clone();
         tied["events"][1]["observed_at_ms"] = json!(99995000);
@@ -1725,7 +1722,7 @@ mod independent_review_fixes {
     #[test]
     #[trace("FR-051-AC-1", "FR-051-AC-5")]
     fn review_type_invalid_records_cannot_discard_healthy_requests_or_leak_labels() {
-        let input = r#"{"schema_version":2,"host":"draco","observed_at_ms":100000000,"requests":[{"request_id":"good","class":"point","state":"succeeded","enqueued_at_ms":99990000,"ended_at_ms":99999000,"exit_code":0},{"request_id":"bad-type","class":"point","state":"running","enqueued_at_ms":"private-invalid-time"},{"request_id":"future-code","class":"point","state":"failed","enqueued_at_ms":99990000,"ended_at_ms":99999000,"code":"LB_PRIVATE_FUTURE"}],"events":[{"request_id":"bad-type","observed_at_ms":99998000,"class":"point","state":"succeeded","enqueued_at_ms":99990000,"ended_at_ms":99998000,"exit_code":0},{"request_id":"broken-event","observed_at_ms":"private-event-time"}],"metrics":{"ix_build_terminations_total":[{"host":"draco","class":"point","code":"LB_PRIVATE_FUTURE","value":1}]}}"#;
+        let input = r#"{"schema_version":2,"host":"draco","observed_at_ms":100000000,"requests":[{"request_id":"good","class":"point","state":"succeeded","enqueued_at_ms":99990000,"ended_at_ms":99999000,"exit_code":0},{"request_id":"bad-type","class":"point","state":"running","enqueued_at_ms":"private-invalid-time"},{"request_id":"future-code","class":"point","state":"failed","enqueued_at_ms":99990000,"ended_at_ms":99999000,"code":"IB_PRIVATE_FUTURE"}],"events":[{"request_id":"bad-type","observed_at_ms":99998000,"class":"point","state":"succeeded","enqueued_at_ms":99990000,"ended_at_ms":99998000,"exit_code":0},{"request_id":"broken-event","observed_at_ms":"private-event-time"}],"metrics":{"ix_build_terminations_total":[{"host":"draco","class":"point","code":"IB_PRIVATE_FUTURE","value":1}]}}"#;
         let report = from_status(input, "draco", 100_000_000);
         assert_eq!(report.reason, None);
         assert_eq!(report.last_1h.as_ref().unwrap().completed, 1);
@@ -1745,8 +1742,8 @@ mod independent_review_fixes {
         assert_eq!(
             hour.terminations_by_code,
             BTreeMap::from([
-                ("LB_SUPERVISION_LOST".into(), 2),
-                ("LB_REFUSED_QUEUE".into(), 1)
+                ("IB_SUPERVISION_LOST".into(), 2),
+                ("IB_REFUSED_QUEUE".into(), 1)
             ])
         );
         assert_eq!(hour.kill_rate, Some(1.0 / 3.0));

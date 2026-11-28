@@ -518,7 +518,7 @@ pub fn build_report_with_timeout(
     )
 }
 
-/// Builds the report with live locked-build owners matched to canonical Herdr labels.
+/// Builds the report with live ix-build owners matched to canonical Herdr labels.
 #[implements("FR-018-AC-30")]
 pub fn build_report_with_leases(
     hosts: &[Arc<dyn Host>],
@@ -814,12 +814,8 @@ fn build_row(
             processes.push(process.comm.clone());
         }
     }
-    if lease_active
-        && !processes
-            .iter()
-            .any(|process| process == "locked-build lease")
-    {
-        processes.push("locked-build lease".to_owned());
+    if lease_active && !processes.iter().any(|process| process == "ix-build lease") {
+        processes.push("ix-build lease".to_owned());
     }
     let verdict = decide(&Evidence {
         herdr: state,
@@ -1071,10 +1067,10 @@ mod tests {
 
     #[test]
     #[trace("FR-018-AC-30", "FR-048-AC-9")]
-    fn locked_build_wrapper_name_does_not_establish_running_work() {
+    fn ix_build_wrapper_name_does_not_establish_running_work() {
         let wrapper = PaneProcess {
             comm: "bash".into(),
-            args: "locked-build.sh".into(),
+            args: "ix-build.sh".into(),
         };
         let leased_command = PaneProcess {
             comm: "cargo".into(),

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Agent-IX
 
-//! Build-host hygiene decisions and locked-build metrics parsing (FR-048).
+//! Build-host hygiene decisions and ix-build metrics parsing (FR-048).
 
 use ix_trace_rs::implements;
 use serde::{Deserialize, Serialize};
@@ -93,7 +93,7 @@ pub struct CleanDecision {
     pub reason: String,
 }
 
-/// One host's locked-build lease and resource metrics.
+/// One host's ix-build lease and resource metrics.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BuildHostMetrics {
@@ -119,7 +119,7 @@ pub struct BuildHostMetrics {
     pub queue_depth: u64,
     /// Whether the exposition contained a queue depth sample for this host.
     pub queue_depth_available: bool,
-    /// Running locked-build lease count.
+    /// Running ix-build lease count.
     pub running_leases: u64,
     /// Whether the exposition contained a running lease sample for this host.
     pub running_leases_available: bool,
@@ -999,7 +999,7 @@ pub fn recheck_clean_decision(
     )
 }
 
-/// Parses the Prometheus text exposition emitted by locked-build and node-exporter.
+/// Parses the Prometheus text exposition emitted by ix-build and node-exporter.
 #[implements("FR-048-AC-7", "FR-050-AC-3")]
 pub fn parse_build_metrics(text: &str) -> BTreeMap<String, BuildHostMetrics> {
     let mut result = BTreeMap::<String, BuildHostMetrics>::new();
@@ -2025,7 +2025,7 @@ mod tests {
 
     #[test]
     #[trace("FR-048-AC-7")]
-    fn locked_build_metrics_aggregate_priorities_and_owner_leases() {
+    fn ix_build_metrics_aggregate_priorities_and_owner_leases() {
         let rows = parse_build_metrics(concat!(
             "node_load1{host=\"luna\"} 6.5\n",
             "node_cpu_seconds_total{host=\"luna\",cpu=\"0\",mode=\"idle\"} 1\n",
@@ -2125,7 +2125,7 @@ mod tests {
 
     #[test]
     #[trace("FR-048-AC-7", "FR-048-AC-8", "FR-050-AC-3")]
-    fn empty_locked_build_lease_gauge_is_known_zero() {
+    fn empty_ix_build_lease_gauge_is_known_zero() {
         let rows = parse_build_metrics(concat!(
             "node_load1{host=\"luna\"} 1\n",
             "node_cpu_seconds_total{host=\"luna\",cpu=\"0\",mode=\"idle\"} 1\n",

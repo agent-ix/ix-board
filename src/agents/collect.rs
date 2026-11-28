@@ -1154,7 +1154,7 @@ mod tests {
         assert!(is_work_command_name("cargo"));
         assert!(is_work_command_name("rustc"));
         assert!(!is_work_command_name("bash"));
-        assert!(!is_work_command_name("locked-build.sh"));
+        assert!(!is_work_command_name("ix-build.sh"));
     }
     #[trace("FR-018-AC-28")]
     #[test]
