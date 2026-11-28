@@ -8,6 +8,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
 use crate::state_path::resolve_links;
+use ix_trace_rs::implements;
 use thiserror::Error as ThisError;
 
 use super::catalog::Record;
@@ -178,6 +179,7 @@ impl Store {
     }
 
     /// Checks repository protection, allowing untracked home state/data. Creates nothing.
+    #[implements("FR-025-AC-3")]
     pub fn check_writable(&self) -> Result<(), StoreError> {
         let resolved = resolve_links(&self.path).map_err(|source| self.io(source))?;
         refuse_inside_git(&resolved)
@@ -187,6 +189,7 @@ impl Store {
     ///
     /// Refuses before creating anything when repository protection rejects the path or
     /// the file does not end in a newline.
+    #[implements("FR-025-AC-3")]
     pub fn append(&self, record: &Record) -> Result<(), StoreError> {
         validate_record(record).map_err(|message| StoreError::Line {
             path: self.path.clone(),
@@ -262,6 +265,7 @@ pub(crate) fn validate_department_version(version: u32) -> Result<(), String> {
     Ok(())
 }
 
+#[implements("FR-025-AC-3")]
 fn refuse_inside_git(resolved: &Path) -> Result<(), StoreError> {
     if let Some(git) =
         crate::state_path::forbidden_git(resolved).map_err(|source| StoreError::Io {

@@ -10,6 +10,7 @@ use ix_board::fleet::FleetConfig;
 use ix_board::fleet::ledger::{Ledger, LedgerError};
 use ix_board::retro::catalog::{Record, RecordKind};
 use ix_board::retro::store::{Store, StoreError};
+use ix_trace_rs::trace;
 
 fn git(root: &Path, args: &[&str]) {
     let output = Command::new("git")
@@ -62,18 +63,21 @@ fn run_case(relative: &str, allowed: bool, tracked: bool, project: bool, xdg: Op
     }
 }
 
+#[trace("FR-039-AC-5", "FR-025-AC-3")]
 #[test]
 fn home_rooted_repo_allows_default_state_and_data() {
     run_case(".local/state", true, false, false, None);
     run_case(".local/share", true, false, false, None);
 }
 
+#[trace("FR-039-AC-5", "FR-025-AC-3")]
 #[test]
 fn home_rooted_repo_allows_custom_xdg_state_and_data() {
     run_case("user-state", true, false, false, Some("XDG_STATE_HOME"));
     run_case("user-data", true, false, false, Some("XDG_DATA_HOME"));
 }
 
+#[trace("FR-039-AC-5", "FR-025-AC-3")]
 #[test]
 fn project_repo_is_refused_even_under_xdg_state() {
     run_case(
@@ -85,17 +89,20 @@ fn project_repo_is_refused_even_under_xdg_state() {
     );
 }
 
+#[trace("FR-039-AC-5", "FR-025-AC-3")]
 #[test]
 fn tracked_state_files_are_refused_even_when_missing() {
     run_case(".local/state", false, true, false, None);
 }
 
+#[trace("FR-039-AC-5", "FR-025-AC-3")]
 #[test]
 fn home_repo_outside_state_and_data_is_refused() {
     run_case("documents", false, false, false, None);
 }
 
 // Run in a subprocess so HOME/XDG never change in the parent test process.
+#[trace("FR-039-AC-5", "FR-025-AC-3")]
 #[test]
 fn guard_child() {
     let Some(root) = std::env::var_os("SWM434_ROOT") else {

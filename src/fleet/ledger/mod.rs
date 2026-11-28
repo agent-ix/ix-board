@@ -170,6 +170,7 @@ pub fn check_compatible(path: &Path) -> Result<(), LedgerError> {
 }
 
 /// Refuses project repositories and tracked files in a home-rooted repository.
+#[implements("FR-039-AC-5")]
 fn refuse_inside_git(path: &Path) -> Result<(), LedgerError> {
     let io = |source| LedgerError::Io {
         path: path.to_owned(),
@@ -648,6 +649,7 @@ impl Ledger {
         Ok(())
     }
 
+    #[implements("FR-039-AC-5")]
     fn open_with(
         path: &Path,
         config: &FleetConfig,

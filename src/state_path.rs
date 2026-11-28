@@ -7,11 +7,13 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use ix_trace_rs::implements;
 
 const LINK_LIMIT: usize = 40;
 
 /// Returns the offending `.git` entry, allowing only untracked user state/data
 /// in a repository rooted at HOME. Git/index errors fail closed.
+#[implements("FR-025-AC-3", "FR-039-AC-5")]
 pub(crate) fn forbidden_git(resolved: &Path) -> std::io::Result<Option<PathBuf>> {
     for directory in resolved.ancestors().skip(1) {
         let git = directory.join(".git");
@@ -25,6 +27,7 @@ pub(crate) fn forbidden_git(resolved: &Path) -> std::io::Result<Option<PathBuf>>
     Ok(None)
 }
 
+#[implements("FR-025-AC-3", "FR-039-AC-5")]
 fn home_state_path(root: &Path, path: &Path) -> std::io::Result<bool> {
     let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) else {
         return Ok(false);
@@ -48,6 +51,7 @@ fn home_state_path(root: &Path, path: &Path) -> std::io::Result<bool> {
     Ok(false)
 }
 
+#[implements("FR-025-AC-3", "FR-039-AC-5")]
 fn untracked(root: &Path, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(root) else {
         return false;
@@ -67,6 +71,7 @@ fn untracked(root: &Path, path: &Path) -> bool {
 
 /// Resolves `path` through every symbolic link, including links that dangle and components
 /// that do not exist yet.
+#[implements("FR-025-AC-3", "FR-039-AC-5")]
 pub(crate) fn resolve_links(path: &Path) -> std::io::Result<PathBuf> {
     let mut pending = vec![std::path::absolute(path)?];
     let mut followed = 0;
