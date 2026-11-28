@@ -148,7 +148,7 @@ configured thresholds from a versioned evidence file or live Linear data. See
 `retro snapshot --config retro.json [--window 24h]` measures whether a team's work is
 converging toward its gate tickets and appends one record of the metric catalog to
 `$TEAM_RETRO_HOME/<team>/snapshots.jsonl` (default `~/.local/state/team-retro`). The store is
-append-only and refuses any path inside a git work tree. A metric whose source cannot be read,
+append-only and refuses paths inside project git work trees. A repository rooted at `HOME` permits untracked files under the XDG state/data directories. A metric whose source cannot be read,
 is incomplete or is not configured is `unavailable` with a reason, never zero. See
 [retro snapshot](docs/retro.md).
 

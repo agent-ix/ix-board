@@ -21,7 +21,7 @@ relationships:
 ## Description
 
 Each `fleet status` and `fleet tick` run SHALL append to a schema-versioned SQLite
-ledger stored outside every git work tree, using the atomic-commit journal pattern
+ledger stored outside project git work trees, using the atomic-commit journal pattern
 of [FR-033](./FR-033-team-flow-effort-export.md). The ledger lets an evaluator and
 a director count idle minutes and time-to-action from stored facts.
 
@@ -58,7 +58,7 @@ project, requested_count, emitted_at, executed_at, resolved_at), `defect`, `assi
   non-WORKING class to the first run in which it is WORKING.
 - **Integrity.** Each run commits atomically; a crash leaves the previous state.
   The default location is the user state directory, overridable by configuration,
-  and a path inside a git work tree is refused. A documented read-only `fleet ledger query`
+  and a path inside a git work tree is refused unless the enclosing root is the resolved `HOME` directory and the resolved path is untracked and under the XDG state or data directory. The directories default to `~/.local/state` and `~/.local/share`, with absolute `XDG_STATE_HOME` and `XDG_DATA_HOME` overrides. Tracked paths (even when missing from the working tree) and nested project work trees are always refused. A documented read-only `fleet ledger query`
   command and direct SQLite read serve the evaluator. An unsupported schema version
   is refused without rewriting. Retention is configurable and prunes by age.
 
@@ -262,7 +262,7 @@ in [FR-041](./FR-041-fleet-saturation.md); `answer_dialog_latency_max` and
 | FR-039-AC-2 | A span with no committed tick for more than twice the tick interval yields a gap interval and no minutes for any class; ad-hoc status runs do not change this. | Test |
 | FR-039-AC-3 | Two concurrent writers serialize under the lock with strictly increasing sequence numbers; a writer that cannot take the lock in the bound fails without writing. | Test |
 | FR-039-AC-4 | A simulated crash between interval write and cursor update leaves the previous committed state. | Test |
-| FR-039-AC-5 | A ledger path inside a git work tree is refused, and the default path is outside any work tree. | Test |
+| FR-039-AC-5 | A ledger path inside a project git work tree is refused. A home-rooted repository permits untracked paths under the resolved XDG state/data directories (including their defaults); tracked paths and nested project repositories are refused. | Test |
 | FR-039-AC-6 | The `executed_at` of a `push_next_ticket` equals the first transition of the target lane into WORKING with focus on the pushed ticket, and WORKING on another ticket gives none; that of an `answer_dialog` equals the first transition out of BLOCKED after an emitted answer, and an `escalate_block` fallback gives none; that of an `act_on_undetermined` equals the first transition to a determined class; a lane already in the expected state at emission has none until a later transition; an action aimed at a lead or project has none and resolves when its condition clears; a `resend_order` has no `executed_at` until SWM-255 adds the `Acted` receipt join. | Test |
 | FR-039-AC-7 | `fleet ledger query` returns idle minutes per lane per day and actions with time-to-action in text and JSON without writing. | Test |
 | FR-039-AC-8 | An unsupported schema version is refused with no change, retention prunes only eligible rows older than the configured age while preserving open intervals and capacity history, and replaced assignments, defects and ground-truth samples are stored with their timestamps. | Test |

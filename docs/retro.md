@@ -8,7 +8,7 @@ type: reference
 ## Typical use
 
 ```bash
-export TEAM_RETRO_HOME=~/.local/state/team-retro     # default; must be outside any git work tree
+export TEAM_RETRO_HOME=~/.local/state/team-retro     # default; project repositories are refused
 ix-board retro backfill --config retro.json --since 2026-10-31 --until 2026-11-06   # once, for a baseline
 ix-board retro snapshot --team QSL                    # generated cadence job, every 30 minutes
 ix-board retro snapshot --config retro.json          # custom scope
@@ -51,7 +51,7 @@ Records go to `$TEAM_RETRO_HOME/<team>/snapshots.jsonl`, defaulting to
 `~/.local/state/team-retro`. Each line is one record with `schema_version`, `kind`, `taken_at`,
 `team`, `window` and a `metrics` map. The command appends with a single write, never rewrites a
 line, and refuses a path that resolves (through symbolic links) inside a git work tree or below a
-directory containing `.git`. It also refuses to append to a file that does not end in a newline,
+directory containing `.git`. A repository rooted at `HOME` permits untracked files under the resolved XDG state/data directories. These default to `~/.local/state` and `~/.local/share`; absolute `XDG_STATE_HOME` and `XDG_DATA_HOME` values override them. Tracked files and nested project repositories are refused. It also refuses to append to a file that does not end in a newline,
 and a reader stops at a line that does not parse or a `schema_version` newer than it understands.
 
 ## Metrics

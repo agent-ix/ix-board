@@ -7,6 +7,8 @@ use std::ffi::OsString;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
+use crate::state_path::resolve_links;
+use ix_trace_rs::implements;
 use thiserror::Error as ThisError;
 
 use super::catalog::Record;
@@ -19,8 +21,6 @@ pub const HOME_VARIABLE: &str = "TEAM_RETRO_HOME";
 pub const FILE_NAME: &str = "snapshots.jsonl";
 /// Default store root below the home directory.
 const DEFAULT_ROOT: &str = ".local/state/team-retro";
-/// Most symbolic links followed while resolving a store path.
-const LINK_LIMIT: usize = 40;
 
 /// Failures resolving, reading or appending the store.
 #[derive(Debug, ThisError)]
@@ -178,7 +178,8 @@ impl Store {
         Ok(keyed.into_iter().map(|(_, record)| record).collect())
     }
 
-    /// Refuses when the resolved store path is inside a git work tree. Creates nothing.
+    /// Checks repository protection, allowing untracked home state/data. Creates nothing.
+    #[implements("FR-025-AC-3")]
     pub fn check_writable(&self) -> Result<(), StoreError> {
         let resolved = resolve_links(&self.path).map_err(|source| self.io(source))?;
         refuse_inside_git(&resolved)
@@ -186,8 +187,9 @@ impl Store {
 
     /// Appends one record as a single write to a file opened in append mode.
     ///
-    /// Refuses before creating anything when the resolved path is inside a git work tree or
+    /// Refuses before creating anything when repository protection rejects the path or
     /// the file does not end in a newline.
+    #[implements("FR-025-AC-3")]
     pub fn append(&self, record: &Record) -> Result<(), StoreError> {
         validate_record(record).map_err(|message| StoreError::Line {
             path: self.path.clone(),
@@ -263,58 +265,18 @@ pub(crate) fn validate_department_version(version: u32) -> Result<(), String> {
     Ok(())
 }
 
-/// Resolves `path` through every symbolic link, including links that dangle and components
-/// that do not exist yet.
-fn resolve_links(path: &Path) -> std::io::Result<PathBuf> {
-    let mut pending = vec![path.to_owned()];
-    let mut followed = 0;
-    while let Some(candidate) = pending.pop() {
-        let mut existing = candidate.clone();
-        let mut tail = Vec::new();
-        loop {
-            match std::fs::canonicalize(&existing) {
-                Ok(resolved) => {
-                    let mut full = resolved;
-                    full.extend(tail.iter().rev());
-                    return Ok(full);
-                }
-                Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
-                Err(_) => {}
-            }
-            // A dangling link is not canonicalizable; follow it by hand.
-            if std::fs::symlink_metadata(&existing).is_ok_and(|meta| meta.is_symlink()) {
-                followed += 1;
-                if followed > LINK_LIMIT {
-                    return Err(std::io::Error::other("too many symbolic links"));
-                }
-                let target = std::fs::read_link(&existing)?;
-                let base = existing.parent().unwrap_or(Path::new("/")).join(target);
-                let mut next = base;
-                next.extend(tail.iter().rev());
-                pending.push(next);
-                break;
-            }
-            let Some(name) = existing.file_name().map(OsString::from) else {
-                return Err(std::io::Error::other("path has no existing ancestor"));
-            };
-            tail.push(name);
-            if !existing.pop() {
-                return Err(std::io::Error::other("path has no existing ancestor"));
-            }
-        }
-    }
-    Err(std::io::Error::other("path did not resolve"))
-}
-
+#[implements("FR-025-AC-3")]
 fn refuse_inside_git(resolved: &Path) -> Result<(), StoreError> {
-    for directory in resolved.ancestors().skip(1) {
-        let git = directory.join(".git");
-        if std::fs::symlink_metadata(&git).is_ok() {
-            return Err(StoreError::InsideGit {
-                path: resolved.to_owned(),
-                git,
-            });
-        }
+    if let Some(git) =
+        crate::state_path::forbidden_git(resolved).map_err(|source| StoreError::Io {
+            path: resolved.to_owned(),
+            source,
+        })?
+    {
+        return Err(StoreError::InsideGit {
+            path: resolved.to_owned(),
+            git,
+        });
     }
     Ok(())
 }

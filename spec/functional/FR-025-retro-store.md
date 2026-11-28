@@ -22,7 +22,13 @@ command SHALL NOT rewrite or truncate an existing line.
 
 While a retro command is about to write, it SHALL resolve the store path, following
 symbolic links, and SHALL refuse the write if the resolved path lies inside a
-git work tree or below a directory that contains a `.git` entry. If the path is refused, then the retro command SHALL name the offending path, exit non-zero and create no file.
+git work tree or below a directory that contains a `.git` entry, except for the home-rooted state/data case below.
+
+When the enclosing work tree root is the resolved `HOME` directory, the retro command SHALL allow an untracked path under the resolved XDG state or data directory. The state and data directories default to `~/.local/state` and `~/.local/share`; an absolute `XDG_STATE_HOME` or `XDG_DATA_HOME` overrides its respective default.
+
+The retro command SHALL refuse a tracked path, including a missing working file still in the index, and a nested project work tree.
+
+If the path is refused, then the retro command SHALL name the offending path, exit non-zero and create no file.
 
 When a command reads a line that does not parse, it SHALL stop with an error
 naming the line number and exit non-zero. If the final byte of the file is not
@@ -33,7 +39,7 @@ understands, it SHALL stop with an error naming that version. The command SHALL
 read an older version without rewriting it.
 
 The retro commands SHALL NOT write retro data to Linear, GitHub or any
-repository; the store is the only write this feature adds. The store orders
+project repository; the store is the only write this feature adds. The store orders
 records by `taken_at`, with file order breaking ties.
 
 ## Acceptance Criteria
@@ -42,7 +48,7 @@ records by `taken_at`, with file order breaking ties.
 |----|----------|--------------|
 | FR-025-AC-1 | With `TEAM_RETRO_HOME` unset, the store path is `~/.local/state/team-retro/<team>/snapshots.jsonl`; with it set, the path is under the given directory. | Test |
 | FR-025-AC-2 | Two consecutive snapshots add two lines and leave the first line byte-identical. | Test |
-| FR-025-AC-3 | A store path inside a git work tree, including through a symbolic link, is refused with a message naming the path, a non-zero exit, and no file or directory created. | Test |
+| FR-025-AC-3 | A store path inside a project git work tree, including through a symbolic link, is refused with a message naming the path, a non-zero exit, and no file or directory created. A home-rooted repository permits untracked paths under the resolved XDG state/data directories (including their defaults); tracked paths and nested project repositories are refused. | Test |
 | FR-025-AC-4 | A record with a newer `schema_version` stops the command with an error naming that version; a record with an older version is read and left unchanged. | Test |
 | FR-025-AC-5 | Every record carries `schema_version`, `kind`, `taken_at`, `team`, `window` and a metric map, and no line contains a credential value. | Test |
 | FR-025-AC-6 | A store with an unparsable line makes read commands stop naming that line number, and a store whose last byte is not a newline makes the append command refuse; neither command alters the file. | Test |
