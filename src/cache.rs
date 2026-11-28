@@ -755,6 +755,7 @@ fn restrict_permissions_with(
 }
 
 #[cfg(unix)]
+#[implements("FR-004-AC-22")]
 pub(crate) fn restrict_permissions(path: &Path) -> Result<(), Error> {
     use std::os::unix::fs::OpenOptionsExt;
 
