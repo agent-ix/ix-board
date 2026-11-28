@@ -618,6 +618,29 @@ fn live_ix_build_lease_matches_canonical_herdr_workspace_and_tab_labels() {
     );
 }
 
+#[trace("FR-018-AC-30", "FR-048-AC-9")]
+#[test]
+fn legacy_lease_marker_is_active_and_is_not_duplicated_by_the_new_marker() {
+    let mut host = machine();
+    host.probe.processes.insert(
+        "w:p".into(),
+        vec![PaneProcess {
+            comm: "locked-build lease".into(),
+            args: String::new(),
+        }],
+    );
+    let hosts: Vec<Arc<dyn Host>> = vec![Arc::new(host)];
+    let report = build_report_with_leases(
+        &hosts,
+        &["team".into()],
+        IDLE,
+        HOST_TIMEOUT,
+        &mut |_| Ok(None),
+        &BTreeSet::from(["local:team:coder".into()]),
+    );
+    assert_eq!(report.agents[0].processes, ["locked-build lease"]);
+}
+
 #[trace(
     "FR-018-AC-1",
     "FR-018-AC-5",

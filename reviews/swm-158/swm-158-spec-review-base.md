@@ -156,7 +156,7 @@ Ticket: SWM-158. Reviewed frozen spec-only PR ix-board#64 at 73367fee91adda8ef51
       "id": "FR-018",
       "path": "spec/functional/FR-018-agent-activity-verdicts.md",
       "role": "examined",
-      "excerpt": "`ix-build.sh`) whose environment attributes them to the pane's"
+      "excerpt": "`locked-build.sh`) whose environment attributes them to the pane's"
     },
     {
       "id": "FR-018",

@@ -72,6 +72,8 @@ pub enum AgentsError {
         command: String,
         /// Exit status text.
         status: String,
+        /// Numeric exit status, when the process exited normally.
+        exit_code: Option<i32>,
         /// Trimmed standard error.
         stderr: String,
     },
@@ -814,7 +816,7 @@ fn build_row(
             processes.push(process.comm.clone());
         }
     }
-    if lease_active && !processes.iter().any(|process| process == "ix-build lease") {
+    if lease_active && !processes.iter().any(|process| is_lease_marker(process)) {
         processes.push("ix-build lease".to_owned());
     }
     let verdict = decide(&Evidence {
@@ -921,7 +923,11 @@ fn build_row(
 
 #[implements("FR-018-AC-30")]
 fn is_work_command(process: &PaneProcess) -> bool {
-    WORK_COMMANDS.contains(&process.comm.as_str())
+    WORK_COMMANDS.contains(&process.comm.as_str()) || is_lease_marker(&process.comm)
+}
+
+fn is_lease_marker(process: &str) -> bool {
+    matches!(process, "ix-build lease" | "locked-build lease")
 }
 
 fn last_chars(text: &str, count: usize) -> String {
@@ -1077,6 +1083,10 @@ mod tests {
             args: "cargo test".into(),
         };
         assert!(!is_work_command(&wrapper));
+        assert!(!is_work_command(&PaneProcess {
+            comm: "bash".into(),
+            args: "locked-build.sh".into()
+        }));
         assert!(is_work_command(&leased_command));
     }
 }

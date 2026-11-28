@@ -1169,6 +1169,48 @@ mod tests {
 
     const NOW: u64 = 100_000_000;
 
+    fn check_transition_code_prefix(prefix: &str) {
+        let codes = [
+            "RSS_CAP",
+            "OOM_KILLED",
+            "HOLD_TIMEOUT",
+            "SUPERVISION_LOST",
+            "CANCELLED",
+            "EXTERNAL_SIGNAL",
+            "REFUSED_MEMORY_BUDGET",
+            "REFUSED_CLASS_CAP",
+            "REFUSED_QUEUE",
+            "REFUSED_CAP_UNAVAILABLE",
+        ];
+        let requests: Vec<_> = codes.iter().map(|suffix| json!({"request_id":suffix,"state":"failed","class":"block","enqueued_at_ms":99_000_000,"ended_at_ms":99_999_000,"exit_code":1,"code":format!("{prefix}_{suffix}"),"limit_key":"policy.cap"})).collect();
+        let report = from_status(
+            &status(json!(requests), json!([])).to_string(),
+            "draco",
+            NOW,
+        );
+        let hour = report.last_1h.unwrap();
+        for suffix in codes {
+            assert_eq!(hour.terminations_by_code[&format!("IB_{suffix}")], 1);
+        }
+        assert_eq!(hour.kill_rate, Some(0.6));
+        assert_eq!(hour.oom_supervision_loss_count, 2);
+        assert_eq!(hour.metric_value("build_oom_count"), Some(1.0));
+        assert_eq!(hour.metric_value("build_supervision_loss_count"), Some(1.0));
+        assert_eq!(hour.top_limit_violated.unwrap().count, 7);
+    }
+
+    #[test]
+    #[trace("FR-051-AC-1", "FR-051-AC-2")]
+    fn stability_accepts_legacy_lb_codes_for_kills_refusals_oom_and_supervision() {
+        check_transition_code_prefix("LB");
+    }
+
+    #[test]
+    #[trace("FR-051-AC-1", "FR-051-AC-2")]
+    fn stability_accepts_ib_codes_for_kills_refusals_oom_and_supervision() {
+        check_transition_code_prefix("IB");
+    }
+
     fn status(requests: serde_json::Value, events: serde_json::Value) -> serde_json::Value {
         json!({"schema_version":1,"host":"draco","observed_at_ms":NOW,"requests":requests,"events":events})
     }
