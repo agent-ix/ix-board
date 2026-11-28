@@ -169,32 +169,18 @@ pub fn check_compatible(path: &Path) -> Result<(), LedgerError> {
     Ok(())
 }
 
-/// Refuses a path whose existing ancestors include a git work tree.
+/// Refuses project repositories and tracked files in a home-rooted repository.
 fn refuse_inside_git(path: &Path) -> Result<(), LedgerError> {
     let io = |source| LedgerError::Io {
         path: path.to_owned(),
         source,
     };
-    let absolute = std::path::absolute(path).map_err(io)?;
-    let mut existing = absolute.as_path();
-    let mut tail = Vec::new();
-    while !existing.exists() {
-        let (Some(name), Some(parent)) = (existing.file_name(), existing.parent()) else {
-            break;
-        };
-        tail.push(name.to_owned());
-        existing = parent;
-    }
-    let mut resolved = std::fs::canonicalize(existing).map_err(io)?;
-    resolved.extend(tail.iter().rev());
-    for directory in resolved.ancestors().skip(1) {
-        let git = directory.join(".git");
-        if std::fs::symlink_metadata(&git).is_ok() {
-            return Err(LedgerError::InsideGit {
-                path: resolved,
-                git,
-            });
-        }
+    let resolved = crate::state_path::resolve_links(path).map_err(io)?;
+    if let Some(git) = crate::state_path::forbidden_git(&resolved).map_err(io)? {
+        return Err(LedgerError::InsideGit {
+            path: resolved,
+            git,
+        });
     }
     Ok(())
 }

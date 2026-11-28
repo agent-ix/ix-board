@@ -31,6 +31,7 @@ mod relay_address;
 pub mod retro;
 mod scope;
 mod settings;
+mod state_path;
 mod summary_cache;
 pub mod team_metrics;
 
