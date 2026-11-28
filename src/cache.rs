@@ -53,6 +53,7 @@ pub(crate) fn select_cache_path(
 #[implements("FR-004-AC-22")]
 fn cache_access_failure(error: &Error) -> bool {
     match error {
+        Error::CachePathUnavailable { source, .. } => cache_access_failure(source),
         Error::CachePermissions(_) | Error::CacheDirectory(_) => true,
         Error::Cache(rusqlite::Error::SqliteFailure(code, _)) => matches!(
             code.code,
@@ -754,6 +755,7 @@ fn restrict_permissions_with(
 }
 
 #[cfg(unix)]
+#[implements("FR-004-AC-22")]
 pub(crate) fn restrict_permissions(path: &Path) -> Result<(), Error> {
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -762,7 +764,10 @@ pub(crate) fn restrict_permissions(path: &Path) -> Result<(), Error> {
         .append(true)
         .mode(0o600)
         .open(path)
-        .map_err(Error::CachePermissions)?;
+        .map_err(|source| Error::CachePathUnavailable {
+            path: path.to_owned(),
+            source: Box::new(Error::CachePermissions(source)),
+        })?;
     restrict_permissions_with(&file, |file, permissions| file.set_permissions(permissions))
 }
 
@@ -872,6 +877,7 @@ mod tests {
             .expect("held lock times out");
         assert!(started.elapsed() < Duration::from_secs(6));
         let message = error.to_string();
+        assert!(message.contains("refresh in progress, retry"), "{message}");
         assert!(
             message.contains(&format!("pid={}", std::process::id())),
             "{message}"
@@ -931,6 +937,85 @@ mod tests {
                     .get::<_, String>(0))
                 .unwrap(),
             "saved"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[trace("FR-004-AC-22")]
+    fn cache_append_denial_names_path_and_writable_override() {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert_ne!(rustix::process::geteuid().as_raw(), 0, "run unprivileged");
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("readonly");
+        std::fs::create_dir(&parent).unwrap();
+        let path = parent.join("linear.sqlite3");
+        std::fs::write(&path, b"retained").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = SnapshotCache::open(&path, "test");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let error = result
+            .err()
+            .expect("append-open must fail before chmod or SQLite");
+        let message = error.to_string();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(message.contains("IX_BOARD_CACHE_PATH"), "{message}");
+        assert!(
+            message.contains("writable local database path"),
+            "{message}"
+        );
+        assert!(matches!(
+            error,
+            Error::CachePathUnavailable { source, .. }
+                if matches!(*source, Error::CachePermissions(ref cause)
+                    if cause.kind() == std::io::ErrorKind::PermissionDenied)
+        ));
+        assert_eq!(std::fs::read(path).unwrap(), b"retained");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[trace("FR-004-AC-22")]
+    fn readonly_default_creation_recovers_or_names_both_failed_paths() {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert_ne!(rustix::process::geteuid().as_raw(), 0, "run unprivileged");
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("readonly");
+        std::fs::create_dir(&parent).unwrap();
+        let preferred = parent.join("linear.sqlite3");
+        let blocked_fallback = parent.join("private/linear.sqlite3");
+        let writable = directory.path().join("private/linear.sqlite3");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let failed = select_cache_path(None, &preferred, &blocked_fallback);
+        let recovered = select_cache_path(None, &preferred, &writable);
+        let explicit = select_cache_path(Some(&preferred), &preferred, &writable);
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let message = failed.unwrap_err().to_string();
+        assert!(
+            message.contains(&preferred.display().to_string()),
+            "{message}"
+        );
+        assert!(
+            message.contains(&blocked_fallback.display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains("IX_BOARD_CACHE_PATH"), "{message}");
+        assert_eq!(recovered.unwrap(), writable);
+        assert!(
+            explicit.is_err(),
+            "explicit overrides must never silently fall back"
+        );
+        assert!(!preferred.exists());
+        assert!(writable.is_file());
+        assert_eq!(
+            std::fs::metadata(&writable).unwrap().permissions().mode() & 0o777,
+            0o600
         );
     }
 

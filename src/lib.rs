@@ -154,11 +154,11 @@ pub enum Error {
         retry_after: std::time::Duration,
     },
     /// The ordinary refresh could not acquire its shared lock within five seconds.
-    #[error("Linear refresh lock timed out")]
+    #[error("Linear refresh lock timed out; refresh in progress, retry after it completes")]
     RefreshLockTimeout,
     /// The refresh lock wait expired, with diagnostic owner metadata.
     #[error(
-        "Linear refresh lock timed out after 5s at {path}; recorded holder {holder}; wait for that process or check its status; do not delete a held lock file"
+        "Linear refresh lock timed out after 5s at {path}; recorded holder {holder}; refresh in progress, retry after that process completes or check its status; do not delete a held lock file"
     )]
     RefreshLockHeld {
         /// Adjacent operating-system lock file.
