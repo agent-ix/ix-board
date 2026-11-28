@@ -119,7 +119,7 @@ fn lock_refresh(directory: &Path) -> File {
     file
 }
 
-/// Trace: FR-004-AC-3, FR-031-AC-2
+#[trace("FR-004-AC-3", "FR-004-AC-23", "FR-031-AC-2")]
 #[test]
 fn cache_coordination_child() {
     let Some(directory) = std::env::var_os("IX_BOARD_COORDINATION_DIRECTORY") else {
@@ -167,6 +167,11 @@ fn cache_coordination_child() {
             );
         }
         "empty-lock" => {
+            let message = result
+                .as_ref()
+                .expect_err("empty cache must fail")
+                .to_string();
+            assert!(message.contains("refresh in progress, retry"), "{message}");
             assert!(matches!(result, Err(Error::RefreshLockHeld { .. })));
             assert!(
                 started.elapsed() < Duration::from_secs(6),
