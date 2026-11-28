@@ -1135,7 +1135,7 @@ dependencies = [
 [[package]]
 name = "ix-build"
 version = "0.2.0"
-source = "git+https://github.com/agent-ix/dev-tools?rev=90133d6bda09b70feeec3a145089b447872b3178#90133d6bda09b70feeec3a145089b447872b3178"
+source = "git+https://github.com/agent-ix/dev-tools?rev=540b8cbd0daf5c7b8f7b44467e852945c03309e7#540b8cbd0daf5c7b8f7b44467e852945c03309e7"
 dependencies = [
  "chrono",
  "clap",
