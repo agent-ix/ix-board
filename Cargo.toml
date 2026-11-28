@@ -22,7 +22,7 @@ name = "ix-team-exporter"
 path = "src/bin/ix-team-exporter.rs"
 
 [dependencies]
-locked-build = { git = "https://github.com/agent-ix/dev-tools", rev = "a50cdbe899eb8a3006d115f4a47c4157b0a3cc15" }
+ix-build = { git = "https://github.com/agent-ix/dev-tools", rev = "540b8cbd0daf5c7b8f7b44467e852945c03309e7" }
 serde_yaml = { package = "yaml_serde", version = "=0.10.7" }
 relay-work-wire = { git = "https://github.com/agent-ix/ix-relay", tag = "v0.6.0" }
 relay-core = { git = "https://github.com/agent-ix/ix-relay", tag = "v0.6.0" }

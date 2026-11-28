@@ -57,9 +57,9 @@ pub struct HostInput {
     pub sustainable_slots: Evidence<u32>,
     /// Optional operator-entered limit on lane demand.
     pub lane_capacity: Evidence<u32>,
-    /// Locked-build occupied slots, if the real producer is present.
+    /// IX-build occupied slots, if the real producer is present.
     pub build_slots_busy: Evidence<u32>,
-    /// Locked-build configured slots, if the real producer is present.
+    /// IX-build configured slots, if the real producer is present.
     pub build_slots_configured: Evidence<u32>,
     /// Arithmetic mean of per-lane compiler duty for lanes with sufficient observations.
     pub duty: Evidence<f64>,

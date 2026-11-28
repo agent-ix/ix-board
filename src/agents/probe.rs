@@ -25,7 +25,7 @@ pub const MAX_PROTOCOL_BYTES: usize = 16 * 1024 * 1024;
 
 /// A machine the detector can read: herdr state plus one batched file probe.
 pub trait Host: Send + Sync {
-    /// Reads redacted locked-build status; older adapters explicitly lack this source.
+    /// Reads redacted ix-build status; older adapters explicitly lack this source.
     fn build_status(&self) -> Result<String, AgentsError> {
         Err(AgentsError::ProbeFormat("build_status_unavailable".into()))
     }
@@ -286,6 +286,48 @@ impl SystemHost {
     }
 }
 
+impl SystemHost {
+    #[implements("FR-051-AC-5")]
+    fn build_status_with(
+        &self,
+        mut execute: impl FnMut(&mut Command, Duration) -> Result<String, AgentsError>,
+    ) -> Result<String, AgentsError> {
+        for binary in ["ix-build", "locked-build"] {
+            let mut command = match &self.machine {
+                None => {
+                    let mut command = Command::new(binary);
+                    command.arg("status");
+                    command
+                }
+                Some(machine) => {
+                    let mut command = Command::new("ssh");
+                    command.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--"]).arg(&machine.ssh_target)
+                        .arg(format!("exec env PATH=\"$PATH:$HOME/.local/bin:$HOME/.cargo/bin\" {binary} status"));
+                    command
+                }
+            };
+            let result = execute(
+                &mut command,
+                self.deadline.saturating_duration_since(Instant::now()),
+            );
+            let absent = match &result {
+                Err(AgentsError::Spawn { source, .. }) => {
+                    self.machine.is_none() && source.kind() == std::io::ErrorKind::NotFound
+                }
+                Err(AgentsError::CommandFailed {
+                    exit_code: Some(127),
+                    ..
+                }) => self.machine.is_some(),
+                _ => false,
+            };
+            if !absent || binary == "locked-build" {
+                return result;
+            }
+        }
+        unreachable!("the final fallback returns its result")
+    }
+}
+
 /// Longest a single herdr or ssh call may take before it becomes an error.
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -303,6 +345,7 @@ fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<V
     })
 }
 
+#[implements("FR-018-AC-20", "FR-018-AC-21")]
 pub(super) fn run(
     command: &mut Command,
     stdin: Option<&str>,
@@ -352,6 +395,7 @@ pub(super) fn run(
         return Err(AgentsError::CommandFailed {
             command: rendered,
             status: status.to_string(),
+            exit_code: status.code(),
             stderr: String::from_utf8_lossy(&stderr).trim().to_owned(),
         });
     }
@@ -361,26 +405,8 @@ pub(super) fn run(
 impl Host for SystemHost {
     #[implements("FR-051-AC-5")]
     fn build_status(&self) -> Result<String, AgentsError> {
-        let mut command;
-        match &self.machine {
-            None => {
-                command = Command::new("locked-build");
-                command.arg("status");
-            }
-            Some(machine) => {
-                command = Command::new("ssh");
-                command
-                    .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--"])
-                    .arg(&machine.ssh_target)
-                    .arg(r#"exec env PATH="$PATH:$HOME/.local/bin:$HOME/.cargo/bin" locked-build status"#);
-            }
-        }
-        run(
-            &mut command,
-            None,
-            self.deadline.saturating_duration_since(Instant::now()),
-        )
-        .map_err(|_| AgentsError::ProbeFormat("build_status_unavailable".into()))
+        self.build_status_with(|command, timeout| run(command, None, timeout))
+            .map_err(|_| AgentsError::ProbeFormat("build_status_unavailable".into()))
     }
 
     fn label(&self) -> &str {
@@ -439,6 +465,67 @@ impl Host for SystemHost {
 #[cfg(test)]
 mod tests {
     use ix_trace_rs::trace;
+
+    #[test]
+    #[trace("FR-051-AC-5")]
+    fn build_status_falls_back_only_when_the_new_binary_is_absent_on_local_and_ssh_hosts() {
+        for host in [SystemHost::local(), SystemHost::remote("luna", "luna")] {
+            let remote = host.machine.is_some();
+            let mut calls = Vec::new();
+            let result = host.build_status_with(|command, _| {
+                calls.push(format!("{command:?}"));
+                if calls.len() == 1 {
+                    if remote {
+                        Err(AgentsError::CommandFailed {
+                            command: "ssh".into(),
+                            status: "127".into(),
+                            exit_code: Some(127),
+                            stderr: "absent".into(),
+                        })
+                    } else {
+                        Err(AgentsError::Spawn {
+                            command: "ix-build".into(),
+                            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+                        })
+                    }
+                } else {
+                    Ok("legacy status".into())
+                }
+            });
+            assert_eq!(result.unwrap(), "legacy status");
+            assert_eq!(calls.len(), 2);
+            assert!(
+                calls[0].contains("ix-build status")
+                    || (!remote && calls[0].contains("\"ix-build\""))
+            );
+            assert!(calls[1].contains("locked-build"));
+            let mut calls = 0;
+            let result = host.build_status_with(|_, _| {
+                calls += 1;
+                Err(AgentsError::CommandFailed {
+                    command: "status".into(),
+                    status: "2".into(),
+                    exit_code: Some(2),
+                    stderr: "invalid state".into(),
+                })
+            });
+            assert!(result.is_err());
+            assert_eq!(
+                calls, 1,
+                "a real status failure must not use another reader"
+            );
+            let mut calls = 0;
+            assert_eq!(
+                host.build_status_with(|_, _| {
+                    calls += 1;
+                    Ok("new status".into())
+                })
+                .unwrap(),
+                "new status"
+            );
+            assert_eq!(calls, 1);
+        }
+    }
 
     #[test]
     #[trace("FR-018-AC-20")]

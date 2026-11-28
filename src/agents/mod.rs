@@ -72,6 +72,8 @@ pub enum AgentsError {
         command: String,
         /// Exit status text.
         status: String,
+        /// Numeric exit status, when the process exited normally.
+        exit_code: Option<i32>,
         /// Trimmed standard error.
         stderr: String,
     },
@@ -518,7 +520,7 @@ pub fn build_report_with_timeout(
     )
 }
 
-/// Builds the report with live locked-build owners matched to canonical Herdr labels.
+/// Builds the report with live ix-build owners matched to canonical Herdr labels.
 #[implements("FR-018-AC-30")]
 pub fn build_report_with_leases(
     hosts: &[Arc<dyn Host>],
@@ -814,12 +816,8 @@ fn build_row(
             processes.push(process.comm.clone());
         }
     }
-    if lease_active
-        && !processes
-            .iter()
-            .any(|process| process == "locked-build lease")
-    {
-        processes.push("locked-build lease".to_owned());
+    if lease_active && !processes.iter().any(|process| is_lease_marker(process)) {
+        processes.push("ix-build lease".to_owned());
     }
     let verdict = decide(&Evidence {
         herdr: state,
@@ -925,7 +923,12 @@ fn build_row(
 
 #[implements("FR-018-AC-30")]
 fn is_work_command(process: &PaneProcess) -> bool {
-    WORK_COMMANDS.contains(&process.comm.as_str())
+    WORK_COMMANDS.contains(&process.comm.as_str()) || is_lease_marker(&process.comm)
+}
+
+#[implements("FR-018-AC-30")]
+fn is_lease_marker(process: &str) -> bool {
+    matches!(process, "ix-build lease" | "locked-build lease")
 }
 
 fn last_chars(text: &str, count: usize) -> String {
@@ -1071,16 +1074,20 @@ mod tests {
 
     #[test]
     #[trace("FR-018-AC-30", "FR-048-AC-9")]
-    fn locked_build_wrapper_name_does_not_establish_running_work() {
+    fn ix_build_wrapper_name_does_not_establish_running_work() {
         let wrapper = PaneProcess {
             comm: "bash".into(),
-            args: "locked-build.sh".into(),
+            args: "ix-build.sh".into(),
         };
         let leased_command = PaneProcess {
             comm: "cargo".into(),
             args: "cargo test".into(),
         };
         assert!(!is_work_command(&wrapper));
+        assert!(!is_work_command(&PaneProcess {
+            comm: "bash".into(),
+            args: "locked-build.sh".into()
+        }));
         assert!(is_work_command(&leased_command));
     }
 }

@@ -482,7 +482,7 @@ Options:
 ```
 
 Exit status: zero when every machine and configured lease source was read. Set
-`IX_BUILD_METRICS_URL` or pass `--lease-metrics-url` to map locked-build owner lanes onto current
+`IX_BUILD_METRICS_URL` or pass `--lease-metrics-url` to map ix-build owner lanes onto current
 Herdr workspace and tab labels. Without readable metrics, agent rows are retained and the report
 exits partial with the lease source error. When some machines are missing (they time out after 45
 seconds or cannot be read) but other machines returned rows, the command prints those rows, lists
@@ -554,7 +554,7 @@ ix-board build status --metrics-url <URL> [--policy <HOST:MAX_LOAD1:HEAVY_GATE_S
 ```
 
 Reads Prometheus text exposition from the configured endpoint and reports per-host one-minute
-load per core, root filesystem free space, memory, swap, queued requests, running locked-build
+load per core, root filesystem free space, memory, swap, queued requests, running ix-build
 leases and policy eligibility.
 Without `--policy`, the command uses configured `[hygiene.hosts.<host>]` entries that provide
 both `max_load1` and `heavy_gate_slots`. Pass one `--policy` for each host to override the
@@ -567,7 +567,7 @@ heavy gate may already be running).
 ix-board host check
 ```
 
-Checks local GitHub and Linear authentication, locked-build load, memory, swap,
+Checks local GitHub and Linear authentication, ix-build load, memory, swap,
 queue and running lease telemetry, admission eligibility, and quire/quoin/rg
 process working directories under `~/dev`. It prints statuses and metrics
 without credential values. Exit status is 0 when all required checks pass and

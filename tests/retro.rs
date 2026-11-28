@@ -3881,7 +3881,7 @@ fn stability_retro_collects_additive_host_metrics_once_and_routes_rises_as_exist
     let now_ms = (NOW * 1000.0) as u64;
     let source = serde_json::json!({"schema_version":1,"host":"draco","observed_at_ms":now_ms,"requests":[
         {"request_id":"one","state":"succeeded","class":"point","enqueued_at_ms":now_ms-5000,"started_at_ms":now_ms-4000,"ended_at_ms":now_ms-3000,"exit_code":0},
-        {"request_id":"two","state":"failed","class":"block","enqueued_at_ms":now_ms-5000,"started_at_ms":now_ms-2000,"ended_at_ms":now_ms-1000,"code":"LB_OOM_KILLED"},
+        {"request_id":"two","state":"failed","class":"block","enqueued_at_ms":now_ms-5000,"started_at_ms":now_ms-2000,"ended_at_ms":now_ms-1000,"code":"IB_OOM_KILLED"},
         {"request_id":"three","state":"failed","class":"point","enqueued_at_ms":now_ms-5000,"started_at_ms":now_ms-3000,"ended_at_ms":now_ms-1000,"reason":"supervisor_lost"}
     ],"events":[]});
     rig.build_status

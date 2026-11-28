@@ -1111,9 +1111,9 @@ dependencies = [
  "assert_cmd",
  "chrono",
  "clap",
+ "ix-build",
  "ix-cli-kit",
  "ix-trace-rs",
- "locked-build",
  "predicates",
  "redis",
  "relay-core",
@@ -1130,6 +1130,24 @@ dependencies = [
  "thiserror",
  "toml 0.8.23",
  "yaml_serde",
+]
+
+[[package]]
+name = "ix-build"
+version = "0.2.0"
+source = "git+https://github.com/agent-ix/dev-tools?rev=540b8cbd0daf5c7b8f7b44467e852945c03309e7#540b8cbd0daf5c7b8f7b44467e852945c03309e7"
+dependencies = [
+ "chrono",
+ "clap",
+ "nix 0.30.1",
+ "rustix",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "signal-hook",
+ "sysinfo",
+ "thiserror",
 ]
 
 [[package]]
@@ -1272,22 +1290,6 @@ name = "litemap"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
-
-[[package]]
-name = "locked-build"
-version = "0.1.0"
-source = "git+https://github.com/agent-ix/dev-tools?rev=a50cdbe899eb8a3006d115f4a47c4157b0a3cc15#a50cdbe899eb8a3006d115f4a47c4157b0a3cc15"
-dependencies = [
- "clap",
- "nix 0.30.1",
- "rustix",
- "semver",
- "serde",
- "serde_json",
- "signal-hook",
- "sysinfo",
- "thiserror",
-]
 
 [[package]]
 name = "log"

@@ -102,7 +102,7 @@ enum Command {
         /// Quiet time after which a ready agent counts as idle (for example 90s, 20m, 2h).
         #[arg(long, default_value = "20m", value_parser = parse_duration)]
         idle_after: u64,
-        /// Prometheus text exposition URL containing locked-build running-owner metrics.
+        /// Prometheus text exposition URL containing ix-build running-owner metrics.
         #[arg(long)]
         lease_metrics_url: Option<String>,
     },
@@ -1858,6 +1858,7 @@ fn run_fleet_assign(
     )?)
 }
 
+#[implements("FR-018-AC-30")]
 fn run_agents(
     teams: &[String],
     idle_after: u64,
@@ -1881,7 +1882,7 @@ fn run_agents(
         },
         None => (
             std::collections::BTreeSet::new(),
-            Some("locked-build metrics are unavailable; configure IX_BUILD_METRICS_URL".into()),
+            Some("ix-build metrics are unavailable; configure IX_BUILD_METRICS_URL".into()),
         ),
     };
     let mut service = None;
