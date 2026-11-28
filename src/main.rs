@@ -1858,6 +1858,7 @@ fn run_fleet_assign(
     )?)
 }
 
+#[implements("FR-018-AC-30")]
 fn run_agents(
     teams: &[String],
     idle_after: u64,
