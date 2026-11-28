@@ -926,6 +926,7 @@ fn is_work_command(process: &PaneProcess) -> bool {
     WORK_COMMANDS.contains(&process.comm.as_str()) || is_lease_marker(&process.comm)
 }
 
+#[implements("FR-018-AC-30")]
 fn is_lease_marker(process: &str) -> bool {
     matches!(process, "ix-build lease" | "locked-build lease")
 }

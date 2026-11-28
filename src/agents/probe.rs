@@ -287,6 +287,7 @@ impl SystemHost {
 }
 
 impl SystemHost {
+    #[implements("FR-051-AC-5")]
     fn build_status_with(
         &self,
         mut execute: impl FnMut(&mut Command, Duration) -> Result<String, AgentsError>,
@@ -344,6 +345,7 @@ fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<V
     })
 }
 
+#[implements("FR-018-AC-20", "FR-018-AC-21")]
 pub(super) fn run(
     command: &mut Command,
     stdin: Option<&str>,
